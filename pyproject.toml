@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "agent-platform"
+version = "0.1.0a1"
+description = "Agent Business Platform — Phase B"
+authors = ["Agent Platform Team"]
+packages = []
+
+[tool.poetry.dependencies]
+python = "^3.12"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
+ruff = "^0.7.0"
+mypy = "^1.13.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

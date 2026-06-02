@@ -1,0 +1,315 @@
+# =============================================================================
+# Agent Platform — Agent Scheduler OpenAPI 3.1
+#
+# Authentication
+# --------------
+# All endpoints (except /healthz and /readyz) require both:
+#   * Authorization: Bearer <JWT>  — service-account or user token; verified
+#     by the gateway against the foundation Keycloak JWKS.
+#   * X-Tenant-Id: <tenant-id>     — injected by the gateway from the JWT
+#     ``tenant_id`` claim.  Clients cannot self-declare a tenant id; the
+#     gateway overrides any client-supplied value.
+#
+# Both are belt-and-braces with the in-process tenant context — the
+# scheduler also rejects requests where the parsed JWT tenant disagrees
+# with X-Tenant-Id.
+# =============================================================================
+openapi: 3.1.0
+
+info:
+  title: Agent Platform — Agent Scheduler
+  description: Sandbox orchestration — spawns containers/microVMs running the AgentScope worker. Endpoints: spawn / status / cancel.
+  version: 0.1.0
+
+servers:
+  - url: http://localhost:8007
+    description: Local dev
+
+security:
+  - bearerAuth: []
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Runs
+  # ---------------------------------------------------------------------------
+  /api/scheduler/v1/runs:
+    post:
+      operationId: scheduler_runs_create
+      summary: Create and start a new run (spawn sandbox with the AgentScope worker)
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/UserIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [session_id, run_id, task]
+              properties:
+                session_id: { type: string, pattern: '^[A-Za-z0-9_\-]{1,40}$' }
+                run_id:     { type: string, pattern: '^[A-Za-z0-9_\-]{1,40}$' }
+                task:
+                  type: string
+                  maxLength: 32768
+                  description: Task description for the agent
+                agent_config:
+                  type: object
+                  properties:
+                    max_iterations: { type: integer, default: 100 }
+                    sandbox_type:   { type: string,  default: python }
+                    model:          { type: string }
+      responses:
+        '201':
+          description: Run created and container started
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+        '502': { $ref: '#/components/responses/BadGateway' }
+        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+
+  /api/scheduler/v1/runs/{run_id}:
+    get:
+      operationId: scheduler_runs_get
+      summary: Get run status (polls container state)
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Run status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/scheduler/v1/runs/{run_id}/cancel:
+    post:
+      operationId: scheduler_runs_cancel
+      summary: Cancel a run (stop + remove container)
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/UserIdHeader'
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Run cancelled
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Run' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/scheduler/v1/runs/{run_id}/events:
+    get:
+      operationId: scheduler_runs_events
+      summary: SSE stream of run events
+      tags: [Runs]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------------------
+  # Sandboxes
+  # ---------------------------------------------------------------------------
+  /api/scheduler/v1/sandboxes:
+    get:
+      operationId: scheduler_sandboxes_list
+      summary: List active sandboxes owned by the caller's tenant
+      tags: [Sandboxes]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      responses:
+        '200':
+          description: Active sandbox list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: '#/components/schemas/Sandbox' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/scheduler/v1/sandboxes/{sandbox_id}/stop:
+    post:
+      operationId: scheduler_sandboxes_stop
+      summary: Stop a sandbox owned by the caller's tenant
+      tags: [Sandboxes]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: sandbox_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: Sandbox stopped }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  # ---------------------------------------------------------------------------
+  # Health — no auth, by design
+  # ---------------------------------------------------------------------------
+  /api/scheduler/v1/healthz:
+    get:
+      operationId: scheduler_healthz
+      summary: Liveness check
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+  /api/scheduler/v1/readyz:
+    get:
+      operationId: scheduler_readyz
+      summary: Readiness check
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+# =============================================================================
+# Components
+# =============================================================================
+components:
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Foundation-issued OIDC JWT.  Gateway verifies signature via Keycloak
+        JWKS and extracts ``tenant_id`` / ``sub`` into request headers.
+
+  parameters:
+    TenantIdHeader:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      description: |
+        Tenant scope of the request.  MUST equal the ``tenant_id`` claim of
+        the bearer token; gateway overrides any client-supplied value.
+      schema:
+        type: string
+        pattern: '^tnt_[0-9A-Z]{26}$'
+
+    UserIdHeader:
+      name: X-User-Id
+      in: header
+      required: false
+      description: |
+        Calling user id, injected by the gateway from JWT ``sub`` when the
+        caller is a human; absent for service-to-service tokens.
+      schema:
+        type: string
+        pattern: '^usr_[0-9A-Z]{26}$|^SYSTEM$'
+
+  schemas:
+    RunStatus:
+      type: string
+      enum: [PENDING, RUNNING, COMPLETED, FAILED, CANCELLED]
+
+    Run:
+      type: object
+      required: [id, session_id, status, task_description, created_at]
+      properties:
+        id:                { type: string, description: "run_<ULID>" }
+        session_id:        { type: string }
+        sandbox_id:        { type: string, nullable: true }
+        status:            { $ref: '#/components/schemas/RunStatus' }
+        task_description:  { type: string }
+        result_summary:    { type: string, nullable: true }
+        error_message:     { type: string, nullable: true }
+        started_at:        { type: string, format: date-time, nullable: true }
+        finished_at:       { type: string, format: date-time, nullable: true }
+        created_at:        { type: string, format: date-time }
+
+    Sandbox:
+      type: object
+      required: [container_id, run_id, session_id, tenant_id, status]
+      properties:
+        container_id: { type: string }
+        run_id:       { type: string }
+        session_id:   { type: string }
+        tenant_id:    { type: string }
+        status:       { $ref: '#/components/schemas/RunStatus' }
+        image:        { type: string }
+        created_at:   { type: string, format: date-time }
+
+    HealthStatus:
+      type: object
+      required: [status, service]
+      properties:
+        status:  { type: string, enum: [OK, DEGRADED, DOWN] }
+        service: { type: string }
+        version: { type: string }
+
+    Error:
+      type: object
+      required: [type, title, status]
+      description: RFC 9457 Problem Details
+      properties:
+        type:     { type: string, format: uri }
+        title:    { type: string }
+        status:   { type: integer }
+        detail:   { type: string }
+        instance: { type: string }
+        code:     { type: string }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token / tenant header
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found (or not owned by caller's tenant)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: Request validation failed
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadGateway:
+      description: Upstream foundation service returned an error
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ServiceUnavailable:
+      description: Upstream dependency unreachable
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }

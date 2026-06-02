@@ -1,0 +1,33 @@
+name: CI - Agent Scheduler
+on:
+  push:
+    paths: ['services/agent-scheduler/**', '.github/workflows/ci-agent-scheduler.yml', '.github/actions/setup-service/**']
+  pull_request:
+    paths: ['services/agent-scheduler/**']
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: agent-scheduler }
+      - run: cd services/agent-scheduler && poetry run ruff check .
+      - run: cd services/agent-scheduler && poetry run mypy src/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: agent-scheduler }
+      - run: cd services/agent-scheduler && poetry run pytest --cov=src --cov-fail-under=80
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: agent-scheduler }
+      - uses: gitleaks/gitleaks-action@v2
+      - run: cd services/agent-scheduler && poetry run pip-licenses --fail-on="GPL;AGPL"

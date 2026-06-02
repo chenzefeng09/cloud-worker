@@ -1,0 +1,30 @@
+name: CI - Contracts (OpenAPI)
+on:
+  push:
+    paths:
+      - 'contracts/**'
+      - '.spectral.yaml'
+      - '.github/workflows/ci-contracts.yml'
+  pull_request:
+    paths:
+      - 'contracts/**'
+      - '.spectral.yaml'
+
+jobs:
+  spectral:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - name: Install Spectral
+        run: npm install -g @stoplight/spectral-cli@6.11.1
+      - name: Lint OpenAPI contracts
+        # Fails the build on any "error" severity; warnings reported but
+        # non-blocking so contract evolution isn't gated on style nits.
+        run: |
+          spectral lint --fail-severity=error \
+            contracts/openapi/bff.yaml \
+            contracts/openapi/session-orchestrator.yaml \
+            contracts/openapi/agent-scheduler.yaml \
+            contracts/openapi/sandbox-pool.yaml

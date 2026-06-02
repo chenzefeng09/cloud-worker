@@ -1,0 +1,50 @@
+name: 'Setup service venv'
+description: |
+  Repeatable setup steps shared by every service CI job:
+  install Poetry, install service deps, then install the foundation SDK
+  (which lives in a sibling repo and isn't on PyPI yet).
+
+inputs:
+  service:
+    description: 'Service directory under services/, e.g. "bff"'
+    required: true
+  foundation-repo:
+    description: 'GitHub <owner/repo> for saas-foundation'
+    required: false
+    default: 'your-org/saas-foundation'
+  foundation-ref:
+    description: 'git ref of saas-foundation to install'
+    required: false
+    default: 'main'
+  poetry-version:
+    description: 'Poetry version (must match the lockfile major)'
+    required: false
+    default: '2.1.4'
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.foundation-repo }}
+        ref: ${{ inputs.foundation-ref }}
+        path: _foundation
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+        cache-dependency-path: services/${{ inputs.service }}/poetry.lock
+    - shell: bash
+      run: pip install "poetry==${{ inputs.poetry-version }}"
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/pypoetry
+          services/${{ inputs.service }}/.venv
+        key: poetry-${{ inputs.service }}-${{ runner.os }}-${{ hashFiles(format('services/{0}/poetry.lock', inputs.service)) }}
+    - shell: bash
+      working-directory: services/${{ inputs.service }}
+      run: |
+        poetry install --no-interaction
+        # Install foundation SDK editable so service code can `import foundation_sdk.fastapi`.
+        poetry run pip install -e "$GITHUB_WORKSPACE/_foundation/sdks/python[fastapi]"

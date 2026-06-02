@@ -1,0 +1,12 @@
+extends:
+  - spectral:oas
+
+rules:
+  operation-operationId: off
+  openapi-tags: off
+  no-server-variables-in-path: off
+  path-keys-no-ambiguous-trailing-slash: error
+  operation-success-response: error
+  openapi-v3_1-schema-valid: error
+  path-params: error
+  typed-enum: error

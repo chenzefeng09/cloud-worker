@@ -1,0 +1,170 @@
+# =============================================================================
+# Agent Platform — Sandbox Pool OpenAPI 3.1
+#
+# Pre-warmed microVM pool (CubeSandbox).  See:
+#   * docs/design/b-m2-sandbox-runtime-v1.md
+#   * docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md
+# =============================================================================
+openapi: 3.1.0
+
+info:
+  title: Agent Platform — Sandbox Pool
+  description: CubeSandbox microVM pool — acquire / release / inspect.
+  version: 0.1.0
+
+servers:
+  - url: http://localhost:8008
+    description: Local dev
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/sandbox-pool/v1/sandboxes/acquire:
+    post:
+      operationId: pool_acquire
+      summary: Acquire a pre-warmed (or cold-spawned) sandbox for one run
+      tags: [Sandboxes]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                template: { type: string, default: base }
+      responses:
+        '201':
+          description: Sandbox handed out
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Acquired' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429':
+          description: Pool max_total reached; retry later
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/sandbox-pool/v1/sandboxes/{sandbox_id}:
+    delete:
+      operationId: pool_release
+      summary: Return a sandbox to the pool (or reap if non-recyclable)
+      tags: [Sandboxes]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: sandbox_id
+          in: path
+          required: true
+          schema: { type: string, pattern: '^sb_[A-Za-z0-9]+$' }
+      responses:
+        '204': { description: Released }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/sandbox-pool/v1/sandboxes/_pool:
+    get:
+      operationId: pool_snapshot
+      summary: Pool occupancy (debug/metrics)
+      tags: [Sandboxes]
+      responses:
+        '200':
+          description: Snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PoolSnapshot' }
+
+  /api/sandbox-pool/v1/healthz:
+    get:
+      operationId: pool_healthz
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+  /api/sandbox-pool/v1/readyz:
+    get:
+      operationId: pool_readyz
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    TenantIdHeader:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: '^tnt_[0-9A-Z]{26}$'
+
+  schemas:
+    Acquired:
+      type: object
+      required: [sandbox_id, template, cold_spawned]
+      properties:
+        sandbox_id: { type: string, pattern: '^sb_[A-Za-z0-9]+$' }
+        template:   { type: string }
+        cold_spawned:
+          type: boolean
+          description: True when the acquire had to cold-spawn (pool was empty)
+
+    PoolSnapshot:
+      type: object
+      required: [total, by_template]
+      properties:
+        total: { type: integer, minimum: 0 }
+        by_template:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              idle:  { type: integer, minimum: 0 }
+              total: { type: integer, minimum: 0 }
+
+    HealthStatus:
+      type: object
+      required: [status, service]
+      properties:
+        status:  { type: string, enum: [OK, DEGRADED, DOWN] }
+        service: { type: string }
+        version: { type: string }
+
+    Error:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:    { type: string, format: uri }
+        title:   { type: string }
+        status:  { type: integer }
+        detail:  { type: string }
+        instance:{ type: string }
+        code:    { type: string }
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token / tenant header
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Sandbox not in pool
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }

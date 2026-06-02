@@ -1,0 +1,256 @@
+# =============================================================================
+# agent-platform B-M1 开发栈 — 扩展 foundation 底座
+#
+# 前置：   cd ../saas-foundation/deploy/docker-compose && docker compose -f dev.yml up -d
+# 启动：   docker compose -f agent-platform.yml up -d --build
+# 状态：   docker compose -f agent-platform.yml ps
+# 清理：   docker compose -f agent-platform.yml down
+#
+# 端口：
+#   BFF                    8005
+#   Session Orchestrator   8006
+#   Agent Scheduler        8007
+#   Web (Vite dev)         5173
+# =============================================================================
+
+name: agent-platform-dev
+
+# --------------------------------------------------------------------------- #
+# Networks
+#
+# We attach to the network created by the saas-foundation dev compose stack so
+# we can reach pgbouncer / keycloak / otel-collector by their service names.
+# The literal name "saas-foundation-dev_foundation" comes from
+#   docker-compose project name "saas-foundation-dev" + network key "foundation"
+# defined in ../../../saas-foundation/deploy/docker-compose/dev.yml.  Override
+# via the FOUNDATION_NETWORK env var if you renamed the foundation project.
+# --------------------------------------------------------------------------- #
+networks:
+  foundation:
+    external: true
+    name: ${FOUNDATION_NETWORK:-saas-foundation-dev_foundation}
+  # Private network shared only between agent-scheduler and the
+  # docker-socket-proxy sidecar.  Keeping it off `foundation` means the proxy
+  # is not reachable from foundation services or other workloads.
+  agent_internal:
+    driver: bridge
+    internal: true
+
+services:
+  # ===========================================================================
+  # Session Orchestrator — session/message/run CRUD + SSE event streams
+  # ===========================================================================
+  session-orchestrator:
+    build:
+      context: ../../services/session-orchestrator
+      dockerfile: Dockerfile
+      # docker compose v2.16+ — lets the Dockerfile do
+      #   COPY --from=foundation_sdk . /sdk
+      # without making the SDK part of the primary build context (which
+      # would pollute it).  ``FOUNDATION_SDK_PATH`` is set in the .env so
+      # both local dev and CI can override; default assumes the foundation
+      # repo is checked out as a sibling.
+      additional_contexts:
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+    container_name: agent-session-orchestrator
+    restart: unless-stopped
+    environment:
+      SESSION_ORCHESTRATOR_ENV: dev
+      SESSION_ORCHESTRATOR_LOG_LEVEL: DEBUG
+      SESSION_ORCHESTRATOR_HTTP_PORT: "8006"
+      SESSION_ORCHESTRATOR_DB_DSN: postgresql+asyncpg://app_user:${APP_USER_PASSWORD:-app_user_change_me}@pgbouncer:6432/foundation
+      SESSION_ORCHESTRATOR_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+      SESSION_ORCHESTRATOR_AGENT_SCHEDULER_URL: http://agent-scheduler:8007/api/scheduler/v1
+      SESSION_ORCHESTRATOR_OTEL_ENABLED: "true"
+      SESSION_ORCHESTRATOR_OTEL_EXPORTER_ENDPOINT: http://otel-collector:4317
+      SESSION_ORCHESTRATOR_DB_POOL_SIZE: "5"
+      SESSION_ORCHESTRATOR_DB_MAX_OVERFLOW: "10"
+      SESSION_ORCHESTRATOR_DB_POOL_RECYCLE: "1800"
+    ports:
+      - "${PORT_SESSION_ORCHESTRATOR:-8006}:8006"
+    networks: [foundation]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8006/healthz').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # NOTE: ``pgbouncer`` is owned by the saas-foundation compose project.
+    # docker-compose forbids depends_on across projects, so we rely on the
+    # healthcheck above retrying until pgbouncer is reachable on the shared
+    # ``foundation`` network.  Bring up the foundation stack first:
+    #   cd ../../../saas-foundation/deploy/docker-compose && docker compose -f dev.yml up -d
+
+  # ===========================================================================
+  # Sandbox Pool — pre-warms microVMs (CubeSandbox) so agent runs get a
+  # warm sandbox in <100ms instead of paying full cold-start latency.
+  # In dev the pool is the in-memory skeleton (Pool class); production
+  # swaps in the KEDA operator (B-M2 follow-up).
+  # ===========================================================================
+  sandbox-pool:
+    build:
+      context: ../../services/sandbox-pool
+      dockerfile: Dockerfile
+      additional_contexts:
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+    container_name: agent-sandbox-pool
+    restart: unless-stopped
+    environment:
+      SANDBOX_POOL_ENV: dev
+      SANDBOX_POOL_LOG_LEVEL: DEBUG
+      SANDBOX_POOL_HTTP_PORT: "8008"
+      SANDBOX_POOL_CUBE_CONTROLLER_URL: ${CUBE_CONTROLLER_URL:-http://cube-controller:8443}
+      SANDBOX_POOL_IDLE_LOW_WATERMARK: "${POOL_IDLE_LOW:-2}"
+      SANDBOX_POOL_IDLE_HIGH_WATERMARK: "${POOL_IDLE_HIGH:-10}"
+      SANDBOX_POOL_MAX_TOTAL: "${POOL_MAX_TOTAL:-50}"
+      SANDBOX_POOL_OTEL_ENABLED: "true"
+      SANDBOX_POOL_OTEL_EXPORTER_ENDPOINT: http://otel-collector:4317
+    ports:
+      - "${PORT_SANDBOX_POOL:-8008}:8008"
+    networks: [foundation]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/api/sandbox-pool/v1/healthz').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ===========================================================================
+  # docker-socket-proxy — least-privilege Docker API for the scheduler.
+  #
+  # The scheduler used to mount /var/run/docker.sock directly which gives a
+  # compromised scheduler container root-equivalent privileges on the host.
+  # tecnativa/docker-socket-proxy fronts the real socket and whitelists only
+  # the API verbs we actually call (containers/images/networks).  Verbs that
+  # would enable container escape (exec, bind-mount arbitrary host paths,
+  # privileged: true) are left at their default 0 = deny.
+  #
+  # Listed as a separate "private" network so only the scheduler can reach it.
+  # ===========================================================================
+  docker-socket-proxy:
+    image: tecnativa/docker-socket-proxy:0.3.0
+    container_name: agent-docker-socket-proxy
+    restart: unless-stopped
+    environment:
+      CONTAINERS: 1
+      IMAGES: 1
+      NETWORKS: 1
+      VOLUMES: 0
+      EXEC: 0
+      INFO: 1
+      POST: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [agent_internal]
+
+  # ===========================================================================
+  # Agent Scheduler — spawns sandbox containers running the AgentScope worker
+  # ===========================================================================
+  agent-scheduler:
+    build:
+      context: ../../services/agent-scheduler
+      dockerfile: Dockerfile
+      additional_contexts:
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+    container_name: agent-scheduler
+    restart: unless-stopped
+    environment:
+      SCHEDULER_ENV: dev
+      SCHEDULER_LOG_LEVEL: DEBUG
+      SCHEDULER_HTTP_PORT: "8007"
+      # Foundation identity — used to mint per-run, scope-limited sandbox tokens.
+      SCHEDULER_FOUNDATION_API_URL: http://keycloak:8080
+      SCHEDULER_FOUNDATION_IDENTITY_URL: http://identity-service:8001/api/identity/v1
+      # Scheduler's OWN service-account token (auth to identity).  MUST be set
+      # in prod — empty here so dev compose starts; create_run will refuse to
+      # spawn until a real token is supplied.
+      SCHEDULER_SERVICE_TOKEN: ${SCHEDULER_SERVICE_TOKEN:-}
+      # Sandboxes are reached via the docker-socket-proxy sidecar.  DOCKER_HOST
+      # is the *only* way the docker SDK is configured here — there is NO
+      # /var/run/docker.sock bind-mount on this container.
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      SCHEDULER_AGENT_IMAGE: ${AGENT_IMAGE:-ghcr.io/agent-platform/agentscope-sandbox:0.1}
+      SCHEDULER_LLM_API_KEY: ${LLM_API_KEY:-}
+      SCHEDULER_LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-20250514}
+      SCHEDULER_WORKSPACE_BASE: /var/agent-platform/workspaces
+      SCHEDULER_DOCKER_NETWORK: ${FOUNDATION_NETWORK:-saas-foundation-dev_foundation}
+      SCHEDULER_SANDBOX_MEMORY_LIMIT: "2g"
+      SCHEDULER_SANDBOX_CPU_SHARES: "1024"
+      SCHEDULER_SANDBOX_TIMEOUT: "600"
+      SCHEDULER_OTEL_ENABLED: "true"
+      SCHEDULER_OTEL_EXPORTER_ENDPOINT: http://otel-collector:4317
+    ports:
+      - "${PORT_AGENT_SCHEDULER:-8007}:8007"
+    volumes:
+      - agent_workspaces:/var/agent-platform/workspaces
+    networks: [foundation, agent_internal]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8007/healthz').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      session-orchestrator:
+        condition: service_healthy
+      docker-socket-proxy:
+        condition: service_started
+
+  # ===========================================================================
+  # BFF — 认证网关 + API 聚合 + SSE 中继
+  # ===========================================================================
+  bff:
+    build:
+      context: ../../services/bff
+      dockerfile: Dockerfile
+      additional_contexts:
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+    container_name: agent-bff
+    restart: unless-stopped
+    environment:
+      BFF_ENV: dev
+      BFF_LOG_LEVEL: DEBUG
+      BFF_HTTP_PORT: "8005"
+      # Identity service base URL.  Pre-D2 this pointed straight at keycloak
+      # but the BFF actually talks to identity-service's /sessions endpoints,
+      # not Keycloak's /token endpoint directly.
+      BFF_FOUNDATION_IDENTITY_URL: http://identity-service:8001/api/identity/v1
+      BFF_SESSION_ORCHESTRATOR_URL: http://session-orchestrator:8006/api/session/v1
+      # MUST be supplied via env in any deployment beyond local dev.
+      # CookieSigner refuses to start if the value looks like a placeholder.
+      BFF_COOKIE_SECRET: ${BFF_COOKIE_SECRET:?BFF_COOKIE_SECRET must be set (>=32 chars, no placeholder text)}
+      BFF_COOKIE_NAME: ap_session
+      BFF_COOKIE_MAX_AGE: "86400"
+      BFF_COOKIE_SECURE: "false"
+      BFF_CORS_ORIGINS: ${BFF_CORS_ORIGINS:-http://localhost:5173,http://web:5173}
+      BFF_OTEL_ENABLED: "true"
+      BFF_OTEL_EXPORTER_ENDPOINT: http://otel-collector:4317
+    ports:
+      - "${PORT_BFF:-8005}:8005"
+    networks: [foundation]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/healthz').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      session-orchestrator:
+        condition: service_healthy
+
+  # ===========================================================================
+  # Web — React 19 + Vite 开发服务器（带 HMR）
+  # ===========================================================================
+  web:
+    build:
+      context: ../../apps/web
+      dockerfile: Dockerfile
+    container_name: agent-web
+    restart: unless-stopped
+    environment:
+      VITE_API_BASE_URL: http://localhost:8005
+    ports:
+      - "${PORT_WEB:-5173}:5173"
+    networks: [foundation]
+    depends_on:
+      bff:
+        condition: service_healthy
+
+volumes:
+  agent_workspaces:

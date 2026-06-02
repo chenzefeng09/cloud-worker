@@ -1,0 +1,37 @@
+# Agent Platform — .gitignore
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+*.log
+.poetry/
+*.env
+!.env.example
+node_modules/
+.vite/
+.next/
+coverage/
+htmlcov/
+.venv/
+*.swp
+*.swo
+*~
+.DS_Store
+*.tsbuildinfo
+
+# Local-only test/build artefacts
+.coverage
+*.coverage.*
+.cache/
+htmlcov/
+test-results/
+
+# Editor / OS
+.idea/
+.vscode/
+*.iml

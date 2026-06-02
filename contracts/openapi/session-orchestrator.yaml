@@ -1,0 +1,458 @@
+# =============================================================================
+# Agent Platform — Session Orchestrator OpenAPI 3.1
+# =============================================================================
+openapi: 3.1.0
+
+info:
+  title: Agent Platform — Session Orchestrator
+  description: Session and message lifecycle management
+  version: 0.1.0
+
+servers:
+  - url: http://localhost:8006
+    description: Local dev
+
+# All endpoints require a Foundation-issued bearer token by default; /healthz
+# and /readyz explicitly override with `security: []` further down.
+security:
+  - bearerAuth: []
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Sessions
+  # ---------------------------------------------------------------------------
+  /api/session/v1/sessions:
+    get:
+      operationId: orchestrator_sessions_list
+      summary: List sessions for current tenant
+      tags: [Sessions]
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Paginated session list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionPage'
+
+    post:
+      operationId: orchestrator_sessions_create
+      summary: Create a new session
+      tags: [Sessions]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                  maxLength: 200
+                agent_config:
+                  type: object
+      responses:
+        '201':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+
+  /api/session/v1/sessions/{session_id}:
+    get:
+      operationId: orchestrator_sessions_get
+      summary: Get session detail
+      tags: [Sessions]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Session detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      operationId: orchestrator_sessions_update
+      summary: Update session
+      tags: [Sessions]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string, maxLength: 200 }
+                status: { $ref: '#/components/schemas/SessionStatus' }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+
+    delete:
+      operationId: orchestrator_sessions_delete
+      summary: Soft-delete session
+      tags: [Sessions]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Deleted
+
+  # ---------------------------------------------------------------------------
+  # Messages
+  # ---------------------------------------------------------------------------
+  /api/session/v1/sessions/{session_id}/messages:
+    get:
+      operationId: orchestrator_messages_list
+      summary: List messages in a session
+      tags: [Messages]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Paginated message list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessagePage'
+
+    post:
+      operationId: orchestrator_messages_create
+      summary: Add a message to a session
+      tags: [Messages]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role, content]
+              properties:
+                role:
+                  type: string
+                  enum: [USER, ASSISTANT, SYSTEM, TOOL]
+                content:
+                  type: string
+                tool_calls:
+                  type: object
+                run_id:
+                  type: string
+      responses:
+        '201':
+          description: Message created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Message'
+
+  # ---------------------------------------------------------------------------
+  # Runs
+  # ---------------------------------------------------------------------------
+  /api/session/v1/sessions/{session_id}/runs:
+    get:
+      operationId: orchestrator_runs_list
+      summary: List runs for a session
+      tags: [Runs]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Run list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Run'
+
+    post:
+      operationId: orchestrator_runs_create
+      summary: Start a new run (relays to agent-scheduler)
+      tags: [Runs]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task]
+              properties:
+                task:
+                  type: string
+                  description: Task description for the agent
+                agent_config:
+                  type: object
+      responses:
+        '201':
+          description: Run created and started
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+
+  /api/session/v1/sessions/{session_id}/runs/{run_id}:
+    get:
+      operationId: orchestrator_runs_get
+      summary: Get run status
+      tags: [Runs]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Run detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+
+  /api/session/v1/sessions/{session_id}/runs/{run_id}/cancel:
+    post:
+      operationId: orchestrator_runs_cancel
+      summary: Cancel a run
+      tags: [Runs]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Run cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+
+  # ---------------------------------------------------------------------------
+  # SSE Stream
+  # ---------------------------------------------------------------------------
+  /api/session/v1/sessions/{session_id}/messages/stream:
+    get:
+      operationId: orchestrator_messages_stream
+      summary: SSE stream of session messages and run events
+      tags: [Messages]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+
+  # ---------------------------------------------------------------------------
+  # Health
+  # ---------------------------------------------------------------------------
+  /api/session/v1/healthz:
+    get:
+      operationId: orchestrator_healthz
+      summary: Liveness check
+      tags: [Health]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /api/session/v1/readyz:
+    get:
+      operationId: orchestrator_readyz
+      summary: Readiness check
+      tags: [Health]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+# =============================================================================
+# Components
+# =============================================================================
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Foundation-issued OIDC JWT; gateway verifies via Keycloak JWKS.
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    TenantIdHeader:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      description: |
+        Tenant scope, injected by the API gateway from the JWT ``tenant_id``
+        claim.  Clients cannot self-declare a tenant id.
+      schema:
+        type: string
+        pattern: '^tnt_[0-9A-Z]{26}$'
+    UserIdHeader:
+      name: X-User-Id
+      in: header
+      required: false
+      description: Calling user id (gateway-injected); absent for service tokens.
+      schema:
+        type: string
+        pattern: '^usr_[0-9A-Z]{26}$|^SYSTEM$'
+
+  schemas:
+    SessionStatus:
+      type: string
+      enum: [ACTIVE, PAUSED, COMPLETED, ERROR, ARCHIVED]
+
+    RunStatus:
+      type: string
+      enum: [PENDING, RUNNING, COMPLETED, FAILED, CANCELLED]
+
+    Session:
+      type: object
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        user_id: { type: string }
+        title: { type: string, nullable: true }
+        status: { $ref: '#/components/schemas/SessionStatus' }
+        current_run_id: { type: string, nullable: true }
+        metadata: { type: object }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    Message:
+      type: object
+      properties:
+        id: { type: string }
+        session_id: { type: string }
+        role: { type: string, enum: [USER, ASSISTANT, SYSTEM, TOOL] }
+        content: { type: string }
+        tool_calls: { type: object, nullable: true }
+        run_id: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        sequence: { type: integer }
+
+    Run:
+      type: object
+      properties:
+        id: { type: string }
+        session_id: { type: string }
+        sandbox_id: { type: string, nullable: true }
+        status: { $ref: '#/components/schemas/RunStatus' }
+        task_description: { type: string }
+        result_summary: { type: string, nullable: true }
+        error_message: { type: string, nullable: true }
+        started_at: { type: string, format: date-time, nullable: true }
+        finished_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    SessionPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Session'
+        next_cursor: { type: string, nullable: true }
+
+    MessagePage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        next_cursor: { type: string, nullable: true }
+
+    HealthStatus:
+      type: object
+      properties:
+        status: { type: string, enum: [OK, DEGRADED, DOWN] }
+        service: { type: string }
+        version: { type: string }
+
+    Error:
+      type: object
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

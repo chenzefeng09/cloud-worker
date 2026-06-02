@@ -1,0 +1,36 @@
+name: CI - Sandbox Pool
+on:
+  push:
+    paths:
+      - 'services/sandbox-pool/**'
+      - '.github/workflows/ci-sandbox-pool.yml'
+      - '.github/actions/setup-service/**'
+  pull_request:
+    paths: ['services/sandbox-pool/**']
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: sandbox-pool }
+      - run: cd services/sandbox-pool && poetry run ruff check .
+      - run: cd services/sandbox-pool && poetry run mypy src/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: sandbox-pool }
+      - run: cd services/sandbox-pool && poetry run pytest --cov=src --cov-fail-under=80
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: sandbox-pool }
+      - uses: gitleaks/gitleaks-action@v2
+      - run: cd services/sandbox-pool && poetry run pip-licenses --fail-on="GPL;AGPL"

@@ -1,0 +1,387 @@
+# =============================================================================
+# Agent Platform — BFF OpenAPI 3.1
+# =============================================================================
+openapi: 3.1.0
+
+info:
+  title: Agent Platform — BFF
+  description: Backend For Frontend — auth proxy, API aggregation, SSE relay
+  version: 0.1.0
+
+servers:
+  - url: http://localhost:8005
+    description: Local dev
+
+paths:
+  # ---------------------------------------------------------------------------
+  # Auth
+  # ---------------------------------------------------------------------------
+  /api/bff/v1/auth/login:
+    post:
+      operationId: auth_login
+      summary: Login (proxy to foundation identity)
+      tags: [Auth]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                password:
+                  type: string
+                  minLength: 1
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/bff/v1/auth/logout:
+    post:
+      operationId: auth_logout
+      summary: Logout (clears session cookie)
+      tags: [Auth]
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Logged out
+
+  /api/bff/v1/auth/me:
+    get:
+      operationId: auth_me
+      summary: Current user profile
+      tags: [Auth]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: User profile
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserProfile'
+
+  # ---------------------------------------------------------------------------
+  # Sessions
+  # ---------------------------------------------------------------------------
+  /api/bff/v1/sessions:
+    get:
+      operationId: sessions_list
+      summary: List sessions
+      tags: [Sessions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Paginated session list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionPage'
+
+    post:
+      operationId: sessions_create
+      summary: Create a new session
+      tags: [Sessions]
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                  maxLength: 200
+                agent_config:
+                  type: object
+                  description: Optional agent configuration overrides
+      responses:
+        '201':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+
+  /api/bff/v1/sessions/{session_id}:
+    get:
+      operationId: sessions_get
+      summary: Get session with messages
+      tags: [Sessions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Session with messages
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionDetail'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      operationId: sessions_update
+      summary: Update session
+      tags: [Sessions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                  maxLength: 200
+                status:
+                  $ref: '#/components/schemas/SessionStatus'
+      responses:
+        '200':
+          description: Session updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+
+    delete:
+      operationId: sessions_delete
+      summary: Soft-delete session
+      tags: [Sessions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Deleted
+
+  /api/bff/v1/sessions/{session_id}/chat:
+    post:
+      operationId: sessions_chat
+      summary: Send message + receive SSE stream
+      tags: [Sessions]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message]
+              properties:
+                message:
+                  type: string
+                  minLength: 1
+                  description: User message content
+      responses:
+        '200':
+          description: SSE event stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  SSE events:
+                  - event: message_created — user message persisted
+                  - event: agent_message — streaming assistant response
+                  - event: tool_call — agent invoked a tool
+                  - event: tool_result — tool result returned
+                  - event: run_complete — run finished
+                  - event: error — error occurred
+                  - event: done — stream ended
+
+  # ---------------------------------------------------------------------------
+  # Health
+  # ---------------------------------------------------------------------------
+  /api/bff/v1/healthz:
+    get:
+      operationId: healthz
+      summary: Liveness check
+      tags: [Health]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+  /api/bff/v1/readyz:
+    get:
+      operationId: readyz
+      summary: Readiness check
+      tags: [Health]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthStatus'
+
+# =============================================================================
+# Components
+# =============================================================================
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT or session cookie
+
+  parameters:
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+      description: Opaque pagination cursor
+
+    Limit:
+      name: limit
+      in: query
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+
+  schemas:
+    SessionStatus:
+      type: string
+      enum: [ACTIVE, PAUSED, COMPLETED, ERROR, ARCHIVED]
+
+    Session:
+      type: object
+      properties:
+        id: { type: string, description: "ses_<ULID>" }
+        tenant_id: { type: string }
+        user_id: { type: string }
+        title: { type: string, nullable: true }
+        status: { $ref: '#/components/schemas/SessionStatus' }
+        current_run_id: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    SessionDetail:
+      allOf:
+        - $ref: '#/components/schemas/Session'
+        - type: object
+          properties:
+            messages:
+              type: array
+              items:
+                $ref: '#/components/schemas/Message'
+
+    Message:
+      type: object
+      properties:
+        id: { type: string, description: "msg_<ULID>" }
+        session_id: { type: string }
+        role: { type: string, enum: [USER, ASSISTANT, SYSTEM, TOOL] }
+        content: { type: string }
+        tool_calls: { type: object, nullable: true }
+        run_id: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        sequence: { type: integer }
+
+    SessionPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Session'
+        next_cursor: { type: string, nullable: true }
+
+    LoginResponse:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        user_id: { type: string }
+        tenant_id: { type: string }
+        email: { type: string }
+        display_name: { type: string }
+
+    UserProfile:
+      type: object
+      properties:
+        id: { type: string }
+        email: { type: string }
+        display_name: { type: string }
+        tenant_id: { type: string }
+        roles:
+          type: array
+          items: { type: string }
+
+    HealthStatus:
+      type: object
+      properties:
+        status: { type: string, enum: [OK, DEGRADED, DOWN] }
+        service: { type: string }
+        version: { type: string }
+
+    Error:
+      type: object
+      properties:
+        type: { type: string, description: "RFC 9457 type URI" }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string, description: "Request path" }
+        code: { type: string, description: "FOUNDATION.<SERVICE>.<CATEGORY>.<NAME>" }
+
+  responses:
+    Unauthorized:
+      description: Authentication required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'

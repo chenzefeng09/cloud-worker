@@ -1,0 +1,33 @@
+name: CI - BFF
+on:
+  push:
+    paths: ['services/bff/**', '.github/workflows/ci-bff.yml', '.github/actions/setup-service/**']
+  pull_request:
+    paths: ['services/bff/**']
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: bff }
+      - run: cd services/bff && poetry run ruff check .
+      - run: cd services/bff && poetry run mypy src/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: bff }
+      - run: cd services/bff && poetry run pytest --cov=src --cov-fail-under=80
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: bff }
+      - uses: gitleaks/gitleaks-action@v2
+      - run: cd services/bff && poetry run pip-licenses --fail-on="GPL;AGPL"
