@@ -21,7 +21,7 @@ import datetime as dt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent_session_orchestrator.domain.models import Message, Run, Session
+from agent_session_orchestrator.domain.models import Attachment, Message, Run, Session
 from agent_session_orchestrator.errors import RunNotFoundError, SessionNotFoundError
 
 
@@ -175,6 +175,68 @@ class SessionService:
         await self._db.flush()
         await self._db.refresh(run)
         return run
+
+    # ------------------------------------------------------------------ attachments
+
+    async def create_attachment(
+        self,
+        session_id: str,
+        *,
+        user_id: str,
+        filename: str,
+        mime: str,
+        size_bytes: int,
+        blob_key: str,
+        kind: str = "input",
+        run_id: str | None = None,
+    ) -> Attachment:
+        await self.get_session(session_id)
+        att = Attachment(
+            tenant_id=self._tenant_id,
+            session_id=session_id,
+            user_id=user_id,
+            filename=filename,
+            mime=mime,
+            size_bytes=size_bytes,
+            blob_key=blob_key,
+            kind=kind,
+            run_id=run_id,
+        )
+        self._db.add(att)
+        await self._db.flush()
+        await self._db.refresh(att)
+        return att
+
+    async def list_attachments(self, session_id: str, *, kind: str | None = None) -> list[Attachment]:
+        await self.get_session(session_id)
+        stmt = (
+            select(Attachment)
+            .where(
+                Attachment.session_id == session_id,
+                Attachment.tenant_id == self._tenant_id,
+            )
+            .order_by(Attachment.created_at.asc())
+        )
+        if kind is not None:
+            stmt = stmt.where(Attachment.kind == kind)
+        result = await self._db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_attachment(self, session_id: str, attachment_id: str) -> Attachment:
+        await self.get_session(session_id)
+        stmt = select(Attachment).where(
+            Attachment.id == attachment_id,
+            Attachment.session_id == session_id,
+            Attachment.tenant_id == self._tenant_id,
+        )
+        result = await self._db.execute(stmt)
+        att = result.scalar_one_or_none()
+        if att is None:
+            from agent_session_orchestrator.errors import SessionNotFoundError
+            raise SessionNotFoundError(attachment_id)
+        return att
+
+    # ------------------------------------------------------------------ runs
 
     async def list_runs(self, session_id: str) -> list[Run]:
         stmt = (

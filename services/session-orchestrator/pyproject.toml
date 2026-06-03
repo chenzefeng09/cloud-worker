@@ -14,10 +14,15 @@ sqlalchemy = { extras = ["asyncio"], version = "^2.0.36" }
 asyncpg = "^0.30.0"
 alembic = "^1.14.0"
 httpx = "^0.28.0"
+boto3 = "^1.35.0"
+python-multipart = "^0.0.9"
 opentelemetry-api = "^1.28.0"
 opentelemetry-sdk = "^1.28.0"
 opentelemetry-instrumentation-fastapi = "^0.49b0"
 opentelemetry-exporter-otlp = "^1.28.0"
+# Foundation SDK — injected at image-build time via docker-compose
+# `additional_contexts: foundation_sdk` (see Dockerfile). When the internal
+# PyPI is online this returns as a real dep + `[[tool.poetry.source]]`.
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"

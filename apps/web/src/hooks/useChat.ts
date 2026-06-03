@@ -1,5 +1,6 @@
-import { useCallback, useRef } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { useChatStore } from '../stores/chatStore';
+import { api, ApiError } from '../api/client';
 import type { Message } from '../api/types';
 
 /**
@@ -60,9 +61,34 @@ function handleSSEEvent(
 export function useChat() {
   const { activeSessionId, messages, setIsStreaming, isStreaming } = useChatStore();
   const abortRef = useRef<AbortController | null>(null);
+  const loadedRef = useRef<Set<string>>(new Set());
+
+  // Hydrate transcript from server when the active session changes (page
+  // refresh, deep-link, session switch).  Without this, refreshing /tasks/:id
+  // shows an empty chat even though the messages are in the DB.
+  useEffect(() => {
+    if (!activeSessionId) return;
+    if (loadedRef.current.has(activeSessionId)) return;
+    loadedRef.current.add(activeSessionId);
+    const sid = activeSessionId;
+    (async () => {
+      try {
+        const page = await api.messages.list(sid);
+        const store = useChatStore.getState();
+        for (const m of page.items) {
+          store.addMessage(sid, m);
+        }
+      } catch (err) {
+        if (!(err instanceof ApiError) || err.status !== 401) {
+          // eslint-disable-next-line no-console
+          console.warn('load messages failed', err);
+        }
+      }
+    })();
+  }, [activeSessionId]);
 
   const sendMessage = useCallback(
-    async (text: string) => {
+    async (text: string, attachmentIds?: string[]) => {
       if (!activeSessionId || isStreaming) return;
       // Snapshot the session id so SSE events route to the correct
       // transcript even if the user switches sessions mid-stream.
@@ -76,7 +102,7 @@ export function useChat() {
         const res = await fetch(`/api/bff/v1/sessions/${sessionId}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text }),
+          body: JSON.stringify({ message: text, attachment_ids: attachmentIds || [] }),
           credentials: 'include',
           signal: abortRef.current.signal,
         });
@@ -126,12 +152,23 @@ export function useChat() {
   );
 
   const cancel = useCallback(() => {
+    // Snapshot the session id before any async work so we cancel the right session
+    // even if the user navigates away while the request is in flight.
+    const sessionId = useChatStore.getState().activeSessionId;
+    // Immediately abort the SSE stream so the UI feels responsive.
     abortRef.current?.abort();
     setIsStreaming(false);
+    // Fire-and-forget the backend cancel — we don't await so the UI isn't blocked.
+    if (sessionId) {
+      api.sessions.cancel(sessionId).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.warn('backend cancel failed', err);
+      });
+    }
   }, [setIsStreaming]);
 
   return {
-    sendMessage,
+    sendMessage: sendMessage as (text: string, attachmentIds?: string[]) => Promise<void>,
     cancel,
     isStreaming,
     messages: activeSessionId ? messages[activeSessionId] || [] : [],

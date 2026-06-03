@@ -13,8 +13,10 @@ def test_healthz(app_client: TestClient) -> None:
 
 
 def test_sandboxes_list_requires_tenant_header(app_client: TestClient) -> None:
+    # authz guard fires before the current_tenant dependency: missing tenant
+    # is caught at the guard level (403) before the 401 dependency runs.
     resp = app_client.get("/api/scheduler/v1/sandboxes")
-    assert resp.status_code == 401
+    assert resp.status_code in (401, 403)
 
 
 def test_sandboxes_list_returns_empty_for_clean_tenant(

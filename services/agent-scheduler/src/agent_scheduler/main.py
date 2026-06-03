@@ -36,6 +36,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.state.runtime = build_runtime(settings.runtime, settings)
 
+    from agent_scheduler.services.quota_guard import QuotaGuard
+    app.state.quota_guard = QuotaGuard(billing_url=settings.foundation_billing_url)
+
     install_request_context(
         app, service_name="agent-scheduler", service_version="0.1.0a1",
     )

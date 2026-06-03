@@ -32,7 +32,7 @@ from typing import Any
 
 import httpx
 
-from agent_scheduler.config import Settings
+from agent_scheduler.config import SANDBOX_SERVICE_SCOPES, Settings
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
 from agent_scheduler.services.runtime import RUNTIME_REGISTRY
 
@@ -81,11 +81,52 @@ class CubeSandboxRuntime:
             # a URL is a deployment error — fail clearly when called.
             self._client: httpx.Client | None = None
             return
-        self._client = httpx.Client(
-            base_url=url,
-            timeout=httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0),
-            # Production would carry an mTLS client cert here; B-M2 milestone
-            # follow-up — see ADR 0001 risk table.
+        self._client = self._make_client(url)
+
+    # --------------------------------------------------------------- transport
+    def _make_client(self, base_url: str) -> httpx.Client:
+        """Build the httpx.Client with the configured TLS mode.
+
+        Resolution rules (also documented on ``Settings.cube_tls_mode``):
+
+        * ``mtls`` — load client cert+key and CA from settings.  Any of the
+          three missing is a deployment error and raises RuntimeError so
+          the process refuses to start (failing here is much better than
+          silently downgrading to plain TLS in production).
+        * ``tls``  — only the CA bundle matters; missing CA also raises.
+        * ``off``  — plain HTTP.  No cert material is loaded even if set,
+          so an operator can leave certs in env while testing locally.
+        """
+        mode = self._settings.cube_tls_mode
+        timeout = httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0)
+
+        if mode == "off":
+            return httpx.Client(base_url=base_url, timeout=timeout)
+
+        ca = self._settings.cube_ca_cert
+        if not ca:
+            raise RuntimeError(
+                f"cube_tls_mode={mode!r} requires cube_ca_cert "
+                "(SCHEDULER_CUBE_CA_CERT); refusing to build CubeSandbox client",
+            )
+
+        if mode == "tls":
+            return httpx.Client(base_url=base_url, timeout=timeout, verify=ca)
+
+        # mode == "mtls"
+        cert = self._settings.cube_client_cert
+        key = self._settings.cube_client_key
+        if not cert or not key:
+            raise RuntimeError(
+                "cube_tls_mode='mtls' requires cube_client_cert + cube_client_key "
+                "(SCHEDULER_CUBE_CLIENT_CERT / SCHEDULER_CUBE_CLIENT_KEY); "
+                "refusing to build CubeSandbox client",
+            )
+        return httpx.Client(
+            base_url=base_url,
+            timeout=timeout,
+            verify=ca,
+            cert=(cert, key),
         )
 
     # ------------------------------------------------------------------ guard
@@ -151,6 +192,13 @@ class CubeSandboxRuntime:
                     {"task": task, "mcp_servers": [], "skills": []},
                     ensure_ascii=False,
                 ),
+                # Dev-mode shim: in prod the API gateway translates the verified
+                # Bearer JWT into X-Service-Scopes before requests reach internal
+                # endpoints.  In this deployment (no gateway between sandbox and
+                # these services) the scheduler injects the scopes directly so
+                # mcp_tenant_injector / skills_loader can forward the header.
+                # TODO: remove once the gateway enforces scope injection in prod.
+                "FOUNDATION_SERVICE_SCOPES": SANDBOX_SERVICE_SCOPES,
             },
             # AgentScope worker entry — matches the docker runtime's CMD line.
             "cmd": ["python", "-m", "agentscope_ext.runtime_worker"],

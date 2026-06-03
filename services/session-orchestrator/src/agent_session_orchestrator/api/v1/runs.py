@@ -14,6 +14,16 @@ no half-baked run record survives.  The container is the one external
 side-effect we cannot atomically roll back; if spawn succeeded but the
 DB commit fails we instead emit a best-effort cancel — at worst the
 sandbox times out via ``Settings.sandbox_timeout`` and stops itself.
+
+Memory pre-fetch
+----------------
+Before relaying the run to the scheduler, ``create_run`` calls knowledge-ingest
+``GET /search`` using the task text as the query.  The top-K hits (memories
+stored by previous runs) are formatted into a ``memory`` string and included
+in the task body sent to the scheduler, which in turn writes it to task.json.
+The in-sandbox worker reads ``task["memory"]`` and prepends it to the system
+prompt.  This is intentionally failure-open: if knowledge-ingest is unreachable
+the run proceeds without memory context.
 """
 
 from __future__ import annotations
@@ -22,25 +32,64 @@ import datetime as dt
 import logging
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agent_session_orchestrator.api.authz_guard import require_permission
 from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, TUserId
 from agent_session_orchestrator.services.session_service import SessionService
 
 router = APIRouter(tags=["Runs"])
 logger = logging.getLogger(__name__)
 
+_MEMORY_SEARCH_K = 5  # top-K memory hits to inject
+
 
 def _now() -> dt.datetime:
     return dt.datetime.now(tz=dt.UTC)
+
+
+async def _fetch_memory(*, knowledge_ingest_url: str, tenant_id: str, query: str) -> str:
+    """Query knowledge-ingest for relevant memories and return a formatted string.
+
+    Uses ``GET /search?q=<query>&k=<K>`` with ``X-Tenant-Id`` header.
+    Returns an empty string on any error (failure-open).
+    """
+    if not query.strip() or not knowledge_ingest_url:
+        return ""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{knowledge_ingest_url}/search",
+                params={"q": query[:500], "k": _MEMORY_SEARCH_K},
+                headers={"X-Tenant-Id": tenant_id, "X-User-Id": "SYSTEM"},
+            )
+        if resp.status_code != 200:
+            logger.debug(
+                "memory search returned %s; proceeding without memory",
+                resp.status_code,
+            )
+            return ""
+        hits = resp.json().get("hits") or []
+        if not hits:
+            return ""
+        snippets = []
+        for hit in hits:
+            text = str(hit.get("text") or "").strip()
+            if text:
+                snippets.append(f"- {text}")
+        return "\n".join(snippets)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("memory pre-fetch failed (failure-open): %s", exc)
+        return ""
 
 
 async def _get_scheduler_url(request: Request) -> str:
     return request.app.state.settings.agent_scheduler_url
 
 
-@router.post("/sessions/{session_id}/runs", status_code=201)
+@router.post("/sessions/{session_id}/runs", status_code=201,
+             dependencies=[Depends(require_permission("run.create", "run"))])
 async def create_run(
     session_id: str,
     body: dict,
@@ -59,6 +108,17 @@ async def create_run(
     scheduler_url = await _get_scheduler_url(request)
     headers = {"X-Tenant-Id": tenant_id, "X-User-Id": user_id}
 
+    # Optional attachment files — [{"key": s3key, "filename": name, "mime": mime}, ...]
+    files: list[dict] = body.get("files") or []
+
+    # Pre-fetch relevant memory from knowledge-ingest; failure-open.
+    knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
+    memory_snippets = await _fetch_memory(
+        knowledge_ingest_url=knowledge_ingest_url,
+        tenant_id=tenant_id,
+        query=task,
+    )
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -68,6 +128,8 @@ async def create_run(
                     "run_id": run.id,
                     "task": task,
                     "agent_config": body.get("agent_config", {}),
+                    "files": files,
+                    "memory": memory_snippets,
                 },
                 headers=headers,
             )
@@ -95,7 +157,11 @@ async def create_run(
     # Update both rows; the surrounding ``async with session.begin()`` will
     # commit once when the request completes, or roll back atomically if
     # anything else in this handler raises.
-    run.sandbox_id = scheduler_run.get("sandbox_id")
+    # Docker container ids are 64 chars; the ``sandbox_id`` column is
+    # String(50).  Persist Docker's standard 12-char short form, which
+    # the scheduler also accepts on subsequent lookups.
+    sandbox_id_full = str(scheduler_run.get("sandbox_id") or "")
+    run.sandbox_id = sandbox_id_full[:12] if sandbox_id_full else None
     run.status = "RUNNING"
     run.started_at = _now()
     session.current_run_id = run.id
@@ -111,7 +177,8 @@ async def create_run(
     }
 
 
-@router.get("/sessions/{session_id}/runs")
+@router.get("/sessions/{session_id}/runs",
+            dependencies=[Depends(require_permission("run.read", "run"))])
 async def list_runs(
     session_id: str,
     db: AsyncSession = TDbSession,
@@ -138,7 +205,8 @@ async def list_runs(
     }
 
 
-@router.get("/sessions/{session_id}/runs/{run_id}")
+@router.get("/sessions/{session_id}/runs/{run_id}",
+            dependencies=[Depends(require_permission("run.read", "run"))])
 async def get_run(
     session_id: str,
     run_id: str,
@@ -161,23 +229,30 @@ async def get_run(
     }
 
 
-@router.post("/sessions/{session_id}/runs/{run_id}/cancel")
-async def cancel_run(
+async def _do_cancel_run(
+    *,
     session_id: str,
     run_id: str,
     request: Request,
-    db: AsyncSession = TDbSession,
-    tenant_id: str = TTenantId,
-    user_id: str = TUserId,
+    db: AsyncSession,
+    tenant_id: str,
+    user_id: str,
 ) -> dict:
+    """Core cancel logic — shared by the run-level and session-level endpoints."""
     svc = SessionService(db, tenant_id=tenant_id)
     run = await svc.get_run(session_id, run_id)
+
+    # Use run.sandbox_id (short Docker container id) as the scheduler path
+    # segment — the same convention used by _reconcile_run_completion in
+    # messages.py.  Passing run_id here would fail because the scheduler
+    # looks up the container by its Docker id, not our internal run id.
+    scheduler_run_key = run.sandbox_id or run_id
 
     scheduler_url = await _get_scheduler_url(request)
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             await client.post(
-                f"{scheduler_url}/runs/{run_id}/cancel",
+                f"{scheduler_url}/runs/{scheduler_run_key}/cancel",
                 headers={"X-Tenant-Id": tenant_id, "X-User-Id": user_id},
             )
     except httpx.HTTPError:
@@ -190,4 +265,82 @@ async def cancel_run(
     run.finished_at = _now()
     await db.flush()
 
+    # Write a system message so the transcript records the cancellation.
+    await svc.create_message(
+        session_id,
+        role="system",
+        content="任务已取消",
+        run_id=run_id,
+    )
+
     return {"id": run.id, "status": "CANCELLED"}
+
+
+@router.post("/sessions/{session_id}/runs/{run_id}/cancel",
+             dependencies=[Depends(require_permission("run.cancel", "run"))])
+async def cancel_run(
+    session_id: str,
+    run_id: str,
+    request: Request,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+    user_id: str = TUserId,
+) -> dict:
+    return await _do_cancel_run(
+        session_id=session_id,
+        run_id=run_id,
+        request=request,
+        db=db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+    )
+
+
+@router.post("/sessions/{session_id}/cancel",
+             dependencies=[Depends(require_permission("run.cancel", "run"))])
+async def cancel_session_run(
+    session_id: str,
+    request: Request,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+    user_id: str = TUserId,
+) -> dict:
+    """Convenience endpoint: cancel the current active run for a session.
+
+    The frontend only knows the session_id at cancel time; this endpoint
+    resolves the current run internally so the client doesn't need to track
+    run_id.
+    """
+    from sqlalchemy import select as _select
+
+    from agent_session_orchestrator.domain.models import Run as _Run
+
+    svc = SessionService(db, tenant_id=tenant_id)
+    session = await svc.get_session(session_id)
+
+    # Find the most recent RUNNING or PENDING run for this session.
+    stmt = (
+        _select(_Run)
+        .where(
+            _Run.session_id == session_id,
+            _Run.tenant_id == tenant_id,
+            _Run.status.in_(("RUNNING", "PENDING")),
+        )
+        .order_by(_Run.created_at.desc())
+        .limit(1)
+    )
+    result = await db.execute(stmt)
+    run = result.scalar_one_or_none()
+
+    if run is None:
+        # No active run — idempotently return success.
+        return {"id": None, "status": "CANCELLED", "detail": "no active run"}
+
+    return await _do_cancel_run(
+        session_id=session_id,
+        run_id=run.id,
+        request=request,
+        db=db,
+        tenant_id=tenant_id,
+        user_id=user_id,
+    )

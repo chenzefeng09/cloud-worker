@@ -104,8 +104,20 @@ class FakeFoundation:
             status, body = self.identity_me_response
         elif "/sessions/current" in url and method == "DELETE":
             status, body = 204, {}
-        elif "/sessions" in url and method == "POST":
+        elif "/sessions" in url and method == "POST" and "identity" in url:
             status, body = self.identity_login_response
+        elif "attachments" in url and method == "GET":
+            status, body = 200, {"items": []}
+        elif "attachments" in url and method == "POST":
+            status, body = 201, {
+                "id": "att_test",
+                "session_id": "ses_abc",
+                "filename": "test.txt",
+                "mime": "text/plain",
+                "size_bytes": 4,
+                "blob_key": "tenant/t/sessions/s/attachments/att_test/test.txt",
+                "created_at": "2026-06-03T00:00:00Z",
+            }
         else:
             status, body = 200, {"ok": True}
         return httpx.Response(status, json=body)

@@ -1,0 +1,63 @@
+# KEDA ScaledObject — sandbox-pool autoscaler
+# -----------------------------------------------------------------------------
+# Scales the sandbox-pool Deployment based on warm-VM availability.  KEDA polls
+# Prometheus for ``sandbox_pool_idle{template="base"}`` and creates an HPA that
+# adds replicas whenever the idle count drops below ``idle_low_watermark`` (so
+# the next agent run has a warm microVM waiting and pays cold-spawn latency
+# only as a fallback).
+#
+# References
+#   * ADR 0001 §6 — warm pool sizing & SLOs
+#   * docs/design/b-m2-sandbox-runtime-v1.md §5 — KEDA-driven operator
+#   * https://keda.sh/docs/2.13/scalers/prometheus/
+# -----------------------------------------------------------------------------
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: sandbox-pool
+  namespace: agent-platform
+  labels:
+    app.kubernetes.io/name: sandbox-pool
+    app.kubernetes.io/part-of: agent-platform
+    app.kubernetes.io/managed-by: keda
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sandbox-pool
+  # Pool replicas should never drop to 0 — losing the in-process state means
+  # losing the warm pool, and the next acquire pays a cold spawn.
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  # Poll Prometheus every 15s; sandbox-pool exposes ``sandbox_pool_idle`` at
+  # /metrics so this is cheap.
+  pollingInterval: 15
+  # Stay scaled-up for 5 min after the idle gauge recovers — avoids flapping
+  # when traffic is bursty (a common case for human-in-the-loop agent runs).
+  cooldownPeriod: 300
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+        scaleUp:
+          stabilizationWindowSeconds: 0
+  triggers:
+    - type: prometheus
+      metadata:
+        # In-cluster Prometheus address; override per environment.
+        serverAddress: http://prometheus-operated.monitoring.svc:9090
+        metricName: sandbox_pool_idle
+        # Trigger fires when the smallest idle count across replicas is below
+        # the watermark.  ``min`` (rather than ``sum``) gives the right answer
+        # when sandbox-pool itself runs >1 replica: any single replica running
+        # short means we want another.
+        query: min(sandbox_pool_idle{template="base"})
+        # Target = idle_low_watermark from sandbox_pool/config.py.  Keep in
+        # sync with SANDBOX_POOL_IDLE_LOW_WATERMARK when tuned per tier.
+        threshold: "5"
+        # ``Value`` (default) compares the query result directly against the
+        # threshold — i.e. idle < 5 → scale up.
+        activationThreshold: "5"
+      authenticationRef:
+        name: sandbox-pool-prometheus-auth

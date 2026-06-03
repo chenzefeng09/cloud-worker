@@ -13,8 +13,9 @@ caller who guessed (or scraped from logs) another tenant's container id
 could stop a workload they don't own.
 """
 
-from fastapi import APIRouter, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 
+from agent_scheduler.api.authz_guard import require_permission
 from agent_scheduler.api.dependencies import TRuntime, TTenantId
 from agent_scheduler.errors import ContainerNotFoundError
 from agent_scheduler.services.docker_runtime import DockerRuntime
@@ -22,7 +23,8 @@ from agent_scheduler.services.docker_runtime import DockerRuntime
 router = APIRouter(tags=["Sandboxes"])
 
 
-@router.get("/sandboxes")
+@router.get("/sandboxes",
+            dependencies=[Depends(require_permission("sandbox.read", "sandbox"))])
 async def list_sandboxes(
     runtime: DockerRuntime = TRuntime,
     tenant_id: str = TTenantId,
@@ -31,7 +33,8 @@ async def list_sandboxes(
     return {"items": items}
 
 
-@router.post("/sandboxes/{sandbox_id}/stop", status_code=204)
+@router.post("/sandboxes/{sandbox_id}/stop", status_code=204,
+             dependencies=[Depends(require_permission("sandbox.stop", "sandbox"))])
 async def stop_sandbox(
     sandbox_id: str,
     runtime: DockerRuntime = TRuntime,

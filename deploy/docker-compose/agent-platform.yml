@@ -43,22 +43,23 @@ services:
   session-orchestrator:
     build:
       context: ../../services/session-orchestrator
-      dockerfile: Dockerfile
-      # docker compose v2.16+ — lets the Dockerfile do
-      #   COPY --from=foundation_sdk . /sdk
-      # without making the SDK part of the primary build context (which
-      # would pollute it).  ``FOUNDATION_SDK_PATH`` is set in the .env so
-      # both local dev and CI can override; default assumes the foundation
-      # repo is checked out as a sibling.
-      additional_contexts:
-        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+      # Dockerfile.overlay reuses the pre-built base image (which has all
+      # Poetry deps + boto3 + python-multipart installed via wheels) and only
+      # swaps in the current src/. This avoids the PyPI MITM issue on rebuild
+      # while keeping the image up to date with code changes.
+      dockerfile: Dockerfile.overlay
     container_name: agent-session-orchestrator
     restart: unless-stopped
     environment:
       SESSION_ORCHESTRATOR_ENV: dev
       SESSION_ORCHESTRATOR_LOG_LEVEL: DEBUG
       SESSION_ORCHESTRATOR_HTTP_PORT: "8006"
-      SESSION_ORCHESTRATOR_DB_DSN: postgresql+asyncpg://app_user:${APP_USER_PASSWORD:-app_user_change_me}@pgbouncer:6432/foundation
+      # asyncpg's prepared-statement model is incompatible with pgbouncer
+      # in transaction pool mode (see ``DuplicatePreparedStatementError``).
+      # The other agent-platform services already talk to ``postgres:5432``
+      # directly for the same reason; route session-orchestrator the same
+      # way so create_session etc. don't 500 on the first request.
+      SESSION_ORCHESTRATOR_DB_DSN: postgresql+asyncpg://app_user:${APP_USER_PASSWORD:-app_user_change_me}@postgres:5432/foundation
       SESSION_ORCHESTRATOR_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
       SESSION_ORCHESTRATOR_AGENT_SCHEDULER_URL: http://agent-scheduler:8007/api/scheduler/v1
       SESSION_ORCHESTRATOR_OTEL_ENABLED: "true"
@@ -66,11 +67,21 @@ services:
       SESSION_ORCHESTRATOR_DB_POOL_SIZE: "5"
       SESSION_ORCHESTRATOR_DB_MAX_OVERFLOW: "10"
       SESSION_ORCHESTRATOR_DB_POOL_RECYCLE: "1800"
+      # Blob storage — session attachments
+      SESSION_ORCHESTRATOR_S3_BUCKET: agent-platform
+      SESSION_ORCHESTRATOR_S3_REGION: us-east-1
+      SESSION_ORCHESTRATOR_S3_ENDPOINT_URL: http://foundation-minio:9000
+      SESSION_ORCHESTRATOR_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-foundation}
+      SESSION_ORCHESTRATOR_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_change_me_min_12_chars}
+      # Memory: knowledge-ingest URL for memory pre-fetch + write-back.
+      SESSION_ORCHESTRATOR_KNOWLEDGE_INGEST_URL: http://knowledge-ingest:8012/api/knowledge/v1
+      SESSION_ORCHESTRATOR_AUTHZ_URL: http://authz:8002/api/authz/v1
+      SESSION_ORCHESTRATOR_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
     ports:
       - "${PORT_SESSION_ORCHESTRATOR:-8006}:8006"
     networks: [foundation]
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8006/healthz').read()\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8006/api/session/v1/healthz').read()\""]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -104,9 +115,17 @@ services:
       SANDBOX_POOL_MAX_TOTAL: "${POOL_MAX_TOTAL:-50}"
       SANDBOX_POOL_OTEL_ENABLED: "true"
       SANDBOX_POOL_OTEL_EXPORTER_ENDPOINT: http://otel-collector:4317
+      # Docker socket proxy — same sidecar the agent-scheduler uses.
+      # The pool uses it to start/stop idle sandbox containers.
+      DOCKER_HOST: tcp://docker-socket-proxy:2375
+      SANDBOX_POOL_SANDBOX_IMAGE: ${AGENT_IMAGE:-ghcr.io/agent-platform/agentscope-sandbox:0.1}
+      SANDBOX_POOL_DOCKER_NETWORK: ${FOUNDATION_NETWORK:-saas-foundation-dev_foundation}
     ports:
       - "${PORT_SANDBOX_POOL:-8008}:8008"
-    networks: [foundation]
+    networks: [foundation, agent_internal]
+    depends_on:
+      docker-socket-proxy:
+        condition: service_started
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8008/api/sandbox-pool/v1/healthz').read()\""]
       interval: 10s
@@ -150,6 +169,8 @@ services:
       dockerfile: Dockerfile
       additional_contexts:
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+      args:
+        PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
     container_name: agent-scheduler
     restart: unless-stopped
     environment:
@@ -163,6 +184,16 @@ services:
       # in prod — empty here so dev compose starts; create_run will refuse to
       # spawn until a real token is supplied.
       SCHEDULER_SERVICE_TOKEN: ${SCHEDULER_SERVICE_TOKEN:-}
+      # Keycloak fallback — used when SCHEDULER_SERVICE_TOKEN is unset/placeholder.
+      # The scheduler bootstraps its own bearer via OIDC client_credentials so the
+      # dev/CI smoke loop doesn't need an out-of-band-provisioned long-lived JWT.
+      SCHEDULER_KEYCLOAK_URL: ${KEYCLOAK_URL:-http://keycloak:8080}
+      SCHEDULER_KEYCLOAK_REALM: ${KEYCLOAK_REALM:-foundation}
+      SCHEDULER_KEYCLOAK_CLIENT_ID: ${KEYCLOAK_CLIENT_ID:-foundation-identity-service}
+      SCHEDULER_KEYCLOAK_CLIENT_SECRET: ${KEYCLOAK_CLIENT_SECRET:-dev-identity-service-secret-change-me}
+      # Tenant context forwarded to identity on /sessions/service-account-token.
+      # Empty = use the caller's tenant (correct for B-M2 single-tenant smoke).
+      SCHEDULER_TENANT_HEADER: ${SCHEDULER_TENANT_HEADER:-}
       # Sandboxes are reached via the docker-socket-proxy sidecar.  DOCKER_HOST
       # is the *only* way the docker SDK is configured here — there is NO
       # /var/run/docker.sock bind-mount on this container.
@@ -170,20 +201,64 @@ services:
       SCHEDULER_AGENT_IMAGE: ${AGENT_IMAGE:-ghcr.io/agent-platform/agentscope-sandbox:0.1}
       SCHEDULER_LLM_API_KEY: ${LLM_API_KEY:-}
       SCHEDULER_LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-20250514}
-      SCHEDULER_WORKSPACE_BASE: /var/agent-platform/workspaces
+      # Optional provider/base-URL overrides — forwarded by docker_runtime.py
+      # into the sandbox container as LLM_PROVIDER / LLM_BASE_URL so the
+      # AgentScope worker can target OpenAI-compatible endpoints (DeepSeek,
+      # vLLM, etc.) without rebuilding the image.  Empty = provider default.
+      SCHEDULER_LLM_PROVIDER: ${LLM_PROVIDER:-}
+      SCHEDULER_LLM_BASE_URL: ${LLM_BASE_URL:-}
+      # WORKSPACE_BASE must resolve to the SAME path on both the scheduler
+      # container and the Docker daemon's host filesystem -- the scheduler
+      # creates the per-run dir at this path and then asks docker-socket-proxy
+      # to bind-mount that same path into the sandbox container.  A
+      # ``/tmp/agent-workspaces`` host bind is the most portable choice on
+      # Docker Desktop (where /tmp is shared with the daemon VM); override via
+      # the ``AGENT_WORKSPACE_BASE`` env on hosts where /tmp isn't shared.
+      SCHEDULER_WORKSPACE_BASE: ${AGENT_WORKSPACE_BASE:-/tmp/agent-workspaces}
       SCHEDULER_DOCKER_NETWORK: ${FOUNDATION_NETWORK:-saas-foundation-dev_foundation}
       SCHEDULER_SANDBOX_MEMORY_LIMIT: "2g"
       SCHEDULER_SANDBOX_CPU_SHARES: "1024"
       SCHEDULER_SANDBOX_TIMEOUT: "600"
       SCHEDULER_OTEL_ENABLED: "true"
       SCHEDULER_OTEL_EXPORTER_ENDPOINT: http://otel-collector:4317
+      # B-M3: URLs forwarded to the sandbox so mcp_tenant_injector and
+      # skills_loader can reach the registry services.  Override via env
+      # if your compose project uses different service names / ports.
+      SCHEDULER_MCP_REGISTRY_URL: ${MCP_REGISTRY_URL:-http://mcp-registry:8010/api/mcp/v1}
+      SCHEDULER_SKILL_STORE_URL: ${SKILL_STORE_URL:-http://skill-store:8011/api/skills/v1}
+      # Activate both B-M3 extensions inside every sandbox container.
+      SCHEDULER_RUNTIME_EXTENSIONS: ${RUNTIME_EXTENSIONS:-mcp_tenant_injector,skills_loader}
+      # S3 credentials forwarded into sandbox for attachment download
+      SCHEDULER_S3_ENDPOINT_URL: http://foundation-minio:9000
+      SCHEDULER_S3_BUCKET: agent-platform
+      SCHEDULER_S3_REGION: us-east-1
+      SCHEDULER_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-foundation}
+      SCHEDULER_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_change_me_min_12_chars}
+      # Hot-state layer — Redis URL the scheduler forwards into each sandbox so
+      # the runtime_worker can write step/plan/cursor checkpoints.
+      # foundation-redis is on the saas-foundation-dev_foundation network;
+      # sandbox containers share that network (SCHEDULER_DOCKER_NETWORK above)
+      # so they reach foundation-redis:6379 directly without any proxy.
+      # Password from foundation-redis requirepass (see saas-foundation dev.yml).
+      SCHEDULER_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
+      SCHEDULER_AUTHZ_URL: http://authz:8002/api/authz/v1
+      SCHEDULER_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
+      # NOTE: FOUNDATION_SERVICE_SCOPES is injected into sandbox env by the
+      # scheduler as a dev-mode shim (see agent_scheduler/config.py
+      # SANDBOX_SERVICE_SCOPES).  It is not an env var of the *scheduler*
+      # container itself; no entry needed here.  The scheduler code builds
+      # the value from the SANDBOX_SERVICE_SCOPES constant at runtime.
     ports:
       - "${PORT_AGENT_SCHEDULER:-8007}:8007"
     volumes:
-      - agent_workspaces:/var/agent-platform/workspaces
+      # Host-bind keeps the path identical inside the scheduler container
+      # and on the Docker daemon's host -- required because the scheduler
+      # tells docker-socket-proxy to bind-mount per-run subdirs by absolute
+      # path, and that path must resolve on the daemon side too.
+      - ${AGENT_WORKSPACE_BASE:-/tmp/agent-workspaces}:${AGENT_WORKSPACE_BASE:-/tmp/agent-workspaces}
     networks: [foundation, agent_internal]
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8007/healthz').read()\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8007/api/scheduler/v1/healthz').read()\""]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -212,7 +287,16 @@ services:
       # but the BFF actually talks to identity-service's /sessions endpoints,
       # not Keycloak's /token endpoint directly.
       BFF_FOUNDATION_IDENTITY_URL: http://identity-service:8001/api/identity/v1
+      BFF_AUTHZ_URL: http://authz:8002/api/authz/v1
+      BFF_FOUNDATION_ORG_URL: http://org:8003/api/org/v1
+      BFF_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
+      BFF_FOUNDATION_AUDIT_URL: http://audit:8013/api/audit/v1
       BFF_SESSION_ORCHESTRATOR_URL: http://session-orchestrator:8006/api/session/v1
+      BFF_MCP_REGISTRY_URL: http://mcp-registry:8010/api/mcp/v1
+      BFF_SKILL_STORE_URL: http://skill-store:8011/api/skills/v1
+      BFF_KNOWLEDGE_INGEST_URL: http://knowledge-ingest:8012/api/knowledge/v1
+      BFF_SANDBOX_POOL_URL: http://sandbox-pool:8008/api/sandbox-pool/v1
+      BFF_AGENT_SCHEDULER_URL: http://agent-scheduler:8007/api/scheduler/v1
       # MUST be supplied via env in any deployment beyond local dev.
       # CookieSigner refuses to start if the value looks like a placeholder.
       BFF_COOKIE_SECRET: ${BFF_COOKIE_SECRET:?BFF_COOKIE_SECRET must be set (>=32 chars, no placeholder text)}
@@ -226,7 +310,7 @@ services:
       - "${PORT_BFF:-8005}:8005"
     networks: [foundation]
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/healthz').read()\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8005/api/bff/v1/healthz').read()\""]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -245,12 +329,129 @@ services:
     restart: unless-stopped
     environment:
       VITE_API_BASE_URL: http://localhost:8005
+    # Bind-mount the host source so Vite HMR picks up edits live; the anonymous
+    # volume keeps the image's node_modules from being shadowed by the host.
+    volumes:
+      - ../../apps/web:/app
+      - /app/node_modules
     ports:
       - "${PORT_WEB:-5173}:5173"
     networks: [foundation]
     depends_on:
       bff:
         condition: service_healthy
+
+  # ===========================================================================
+  # MCP Registry — tenant MCP server registry (B-M3)
+  # ===========================================================================
+  mcp-registry:
+    build:
+      context: ../../services/mcp-registry
+      dockerfile: Dockerfile
+      additional_contexts:
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+      args:
+        PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
+    container_name: agent-mcp-registry
+    restart: unless-stopped
+    environment:
+      MCP_REGISTRY_ENV: dev
+      MCP_REGISTRY_LOG_LEVEL: DEBUG
+      MCP_REGISTRY_HTTP_PORT: "8010"
+      MCP_REGISTRY_DB_DSN: postgresql+asyncpg://app_user:${APP_USER_PASSWORD:-app_user_change_me}@postgres:5432/foundation
+      MCP_REGISTRY_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+      MCP_REGISTRY_DB_POOL_SIZE: "5"
+      MCP_REGISTRY_DB_MAX_OVERFLOW: "10"
+      MCP_REGISTRY_DB_POOL_RECYCLE: "1800"
+      MCP_REGISTRY_AUTHZ_URL: http://authz:8002/api/authz/v1
+    ports:
+      - "${PORT_MCP_REGISTRY:-8010}:8010"
+    networks: [foundation]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/api/mcp/v1/healthz').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ===========================================================================
+  # Skill Store — versioned skill package registry (B-M3)
+  # ===========================================================================
+  skill-store:
+    build:
+      context: ../../services/skill-store
+      dockerfile: Dockerfile
+      additional_contexts:
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+      args:
+        PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
+    container_name: agent-skill-store
+    restart: unless-stopped
+    environment:
+      SKILL_STORE_ENV: dev
+      SKILL_STORE_LOG_LEVEL: DEBUG
+      SKILL_STORE_HTTP_PORT: "8011"
+      SKILL_STORE_DB_DSN: postgresql+asyncpg://app_user:${APP_USER_PASSWORD:-app_user_change_me}@postgres:5432/foundation
+      SKILL_STORE_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+      SKILL_STORE_BLOB_BACKEND: s3
+      SKILL_STORE_S3_BUCKET: agent-platform
+      SKILL_STORE_S3_REGION: us-east-1
+      SKILL_STORE_S3_ENDPOINT_URL: http://foundation-minio:9000
+      SKILL_STORE_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-foundation}
+      SKILL_STORE_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_change_me_min_12_chars}
+      SKILL_STORE_DB_POOL_SIZE: "5"
+      SKILL_STORE_DB_MAX_OVERFLOW: "10"
+      SKILL_STORE_DB_POOL_RECYCLE: "1800"
+      SKILL_STORE_AUTHZ_URL: http://authz:8002/api/authz/v1
+      SKILL_STORE_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
+    ports:
+      - "${PORT_SKILL_STORE:-8011}:8011"
+    networks: [foundation]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8011/api/skills/v1/healthz').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ===========================================================================
+  # Knowledge Ingest — document → embedding → pgvector pipeline (B-M3)
+  # ===========================================================================
+  knowledge-ingest:
+    build:
+      context: ../../services/knowledge-ingest
+      dockerfile: Dockerfile
+      additional_contexts:
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+      args:
+        PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
+    container_name: agent-knowledge-ingest
+    restart: unless-stopped
+    environment:
+      KNOWLEDGE_INGEST_ENV: dev
+      KNOWLEDGE_INGEST_LOG_LEVEL: DEBUG
+      KNOWLEDGE_INGEST_HTTP_PORT: "8012"
+      KNOWLEDGE_INGEST_DB_DSN: postgresql+asyncpg://app_user:${APP_USER_PASSWORD:-app_user_change_me}@postgres:5432/foundation
+      KNOWLEDGE_INGEST_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+      KNOWLEDGE_INGEST_BLOB_BACKEND: s3
+      KNOWLEDGE_INGEST_S3_BUCKET: agent-platform
+      KNOWLEDGE_INGEST_S3_REGION: us-east-1
+      KNOWLEDGE_INGEST_S3_ENDPOINT_URL: http://foundation-minio:9000
+      KNOWLEDGE_INGEST_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-foundation}
+      KNOWLEDGE_INGEST_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_change_me_min_12_chars}
+      KNOWLEDGE_INGEST_FOUNDATION_LLM_GATEWAY_URL: http://llm-gateway:8003/api/llm/v1
+      KNOWLEDGE_INGEST_EMBEDDING_BACKEND: local
+      KNOWLEDGE_INGEST_DB_POOL_SIZE: "5"
+      KNOWLEDGE_INGEST_DB_MAX_OVERFLOW: "10"
+      KNOWLEDGE_INGEST_DB_POOL_RECYCLE: "1800"
+      KNOWLEDGE_INGEST_AUTHZ_URL: http://authz:8002/api/authz/v1
+      KNOWLEDGE_INGEST_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
+    ports:
+      - "${PORT_KNOWLEDGE_INGEST:-8012}:8012"
+    networks: [foundation]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8012/api/knowledge/v1/healthz').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
 volumes:
   agent_workspaces:

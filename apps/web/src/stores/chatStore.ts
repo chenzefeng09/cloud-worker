@@ -42,12 +42,15 @@ export const useChatStore = create<ChatState>((set) => ({
   setMessages: (sessionId, messages) =>
     set((s) => ({ messages: { ...s.messages, [sessionId]: messages } })),
   addMessage: (sessionId, message) =>
-    set((s) => ({
-      messages: {
-        ...s.messages,
-        [sessionId]: [...(s.messages[sessionId] || []), message],
-      },
-    })),
+    set((s) => {
+      // Dedup by id — SSE and the post-refresh /messages hydrate both arrive
+      // for the same row and we used to render each message twice.
+      const existing = s.messages[sessionId] || [];
+      if (message.id && existing.some((m) => m.id === message.id)) return s;
+      return {
+        messages: { ...s.messages, [sessionId]: [...existing, message] },
+      };
+    }),
   updateLastMessage: (sessionId, content) =>
     set((s) => {
       const msgs = s.messages[sessionId] || [];

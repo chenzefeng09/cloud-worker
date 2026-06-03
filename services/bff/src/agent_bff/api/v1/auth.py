@@ -28,7 +28,9 @@ import httpx
 from fastapi import APIRouter, Request, Response, status
 from fastapi.responses import JSONResponse
 from foundation_sdk import CookieSigner
+from foundation_sdk.fastapi import get_tenant_id, get_user_id
 
+from agent_bff.api._http import foundation_headers
 from agent_bff.api.middleware import get_access_token
 from agent_bff.errors import AuthenticationError
 
@@ -156,11 +158,19 @@ async def me(request: Request) -> dict:
         raise AuthenticationError("Not authenticated")
 
     settings = request.app.state.settings
+    # Forward the same X-Tenant-Id / X-User-Id context every other
+    # foundation call uses — otherwise the identity service's tenant
+    # middleware 401s because it has no tenant context to bind to.
+    headers = foundation_headers(
+        tenant_id=get_tenant_id(),
+        user_id=get_user_id(),
+        access_token=access_token,
+    )
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(
                 f"{settings.foundation_identity_url}/sessions/me",
-                headers={"Authorization": f"Bearer {access_token}"},
+                headers=headers,
             )
     except httpx.HTTPError as exc:
         logger.warning("me: identity unreachable", extra={"exc": str(exc)})

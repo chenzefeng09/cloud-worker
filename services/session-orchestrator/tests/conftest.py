@@ -15,8 +15,9 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -53,12 +54,45 @@ def mock_db() -> AsyncMock:
 
 
 @pytest.fixture
+def mock_authz_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch httpx.AsyncClient in the authz_guard module to always allow.
+
+    Applied automatically to the app_client fixture so ordinary API tests
+    don't need to set up authz mocking themselves.  Tests that specifically
+    want to test deny-paths (test_authz_guard.py) patch the client directly
+    per-test, overriding this fixture's effect.
+    """
+    _allowed_resp = MagicMock(spec=httpx.Response)
+    _allowed_resp.status_code = 200
+    _allowed_resp.json = MagicMock(return_value={"allowed": True})
+
+    class _FakeAsyncClient:
+        def __init__(self, *args: Any, **kw: Any) -> None:
+            pass
+
+        async def __aenter__(self) -> "_FakeAsyncClient":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def post(self, *args: Any, **kw: Any) -> MagicMock:
+            return _allowed_resp
+
+    monkeypatch.setattr(
+        "agent_session_orchestrator.api.authz_guard.httpx.AsyncClient",
+        _FakeAsyncClient,
+    )
+
+
+@pytest.fixture
 def app_client(
     settings: Settings,
     mock_db: AsyncMock,
+    mock_authz_allowed: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[TestClient]:
-    """API client with the DB dependency mocked out."""
+    """API client with the DB dependency mocked out and authz always-allow."""
     from agent_session_orchestrator.domain import db as db_module
 
     async def _noop_init(*args: Any, **kw: Any) -> None:

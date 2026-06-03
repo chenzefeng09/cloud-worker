@@ -1,0 +1,14 @@
+# syntax=docker/dockerfile:1.7
+# Source-only overlay: reuses the existing session-orchestrator image's
+# already-installed Python deps and only swaps the in-repo source files.
+# Skips poetry install so a flaky PyPI doesn't block the rebuild.
+
+FROM agent-platform-dev-session-orchestrator:latest
+
+USER root
+COPY src /app/src
+RUN find /app/src -name __pycache__ -exec rm -rf {} + 2>/dev/null || true \
+ && chown -R app:app /app/src
+USER app
+WORKDIR /app
+CMD ["uvicorn", "agent_session_orchestrator.main:create_app", "--host", "0.0.0.0", "--port", "8006", "--factory"]

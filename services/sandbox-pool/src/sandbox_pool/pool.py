@@ -1,36 +1,57 @@
-"""In-memory pool state.
+"""In-memory pool state with real Docker-backed spawn/reap.
 
-This is the skeleton implementation — single-process, no persistence.
-B-M2 replaces it with a KEDA-driven operator that reads pool state from
-the actual CubeSandbox controller (so a pod restart doesn't lose the
-warm VMs we've already paid to boot).  See
-``docs/design/b-m2-sandbox-runtime-v1.md §5``.
+Design
+------
+The pool maintains a set of WARM idle sandbox containers (pre-started via
+``PoolDockerRuntime.start_idle_container``).  ``acquire()`` hands one out
+instantly when available; callers never pay cold-start latency on a warm hit.
 
-Why the dict-based skeleton lives here at all:
+Lifecycle
+~~~~~~~~~
+* **warmup_tick()** runs in the background, spawning real Docker containers
+  up to ``idle_low_watermark`` per template.
+* **acquire()** claims an IDLE entry (fast path) or cold-spawns one
+  synchronously when none are available (waits up to
+  ``acquire_timeout_seconds`` polling for a warm one first).
+* **release(sandbox_id)** reaps the container (``sleep infinity`` containers
+  are not reusable after task assignment in the current Docker dev path;
+  the snapshot-based recycle path is a KEDA/CubeSandbox follow-up).
+* **reap_excess_tick()** removes idle containers above
+  ``idle_high_watermark``.
 
-* It lets us land the HTTP contract first (``POST /sandboxes/acquire``,
-  ``DELETE /sandboxes/{id}``), so agent-scheduler and tests can target
-  the real endpoints before we have a KEDA setup.
-* It exercises the watermark logic in unit tests without spinning up a
-  controller.
+Persistence
+~~~~~~~~~~~
+State is in-process; a restart re-discovers warm containers (future work —
+for now it re-spawns).  The KEDA operator (B-M2 follow-up) replaces this
+with the CubeSandbox controller as the source of truth.
+
+Runtime injection
+~~~~~~~~~~~~~~~~~
+``Pool`` accepts an optional ``runtime`` argument so tests can inject a mock
+without touching Docker.  Production omits it and ``Pool`` builds a real
+``PoolDockerRuntime`` from the settings.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
+import time
 from dataclasses import dataclass, field
 
+from prometheus_client import CollectorRegistry
+
 from sandbox_pool.config import Settings
+from sandbox_pool.docker_runtime import PoolDockerRuntime
 from sandbox_pool.errors import PoolExhaustedError, SandboxNotFoundError
+from sandbox_pool.metrics import PoolMetrics, build_metrics
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class PoolEntry:
-    """One pre-warmed VM (or one in-use VM after acquire)."""
+    """One pre-warmed container (or one in-use container after acquire)."""
 
     sandbox_id: str
     template: str
@@ -53,21 +74,42 @@ class PoolState:
 
 
 class Pool:
-    """Skeleton pool with the public contract callers will use.
+    """Pool with warm Docker containers.
 
-    The real implementation will replace ``_spawn_one`` /
-    ``_reap_one`` with calls to the CubeSandbox controller; this version
-    fabricates fake sandbox ids so the API + watermark logic can be
-    exercised end-to-end without a running controller.
+    ``_spawn_one`` starts a real idle container via ``PoolDockerRuntime``.
+    ``_reap_one`` stops + removes the container.
+    ``acquire()`` polls for a warm container up to ``acquire_timeout_seconds``
+    before falling back to a synchronous cold spawn.
     """
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        metrics: PoolMetrics | None = None,
+        metrics_registry: CollectorRegistry | None = None,
+        runtime: object = None,
+    ) -> None:
         self._settings = settings
         self._state = PoolState()
-        # ``_lock`` guards mutations to ``_state``.  asyncio.Lock is fine for
-        # the single-process skeleton; the KEDA operator will replace this
-        # with the controller's own atomic operations.
         self._lock = asyncio.Lock()
+
+        if metrics is not None:
+            self._metrics = metrics
+        else:
+            self._metrics = build_metrics(
+                metrics_registry if metrics_registry is not None
+                else CollectorRegistry(),
+            )
+
+        if runtime is not None:
+            self._runtime = runtime
+        else:
+            self._runtime = PoolDockerRuntime(settings)
+
+    @property
+    def metrics(self) -> PoolMetrics:
+        return self._metrics
 
     # ------------------------------------------------------------------ inspect
     def snapshot(self) -> dict[str, object]:
@@ -87,34 +129,88 @@ class Pool:
 
     # ------------------------------------------------------------------ acquire
     async def acquire(self, *, tenant_id: str, template: str = "base") -> PoolEntry:
-        """Hand out one VM to a caller, spawning if no warm one is available.
+        """Hand out one sandbox to a caller.
 
-        TODO(B-M2): wait up to ``acquire_timeout_seconds`` for a warm VM
-        before falling back to a sync cold spawn.  Skeleton always
-        cold-spawns when the pool is empty.
+        Fast path: if a warm IDLE entry exists for the requested template,
+        claim it immediately (no new container is started).
+
+        Slow path: poll for a warm entry up to ``acquire_timeout_seconds``.
+        If no warm entry appears within the timeout, cold-spawn synchronously
+        (blocking on the Docker API call via asyncio.to_thread).
+
+        Records three Prometheus signals before returning / raising:
+
+        * ``sandbox_pool_acquire_total{outcome=warm|cold|failed,template=...}``
+        * ``sandbox_pool_acquire_latency_seconds`` (same labels)
+        * ``sandbox_pool_idle`` / ``sandbox_pool_total`` gauges refreshed.
         """
-        async with self._lock:
-            if self._state.total_count() >= self._settings.max_total:
-                raise PoolExhaustedError()
-            # Prefer warm
-            for entry in self._state.entries.values():
-                if entry.state == "IDLE" and entry.template == template:
-                    entry.state = "ACQUIRED"
-                    entry.tenant_id = tenant_id
-                    logger.info(
-                        "acquire warm",
-                        extra={"sandbox_id": entry.sandbox_id, "tenant_id": tenant_id},
-                    )
-                    return entry
-            # Cold spawn
-            entry = self._spawn_one(template)
-            entry.state = "ACQUIRED"
-            entry.tenant_id = tenant_id
-            logger.info(
-                "acquire cold",
-                extra={"sandbox_id": entry.sandbox_id, "tenant_id": tenant_id},
-            )
-            return entry
+        start = time.perf_counter()
+        outcome = "failed"
+        try:
+            # --- fast path: warm entry available right now ---
+            async with self._lock:
+                if self._state.total_count() >= self._settings.max_total:
+                    raise PoolExhaustedError()
+                for entry in self._state.entries.values():
+                    if entry.state == "IDLE" and entry.template == template:
+                        entry.state = "ACQUIRED"
+                        entry.tenant_id = tenant_id
+                        outcome = "warm"
+                        logger.info(
+                            "acquire warm",
+                            extra={
+                                "sandbox_id": entry.sandbox_id,
+                                "tenant_id": tenant_id,
+                            },
+                        )
+                        return entry
+
+            # --- slow path: poll for a warm entry ---
+            deadline = time.perf_counter() + self._settings.acquire_timeout_seconds
+            _POLL_INTERVAL = 0.25  # seconds between polls
+
+            while time.perf_counter() < deadline:
+                await asyncio.sleep(_POLL_INTERVAL)
+                async with self._lock:
+                    if self._state.total_count() >= self._settings.max_total:
+                        raise PoolExhaustedError()
+                    for entry in self._state.entries.values():
+                        if entry.state == "IDLE" and entry.template == template:
+                            entry.state = "ACQUIRED"
+                            entry.tenant_id = tenant_id
+                            outcome = "warm"
+                            logger.info(
+                                "acquire warm (after poll)",
+                                extra={
+                                    "sandbox_id": entry.sandbox_id,
+                                    "tenant_id": tenant_id,
+                                },
+                            )
+                            return entry
+
+            # --- cold spawn: no warm entry within timeout ---
+            async with self._lock:
+                if self._state.total_count() >= self._settings.max_total:
+                    raise PoolExhaustedError()
+                entry = await asyncio.to_thread(self._spawn_one, template)
+                entry.state = "ACQUIRED"
+                entry.tenant_id = tenant_id
+                outcome = "cold"
+                logger.info(
+                    "acquire cold",
+                    extra={"sandbox_id": entry.sandbox_id, "tenant_id": tenant_id},
+                )
+                return entry
+
+        finally:
+            elapsed = time.perf_counter() - start
+            self._metrics.acquire_total.labels(
+                outcome=outcome, template=template,
+            ).inc()
+            self._metrics.acquire_latency.labels(
+                outcome=outcome, template=template,
+            ).observe(elapsed)
+            self._refresh_gauges()
 
     # ------------------------------------------------------------------ release
     async def release(self, sandbox_id: str) -> None:
@@ -122,16 +218,18 @@ class Pool:
             entry = self._state.entries.get(sandbox_id)
             if entry is None:
                 raise SandboxNotFoundError(sandbox_id)
-            # Skeleton: reap on release; production will recycle to IDLE
-            # when sandbox is fast to rewind (snapshot-based reset).
+            # Reap on release.  Snapshot-based recycle (→ IDLE) is the
+            # KEDA/CubeSandbox follow-up; Docker containers running
+            # ``sleep infinity`` are not reusable after a task run anyway.
             self._reap_one(sandbox_id)
+        self._refresh_gauges()
 
     # ------------------------------------------------------------------ warm-up
     async def warmup_tick(self) -> int:
         """Background task that brings idle count up to ``idle_low_watermark``.
 
-        Returns how many VMs were spawned this tick (useful for tests).
-        Called from a periodic scheduler the operator will run.
+        Returns how many containers were spawned this tick.
+        Called from the periodic scheduler in lifespan().
         """
         spawned = 0
         async with self._lock:
@@ -142,12 +240,13 @@ class Pool:
                     self._settings.max_total - self._state.total_count(),
                 )
                 for _ in range(max(deficit, 0)):
-                    self._spawn_one(template)
+                    await asyncio.to_thread(self._spawn_one, template)
                     spawned += 1
+        self._refresh_gauges()
         return spawned
 
     async def reap_excess_tick(self) -> int:
-        """Trim idle VMs above ``idle_high_watermark`` for each template."""
+        """Trim idle containers above ``idle_high_watermark`` per template."""
         reaped = 0
         async with self._lock:
             for template in self._settings.warmup_templates:
@@ -159,14 +258,30 @@ class Pool:
                 for v in victims:
                     self._reap_one(v.sandbox_id)
                     reaped += 1
+        self._refresh_gauges()
         return reaped
 
     # ============================================================== internals
+    def _refresh_gauges(self) -> None:
+        self._metrics.total.set(self._state.total_count())
+        for tmpl in self._settings.warmup_templates:
+            self._metrics.idle.labels(template=tmpl).set(
+                self._state.idle_count(tmpl),
+            )
+
     def _spawn_one(self, template: str) -> PoolEntry:
-        # B-M2 follow-up: actually POST to ``cube_controller_url``.
-        # Skeleton: just fabricate an id so watermark math works in tests.
+        """Start a real idle container and register it in the pool state.
+
+        Called from warmup_tick (via asyncio.to_thread) and the cold-spawn
+        path in acquire (also via asyncio.to_thread) so the blocking Docker
+        API call doesn't stall the event loop.
+
+        Returns the PoolEntry (state=IDLE) so callers can immediately
+        transition it to ACQUIRED if needed.
+        """
+        container_id = self._runtime.start_idle_container(template)
         entry = PoolEntry(
-            sandbox_id=f"sb_{uuid.uuid4().hex[:24]}",
+            sandbox_id=container_id,
             template=template,
             state="IDLE",
         )
@@ -174,5 +289,17 @@ class Pool:
         return entry
 
     def _reap_one(self, sandbox_id: str) -> None:
-        # B-M2 follow-up: DELETE from controller.
+        """Stop + remove the container and remove its entry from pool state."""
         self._state.entries.pop(sandbox_id, None)
+        # Stop the real container in a fire-and-forget way.  We've already
+        # removed the entry from PoolState so the pool considers it gone;
+        # the actual Docker stop/remove is best-effort (the container will
+        # be cleaned up by the proxy's TTL or a manual prune if it hangs).
+        try:
+            self._runtime.stop_container(sandbox_id)
+        except Exception:
+            logger.warning(
+                "pool: reap failed (container may already be gone)",
+                extra={"sandbox_id": sandbox_id},
+                exc_info=True,
+            )

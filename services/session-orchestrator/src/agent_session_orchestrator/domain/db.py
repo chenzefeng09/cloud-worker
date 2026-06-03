@@ -37,12 +37,26 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 
 async def init_db(settings: Settings) -> None:
     global _engine, _session_factory
+    # The dev/CI deploy fronts Postgres with pgbouncer in ``transaction``
+    # pool mode, which rebinds server connections per transaction and
+    # therefore cannot honour asyncpg's per-connection prepared-statement
+    # cache.  Both caches must be disabled to avoid
+    # ``DuplicatePreparedStatementError``:
+    #   * ``statement_cache_size=0``           -> asyncpg's own LRU
+    #   * ``prepared_statement_cache_size=0``  -> SQLAlchemy dialect cache
+    # Per SQLAlchemy docs the dialect arg goes in the URL query string,
+    # not in ``connect_args`` (asyncpg's ``connect`` would error).
+    dsn = settings.db_dsn
+    sep = "&" if "?" in dsn else "?"
+    if "prepared_statement_cache_size" not in dsn:
+        dsn = f"{dsn}{sep}prepared_statement_cache_size=0"
     _engine = create_async_engine(
-        settings.db_dsn,
+        dsn,
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
         pool_recycle=settings.db_pool_recycle,
         echo=settings.env == "dev",
+        connect_args={"statement_cache_size": 0},
     )
     _session_factory = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
 

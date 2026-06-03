@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -80,6 +80,38 @@ class Run(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
+    )
+
+
+class Attachment(Base):
+    """File/image attached to a session by the user before or during a chat,
+    or an artifact produced by an agent run.
+
+    The raw bytes live in S3 under ``blob_key``; this row is the authoritative
+    metadata record.  RLS is enabled on this table (same pattern as ``session``).
+
+    ``kind`` distinguishes user-uploaded inputs ('input', default) from
+    agent-produced artifacts ('output').  ``run_id`` links output attachments
+    back to the run that produced them.
+    """
+
+    __tablename__ = "attachment"
+    __table_args__ = {"schema": "session_orchestrator"}
+
+    id: Mapped[str] = mapped_column(String(30), primary_key=True, default=lambda: new_id("att"))
+    tenant_id: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    session_id: Mapped[str] = mapped_column(
+        String(30), ForeignKey("session_orchestrator.session.id"), nullable=False, index=True
+    )
+    user_id: Mapped[str] = mapped_column(String(30), nullable=False)
+    filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    mime: Mapped[str] = mapped_column(String(200), nullable=False, default="application/octet-stream")
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    blob_key: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(String(10), nullable=False, default="input", server_default="input")
+    run_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
     )

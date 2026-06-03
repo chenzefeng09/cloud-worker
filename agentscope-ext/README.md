@@ -8,11 +8,11 @@ our integration as standalone Python packages that the sandbox image
 
 | Module | Purpose | Status |
 |---|---|---|
-| ``runtime_worker/`` | Sandbox entrypoint — boots a single ``ReActAgent`` with the configured ``Toolkit``, runs one task, persists the result + audit trail to the workspace, and exits.  This is what ``agent-scheduler`` invokes inside every sandbox container/VM. | Skeleton (B-M2) |
-| ``event_audit_sink/`` | ``MsgHub`` subscriber that forwards every agent event (message, tool call, model invocation) to ``foundation.audit``. | Planned (B-M3) |
-| ``llm_gateway_enforcer/`` | Custom ``ModelBase`` impl that routes every LLM call through ``foundation.llm-gateway`` (no direct provider keys in the sandbox). | Planned (B-M3) |
-| ``mcp_tenant_injector/`` | Resolves the tenant's MCP-server list from ``mcp-registry`` at session start and feeds it into ``MCPToolkit``. | Planned (B-M3) |
-| ``skills_loader/`` | Materialises Skills package into the AgentScope ``Toolkit`` before run. | Planned (B-M3) |
+| ``agentscope_ext/runtime_worker/`` | Sandbox entrypoint — boots a single ``ReActAgent`` with the configured ``Toolkit``, runs one task, persists the result + audit trail to the workspace, and exits.  This is what ``agent-scheduler`` invokes inside every sandbox container/VM. | B-M2 (this milestone) |
+| ``agentscope_ext/event_audit_sink/`` | ``post_print`` hook that forwards every agent event to ``foundation.audit``. | Planned (B-M3) |
+| ``agentscope_ext/llm_gateway_enforcer/`` | Custom ``ModelBase`` impl that routes every LLM call through ``foundation.llm-gateway`` (no direct provider keys in the sandbox). | Planned (B-M3) |
+| ``agentscope_ext/mcp_tenant_injector/`` | Resolves the tenant's MCP-server list from ``mcp-registry`` at session start and feeds it into the ``Toolkit``. | Planned (B-M3) |
+| ``agentscope_ext/skills_loader/`` | Materialises packaged Skills into the AgentScope ``Toolkit`` before run. | Planned (B-M3) |
 
 ## How the sandbox picks these up
 
@@ -27,14 +27,43 @@ vars (``FOUNDATION_API_TOKEN``, ``FOUNDATION_TENANT_ID``, ...) and the
 ``ReActAgent`` with the tenant's MCP servers + Skills, runs the task,
 and exits.  Container exit code + ``/workspace/result.json`` are how
 the scheduler learns the outcome — see
-``runtime_worker/__main__.py`` for the contract.
+``agentscope_ext/runtime_worker/__main__.py`` for the contract.
+
+## Hook surface (the override points the four extensions plug into)
+
+``runtime_worker`` exposes four module-level functions in
+``agentscope_ext.runtime_worker.hooks``.  Each sibling extension owns
+one (or two) of them and monkey-patches at import time:
+
+| Hook function | Default behaviour | Owner extension (planned) |
+|---|---|---|
+| ``build_model(task, env) -> ModelBase`` | ``AnthropicChatModel`` or ``OpenAIChatModel`` depending on ``LLM_PROVIDER`` env var; reads ``LLM_API_KEY`` directly. | ``llm_gateway_enforcer`` — returns a ``GatewayModel`` that POSTs to ``foundation.llm-gateway`` with the foundation JWT instead of holding raw provider keys. |
+| ``build_formatter(task, env) -> FormatterBase`` | Matches the provider above (``AnthropicChatFormatter`` / ``OpenAIChatFormatter``). | ``llm_gateway_enforcer`` (paired with the model). |
+| ``build_toolkit(task, tenant_id, env) -> Toolkit`` | Empty ``Toolkit()`` — useful for smoke tests without the foundation stack. | ``mcp_tenant_injector`` then ``skills_loader`` (chained: MCP servers resolved from ``mcp-registry`` first, packaged Skills layered on top). |
+| ``attach_hooks(agent, *, events_path, env) -> None`` | Registers a ``post_print`` instance hook that appends each printed ``Msg`` to ``/workspace/events.jsonl`` as one JSON line. | ``event_audit_sink`` — registers a **second** ``post_print`` hook that POSTs each event to ``foundation.audit``.  Both run; the disk log survives gateway outages, the audit POST survives sandbox crashes. |
+
+Extensions install themselves by importing the hooks module and
+reassigning the attribute, e.g.::
+
+    from agentscope_ext.runtime_worker import hooks
+    from agentscope_ext.llm_gateway_enforcer import build_gateway_model
+
+    hooks.build_model = build_gateway_model
+
+Because the entrypoint resolves the functions via attribute access on
+each invocation (``_hooks.build_model(...)``), patching can happen at
+sandbox-image build time (via a ``sitecustomize.py`` or a
+``[project.entry-points."agentscope_ext.boot"]`` hook the scheduler
+triggers) or at process start.  The runtime_worker itself never imports
+the sibling packages directly — that keeps the dependency arrow
+one-way and lets the smoke-test image ship without them.
 
 ## Versioning
 
 The sandbox image pins a specific AgentScope minor (target: 2.0.x) and
 bumps quarterly.  Extensions target the public AgentScope 2.0 surface —
-``ReActAgent`` / ``Toolkit`` / ``MCPToolkit`` / ``MsgHub`` — which
-AgentScope's release notes flag as stable.
+``ReActAgent`` / ``Toolkit`` / ``MsgHub`` / formatter + model classes —
+which AgentScope's release notes flag as stable.
 
 ## Why not run AgentScope's ``examples/agent_service``?
 
@@ -49,3 +78,11 @@ directly because:
 * **Per-run lifecycle is the unit of audit + billing.**  A one-shot
   worker maps cleanly onto ``run`` rows; a long-running service blurs
   the line.
+
+## Tests
+
+The wire-contract tests stub AgentScope via ``sys.modules`` so they run
+without the real dependency::
+
+    cd agentscope-ext
+    python -m pytest tests/ -v

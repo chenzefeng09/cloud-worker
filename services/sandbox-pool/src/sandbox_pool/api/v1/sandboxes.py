@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Request, Response, status
 from foundation_sdk.fastapi import get_tenant_id
 from pydantic import BaseModel
 
@@ -60,14 +60,16 @@ async def acquire(body: AcquireRequest, request: Request) -> AcquireResponse:
 @router.delete(
     "/sandboxes/{sandbox_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
 )
-async def release(sandbox_id: str, request: Request) -> None:
+async def release(sandbox_id: str, request: Request) -> Response:
     _require_tenant()
     pool = _pool(request)
     try:
         await pool.release(sandbox_id)
     except PoolError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/sandboxes/_pool")

@@ -17,7 +17,9 @@ def test_healthz(app_client: TestClient) -> None:
 
 def test_list_sessions_requires_tenant(app_client: TestClient) -> None:
     resp = app_client.get("/api/session/v1/sessions")
-    assert resp.status_code == 401
+    # Without headers, either the RBAC guard (403) or the tenant dep (401)
+    # reject the request — both indicate the caller is unauthenticated.
+    assert resp.status_code in (401, 403)
 
 
 def test_list_sessions_returns_empty(

@@ -1,0 +1,272 @@
+# =============================================================================
+# Agent Platform — Skill Store OpenAPI 3.1
+#
+# Versioned skill-package registry (skill.yaml + Python tarballs).  Backs
+# the agentscope-ext/skills_loader.
+# =============================================================================
+openapi: 3.1.0
+
+info:
+  title: Agent Platform — Skill Store
+  description: Per-tenant skill packages with versioned tarball uploads.
+  version: 0.1.0
+
+servers:
+  - url: http://localhost:8011
+    description: Local dev
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/skills/v1/skills:
+    get:
+      operationId: skills_list
+      tags: [Skills]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListPage' }
+    post:
+      operationId: skills_create
+      tags: [Skills]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SkillCreate' }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Skill' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/skills/v1/skills/{skill_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - name: skill_id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: skills_get
+      tags: [Skills]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Skill' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/skills/v1/skills/{skill_id}/versions:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - name: skill_id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      operationId: skills_upload_version
+      tags: [SkillVersions]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [version, file]
+              properties:
+                version: { type: string }
+                manifest: { type: string, description: JSON-encoded manifest }
+                expected_sha256: { type: string }
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SkillVersion' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /api/skills/v1/skills/{skill_id}/versions/{version}/download:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - name: skill_id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: skills_download_version
+      tags: [SkillVersions]
+      responses:
+        '307': { description: Redirect to presigned blob URL }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/skills/v1/skills/{skill_id}/versions/{version}:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - name: skill_id
+        in: path
+        required: true
+        schema: { type: string }
+      - name: version
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      operationId: skills_delete_version
+      tags: [SkillVersions]
+      responses:
+        '204': { description: Deleted (row + blob) }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/skills/v1/internal/skills:
+    get:
+      operationId: skills_internal_list
+      summary: Cross-tenant fetch for skills_loader
+      tags: [Internal]
+      parameters:
+        - name: tenant_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: names
+          in: query
+          schema: { type: string, example: "foo,bar" }
+        - name: X-Service-Scopes
+          in: header
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListPage' }
+        '403':
+          description: Missing skill.read_internal scope
+
+  /api/skills/v1/healthz:
+    get:
+      operationId: skills_healthz
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+  /api/skills/v1/readyz:
+    get:
+      operationId: skills_readyz
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+
+  parameters:
+    TenantIdHeader:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema: { type: string }
+
+  schemas:
+    SkillCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 120 }
+        description: { type: string, maxLength: 2000 }
+        owner: { type: string, maxLength: 120 }
+        visibility: { type: string, enum: [private, tenant, public], default: private }
+
+    Skill:
+      type: object
+      required: [id, tenant_id, name, visibility, created_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        owner: { type: string, nullable: true }
+        visibility: { type: string, enum: [private, tenant, public] }
+        created_at: { type: string, format: date-time }
+
+    SkillVersion:
+      type: object
+      required: [id, skill_id, version, blob_url, sha256, uploaded_at]
+      properties:
+        id: { type: string }
+        skill_id: { type: string }
+        version: { type: string }
+        manifest:
+          type: object
+          additionalProperties: true
+        blob_url: { type: string }
+        sha256: { type: string }
+        uploaded_by: { type: string, nullable: true }
+        uploaded_at: { type: string, format: date-time }
+
+    ListPage:
+      type: object
+      required: [items, total]
+      properties:
+        items: { type: array, items: { type: object } }
+        total: { type: integer, minimum: 0 }
+
+    HealthStatus:
+      type: object
+      required: [status, service]
+      properties:
+        status: { type: string }
+        service: { type: string }
+        version: { type: string }
+
+    Error:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Resource already exists
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: Request validation failed
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }

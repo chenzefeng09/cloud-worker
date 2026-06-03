@@ -37,3 +37,41 @@ def test_create_session_proxies_body(
         None,
     )
     assert posted_body == {"title": "hello"}
+
+
+def test_cancel_session_proxies_to_orchestrator(
+    client: TestClient, authed_cookie: dict[str, str], fake_foundation,
+) -> None:
+    """BFF cancel endpoint forwards to orchestrator session-level cancel."""
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/cancel",
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    # Confirm it hit the orchestrator (orch-test host) and not identity
+    cancel_calls = [
+        c for c in fake_foundation.calls
+        if c[0] == "POST" and "orch-test" in c[1] and "cancel" in c[1]
+    ]
+    assert cancel_calls, f"expected cancel forwarded to orchestrator, got {fake_foundation.calls}"
+    assert "ses_abc" in cancel_calls[0][1]
+
+
+def test_list_attachments_requires_auth(client: TestClient) -> None:
+    resp = client.get("/api/bff/v1/sessions/ses_abc/attachments")
+    assert resp.status_code == 401
+
+
+def test_list_attachments_proxies_to_orchestrator(
+    client: TestClient, authed_cookie: dict[str, str], fake_foundation,
+) -> None:
+    resp = client.get(
+        "/api/bff/v1/sessions/ses_abc/attachments",
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    att_calls = [
+        c for c in fake_foundation.calls
+        if c[0] == "GET" and "orch-test" in c[1] and "attachments" in c[1]
+    ]
+    assert att_calls, f"expected attachment list call to orchestrator, got {fake_foundation.calls}"

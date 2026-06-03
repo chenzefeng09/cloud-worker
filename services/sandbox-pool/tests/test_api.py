@@ -1,8 +1,13 @@
-"""HTTP-layer smoke tests for sandbox-pool."""
+"""HTTP-layer smoke tests for sandbox-pool.
+
+We patch ``PoolDockerRuntime`` so no Docker daemon is needed during tests.
+"""
 
 from __future__ import annotations
 
+import itertools
 from collections.abc import Iterator
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,12 +26,28 @@ def settings() -> Settings:
         max_total=10,
         warmup_templates=["base"],
         otel_enabled=False,
+        sandbox_image="test-image:latest",
+        docker_network="test_net",
     )
+
+
+def _mock_runtime_factory() -> MagicMock:
+    runtime = MagicMock()
+    _counter = itertools.count()
+    runtime.start_idle_container.side_effect = (
+        lambda template: f"{next(_counter):012x}"
+    )
+    return runtime
 
 
 @pytest.fixture
 def client(settings: Settings) -> Iterator[TestClient]:
-    app = create_app(settings)
+    mock_runtime = _mock_runtime_factory()
+    with patch(
+        "sandbox_pool.pool.PoolDockerRuntime",
+        return_value=mock_runtime,
+    ):
+        app = create_app(settings)
     with TestClient(app, raise_server_exceptions=False) as c:
         yield c
 
@@ -62,7 +83,9 @@ def test_acquire_and_release_round_trip(client: TestClient) -> None:
     )
     assert acq.status_code == 201, acq.text
     sandbox_id = acq.json()["sandbox_id"]
-    assert sandbox_id.startswith("sb_")
+    # Real short container id: 12 hex chars (not the old "sb_..." fake UUID)
+    assert len(sandbox_id) == 12
+    assert all(c in "0123456789abcdef" for c in sandbox_id)
 
     snap = client.get("/api/sandbox-pool/v1/sandboxes/_pool")
     assert snap.json()["total"] == 1

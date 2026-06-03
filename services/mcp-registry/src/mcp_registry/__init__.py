@@ -1,0 +1,5 @@
+"""mcp-registry — tenant MCP server registry."""
+
+from __future__ import annotations
+
+__version__ = "0.1.0a1"

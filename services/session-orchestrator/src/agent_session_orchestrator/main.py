@@ -11,6 +11,26 @@ from agent_session_orchestrator.domain.db import close_db, init_db
 from agent_session_orchestrator.observability import init_observability
 
 
+def _make_blob_store(settings: Settings):  # type: ignore[no-untyped-def]
+    """Build the S3BlobStore from settings; return None if credentials missing."""
+    try:
+        from agent_session_orchestrator.blob.s3 import S3BlobStore
+        return S3BlobStore(
+            bucket=settings.s3_bucket,
+            region=settings.s3_region,
+            endpoint_url=settings.s3_endpoint_url,
+            access_key_id=settings.s3_access_key_id,
+            secret_access_key=settings.s3_secret_access_key,
+        )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning(
+            "S3BlobStore unavailable (boto3 missing or creds unset); "
+            "attachment upload will return 503"
+        )
+        return None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = app.state.settings
@@ -30,6 +50,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.blob_store = _make_blob_store(settings)
+
+    from agent_session_orchestrator.services.quota_guard import QuotaGuard
+    app.state.quota_guard = QuotaGuard(billing_url=settings.foundation_billing_url)
 
     install_request_context(
         app, service_name="session-orchestrator", service_version="0.1.0a1",
@@ -50,6 +74,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from agent_session_orchestrator.api.v1.runs import router as runs_router
     app.include_router(runs_router, prefix=settings.api_prefix)
+
+    from agent_session_orchestrator.api.v1.attachments import router as attachments_router
+    app.include_router(attachments_router, prefix=settings.api_prefix)
 
     return app
 

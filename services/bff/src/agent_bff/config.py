@@ -23,7 +23,23 @@ class Settings(BaseSettings):
     # NOT keycloak directly; identity-service proxies to keycloak internally.
     foundation_identity_url: str = "http://localhost:8001/api/identity/v1"
 
+    # Foundation authz + billing — RBAC enforcement and quota checks.
+    authz_url: str = "http://authz:8002/api/authz/v1"
+    foundation_org_url: str = "http://org:8003/api/org/v1"
+    foundation_billing_url: str = "http://billing:8007/api/billing/v1"
+    # Audit service — added to dev.yml as port 8013 (8005 conflicts with BFF).
+    foundation_audit_url: str = "http://audit:8013/api/audit/v1"
+
     session_orchestrator_url: str = "http://localhost:8006/api/session/v1"
+
+    # Library services
+    mcp_registry_url: str = "http://localhost:8010/api/mcp/v1"
+    skill_store_url: str = "http://localhost:8011/api/skills/v1"
+    knowledge_ingest_url: str = "http://localhost:8012/api/knowledge/v1"
+
+    # Fleet services
+    sandbox_pool_url: str = "http://localhost:8008/api/sandbox-pool/v1"
+    agent_scheduler_url: str = "http://localhost:8007/api/scheduler/v1"
 
     # Cookie signing — see foundation_sdk.CookieSigner.  No default value:
     # forgetting to set this in any deployment beyond local dev should fail

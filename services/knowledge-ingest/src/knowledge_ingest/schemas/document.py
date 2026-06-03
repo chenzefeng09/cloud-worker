@@ -1,0 +1,46 @@
+"""Document + search schemas."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+
+from pydantic import BaseModel, ConfigDict
+
+
+class DocumentStatus(str, Enum):
+    PENDING = "PENDING"
+    INGESTING = "INGESTING"
+    READY = "READY"
+    FAILED = "FAILED"
+
+
+class DocumentOut(BaseModel):
+    id: str
+    tenant_id: str
+    title: str
+    mime: str
+    source_uri: str | None = None
+    status: DocumentStatus
+    uploaded_at: datetime
+    chunk_count: int = 0
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class IngestResult(BaseModel):
+    document_id: str
+    status: DocumentStatus
+    chunks_created: int
+
+
+class SearchHit(BaseModel):
+    document_id: str
+    chunk_id: str
+    ord: int
+    text: str
+    score: float
+
+
+class SearchResponse(BaseModel):
+    hits: list[SearchHit]

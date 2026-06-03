@@ -11,6 +11,7 @@ fastapi = "^0.115.0"
 uvicorn = { extras = ["standard"], version = "^0.32.0" }
 pydantic-settings = "^2.6.0"
 httpx = "^0.28.0"
+python-multipart = "^0.0.9"
 opentelemetry-api = "^1.28.0"
 opentelemetry-sdk = "^1.28.0"
 opentelemetry-instrumentation-fastapi = "^0.49b0"
@@ -18,6 +19,11 @@ opentelemetry-exporter-otlp = "^1.28.0"
 python-jose = { extras = ["cryptography"], version = "^3.3.0" }
 # CookieSigner + identity SDK
 itsdangerous = "^2.2.0"
+# Foundation SDK — injected at image-build time via the docker-compose
+# `additional_contexts: foundation_sdk` entry (see the service Dockerfile,
+# which `pip install /sdk[fastapi]` before poetry runs).  When the internal
+# PyPI is online this dep returns as `foundation-sdk = ">=0.1,<0.2"` with a
+# `[[tool.poetry.source]]` block; until then the Dockerfile is the source.
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"

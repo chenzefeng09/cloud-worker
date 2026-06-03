@@ -1,0 +1,248 @@
+# =============================================================================
+# Agent Platform — MCP Registry OpenAPI 3.1
+#
+# Tenant MCP server registry — backs the agentscope-ext/mcp_tenant_injector.
+# =============================================================================
+openapi: 3.1.0
+
+info:
+  title: Agent Platform — MCP Registry
+  description: Per-tenant Model Context Protocol server catalogue.
+  version: 0.1.0
+
+servers:
+  - url: http://localhost:8010
+    description: Local dev
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/mcp/v1/mcp-servers:
+    get:
+      operationId: mcp_list
+      summary: List MCP servers for the current tenant
+      tags: [MCPServers]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      responses:
+        '200':
+          description: List page
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      operationId: mcp_create
+      summary: Register a new MCP server
+      tags: [MCPServers]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/McpServerCreate' }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/McpServer' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/Unprocessable' }
+
+  /api/mcp/v1/mcp-servers/{server_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - name: server_id
+        in: path
+        required: true
+        schema: { type: string, pattern: '^mcp_[A-Z0-9]+$' }
+    get:
+      operationId: mcp_get
+      tags: [MCPServers]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/McpServer' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: mcp_update
+      tags: [MCPServers]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/McpServerUpdate' }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/McpServer' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: mcp_delete
+      tags: [MCPServers]
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/mcp/v1/internal/mcp-servers:
+    get:
+      operationId: mcp_internal_list
+      summary: Cross-tenant list for service accounts (mcp_tenant_injector)
+      tags: [Internal]
+      parameters:
+        - name: tenant_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: X-Service-Scopes
+          in: header
+          required: true
+          schema: { type: string, example: "mcp.read_internal" }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListPage' }
+        '403':
+          description: Missing mcp.read_internal scope
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /api/mcp/v1/healthz:
+    get:
+      operationId: mcp_healthz
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+  /api/mcp/v1/readyz:
+    get:
+      operationId: mcp_readyz
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+
+  parameters:
+    TenantIdHeader:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema: { type: string }
+
+  schemas:
+    McpServerCreate:
+      type: object
+      required: [name, transport]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        transport: { type: string, enum: [http, stdio] }
+        endpoint: { type: string, maxLength: 500 }
+        command: { type: string, maxLength: 500 }
+        env:
+          type: object
+          additionalProperties: { type: string }
+        scopes:
+          type: array
+          items: { type: string }
+        enabled: { type: boolean, default: true }
+
+    McpServerUpdate:
+      type: object
+      properties:
+        transport: { type: string, enum: [http, stdio] }
+        endpoint: { type: string, maxLength: 500 }
+        command: { type: string, maxLength: 500 }
+        env:
+          type: object
+          additionalProperties: { type: string }
+        scopes:
+          type: array
+          items: { type: string }
+        enabled: { type: boolean }
+
+    McpServer:
+      type: object
+      required: [id, tenant_id, name, transport, enabled, created_at, updated_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        name: { type: string }
+        transport: { type: string, enum: [http, stdio] }
+        endpoint: { type: string, nullable: true }
+        command: { type: string, nullable: true }
+        env:
+          type: object
+          additionalProperties: true
+        scopes:
+          type: array
+          items: { type: string }
+        enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    ListPage:
+      type: object
+      required: [items, total]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/McpServer' } }
+        total: { type: integer, minimum: 0 }
+
+    HealthStatus:
+      type: object
+      required: [status, service]
+      properties:
+        status: { type: string, enum: [OK, DEGRADED, DOWN] }
+        service: { type: string }
+        version: { type: string }
+
+    Error:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+
+  responses:
+    Unauthorized:
+      description: Missing X-Tenant-Id or invalid bearer
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Server not found
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Server name already registered
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unprocessable:
+      description: Request body failed validation
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }

@@ -11,12 +11,16 @@ fastapi = "^0.115.0"
 uvicorn = { extras = ["standard"], version = "^0.32.0" }
 pydantic-settings = "^2.6.0"
 docker = "^7.1.0"
+boto3 = "^1.35.0"
 httpx = "^0.28.0"
 tomli-w = "^1.0.0"  # reserved for future config emission (B-M2); see docker_runtime.py
 opentelemetry-api = "^1.28.0"
 opentelemetry-sdk = "^1.28.0"
 opentelemetry-instrumentation-fastapi = "^0.49b0"
 opentelemetry-exporter-otlp = "^1.28.0"
+# Foundation SDK — injected at image-build time via docker-compose
+# `additional_contexts: foundation_sdk` (see Dockerfile). When the internal
+# PyPI is online this returns as a real dep + `[[tool.poetry.source]]`.
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"

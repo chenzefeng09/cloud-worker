@@ -1,0 +1,221 @@
+# =============================================================================
+# Agent Platform — Knowledge Ingest OpenAPI 3.1
+#
+# Document → embedding → pgvector chunks.  Search returns ranked chunks
+# scoped to the requesting tenant.
+# =============================================================================
+openapi: 3.1.0
+
+info:
+  title: Agent Platform — Knowledge Ingest
+  description: Upload, parse, embed, and search knowledge documents.
+  version: 0.1.0
+
+servers:
+  - url: http://localhost:8012
+    description: Local dev
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/knowledge/v1/documents:
+    get:
+      operationId: docs_list
+      tags: [Documents]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListPage' }
+    post:
+      operationId: docs_upload
+      tags: [Documents]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [title, mime, file]
+              properties:
+                title: { type: string }
+                mime: { type: string, enum: [text/plain, text/markdown, application/pdf] }
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '415': { $ref: '#/components/responses/Unsupported' }
+
+  /api/knowledge/v1/documents/{document_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - name: document_id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: docs_get
+      tags: [Documents]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/knowledge/v1/documents/{document_id}/ingest:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - name: document_id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      operationId: docs_ingest
+      summary: Parse + chunk + embed (synchronous in skeleton)
+      tags: [Documents]
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IngestResult' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/knowledge/v1/search:
+    get:
+      operationId: docs_search
+      tags: [Search]
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: q
+          in: query
+          required: true
+          schema: { type: string }
+        - name: k
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 50, default: 5 }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SearchResponse' }
+
+  /api/knowledge/v1/healthz:
+    get:
+      operationId: knowledge_healthz
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+  /api/knowledge/v1/readyz:
+    get:
+      operationId: knowledge_readyz
+      tags: [Health]
+      security: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthStatus' }
+
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+
+  parameters:
+    TenantIdHeader:
+      name: X-Tenant-Id
+      in: header
+      required: true
+      schema: { type: string }
+
+  schemas:
+    Document:
+      type: object
+      required: [id, tenant_id, title, mime, status, uploaded_at, chunk_count]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        title: { type: string }
+        mime: { type: string }
+        source_uri: { type: string, nullable: true }
+        status: { type: string, enum: [PENDING, INGESTING, READY, FAILED] }
+        uploaded_at: { type: string, format: date-time }
+        chunk_count: { type: integer, minimum: 0 }
+
+    IngestResult:
+      type: object
+      required: [document_id, status, chunks_created]
+      properties:
+        document_id: { type: string }
+        status: { type: string, enum: [PENDING, INGESTING, READY, FAILED] }
+        chunks_created: { type: integer, minimum: 0 }
+
+    SearchHit:
+      type: object
+      required: [document_id, chunk_id, ord, text, score]
+      properties:
+        document_id: { type: string }
+        chunk_id: { type: string }
+        ord: { type: integer }
+        text: { type: string }
+        score: { type: number }
+
+    SearchResponse:
+      type: object
+      required: [hits]
+      properties:
+        hits:
+          type: array
+          items: { $ref: '#/components/schemas/SearchHit' }
+
+    ListPage:
+      type: object
+      required: [items, total]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Document' } }
+        total: { type: integer, minimum: 0 }
+
+    HealthStatus:
+      type: object
+      required: [status, service]
+      properties:
+        status: { type: string }
+        service: { type: string }
+        version: { type: string }
+
+    Error:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+
+  responses:
+    NotFound:
+      description: Resource not found
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Unsupported:
+      description: MIME type not supported
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }

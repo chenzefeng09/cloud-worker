@@ -2,16 +2,17 @@
 FROM node:22-alpine
 
 WORKDIR /app
+RUN chown -R node:node /app
 
 # Node Alpine images already ship a non-root ``node`` user (uid 1000); reuse it
 # rather than creating a duplicate.
+USER node
 COPY --chown=node:node package.json package-lock.json* ./
 RUN npm ci || npm install
 
 COPY --chown=node:node . .
 
 ENV NODE_ENV=development
-USER node
 
 EXPOSE 5173
 

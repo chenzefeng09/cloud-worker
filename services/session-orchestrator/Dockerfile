@@ -18,6 +18,12 @@ COPY pyproject.toml poetry.lock* ./
 RUN poetry config virtualenvs.create false \
  && poetry install --no-root --without dev --no-interaction --no-ansi
 
+# Install boto3 + python-multipart from pre-fetched wheels (PyPI MITM workaround).
+# These are required for S3 attachment storage and multipart file uploads.
+COPY wheels/ /tmp/wheels/
+RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl \
+ && rm -rf /tmp/wheels
+
 COPY src/ ./src/
 COPY migrations/ ./migrations/
 COPY alembic.ini .

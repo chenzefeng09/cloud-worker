@@ -8,7 +8,15 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
-      '/api': { target: 'http://localhost:8005', changeOrigin: true },
+      // Inside the docker compose web container `localhost` is the container
+      // itself, not the host. BFF lives in a sibling container named `bff`
+      // on the same `foundation` network. Default target uses the in-cluster
+      // service name; override with VITE_BFF_PROXY=http://localhost:8005 for
+      // running `npm run dev` directly on the host.
+      '/api': {
+        target: process.env.VITE_BFF_PROXY ?? 'http://bff:8005',
+        changeOrigin: true,
+      },
     },
   },
   build: {

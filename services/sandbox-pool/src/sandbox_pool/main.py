@@ -10,6 +10,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from foundation_sdk.fastapi import install_request_context, register_problem_details
+from prometheus_client import CollectorRegistry, make_asgi_app
 
 from sandbox_pool.config import Settings
 from sandbox_pool.pool import Pool
@@ -63,7 +64,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
-    app.state.pool = Pool(settings)
+    # One registry per app so create_app() can be called repeatedly (tests,
+    # multi-worker setups) without "duplicated timeseries" errors.  The
+    # /metrics endpoint below scrapes the same registry the pool writes to.
+    registry = CollectorRegistry()
+    app.state.metrics_registry = registry
+    app.state.pool = Pool(settings, metrics_registry=registry)
 
     install_request_context(
         app, service_name="sandbox-pool", service_version="0.1.0a1",
@@ -75,6 +81,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.include_router(health_router, prefix=settings.api_prefix)
     app.include_router(sandboxes_router, prefix=settings.api_prefix)
+
+    # Prometheus scrape target — mounted at the conventional ``/metrics``
+    # path (outside the API prefix so the ServiceMonitor configuration
+    # in deploy/operator/README.md works without per-tier overrides).
+    app.mount("/metrics", make_asgi_app(registry=registry))
 
     return app
 

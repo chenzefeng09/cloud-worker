@@ -1,21 +1,17 @@
 # syntax=docker/dockerfile:1.7
-# See services/bff/Dockerfile for the rationale on the ``foundation_sdk``
-# additional context.
-FROM python:3.12-slim
+# Overlay pattern: base image already has fastapi/sqlalchemy/asyncpg/alembic/
+# foundation_sdk/opentelemetry/httpx. sandbox-pool needs docker SDK +
+# websocket-client + prometheus_client on top; install from pre-fetched wheels
+# to avoid the Docker Desktop PyPI MITM issue (see services/agent-scheduler/Dockerfile).
+FROM agent-platform-dev-session-orchestrator:latest
 
+USER root
 WORKDIR /app
+RUN rm -rf /app/src 2>/dev/null || true
 
-RUN groupadd --system --gid 1000 app \
- && useradd  --system --uid 1000 --gid app --create-home --shell /usr/sbin/nologin app
-
-RUN pip install --no-cache-dir poetry==2.1.4
-
-COPY --from=foundation_sdk . /sdk
-RUN pip install --no-cache-dir "/sdk[fastapi]"
-
-COPY pyproject.toml poetry.lock* ./
-RUN poetry config virtualenvs.create false \
- && poetry install --no-root --without dev --no-interaction --no-ansi
+COPY wheels/ /tmp/wheels/
+RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl \
+ && rm -rf /tmp/wheels
 
 COPY src/ ./src/
 RUN chown -R app:app /app

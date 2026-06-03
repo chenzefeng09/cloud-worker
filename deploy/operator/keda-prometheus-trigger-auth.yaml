@@ -1,0 +1,32 @@
+# TriggerAuthentication — credentials KEDA uses to query Prometheus
+# -----------------------------------------------------------------------------
+# Placeholder: in clusters where Prometheus requires bearer-token auth (e.g.
+# Prometheus Operator with kube-rbac-proxy in front), KEDA needs a token to
+# scrape it.  The secret referenced below is expected to live in the
+# ``agent-platform`` namespace and carry:
+#
+#   bearerToken: <base64 of a ServiceAccount token with read access to
+#                 ``sandbox_pool_*`` series>
+#   ca:          <base64 of the Prometheus serving CA bundle>
+#
+# Create the secret via your usual flow (sealed-secrets, ExternalSecrets,
+# Vault Agent injector, etc.) — committing the raw values here is by design
+# NOT supported.
+#
+# If your in-cluster Prometheus is open to scrapes from agent-platform, you
+# can omit the ``authenticationRef`` block in the ScaledObject and delete
+# this file entirely.
+# -----------------------------------------------------------------------------
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: sandbox-pool-prometheus-auth
+  namespace: agent-platform
+spec:
+  secretTargetRef:
+    - parameter: bearerToken
+      name: sandbox-pool-prometheus-credentials
+      key: bearerToken
+    - parameter: ca
+      name: sandbox-pool-prometheus-credentials
+      key: ca

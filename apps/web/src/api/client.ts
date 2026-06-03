@@ -1,4 +1,25 @@
-import type { CursorPage, LoginResponse, Message, Session, UserProfile } from './types';
+import type {
+  AdminUser,
+  AuditEvent,
+  AuditQueryRequest,
+  Attachment,
+  AttachmentKind,
+  CreateTenantRequest,
+  CursorPage,
+  KnowledgeDocument,
+  ListPage,
+  LoginResponse,
+  McpServer,
+  Message,
+  PatchTenantRequest,
+  PoolSnapshot,
+  QuotaInfo,
+  SandboxItem,
+  Session,
+  Skill,
+  Tenant,
+  UserProfile,
+} from './types';
 
 const BFF_BASE = '/api/bff/v1';
 
@@ -47,6 +68,8 @@ export const api = {
       request<Session>('PATCH', `/sessions/${id}`, data),
     delete: (id: string) =>
       request<void>('DELETE', `/sessions/${id}`),
+    cancel: (sessionId: string) =>
+      request<Record<string, unknown>>('POST', `/sessions/${sessionId}/cancel`),
   },
 
   messages: {
@@ -54,13 +77,98 @@ export const api = {
       request<CursorPage<Message>>('GET', `/sessions/${sessionId}/messages${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`),
   },
 
+  attachments: {
+    upload: async (sessionId: string, file: File): Promise<Attachment> => {
+      const formData = new FormData();
+      formData.append('file', file, file.name);
+      const res = await fetch(`${BFF_BASE}/sessions/${sessionId}/attachments`, {
+        method: 'POST',
+        body: formData,
+        credentials: 'include',
+        // No Content-Type header — browser sets multipart boundary automatically
+      });
+      if (!res.ok) {
+        const problem = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new ApiError(res.status, problem.code || 'UNKNOWN', problem.detail || 'Upload failed');
+      }
+      return res.json();
+    },
+    list: (sessionId: string, kind?: AttachmentKind) => {
+      const qs = kind ? `?kind=${encodeURIComponent(kind)}` : '';
+      return request<{ items: Attachment[] }>('GET', `/sessions/${sessionId}/attachments${qs}`);
+    },
+    getContent: async (sessionId: string, fileId: string): Promise<{ text: string | null; blob: Blob; mime: string }> => {
+      const res = await fetch(`${BFF_BASE}/sessions/${sessionId}/files/${fileId}/content`, {
+        credentials: 'include',
+      });
+      if (!res.ok) {
+        const problem = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new ApiError(res.status, problem.code || 'UNKNOWN', problem.detail || 'Fetch failed');
+      }
+      const mime = res.headers.get('content-type') || 'application/octet-stream';
+      const blob = await res.blob();
+      // For text-like content, also decode as string for preview
+      const isText = mime.startsWith('text/') || mime.includes('json') || mime.includes('xml') || mime.includes('yaml') || mime.includes('markdown');
+      let text: string | null = null;
+      if (isText) {
+        text = await blob.text();
+      }
+      return { text, blob, mime };
+    },
+  },
+
+  library: {
+    listMcpServers: () =>
+      request<ListPage<McpServer>>('GET', '/library/mcp-servers'),
+    listSkills: () =>
+      request<ListPage<Skill>>('GET', '/library/skills'),
+    listDocuments: () =>
+      request<ListPage<KnowledgeDocument>>('GET', '/library/documents'),
+  },
+
+  fleet: {
+    poolSnapshot: () =>
+      request<PoolSnapshot>('GET', '/fleet/pool'),
+    listSandboxes: () =>
+      request<{ items: SandboxItem[] }>('GET', '/fleet/sandboxes'),
+  },
+
+  admin: {
+    tenants: {
+      list: () =>
+        request<{ items: Tenant[] }>('GET', '/admin/tenants'),
+      create: (body: CreateTenantRequest) =>
+        request<Tenant>('POST', '/admin/tenants', body),
+      get: (tid: string) =>
+        request<Tenant>('GET', `/admin/tenants/${tid}`),
+      patch: (tid: string, body: PatchTenantRequest) =>
+        request<Tenant>('PATCH', `/admin/tenants/${tid}`, body),
+    },
+    users: {
+      list: (tenantId?: string) => {
+        const qs = tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : '';
+        return request<{ items: AdminUser[] }>('GET', `/admin/users${qs}`);
+      },
+    },
+    // TODO: BFF proxy for audit events — POST /admin/audit/events:query → foundation audit
+    audit: {
+      query: (body: AuditQueryRequest) =>
+        request<{ items: AuditEvent[]; next_cursor?: string }>('POST', '/admin/audit/events:query', body),
+    },
+    // TODO: BFF proxy for billing — GET /admin/billing/quota?tenant_id=
+    billing: {
+      quota: (tenantId: string) =>
+        request<QuotaInfo>('GET', `/admin/billing/quota?tenant_id=${encodeURIComponent(tenantId)}`),
+    },
+  },
+
   chat: {
-    send: (sessionId: string, message: string): AbortController => {
+    send: (sessionId: string, message: string, attachmentIds?: string[]): AbortController => {
       const controller = new AbortController();
       fetch(`${BFF_BASE}/sessions/${sessionId}/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message }),
+        body: JSON.stringify({ message, attachment_ids: attachmentIds || [] }),
         credentials: 'include',
         signal: controller.signal,
       });

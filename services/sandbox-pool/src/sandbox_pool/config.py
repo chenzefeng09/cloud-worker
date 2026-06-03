@@ -47,5 +47,17 @@ class Settings(BaseSettings):
     # "base"; production tiers add "office" / "matlab".
     warmup_templates: list[str] = ["base"]
 
+    # Docker runtime — mirrors agent-scheduler's setup.
+    # docker_host is picked up by the docker SDK via DOCKER_HOST env var when
+    # empty; set explicitly here only for tests or non-standard deployments.
+    docker_host: str = ""  # empty → SDK picks up DOCKER_HOST from env
+    # Sandbox image to run as idle containers.
+    sandbox_image: str = "ghcr.io/agent-platform/agentscope-sandbox:0.1"
+    # Docker network the pool-managed containers join (must match compose network).
+    docker_network: str = "saas-foundation-dev_foundation"
+    # Resource limits for idle sandbox containers (mirrors scheduler defaults).
+    sandbox_memory_limit: str = "2g"
+    sandbox_cpu_shares: int = 1024
+
     otel_enabled: bool = True
     otel_exporter_endpoint: str = "http://localhost:4317"

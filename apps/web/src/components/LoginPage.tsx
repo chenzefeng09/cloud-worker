@@ -38,10 +38,10 @@ export function LoginPage() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-surface-50">
       <div className="w-full max-w-sm p-8 bg-white rounded-xl shadow-sm border border-surface-200">
-        <h1 className="text-2xl font-semibold text-center mb-8">Agent Platform</h1>
+        <h1 className="text-2xl font-semibold text-center mb-8">Agent 平台</h1>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-1">Email</label>
+            <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-1">邮箱</label>
             <input
               id="email"
               type="email"
@@ -53,7 +53,7 @@ export function LoginPage() {
             />
           </div>
           <div>
-            <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-1">Password</label>
+            <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-1">密码</label>
             <input
               id="password"
               type="password"
@@ -69,7 +69,7 @@ export function LoginPage() {
             disabled={loading}
             className="w-full py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 font-medium"
           >
-            {loading ? 'Signing in…' : 'Sign In'}
+            {loading ? '登录中…' : '登录'}
           </button>
         </form>
       </div>

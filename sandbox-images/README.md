@@ -1,5 +1,13 @@
 # sandbox-images — agent-side container/microVM images
 
+> **Smoke-test note (B-M1):** ``base.Dockerfile`` is the *only* image
+> required to run the local end-to-end smoke (login → session → LLM
+> reply).  It currently ships AgentScope 2.x + httpx + pydantic + pypdf
+> and intentionally omits Chromium/Playwright to keep the image ~700 MB
+> and the smoke-build under 6 minutes.  ``office.Dockerfile`` and
+> ``matlab.Dockerfile`` are layered tiers used by later milestones and
+> are not required for the smoke flow.
+
 Three layers, each adds capability on top of the previous:
 
 ```

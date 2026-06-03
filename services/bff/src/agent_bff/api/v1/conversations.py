@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -12,6 +13,50 @@ from agent_bff.api._http import foundation_headers
 from agent_bff.api.dependencies import require_auth
 
 router = APIRouter(tags=["Conversations"])
+logger = logging.getLogger(__name__)
+
+
+async def _resolve_attachment_files(
+    *,
+    client: httpx.AsyncClient,
+    orch_url: str,
+    session_id: str,
+    attachment_ids: list[str],
+    headers: dict[str, str],
+) -> list[dict]:
+    """Fetch attachment metadata from orchestrator and return files list.
+
+    Failure-open: if the attachment list fetch fails, we log a warning and
+    return an empty list so the run proceeds without files rather than failing.
+    """
+    if not attachment_ids:
+        return []
+    try:
+        resp = await client.get(
+            f"{orch_url}/sessions/{session_id}/attachments",
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            logger.warning("attachment list fetch failed: HTTP %s", resp.status_code)
+            return []
+        data = resp.json()
+        items = data.get("items", [])
+        att_map = {a["id"]: a for a in items}
+        files = []
+        for aid in attachment_ids:
+            att = att_map.get(aid)
+            if att:
+                files.append({
+                    "key": att["blob_key"],
+                    "filename": att["filename"],
+                    "mime": att.get("mime", "application/octet-stream"),
+                })
+            else:
+                logger.warning("attachment id %s not found in session", aid)
+        return files
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("resolve_attachment_files error: %s", exc)
+        return []
 
 
 @router.post("/sessions/{session_id}/chat")
@@ -20,11 +65,18 @@ async def chat(
     request: Request,
     _auth: tuple = Depends(require_auth()),
 ) -> StreamingResponse:
-    """Send a user message, trigger run, relay SSE stream from orchestrator."""
+    """Send a user message, trigger run, relay SSE stream from orchestrator.
+
+    Body fields:
+    * ``message``        — required, user text
+    * ``attachment_ids`` — optional list of attachment ids already uploaded to
+                           this session; they will be downloaded into the sandbox
+    """
     tenant_id, user_id, access_token = _auth
     orch_url = request.app.state.settings.session_orchestrator_url
     body = await request.json()
     message_text = body.get("message", "")
+    attachment_ids: list[str] = body.get("attachment_ids") or []
 
     async def event_generator():
         async with httpx.AsyncClient(timeout=600) as client:
@@ -46,10 +98,19 @@ async def chat(
             msg = resp.json()
             yield f"event: message_created\ndata: {json.dumps(msg)}\n\n"
 
-            # 2. Trigger run
+            # 2. Resolve attachment files (failure-open)
+            files = await _resolve_attachment_files(
+                client=client,
+                orch_url=orch_url,
+                session_id=session_id,
+                attachment_ids=attachment_ids,
+                headers=headers,
+            )
+
+            # 3. Trigger run (pass files so worker downloads them)
             resp = await client.post(
                 f"{orch_url}/sessions/{session_id}/runs",
-                json={"task": message_text},
+                json={"task": message_text, "files": files},
                 headers=headers,
             )
             if resp.status_code >= 400:
@@ -62,7 +123,7 @@ async def chat(
             run = resp.json()
             yield f"event: run_started\ndata: {json.dumps(run)}\n\n"
 
-            # 3. Relay orchestrator SSE messages verbatim.
+            # 4. Relay orchestrator SSE messages verbatim.
             async with client.stream(
                 "GET",
                 f"{orch_url}/sessions/{session_id}/messages/stream",

@@ -1,0 +1,43 @@
+[tool.poetry]
+name = "mcp-registry"
+version = "0.1.0a1"
+description = "Tenant MCP server registry — list/manage MCP backends per tenant"
+authors = ["Agent Platform Team"]
+packages = [{ include = "mcp_registry", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.115.0"
+uvicorn = { extras = ["standard"], version = "^0.32.0" }
+pydantic = { extras = ["email"], version = "^2.9.0" }
+pydantic-settings = "^2.6.0"
+sqlalchemy = { extras = ["asyncio"], version = "^2.0.36" }
+asyncpg = "^0.30.0"
+aiosqlite = "^0.20.0"
+alembic = "^1.14.0"
+httpx = "^0.28.0"
+# foundation-sdk is injected at image-build time via Dockerfile `pip install /sdk[fastapi]`
+# (docker-compose additional_contexts: foundation_sdk). Not declared here to avoid
+# PyPI version conflicts during `poetry lock`. See services/bff/Dockerfile for pattern.
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
+pytest-asyncio = "^0.24.0"
+pytest-cov = "^6.0.0"
+ruff = "^0.7.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "--cov=src/mcp_registry --cov-report=term-missing --cov-fail-under=75"
