@@ -31,6 +31,10 @@ htmlcov/
 htmlcov/
 test-results/
 
+# Compiled JS accidentally emitted into the TS source tree
+# (tsc must run with noEmit; Vite handles transpilation)
+apps/web/src/**/*.js
+
 # Editor / OS
 .idea/
 .vscode/
