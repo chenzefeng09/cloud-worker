@@ -85,35 +85,50 @@ def upgrade() -> None:
         schema="session_orchestrator",
     )
 
+    # ------------------------------------------------------------------ grants
+    # Grant schema USAGE and table-level DML to the runtime role so that
+    # app_user (which connects as a non-owner) can reach the tables.
+    op.execute("GRANT USAGE ON SCHEMA session_orchestrator TO app_user")
+    for table in _TENANT_TABLES:
+        op.execute(
+            f"GRANT SELECT, INSERT, UPDATE, DELETE"
+            f" ON session_orchestrator.{table} TO app_user"
+        )
+
     # ------------------------------------------------------------------ RLS
     # Per ``saas-foundation/docs/multi-tenancy.md §7.2``: enable + force RLS,
     # then four explicit policies per table (FOR ALL is intentionally avoided
     # because UPDATE needs both USING and WITH CHECK to block tenant_id
     # rewrites).  app_user is the only runtime role; admin operations get
     # their own policies in a later migration.
-    _RLS_TEMPLATE = """
-        ALTER TABLE session_orchestrator.{t} ENABLE ROW LEVEL SECURITY;
-        ALTER TABLE session_orchestrator.{t} FORCE ROW LEVEL SECURITY;
-
-        CREATE POLICY {t}_tenant_select ON session_orchestrator.{t}
-            FOR SELECT TO app_user
-            USING (tenant_id = current_setting('app.tenant_id', true));
-
-        CREATE POLICY {t}_tenant_insert ON session_orchestrator.{t}
-            FOR INSERT TO app_user
-            WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
-
-        CREATE POLICY {t}_tenant_update ON session_orchestrator.{t}
-            FOR UPDATE TO app_user
-            USING (tenant_id = current_setting('app.tenant_id', true))
-            WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
-
-        CREATE POLICY {t}_tenant_delete ON session_orchestrator.{t}
-            FOR DELETE TO app_user
-            USING (tenant_id = current_setting('app.tenant_id', true));
-    """
+    #
+    # Each statement is executed individually because asyncpg (the runtime
+    # driver) uses prepared statements and does not allow multiple commands
+    # in a single execute() call.
     for table in _TENANT_TABLES:
-        op.execute(_RLS_TEMPLATE.format(t=table))
+        op.execute(f"ALTER TABLE session_orchestrator.{table} ENABLE ROW LEVEL SECURITY")
+        op.execute(f"ALTER TABLE session_orchestrator.{table} FORCE ROW LEVEL SECURITY")
+        op.execute(
+            f"CREATE POLICY {table}_tenant_select ON session_orchestrator.{table}"
+            f" FOR SELECT TO app_user"
+            f" USING (tenant_id = current_setting('app.tenant_id', true))"
+        )
+        op.execute(
+            f"CREATE POLICY {table}_tenant_insert ON session_orchestrator.{table}"
+            f" FOR INSERT TO app_user"
+            f" WITH CHECK (tenant_id = current_setting('app.tenant_id', true))"
+        )
+        op.execute(
+            f"CREATE POLICY {table}_tenant_update ON session_orchestrator.{table}"
+            f" FOR UPDATE TO app_user"
+            f" USING (tenant_id = current_setting('app.tenant_id', true))"
+            f" WITH CHECK (tenant_id = current_setting('app.tenant_id', true))"
+        )
+        op.execute(
+            f"CREATE POLICY {table}_tenant_delete ON session_orchestrator.{table}"
+            f" FOR DELETE TO app_user"
+            f" USING (tenant_id = current_setting('app.tenant_id', true))"
+        )
 
 
 def downgrade() -> None:

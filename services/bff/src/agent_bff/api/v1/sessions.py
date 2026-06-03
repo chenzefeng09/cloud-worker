@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import httpx
 from fastapi import APIRouter, Depends, Request, Response, UploadFile
+from fastapi.responses import JSONResponse
 
 from agent_bff.api._http import foundation_headers
 from agent_bff.api.dependencies import require_auth
@@ -24,13 +25,24 @@ async def _orchestrator_url(request: Request) -> str:
     return request.app.state.settings.session_orchestrator_url
 
 
+def _proxy_json(resp: httpx.Response) -> JSONResponse:
+    """Return a JSONResponse that faithfully forwards the upstream status code.
+
+    Handles 204 / empty body safely: returns an empty JSON object rather than
+    blowing up on ``resp.json()`` when there is no body.
+    """
+    if not resp.content:
+        return JSONResponse(content=None, status_code=resp.status_code)
+    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+
 @router.get("/sessions")
 async def list_sessions(
     request: Request,
     cursor: str | None = None,
     limit: int = 50,
     _auth: tuple = Depends(require_auth()),
-) -> dict:
+) -> JSONResponse:
     tenant_id, user_id, access_token = _auth
     orch_url = await _orchestrator_url(request)
     params = {"limit": limit}
@@ -43,14 +55,14 @@ async def list_sessions(
             params=params,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-        return resp.json()
+        return _proxy_json(resp)
 
 
 @router.post("/sessions", status_code=201)
 async def create_session(
     request: Request,
     _auth: tuple = Depends(require_auth()),
-) -> dict:
+) -> JSONResponse:
     tenant_id, user_id, access_token = _auth
     body = await request.json() if await request.body() else {}
 
@@ -61,7 +73,7 @@ async def create_session(
             json=body,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-        return resp.json()
+        return _proxy_json(resp)
 
 
 @router.get("/sessions/{session_id}")
@@ -69,7 +81,7 @@ async def get_session(
     session_id: str,
     request: Request,
     _auth: tuple = Depends(require_auth()),
-) -> dict:
+) -> JSONResponse:
     tenant_id, user_id, access_token = _auth
     orch_url = await _orchestrator_url(request)
     async with httpx.AsyncClient(timeout=15) as client:
@@ -77,7 +89,7 @@ async def get_session(
             f"{orch_url}/sessions/{session_id}",
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-        return resp.json()
+        return _proxy_json(resp)
 
 
 @router.patch("/sessions/{session_id}")
@@ -85,7 +97,7 @@ async def update_session(
     session_id: str,
     request: Request,
     _auth: tuple = Depends(require_auth()),
-) -> dict:
+) -> JSONResponse:
     tenant_id, user_id, access_token = _auth
     body = await request.json() if await request.body() else {}
     orch_url = await _orchestrator_url(request)
@@ -95,7 +107,7 @@ async def update_session(
             json=body,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-        return resp.json()
+        return _proxy_json(resp)
 
 
 @router.delete("/sessions/{session_id}", status_code=204)
@@ -119,7 +131,7 @@ async def cancel_session(
     session_id: str,
     request: Request,
     _auth: tuple = Depends(require_auth()),
-) -> dict:
+) -> JSONResponse:
     """Cancel the current active run for a session.
 
     Proxies to orchestrator POST /sessions/{session_id}/cancel.
@@ -131,7 +143,7 @@ async def cancel_session(
             f"{orch_url}/sessions/{session_id}/cancel",
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-        return resp.json()
+        return _proxy_json(resp)
 
 
 @router.get("/sessions/{session_id}/messages")
@@ -141,7 +153,7 @@ async def list_messages(
     cursor: str | None = None,
     limit: int = 50,
     _auth: tuple = Depends(require_auth()),
-) -> dict:
+) -> JSONResponse:
     """Proxy the transcript fetch so the SPA can hydrate after refresh."""
     tenant_id, user_id, access_token = _auth
     orch_url = await _orchestrator_url(request)
@@ -154,7 +166,7 @@ async def list_messages(
             params=params,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-        return resp.json()
+        return _proxy_json(resp)
 
 
 # --------------------------------------------------------------------------- #
@@ -168,7 +180,7 @@ async def upload_attachment(
     file: UploadFile,
     request: Request,
     _auth: tuple = Depends(require_auth()),
-) -> dict:
+) -> JSONResponse:
     """Proxy multipart upload to session-orchestrator.
 
     httpx supports multipart forwarding natively via the ``files=`` arg.
@@ -188,9 +200,7 @@ async def upload_attachment(
             files={"file": (filename, data, content_type)},
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    if resp.status_code >= 400:
-        return resp.json()
-    return resp.json()
+    return _proxy_json(resp)
 
 
 @router.get("/sessions/{session_id}/attachments")
@@ -199,7 +209,7 @@ async def list_attachments(
     request: Request,
     kind: str | None = None,
     _auth: tuple = Depends(require_auth()),
-) -> dict:
+) -> JSONResponse:
     """Proxy attachment listing from session-orchestrator.
 
     Optional ``kind`` query param: ``input`` or ``output``.
@@ -215,7 +225,7 @@ async def list_attachments(
             params=params,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-        return resp.json()
+        return _proxy_json(resp)
 
 
 @router.get("/sessions/{session_id}/files/{file_id}/content")

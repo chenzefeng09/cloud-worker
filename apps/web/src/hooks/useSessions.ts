@@ -13,7 +13,10 @@ export function useSessions() {
     setError(null);
     try {
       const page = await api.sessions.list();
-      setSessions(page.items);
+      // The BFF can hand back a 200 whose body is actually a downstream error
+      // object (no `items`). Guard so a malformed page never poisons the store
+      // with `undefined` — that used to crash <Sidebar> on `sessions.length`.
+      setSessions(Array.isArray(page?.items) ? page.items : []);
     } catch (e) {
       setError((e as Error).message);
     } finally {

@@ -48,30 +48,33 @@ def upgrade() -> None:
         schema="session_orchestrator",
     )
 
-    _RLS = """
-        GRANT SELECT, INSERT, UPDATE, DELETE ON session_orchestrator.attachment TO app_user;
-
-        ALTER TABLE session_orchestrator.attachment ENABLE ROW LEVEL SECURITY;
-        ALTER TABLE session_orchestrator.attachment FORCE ROW LEVEL SECURITY;
-
-        CREATE POLICY attachment_tenant_select ON session_orchestrator.attachment
-            FOR SELECT TO app_user
-            USING (tenant_id = current_setting('app.tenant_id', true));
-
-        CREATE POLICY attachment_tenant_insert ON session_orchestrator.attachment
-            FOR INSERT TO app_user
-            WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
-
-        CREATE POLICY attachment_tenant_update ON session_orchestrator.attachment
-            FOR UPDATE TO app_user
-            USING (tenant_id = current_setting('app.tenant_id', true))
-            WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
-
-        CREATE POLICY attachment_tenant_delete ON session_orchestrator.attachment
-            FOR DELETE TO app_user
-            USING (tenant_id = current_setting('app.tenant_id', true));
-    """
-    op.execute(_RLS)
+    # Each statement is executed individually because asyncpg (the runtime
+    # driver) uses prepared statements and does not allow multiple commands
+    # in a single execute() call.
+    op.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON session_orchestrator.attachment TO app_user")
+    op.execute("ALTER TABLE session_orchestrator.attachment ENABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE session_orchestrator.attachment FORCE ROW LEVEL SECURITY")
+    op.execute(
+        "CREATE POLICY attachment_tenant_select ON session_orchestrator.attachment"
+        " FOR SELECT TO app_user"
+        " USING (tenant_id = current_setting('app.tenant_id', true))"
+    )
+    op.execute(
+        "CREATE POLICY attachment_tenant_insert ON session_orchestrator.attachment"
+        " FOR INSERT TO app_user"
+        " WITH CHECK (tenant_id = current_setting('app.tenant_id', true))"
+    )
+    op.execute(
+        "CREATE POLICY attachment_tenant_update ON session_orchestrator.attachment"
+        " FOR UPDATE TO app_user"
+        " USING (tenant_id = current_setting('app.tenant_id', true))"
+        " WITH CHECK (tenant_id = current_setting('app.tenant_id', true))"
+    )
+    op.execute(
+        "CREATE POLICY attachment_tenant_delete ON session_orchestrator.attachment"
+        " FOR DELETE TO app_user"
+        " USING (tenant_id = current_setting('app.tenant_id', true))"
+    )
 
 
 def downgrade() -> None:
