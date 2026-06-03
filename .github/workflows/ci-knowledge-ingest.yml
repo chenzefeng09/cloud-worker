@@ -1,0 +1,33 @@
+name: CI - Knowledge Ingest
+on:
+  push:
+    paths: ['services/knowledge-ingest/**', '.github/workflows/ci-knowledge-ingest.yml', '.github/actions/setup-service/**']
+  pull_request:
+    paths: ['services/knowledge-ingest/**']
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: knowledge-ingest }
+      - run: cd services/knowledge-ingest && poetry run ruff check .
+      - run: cd services/knowledge-ingest && poetry run mypy src/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: knowledge-ingest }
+      - run: cd services/knowledge-ingest && poetry run pytest --cov=src --cov-fail-under=75
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: knowledge-ingest }
+      - uses: gitleaks/gitleaks-action@v2
+      - run: cd services/knowledge-ingest && poetry run pip-licenses --fail-on="GPL;AGPL"

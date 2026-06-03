@@ -1,0 +1,33 @@
+name: CI - MCP Registry
+on:
+  push:
+    paths: ['services/mcp-registry/**', '.github/workflows/ci-mcp-registry.yml', '.github/actions/setup-service/**']
+  pull_request:
+    paths: ['services/mcp-registry/**']
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: mcp-registry }
+      - run: cd services/mcp-registry && poetry run ruff check .
+      - run: cd services/mcp-registry && poetry run mypy src/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: mcp-registry }
+      - run: cd services/mcp-registry && poetry run pytest --cov=src --cov-fail-under=75
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: mcp-registry }
+      - uses: gitleaks/gitleaks-action@v2
+      - run: cd services/mcp-registry && poetry run pip-licenses --fail-on="GPL;AGPL"

@@ -11,7 +11,7 @@ FOUNDATION_DIR := /Users/chenzefeng/Development/saas-foundation
 COMPOSE_FOUNDATION := docker compose -f $(FOUNDATION_DIR)/deploy/docker-compose/dev.yml --env-file $(FOUNDATION_DIR)/deploy/docker-compose/.env
 COMPOSE_AGENT := docker compose -f deploy/docker-compose/agent-platform.yml --env-file $(FOUNDATION_DIR)/deploy/docker-compose/.env --env-file deploy/docker-compose/.env
 
-SERVICES := bff session-orchestrator agent-scheduler sandbox-pool
+SERVICES := bff session-orchestrator agent-scheduler sandbox-pool skill-store knowledge-ingest mcp-registry
 
 BOLD := \033[1m
 GREEN := \033[32m

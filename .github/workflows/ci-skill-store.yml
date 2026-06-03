@@ -1,0 +1,33 @@
+name: CI - Skill Store
+on:
+  push:
+    paths: ['services/skill-store/**', '.github/workflows/ci-skill-store.yml', '.github/actions/setup-service/**']
+  pull_request:
+    paths: ['services/skill-store/**']
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: skill-store }
+      - run: cd services/skill-store && poetry run ruff check .
+      - run: cd services/skill-store && poetry run mypy src/
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: skill-store }
+      - run: cd services/skill-store && poetry run pytest --cov=src --cov-fail-under=75
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-service
+        with: { service: skill-store }
+      - uses: gitleaks/gitleaks-action@v2
+      - run: cd services/skill-store && poetry run pip-licenses --fail-on="GPL;AGPL"
