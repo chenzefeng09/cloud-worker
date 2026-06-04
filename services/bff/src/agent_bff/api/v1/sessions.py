@@ -45,7 +45,7 @@ async def list_sessions(
 ) -> JSONResponse:
     tenant_id, user_id, access_token = _auth
     orch_url = await _orchestrator_url(request)
-    params = {"limit": limit}
+    params: dict[str, int | str] = {"limit": limit}
     if cursor:
         params["cursor"] = cursor
 

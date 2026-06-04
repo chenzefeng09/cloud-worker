@@ -10,11 +10,10 @@ Verifies fail-closed behaviour:
 
 from __future__ import annotations
 
-import pytest
 import httpx
+import pytest
 
 from agent_scheduler.services.quota_guard import QuotaGuard
-
 
 # ---------------------------------------------------------------------------
 # Helpers

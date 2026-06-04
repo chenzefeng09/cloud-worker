@@ -36,11 +36,13 @@ async def db_session(
 
 
 def get_blob_store(request: Request) -> BlobStore:
-    return request.app.state.blob_store
+    blob_store: BlobStore = request.app.state.blob_store
+    return blob_store
 
 
 def get_embeddings(request: Request) -> EmbeddingClient:
-    return request.app.state.embeddings
+    embeddings: EmbeddingClient = request.app.state.embeddings
+    return embeddings
 
 
 TDbSession = Depends(db_session)

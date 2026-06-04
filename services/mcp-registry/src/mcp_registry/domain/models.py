@@ -47,7 +47,7 @@ class McpServer(Base):
     transport: Mapped[str] = mapped_column(String(20), nullable=False)
     endpoint: Mapped[str | None] = mapped_column(String(500), nullable=True)
     command: Mapped[str | None] = mapped_column(String(500), nullable=True)
-    env: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    env: Mapped[dict[str, str]] = mapped_column(JSON, nullable=False, default=dict)
     # ``scopes`` is a list of strings — TEXT[] on Postgres, JSON on SQLite.
     scopes: Mapped[list[str]] = mapped_column(_SCOPES_TYPE, nullable=False, default=list)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

@@ -32,7 +32,7 @@ def parse_document(*, mime: str, data: bytes) -> str:
 
 
 def _parse_pdf(data: bytes) -> str:
-    from pypdf import PdfReader  # type: ignore[import-not-found]
+    from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(data))
     pages = [page.extract_text() or "" for page in reader.pages]

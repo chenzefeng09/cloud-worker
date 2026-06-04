@@ -88,7 +88,7 @@ async def delete_session(
     session_id: str,
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
-) -> None:
+) -> Response:
     svc = SessionService(db, tenant_id=tenant_id)
     await svc.delete_session(session_id)
     return Response(status_code=204)

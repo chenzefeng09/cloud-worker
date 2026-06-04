@@ -82,7 +82,6 @@ def test_upload_attachment(
 ) -> None:
     """POST /attachments stores blob and returns attachment metadata."""
     session = _fake_session()
-    att = _fake_attachment()
 
     async def _refresh(obj: Attachment) -> None:
         obj.id = "att_001"

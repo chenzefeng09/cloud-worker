@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -87,19 +88,20 @@ async def _fetch_memory(*, knowledge_ingest_url: str, tenant_id: str, query: str
 
 
 async def _get_scheduler_url(request: Request) -> str:
-    return request.app.state.settings.agent_scheduler_url
+    url: str = request.app.state.settings.agent_scheduler_url
+    return url
 
 
 @router.post("/sessions/{session_id}/runs", status_code=201,
              dependencies=[Depends(require_permission("run.create", "run"))])
 async def create_run(
     session_id: str,
-    body: dict,
+    body: dict[str, Any],
     request: Request,
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     user_id: str = TUserId,
-) -> dict:
+) -> dict[str, Any]:
     svc = SessionService(db, tenant_id=tenant_id)
     session = await svc.get_session(session_id)
 
@@ -111,7 +113,7 @@ async def create_run(
     headers = {"X-Tenant-Id": tenant_id, "X-User-Id": user_id}
 
     # Optional attachment files — [{"key": s3key, "filename": name, "mime": mime}, ...]
-    files: list[dict] = body.get("files") or []
+    files: list[dict[str, Any]] = body.get("files") or []
 
     # Pre-fetch relevant memory from knowledge-ingest; failure-open.
     knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
@@ -185,7 +187,7 @@ async def list_runs(
     session_id: str,
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
-) -> dict:
+) -> dict[str, Any]:
     svc = SessionService(db, tenant_id=tenant_id)
     runs = await svc.list_runs(session_id)
     return {
@@ -217,7 +219,7 @@ async def get_run(
     run_id: str,
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
-) -> dict:
+) -> dict[str, Any]:
     svc = SessionService(db, tenant_id=tenant_id)
     run = await svc.get_run(session_id, run_id)
     return {
@@ -245,7 +247,7 @@ async def _do_cancel_run(
     db: AsyncSession,
     tenant_id: str,
     user_id: str,
-) -> dict:
+) -> dict[str, Any]:
     """Core cancel logic — shared by the run-level and session-level endpoints."""
     svc = SessionService(db, tenant_id=tenant_id)
     run = await svc.get_run(session_id, run_id)
@@ -289,7 +291,7 @@ async def daily_token_usage(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     days: int = Query(default=7, ge=1, le=90),
-) -> dict:
+) -> dict[str, Any]:
     """Return per-day token totals for the last N days (default 7).
 
     SQL: SELECT date(created_at) AS day, SUM(COALESCE(total_tokens, 0)) AS tokens
@@ -323,7 +325,7 @@ async def daily_token_usage(
 
     # Generate the full range of the last N days (today is index days-1).
     today = dt.date.today()
-    out: list[dict] = []
+    out: list[dict[str, Any]] = []
     for i in range(days):
         d = today - dt.timedelta(days=days - 1 - i)
         key = d.isoformat()
@@ -341,7 +343,7 @@ async def cancel_run(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     user_id: str = TUserId,
-) -> dict:
+) -> dict[str, Any]:
     return await _do_cancel_run(
         session_id=session_id,
         run_id=run_id,
@@ -360,7 +362,7 @@ async def cancel_session_run(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     user_id: str = TUserId,
-) -> dict:
+) -> dict[str, Any]:
     """Convenience endpoint: cancel the current active run for a session.
 
     The frontend only knows the session_id at cancel time; this endpoint
@@ -372,7 +374,7 @@ async def cancel_session_run(
     from agent_session_orchestrator.domain.models import Run as _Run
 
     svc = SessionService(db, tenant_id=tenant_id)
-    session = await svc.get_session(session_id)
+    await svc.get_session(session_id)
 
     # Find the most recent RUNNING or PENDING run for this session.
     stmt = (

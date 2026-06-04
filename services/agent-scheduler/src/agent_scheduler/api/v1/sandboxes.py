@@ -13,6 +13,8 @@ caller who guessed (or scraped from logs) another tenant's container id
 could stop a workload they don't own.
 """
 
+from typing import Any
+
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 
 from agent_scheduler.api.authz_guard import require_permission
@@ -28,7 +30,7 @@ router = APIRouter(tags=["Sandboxes"])
 async def list_sandboxes(
     runtime: DockerRuntime = TRuntime,
     tenant_id: str = TTenantId,
-) -> dict:
+) -> dict[str, Any]:
     items = runtime.list_containers(tenant_id=tenant_id)
     return {"items": items}
 

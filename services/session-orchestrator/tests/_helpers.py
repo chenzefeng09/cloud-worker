@@ -33,7 +33,7 @@ class AuthzAwareClient:
     URLs while this base handles authz transparently.
     """
 
-    async def __aenter__(self) -> "AuthzAwareClient":
+    async def __aenter__(self) -> AuthzAwareClient:
         return self
 
     async def __aexit__(self, *args: Any) -> None:

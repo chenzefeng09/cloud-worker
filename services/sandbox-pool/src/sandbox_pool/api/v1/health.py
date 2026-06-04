@@ -8,12 +8,12 @@ router = APIRouter(tags=["Health"])
 
 
 @router.get("/healthz")
-async def healthz() -> dict:
+async def healthz() -> dict[str, str]:
     return {"status": "OK", "service": "sandbox-pool", "version": "0.1.0a1"}
 
 
 @router.get("/readyz")
-async def readyz(request: Request) -> dict:
+async def readyz(request: Request) -> dict[str, object]:
     """Ready when the in-memory pool is reachable.
 
     Once we wire the CubeSandbox controller, this probe should additionally

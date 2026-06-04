@@ -17,16 +17,13 @@ Covers:
 from __future__ import annotations
 
 import hashlib
-from collections.abc import AsyncIterator
 from typing import Any
 
-import pytest
 import pytest_asyncio
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from agent_bff.domain.db import set_session_factory
 from agent_bff.domain.models import Base
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SQLite in-memory DB fixture (replaces Postgres for unit tests)

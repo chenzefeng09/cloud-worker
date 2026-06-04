@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from alembic import context
 from skill_store.config import Settings
 from skill_store.domain.models import Base
 

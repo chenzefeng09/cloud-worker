@@ -17,7 +17,7 @@ class S3BlobStore:
         client: Any | None = None,
     ) -> None:
         if client is None:
-            import boto3  # type: ignore[import-not-found]
+            import boto3
 
             client = boto3.client(
                 "s3",
@@ -35,18 +35,20 @@ class S3BlobStore:
 
     def get(self, key: str) -> bytes:
         obj = self._client.get_object(Bucket=self._bucket, Key=key)
-        return obj["Body"].read()
+        data: bytes = obj["Body"].read()
+        return data
 
     def delete(self, key: str) -> None:
         self._client.delete_object(Bucket=self._bucket, Key=key)
 
     def presign_get(self, key: str, *, ttl_seconds: int = 600) -> str:
         """Return a pre-signed URL the client can GET directly."""
-        return self._client.generate_presigned_url(
+        result: str = self._client.generate_presigned_url(
             ClientMethod="get_object",
             Params={"Bucket": self._bucket, "Key": key},
             ExpiresIn=ttl_seconds,
         )
+        return result
 
     def list_prefix(self, prefix: str) -> list[str]:
         """Return all object keys under ``prefix`` (handles pagination)."""

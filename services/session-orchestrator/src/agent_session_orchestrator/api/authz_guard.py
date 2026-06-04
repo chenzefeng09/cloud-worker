@@ -79,11 +79,11 @@ def require_permission(action: str, resource_type: str) -> Callable[..., Any]:
                     },
                     headers={"X-Tenant-Id": tenant_id},
                 )
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError):
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="RBAC: authz service unreachable",
-            )
+            ) from exc
 
         # ── Deny point 3: non-200 response ──────────────────────────────────
         if resp.status_code != 200:
@@ -99,7 +99,7 @@ def require_permission(action: str, resource_type: str) -> Callable[..., Any]:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="RBAC: authz response unparseable",
-            )
+            ) from None
 
         if body.get("allowed") is not True:
             raise HTTPException(

@@ -21,7 +21,7 @@ class S3BlobStore:
         client: Any | None = None,
     ) -> None:
         if client is None:
-            import boto3  # type: ignore[import-not-found]
+            import boto3
 
             client = boto3.client(
                 "s3",

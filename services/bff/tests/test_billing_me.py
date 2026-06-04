@@ -18,7 +18,6 @@ from typing import Any
 import httpx
 import pytest
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Fake upstream that handles billing + identity /mfa/methods
 # ──────────────────────────────────────────────────────────────────────────────

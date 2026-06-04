@@ -28,7 +28,7 @@ import asyncio
 import logging
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from agent_bff.api._http import foundation_headers
 from agent_bff.api.dependencies import require_auth
@@ -72,7 +72,7 @@ async def require_super_admin_bff(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="ADMIN: authz service unreachable",
-        )
+        ) from exc
 
     if resp.status_code != 200:
         raise HTTPException(
@@ -86,7 +86,7 @@ async def require_super_admin_bff(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="ADMIN: authz response unparseable",
-        )
+        ) from None
 
     if body.get("allowed") is not True:
         raise HTTPException(

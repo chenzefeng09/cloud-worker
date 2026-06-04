@@ -6,7 +6,6 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -97,7 +96,7 @@ def fake_topo(monkeypatch: pytest.MonkeyPatch) -> FakeFoundationTopology:
         def __init__(self, *args, **kwargs) -> None:
             pass
 
-        async def __aenter__(self) -> "_AsyncClient":
+        async def __aenter__(self) -> _AsyncClient:
             return self
 
         async def __aexit__(self, *args) -> None:

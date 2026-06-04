@@ -59,7 +59,8 @@ class SessionService:
         return rows, next_cursor
 
     async def create_session(
-        self, *, user_id: str, title: str | None = None, metadata: dict | None = None
+        self, *, user_id: str, title: str | None = None,
+        metadata: dict[str, object] | None = None,
     ) -> Session:
         session = Session(
             tenant_id=self._tenant_id,
@@ -105,7 +106,7 @@ class SessionService:
         *,
         role: str,
         content: str,
-        tool_calls: dict | None = None,
+        tool_calls: dict[str, object] | None = None,
         run_id: str | None = None,
     ) -> Message:
         await self.get_session(session_id)
@@ -207,7 +208,9 @@ class SessionService:
         await self._db.refresh(att)
         return att
 
-    async def list_attachments(self, session_id: str, *, kind: str | None = None) -> list[Attachment]:
+    async def list_attachments(
+        self, session_id: str, *, kind: str | None = None,
+    ) -> list[Attachment]:
         await self.get_session(session_id)
         stmt = (
             select(Attachment)

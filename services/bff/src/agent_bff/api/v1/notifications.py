@@ -21,7 +21,6 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_bff.api.dependencies import require_auth
 from agent_bff.domain import db as db_module

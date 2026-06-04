@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -71,7 +73,7 @@ class ApiKeyIdentity:
     tenant_id: str
 
 
-def require_api_key():
+def require_api_key() -> Callable[..., Coroutine[Any, Any, ApiKeyIdentity]]:
     """FastAPI dependency: validate an API key and return its identity.
 
     Returns an ``ApiKeyIdentity`` on success.  Raises 401 on any failure.

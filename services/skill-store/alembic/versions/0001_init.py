@@ -10,8 +10,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision: str = "0001_init"
 down_revision: str | None = None
@@ -53,7 +54,9 @@ def upgrade() -> None:
             index=True,
         ),
         sa.Column("version", sa.String(40), nullable=False),
-        sa.Column("manifest", postgresql.JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")),
+        sa.Column(
+            "manifest", postgresql.JSONB, nullable=False, server_default=sa.text("'{}'::jsonb")
+        ),
         sa.Column("blob_url", sa.String(1000), nullable=False),
         sa.Column("sha256", sa.String(64), nullable=False),
         sa.Column("uploaded_by", sa.String(120), nullable=True),

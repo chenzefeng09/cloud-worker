@@ -30,6 +30,8 @@ import asyncio
 import datetime as dt
 import json
 import logging
+from collections.abc import AsyncGenerator
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, Request
@@ -39,6 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent_session_orchestrator.api.authz_guard import require_permission
 from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId
 from agent_session_orchestrator.domain.db import get_session as acquire_db_session
+from agent_session_orchestrator.domain.models import Run
 from agent_session_orchestrator.schemas.common import CursorPage
 from agent_session_orchestrator.schemas.message import MessageCreate, MessageOut
 from agent_session_orchestrator.services.session_service import SessionService
@@ -110,10 +113,10 @@ async def _reconcile_run_completion(
     scheduler_url: str,
     tenant_id: str,
     user_id: str,
-    run,
+    run: Run,
     svc: SessionService,
     knowledge_ingest_url: str = "",
-) -> tuple[bool, list]:
+) -> tuple[bool, list[Any]]:
     """Poll the scheduler for a RUNNING run; persist result on terminal exit.
 
     Returns ``(terminal_reached, plan_steps)`` where:
@@ -149,7 +152,7 @@ async def _reconcile_run_completion(
 
     payload = resp.json()
     # Always extract plan_steps — available during RUNNING and after terminal.
-    plan_steps: list = payload.get("plan_steps") or []
+    plan_steps: list[Any] = payload.get("plan_steps") or []
 
     sched_status = payload.get("status")
     if sched_status not in ("COMPLETED", "FAILED"):
@@ -206,8 +209,8 @@ async def _reconcile_run_completion(
 
 async def _persist_artifacts(
     *,
-    artifacts: list[dict],
-    run,
+    artifacts: list[dict[str, Any]],
+    run: Run,
     svc: SessionService,
     tenant_id: str,
 ) -> None:
@@ -321,7 +324,7 @@ async def stream_messages(
     scheduler_url = request.app.state.settings.agent_scheduler_url
     knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
 
-    async def event_generator():
+    async def event_generator() -> AsyncGenerator[str, None]:
         last_seq = 0
         try:
             for _ in range(_MAX_POLLS):
@@ -347,7 +350,7 @@ async def stream_messages(
                     session_obj = await svc.get_session(session_id)
                     runs = await svc.list_runs(session_id)
                     # Collect plan_steps from any running run this poll.
-                    latest_plan_steps: list = []
+                    latest_plan_steps: list[Any] = []
                     latest_run_id: str = ""
                     for r in runs:
                         if r.status in ("RUNNING", "PENDING"):

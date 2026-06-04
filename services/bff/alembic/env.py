@@ -5,11 +5,11 @@ from __future__ import annotations
 import asyncio
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from agent_bff.config import Settings
 from agent_bff.domain.models import Base
+from alembic import context
 
 config = context.config
 if config.config_file_name is not None:

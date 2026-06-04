@@ -112,7 +112,7 @@ class DockerRuntime:
         user_id: str,
         foundation_token: str,
         skills: list[str] | None = None,
-        files: list[dict] | None = None,
+        files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
     ) -> str:
         """Spawn a sandbox container for one agent run.
@@ -248,17 +248,17 @@ class DockerRuntime:
                 # Token deliberately not logged.
             },
         )
-        return container.id
+        return str(container.id)
 
     # --------------------------------------------------------------- inspect
-    def get_run_status(self, container_id: str) -> dict:
+    def get_run_status(self, container_id: str) -> dict[str, Any]:
         try:
             c = self.client.containers.get(container_id)
         except docker.errors.NotFound:
             return {"status": "NOT_FOUND", "exit_code": None}
 
         status = _CONTAINER_STATUS_MAP.get(c.status, "UNKNOWN")
-        result: dict = {
+        result: dict[str, Any] = {
             "status": status,
             "exit_code": c.attrs["State"].get("ExitCode"),
             "started_at": c.attrs["State"].get("StartedAt"),
@@ -300,37 +300,35 @@ class DockerRuntime:
                 except (OSError, ValueError):
                     pass
 
-        if status in ("COMPLETED", "FAILED"):
-            if workspace is not None:
-                result_path = workspace / "result.json"
-                if result_path.is_file():
-                    try:
-                        import json
+        if status in ("COMPLETED", "FAILED") and workspace is not None:
+            result_path = workspace / "result.json"
+            if result_path.is_file():
+                try:
+                    import json
 
-                        payload = json.loads(result_path.read_text(encoding="utf-8"))
-                    except (OSError, ValueError):
-                        payload = {}
-                    result["result_summary"] = payload.get("summary")
-                    result["result_error"] = payload.get("error")
-                    result["result_status"] = payload.get("status")
-                    result["usage"] = payload.get("usage")
-                    result["plan_steps"] = payload.get("plan_steps") or []
-                    # If the worker reported FAILED via result.json (exit 0
-                    # with status="FAILED"), promote that over the docker
-                    # exit-code-based status so callers see the real reason.
-                    if payload.get("status") == "FAILED" and result["status"] == "COMPLETED":
-                        result["status"] = "FAILED"
+                    payload = json.loads(result_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    payload = {}
+                result["result_summary"] = payload.get("summary")
+                result["result_error"] = payload.get("error")
+                result["result_status"] = payload.get("status")
+                result["usage"] = payload.get("usage")
+                result["plan_steps"] = payload.get("plan_steps") or []
+                # If the worker reported FAILED via result.json (exit 0
+                # with status="FAILED"), promote that over the docker
+                # exit-code-based status so callers see the real reason.
+                if payload.get("status") == "FAILED" and result["status"] == "COMPLETED":
+                    result["status"] = "FAILED"
 
-                # Upload artifacts to S3 and attach the list to the result.
-                # Failure-open: any upload error is logged; the run result
-                # is still returned without the failed artifact.
-                if workspace is not None:
-                    result["artifacts"] = self._upload_artifacts(
-                        workspace=workspace,
-                        tenant_id=tenant_id,
-                        session_id=session_id,
-                        run_id=run_id,
-                    )
+            # Upload artifacts to S3 and attach the list to the result.
+            # Failure-open: any upload error is logged; the run result
+            # is still returned without the failed artifact.
+            result["artifacts"] = self._upload_artifacts(
+                workspace=workspace,
+                tenant_id=tenant_id,
+                session_id=session_id,
+                run_id=run_id,
+            )
         return result
 
     # ---------------------------------------------------------------- artifacts
@@ -417,7 +415,7 @@ class DockerRuntime:
         Returns None if boto3 is unavailable or credentials are unset.
         """
         try:
-            import boto3  # type: ignore[import-not-found]
+            import boto3
             client = boto3.client(
                 "s3",
                 endpoint_url=self._settings.s3_endpoint_url,
@@ -444,7 +442,7 @@ class DockerRuntime:
         tenant = c.labels.get("agent-platform.tenant-id", "")
         if not tenant:
             raise ContainerNotFoundError(container_id)
-        return tenant
+        return str(tenant)
 
     # ---------------------------------------------------------------- cancel
     def cancel_run(self, container_id: str) -> None:
@@ -463,7 +461,7 @@ class DockerRuntime:
             c.remove()
 
     # ------------------------------------------------------------------ list
-    def list_containers(self, *, tenant_id: str) -> list[dict]:
+    def list_containers(self, *, tenant_id: str) -> list[dict[str, Any]]:
         """List agent-platform containers belonging to ``tenant_id``.
 
         The argument is required; callers in the API layer have already
@@ -512,7 +510,7 @@ class DockerRuntime:
         *,
         task: str,
         skills: list[str] | None = None,
-        files: list[dict] | None = None,
+        files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
     ) -> Path:
         """Write the task payload ``runtime_worker`` will read.
