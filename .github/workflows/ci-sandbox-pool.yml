@@ -14,7 +14,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-service
-        with: { service: sandbox-pool }
+        with: { service: sandbox-pool, foundation-token: '${{ secrets.FOUNDATION_REPO_TOKEN }}' }
       - run: cd services/sandbox-pool && poetry run ruff check .
       - run: cd services/sandbox-pool && poetry run mypy src/
 
@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-service
-        with: { service: sandbox-pool }
+        with: { service: sandbox-pool, foundation-token: '${{ secrets.FOUNDATION_REPO_TOKEN }}' }
       - run: cd services/sandbox-pool && poetry run pytest --cov=src --cov-fail-under=80
 
   security:
@@ -31,6 +31,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-service
-        with: { service: sandbox-pool }
+        with: { service: sandbox-pool, foundation-token: '${{ secrets.FOUNDATION_REPO_TOKEN }}' }
       - uses: gitleaks/gitleaks-action@v2
       - run: cd services/sandbox-pool && poetry run pip-licenses --fail-on="GPL;AGPL"
