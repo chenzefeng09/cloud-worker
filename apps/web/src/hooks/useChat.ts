@@ -89,7 +89,7 @@ export function useChat() {
         }
       } catch (err) {
         if (!(err instanceof ApiError) || err.status !== 401) {
-          // eslint-disable-next-line no-console
+           
           console.warn('load messages failed', err);
         }
       }
@@ -150,7 +150,7 @@ export function useChat() {
         }
       } catch (e) {
         if ((e as Error).name !== 'AbortError') {
-          // eslint-disable-next-line no-console
+           
           console.error('Chat error:', e);
         }
       } finally {
@@ -170,7 +170,7 @@ export function useChat() {
     // Fire-and-forget the backend cancel — we don't await so the UI isn't blocked.
     if (sessionId) {
       api.sessions.cancel(sessionId).catch((err) => {
-        // eslint-disable-next-line no-console
+         
         console.warn('backend cancel failed', err);
       });
     }

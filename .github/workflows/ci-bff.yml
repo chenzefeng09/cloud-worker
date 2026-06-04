@@ -30,6 +30,7 @@ jobs:
       pull-requests: read
     steps:
       - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
       - uses: ./.github/actions/setup-service
         with: { service: bff, foundation-token: '${{ secrets.FOUNDATION_REPO_TOKEN }}' }
       - uses: gitleaks/gitleaks-action@v2

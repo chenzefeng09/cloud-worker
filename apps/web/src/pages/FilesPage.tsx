@@ -102,7 +102,7 @@ export function FilesPage() {
 
   useEffect(() => {
     loadDocs();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+     
   }, []);
 
   async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {

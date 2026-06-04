@@ -52,7 +52,7 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload }: Pr
         setAttachments((prev) => [...prev, att]);
       }
     } catch (err) {
-      // eslint-disable-next-line no-console
+       
       console.warn('attachment upload failed', err);
     } finally {
       setUploading(false);
