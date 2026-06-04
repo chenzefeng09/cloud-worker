@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     db_dsn_migrator: str = (
         "postgresql+asyncpg://app_migrator:app_migrator_change_me@localhost:5432/foundation"
     )
+    # Postgres schema that owns this service's tables.  See mcp-registry's
+    # config for the rationale (foundation per-service schema isolation;
+    # ORM stays schema-less + schema_translate_map on Postgres).
+    db_schema: str = "skill_store"
 
     # Blob storage — defaults are S3, swapped to in-memory in tests.
     blob_backend: str = "s3"

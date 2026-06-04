@@ -14,8 +14,15 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, String, UniqueConstraint, func
+from sqlalchemy import JSON, Boolean, DateTime, String, Text, UniqueConstraint, func
+from sqlalchemy.dialects.postgresql import ARRAY as PG_ARRAY
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+# ``scopes`` is stored as ``TEXT[]`` on Postgres (see Alembic 0001) but as a
+# JSON-encoded list on SQLite (unit tests).  ``with_variant`` keeps the ORM
+# dialect-agnostic *and* binds correctly on each backend — a plain ``JSON``
+# mapping cannot bind a Python list to a Postgres ``text[]`` column.
+_SCOPES_TYPE = JSON().with_variant(PG_ARRAY(Text), "postgresql")
 
 
 def new_id(prefix: str) -> str:
@@ -41,9 +48,8 @@ class McpServer(Base):
     endpoint: Mapped[str | None] = mapped_column(String(500), nullable=True)
     command: Mapped[str | None] = mapped_column(String(500), nullable=True)
     env: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
-    # ``scopes`` is a list of strings.  Storing as JSON keeps the model
-    # dialect-agnostic; the Postgres migration uses TEXT[].
-    scopes: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    # ``scopes`` is a list of strings — TEXT[] on Postgres, JSON on SQLite.
+    scopes: Mapped[list[str]] = mapped_column(_SCOPES_TYPE, nullable=False, default=list)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     created_at: Mapped[datetime] = mapped_column(
