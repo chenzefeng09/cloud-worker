@@ -12,8 +12,6 @@ export interface Workspace {
   name: string;
   glyph: string;
   desc: string;
-  taskCount: number;
-  fileCount: number;
   accent: string;
 }
 
@@ -28,10 +26,10 @@ export interface BaseFile {
 }
 
 export const WORKSPACES: Workspace[] = [
-  { id: 'eng', name: '工程', glyph: '⌥', desc: '代码 · 仓库 · 基础设施', taskCount: 3, fileCount: 8, accent: '#d23a1f' },
-  { id: 'ops', name: '运营', glyph: '✉', desc: '收件箱 · 财务 · 供应商', taskCount: 4, fileCount: 12, accent: '#1f5fd2' },
-  { id: 'gtm', name: '市场', glyph: '◐', desc: '演示 · 文案 · 发布', taskCount: 2, fileCount: 9, accent: '#0f8a4d' },
-  { id: 'cs', name: '客户', glyph: '✦', desc: '工单 · 反馈 · CRM', taskCount: 1, fileCount: 6, accent: '#6b3fa0' },
+  { id: 'eng', name: '工程', glyph: '⌥', desc: '代码 · 仓库 · 基础设施', accent: '#d23a1f' },
+  { id: 'ops', name: '运营', glyph: '✉', desc: '收件箱 · 财务 · 供应商', accent: '#1f5fd2' },
+  { id: 'gtm', name: '市场', glyph: '◐', desc: '演示 · 文案 · 发布', accent: '#0f8a4d' },
+  { id: 'cs', name: '客户', glyph: '✦', desc: '工单 · 反馈 · CRM', accent: '#6b3fa0' },
 ];
 
 export const WORKSPACE_FILES: Record<string, BaseFile[]> = {

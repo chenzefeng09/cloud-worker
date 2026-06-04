@@ -91,9 +91,7 @@ export function WorkspaceSwitcher() {
                 <div className="text-[12.5px] font-semibold tracking-[-0.01em] text-ink truncate">
                   {w.name}
                 </div>
-                <div className="font-mono text-[10px] text-dim">
-                  {w.fileCount} 个文件 · {w.taskCount} 个进行中
-                </div>
+                <div className="font-mono text-[10px] text-dim truncate">{w.desc}</div>
               </div>
               {w.id === wsId && (
                 <span className="font-mono text-[9px]" style={{ color: w.accent }}>

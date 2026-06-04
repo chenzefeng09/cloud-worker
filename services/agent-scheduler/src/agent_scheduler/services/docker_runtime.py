@@ -267,23 +267,41 @@ class DockerRuntime:
         if status == "COMPLETED" and result["exit_code"] != 0:
             result["status"] = "FAILED"
 
-        # On terminal states, pull the worker's ``result.json`` from the
-        # per-run workspace so callers (session-orchestrator) can persist
-        # the assistant summary without having to bind-mount workspaces.
-        # Best-effort: the file may be missing if the worker crashed before
-        # it could write it; we surface a None summary in that case.
+        # Read result.json for both terminal AND running states.
+        # For RUNNING runs we only extract plan_steps (written continuously
+        # by the worker after each ToolCallEndEvent) so the orchestrator's
+        # SSE poll can relay real-time plan progress to the frontend.
+        # For terminal states we additionally pull summary/error/status/usage.
+        # Best-effort: missing or malformed file returns empty plan_steps.
+        labels = c.labels or {}
+        run_id = labels.get("agent-platform.run-id", "")
+        session_id = labels.get("agent-platform.session-id", "")
+        tenant_id = labels.get("agent-platform.tenant-id", "")
+
+        workspace = None
+        if run_id and session_id and tenant_id:
+            workspace = (
+                Path(self._settings.workspace_base)
+                / tenant_id
+                / session_id
+                / run_id
+            )
+
+        # Always try to read plan_steps (available during RUNNING too).
+        result["plan_steps"] = []
+        if workspace is not None:
+            result_path = workspace / "result.json"
+            if result_path.is_file():
+                try:
+                    import json as _json
+
+                    payload = _json.loads(result_path.read_text(encoding="utf-8"))
+                    result["plan_steps"] = payload.get("plan_steps") or []
+                except (OSError, ValueError):
+                    pass
+
         if status in ("COMPLETED", "FAILED"):
-            labels = c.labels or {}
-            run_id = labels.get("agent-platform.run-id", "")
-            session_id = labels.get("agent-platform.session-id", "")
-            tenant_id = labels.get("agent-platform.tenant-id", "")
-            if run_id and session_id and tenant_id:
-                workspace = (
-                    Path(self._settings.workspace_base)
-                    / tenant_id
-                    / session_id
-                    / run_id
-                )
+            if workspace is not None:
                 result_path = workspace / "result.json"
                 if result_path.is_file():
                     try:
@@ -295,6 +313,8 @@ class DockerRuntime:
                     result["result_summary"] = payload.get("summary")
                     result["result_error"] = payload.get("error")
                     result["result_status"] = payload.get("status")
+                    result["usage"] = payload.get("usage")
+                    result["plan_steps"] = payload.get("plan_steps") or []
                     # If the worker reported FAILED via result.json (exit 0
                     # with status="FAILED"), promote that over the docker
                     # exit-code-based status so callers see the real reason.
@@ -304,12 +324,13 @@ class DockerRuntime:
                 # Upload artifacts to S3 and attach the list to the result.
                 # Failure-open: any upload error is logged; the run result
                 # is still returned without the failed artifact.
-                result["artifacts"] = self._upload_artifacts(
-                    workspace=workspace,
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                    run_id=run_id,
-                )
+                if workspace is not None:
+                    result["artifacts"] = self._upload_artifacts(
+                        workspace=workspace,
+                        tenant_id=tenant_id,
+                        session_id=session_id,
+                        run_id=run_id,
+                    )
         return result
 
     # ---------------------------------------------------------------- artifacts

@@ -109,19 +109,25 @@ async def _reconcile_run_completion(
     *,
     scheduler_url: str,
     tenant_id: str,
+    user_id: str,
     run,
     svc: SessionService,
     knowledge_ingest_url: str = "",
-) -> bool:
+) -> tuple[bool, list]:
     """Poll the scheduler for a RUNNING run; persist result on terminal exit.
 
-    Returns ``True`` when the run reached a terminal state and the DB has
-    been updated (so the SSE loop can emit the run_complete event on the
-    same iteration).  Best-effort: scheduler errors are logged and treated
-    as "still running" so the next poll retries.
+    Returns ``(terminal_reached, plan_steps)`` where:
+    * ``terminal_reached`` is True when the run reached a terminal state and
+      the DB has been updated (so the SSE loop can emit run_complete on the
+      same iteration).
+    * ``plan_steps`` is the list of structured plan steps read from
+      result.json (available both while RUNNING and after completion).
+
+    Best-effort: scheduler errors are logged and treated as "still running"
+    so the next poll retries.
     """
     if not run.sandbox_id or run.status not in ("RUNNING", "PENDING"):
-        return run.status in ("COMPLETED", "FAILED", "CANCELLED")
+        return run.status in ("COMPLETED", "FAILED", "CANCELLED"), []
 
     # Scheduler's ``GET /runs/{id}`` uses the path segment as the Docker
     # container id (its ``sandbox_id``), falling back to ``run_id`` only
@@ -132,28 +138,36 @@ async def _reconcile_run_completion(
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(
                 f"{scheduler_url}/runs/{run.sandbox_id}",
-                headers={"X-Tenant-Id": tenant_id, "X-User-Id": "SYSTEM"},
+                headers={"X-Tenant-Id": tenant_id, "X-User-Id": user_id},
             )
     except httpx.HTTPError as exc:
         logger.warning("scheduler poll failed", extra={"run_id": run.id, "err": str(exc)})
-        return False
+        return False, []
 
     if resp.status_code != 200:
-        return False
+        return False, []
 
     payload = resp.json()
+    # Always extract plan_steps — available during RUNNING and after terminal.
+    plan_steps: list = payload.get("plan_steps") or []
+
     sched_status = payload.get("status")
     if sched_status not in ("COMPLETED", "FAILED"):
-        return False
+        # Run is still in progress; surface plan_steps to the SSE caller.
+        return False, plan_steps
 
     summary = payload.get("result_summary")
     error = payload.get("result_error")
     artifacts = payload.get("artifacts") or []
+    usage = payload.get("usage") or {}
 
     run.status = sched_status
     run.result_summary = summary
     run.error_message = error
     run.finished_at = dt.datetime.now(tz=dt.UTC)
+    run.input_tokens = usage.get("input_tokens")
+    run.output_tokens = usage.get("output_tokens")
+    run.total_tokens = usage.get("total_tokens")
 
     # Write an assistant message so the UI sees the reply.
     if summary:
@@ -187,7 +201,7 @@ async def _reconcile_run_completion(
             summary=summary,
         )
 
-    return True
+    return True, plan_steps
 
 
 async def _persist_artifacts(
@@ -249,14 +263,21 @@ async def list_messages(
         runs = await svc.list_runs(session_id)
         scheduler_url = request.app.state.settings.agent_scheduler_url
         knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
+        # Fetch the session's real user_id so the scheduler poll header
+        # carries the originating user rather than the "SYSTEM" sentinel
+        # (which the scheduler's authz guard rejects with 403).
+        session_obj = await svc.get_session(session_id)
         for run in runs:
             await _reconcile_run_completion(
                 scheduler_url=scheduler_url,
                 tenant_id=tenant_id,
+                user_id=session_obj.user_id,
                 run=run,
                 svc=svc,
                 knowledge_ingest_url=knowledge_ingest_url,
             )
+            # Note: plan_steps from list_messages are discarded — this path is
+            # a page-refresh reconcile; SSE is the real-time channel for plans.
         # db session is managed by the dependency wrapper; flushing makes the
         # newly-added assistant message visible to the subsequent list_messages
         # query without us double-committing the outer transaction.
@@ -321,16 +342,36 @@ async def stream_messages(
                     # the scheduler so terminal exits get persisted (status,
                     # result_summary) and an assistant message lands in the
                     # messages table for the UI.
+                    # Fetch session once per poll to get the real user_id for
+                    # the scheduler authz header (SYSTEM is rejected with 403).
+                    session_obj = await svc.get_session(session_id)
                     runs = await svc.list_runs(session_id)
+                    # Collect plan_steps from any running run this poll.
+                    latest_plan_steps: list = []
+                    latest_run_id: str = ""
                     for r in runs:
                         if r.status in ("RUNNING", "PENDING"):
-                            await _reconcile_run_completion(
+                            _terminal, _plan = await _reconcile_run_completion(
                                 scheduler_url=scheduler_url,
                                 tenant_id=tenant_id,
+                                user_id=session_obj.user_id,
                                 run=r,
                                 svc=svc,
                                 knowledge_ingest_url=knowledge_ingest_url,
                             )
+                            if _plan:
+                                latest_plan_steps = _plan
+                                latest_run_id = r.id
+
+                    # Emit a plan SSE event whenever plan_steps are available,
+                    # even while the run is still RUNNING.  This lets the
+                    # frontend PLAN panel update in real time.
+                    if latest_plan_steps:
+                        plan_payload = json.dumps({
+                            "run_id": latest_run_id,
+                            "plan_steps": latest_plan_steps,
+                        })
+                        events.append(f"event: plan\ndata: {plan_payload}\n\n")
 
                     items, _ = await svc.list_messages(
                         session_id, cursor=str(last_seq) if last_seq else None, limit=50

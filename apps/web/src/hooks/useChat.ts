@@ -39,6 +39,15 @@ function handleSSEEvent(
         created_at: new Date().toISOString(),
       });
       break;
+    case 'plan': {
+      // Real-time plan steps from the worker's TaskCreate/TaskUpdate calls.
+      // Shape: { run_id: string, plan_steps: PlanStep[] }
+      const steps = data.plan_steps;
+      if (Array.isArray(steps) && steps.length > 0) {
+        store.setPlanSteps(sessionId, steps as import('../lib/designFixtures').PlanStep[]);
+      }
+      break;
+    }
     case 'run_complete':
       // Run finalisation handled by the run_complete event in the orchestrator
       // SSE stream; nothing to do client-side here right now.

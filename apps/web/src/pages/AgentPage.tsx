@@ -8,13 +8,25 @@ import { useChatStore } from '../stores/chatStore';
 import { useSessions } from '../hooks/useSessions';
 import { sessionStatusZh } from '../lib/format';
 import { useWorkspace } from '../lib/workspaceContext';
+import { api } from '../api/client';
+import type { Run } from '../api/types';
 import {
   SHOW_DESIGN_FIXTURES,
-  PLAN_STEPS,
   AGENT_SKILLS,
-  AGENT_WORKER,
-  AGENT_LIVE_STATS,
+  type PlanStep,
 } from '../lib/designFixtures';
+
+/** Stable empty-array reference — never recreate inline in a Zustand selector. */
+const EMPTY_PLAN_STEPS: PlanStep[] = [];
+
+/** Format elapsed seconds as "Xm Ys" or "Xs". */
+function fmtElapsed(seconds: number): string {
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${m}m ${rem}s`;
+}
 
 /**
  * Single-task agent view. The URL `/tasks/:id` drives `activeSessionId` in the
@@ -31,10 +43,15 @@ export function AgentPage() {
   const [searchParams] = useSearchParams();
   const friendly = searchParams.get('mode') === 'friendly';
 
-  const { ws, files: wsFiles } = useWorkspace();
+  const { ws } = useWorkspace();
   const { sessions } = useSessions();
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const setActiveSession = useChatStore((s) => s.setActiveSession);
+  // Select the raw stored value (stable reference); apply the empty fallback
+  // OUTSIDE the selector — returning `?? []` inside it creates a new array
+  // every render and triggers a getSnapshot infinite loop.
+  const storedPlanSteps = useChatStore((s) => s.planSteps[id ?? '']);
+  const planSteps = storedPlanSteps ?? EMPTY_PLAN_STEPS;
   const { sendMessage, cancel, isStreaming } = useChat();
 
   // Friendly defaults rail hidden; non-friendly defaults rail shown.
@@ -62,6 +79,38 @@ export function AgentPage() {
   }, [id, activeSessionId, location.pathname, location.state, navigate, sendMessage]);
 
   const session = sessions.find((s) => s.id === id);
+
+  // Fetch the current run to obtain started_at for the elapsed timer.
+  const [currentRun, setCurrentRun] = useState<Run | null>(null);
+  const [elapsedSec, setElapsedSec] = useState(0);
+
+  useEffect(() => {
+    if (!id || !session?.current_run_id) {
+      setCurrentRun(null);
+      return;
+    }
+    let cancelled = false;
+    api.runs.get(id, session.current_run_id).then((run) => {
+      if (!cancelled) setCurrentRun(run);
+    }).catch(() => { /* best-effort */ });
+    return () => { cancelled = true; };
+  }, [id, session?.current_run_id]);
+
+  // Tick the elapsed counter every second while there's a live run with started_at.
+  useEffect(() => {
+    if (!currentRun?.started_at) {
+      setElapsedSec(0);
+      return;
+    }
+    const startedAt = new Date(currentRun.started_at).getTime();
+    const tick = () => {
+      const now = Date.now();
+      setElapsedSec(Math.max(0, Math.floor((now - startedAt) / 1000)));
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [currentRun?.started_at]);
 
   if (!id) {
     return (
@@ -156,46 +205,36 @@ export function AgentPage() {
                   <div className="text-[12.5px] font-semibold tracking-[-0.01em] truncate">
                     {ws.name}
                   </div>
-                  <div className="font-mono text-[10px] text-dim">
-                    {wsFiles.length} base files
-                  </div>
+                  <div className="font-mono text-[10px] text-dim truncate">{ws.desc}</div>
                 </div>
               </div>
-              {/* dotted vertical base-files list */}
-              {wsFiles.slice(0, 4).length > 0 && (
-                <div className="flex flex-col gap-0.5 mt-1.5 pl-1">
-                  {wsFiles.slice(0, 4).map((f) => (
-                    <div
-                      key={f.n}
-                      className="flex items-center gap-1.5 px-1 font-mono text-[10.5px] text-ink-2 min-w-0"
-                    >
-                      <span style={{ color: ws.accent, fontSize: 9 }}>●</span>
-                      <span className="whitespace-nowrap overflow-hidden text-ellipsis flex-1">
-                        {f.n}
-                      </span>
-                    </div>
-                  ))}
-                  {wsFiles.length === 0 && (
-                    <span className="font-mono text-[11px] italic text-dim">无基础文件</span>
-                  )}
-                </div>
-              )}
             </div>
 
-            {/* ── Worker card (fixture) ── */}
-            {SHOW_DESIGN_FIXTURES && (
+            {/* ── Worker card (real data from currentRun) ── */}
+            {currentRun && (
               <div>
                 <div className="cw-label mb-1.5">Worker</div>
                 <div
                   className="flex items-center gap-2 px-2 py-1.5 bg-surface border border-line"
                   style={{ borderRadius: 'var(--r-sm)' }}
                 >
-                  <span className="cw-avatar accent lg shrink-0">{AGENT_WORKER.glyph}</span>
+                  <span className="cw-avatar accent lg shrink-0">◈</span>
                   <div className="min-w-0 flex-1">
-                    <div className="font-mono text-[12px] font-semibold">{AGENT_WORKER.id}</div>
-                    <div className="font-mono text-[10px] text-dim">
-                      since {AGENT_WORKER.ago} ago
+                    <div className="font-mono text-[12px] font-semibold truncate">
+                      {currentRun.sandbox_id
+                        ? currentRun.sandbox_id.slice(0, 12)
+                        : currentRun.id.slice(0, 12)}
                     </div>
+                    <div className="font-mono text-[10px] text-dim">
+                      {currentRun.started_at
+                        ? `${fmtElapsed(elapsedSec)} ago`
+                        : 'pending'}
+                    </div>
+                  </div>
+                  <div className="font-mono text-[10px] text-ink-2 shrink-0 text-right">
+                    {currentRun.total_tokens != null && (
+                      <div>{currentRun.total_tokens.toLocaleString()} tok</div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -217,14 +256,14 @@ export function AgentPage() {
               </div>
             )}
 
-            {/* ── Plan (fixture) ── */}
-            {SHOW_DESIGN_FIXTURES && (
+            {/* ── Plan (real-time from agent TaskCreate/TaskUpdate) ── */}
+            {planSteps.length > 0 && (
               <div>
                 <div className="cw-label mb-1.5">
-                  Plan · {PLAN_STEPS.length} steps
+                  Plan · {planSteps.length} steps
                 </div>
                 <div className="flex flex-col gap-0.5">
-                  {PLAN_STEPS.map((s) => (
+                  {planSteps.map((s) => (
                     <div
                       key={s.n}
                       className="flex items-center gap-2 px-1.5 py-1"
@@ -265,7 +304,7 @@ export function AgentPage() {
 
             <div className="flex-1" />
 
-            {/* ── Live stats (fixture + real streaming blip) ── */}
+            {/* ── Live stats ── */}
             <div>
               <div className="cw-label mb-1.5">Live</div>
               {isStreaming && (
@@ -274,12 +313,25 @@ export function AgentPage() {
                   <span className="font-mono text-[10.5px] text-accent">运行中…</span>
                 </div>
               )}
-              {SHOW_DESIGN_FIXTURES && (
+              {currentRun?.started_at ? (
                 <div className="font-mono text-[10.5px] text-ink-2 leading-[1.6]">
-                  <div>elapsed · {AGENT_LIVE_STATS.elapsed}</div>
-                  <div>tokens · {AGENT_LIVE_STATS.tokens}</div>
-                  <div>cost · {AGENT_LIVE_STATS.cost}</div>
+                  <div>elapsed · {fmtElapsed(elapsedSec)}</div>
+                  {currentRun.input_tokens != null && (
+                    <div>in · {currentRun.input_tokens.toLocaleString()} tok</div>
+                  )}
+                  {currentRun.output_tokens != null && (
+                    <div>out · {currentRun.output_tokens.toLocaleString()} tok</div>
+                  )}
+                  {currentRun.total_tokens != null && (
+                    <div>total · {currentRun.total_tokens.toLocaleString()} tok</div>
+                  )}
                 </div>
+              ) : (
+                !isStreaming && !currentRun && (
+                  <div className="font-mono text-[10.5px] text-dim italic leading-[1.6]">
+                    无活跃任务
+                  </div>
+                )
               )}
             </div>
           </aside>

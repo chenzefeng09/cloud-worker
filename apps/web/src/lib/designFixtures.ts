@@ -4,7 +4,7 @@
 
 // ── Toggle ────────────────────────────────────────────────────────
 /** Set to false to stop rendering fixture data in the UI. */
-export const SHOW_DESIGN_FIXTURES = true; // DESIGN FIXTURE — remove when backend provides feature flags
+export const SHOW_DESIGN_FIXTURES = false; // DESIGN FIXTURE — remove when backend provides feature flags
 
 // ── Shared primitive interfaces ───────────────────────────────────
 

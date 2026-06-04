@@ -7,8 +7,14 @@ FROM agent-platform-dev-session-orchestrator:latest
 
 USER root
 COPY src /app/src
-RUN find /app/src -name __pycache__ -exec rm -rf {} + 2>/dev/null || true \
- && chown -R app:app /app/src
+# Refresh migrations + alembic.ini too: the migrate sidecar runs
+# ``alembic upgrade head`` from this same image, and the base image may carry
+# a stale migrations/ tree (e.g. only 0001_init).  Copying the in-repo
+# migrations guarantees the sidecar sees 0002/0003/... and reaches head.
+COPY migrations /app/migrations
+COPY alembic.ini /app/alembic.ini
+RUN find /app/src /app/migrations -name __pycache__ -exec rm -rf {} + 2>/dev/null || true \
+ && chown -R app:app /app/src /app/migrations /app/alembic.ini
 USER app
 WORKDIR /app
 CMD ["uvicorn", "agent_session_orchestrator.main:create_app", "--host", "0.0.0.0", "--port", "8006", "--factory"]

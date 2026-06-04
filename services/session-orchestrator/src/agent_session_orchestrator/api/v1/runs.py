@@ -32,11 +32,13 @@ import datetime as dt
 import logging
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
 from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, TUserId
+from agent_session_orchestrator.domain.models import Run
 from agent_session_orchestrator.services.session_service import SessionService
 
 router = APIRouter(tags=["Runs"])
@@ -199,6 +201,9 @@ async def list_runs(
                 "started_at": r.started_at.isoformat() if r.started_at else None,
                 "finished_at": r.finished_at.isoformat() if r.finished_at else None,
                 "created_at": r.created_at.isoformat(),
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+                "total_tokens": r.total_tokens,
             }
             for r in runs
         ]
@@ -226,6 +231,9 @@ async def get_run(
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "finished_at": run.finished_at.isoformat() if run.finished_at else None,
         "created_at": run.created_at.isoformat(),
+        "input_tokens": run.input_tokens,
+        "output_tokens": run.output_tokens,
+        "total_tokens": run.total_tokens,
     }
 
 
@@ -274,6 +282,54 @@ async def _do_cancel_run(
     )
 
     return {"id": run.id, "status": "CANCELLED"}
+
+
+@router.get("/runs/token-usage/daily")
+async def daily_token_usage(
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+    days: int = Query(default=7, ge=1, le=90),
+) -> dict:
+    """Return per-day token totals for the last N days (default 7).
+
+    SQL: SELECT date(created_at) AS day, SUM(COALESCE(total_tokens, 0)) AS tokens
+         FROM run
+         WHERE tenant_id = :tenant_id AND created_at >= now() - interval 'N days'
+         GROUP BY date(created_at)
+
+    Fills in missing days with 0 so the response always contains exactly
+    ``days`` entries in ascending order.
+    """
+    cutoff = dt.datetime.now(tz=dt.UTC) - dt.timedelta(days=days)
+
+    stmt = (
+        select(
+            func.date(Run.created_at).label("day"),
+            func.sum(func.coalesce(Run.total_tokens, 0)).label("tokens"),
+        )
+        .where(Run.tenant_id == tenant_id, Run.created_at >= cutoff)
+        .group_by(func.date(Run.created_at))
+        .order_by(func.date(Run.created_at))
+    )
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    # Build a dict keyed by date string for fast lookup.
+    by_day: dict[str, int] = {}
+    for row in rows:
+        # row.day may be a date object or a string depending on the DB driver.
+        day_key = str(row.day) if not isinstance(row.day, str) else row.day
+        by_day[day_key] = int(row.tokens or 0)
+
+    # Generate the full range of the last N days (today is index days-1).
+    today = dt.date.today()
+    out: list[dict] = []
+    for i in range(days):
+        d = today - dt.timedelta(days=days - 1 - i)
+        key = d.isoformat()
+        out.append({"day": key, "tokens": by_day.get(key, 0)})
+
+    return {"days": out}
 
 
 @router.post("/sessions/{session_id}/runs/{run_id}/cancel",

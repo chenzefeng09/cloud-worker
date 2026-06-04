@@ -54,3 +54,17 @@ class Settings(BaseSettings):
 
     otel_enabled: bool = True
     otel_exporter_endpoint: str = "http://localhost:4317"
+
+    # ── BFF-local DB (notification_preferences, future: api_keys) ──────────
+    # The BFF stores per-user preferences in its own schema inside the shared
+    # foundation Postgres instance.  Tests use SQLite in-memory.
+    db_dsn: str = (
+        "postgresql+asyncpg://app_user:app_user_change_me@localhost:6432/foundation"
+    )
+    db_dsn_migrator: str = (
+        "postgresql+asyncpg://app_migrator:app_migrator_change_me@localhost:5432/foundation"
+    )
+    db_schema: str = "agent_bff"
+    db_pool_size: int = 5
+    db_max_overflow: int = 10
+    db_pool_recycle: int = 1800
