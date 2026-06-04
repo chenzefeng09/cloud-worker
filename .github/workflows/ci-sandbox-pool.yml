@@ -33,4 +33,6 @@ jobs:
       - uses: ./.github/actions/setup-service
         with: { service: sandbox-pool, foundation-token: '${{ secrets.FOUNDATION_REPO_TOKEN }}' }
       - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: cd services/sandbox-pool && poetry run pip-licenses --fail-on="GPL;AGPL"

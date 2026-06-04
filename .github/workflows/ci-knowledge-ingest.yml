@@ -30,4 +30,6 @@ jobs:
       - uses: ./.github/actions/setup-service
         with: { service: knowledge-ingest, foundation-token: '${{ secrets.FOUNDATION_REPO_TOKEN }}' }
       - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - run: cd services/knowledge-ingest && poetry run pip-licenses --fail-on="GPL;AGPL"
