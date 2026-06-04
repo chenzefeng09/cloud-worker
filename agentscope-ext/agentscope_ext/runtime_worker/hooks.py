@@ -174,21 +174,26 @@ def _provider_default_model(provider: str) -> str:
 
 
 def build_toolkit(task: dict, tenant_id: str, env: Mapping[str, str]) -> Any:
-    """Default toolkit — empty.
+    """Default toolkit — pre-loaded with built-in planning tools.
+
+    ``TaskCreate``, ``TaskUpdate``, and ``TaskList`` are always registered so
+    the agent can emit structured plan steps that are read by the worker and
+    streamed to the frontend PLAN panel in real time.
 
     The ``mcp_tenant_injector`` extension is expected to resolve the
     tenant's MCP server list from ``foundation.mcp-registry`` and feed
-    the resulting MCP clients to ``Toolkit(mcps=...)``.  The
-    ``skills_loader`` extension layers package-defined Skills on top via
-    ``Toolkit(skills_or_loaders=...)``.
+    the resulting MCP clients into the returned Toolkit (appending to the
+    basic group's mcps list — it does NOT replace the Toolkit, so the
+    planning tools are preserved).  The ``skills_loader`` extension layers
+    package-defined Skills on top via the same append pattern.
 
-    Returning an empty toolkit by default keeps the worker runnable in
-    smoke tests where no foundation services exist.
+    Returning a toolkit with the planning tools by default keeps the worker
+    runnable in smoke tests where no foundation services exist.
     """
     del task, tenant_id, env  # arguments are part of the override contract
-    from agentscope.tool import Toolkit
+    from agentscope.tool import Toolkit, TaskCreate, TaskUpdate, TaskList
 
-    return Toolkit()
+    return Toolkit(tools=[TaskCreate(), TaskUpdate(), TaskList()])
 
 
 # ---------------------------------------------------------------------------

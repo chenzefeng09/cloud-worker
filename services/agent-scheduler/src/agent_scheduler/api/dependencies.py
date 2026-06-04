@@ -32,7 +32,8 @@ from agent_scheduler.services.runtime import SandboxRuntime, build_runtime
 def get_runtime(request: Request) -> SandboxRuntime:
     # Cached on app.state by ``main.create_app`` so we don't rebuild the
     # httpx / docker client on every request.
-    return request.app.state.runtime
+    runtime: SandboxRuntime = request.app.state.runtime
+    return runtime
 
 
 async def current_tenant() -> str:

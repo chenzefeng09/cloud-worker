@@ -8,13 +8,12 @@ import pytest
 
 from knowledge_ingest.embeddings.local import LocalEmbeddingClient
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def cosine(a: list[float], b: list[float]) -> float:
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     na = math.sqrt(sum(x * x for x in a)) or 1.0
     nb = math.sqrt(sum(x * x for x in b)) or 1.0
     return dot / (na * nb)
@@ -74,7 +73,7 @@ async def test_batch_order_preserved() -> None:
     texts = ["alpha", "beta", "gamma"]
     vecs = await client.embed(texts)
     singles = [await client.embed([t]) for t in texts]
-    for i, (v, s) in enumerate(zip(vecs, singles)):
+    for i, (v, s) in enumerate(zip(vecs, singles, strict=True)):
         assert v == s[0], f"vector at position {i} does not match single-embed result"
 
 

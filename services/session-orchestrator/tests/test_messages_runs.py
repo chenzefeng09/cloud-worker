@@ -2,16 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 from fastapi.testclient import TestClient
 
 from agent_session_orchestrator.domain.models import Message, Run, Session
 from tests._helpers import TEST_TENANT, AuthzAwareClient, make_scalar_result
-
-import asyncio
 
 
 def _ses_row() -> Session:
@@ -265,9 +263,9 @@ def test_update_session_mutates_via_service(
 
 def test_fetch_memory_returns_empty_on_http_error() -> None:
     """_fetch_memory is failure-open: HTTP errors → empty string."""
-    from agent_session_orchestrator.api.v1.runs import _fetch_memory
-
     import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_memory
 
     class _FailClient:
         async def __aenter__(self): return self
@@ -287,9 +285,9 @@ def test_fetch_memory_returns_empty_on_http_error() -> None:
 
 def test_fetch_memory_formats_hits() -> None:
     """_fetch_memory returns formatted bullet points from hits."""
-    from agent_session_orchestrator.api.v1.runs import _fetch_memory
-
     import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_memory
 
     class _FakeResp:
         status_code = 200
@@ -318,9 +316,9 @@ def test_fetch_memory_formats_hits() -> None:
 
 def test_write_memory_failure_open() -> None:
     """_write_memory swallows errors silently."""
-    from agent_session_orchestrator.api.v1.messages import _write_memory
-
     import httpx
+
+    from agent_session_orchestrator.api.v1.messages import _write_memory
 
     class _FailClient:
         async def __aenter__(self): return self
@@ -348,12 +346,6 @@ def test_create_run_injects_memory(
     session = Session(
         id="ses_mem", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
     )
-    run = Run(
-        id="run_mem", tenant_id=TEST_TENANT, session_id="ses_mem",
-        task_description="我叫什么", status="PENDING",
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-    )
-
     mock_db.execute.return_value = make_scalar_result(session)
     mock_db.refresh = AsyncMock(side_effect=[None])
 
@@ -376,8 +368,6 @@ def test_create_run_injects_memory(
         def json(self):
             return {"id": "run_mem", "sandbox_id": "abc123", "status": "RUNNING"}
 
-    call_count = [0]
-
     class _FakeClient(AuthzAwareClient):
         async def get(self, url, **kw): return _MemResp()
         async def post(self, url, json=None, **kw):
@@ -389,7 +379,7 @@ def test_create_run_injects_memory(
             return _SchResp()
 
     with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
-        resp = app_client.post(
+        app_client.post(
             "/api/session/v1/sessions/ses_mem/runs",
             headers=auth_headers,
             json={"task": "我叫什么"},

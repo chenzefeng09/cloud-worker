@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Coroutine
+from typing import Any
+
 from fastapi import Depends
 
 from agent_bff.api.middleware import get_access_token, get_tenant_id, get_user_id
@@ -21,7 +24,7 @@ async def current_access_token() -> str:
     return get_access_token()
 
 
-def require_auth():
+def require_auth() -> Callable[..., Coroutine[Any, Any, tuple[str, str, str]]]:
     """Dependency that requires authentication.
 
     Returns ``(tenant_id, user_id, access_token)``.  The third element is

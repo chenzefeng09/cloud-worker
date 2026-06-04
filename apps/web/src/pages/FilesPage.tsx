@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { PageHead } from '../components/shell/PageHead';
 import { Chip } from '../components/shell/Chip';
 import { useWorkspace } from '../lib/workspaceContext';
@@ -68,6 +68,11 @@ export function FilesPage() {
   const [query, setQuery] = useState('');
   const [selected, setSelected] = useState<SelItem | null>(null);
 
+  // Upload state
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+
   // Remote knowledge documents
   const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
   const [docsLoading, setDocsLoading] = useState(false);
@@ -83,23 +88,44 @@ export function FilesPage() {
   const [contentText, setContentText] = useState<string | null>(null);
   const [contentError, setContentError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
+  function loadDocs() {
     setDocsLoading(true);
     setDocsError(null);
-
     api.library.listDocuments().then((res) => {
-      if (cancelled) return;
       setDocs(res.items);
     }).catch((e) => {
-      if (cancelled) return;
       setDocsError(e instanceof ApiError ? e.message : '加载知识文档失败');
     }).finally(() => {
-      if (!cancelled) setDocsLoading(false);
+      setDocsLoading(false);
     });
+  }
 
-    return () => { cancelled = true; };
+  useEffect(() => {
+    loadDocs();
+     
   }, []);
+
+  async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+
+    setUploading(true);
+    setUploadError(null);
+    try {
+      const fd = new FormData();
+      fd.append('title', file.name);
+      fd.append('mime', file.type || 'text/plain');
+      fd.append('file', file, file.name);
+      const doc = await api.library.uploadDocument(fd);
+      await api.library.ingestDocument(doc.id);
+      loadDocs();
+    } catch (e) {
+      setUploadError(e instanceof ApiError ? e.message : '上传文档失败');
+    } finally {
+      setUploading(false);
+    }
+  }
 
   useEffect(() => {
     if (!activeSessionId) {
@@ -177,11 +203,18 @@ export function FilesPage() {
         ]}
         actions={
           <>
-            <button className="cw-btn cw-btn-ghost cw-btn-sm">
-              + 上传
-            </button>
-            <button className="cw-btn cw-btn-sm">
-              同步源
+            <input
+              ref={uploadInputRef}
+              type="file"
+              className="hidden"
+              onChange={handleUpload}
+            />
+            <button
+              className="cw-btn cw-btn-ghost cw-btn-sm"
+              disabled={uploading}
+              onClick={() => uploadInputRef.current?.click()}
+            >
+              {uploading ? '上传中…' : '+ 上传'}
             </button>
           </>
         }
@@ -206,6 +239,9 @@ export function FilesPage() {
             )}
             {docsError && (
               <div className="px-3 py-2 font-mono text-[11px] text-accent">{docsError}</div>
+            )}
+            {uploadError && (
+              <div className="px-3 py-2 font-mono text-[11px] text-accent">{uploadError}</div>
             )}
             {filesError && (
               <div className="px-3 py-2 font-mono text-[11px] text-accent">{filesError}</div>

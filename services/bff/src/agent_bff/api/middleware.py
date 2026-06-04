@@ -26,6 +26,7 @@ from foundation_sdk.fastapi import (
     push_identity,
 )
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.types import ASGIApp
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +53,7 @@ class SessionMiddleware(BaseHTTPMiddleware):
 
     def __init__(
         self,
-        app: object,
+        app: ASGIApp,
         *,
         cookie_name: str,
         signer: CookieSigner,

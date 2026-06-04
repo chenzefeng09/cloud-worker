@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -36,7 +37,7 @@ class Skill(Base):
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now(),
     )
 
-    versions: Mapped[list["SkillVersion"]] = relationship(
+    versions: Mapped[list[SkillVersion]] = relationship(
         "SkillVersion", back_populates="skill", cascade="all, delete-orphan",
     )
 
@@ -48,7 +49,7 @@ class SkillVersion(Base):
     id: Mapped[str] = mapped_column(String(40), primary_key=True, default=lambda: new_id("sv"))
     skill_id: Mapped[str] = mapped_column(String(40), ForeignKey("skills.id"), nullable=False)
     version: Mapped[str] = mapped_column(String(40), nullable=False)
-    manifest: Mapped[dict] = mapped_column(JSON, nullable=False, default=dict)
+    manifest: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     blob_url: Mapped[str] = mapped_column(String(1000), nullable=False)
     sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     uploaded_by: Mapped[str | None] = mapped_column(String(120), nullable=True)

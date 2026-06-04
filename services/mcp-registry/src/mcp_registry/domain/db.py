@@ -37,6 +37,13 @@ async def init_db(settings: Settings) -> None:
             pool_recycle=settings.db_pool_recycle,
             echo=settings.env == "dev",
         )
+        # The ORM models are schema-less; on Postgres translate the default
+        # schema (None) to the service's owned schema so SQLAlchemy emits
+        # ``mcp_registry.mcp_servers`` etc.  SQLite tests never set this map,
+        # so create_all stays unqualified there.
+        _engine = _engine.execution_options(
+            schema_translate_map={None: settings.db_schema}
+        )
     _session_factory = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
 
 

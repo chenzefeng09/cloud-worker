@@ -38,6 +38,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from prometheus_client import CollectorRegistry
 
@@ -45,6 +46,14 @@ from sandbox_pool.config import Settings
 from sandbox_pool.docker_runtime import PoolDockerRuntime
 from sandbox_pool.errors import PoolExhaustedError, SandboxNotFoundError
 from sandbox_pool.metrics import PoolMetrics, build_metrics
+
+
+class PoolRuntime(Protocol):
+    """Minimal interface required by Pool — satisfied by PoolDockerRuntime and test mocks."""
+
+    def start_idle_container(self, template: str) -> str: ...
+
+    def stop_container(self, container_id: str) -> None: ...
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +97,7 @@ class Pool:
         *,
         metrics: PoolMetrics | None = None,
         metrics_registry: CollectorRegistry | None = None,
-        runtime: object = None,
+        runtime: PoolRuntime | None = None,
     ) -> None:
         self._settings = settings
         self._state = PoolState()
@@ -102,6 +111,7 @@ class Pool:
                 else CollectorRegistry(),
             )
 
+        self._runtime: PoolRuntime
         if runtime is not None:
             self._runtime = runtime
         else:
@@ -167,10 +177,10 @@ class Pool:
 
             # --- slow path: poll for a warm entry ---
             deadline = time.perf_counter() + self._settings.acquire_timeout_seconds
-            _POLL_INTERVAL = 0.25  # seconds between polls
+            _poll_interval = 0.25  # seconds between polls
 
             while time.perf_counter() < deadline:
-                await asyncio.sleep(_POLL_INTERVAL)
+                await asyncio.sleep(_poll_interval)
                 async with self._lock:
                     if self._state.total_count() >= self._settings.max_total:
                         raise PoolExhaustedError()

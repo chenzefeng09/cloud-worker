@@ -47,7 +47,8 @@ async def internal_db_session(
 
 
 def get_blob_store(request: Request) -> BlobStore:
-    return request.app.state.blob_store
+    blob_store: BlobStore = request.app.state.blob_store
+    return blob_store
 
 
 def require_internal_scope(

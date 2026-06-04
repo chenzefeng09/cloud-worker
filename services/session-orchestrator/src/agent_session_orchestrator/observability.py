@@ -9,7 +9,7 @@ def init_observability(*, service_name: str, otlp_endpoint: str | None = None) -
     if os.environ.get("SESSION_ORCHESTRATOR_OTEL_ENABLED", "true").lower() == "false":
         return
 
-    endpoint = otlp_endpoint or os.environ.get(
+    _ = otlp_endpoint or os.environ.get(
         "SESSION_ORCHESTRATOR_OTEL_EXPORTER_ENDPOINT", "http://localhost:4317"
     )
 

@@ -1,5 +1,4 @@
 import { useSessions } from '../hooks/useSessions';
-import { useChatStore } from '../stores/chatStore';
 
 export function SessionList() {
   const { sessions, loading, createSession, setActiveSession, activeSessionId } = useSessions();

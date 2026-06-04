@@ -21,7 +21,9 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+from typing import Any
 
 import docker
 import httpx
@@ -30,7 +32,7 @@ from fastapi.responses import StreamingResponse
 
 from agent_scheduler.api.authz_guard import require_permission
 from agent_scheduler.api.dependencies import TRuntime, TTenantId, TUserId
-from agent_scheduler.config import SANDBOX_TOKEN_SCOPES
+from agent_scheduler.config import SANDBOX_TOKEN_SCOPES, Settings
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
 from agent_scheduler.services.docker_runtime import DockerRuntime
 
@@ -133,7 +135,7 @@ async def _bootstrap_scheduler_token(settings) -> str:  # type: ignore[no-untype
 
 async def _mint_sandbox_token(
     *,
-    settings,  # type: ignore[no-untyped-def]
+    settings: Settings,
     tenant_id: str,
     run_id: str,
 ) -> str:
@@ -198,7 +200,7 @@ async def _mint_sandbox_token(
             detail=f"identity rejected token request: HTTP {resp.status_code}",
         )
 
-    token = resp.json().get("access_token")
+    token: str = str(resp.json().get("access_token") or "")
     if not token:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
@@ -229,12 +231,12 @@ def _require_tenant_owner(
 @router.post("/runs", status_code=201,
              dependencies=[Depends(require_permission("run.create", "run"))])
 async def create_run(
-    body: dict,
+    body: dict[str, Any],
     request: Request,
     runtime: DockerRuntime = TRuntime,
     tenant_id: str = TTenantId,
     user_id: str = TUserId,
-) -> dict:
+) -> dict[str, Any]:
     session_id = body.get("session_id", "")
     run_id = body.get("run_id", "")
     task = body.get("task", "")
@@ -249,7 +251,7 @@ async def create_run(
     # Optional: list of attachment file dicts {"key", "filename", "mime"}.
     # Written to task.json; the runtime_worker downloads them to /workspace/inputs/.
     files_raw = body.get("files")
-    files: list[dict] = (
+    files: list[dict[str, Any]] = (
         [f for f in files_raw if isinstance(f, dict)]
         if isinstance(files_raw, list)
         else []
@@ -312,10 +314,10 @@ async def create_run(
             dependencies=[Depends(require_permission("run.read", "run"))])
 async def get_run(
     run_id: str,
-    body: dict | None = None,
+    body: dict[str, Any] | None = None,
     runtime: DockerRuntime = TRuntime,
     tenant_id: str = TTenantId,
-) -> dict:
+) -> dict[str, Any]:
     container_id = (body or {}).get("sandbox_id") or run_id
     _require_tenant_owner(runtime, container_id, tenant_id)
 
@@ -330,10 +332,10 @@ async def get_run(
              dependencies=[Depends(require_permission("run.cancel", "run"))])
 async def cancel_run(
     run_id: str,
-    body: dict | None = None,
+    body: dict[str, Any] | None = None,
     runtime: DockerRuntime = TRuntime,
     tenant_id: str = TTenantId,
-) -> dict:
+) -> dict[str, Any]:
     container_id = (body or {}).get("sandbox_id") or run_id
     _require_tenant_owner(runtime, container_id, tenant_id)
 
@@ -350,7 +352,7 @@ async def cancel_run(
             dependencies=[Depends(require_permission("run.read", "run"))])
 async def run_events(
     run_id: str,
-    body: dict | None = None,
+    body: dict[str, Any] | None = None,
     runtime: DockerRuntime = TRuntime,
     tenant_id: str = TTenantId,
 ) -> StreamingResponse:
@@ -358,7 +360,7 @@ async def run_events(
     container_id = (body or {}).get("sandbox_id") or run_id
     _require_tenant_owner(runtime, container_id, tenant_id)
 
-    async def event_generator():
+    async def event_generator() -> AsyncGenerator[str, None]:
         try:
             container = runtime.client.containers.get(container_id)
 

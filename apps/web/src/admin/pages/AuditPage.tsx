@@ -3,12 +3,6 @@ import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import type { AuditEvent } from '../../api/types';
 
-/**
- * TODO: This page calls /admin/audit/events:query which proxies the foundation
- * audit service. The BFF endpoint `/admin/audit/events:query` may not yet be
- * implemented. When it is, remove the placeholder banner and this page will
- * start working automatically.
- */
 export function AuditPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading } = useAdminStore();
   const [tenantId, setTenantId] = useState('');
@@ -62,12 +56,6 @@ export function AuditPage() {
       <div>
         <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">审计日志</h1>
         <p className="text-[12px] text-dim mt-0.5">查询平台操作事件</p>
-      </div>
-
-      {/* TODO banner */}
-      <div className="border border-warn/30 rounded-md px-4 py-3 bg-warn/5 text-[12px] text-warn font-mono">
-        TODO: BFF 端点 <code className="bg-warn/10 px-1 rounded-sm">POST /admin/audit/events:query</code> 尚未在 BFF 层暴露。
-        UI 已就绪，接线占位。待 BFF 代理 audit 服务后，本提示可删除。
       </div>
 
       {/* Query form */}
