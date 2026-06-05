@@ -1,9 +1,11 @@
 import { useEffect, useRef } from 'react';
 import { useChat } from '../hooks/useChat';
-import { MessageBubble } from './MessageBubble';
+import { MessageBubble, WorkingOnItPill } from './MessageBubble';
+import { StepGroup } from './StepGroup';
 import { InputBar } from './InputBar';
 import { api } from '../api/client';
-import type { Attachment } from '../api/types';
+import type { Attachment, MessageAttachment } from '../api/types';
+import { groupSteps } from '../lib/groupSteps';
 import {
   SHOW_DESIGN_FIXTURES,
   AGENT_TRANSCRIPT_FIXTURE,
@@ -284,9 +286,11 @@ function FixtureMessageInner({
 export function ChatWindow({
   sessionId,
   friendly,
+  onPreviewFile,
 }: {
   sessionId: string;
   friendly?: boolean;
+  onPreviewFile?: (att: { id: string; filename: string; mime?: string }) => void;
 }) {
   const { messages, isStreaming, sendMessage, cancel } = useChat();
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -299,8 +303,14 @@ export function ChatWindow({
     return api.attachments.upload(sessionId, file);
   };
 
-  const handleSend = (text: string, attachmentIds?: string[]) => {
-    sendMessage(text, attachmentIds);
+  const handleSend = (text: string, attachmentIds?: string[], attachments?: Attachment[]) => {
+    const attMeta: MessageAttachment[] | undefined = attachments?.map((a) => ({
+      id: a.id,
+      filename: a.filename,
+      mime: a.mime,
+      size: a.size_bytes,
+    }));
+    sendMessage(text, attachmentIds, attMeta);
   };
 
   // Show fixture fallback only when no real messages exist, not streaming,
@@ -314,9 +324,23 @@ export function ChatWindow({
       <div className="cw-scroll flex-1 px-8 py-5 flex flex-col gap-[18px]">
         <div style={{ maxWidth: 780, margin: '0 auto', width: '100%', display: 'flex', flexDirection: 'column', gap: 18 }}>
           {/* ── Real messages ── */}
-          {messages.map((msg) => (
-            <MessageBubble key={msg.id} message={msg} friendly={friendly} />
-          ))}
+          {groupSteps(messages, isStreaming).map((u) =>
+            u.kind === 'message' ? (
+              <MessageBubble
+                key={u.message.id}
+                message={u.message}
+                friendly={friendly}
+                onPreviewFile={onPreviewFile}
+              />
+            ) : (
+              <StepGroup
+                key={`steps_${u.runId}_${u.steps[0]?.id ?? '0'}`}
+                group={u}
+                friendly={friendly}
+                onPreviewFile={onPreviewFile}
+              />
+            )
+          )}
 
           {/* ── Design fixture fallback (no real messages yet) ── */}
           {/* DESIGN FIXTURE — remove when backend provides transcript data */}
@@ -334,40 +358,8 @@ export function ChatWindow({
             </div>
           )}
 
-          {/* ── Live streaming indicator (design's "live" bubble) ── */}
-          {isStreaming && (
-            <div className="flex gap-3">
-              <span
-                className="cw-avatar accent lg shrink-0 font-mono"
-                style={{ marginTop: 2 }}
-              >
-                ◆
-              </span>
-              <div className="flex-1 min-w-0">
-                <div
-                  className="flex items-start gap-2.5"
-                  style={{
-                    padding: '10px 12px',
-                    border: '1.5px solid var(--accent-line)',
-                    background: 'var(--accent-soft)',
-                    borderRadius: 'var(--r-sm)',
-                  }}
-                >
-                  <span className="w-1.5 h-1.5 rounded-full bg-accent animate-blip mt-1.5 shrink-0" />
-                  <div
-                    className={
-                      friendly
-                        ? 'text-[13.5px] font-semibold tracking-[-0.005em]'
-                        : 'font-mono text-[12px] font-semibold'
-                    }
-                    style={{ color: 'var(--accent)' }}
-                  >
-                    {friendly ? 'Working on it…' : 'Running…'}
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
+          {/* ── Live "Working on it…" pill — shown while streaming, regardless of mode ── */}
+          {isStreaming && <WorkingOnItPill />}
 
           <div ref={bottomRef} />
         </div>
