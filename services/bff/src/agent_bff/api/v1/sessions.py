@@ -126,6 +126,52 @@ async def delete_session(
     return Response(status_code=204)
 
 
+@router.get("/sessions/{session_id}/runs")
+async def list_runs(
+    session_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> JSONResponse:
+    """Proxy the run list for a session from session-orchestrator.
+
+    Forwards to ``GET /sessions/{session_id}/runs`` and returns the JSON
+    unchanged (``{"items": [...]}``).  The web context rail uses this to show
+    the active worker and elapsed time.
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = await _orchestrator_url(request)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{orch_url}/sessions/{session_id}/runs",
+            headers=foundation_headers(tenant_id, user_id, access_token),
+        )
+        return _proxy_json(resp)
+
+
+@router.get("/sessions/{session_id}/runs/{run_id}/state")
+async def get_run_state(
+    session_id: str,
+    run_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> JSONResponse:
+    """Proxy run hot-state (plan/step/cursor) from session-orchestrator.
+
+    Forwards to ``GET /sessions/{session_id}/runs/{run_id}/state`` on the
+    orchestrator and returns the JSON unchanged.  Failure-open on the
+    orchestrator side: even if Redis is down, the orchestrator returns 200
+    with empty plan/cursor and DB-sourced status.
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = await _orchestrator_url(request)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{orch_url}/sessions/{session_id}/runs/{run_id}/state",
+            headers=foundation_headers(tenant_id, user_id, access_token),
+        )
+        return _proxy_json(resp)
+
+
 @router.post("/sessions/{session_id}/cancel")
 async def cancel_session(
     session_id: str,
@@ -144,6 +190,29 @@ async def cancel_session(
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
         return _proxy_json(resp)
+
+
+@router.delete("/sessions/{session_id}/messages")
+async def delete_messages_from_sequence(
+    session_id: str,
+    from_sequence: int,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> JSONResponse:
+    """Proxy message truncation to session-orchestrator.
+
+    Deletes all messages with sequence >= from_sequence, allowing the frontend
+    to rewind a conversation to a specific user turn.
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = await _orchestrator_url(request)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.delete(
+            f"{orch_url}/sessions/{session_id}/messages",
+            params={"from_sequence": from_sequence},
+            headers=foundation_headers(tenant_id, user_id, access_token),
+        )
+    return _proxy_json(resp)
 
 
 @router.get("/sessions/{session_id}/messages")

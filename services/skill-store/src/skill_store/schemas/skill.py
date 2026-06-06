@@ -34,6 +34,26 @@ class SkillOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class SkillInstallRequest(BaseModel):
+    enabled_by_default: bool = True
+
+
+class InstalledSkillOut(BaseModel):
+    """A skill in the user's toolbox — skill fields + install metadata."""
+
+    id: str
+    tenant_id: str
+    name: str
+    description: str | None = None
+    owner: str | None = None
+    visibility: Visibility
+    created_at: datetime
+    enabled_by_default: bool
+    installed_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class SkillVersionOut(BaseModel):
     id: str
     skill_id: str

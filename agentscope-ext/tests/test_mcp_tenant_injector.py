@@ -140,6 +140,7 @@ def test_install_registers_each_server(fresh):
         # injector appends /internal/mcp-servers to MCP_REGISTRY_URL
         assert request.url.path == "/api/mcp/v1/internal/mcp-servers"
         assert request.url.params["tenant_id"] == "tnt-abc"
+        assert request.headers["X-Tenant-Id"] == "tnt-abc"
         return httpx.Response(
             200,
             json={
@@ -212,6 +213,7 @@ def test_fetch_sends_x_service_scopes_header(fresh):
         "X-Service-Scopes header not sent to mcp-registry internal endpoint"
     )
     assert "mcp.read_internal" in captured_headers["x-service-scopes"]
+    assert captured_headers.get("x-tenant-id") == "tnt-abc"
 
     injector.set_client(None)
 

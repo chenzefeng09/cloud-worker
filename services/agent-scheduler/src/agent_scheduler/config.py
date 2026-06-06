@@ -47,7 +47,9 @@ SANDBOX_TOKEN_SCOPES: tuple[str, ...] = (
 #
 # Deliberately a module constant — widening this set is a security decision
 # that should go through code review, not env-var twiddling.
-SANDBOX_SERVICE_SCOPES: str = "mcp.read_internal,skill.read_internal"
+SANDBOX_SERVICE_SCOPES: str = (
+    "mcp.read_internal,skill.read_internal,web_fetch.invoke"
+)
 
 
 class Settings(BaseSettings):
@@ -138,8 +140,29 @@ class Settings(BaseSettings):
     mcp_registry_url: str = "http://mcp-registry:8010/api/mcp/v1"
     skill_store_url: str = "http://skill-store:8011/api/skills/v1"
     # Comma-separated list of agentscope_ext extensions to activate inside
-    # the sandbox.  Order matters: mcp_tenant_injector before skills_loader.
-    runtime_extensions: str = "mcp_tenant_injector,skills_loader"
+    # the sandbox.  Order matters: load MCP / Skills / web tools before the
+    # audit + LLM gateway hooks so every tool call and model call is captured.
+    # The enterprise default is fail-closed: no direct provider keys in the
+    # sandbox, and every model call must route through foundation llm-gateway.
+    runtime_extensions: str = (
+        "mcp_tenant_injector,skills_loader,web_fetch,"
+        "event_audit_sink,llm_gateway_enforcer"
+    )
+
+    # Web-fetch gateway — the sidecar that lets sandboxed agents fetch public
+    # URLs.  Forwarded into the sandbox as WEB_FETCH_GATEWAY_URL so the
+    # web_fetch extension can POST to /api/web-fetch/v1/fetch.  Uses the
+    # service name ``web-fetch-gateway`` which is routable on the ``foundation``
+    # docker network shared by all platform services and sandbox containers.
+    web_fetch_gateway_url: str = "http://web-fetch-gateway:8013"
+
+    # LLM Gateway (M1-P3) — base URL *with* API version prefix.
+    # Forwarded into every sandbox as LLM_GATEWAY_URL.  The scheduler also
+    # queries GET /tenant-keys?tenant_id= on this base URL to retrieve the
+    # tenant's virtual key (LLM_VIRTUAL_KEY) at spawn time.
+    # The enforcer is enabled by default.  A missing tenant virtual key is a
+    # spawn-time error; direct-connect is reserved for explicit local dev only.
+    llm_gateway_url: str = "http://llm-gateway:8011/api/llm-gateway/v1"
 
     otel_enabled: bool = True
     otel_exporter_endpoint: str = "http://localhost:4317"

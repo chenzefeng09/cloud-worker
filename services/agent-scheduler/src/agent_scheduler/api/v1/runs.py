@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
@@ -29,6 +30,8 @@ import docker
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
+
+logger = logging.getLogger(__name__)
 
 from agent_scheduler.api.authz_guard import require_permission
 from agent_scheduler.api.dependencies import TRuntime, TTenantId, TUserId
@@ -209,6 +212,77 @@ async def _mint_sandbox_token(
     return token
 
 
+async def _fetch_tenant_virtual_key(
+    *,
+    settings,  # type: ignore[no-untyped-def]
+    tenant_id: str,
+    bearer: str,
+) -> str | None:
+    """Query the LLM gateway for the tenant's virtual key.
+
+    Returns the first enabled virtual key string, or ``None`` if:
+    * the tenant has no virtual keys configured, or
+    * the gateway is unreachable / returns an error.
+
+    This helper only normalizes gateway failures into ``None``.  The caller
+    decides whether that means an explicit local direct-connect run or the
+    default fail-closed enterprise behavior.
+    """
+    if not settings.llm_gateway_url:
+        return None
+    url = f"{settings.llm_gateway_url.rstrip('/')}/tenant-keys"
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get(
+                url,
+                params={"tenant_id": tenant_id},
+                headers={
+                    "Authorization": f"Bearer {bearer}",
+                    # The gateway resolves the tenant from X-Tenant-Id (its
+                    # TenantContextMiddleware); without this header it returns
+                    # 401 and we would never retrieve the virtual key.  The
+                    # query param is kept for forward-compat but the header is
+                    # what the gateway actually reads.
+                    "X-Tenant-Id": tenant_id,
+                },
+            )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "llm-gateway unreachable while fetching tenant virtual key: %s",
+            exc,
+        )
+        return None
+
+    if resp.status_code != status.HTTP_200_OK:
+        logger.warning(
+            "llm-gateway returned HTTP %s for GET /tenant-keys",
+            resp.status_code,
+        )
+        return None
+
+    try:
+        keys = resp.json()
+        if isinstance(keys, list):
+            for item in keys:
+                if isinstance(item, dict) and item.get("enabled", True):
+                    key_val = item.get("key") or item.get("virtual_key") or item.get("value")
+                    if key_val:
+                        return str(key_val)
+        # Response may be a dict with a ``keys`` or ``data`` list
+        if isinstance(keys, dict):
+            for field in ("keys", "data", "items", "results"):
+                items = keys.get(field, [])
+                if isinstance(items, list):
+                    for item in items:
+                        if isinstance(item, dict) and item.get("enabled", True):
+                            key_val = item.get("key") or item.get("virtual_key") or item.get("value")
+                            if key_val:
+                                return str(key_val)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("failed to parse /tenant-keys response: %s", exc)
+    return None
+
+
 def _require_tenant_owner(
     runtime: DockerRuntime, container_id: str, tenant_id: str
 ) -> None:
@@ -270,11 +344,37 @@ async def create_run(
     quota_guard = request.app.state.quota_guard
     await quota_guard.check(tenant_id=tenant_id, dimension="agent_sessions", requested=1)
 
+    _settings = request.app.state.settings
+
     foundation_token = await _mint_sandbox_token(
-        settings=request.app.state.settings,
+        settings=_settings,
         tenant_id=tenant_id,
         run_id=run_id,
     )
+
+    # Fetch the tenant's virtual key from the LLM gateway so the sandbox can
+    # route every model call through the foundation gateway.  With the gateway
+    # enforcer enabled this is fail-closed: no virtual key, no sandbox spawn.
+    scheduler_bearer = _settings.scheduler_service_token
+    if scheduler_bearer in _PLACEHOLDER_TOKENS:
+        # Best-effort: try the cached KC token without re-minting to avoid a
+        # second round-trip.  If it's still empty we simply skip the key fetch.
+        scheduler_bearer = str(_kc_token_cache.get("token", ""))
+    virtual_key: str | None = await _fetch_tenant_virtual_key(
+        settings=_settings,
+        tenant_id=tenant_id,
+        bearer=scheduler_bearer,
+    )
+    extensions = {
+        e.strip()
+        for e in (_settings.runtime_extensions or "").split(",")
+        if e.strip()
+    }
+    if "llm_gateway_enforcer" in extensions and not virtual_key:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="LLM gateway virtual key unavailable for tenant",
+        )
 
     try:
         container_id = runtime.spawn_run(
@@ -287,6 +387,8 @@ async def create_run(
             skills=skills,
             files=files,
             memory=memory,
+            llm_gateway_url=_settings.llm_gateway_url,
+            llm_virtual_key=virtual_key,
         )
     except SandboxSpawnError as exc:
         raise HTTPException(

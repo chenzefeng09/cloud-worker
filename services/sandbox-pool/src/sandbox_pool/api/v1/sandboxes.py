@@ -64,10 +64,10 @@ async def acquire(body: AcquireRequest, request: Request) -> AcquireResponse:
     response_model=None,
 )
 async def release(sandbox_id: str, request: Request) -> Response:
-    _require_tenant()
+    tenant_id = _require_tenant()
     pool = _pool(request)
     try:
-        await pool.release(sandbox_id)
+        await pool.release(sandbox_id, tenant_id=tenant_id)
     except PoolError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)

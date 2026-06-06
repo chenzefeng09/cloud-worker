@@ -287,6 +287,252 @@ def test_from_env_noop_when_no_env(no_redis, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# push_token / push_token_end — token streaming contract
+# ---------------------------------------------------------------------------
+
+
+def test_push_token_xadd_calls_contract(fake_redis):
+    """push_token issues XADD with type=delta, text=<delta>, MAXLEN~10000."""
+    _, mock_instance = fake_redis
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient, _TOKEN_STREAM_MAXLEN
+
+    client = RunStateClient(run_id="run_tok", redis_url="redis://host:6379/0")
+    client.push_token("Hello")
+    client.push_token(", world")
+
+    assert mock_instance.xadd.call_count == 2
+    # First call
+    first_args, first_kwargs = mock_instance.xadd.call_args_list[0]
+    assert first_args[0] == "agent:run:run_tok:tokens"
+    assert first_args[1] == {"type": "delta", "text": "Hello"}
+    assert first_kwargs.get("maxlen") == _TOKEN_STREAM_MAXLEN
+    assert first_kwargs.get("approximate") is True
+    # Second call
+    second_args, _ = mock_instance.xadd.call_args_list[1]
+    assert second_args[1] == {"type": "delta", "text": ", world"}
+
+
+def test_push_token_end_xadd_type_end(fake_redis):
+    """push_token_end issues XADD with type=end, text=''."""
+    _, mock_instance = fake_redis
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient, _TOKEN_STREAM_MAXLEN
+
+    client = RunStateClient(run_id="run_tok_end", redis_url="redis://host:6379/0")
+    client.push_token_end()
+
+    assert mock_instance.xadd.call_count == 1
+    args, kwargs = mock_instance.xadd.call_args
+    assert args[0] == "agent:run:run_tok_end:tokens"
+    assert args[1] == {"type": "end", "text": ""}
+    assert kwargs.get("maxlen") == _TOKEN_STREAM_MAXLEN
+    assert kwargs.get("approximate") is True
+
+
+def test_push_token_sets_expire_on_first_call(fake_redis):
+    """The first push_token call must set EXPIRE on the stream key."""
+    _, mock_instance = fake_redis
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient, STATE_TTL_SECONDS
+
+    client = RunStateClient(run_id="run_exp", redis_url="redis://host:6379/0")
+    # No expire call before first push.
+    assert mock_instance.expire.call_count == 0
+
+    client.push_token("hi")
+    mock_instance.expire.assert_called_once_with(
+        "agent:run:run_exp:tokens", STATE_TTL_SECONDS
+    )
+
+    # Second push must NOT call expire again.
+    client.push_token("there")
+    assert mock_instance.expire.call_count == 1
+
+
+def test_push_token_end_sets_expire_when_no_deltas(fake_redis):
+    """push_token_end alone must also set EXPIRE on the stream key."""
+    _, mock_instance = fake_redis
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient, STATE_TTL_SECONDS
+
+    client = RunStateClient(run_id="run_exp2", redis_url="redis://host:6379/0")
+    client.push_token_end()
+    mock_instance.expire.assert_called_once_with(
+        "agent:run:run_exp2:tokens", STATE_TTL_SECONDS
+    )
+
+
+def test_push_token_failure_open(fake_redis):
+    """XADD failure must not propagate — only a warning is logged."""
+    _, mock_instance = fake_redis
+    mock_instance.xadd.side_effect = Exception("connection reset")
+
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient
+
+    client = RunStateClient(run_id="run_fail", redis_url="redis://host:6379/0")
+    client.push_token("boom")  # must not raise
+
+
+def test_push_token_end_failure_open(fake_redis):
+    """XADD failure in push_token_end must not propagate."""
+    _, mock_instance = fake_redis
+    mock_instance.xadd.side_effect = Exception("timeout")
+
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient
+
+    client = RunStateClient(run_id="run_fail_end", redis_url="redis://host:6379/0")
+    client.push_token_end()  # must not raise
+
+
+def test_push_token_noop_when_no_client(no_redis):
+    """push_token and push_token_end are silent no-ops when Redis is unavailable."""
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient
+
+    client = RunStateClient(run_id="run_noop", redis_url=None)
+    client.push_token("x")  # must not raise
+    client.push_token_end()  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# push_tool_call / push_tool_result / push_thinking — streaming contract
+# ---------------------------------------------------------------------------
+
+
+def test_push_tool_call_xadd_contract(fake_redis):
+    """push_tool_call issues XADD with correct type/tool_call_id/name/args fields."""
+    _, mock_instance = fake_redis
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient, _TOKEN_STREAM_MAXLEN
+
+    client = RunStateClient(run_id="run_tc", redis_url="redis://host:6379/0")
+    client.push_tool_call("tc-1", "Read", '{"file": "src/auth.ts", "limit": 142}')
+
+    assert mock_instance.xadd.call_count == 1
+    args, kwargs = mock_instance.xadd.call_args
+    assert args[0] == "agent:run:run_tc:tokens"
+    assert args[1] == {
+        "type": "tool_call",
+        "tool_call_id": "tc-1",
+        "name": "Read",
+        "args": '{"file": "src/auth.ts", "limit": 142}',
+    }
+    assert kwargs.get("maxlen") == _TOKEN_STREAM_MAXLEN
+    assert kwargs.get("approximate") is True
+
+
+def test_push_tool_result_xadd_contract(fake_redis):
+    """push_tool_result issues XADD with correct type/tool_call_id/name/result/state."""
+    _, mock_instance = fake_redis
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient, _TOKEN_STREAM_MAXLEN
+
+    client = RunStateClient(run_id="run_tr", redis_url="redis://host:6379/0")
+    client.push_tool_result("tc-2", "Read", "import session from ...", "success")
+
+    assert mock_instance.xadd.call_count == 1
+    args, kwargs = mock_instance.xadd.call_args
+    assert args[0] == "agent:run:run_tr:tokens"
+    fields = args[1]
+    assert fields["type"] == "tool_result"
+    assert fields["tool_call_id"] == "tc-2"
+    assert fields["name"] == "Read"
+    assert fields["result"] == "import session from ..."
+    assert fields["state"] == "success"
+    assert kwargs.get("maxlen") == _TOKEN_STREAM_MAXLEN
+    assert kwargs.get("approximate") is True
+
+
+def test_push_tool_result_truncates_large_output(fake_redis):
+    """Results larger than 8 KB must be truncated with '…[truncated]' suffix."""
+    _, mock_instance = fake_redis
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient
+
+    client = RunStateClient(run_id="run_trunc", redis_url="redis://host:6379/0")
+    big_result = "x" * (9 * 1024)  # 9 KB, over the 8 KB limit
+    client.push_tool_result("tc-trunc", "Grep", big_result, "success")
+
+    args, _ = mock_instance.xadd.call_args
+    stored_result = args[1]["result"]
+    assert stored_result.endswith("…[truncated]")
+    # The stored result must be at most 8 KB + overhead of the truncation suffix.
+    assert len(stored_result.encode("utf-8")) <= 9 * 1024  # definitely under 9 KB
+
+
+def test_push_tool_result_no_truncation_for_small_output(fake_redis):
+    """Results under 8 KB must be stored verbatim."""
+    _, mock_instance = fake_redis
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient
+
+    client = RunStateClient(run_id="run_notrunc", redis_url="redis://host:6379/0")
+    small_result = "line 1\nline 2\nline 3"
+    client.push_tool_result("tc-small", "Read", small_result, "success")
+
+    args, _ = mock_instance.xadd.call_args
+    assert args[1]["result"] == small_result
+
+
+def test_push_thinking_xadd_contract(fake_redis):
+    """push_thinking issues XADD with type=thinking, text=<thought>."""
+    _, mock_instance = fake_redis
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient, _TOKEN_STREAM_MAXLEN
+
+    client = RunStateClient(run_id="run_think", redis_url="redis://host:6379/0")
+    client.push_thinking("I need to read the file first")
+
+    assert mock_instance.xadd.call_count == 1
+    args, kwargs = mock_instance.xadd.call_args
+    assert args[0] == "agent:run:run_think:tokens"
+    assert args[1] == {"type": "thinking", "text": "I need to read the file first"}
+    assert kwargs.get("maxlen") == _TOKEN_STREAM_MAXLEN
+    assert kwargs.get("approximate") is True
+
+
+def test_push_tool_call_failure_open(fake_redis):
+    """XADD failure in push_tool_call must not propagate."""
+    _, mock_instance = fake_redis
+    mock_instance.xadd.side_effect = Exception("connection reset")
+
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient
+
+    client = RunStateClient(run_id="run_tc_fail", redis_url="redis://host:6379/0")
+    client.push_tool_call("tc-x", "Read", "{}")  # must not raise
+
+
+def test_push_tool_result_failure_open(fake_redis):
+    """XADD failure in push_tool_result must not propagate."""
+    _, mock_instance = fake_redis
+    mock_instance.xadd.side_effect = Exception("timeout")
+
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient
+
+    client = RunStateClient(run_id="run_tr_fail", redis_url="redis://host:6379/0")
+    client.push_tool_result("tc-x", "Read", "output", "success")  # must not raise
+
+
+def test_push_tool_call_noop_when_no_client(no_redis):
+    """push_tool_call/push_tool_result/push_thinking are no-ops without Redis."""
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient
+
+    client = RunStateClient(run_id="run_noop2", redis_url=None)
+    client.push_tool_call("tc-1", "Read", "{}")  # must not raise
+    client.push_tool_result("tc-1", "Read", "out", "success")  # must not raise
+    client.push_thinking("thought")  # must not raise
+
+
+def test_push_tool_call_sets_expire_on_first_call(fake_redis):
+    """The first push_tool_call must set EXPIRE on the stream key."""
+    _, mock_instance = fake_redis
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient, STATE_TTL_SECONDS
+
+    client = RunStateClient(run_id="run_tc_exp", redis_url="redis://host:6379/0")
+    assert mock_instance.expire.call_count == 0
+
+    client.push_tool_call("tc-1", "Read", "{}")
+    mock_instance.expire.assert_called_once_with(
+        "agent:run:run_tc_exp:tokens", STATE_TTL_SECONDS
+    )
+
+    # Second call must NOT call expire again.
+    client.push_tool_call("tc-2", "Grep", '{"pattern": "foo"}')
+    assert mock_instance.expire.call_count == 1
+
+
+# ---------------------------------------------------------------------------
 # Integration: resume detection in _run_real (worker entrypoint)
 # ---------------------------------------------------------------------------
 

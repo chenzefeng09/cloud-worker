@@ -1,0 +1,56 @@
+{{/* =============================================================================
+     Ingress — 对外暴露 BFF (API) 和 Web (UI)
+     BFF path:  /api/ → ap-bff
+     Web path:  /     → ap-web
+     ============================================================================= */}}
+
+{{- if .Values.global.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ap-ingress
+  labels:
+    app.kubernetes.io/part-of: agent-platform
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    agent-platform.example.com/profile: {{ .Values.global.profile | default "small" }}
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    # SSE 长连接：关闭 proxy-buffering
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-http-version: "1.1"
+    {{- with .Values.global.ingress.annotations }}
+      {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  ingressClassName: {{ .Values.global.ingress.className | default "nginx" }}
+  {{- if .Values.global.ingress.tls }}
+  tls:
+    - hosts:
+        - {{ .Values.global.ingress.host }}
+      secretName: {{ printf "ap-tls-%s" (.Values.global.ingress.host | replace "." "-") }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.global.ingress.host }}
+      http:
+        paths:
+          {{- if .Values.bff.enabled }}
+          - path: /api/
+            pathType: Prefix
+            backend:
+              service:
+                name: ap-bff
+                port:
+                  number: {{ .Values.bff.port | default 8005 }}
+          {{- end }}
+          {{- if .Values.web.enabled }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: ap-web
+                port:
+                  number: {{ .Values.web.port | default 80 }}
+          {{- end }}
+{{- end }}

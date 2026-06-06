@@ -17,12 +17,15 @@ state to the DB without committing.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.domain.models import Attachment, Message, Run, Session
 from agent_session_orchestrator.errors import RunNotFoundError, SessionNotFoundError
+
+logger = logging.getLogger(__name__)
 
 
 def _now() -> dt.datetime:
@@ -108,6 +111,7 @@ class SessionService:
         content: str,
         tool_calls: dict[str, object] | None = None,
         run_id: str | None = None,
+        attachment_ids: list[str] | None = None,
     ) -> Message:
         await self.get_session(session_id)
 
@@ -120,12 +124,37 @@ class SessionService:
         last_seq = result.scalar_one_or_none()
         sequence = (last_seq or 0) + 1
 
+        # Resolve attachment metadata for the JSON column (failure-open).
+        attachments_meta: list[dict] | None = None
+        if attachment_ids:
+            try:
+                stmt = select(Attachment).where(
+                    Attachment.id.in_(attachment_ids),
+                    Attachment.session_id == session_id,
+                    Attachment.tenant_id == self._tenant_id,
+                    Attachment.kind == "input",
+                )
+                att_result = await self._db.execute(stmt)
+                att_rows = list(att_result.scalars().all())
+                attachments_meta = [
+                    {
+                        "id": a.id,
+                        "filename": a.filename,
+                        "mime": a.mime,
+                        "size": a.size_bytes,
+                    }
+                    for a in att_rows
+                ]
+            except Exception:  # noqa: BLE001 — failure-open; don't block message creation
+                attachments_meta = None
+
         msg = Message(
             tenant_id=self._tenant_id,
             session_id=session_id,
             role=role,
             content=content,
             tool_calls=tool_calls,
+            attachments=attachments_meta,
             run_id=run_id,
             sequence=sequence,
         )
@@ -252,6 +281,57 @@ class SessionService:
         )
         result = await self._db.execute(stmt)
         return list(result.scalars().all())
+
+    async def delete_messages_from_sequence(self, session_id: str, from_sequence: int) -> int:
+        """Delete all messages with sequence >= from_sequence for this session.
+
+        Also deletes output Attachment rows whose run_id matches any deleted
+        message's run_id (orphaned output attachments from truncated runs).
+
+        Returns the number of message rows deleted.
+        """
+        # Validate the session exists first (reuse get_session pattern).
+        await self.get_session(session_id)
+
+        # Collect run_ids from messages that will be deleted, for attachment cleanup.
+        select_stmt = select(Message.run_id).where(
+            Message.session_id == session_id,
+            Message.sequence >= from_sequence,
+            Message.run_id.is_not(None),
+        )
+        run_ids_result = await self._db.execute(select_stmt)
+        run_ids = {row[0] for row in run_ids_result.fetchall() if row[0]}
+
+        # Delete the messages.
+        del_stmt = delete(Message).where(
+            Message.session_id == session_id,
+            Message.sequence >= from_sequence,
+        )
+        result = await self._db.execute(del_stmt)
+        deleted_count = result.rowcount
+
+        # Clean up orphaned output attachments for the deleted runs.
+        if run_ids:
+            try:
+                att_del_stmt = delete(Attachment).where(
+                    Attachment.session_id == session_id,
+                    Attachment.tenant_id == self._tenant_id,
+                    Attachment.kind == "output",
+                    Attachment.run_id.in_(run_ids),
+                )
+                att_result = await self._db.execute(att_del_stmt)
+                logger.debug(
+                    "truncate: deleted %d output attachment(s) for %d run(s)",
+                    att_result.rowcount,
+                    len(run_ids),
+                )
+            except Exception as exc:  # noqa: BLE001 — failure-open; don't block truncation
+                logger.warning(
+                    "truncate: attachment cleanup failed (failure-open): %s", exc
+                )
+
+        await self._db.flush()
+        return deleted_count
 
     async def get_run(self, session_id: str, run_id: str) -> Run:
         stmt = select(Run).where(

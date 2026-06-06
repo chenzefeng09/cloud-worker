@@ -24,6 +24,7 @@ def settings() -> Settings:
         idle_low_watermark=0,  # disable background spawning for stable tests
         idle_high_watermark=5,
         max_total=10,
+        acquire_timeout_seconds=0,
         warmup_templates=["base"],
         otel_enabled=False,
         sandbox_image="test-image:latest",
@@ -98,3 +99,30 @@ def test_acquire_and_release_round_trip(client: TestClient) -> None:
 
     snap = client.get("/api/sandbox-pool/v1/sandboxes/_pool")
     assert snap.json()["total"] == 0
+
+
+def test_release_rejects_cross_tenant(client: TestClient) -> None:
+    owner_headers = {"X-Tenant-Id": "tnt_01J5TEST00000000000000TNT1"}
+    other_headers = {"X-Tenant-Id": "tnt_01J5TEST00000000000000TNT2"}
+    acq = client.post(
+        "/api/sandbox-pool/v1/sandboxes/acquire",
+        headers=owner_headers,
+        json={"template": "base"},
+    )
+    assert acq.status_code == 201, acq.text
+    sandbox_id = acq.json()["sandbox_id"]
+
+    rel = client.delete(
+        f"/api/sandbox-pool/v1/sandboxes/{sandbox_id}",
+        headers=other_headers,
+    )
+    assert rel.status_code == 404
+
+    snap = client.get("/api/sandbox-pool/v1/sandboxes/_pool")
+    assert snap.json()["total"] == 1
+
+    owner_rel = client.delete(
+        f"/api/sandbox-pool/v1/sandboxes/{sandbox_id}",
+        headers=owner_headers,
+    )
+    assert owner_rel.status_code == 204

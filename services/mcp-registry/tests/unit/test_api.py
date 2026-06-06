@@ -169,9 +169,26 @@ def test_internal_endpoint_multi_scope_header_accepted(
     resp = app_client.get(
         "/api/mcp/v1/internal/mcp-servers",
         params={"tenant_id": "tnt_01J5TEST00000000000000TNT1"},
-        headers={"X-Service-Scopes": "mcp.read_internal,skill.read_internal"},
+        headers={
+            "X-Tenant-Id": "tnt_01J5TEST00000000000000TNT1",
+            "X-Service-Scopes": "mcp.read_internal,skill.read_internal",
+        },
     )
     assert resp.status_code == 200, resp.text
+
+
+def test_internal_endpoint_rejects_query_tenant_mismatch(
+    app_client: TestClient,
+) -> None:
+    resp = app_client.get(
+        "/api/mcp/v1/internal/mcp-servers",
+        params={"tenant_id": "tnt_01J5TEST00000000000000TNT2"},
+        headers={
+            "X-Tenant-Id": "tnt_01J5TEST00000000000000TNT1",
+            "X-Service-Scopes": "mcp.read_internal",
+        },
+    )
+    assert resp.status_code == 403
 
 
 def test_internal_endpoint_returns_enabled_servers(

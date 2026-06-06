@@ -6,6 +6,7 @@ import { api, ApiError } from '../api/client';
 import type { Attachment, KnowledgeDocument } from '../api/types';
 import { useChatStore } from '../stores/chatStore';
 import { formatRelativeTimeZh } from '../lib/format';
+import { mimeToKind, FilePreviewBody } from '../components/filePreview';
 
 const KIND_GLYPH: Record<string, string> = {
   md: '☷',
@@ -31,21 +32,6 @@ const DOC_STATUS_ZH: Record<string, string> = {
   READY: '就绪',
   FAILED: '失败',
 };
-
-function mimeToKind(mime: string): string {
-  if (mime.includes('pdf')) return 'pdf';
-  if (mime.includes('markdown') || mime.includes('text/plain')) return 'md';
-  if (mime.includes('json')) return 'json';
-  if (mime.includes('yaml')) return 'yaml';
-  if (mime.includes('csv')) return 'csv';
-  if (mime.includes('word') || mime.includes('docx')) return 'docx';
-  if (mime.includes('spreadsheet') || mime.includes('xlsx')) return 'xlsx';
-  if (mime.includes('presentation') || mime.includes('pptx')) return 'pptx';
-  if (mime.includes('image/png')) return 'png';
-  if (mime.includes('image/jpeg')) return 'jpg';
-  if (mime.includes('text/')) return 'txt';
-  return 'md';
-}
 
 function extFromFilename(name: string): string {
   const parts = name.split('.');
@@ -82,11 +68,6 @@ export function FilesPage() {
   const [sessionFiles, setSessionFiles] = useState<Attachment[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
   const [filesError, setFilesError] = useState<string | null>(null);
-
-  // File content for preview
-  const [contentLoading, setContentLoading] = useState(false);
-  const [contentText, setContentText] = useState<string | null>(null);
-  const [contentError, setContentError] = useState<string | null>(null);
 
   function loadDocs() {
     setDocsLoading(true);
@@ -148,43 +129,6 @@ export function FilesPage() {
 
     return () => { cancelled = true; };
   }, [activeSessionId]);
-
-  // Load content when an attachment is selected
-  useEffect(() => {
-    if (!selected || selected.type !== 'att') {
-      setContentText(null);
-      setContentError(null);
-      return;
-    }
-    const att = selected.att;
-    const isPreviewable =
-      att.mime.startsWith('text/') ||
-      att.mime.includes('json') ||
-      att.mime.includes('yaml') ||
-      att.mime.includes('xml') ||
-      att.mime.includes('markdown');
-
-    if (!isPreviewable) {
-      setContentText(null);
-      return;
-    }
-
-    let cancelled = false;
-    setContentLoading(true);
-    setContentError(null);
-
-    api.attachments.getContent(att.session_id, att.id).then((res) => {
-      if (cancelled) return;
-      setContentText(res.text);
-    }).catch((e) => {
-      if (cancelled) return;
-      setContentError(e instanceof ApiError ? e.message : '加载文件内容失败');
-    }).finally(() => {
-      if (!cancelled) setContentLoading(false);
-    });
-
-    return () => { cancelled = true; };
-  }, [selected]);
 
   const inputFiles = useMemo(() => sessionFiles.filter((f) => f.kind === 'input'), [sessionFiles]);
   const outputFiles = useMemo(() => sessionFiles.filter((f) => f.kind === 'output'), [sessionFiles]);
@@ -351,7 +295,7 @@ export function FilesPage() {
 
           <div className="px-3 py-2.5 border-t border-line-2 font-mono text-[10.5px] text-ink-2 leading-[1.7]">
             <div className="cw-label mb-1.5">
-              工作区 · {ws.name}
+              {ws.name}
             </div>
             {activeSessionId ? (
               <div>{inputFiles.length} 个上传 · {outputFiles.length} 个产物 · {docs.length} 个知识文档</div>
@@ -366,12 +310,7 @@ export function FilesPage() {
             selected.type === 'doc' ? (
               <DocDetail doc={selected.doc} />
             ) : (
-              <AttDetail
-                att={selected.att}
-                contentLoading={contentLoading}
-                contentText={contentText}
-                contentError={contentError}
-              />
+              <AttDetail att={selected.att} />
             )
           ) : (
             <div className="flex-1 flex items-center justify-center text-dim text-[13px]">
@@ -427,19 +366,8 @@ function DocDetail({ doc }: { doc: KnowledgeDocument }) {
   );
 }
 
-function AttDetail({
-  att,
-  contentLoading,
-  contentText,
-  contentError,
-}: {
-  att: Attachment;
-  contentLoading: boolean;
-  contentText: string | null;
-  contentError: string | null;
-}) {
+function AttDetail({ att }: { att: Attachment }) {
   const ext = att.filename.split('.').pop()?.toLowerCase() ?? '';
-  const isImage = att.mime.startsWith('image/');
 
   return (
     <>
@@ -470,37 +398,13 @@ function AttDetail({
             ))}
           </div>
 
-          {/* Preview */}
-          {contentLoading && (
-            <div className="font-mono text-[11px] text-dim">加载预览…</div>
-          )}
-          {contentError && (
-            <div className="font-mono text-[11px] text-accent">{contentError}</div>
-          )}
-          {isImage && (
-            <div className="border border-line rounded-md overflow-hidden bg-surface p-2">
-              <img
-                src={`/api/bff/v1/sessions/${att.session_id}/files/${att.id}/content`}
-                alt={att.filename}
-                className="max-w-full max-h-[400px] object-contain"
-              />
-            </div>
-          )}
-          {contentText !== null && !contentLoading && (
-            <div className="border border-line rounded-md overflow-hidden bg-surface">
-              <div className="cw-label px-4 py-2 border-b border-line-2">
-                文件内容
-              </div>
-              <pre className="px-4 py-3 font-mono text-[11.5px] text-ink-2 whitespace-pre-wrap break-words overflow-auto max-h-[400px]">
-                {contentText}
-              </pre>
-            </div>
-          )}
-          {!contentLoading && contentText === null && !isImage && !contentError && (
-            <div className="font-mono text-[11px] text-dim italic">
-              — 该文件类型暂不支持预览，请下载查看 —
-            </div>
-          )}
+          {/* Preview — delegated to shared FilePreviewBody */}
+          <FilePreviewBody
+            sessionId={att.session_id}
+            fileId={att.id}
+            filename={att.filename}
+            mime={att.mime}
+          />
 
           <div className="font-mono text-[11px] text-dim italic">附件 ID · {att.id}</div>
           {att.run_id && (

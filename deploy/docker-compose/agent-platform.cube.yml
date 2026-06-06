@@ -1,0 +1,179 @@
+# =============================================================================
+# CubeSandbox staging override — applies on top of agent-platform.yml
+#
+# Usage (staging Linux host with /dev/kvm):
+#
+#   docker compose \
+#     -f deploy/docker-compose/agent-platform.yml \
+#     -f deploy/docker-compose/agent-platform.cube.yml \
+#     up -d
+#
+# Prerequisites
+# -------------
+# 1. /dev/kvm must exist on the host (KVM hypervisor enabled).
+# 2. The CUBE_CONTROLLER_IMAGE variable must be set to the real
+#    CubeSandbox controller image (see comment on the `cube-controller`
+#    service below).  There is no public image in this repo — fill in the
+#    image published by Tencent Cloud / CubeSandbox:
+#      export CUBE_CONTROLLER_IMAGE=ccr.ccs.tencentyun.com/cube/cube-controller:<tag>
+# 3. mTLS certificates must be present.  Generate them first:
+#      bash deploy/scripts/gen-cube-certs.sh
+#    This creates deploy/certs/{ca,controller,scheduler-client}.{crt,key}
+#    which are bind-mounted below.
+#
+# Environment variables consumed by this file (set in your .env or shell):
+#   CUBE_CONTROLLER_IMAGE   — REQUIRED: CubeSandbox controller OCI image
+#   CUBE_CONTROLLER_URL     — default: https://cube-controller:8443
+#   CUBE_CERTS_DIR          — default: ./deploy/certs (absolute or relative to repo root)
+#   CUBE_CONTROLLER_PORT    — host port mapping; default 8443
+#
+# What this file does
+# -------------------
+# * Adds the `cube-controller` service (placeholder image — see above).
+# * Overrides `agent-scheduler` to: set SCHEDULER_RUNTIME=cube, point it at
+#   the controller, and mount the mTLS client certificate.
+# * Overrides `sandbox-pool` to: point its cube_controller_url at the real
+#   controller and set SANDBOX_POOL_RUNTIME=cube.
+# * Does NOT override the docker-socket-proxy service — it stays up so
+#   docker-runtime-based dev/CI continues to work if needed.
+# =============================================================================
+
+name: agent-platform-dev
+
+# ---------------------------------------------------------------------------
+# This override participates in the same named networks declared in
+# agent-platform.yml.  Declaring them here as `external: true` prevents
+# Compose from trying to re-create them when this file is stacked.
+# ---------------------------------------------------------------------------
+networks:
+  foundation:
+    external: true
+    name: ${FOUNDATION_NETWORK:-saas-foundation-dev_foundation}
+  agent_internal:
+    driver: bridge
+    internal: true
+
+services:
+
+  # ===========================================================================
+  # CubeSandbox controller — microVM lifecycle manager (E2B-compatible API)
+  #
+  # PLACEHOLDER: Set CUBE_CONTROLLER_IMAGE to the real CubeSandbox controller
+  # image from Tencent Cloud before starting this compose file.
+  #
+  # Confirmed-correct values (determined from this codebase):
+  #   - Port: 8443 (HTTPS / mTLS endpoint, matches cube_runtime.py default)
+  #   - Device: /dev/kvm required for KVM-backed microVMs
+  #   - Network: `foundation` so agent-scheduler and sandbox-pool reach it by
+  #     service name `cube-controller`
+  #   - mTLS: server cert/key mounted from deploy/certs/; CA cert shared with
+  #     the scheduler's client trust
+  #
+  # Placeholder / operator-fill values:
+  #   - CUBE_CONTROLLER_IMAGE: fill in the real image URI
+  #   - CUBE_CONTROLLER_* env vars: defaults below match common deployments;
+  #     adjust to the real image's documented env names if they differ
+  # ===========================================================================
+  cube-controller:
+    # PLACEHOLDER — replace with the real CubeSandbox controller OCI image.
+    # Example: ccr.ccs.tencentyun.com/cube/cube-controller:v0.7.2
+    image: ${CUBE_CONTROLLER_IMAGE:?CUBE_CONTROLLER_IMAGE must be set to the CubeSandbox controller image}
+    container_name: agent-cube-controller
+    restart: unless-stopped
+    privileged: true          # required for KVM device access and nested networking
+    devices:
+      - /dev/kvm:/dev/kvm     # KVM hypervisor — mandatory on Linux staging hosts
+    environment:
+      # --------------------------------------------------------------------- #
+      # These env var names are our best understanding of CubeSandbox's       #
+      # controller configuration surface.  Verify against the official image  #
+      # documentation and adjust if the real names differ.                    #
+      # --------------------------------------------------------------------- #
+
+      # mTLS — the controller presents this cert to connecting clients.
+      # Paths inside the container correspond to the bind-mounts below.
+      CUBE_TLS_CERT_FILE: /etc/cube/certs/controller.crt
+      CUBE_TLS_KEY_FILE: /etc/cube/certs/controller.key
+      CUBE_TLS_CA_FILE: /etc/cube/certs/ca.crt
+
+      # Listen address.  The E2B-compatible REST API is on 8443.
+      CUBE_LISTEN_ADDR: "0.0.0.0:8443"
+
+      # Optional: where CubeSandbox stores VM disk images / snapshots.
+      # Override if the staging host has a dedicated NVMe mount.
+      CUBE_STORAGE_PATH: ${CUBE_STORAGE_PATH:-/var/lib/cube/storage}
+
+      # Log verbosity — set to INFO in staging, DEBUG only for deep troubleshooting.
+      CUBE_LOG_LEVEL: ${CUBE_LOG_LEVEL:-INFO}
+
+    volumes:
+      # mTLS certificate bundle — generated by deploy/scripts/gen-cube-certs.sh
+      # PLACEHOLDER: adjust ${CUBE_CERTS_DIR} if your cert path differs.
+      - ${CUBE_CERTS_DIR:-./deploy/certs}:/etc/cube/certs:ro
+
+      # Persistent storage for VM images and snapshots.
+      # Use a dedicated volume or host path on storage-optimised machines.
+      - cube_storage:/var/lib/cube/storage
+
+    ports:
+      # Host→container: expose 8443 for health-checking from outside Docker.
+      # The scheduler and sandbox-pool reach cube-controller by service name
+      # on the `foundation` network and do NOT need this port exposed.
+      - "${CUBE_CONTROLLER_PORT:-8443}:8443"
+
+    networks: [foundation]
+
+    # No healthcheck defined here because we don't know the real controller's
+    # health endpoint.  Add one once the image documentation is available:
+    #   healthcheck:
+    #     test: ["CMD", "curl", "-f", "--cacert", "/etc/cube/certs/ca.crt",
+    #            "https://127.0.0.1:8443/healthz"]
+    #     interval: 10s
+    #     timeout: 5s
+    #     retries: 10
+
+  # ===========================================================================
+  # agent-scheduler — override to enable cube runtime + mTLS client cert
+  # ===========================================================================
+  agent-scheduler:
+    environment:
+      # Switch from docker to cube runtime.
+      SCHEDULER_RUNTIME: cube
+      # Controller endpoint — service name resolves on `foundation` network.
+      SCHEDULER_CUBE_CONTROLLER_URL: ${CUBE_CONTROLLER_URL:-https://cube-controller:8443}
+      # mTLS mode — "mtls" is the production default (ADR 0001 §5).
+      # Use "tls" if an Istio/Linkerd sidecar terminates client auth out-of-band.
+      # Use "off" only for isolated test setups where TLS is not needed.
+      SCHEDULER_CUBE_TLS_MODE: ${CUBE_TLS_MODE:-mtls}
+      # Paths inside the container where mTLS material is mounted.
+      SCHEDULER_CUBE_CLIENT_CERT: /etc/cube/certs/scheduler-client.crt
+      SCHEDULER_CUBE_CLIENT_KEY: /etc/cube/certs/scheduler-client.key
+      SCHEDULER_CUBE_CA_CERT: /etc/cube/certs/ca.crt
+    volumes:
+      # Append cert volume on top of the workspace volume declared in base file.
+      # Compose merges volumes lists — the workspace bind-mount is preserved.
+      - ${CUBE_CERTS_DIR:-./deploy/certs}:/etc/cube/certs:ro
+
+  # ===========================================================================
+  # sandbox-pool — override to enable cube runtime
+  # ===========================================================================
+  sandbox-pool:
+    environment:
+      # Switch pool to cube pre-warming mode.
+      # PoolCubeRuntime in pool.py uses this value to select the cube backend.
+      SANDBOX_POOL_RUNTIME: cube
+      # Point at the same cube-controller the scheduler uses.
+      SANDBOX_POOL_CUBE_CONTROLLER_URL: ${CUBE_CONTROLLER_URL:-https://cube-controller:8443}
+      # mTLS for pool → controller (same cert bundle, different client role).
+      SANDBOX_POOL_CUBE_TLS_MODE: ${CUBE_TLS_MODE:-mtls}
+      SANDBOX_POOL_CUBE_CLIENT_CERT: /etc/cube/certs/scheduler-client.crt
+      SANDBOX_POOL_CUBE_CLIENT_KEY: /etc/cube/certs/scheduler-client.key
+      SANDBOX_POOL_CUBE_CA_CERT: /etc/cube/certs/ca.crt
+    volumes:
+      - ${CUBE_CERTS_DIR:-./deploy/certs}:/etc/cube/certs:ro
+
+volumes:
+  # Persistent volume for CubeSandbox VM images and snapshot state.
+  # On a multi-host or shared-storage staging setup replace this named
+  # volume with a host-path or NFS/CSI mount.
+  cube_storage:

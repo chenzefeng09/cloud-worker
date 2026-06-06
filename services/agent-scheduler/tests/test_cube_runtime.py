@@ -123,6 +123,7 @@ def test_spawn_posts_to_e2b_endpoint_and_returns_sandbox_id() -> None:
         tenant_id="tnt_01J5TNT0000000000000000001",
         user_id="usr_01J5USR0000000000000000001",
         foundation_token="ft",
+        llm_virtual_key="vk-test",
     )
     assert sid == "sb_xyz"
     # The request body carries the tenant metadata we'll later filter by.
@@ -143,6 +144,7 @@ def test_spawn_propagates_e2b_4xx_as_spawn_error() -> None:
         rt.spawn_run(
             run_id="r1", session_id="s1", task="t",
             tenant_id="t1", user_id="u1", foundation_token="ft",
+            llm_virtual_key="vk-test",
         )
 
 
@@ -154,6 +156,7 @@ def test_spawn_treats_network_error_as_spawn_error() -> None:
         rt.spawn_run(
             run_id="r1", session_id="s1", task="t",
             tenant_id="t1", user_id="u1", foundation_token="ft",
+            llm_virtual_key="vk-test",
         )
 
 

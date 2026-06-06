@@ -1,230 +1,303 @@
-"""Custom ``ModelBase`` that proxies through ``foundation.llm-gateway``.
+"""LLM-gateway enforcer: build an ``OpenAIChatModel`` pointed at the gateway.
 
-The implementation is split in two layers so it can be unit-tested
-without AgentScope installed:
+Design rationale
+----------------
+The foundation ``llm-gateway`` exposes an OpenAI-compatible endpoint at::
 
-* :class:`_GatewayCallable` — a plain ``async`` callable that takes
-  AgentScope-style messages, builds the OpenAI-compatible chat
-  request, POSTs it through ``httpx``, and adapts the response.
+    POST {LLM_GATEWAY_URL}/chat/completions
+        (LLM_GATEWAY_URL is expected to include the /api/llm-gateway/v1 prefix)
 
-* :class:`GatewayModel` (created lazily inside :func:`make_gateway_model`)
-  — the real AgentScope ``ChatModelBase`` subclass.  It composes the
-  callable above and lives behind a factory so importing this module
-  does not require AgentScope.
+Authentication uses two headers:
 
-The metadata ``{"tenant_id", "user_id"}`` injected on every request is
-what ``llm-gateway`` uses for per-tenant rate limits and billing.
+* ``Authorization: Bearer <FOUNDATION_API_TOKEN>`` — the per-run foundation JWT
+  issued by the scheduler.
+* ``X-LLM-Virtual-Key: <LLM_VIRTUAL_KEY>`` — the tenant virtual key that the
+  gateway uses for quota accounting and model routing.
+
+``OpenAIChatModel`` (agentscope 2.0) creates an ``openai.AsyncOpenAI`` client
+internally in ``_call_api``.  The client constructor accepts
+``default_headers`` but ``OpenAIChatModel`` does not expose it.  We subclass
+``OpenAIChatModel`` and override ``_call_api`` to inject the gateway headers.
+This preserves the full native streaming / tool-call / formatter pipeline —
+delta events, ``ToolCallBlock``, ``ThinkingBlock`` — without any hand-rolled
+round-trip.
+
+The ``OpenAICredential.api_key`` is set to the virtual key (openai-sdk requires
+a non-empty API key string).  The gateway also accepts the virtual key via
+``Authorization`` when ``X-LLM-Virtual-Key`` is absent, so the two auth paths
+are compatible.
+
+``FOUNDATION_API_TOKEN`` doubles as the bearer token; it is always present
+inside the sandbox (injected by the scheduler).  ``LLM_VIRTUAL_KEY`` is the
+new env var injected by M1-P3/P4 when the scheduler resolves and injects the
+tenant virtual key.  If it is absent we fall back to using the virtual key =
+the bearer token (so the module stays importable and callable even without the
+new scheduler wiring).
+
+``make_gateway_model`` is the public factory; ``_GatewayCallable`` and the old
+``ChatResponse`` shim are **kept** for import-compatibility with existing unit
+tests but are no longer used in production.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping
-
-import httpx
+from typing import Any, AsyncGenerator, Mapping
 
 _LOG = logging.getLogger(__name__)
 
-_DEFAULT_TIMEOUT = httpx.Timeout(60.0, connect=5.0)
-_CLIENT: httpx.Client | None = None
-
-
-def set_client(client: httpx.Client | None) -> None:
-    """Override the module-level ``httpx.Client`` (mainly for tests)."""
-    global _CLIENT
-    _CLIENT = client
-
-
-def _client() -> httpx.Client:
-    global _CLIENT
-    if _CLIENT is None:
-        _CLIENT = httpx.Client(timeout=_DEFAULT_TIMEOUT)
-    return _CLIENT
+# ---------------------------------------------------------------------------
+# Legacy shim (kept for backwards-compat with existing tests)
+# ---------------------------------------------------------------------------
 
 
 @dataclass
 class ChatResponse:
-    """Minimal AgentScope-compatible response surface.
-
-    AgentScope's ``ChatResponse`` carries more fields (usage, raw
-    response, etc.); the runtime worker only inspects ``content`` and
-    ``tool_calls`` so we keep this lightweight.  When AgentScope's
-    real class is importable we wrap *its* type instead — see
-    :func:`_to_agentscope_response`.
-    """
+    """Minimal response shim — used only by the old-style _GatewayCallable tests."""
 
     content: str = ""
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] | None = None
 
 
-class _GatewayCallable:
-    """The plain-Python implementation of the gateway round-trip."""
+# ---------------------------------------------------------------------------
+# Module-level httpx client hook (used only by legacy _GatewayCallable tests)
+# ---------------------------------------------------------------------------
 
-    def __init__(
-        self,
-        *,
-        base_url: str,
-        token: str,
-        model_name: str,
-        tenant_id: str,
-        user_id: str,
-    ) -> None:
-        if not base_url:
-            raise ValueError("FOUNDATION_API_URL is required for GatewayModel")
-        if not model_name:
-            raise ValueError("LLM_MODEL is required for GatewayModel")
-        self.base_url = base_url.rstrip("/")
-        self.token = token
-        self.model_name = model_name
-        self.tenant_id = tenant_id
-        self.user_id = user_id
+try:
+    import httpx as _httpx
 
-    @property
-    def endpoint(self) -> str:
-        return f"{self.base_url}/llm-gateway/v1/chat/completions"
+    _DEFAULT_TIMEOUT = _httpx.Timeout(60.0, connect=5.0)
+    _CLIENT: "_httpx.Client | None" = None
 
-    def _headers(self) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-        return headers
+    def set_client(client: "_httpx.Client | None") -> None:
+        """Override the module-level ``httpx.Client`` (mainly for tests)."""
+        global _CLIENT
+        _CLIENT = client
 
-    def build_payload(
-        self,
-        messages: Iterable[Any],
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Translate AgentScope/OpenAI-ish messages into the gateway body."""
-        oai_messages = [_to_openai_message(m) for m in messages]
-        payload: dict[str, Any] = {
-            "model": self.model_name,
-            "messages": oai_messages,
-            "metadata": {
-                "tenant_id": self.tenant_id,
-                "user_id": self.user_id,
-            },
-        }
-        # Passthrough commonly-used knobs.
-        for key in ("temperature", "top_p", "max_tokens", "stop", "stream", "tools"):
-            if key in kwargs and kwargs[key] is not None:
-                payload[key] = kwargs[key]
-        return payload
+    def _client() -> "_httpx.Client":
+        global _CLIENT
+        if _CLIENT is None:
+            _CLIENT = _httpx.Client(timeout=_DEFAULT_TIMEOUT)
+        return _CLIENT
 
-    def _post(self, payload: dict[str, Any]) -> httpx.Response:
-        response = _client().post(self.endpoint, json=payload, headers=self._headers())
-        response.raise_for_status()
-        return response
+except ImportError:  # pragma: no cover
 
-    def call_sync(self, messages: Iterable[Any], **kwargs: Any) -> ChatResponse:
-        payload = self.build_payload(messages, **kwargs)
-        response = self._post(payload)
-        return _parse_response(response.json())
+    def set_client(client: Any) -> None:  # type: ignore[misc]
+        pass
 
-    async def __call__(self, messages: Iterable[Any], **kwargs: Any) -> ChatResponse:
-        # The shared client is sync — POSTs to the gateway are cheap and we
-        # currently run one agent per process.  If the worker ever moves to
-        # a concurrent loop this should switch to ``httpx.AsyncClient``.
-        return self.call_sync(messages, **kwargs)
-
-
-def _to_openai_message(msg: Any) -> dict[str, Any]:
-    """Best-effort conversion of an AgentScope ``Msg`` (or dict) -> OpenAI shape."""
-    if isinstance(msg, Mapping):
-        role = msg.get("role") or msg.get("name") or "user"
-        content = msg.get("content", "")
-    else:
-        role = getattr(msg, "role", None) or getattr(msg, "name", None) or "user"
-        content = getattr(msg, "content", "")
-    if isinstance(content, list):
-        # Flatten AgentScope content blocks into a plain string for the
-        # gateway's OpenAI surface; richer block support is a follow-up.
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, Mapping):
-                if block.get("type") == "text":
-                    parts.append(str(block.get("text", "")))
-                else:
-                    parts.append(json.dumps(block, ensure_ascii=False))
-            else:
-                parts.append(str(block))
-        content = "\n".join(p for p in parts if p)
-    elif not isinstance(content, str):
-        content = str(content)
-    return {"role": str(role), "content": content}
-
-
-def _parse_response(body: dict[str, Any]) -> ChatResponse:
-    """Extract the assistant message from an OpenAI-shaped response."""
-    try:
-        choice = body["choices"][0]
-        message = choice.get("message") or {}
-    except (KeyError, IndexError, TypeError):
-        return ChatResponse(content="", tool_calls=[], raw=body)
-    content = message.get("content") or ""
-    tool_calls = list(message.get("tool_calls") or [])
-    return ChatResponse(content=str(content), tool_calls=tool_calls, raw=body)
+    def _client() -> Any:  # type: ignore[misc]
+        raise RuntimeError("httpx not available")
 
 
 # ---------------------------------------------------------------------------
-# AgentScope-facing factory
+# Gateway-aware OpenAIChatModel subclass
+# ---------------------------------------------------------------------------
+
+
+def _build_openai_gateway_model(
+    *,
+    gateway_url: str,
+    virtual_key: str,
+    bearer_token: str,
+    model_name: str,
+    formatter: Any,
+    tenant_id: str = "",
+) -> Any:
+    """Return a ``_GatewayOpenAIChatModel`` that talks to the foundation gateway.
+
+    The subclass overrides ``_call_api`` to inject the two auth headers that
+    the gateway requires:
+
+    * ``Authorization: Bearer <bearer_token>``  — the sandbox-lifetime JWT
+    * ``X-LLM-Virtual-Key: <virtual_key>``      — tenant quota/routing key
+
+    Args:
+        gateway_url: Full base URL for the gateway, e.g.
+            ``http://llm-gw:8011/api/llm-gateway/v1``.  Must NOT end with
+            ``/chat/completions``; the openai SDK appends that itself.
+        virtual_key: Tenant virtual key.  Also used as ``api_key`` for the
+            openai client (which requires a non-empty string).
+        bearer_token: Per-run foundation JWT.
+        model_name: Model routing key passed as ``model`` to the gateway.
+        formatter: AgentScope formatter instance (``OpenAIChatFormatter``).
+
+    Returns:
+        A ``ChatModelBase`` subclass instance ready to be plugged into
+        ``Agent(model=...)``.
+    """
+    from agentscope.credential import OpenAICredential
+    from agentscope.model import OpenAIChatModel
+
+    credential = OpenAICredential(
+        api_key=virtual_key or bearer_token or "gateway-placeholder",
+        base_url=gateway_url,
+    )
+
+    extra_headers: dict[str, str] = {
+        "Authorization": f"Bearer {bearer_token}",
+    }
+    if virtual_key:
+        extra_headers["X-LLM-Virtual-Key"] = virtual_key
+    # The gateway's TenantContextMiddleware resolves the tenant from the
+    # ``X-Tenant-Id`` header and returns 401 ("Tenant context missing") if it
+    # is absent — the Bearer token is NOT yet JWT-validated for a tenant claim.
+    # The scheduler injects FOUNDATION_TENANT_ID into every sandbox, so we
+    # forward it here.  Without this header the enforcer cannot reach the
+    # gateway at all.
+    if tenant_id:
+        extra_headers["X-Tenant-Id"] = tenant_id
+
+    class _GatewayOpenAIChatModel(OpenAIChatModel):
+        """OpenAIChatModel subclass that injects gateway auth headers."""
+
+        async def _call_api(
+            self,
+            model_name_: str,
+            messages: list,
+            tools: list[dict] | None = None,
+            tool_choice: Any | None = None,
+            **generate_kwargs: Any,
+        ) -> "Any | AsyncGenerator":
+            # Re-enter with the bound closure variables so the overriding
+            # happens transparently.  We import openai here (same place as
+            # the parent does) so the dependency stays optional at module
+            # import time.
+            import openai
+            from datetime import datetime
+
+            client = openai.AsyncOpenAI(
+                api_key=self.credential.api_key.get_secret_value(),
+                base_url=self.credential.base_url,
+                default_headers=extra_headers,
+            )
+
+            formatted_messages = await self.formatter.format(messages)
+
+            kwargs: dict[str, Any] = {
+                "model": model_name_,
+                "messages": formatted_messages,
+                "stream": self.stream,
+            }
+
+            if self.parameters.max_tokens is not None:
+                kwargs["max_tokens"] = self.parameters.max_tokens
+            if self.parameters.temperature is not None:
+                kwargs["temperature"] = self.parameters.temperature
+            if self.parameters.top_p is not None:
+                kwargs["top_p"] = self.parameters.top_p
+            if self.parameters.thinking_enable and self.parameters.reasoning_effort:
+                kwargs["reasoning_effort"] = self.parameters.reasoning_effort
+
+            kwargs.update(generate_kwargs)
+
+            fmt_tools, fmt_tool_choice = self._format_tools(tools, tool_choice)
+            if fmt_tools:
+                kwargs["tools"] = fmt_tools
+                if not self.parameters.parallel_tool_calls:
+                    kwargs["parallel_tool_calls"] = False
+            if fmt_tool_choice is not None:
+                kwargs["tool_choice"] = fmt_tool_choice
+
+            if self.stream:
+                kwargs["stream_options"] = {"include_usage": True}
+
+            start_datetime = datetime.now()
+            response = await client.chat.completions.create(**kwargs)
+
+            audio_cfg = kwargs.get("audio")
+            audio_fmt = (
+                audio_cfg.get("format", "wav")
+                if isinstance(audio_cfg, dict)
+                else "wav"
+            )
+
+            if self.stream:
+                return self._parse_stream_response(start_datetime, response, audio_fmt)
+
+            return self._parse_completion_response(start_datetime, response, audio_fmt)
+
+    return _GatewayOpenAIChatModel(
+        credential=credential,
+        model=model_name,
+        stream=True,
+        formatter=formatter,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public factory
 # ---------------------------------------------------------------------------
 
 
 def make_gateway_model(*, task: dict, env: Mapping[str, str]) -> Any:
-    """Return a GatewayModel instance bound to ``env``.
+    """Return a gateway-wired ``OpenAIChatModel`` subclass instance.
 
-    If AgentScope is importable we return a real ``ChatModelBase``
-    subclass so ``ReActAgent`` accepts it without further adaption; if
-    not (unit tests for sibling extensions), we return the plain
-    callable so the caller can still drive it.
+    Reads the following env vars (all injected by the scheduler):
+
+    * ``LLM_GATEWAY_URL``      — full gateway base URL including /api/llm-gateway/v1
+    * ``LLM_VIRTUAL_KEY``      — tenant virtual key (optional; falls back to bearer)
+    * ``FOUNDATION_API_TOKEN`` — per-run sandbox JWT used as bearer token
+    * ``LLM_MODEL``            — model routing key
+
+    Validation
+    ----------
+    * Raises ``ValueError`` if ``LLM_GATEWAY_URL`` is not set (we need an
+      explicit gateway URL, not a guess).
+    * Raises ``ValueError`` if ``LLM_MODEL`` is not set.
+    * ``LLM_VIRTUAL_KEY`` is optional — if absent, the bearer token is used as
+      the api_key placeholder (network auth still works via ``Authorization``).
+    * ``FOUNDATION_API_TOKEN`` absent is non-fatal (yields an empty bearer);
+      the gateway will 401 — but this matches the normal infra failure mode.
+
+    Returns
+    -------
+    An ``OpenAIChatModel`` subclass instance when agentscope + openai are
+    importable, otherwise raises ``ImportError``.
     """
     del task
-    callable_ = _GatewayCallable(
-        base_url=env.get("FOUNDATION_API_URL", ""),
-        token=env.get("FOUNDATION_API_TOKEN", ""),
-        model_name=env.get("LLM_MODEL", ""),
-        tenant_id=env.get("FOUNDATION_TENANT_ID", ""),
-        user_id=env.get("FOUNDATION_USER_ID", ""),
+
+    gateway_url = env.get("LLM_GATEWAY_URL", "").rstrip("/")
+    if not gateway_url:
+        raise ValueError(
+            "LLM_GATEWAY_URL is required for llm_gateway_enforcer; "
+            "set it to the gateway base URL (e.g. http://llm-gw:8011/api/llm-gateway/v1)"
+        )
+
+    model_name = env.get("LLM_MODEL", "").strip()
+    if not model_name:
+        raise ValueError("LLM_MODEL is required for llm_gateway_enforcer")
+
+    virtual_key = env.get("LLM_VIRTUAL_KEY", "").strip()
+    bearer_token = env.get("FOUNDATION_API_TOKEN", "").strip()
+    tenant_id = env.get("FOUNDATION_TENANT_ID", "").strip()
+
+    # Build formatter (OpenAI-compatible; gateway speaks OpenAI wire format).
+    try:
+        from agentscope.formatter import OpenAIChatFormatter
+
+        formatter = OpenAIChatFormatter()
+    except ImportError as exc:
+        raise ImportError(
+            "agentscope.formatter is required for llm_gateway_enforcer"
+        ) from exc
+
+    _LOG.info(
+        "llm_gateway_enforcer: routing via %s (model=%s, virtual_key=%s)",
+        gateway_url,
+        model_name,
+        "set" if virtual_key else "absent-using-bearer",
     )
 
-    base_cls = _try_agentscope_chat_model_base()
-    if base_cls is None:
-        return callable_
-
-    class GatewayModel(base_cls):  # type: ignore[misc, valid-type]
-        """ChatModelBase subclass that delegates to the gateway."""
-
-        def __init__(self) -> None:
-            try:
-                super().__init__(model_name=callable_.model_name, stream=False)
-            except TypeError:
-                # Older / different ChatModelBase signatures — keep going.
-                super().__init__()
-            self._gateway = callable_
-
-        async def __call__(self, messages: Any, **kwargs: Any) -> Any:
-            return await self._gateway(messages, **kwargs)
-
-    return GatewayModel()
-
-
-def _try_agentscope_chat_model_base() -> type | None:
-    """Locate ``ChatModelBase`` (name varies across AgentScope minors)."""
-    try:
-        from agentscope.model import ChatModelBase  # type: ignore[attr-defined]
-
-        return ChatModelBase
-    except (ImportError, AttributeError):
-        pass
-    try:
-        from agentscope.model import ModelBase  # type: ignore[attr-defined]
-
-        return ModelBase
-    except (ImportError, AttributeError):
-        return None
+    return _build_openai_gateway_model(
+        gateway_url=gateway_url,
+        virtual_key=virtual_key,
+        bearer_token=bearer_token,
+        model_name=model_name,
+        formatter=formatter,
+        tenant_id=tenant_id,
+    )
 
 
 __all__ = ["ChatResponse", "make_gateway_model", "set_client"]

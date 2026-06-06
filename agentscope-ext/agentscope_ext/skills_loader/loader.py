@@ -104,6 +104,8 @@ def fetch_skill_manifests(
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if tenant_id:
+        headers["X-Tenant-Id"] = tenant_id
     if service_scopes:
         headers["X-Service-Scopes"] = service_scopes
     params = [("tenant_id", tenant_id)] + [("names", n) for n in name_list]

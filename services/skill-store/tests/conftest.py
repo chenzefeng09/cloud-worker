@@ -163,4 +163,8 @@ def other_tenant_headers() -> dict[str, str]:
 
 @pytest.fixture
 def internal_headers() -> dict[str, str]:
-    return {"X-Service-Scopes": "skill.read_internal", "X-User-Id": "svc_skills_loader"}
+    return {
+        "X-Tenant-Id": TEST_TENANT,
+        "X-Service-Scopes": "skill.read_internal",
+        "X-User-Id": "svc_skills_loader",
+    }

@@ -1,0 +1,4 @@
+# Exclude pre-fetched wheels from the primary build context so they don't
+# invalidate the agentscope pip install layer cache.  Wheels are injected
+# via --build-context office_wheels=./sandbox-images/wheels instead.
+wheels/

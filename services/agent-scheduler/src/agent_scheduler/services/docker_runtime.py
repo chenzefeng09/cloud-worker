@@ -114,6 +114,8 @@ class DockerRuntime:
         skills: list[str] | None = None,
         files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
+        llm_gateway_url: str | None = None,
+        llm_virtual_key: str | None = None,
     ) -> str:
         """Spawn a sandbox container for one agent run.
 
@@ -132,6 +134,13 @@ class DockerRuntime:
                 dicts describing user-uploaded attachments.  Written to task.json
                 ``files`` field; the runtime_worker downloads them to
                 ``/workspace/inputs/`` before starting the agent.
+            llm_gateway_url: M1-P3 — LLM gateway base URL (with API prefix).
+                Injected as ``LLM_GATEWAY_URL``.  Defaults to
+                ``settings.llm_gateway_url`` when omitted.  The sandbox
+                ignores this env if ``llm_gateway_enforcer`` is not active.
+            llm_virtual_key: tenant virtual key from the gateway.  Required
+                when ``llm_gateway_enforcer`` is active; omitted only for an
+                explicit local direct-connect configuration.
         """
         _check_ids(
             run_id=run_id,
@@ -161,8 +170,25 @@ class DockerRuntime:
             memory=memory or "",
         )
 
+        # When the ``llm_gateway_enforcer`` extension is active, the sandbox
+        # routes all LLM traffic through foundation llm-gateway using a
+        # per-tenant virtual key.  The real upstream provider key lives inside
+        # the gateway and must not be exposed to sandbox code.
+        _extensions = {
+            e.strip()
+            for e in (self._settings.runtime_extensions or "").split(",")
+            if e.strip()
+        }
+        _gateway_mode = "llm_gateway_enforcer" in _extensions
+        if _gateway_mode and not llm_virtual_key:
+            raise SandboxSpawnError(
+                "llm_gateway_enforcer is enabled but no tenant LLM virtual key "
+                "was provided; refusing direct-connect fallback",
+            )
+        _sandbox_llm_api_key = "" if _gateway_mode else self._settings.llm_api_key
+
         env_vars = {
-            "LLM_API_KEY": self._settings.llm_api_key,
+            "LLM_API_KEY": _sandbox_llm_api_key,
             "LLM_MODEL": self._settings.llm_model,
             # Provider selector + base URL are forwarded so the in-sandbox
             # worker can talk to OpenAI-compatible endpoints (DeepSeek, etc.)
@@ -170,6 +196,9 @@ class DockerRuntime:
             # The worker treats the empty string as "fall back to default".
             "LLM_PROVIDER": self._settings.llm_provider,
             "LLM_BASE_URL": self._settings.llm_base_url,
+            # LLM gateway env vars.  The enforcer is enabled by default and
+            # refuses to build a model if either URL or virtual key is absent.
+            "LLM_GATEWAY_URL": llm_gateway_url or self._settings.llm_gateway_url,
             "WORKSPACE_BASE": str(workspace_dir),
             "FOUNDATION_API_URL": self._settings.foundation_api_url,
             "FOUNDATION_API_TOKEN": foundation_token,
@@ -204,7 +233,17 @@ class DockerRuntime:
             # (plan a — no sidecar needed).
             "RUN_ID": run_id,
             "REDIS_URL": self._settings.redis_url,
+            # Web-fetch gateway — the web_fetch extension reads this to
+            # POST fetch requests to the gateway sidecar.  The gateway is
+            # on the foundation network so sandbox containers reach it by
+            # service name without any additional proxy.
+            "WEB_FETCH_GATEWAY_URL": self._settings.web_fetch_gateway_url,
         }
+
+        # M1-P3: inject LLM_VIRTUAL_KEY only when present (omit rather than
+        # blank so the enforcer can reliably detect "no key configured").
+        if llm_virtual_key:
+            env_vars["LLM_VIRTUAL_KEY"] = llm_virtual_key
 
         try:
             container = self.client.containers.run(

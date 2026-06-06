@@ -20,11 +20,15 @@ import type {
   NotifPreferenceItem,
   PatchTenantRequest,
   PoolSnapshot,
+  ProbeReport,
+  ProbeRequest,
   QuotaInfo,
   Run,
+  RunState,
   SandboxItem,
   Session,
   Skill,
+  InstalledSkill,
   SkillVersion,
   Tenant,
   TokenUsage,
@@ -77,6 +81,8 @@ export const api = {
       request<Run>('GET', `/sessions/${sessionId}/runs/${runId}`),
     list: (sessionId: string) =>
       request<{ items: Run[] }>('GET', `/sessions/${sessionId}/runs`),
+    getState: (sessionId: string, runId: string) =>
+      request<RunState>('GET', `/sessions/${sessionId}/runs/${runId}/state`),
     count: () =>
       request<{ count: number }>('GET', '/runs/count'),
     tokenUsage: () =>
@@ -103,6 +109,8 @@ export const api = {
   messages: {
     list: (sessionId: string, cursor?: string) =>
       request<CursorPage<Message>>('GET', `/sessions/${sessionId}/messages${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`),
+    deleteFrom: (sessionId: string, fromSequence: number) =>
+      request<{ deleted_count: number }>('DELETE', `/sessions/${sessionId}/messages?from_sequence=${fromSequence}`),
   },
 
   attachments: {
@@ -150,6 +158,14 @@ export const api = {
       request<ListPage<McpServer>>('GET', '/library/mcp-servers'),
     listSkills: () =>
       request<ListPage<Skill>>('GET', '/library/skills'),
+    listInstalledSkills: () =>
+      request<ListPage<InstalledSkill>>('GET', '/library/skills/installed'),
+    installSkill: (skillId: string, enabledByDefault = true) =>
+      request<InstalledSkill>('POST', `/library/skills/${skillId}/install`, {
+        enabled_by_default: enabledByDefault,
+      }),
+    uninstallSkill: (skillId: string) =>
+      request<void>('DELETE', `/library/skills/${skillId}/install`),
     listDocuments: () =>
       request<ListPage<KnowledgeDocument>>('GET', '/library/documents'),
 
@@ -247,6 +263,10 @@ export const api = {
     billing: {
       quota: (tenantId: string) =>
         request<QuotaInfo>('GET', `/admin/billing/quota?tenant_id=${encodeURIComponent(tenantId)}`),
+    },
+    llm: {
+      probe: (body: ProbeRequest) =>
+        request<ProbeReport>('POST', '/admin/llm/probe', body),
     },
   },
 

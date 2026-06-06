@@ -62,6 +62,7 @@ class Message(Base):
     role: Mapped[str] = mapped_column(String(10), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     tool_calls: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
+    attachments: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     run_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
     sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(

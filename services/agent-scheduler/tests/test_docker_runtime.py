@@ -196,6 +196,7 @@ def test_spawn_run_env_contains_mcp_and_skill_urls(
         user_id="usr_01J5USR0000000000000000001",
         foundation_token="tok_test",
         skills=["csv-tools"],
+        llm_virtual_key="vk-test",
     )
 
     _, kwargs = mock_docker_client.containers.run.call_args
@@ -222,6 +223,7 @@ def test_spawn_run_env_contains_foundation_service_scopes(
         tenant_id="tnt_01J5TNT0000000000000000001",
         user_id="usr_01J5USR0000000000000000001",
         foundation_token="tok_scope",
+        llm_virtual_key="vk-test",
     )
 
     _, kwargs = mock_docker_client.containers.run.call_args
@@ -252,6 +254,7 @@ def test_spawn_run_task_json_contains_skills(
             user_id="usr_01J5USR0000000000000000001",
             foundation_token="tok_test2",
             skills=["csv-tools", "pandas-helper"],
+            llm_virtual_key="vk-test",
         )
         task_path = (
             Path(tmpdir)
@@ -265,6 +268,163 @@ def test_spawn_run_task_json_contains_skills(
     assert payload["task"] == "crunch numbers"
     assert payload["skills"] == ["csv-tools", "pandas-helper"]
     assert payload["mcp_servers"] == []
+
+
+# ---------------------------------------------------------------------------
+# M1-P3: LLM gateway env injection
+# ---------------------------------------------------------------------------
+
+
+def test_spawn_run_env_contains_llm_gateway_url(
+    runtime: DockerRuntime,
+    mock_docker_client: MagicMock,
+) -> None:
+    """``spawn_run`` must always inject LLM_GATEWAY_URL regardless of virtual key."""
+    mock_docker_client.containers.run.return_value = MagicMock(id="container-gw-url")
+
+    runtime.spawn_run(
+        run_id="run_01J5RUN0000000000000GW001",
+        session_id="ses_01J5SES0000000000000GW001",
+        task="hello gateway",
+        tenant_id="tnt_01J5TNT0000000000000000001",
+        user_id="usr_01J5USR0000000000000000001",
+        foundation_token="tok_gw",
+        llm_virtual_key="vk-test",
+    )
+
+    _, kwargs = mock_docker_client.containers.run.call_args
+    env = kwargs["environment"]
+    assert "LLM_GATEWAY_URL" in env, "LLM_GATEWAY_URL missing from container env"
+    # Default from Settings
+    assert "llm-gateway" in env["LLM_GATEWAY_URL"] or "localhost" in env["LLM_GATEWAY_URL"]
+
+
+def test_spawn_run_env_contains_virtual_key_when_provided(
+    runtime: DockerRuntime,
+    mock_docker_client: MagicMock,
+) -> None:
+    """When a virtual key is supplied it appears as LLM_VIRTUAL_KEY in the sandbox env."""
+    mock_docker_client.containers.run.return_value = MagicMock(id="container-vk-present")
+
+    runtime.spawn_run(
+        run_id="run_01J5RUN0000000000000GW002",
+        session_id="ses_01J5SES0000000000000GW002",
+        task="hello with key",
+        tenant_id="tnt_01J5TNT0000000000000000001",
+        user_id="usr_01J5USR0000000000000000001",
+        foundation_token="tok_vk",
+        llm_virtual_key="vk-tenant-test-123",
+    )
+
+    _, kwargs = mock_docker_client.containers.run.call_args
+    env = kwargs["environment"]
+    assert "LLM_VIRTUAL_KEY" in env, "LLM_VIRTUAL_KEY missing from container env"
+    assert env["LLM_VIRTUAL_KEY"] == "vk-tenant-test-123"
+
+
+def test_spawn_run_rejects_missing_virtual_key_when_enforcer_enabled(
+    runtime: DockerRuntime,
+    mock_docker_client: MagicMock,
+) -> None:
+    """Enterprise default is fail-closed: no virtual key means no sandbox."""
+    mock_docker_client.containers.run.return_value = MagicMock(id="container-vk-absent")
+
+    with pytest.raises(SandboxSpawnError, match="no tenant LLM virtual key"):
+        runtime.spawn_run(
+            run_id="run_01J5RUN0000000000000GW003",
+            session_id="ses_01J5SES0000000000000GW003",
+            task="hello no key",
+            tenant_id="tnt_01J5TNT0000000000000000001",
+            user_id="usr_01J5USR0000000000000000001",
+            foundation_token="tok_novk",
+            llm_virtual_key=None,
+        )
+    mock_docker_client.containers.run.assert_not_called()
+
+
+def test_spawn_run_blanks_direct_key_when_enforcer_enabled(
+    runtime: DockerRuntime,
+    mock_docker_client: MagicMock,
+) -> None:
+    """Default enforcer mode must not expose provider secrets to sandbox code."""
+    from agent_scheduler.config import Settings
+
+    runtime._settings = Settings(
+        env="test",
+        log_level="WARNING",
+        agent_image="hello-world:latest",
+        workspace_base="/tmp/agent-platform-test",
+        docker_network="none",
+        foundation_identity_url="http://identity-test/api/identity/v1",
+        scheduler_service_token="fake-service-token",
+        otel_enabled=False,
+        llm_api_key="sk-direct-key",
+        llm_model="deepseek-chat",
+        llm_provider="openai",
+        llm_base_url="https://api.deepseek.com/v1",
+    )
+    mock_docker_client.containers.run.return_value = MagicMock(id="container-direct")
+
+    runtime.spawn_run(
+        run_id="run_01J5RUN0000000000000GW004",
+        session_id="ses_01J5SES0000000000000GW004",
+        task="direct connect check",
+        tenant_id="tnt_01J5TNT0000000000000000001",
+        user_id="usr_01J5USR0000000000000000001",
+        foundation_token="tok_direct",
+        llm_virtual_key="vk-also-injected",
+    )
+
+    _, kwargs = mock_docker_client.containers.run.call_args
+    env = kwargs["environment"]
+    assert env.get("LLM_API_KEY") == "", "LLM_API_KEY must be blank in gateway mode"
+    assert env.get("LLM_BASE_URL") == "https://api.deepseek.com/v1", "LLM_BASE_URL must be preserved"
+    assert env.get("LLM_MODEL") == "deepseek-chat", "LLM_MODEL must be preserved"
+    assert env.get("LLM_PROVIDER") == "openai", "LLM_PROVIDER must be preserved"
+    # Gateway vars also present
+    assert "LLM_GATEWAY_URL" in env
+    assert env.get("LLM_VIRTUAL_KEY") == "vk-also-injected"
+
+
+def test_spawn_run_direct_connect_vars_preserved_when_enforcer_disabled(
+    runtime: DockerRuntime,
+    mock_docker_client: MagicMock,
+) -> None:
+    """Local-only direct-connect mode remains available when explicitly configured."""
+    from agent_scheduler.config import Settings
+
+    runtime._settings = Settings(
+        env="test",
+        log_level="WARNING",
+        agent_image="hello-world:latest",
+        workspace_base="/tmp/agent-platform-test",
+        docker_network="none",
+        foundation_identity_url="http://identity-test/api/identity/v1",
+        scheduler_service_token="fake-service-token",
+        otel_enabled=False,
+        llm_api_key="sk-direct-key",
+        llm_model="deepseek-chat",
+        llm_provider="openai",
+        llm_base_url="https://api.deepseek.com/v1",
+        runtime_extensions="mcp_tenant_injector,skills_loader,web_fetch",
+    )
+    mock_docker_client.containers.run.return_value = MagicMock(id="container-direct")
+
+    runtime.spawn_run(
+        run_id="run_01J5RUN0000000000000GW005",
+        session_id="ses_01J5SES0000000000000GW005",
+        task="direct connect check",
+        tenant_id="tnt_01J5TNT0000000000000000001",
+        user_id="usr_01J5USR0000000000000000001",
+        foundation_token="tok_direct",
+    )
+
+    _, kwargs = mock_docker_client.containers.run.call_args
+    env = kwargs["environment"]
+    assert env.get("LLM_API_KEY") == "sk-direct-key"
+    assert env.get("LLM_BASE_URL") == "https://api.deepseek.com/v1"
+    assert env.get("LLM_MODEL") == "deepseek-chat"
+    assert env.get("LLM_PROVIDER") == "openai"
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +462,7 @@ def test_spawn_run_env_contains_redis_url_and_run_id(
         tenant_id="tnt_01J5TNT0000000000000000001",
         user_id="usr_01J5USR0000000000000000001",
         foundation_token="tok_redis",
+        llm_virtual_key="vk-test",
     )
 
     _, kwargs = mock_docker_client.containers.run.call_args

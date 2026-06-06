@@ -9,7 +9,16 @@ Proxies to:
 from __future__ import annotations
 
 import httpx
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 
 from agent_bff.api._http import foundation_headers
 from agent_bff.api.dependencies import require_auth
@@ -76,7 +85,7 @@ async def list_skills(
     request: Request,
     _auth: tuple = Depends(require_auth()),
 ) -> dict:
-    """List tenant skills from skill-store."""
+    """List tenant skills published to the shelf (browse list)."""
     tenant_id, user_id, access_token = _auth
     url = request.app.state.settings.skill_store_url
     async with httpx.AsyncClient(timeout=15) as client:
@@ -86,6 +95,64 @@ async def list_skills(
         )
         resp.raise_for_status()
         return resp.json()
+
+
+@router.get("/library/skills/installed")
+async def list_installed_skills(
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> dict:
+    """The calling user's installed skills (their personal toolbox)."""
+    tenant_id, user_id, access_token = _auth
+    url = request.app.state.settings.skill_store_url
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{url}/skills/installed",
+            headers=foundation_headers(tenant_id, user_id, access_token),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+@router.post("/library/skills/{skill_id}/install")
+async def install_skill(
+    skill_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> dict:
+    """Install a skill into the calling user's toolbox."""
+    tenant_id, user_id, access_token = _auth
+    url = request.app.state.settings.skill_store_url
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"{url}/skills/{skill_id}/install",
+            json=body or {},
+            headers=foundation_headers(tenant_id, user_id, access_token),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
+@router.delete("/library/skills/{skill_id}/install", status_code=204)
+async def uninstall_skill(
+    skill_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> Response:
+    """Remove a skill from the calling user's toolbox."""
+    tenant_id, user_id, access_token = _auth
+    url = request.app.state.settings.skill_store_url
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.delete(
+            f"{url}/skills/{skill_id}/install",
+            headers=foundation_headers(tenant_id, user_id, access_token),
+        )
+        resp.raise_for_status()
+        return Response(status_code=204)
 
 
 @router.post("/library/skills", status_code=201)
