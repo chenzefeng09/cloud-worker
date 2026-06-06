@@ -255,7 +255,11 @@ def test_audit_query_body_forwarded_verbatim(
     """BFF must forward the request body to foundation audit unchanged."""
     resp = client.post(
         "/api/bff/v1/admin/audit/events:query",
-        json={"tenant_id": "tnt_01J5TEST00000000000000TNT1", "action": "tenant.create", "limit": 10},
+        json={
+            "tenant_id": "tnt_01J5TEST00000000000000TNT1",
+            "action": "tenant.create",
+            "limit": 10,
+        },
         cookies=authed_cookie,
     )
     assert resp.status_code == 200
@@ -384,7 +388,12 @@ def test_billing_quota_merges_plans_when_limits_missing(
             if "/plans" in url and method == "GET":
                 return httpx.Response(200, json={
                     "items": [
-                        {"id": "plan_free", "name": "Free", "tier": "FREE", "limits": {"sessions": 5}},
+                        {
+                            "id": "plan_free",
+                            "name": "Free",
+                            "tier": "FREE",
+                            "limits": {"sessions": 5},
+                        },
                     ]
                 })
             return super().route(method, url, **kwargs)

@@ -14,7 +14,6 @@ from typing import Any
 import httpx
 import pytest
 
-
 # ─── Fake foundation responses ────────────────────────────────────────────────
 
 _PROBE_REPORT = {
@@ -143,7 +142,11 @@ def test_probe_super_admin_returns_report(client, authed_cookie, fake_probe_allo
     """Authenticated super_admin → proxied to llm-gateway, returns ProbeReport."""
     resp = client.post(
         "/api/bff/v1/admin/llm/probe",
-        json={"url": "http://my-llm:8080", "api_key": "sk-secret", "provider_type": "openai_compatible"},
+        json={
+            "url": "http://my-llm:8080",
+            "api_key": "sk-secret",
+            "provider_type": "openai_compatible",
+        },
         cookies=authed_cookie,
     )
     assert resp.status_code == 200

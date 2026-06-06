@@ -327,23 +327,6 @@ async def get_file_content(
 # --------------------------------------------------------------------------- #
 
 
-@router.get("/sessions/{session_id}/runs")
-async def list_runs(
-    session_id: str,
-    request: Request,
-    _auth: tuple = Depends(require_auth()),
-) -> JSONResponse:
-    """Proxy run listing from session-orchestrator."""
-    tenant_id, user_id, access_token = _auth
-    orch_url = await _orchestrator_url(request)
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            f"{orch_url}/sessions/{session_id}/runs",
-            headers=foundation_headers(tenant_id, user_id, access_token),
-        )
-    return _proxy_json(resp)
-
-
 @router.get("/sessions/{session_id}/runs/{run_id}")
 async def get_run(
     session_id: str,
