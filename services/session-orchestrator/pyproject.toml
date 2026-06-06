@@ -16,6 +16,9 @@ alembic = "^1.14.0"
 httpx = "^0.28.0"
 boto3 = "^1.35.0"
 python-multipart = "^0.0.9"
+# Redis async client — reads agent run hot-state (plan/step/cursor) from Redis.
+# Only the asyncio extras are needed; hiredis is optional but faster.
+redis = { extras = ["hiredis"], version = ">=4.2.0" }
 opentelemetry-api = "^1.28.0"
 opentelemetry-sdk = "^1.28.0"
 opentelemetry-instrumentation-fastapi = "^0.49b0"
@@ -42,6 +45,9 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"migrations/**/*.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

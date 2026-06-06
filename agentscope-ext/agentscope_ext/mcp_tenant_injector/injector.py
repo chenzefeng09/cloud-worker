@@ -56,6 +56,8 @@ def fetch_mcp_servers(
     headers = {"Accept": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    if tenant_id:
+        headers["X-Tenant-Id"] = tenant_id
     if service_scopes:
         headers["X-Service-Scopes"] = service_scopes
     response = _client().get(url, params={"tenant_id": tenant_id}, headers=headers)

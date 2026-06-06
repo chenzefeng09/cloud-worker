@@ -29,6 +29,7 @@ _KNOWN: dict[str, str] = {
     "llm_gateway_enforcer": "agentscope_ext.llm_gateway_enforcer",
     "mcp_tenant_injector": "agentscope_ext.mcp_tenant_injector",
     "skills_loader": "agentscope_ext.skills_loader",
+    "web_fetch": "agentscope_ext.web_fetch",
 }
 
 

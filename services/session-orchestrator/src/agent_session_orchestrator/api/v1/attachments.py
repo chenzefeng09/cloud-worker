@@ -22,6 +22,7 @@ bucket without additional tooling.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,7 +55,7 @@ async def upload_attachment(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     user_id: str = TUserId,
-) -> dict:
+) -> dict[str, Any]:
     """Upload a file and attach it to the session.
 
     Accepts ``multipart/form-data`` with one ``file`` field.
@@ -118,7 +119,7 @@ async def list_attachments(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     kind: str | None = None,
-) -> dict:
+) -> dict[str, Any]:
     """List attachments for a session.
 
     Optional ``kind`` query param: ``input`` (user-uploaded) or ``output``
@@ -163,7 +164,7 @@ async def get_file_content(
     try:
         att = await svc.get_attachment(session_id, file_id)
     except Exception:
-        raise HTTPException(status_code=404, detail="file not found")
+        raise HTTPException(status_code=404, detail="file not found") from None
 
     try:
         import asyncio

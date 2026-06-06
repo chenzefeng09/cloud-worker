@@ -1,7 +1,6 @@
-import { useState, useCallback, useRef } from 'react';
+import { useState, useCallback } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { api } from '../api/client';
-import type { Message } from '../api/types';
 
 export function useSessions() {
   const { sessions, setSessions, addSession, setActiveSession, activeSessionId } = useChatStore();

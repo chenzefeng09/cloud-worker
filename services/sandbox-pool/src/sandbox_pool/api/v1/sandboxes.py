@@ -23,11 +23,12 @@ class AcquireResponse(BaseModel):
 
 
 def _pool(request: Request) -> Pool:
-    return request.app.state.pool
+    pool: Pool = request.app.state.pool
+    return pool
 
 
 def _require_tenant() -> str:
-    tid = get_tenant_id()
+    tid: str | None = get_tenant_id()
     if not tid:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -63,16 +64,16 @@ async def acquire(body: AcquireRequest, request: Request) -> AcquireResponse:
     response_model=None,
 )
 async def release(sandbox_id: str, request: Request) -> Response:
-    _require_tenant()
+    tenant_id = _require_tenant()
     pool = _pool(request)
     try:
-        await pool.release(sandbox_id)
+        await pool.release(sandbox_id, tenant_id=tenant_id)
     except PoolError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/sandboxes/_pool")
-async def pool_snapshot(request: Request) -> dict:
+async def pool_snapshot(request: Request) -> dict[str, object]:
     """Return pool occupancy.  Wired to the readiness probe + metrics."""
     return _pool(request).snapshot()

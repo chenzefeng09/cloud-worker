@@ -129,6 +129,21 @@ class ReplyEndEvent:
         return {"event_type": "ReplyEndEvent"}
 
 
+class ModelCallEndEvent:
+    """Fake ModelCallEndEvent with token usage fields."""
+
+    def __init__(self, input_tokens: int = 0, output_tokens: int = 0):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+    def model_dump(self):
+        return {
+            "event_type": "ModelCallEndEvent",
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+        }
+
+
 class _FakeAgent:
     """Records its construction args; reply_stream yields canned events (AS 2.x)."""
 
@@ -199,13 +214,28 @@ def _install_fake_agentscope(monkeypatch):
     tool_mod = types.ModuleType("agentscope.tool")
 
     class _FakeToolkit:
-        def __init__(self):
-            self.tools: list[Any] = []
+        def __init__(self, tools=None, **_kw):
+            self.tools: list[Any] = list(tools or [])
+            self.tool_groups = [types.SimpleNamespace(mcps=[])]
 
         def register_tool_function(self, fn, **_):
             self.tools.append(fn)
 
+    # Minimal stubs for the built-in planning tools so hooks.build_toolkit
+    # can call Toolkit(tools=[TaskCreate(), TaskUpdate(), TaskList()]).
+    class _FakeTaskCreate:
+        pass
+
+    class _FakeTaskUpdate:
+        pass
+
+    class _FakeTaskList:
+        pass
+
     tool_mod.Toolkit = _FakeToolkit
+    tool_mod.TaskCreate = _FakeTaskCreate
+    tool_mod.TaskUpdate = _FakeTaskUpdate
+    tool_mod.TaskList = _FakeTaskList
 
     for name, mod in [
         ("agentscope", agentscope),
@@ -304,7 +334,12 @@ def test_happy_path_writes_result_and_events(workspace, env, monkeypatch):
 
     assert code == 0
     result = json.loads((ws / "result.json").read_text())
-    assert result == {"status": "OK", "summary": "hi back", "error": None}
+    assert result["status"] == "OK"
+    assert result["summary"] == "hi back"
+    assert result["error"] is None
+    # usage is always present (may be all-zeros when no ModelCallEndEvent fired).
+    assert "usage" in result
+    assert isinstance(result["usage"], dict)
 
     # Events come from the fake's reply_stream:
     # TextBlockStartEvent + TextBlockDeltaEvent + ReplyEndEvent = 3 events.
@@ -549,3 +584,347 @@ def test_memory_absent_does_not_break_run(workspace, env, monkeypatch):
     inst = _FakeAgent.last_instance
     assert inst is not None
     assert "历史记忆" not in inst.system_prompt
+
+
+# ---------------------------------------------------------------------------
+# Tests -- token accumulation via ModelCallEndEvent
+# ---------------------------------------------------------------------------
+
+
+class _FakeAgentWithTokens:
+    """Like _FakeAgent but emits ModelCallEndEvent(s) to test token accumulation."""
+
+    last_instance: "_FakeAgentWithTokens | None" = None
+    # Each entry is (input_tokens, output_tokens) for one model call.
+    model_call_usages: list[tuple[int, int]] = []
+    reply_text: str = "done"
+
+    def __init__(self, *, name, system_prompt, model, toolkit, **_kw):
+        self.name = name
+        self.system_prompt = system_prompt
+        self.model = model
+        self.toolkit = toolkit
+        _FakeAgentWithTokens.last_instance = self
+
+    async def reply_stream(self, msg):
+        block_id = "blk-t"
+        yield TextBlockStartEvent(block_id)
+        for in_tok, out_tok in _FakeAgentWithTokens.model_call_usages:
+            yield ModelCallEndEvent(input_tokens=in_tok, output_tokens=out_tok)
+        yield TextBlockDeltaEvent(block_id, _FakeAgentWithTokens.reply_text)
+        yield ReplyEndEvent()
+
+
+def _install_fake_agentscope_with_tokens(monkeypatch):
+    """Like _install_fake_agentscope but uses _FakeAgentWithTokens."""
+    _FakeAgentWithTokens.last_instance = None
+    _FakeAgentWithTokens.model_call_usages = []
+    _FakeAgentWithTokens.reply_text = "done"
+
+    import agentscope_ext.runtime_worker.__main__ as worker_mod
+    import agentscope_ext.runtime_worker.hooks as hooks_mod
+    import agentscope_ext.runtime_worker.redis_state as redis_mod
+
+    # Reuse the agentscope stubs from _install_fake_agentscope but swap Agent.
+    import types as _types
+
+    agentscope = _types.ModuleType("agentscope")
+    agent_mod = _types.ModuleType("agentscope.agent")
+    agent_mod.Agent = _FakeAgentWithTokens
+    message_mod = _types.ModuleType("agentscope.message")
+    message_mod.Msg = _FakeMsg
+    message_mod.TextBlock = _FakeTextBlock
+
+    formatter_mod = _types.ModuleType("agentscope.formatter")
+    formatter_mod.AnthropicChatFormatter = lambda: "fake-anthropic-formatter"
+    formatter_mod.OpenAIChatFormatter = lambda: "fake-openai-formatter"
+    formatter_mod.DeepSeekChatFormatter = lambda: "fake-deepseek-formatter"
+
+    model_mod = _types.ModuleType("agentscope.model")
+    credential_mod = _types.ModuleType("agentscope.credential")
+
+    class _FakeCred:
+        def __init__(self, **kw):
+            self.kw = kw
+
+    class _FakeAnthropic:
+        def __init__(self, *, credential, model, stream=False, formatter=None):
+            self.credential = credential
+            self.model_name = model
+            self.kind = "anthropic"
+
+    credential_mod.AnthropicCredential = _FakeCred
+    credential_mod.OpenAICredential = _FakeCred
+    credential_mod.DeepSeekCredential = _FakeCred
+    model_mod.AnthropicChatModel = _FakeAnthropic
+    model_mod.OpenAIChatModel = _FakeAnthropic
+    model_mod.DeepSeekChatModel = _FakeAnthropic
+
+    tool_mod = _types.ModuleType("agentscope.tool")
+
+    class _FakeToolkit:
+        def __init__(self, tools=None, **_kw):
+            self.tools: list = list(tools or [])
+            self.tool_groups = [_types.SimpleNamespace(mcps=[])]
+
+        def register_tool_function(self, fn, **_):
+            self.tools.append(fn)
+
+    class _FakeTaskCreate:
+        pass
+
+    class _FakeTaskUpdate:
+        pass
+
+    class _FakeTaskList:
+        pass
+
+    tool_mod.Toolkit = _FakeToolkit
+    tool_mod.TaskCreate = _FakeTaskCreate
+    tool_mod.TaskUpdate = _FakeTaskUpdate
+    tool_mod.TaskList = _FakeTaskList
+
+    for name, mod in [
+        ("agentscope", agentscope),
+        ("agentscope.agent", agent_mod),
+        ("agentscope.message", message_mod),
+        ("agentscope.formatter", formatter_mod),
+        ("agentscope.model", model_mod),
+        ("agentscope.credential", credential_mod),
+        ("agentscope.tool", tool_mod),
+    ]:
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
+def test_token_counts_accumulated_from_model_call_end_events(workspace, env, monkeypatch):
+    """ModelCallEndEvent tokens are accumulated and written to result.json usage."""
+    ws, worker_mod = workspace
+    _install_fake_agentscope_with_tokens(monkeypatch)
+
+    _FakeAgentWithTokens.model_call_usages = [(100, 50), (200, 80)]
+    _FakeAgentWithTokens.reply_text = "summary"
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "count tokens"}))
+
+    code = worker_mod.main([])
+
+    assert code == 0
+    result = json.loads((ws / "result.json").read_text())
+    assert result["status"] == "OK"
+    usage = result["usage"]
+    assert usage["input_tokens"] == 300   # 100 + 200
+    assert usage["output_tokens"] == 130  # 50 + 80
+    assert usage["total_tokens"] == 430   # 300 + 130
+
+
+def test_token_counts_zero_when_no_model_call_end_events(workspace, env, monkeypatch):
+    """When no ModelCallEndEvent is emitted, usage is all zeros."""
+    ws, worker_mod = workspace
+    _install_fake_agentscope(monkeypatch)
+
+    _FakeAgent.reply_text = "no tokens"
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "silent"}))
+
+    code = worker_mod.main([])
+
+    assert code == 0
+    result = json.loads((ws / "result.json").read_text())
+    usage = result["usage"]
+    assert usage["input_tokens"] == 0
+    assert usage["output_tokens"] == 0
+    assert usage["total_tokens"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests -- plan_steps extraction + result.json persistence
+# ---------------------------------------------------------------------------
+
+
+class _FakeTask:
+    """Minimal Task stub for plan_steps extraction tests."""
+
+    def __init__(self, subject: str, state: str):
+        self.subject = subject
+        self.state = state
+
+
+class _FakeTasksContext:
+    def __init__(self, tasks):
+        self.tasks = tasks
+
+
+class _ToolCallEndEvent:
+    """Fake ToolCallEndEvent — type().__name__ must equal 'ToolCallEndEvent'."""
+
+    def model_dump(self):
+        return {"event_type": "ToolCallEndEvent"}
+
+
+class _FakeAgentWithTasks:
+    """Agent stub whose state exposes tasks_context for plan extraction."""
+
+    last_instance: "_FakeAgentWithTasks | None" = None
+    reply_text: str = "done"
+    tasks: list = []  # set per-test
+
+    def __init__(self, *, name, system_prompt, model, toolkit, **_kw):
+        self.name = name
+        self.system_prompt = system_prompt
+        self.model = model
+        self.toolkit = toolkit
+        # Attach a state object with tasks_context.
+        self.state = types.SimpleNamespace(
+            tasks_context=_FakeTasksContext(list(_FakeAgentWithTasks.tasks))
+        )
+        _FakeAgentWithTasks.last_instance = self
+
+    async def reply_stream(self, msg):
+        block_id = "blk-plan"
+        yield TextBlockStartEvent(block_id)
+        # Emit a ToolCallEndEvent so _dispatch re-reads tasks.
+        yield _ToolCallEndEvent()
+        yield TextBlockDeltaEvent(block_id, _FakeAgentWithTasks.reply_text)
+        yield ReplyEndEvent()
+
+
+def _install_fake_agentscope_with_tasks(monkeypatch):
+    """Install stubs identical to _install_fake_agentscope but using _FakeAgentWithTasks."""
+    _FakeAgentWithTasks.last_instance = None
+    _FakeAgentWithTasks.tasks = []
+    _FakeAgentWithTasks.reply_text = "done"
+
+    _types = types  # local alias
+
+    agentscope = _types.ModuleType("agentscope")
+    agent_mod = _types.ModuleType("agentscope.agent")
+    agent_mod.Agent = _FakeAgentWithTasks
+    message_mod = _types.ModuleType("agentscope.message")
+    message_mod.Msg = _FakeMsg
+    message_mod.TextBlock = _FakeTextBlock
+
+    formatter_mod = _types.ModuleType("agentscope.formatter")
+    formatter_mod.AnthropicChatFormatter = lambda: "fake-fmt"
+    formatter_mod.OpenAIChatFormatter = lambda: "fake-fmt"
+    formatter_mod.DeepSeekChatFormatter = lambda: "fake-fmt"
+
+    model_mod = _types.ModuleType("agentscope.model")
+    credential_mod = _types.ModuleType("agentscope.credential")
+
+    class _FakeCred:
+        def __init__(self, **kw):
+            pass
+
+    class _FakeAnthropic:
+        def __init__(self, *, credential, model, stream=False, formatter=None):
+            self.model_name = model
+            self.kind = "anthropic"
+
+    credential_mod.AnthropicCredential = _FakeCred
+    credential_mod.OpenAICredential = _FakeCred
+    credential_mod.DeepSeekCredential = _FakeCred
+    model_mod.AnthropicChatModel = _FakeAnthropic
+    model_mod.OpenAIChatModel = _FakeAnthropic
+    model_mod.DeepSeekChatModel = _FakeAnthropic
+
+    tool_mod = _types.ModuleType("agentscope.tool")
+
+    class _FakeToolkit:
+        def __init__(self, tools=None):
+            self.tools: list = tools or []
+            self.tool_groups = [_types.SimpleNamespace(mcps=[])]
+
+    class _FakeTaskCreate:
+        pass
+
+    class _FakeTaskUpdate:
+        pass
+
+    class _FakeTaskList:
+        pass
+
+    tool_mod.Toolkit = _FakeToolkit
+    tool_mod.TaskCreate = _FakeTaskCreate
+    tool_mod.TaskUpdate = _FakeTaskUpdate
+    tool_mod.TaskList = _FakeTaskList
+
+    for name, mod in [
+        ("agentscope", agentscope),
+        ("agentscope.agent", agent_mod),
+        ("agentscope.message", message_mod),
+        ("agentscope.formatter", formatter_mod),
+        ("agentscope.model", model_mod),
+        ("agentscope.credential", credential_mod),
+        ("agentscope.tool", tool_mod),
+    ]:
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
+def test_plan_steps_empty_when_no_tasks(workspace, env, monkeypatch):
+    """result.json always carries plan_steps key; it is [] when agent made no tasks."""
+    ws, worker_mod = workspace
+    _install_fake_agentscope(monkeypatch)
+
+    _FakeAgent.reply_text = "no tasks"
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "simple"}))
+
+    code = worker_mod.main([])
+
+    assert code == 0
+    result = json.loads((ws / "result.json").read_text())
+    assert "plan_steps" in result
+    assert result["plan_steps"] == []
+
+
+def test_plan_steps_extracted_from_agent_tasks(workspace, env, monkeypatch):
+    """plan_steps reflects agent.state.tasks_context.tasks with correct shape."""
+    ws, worker_mod = workspace
+    _install_fake_agentscope_with_tasks(monkeypatch)
+
+    _FakeAgentWithTasks.tasks = [
+        _FakeTask("Research the problem", "completed"),
+        _FakeTask("Write solution", "in_progress"),
+        _FakeTask("Review output", "pending"),
+    ]
+    _FakeAgentWithTasks.reply_text = "done planning"
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "multi-step"}))
+
+    code = worker_mod.main([])
+
+    assert code == 0
+    result = json.loads((ws / "result.json").read_text())
+    assert result["status"] == "OK"
+
+    steps = result["plan_steps"]
+    assert len(steps) == 3
+
+    # n is 1-based
+    assert steps[0] == {"n": 1, "t": "Research the problem", "d": True, "live": False}
+    assert steps[1] == {"n": 2, "t": "Write solution", "d": False, "live": True}
+    assert steps[2] == {"n": 3, "t": "Review output", "d": False, "live": False}
+
+
+def test_extract_plan_steps_returns_empty_on_missing_state(workspace, env, monkeypatch):
+    """_extract_plan_steps never raises; returns [] when agent has no state attr."""
+    import agentscope_ext.runtime_worker.__main__ as worker_mod
+
+    class _BrokenAgent:
+        pass  # no .state attribute at all
+
+    steps = worker_mod._extract_plan_steps(_BrokenAgent())
+    assert steps == []
+
+
+def test_planning_guidance_in_system_prompt(workspace, env, monkeypatch):
+    """The assembled system prompt always contains planning tool guidance."""
+    ws, worker_mod = workspace
+    _install_fake_agentscope_with_tasks(monkeypatch)
+
+    _FakeAgentWithTasks.reply_text = "done"
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "complex task"}))
+
+    code = worker_mod.main([])
+
+    assert code == 0
+    inst = _FakeAgentWithTasks.last_instance
+    assert inst is not None
+    # The system prompt must include TaskCreate guidance.
+    assert "TaskCreate" in inst.system_prompt

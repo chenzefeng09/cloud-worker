@@ -1,0 +1,178 @@
+{{/* =============================================================================
+     批量渲染无状态服务：bff / session-orchestrator / mcp-registry /
+     skill-store / knowledge-ingest / web / web-fetch-gateway
+     照底座 foundation/templates/services-renderer.yaml 范式。
+
+     每个服务渲染：
+       - Deployment
+       - ServiceAccount
+       - Service (ClusterIP)
+       - HPA（autoscaling.enabled=true 时）
+       - PDB（podDisruptionBudget.enabled=true 时）
+       - NetworkPolicy（networkPolicy.enabled=true 时）
+
+     agent-scheduler 和 sandbox-pool 因有特殊资源（docker-socket-proxy sidecar、
+     KEDA ScaledObject）拆到单独文件处理：
+       templates/agent-scheduler.yaml
+       templates/sandbox-pool.yaml
+     ============================================================================= */}}
+
+{{- $root := . -}}
+{{- $profile := .Values.global.profile | default "small" -}}
+
+{{- /*
+     svcMap: serviceName -> svc values block
+     端口映射写死（与 docker-compose 保持一致）
+*/ -}}
+{{- $svcMap := dict
+    "bff"               (dict "svc" .Values.bff              "port" 8005 "healthPath" "/api/bff/v1/healthz")
+    "session-orchestrator" (dict "svc" .Values.sessionOrchestrator "port" 8006 "healthPath" "/api/session/v1/healthz")
+    "mcp-registry"      (dict "svc" .Values.mcpRegistry      "port" 8010 "healthPath" "/api/mcp/v1/healthz")
+    "skill-store"       (dict "svc" .Values.skillStore        "port" 8011 "healthPath" "/api/skills/v1/healthz")
+    "knowledge-ingest"  (dict "svc" .Values.knowledgeIngest   "port" 8012 "healthPath" "/api/knowledge/v1/healthz")
+    "web"               (dict "svc" .Values.web               "port" 80   "healthPath" "/")
+    "web-fetch-gateway" (dict "svc" .Values.webFetchGateway   "port" 8013 "healthPath" "/api/web-fetch/v1/healthz")
+-}}
+
+{{- range $svcName, $entry := $svcMap }}
+{{- $svc := $entry.svc }}
+{{- $port := $entry.port }}
+{{- $healthPath := $entry.healthPath }}
+{{- if $svc.enabled }}
+---
+# ============================================================================
+# {{ $svcName }} — Deployment
+# ============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" $root) }}
+  labels: {{- include "agent-platform.labels" (dict "svcName" $svcName "root" $root) | nindent 4 }}
+spec:
+  {{- if not $svc.autoscaling.enabled }}
+  replicas: {{ $svc.replicaCount | default 1 }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels: {{- include "agent-platform.selectorLabels" (dict "svcName" $svcName "root" $root) | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "agent-platform.selectorLabels" (dict "svcName" $svcName "root" $root) | nindent 8 }}
+        app.kubernetes.io/part-of: agent-platform
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $port | quote }}
+        prometheus.io/path: /metrics
+        checksum/config: {{ $root.Values | toYaml | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" $root) }}
+      {{- with $root.Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml $root.Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: 30
+      {{- with $root.Values.global.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.global.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.global.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $svc.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable }}
+          labelSelector:
+            matchLabels: {{- include "agent-platform.selectorLabels" (dict "svcName" $svcName "root" $root) | nindent 14 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: {{ $svcName }}
+          image: {{ include "agent-platform.image" (dict "img" $svc.image "root" $root) }}
+          imagePullPolicy: {{ $root.Values.global.imagePullPolicy | default "IfNotPresent" }}
+          securityContext: {{- toYaml $root.Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ $port }}
+              protocol: TCP
+          env:
+            {{- include "agent-platform.commonEnv" (dict "svcName" $svcName "root" $root) | nindent 12 }}
+            # Service-specific env (from configmap)
+            - name: {{ $svcName | upper | replace "-" "_" }}_ENV
+              valueFrom:
+                configMapKeyRef:
+                  name: ap-config
+                  key: AP_PROFILE
+            {{- with $svc.env }}
+              {{- toYaml . | nindent 12 }}
+            {{- end }}
+          envFrom:
+            - configMapRef:
+                name: ap-config
+            {{- if and (eq $svcName "bff") $root.Values.bff.existingSecret }}
+            - secretRef:
+                name: {{ $root.Values.bff.existingSecret }}
+            {{- else if eq $svcName "bff" }}
+            - secretRef:
+                name: ap-bff-secrets
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: {{ $healthPath }}
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: {{ $healthPath }}
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          resources: {{- toYaml ($svc.resources | default (dict "requests" (dict "cpu" "100m" "memory" "256Mi") "limits" (dict "cpu" "500m" "memory" "512Mi"))) | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /app/.cache
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+---
+# {{ $svcName }} — ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" $root) }}
+  labels: {{- include "agent-platform.labels" (dict "svcName" $svcName "root" $root) | nindent 4 }}
+---
+# {{ $svcName }} — Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" $root) }}
+  labels: {{- include "agent-platform.labels" (dict "svcName" $svcName "root" $root) | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: {{- include "agent-platform.selectorLabels" (dict "svcName" $svcName "root" $root) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $port }}
+      targetPort: http
+      protocol: TCP
+{{ include "agent-platform.hpa" (dict "svcName" $svcName "svc" $svc "root" $root) }}
+{{ include "agent-platform.pdb" (dict "svcName" $svcName "svc" $svc "root" $root) }}
+{{ include "agent-platform.networkPolicy" (dict "svcName" $svcName "svc" $svc "root" $root "port" $port) }}
+{{- end }}
+{{- end }}

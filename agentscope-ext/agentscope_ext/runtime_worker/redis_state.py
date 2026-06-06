@@ -34,6 +34,18 @@ Key schema
 Terminal states ("COMPLETED", "FAILED") keep the key for
 ``STATE_TTL_SECONDS`` so the scheduler can read the outcome even after
 the container exits.
+
+Token streaming
+---------------
+``agent:run:{run_id}:tokens`` → Redis Stream
+
+Each entry has two fields:
+  ``type``  ``delta`` | ``end``
+  ``text``  the delta string (empty for ``end`` entries)
+
+The stream is capped at 10 000 entries (``MAXLEN ~ 10000``) and expires
+after ``STATE_TTL_SECONDS`` seconds (same TTL as the state key).
+Consumers should read until they see a ``type=end`` entry.
 """
 
 from __future__ import annotations
@@ -58,6 +70,15 @@ def _make_key(run_id: str) -> str:
     return f"{_KEY_PREFIX}:{run_id}:state"
 
 
+def _make_token_stream_key(run_id: str) -> str:
+    return f"{_KEY_PREFIX}:{run_id}:tokens"
+
+
+# Maximum number of entries to retain in the token stream.
+# XADD uses approximate trimming (MAXLEN ~) which keeps Redis CPU cheap.
+_TOKEN_STREAM_MAXLEN = 10_000
+
+
 class RunStateClient:
     """Failure-open Redis client scoped to a single agent run.
 
@@ -75,8 +96,11 @@ class RunStateClient:
     def __init__(self, run_id: str, redis_url: str | None) -> None:
         self._run_id = run_id
         self._key = _make_key(run_id)
+        self._token_stream_key = _make_token_stream_key(run_id)
         self._client: Any | None = None
         self._step = 0
+        # Tracks whether we have already set EXPIRE on the token stream key.
+        self._token_stream_expire_set: bool = False
 
         if not redis_url:
             logger.debug("REDIS_URL unset; hot-state disabled for run %s", run_id)
@@ -150,6 +174,194 @@ class RunStateClient:
     def mark_failed(self) -> None:
         """Set status=FAILED; keep key alive for TTL."""
         self._write_terminal("FAILED")
+
+    def push_token(self, delta: str) -> None:
+        """Append one token delta to the Redis Stream ``agent:run:{run_id}:tokens``.
+
+        Contract (consumed by the orchestrator SSE bridge):
+        * Stream key : ``agent:run:{run_id}:tokens``
+        * Entry fields: ``type=delta``, ``text=<delta string>``
+        * Stream is capped at ``_TOKEN_STREAM_MAXLEN`` entries (approximate).
+        * TTL is set to ``STATE_TTL_SECONDS`` on the first push.
+
+        Failure-open: any Redis error is logged as WARNING and swallowed.
+        The agent run must never crash because of a streaming failure.
+        """
+        if self._client is None:
+            return
+        try:
+            self._client.xadd(
+                self._token_stream_key,
+                {"type": "delta", "text": delta},
+                maxlen=_TOKEN_STREAM_MAXLEN,
+                approximate=True,
+            )
+            # Set TTL on the first successful write so the stream does not
+            # accumulate in Redis indefinitely if the consumer never reads it.
+            if not self._token_stream_expire_set:
+                self._client.expire(self._token_stream_key, STATE_TTL_SECONDS)
+                self._token_stream_expire_set = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis token push failed for run %s: %s",
+                self._run_id,
+                exc,
+            )
+
+    def push_token_end(self) -> None:
+        """Append a terminal ``type=end`` entry to the token stream.
+
+        Consumers poll the stream and stop when they see this entry.
+        Failure-open: errors are logged and swallowed.
+        """
+        if self._client is None:
+            return
+        try:
+            self._client.xadd(
+                self._token_stream_key,
+                {"type": "end", "text": ""},
+                maxlen=_TOKEN_STREAM_MAXLEN,
+                approximate=True,
+            )
+            # Ensure TTL is set even if no deltas were pushed (e.g. empty reply).
+            if not self._token_stream_expire_set:
+                self._client.expire(self._token_stream_key, STATE_TTL_SECONDS)
+                self._token_stream_expire_set = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis token end push failed for run %s: %s",
+                self._run_id,
+                exc,
+            )
+
+    # Maximum result size (bytes) pushed to Redis — avoids bloating the stream
+    # with huge tool outputs (e.g. file contents).  Excess is truncated.
+    _TOOL_RESULT_MAX_BYTES = 8 * 1024  # 8 KB
+
+    def push_tool_call(self, tool_call_id: str, name: str, args: str) -> None:
+        """Append a ``type=tool_call`` entry to the shared token stream.
+
+        The entry interleaves with ``type=delta`` / ``type=end`` entries in
+        the same stream so the frontend can reconstruct the exact execution
+        order.
+
+        Contract::
+
+            type=tool_call
+            tool_call_id=<id>
+            name=<tool name, e.g. "Read">
+            args=<complete JSON args string>
+
+        Failure-open: any Redis error is logged as WARNING and swallowed.
+        """
+        if self._client is None:
+            return
+        try:
+            self._client.xadd(
+                self._token_stream_key,
+                {
+                    "type": "tool_call",
+                    "tool_call_id": tool_call_id,
+                    "name": name,
+                    "args": args,
+                },
+                maxlen=_TOKEN_STREAM_MAXLEN,
+                approximate=True,
+            )
+            if not self._token_stream_expire_set:
+                self._client.expire(self._token_stream_key, STATE_TTL_SECONDS)
+                self._token_stream_expire_set = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis tool_call push failed for run %s: %s",
+                self._run_id,
+                exc,
+            )
+
+    def push_tool_result(
+        self,
+        tool_call_id: str,
+        name: str,
+        result: str,
+        state: str,
+    ) -> None:
+        """Append a ``type=tool_result`` entry to the shared token stream.
+
+        Large results are truncated to ``_TOOL_RESULT_MAX_BYTES`` bytes to
+        avoid bloating Redis / SSE payloads.
+
+        Contract::
+
+            type=tool_result
+            tool_call_id=<id>
+            name=<tool name>
+            result=<tool output text, possibly truncated>
+            state=<"success" | ...>
+
+        Failure-open: any Redis error is logged as WARNING and swallowed.
+        """
+        if self._client is None:
+            return
+        try:
+            # Truncate to avoid oversized stream entries.
+            result_bytes = result.encode("utf-8", errors="replace")
+            if len(result_bytes) > self._TOOL_RESULT_MAX_BYTES:
+                result = (
+                    result_bytes[: self._TOOL_RESULT_MAX_BYTES].decode(
+                        "utf-8", errors="replace"
+                    )
+                    + "…[truncated]"
+                )
+            self._client.xadd(
+                self._token_stream_key,
+                {
+                    "type": "tool_result",
+                    "tool_call_id": tool_call_id,
+                    "name": name,
+                    "result": result,
+                    "state": state,
+                },
+                maxlen=_TOKEN_STREAM_MAXLEN,
+                approximate=True,
+            )
+            if not self._token_stream_expire_set:
+                self._client.expire(self._token_stream_key, STATE_TTL_SECONDS)
+                self._token_stream_expire_set = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis tool_result push failed for run %s: %s",
+                self._run_id,
+                exc,
+            )
+
+    def push_thinking(self, text: str) -> None:
+        """Append a ``type=thinking`` entry to the shared token stream.
+
+        Contract::
+
+            type=thinking
+            text=<thinking text>
+
+        Failure-open: any Redis error is logged as WARNING and swallowed.
+        """
+        if self._client is None:
+            return
+        try:
+            self._client.xadd(
+                self._token_stream_key,
+                {"type": "thinking", "text": text},
+                maxlen=_TOKEN_STREAM_MAXLEN,
+                approximate=True,
+            )
+            if not self._token_stream_expire_set:
+                self._client.expire(self._token_stream_key, STATE_TTL_SECONDS)
+                self._token_stream_expire_set = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis thinking push failed for run %s: %s",
+                self._run_id,
+                exc,
+            )
 
     # ------------------------------------------------------------------
     # Internal helpers

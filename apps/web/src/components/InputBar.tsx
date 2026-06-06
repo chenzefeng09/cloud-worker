@@ -1,26 +1,46 @@
-import { useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
+import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import type { Attachment } from '../api/types';
 
 interface Props {
-  onSend: (text: string, attachmentIds?: string[]) => void;
+  onSend: (text: string, attachmentIds?: string[], attachments?: Attachment[]) => void;
   disabled?: boolean;
   isStreaming?: boolean;
   onStop?: () => void;
   onUpload?: (file: File) => Promise<Attachment>;
+  /** Pre-populate the input (e.g. after a rewind). Cleared after consumed. */
+  prefill?: string;
+  onPrefillConsumed?: () => void;
 }
 
-export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload }: Props) {
+export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, prefill, onPrefillConsumed }: Props) {
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Apply prefill when it arrives (e.g. after rewind).
+  useEffect(() => {
+    if (!prefill) return;
+    setText(prefill);
+    onPrefillConsumed?.();
+    // Focus and resize the textarea after filling.
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.style.height = 'auto';
+      el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+      el.focus();
+    });
+  }, [prefill, onPrefillConsumed]);
 
   const handleSubmit = (e?: FormEvent) => {
     e?.preventDefault();
     if ((!text.trim() && attachments.length === 0) || disabled) return;
     const ids = attachments.map((a) => a.id);
-    onSend(text.trim(), ids);
+    // Pass full attachment objects so callers can populate optimistic messages.
+    onSend(text.trim(), ids, attachments.slice());
     setText('');
     setAttachments([]);
     if (textareaRef.current) {
@@ -46,14 +66,15 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload }: Pr
     const files = Array.from(e.target.files || []);
     if (!files.length || !onUpload) return;
     setUploading(true);
+    setUploadError(null);
     try {
       for (const file of files) {
         const att = await onUpload(file);
         setAttachments((prev) => [...prev, att]);
       }
     } catch (err) {
-      // eslint-disable-next-line no-console
-      console.warn('attachment upload failed', err);
+      const msg = err instanceof Error ? err.message : '上传失败，请重试';
+      setUploadError(msg);
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -96,6 +117,21 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload }: Pr
         </div>
       )}
 
+      {/* Upload error */}
+      {uploadError && (
+        <div className="flex items-center gap-2 mb-2 max-w-3xl text-[11px] font-mono text-red-600">
+          <span>⚠ {uploadError}</span>
+          <button
+            type="button"
+            onClick={() => setUploadError(null)}
+            className="text-dim hover:text-ink leading-none"
+            aria-label="关闭错误提示"
+          >
+            ×
+          </button>
+        </div>
+      )}
+
       <div className="flex gap-2 items-end bg-surface border border-line rounded-lg overflow-hidden shadow-[0_4px_12px_-4px_rgba(15,17,20,0.06)]">
         {/* Hidden file input */}
         <input
@@ -105,7 +141,7 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload }: Pr
           accept="image/*,.pdf,.txt,.csv,.md,.json,.py,.js,.ts,.html,.xml,.yaml,.yml"
           className="hidden"
           onChange={handleFileChange}
-          disabled={disabled || !onUpload || uploading}
+          disabled={!onUpload || uploading}
         />
 
         {/* File button */}
@@ -113,7 +149,7 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload }: Pr
           <button
             type="button"
             onClick={() => fileInputRef.current?.click()}
-            disabled={disabled || uploading}
+            disabled={uploading}
             className="px-3 py-3 font-mono text-[13px] text-ink-2 hover:bg-paper rounded-l-lg disabled:opacity-40 shrink-0"
             title="上传文件或图片"
           >

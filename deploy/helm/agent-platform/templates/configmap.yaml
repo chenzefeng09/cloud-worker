@@ -1,0 +1,101 @@
+{{/* =============================================================================
+     ConfigMap — non-sensitive configuration shared across agent-platform services
+     Sensitive values (DB credentials, cookie secret, S3 keys) go in secrets.yaml
+     ============================================================================= */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ap-config
+  labels:
+    app.kubernetes.io/part-of: agent-platform
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    agent-platform.example.com/profile: {{ .Values.global.profile | default "small" }}
+data:
+  AP_PROFILE: {{ .Values.global.profile | default "small" | quote }}
+  TZ: {{ .Values.global.timezone | default "Asia/Shanghai" | quote }}
+
+  # Foundation service URLs
+  FOUNDATION_IDENTITY_URL:  {{ .Values.global.foundation.identityUrl | quote }}
+  FOUNDATION_AUTHZ_URL:     {{ .Values.global.foundation.authzUrl | quote }}
+  FOUNDATION_ORG_URL:       {{ .Values.global.foundation.orgUrl | quote }}
+  FOUNDATION_BILLING_URL:   {{ .Values.global.foundation.billingUrl | quote }}
+  FOUNDATION_AUDIT_URL:     {{ .Values.global.foundation.auditUrl | quote }}
+  FOUNDATION_LLM_GATEWAY_URL: {{ .Values.global.foundation.llmGatewayUrl | quote }}
+
+  # Keycloak
+  KEYCLOAK_URL:   {{ .Values.global.foundation.keycloak.url | quote }}
+  KEYCLOAK_REALM: {{ .Values.global.foundation.keycloak.realm | quote }}
+
+  # OTEL
+  OTEL_EXPORTER_OTLP_ENDPOINT: {{ .Values.global.foundation.otelCollector.endpoint | quote }}
+
+  # S3 (non-sensitive)
+  S3_ENDPOINT_URL: {{ .Values.global.foundation.s3.endpoint | quote }}
+  S3_REGION:       {{ .Values.global.foundation.s3.region | quote }}
+  S3_BUCKET:       {{ .Values.global.foundation.s3.bucket | quote }}
+
+  # Database (non-sensitive connection params)
+  DB_HOST: {{ .Values.global.foundation.database.host | quote }}
+  DB_PORT: {{ .Values.global.foundation.database.port | quote }}
+  DB_NAME: {{ .Values.global.foundation.database.name | quote }}
+
+  # Redis (non-sensitive)
+  REDIS_HOST: {{ .Values.global.foundation.redis.host | quote }}
+  REDIS_PORT: {{ .Values.global.foundation.redis.port | quote }}
+
+  # Inter-service URLs (cluster-internal)
+  SESSION_ORCHESTRATOR_URL:  {{ printf "http://ap-session-orchestrator:%d/api/session/v1" (int .Values.sessionOrchestrator.port) | quote }}
+  AGENT_SCHEDULER_URL:       {{ printf "http://ap-agent-scheduler:%d/api/scheduler/v1" (int .Values.agentScheduler.port) | quote }}
+  MCP_REGISTRY_URL:          {{ printf "http://ap-mcp-registry:%d/api/mcp/v1" (int .Values.mcpRegistry.port) | quote }}
+  SKILL_STORE_URL:           {{ printf "http://ap-skill-store:%d/api/skills/v1" (int .Values.skillStore.port) | quote }}
+  KNOWLEDGE_INGEST_URL:      {{ printf "http://ap-knowledge-ingest:%d/api/knowledge/v1" (int .Values.knowledgeIngest.port) | quote }}
+  SANDBOX_POOL_URL:          {{ printf "http://ap-sandbox-pool:%d/api/sandbox-pool/v1" (int .Values.sandboxPool.port) | quote }}
+  WEB_FETCH_GATEWAY_URL:     {{ printf "http://ap-web-fetch-gateway:%d/api/web-fetch/v1" (int .Values.webFetchGateway.port) | quote }}
+
+  # Agent scheduler config (non-sensitive)
+  AGENT_IMAGE:               {{ .Values.agentScheduler.config.agentImage | quote }}
+  LLM_MODEL:                 {{ .Values.agentScheduler.config.llmModel | quote }}
+  LLM_PROVIDER:              {{ .Values.agentScheduler.config.llmProvider | quote }}
+  LLM_BASE_URL:              {{ .Values.agentScheduler.config.llmBaseUrl | quote }}
+  SANDBOX_MEMORY_LIMIT:      {{ .Values.agentScheduler.config.sandboxMemoryLimit | quote }}
+  SANDBOX_CPU_SHARES:        {{ .Values.agentScheduler.config.sandboxCpuShares | quote }}
+  SANDBOX_TIMEOUT:           {{ .Values.agentScheduler.config.sandboxTimeout | quote }}
+  RUNTIME_EXTENSIONS:        {{ .Values.agentScheduler.config.runtimeExtensions | quote }}
+  SCHEDULER_KEYCLOAK_REALM:  {{ .Values.agentScheduler.config.keycloakRealm | quote }}
+  SCHEDULER_KEYCLOAK_CLIENT_ID: {{ .Values.agentScheduler.config.keycloakClientId | quote }}
+  {{- if eq .Values.agentScheduler.config.runtime "cube" }}
+  SCHEDULER_CUBE_CONTROLLER_URL: {{ .Values.agentScheduler.cubeControllerUrl | quote }}
+  {{- end }}
+
+  # Sandbox pool config
+  SANDBOX_POOL_IDLE_LOW_WATERMARK:  {{ .Values.sandboxPool.config.idleLowWatermark | quote }}
+  SANDBOX_POOL_IDLE_HIGH_WATERMARK: {{ .Values.sandboxPool.config.idleHighWatermark | quote }}
+  SANDBOX_POOL_MAX_TOTAL:           {{ .Values.sandboxPool.config.maxTotal | quote }}
+  SANDBOX_POOL_SANDBOX_IMAGE:       {{ .Values.sandboxPool.config.sandboxImage | quote }}
+
+  # BFF config
+  BFF_COOKIE_NAME:    {{ .Values.bff.config.cookieName | default "ap_session" | quote }}
+  BFF_COOKIE_MAX_AGE: {{ .Values.bff.config.cookieMaxAge | default "86400" | quote }}
+  BFF_COOKIE_SECURE:  {{ .Values.bff.config.cookieSecure | default "true" | quote }}
+  {{- if .Values.bff.config.corsOrigins }}
+  BFF_CORS_ORIGINS: {{ .Values.bff.config.corsOrigins | quote }}
+  {{- end }}
+
+  # Web Fetch Gateway config
+  WEB_FETCH_ALLOWED_DOMAINS:      {{ .Values.webFetchGateway.config.allowedDomains | quote }}
+  WEB_FETCH_MAX_RESPONSE_BYTES:   {{ .Values.webFetchGateway.config.maxResponseBytes | quote }}
+  WEB_FETCH_FETCH_TIMEOUT_SECONDS: {{ .Values.webFetchGateway.config.fetchTimeoutSeconds | quote }}
+  WEB_FETCH_RESTRICT_CONTENT_TYPES: {{ .Values.webFetchGateway.config.restrictContentTypes | quote }}
+  WEB_FETCH_REQUIRE_AUTH:         {{ .Values.webFetchGateway.config.requireAuth | quote }}
+  WEB_FETCH_REQUIRED_SCOPE:       {{ .Values.webFetchGateway.config.requiredScope | quote }}
+
+  # Knowledge ingest config
+  KNOWLEDGE_INGEST_EMBEDDING_BACKEND: {{ .Values.knowledgeIngest.config.embeddingBackend | quote }}
+
+  # DB pool sizes (per-service env picked up by each service's own config.py)
+  SESSION_ORCHESTRATOR_DB_POOL_SIZE:     {{ .Values.sessionOrchestrator.config.dbPoolSize | quote }}
+  SESSION_ORCHESTRATOR_DB_MAX_OVERFLOW:  {{ .Values.sessionOrchestrator.config.dbMaxOverflow | quote }}
+  MCP_REGISTRY_DB_POOL_SIZE:             {{ .Values.mcpRegistry.config.dbPoolSize | quote }}
+  SKILL_STORE_DB_POOL_SIZE:              {{ .Values.skillStore.config.dbPoolSize | quote }}
+  KNOWLEDGE_INGEST_DB_POOL_SIZE:         {{ .Values.knowledgeIngest.config.dbPoolSize | quote }}

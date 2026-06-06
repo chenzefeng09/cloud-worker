@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -21,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from skill_store.blob.base import BlobStore, make_key
-from skill_store.domain.models import Skill, SkillVersion
+from skill_store.domain.models import Skill, SkillVersion, UserInstalledSkill
 from skill_store.errors import (
     SkillNameConflictError,
     SkillNotFoundError,
@@ -30,21 +31,33 @@ from skill_store.errors import (
     VersionNotFoundError,
 )
 
+# Visibility levels that make a skill visible on the shared shelf (browse list).
+# "private" skills are excluded from the shelf. This filter applies ONLY to the
+# user-facing browse list — NOT to ``list_internal`` (the worker load path),
+# which must load any skill a user actually selected regardless of visibility.
+_SHELF_VISIBILITIES = ("tenant", "public")
+
 
 class SkillService:
     def __init__(
         self, db: AsyncSession, blob: BlobStore, *, tenant_id: str,
+        user_id: str | None = None,
     ) -> None:
         self._db = db
         self._blob = blob
         self._tenant_id = tenant_id
+        self._user_id = user_id
 
     # ----------------------------------------------------------- skills
 
     async def list_skills(self) -> list[Skill]:
+        """Browse list — skills published to the tenant shelf."""
         stmt = (
             select(Skill)
-            .where(Skill.tenant_id == self._tenant_id)
+            .where(
+                Skill.tenant_id == self._tenant_id,
+                Skill.visibility.in_(_SHELF_VISIBILITIES),
+            )
             .order_by(Skill.name.asc())
         )
         result = await self._db.execute(stmt)
@@ -83,6 +96,74 @@ class SkillService:
             raise SkillNotFoundError(skill_id)
         return skill
 
+    # ------------------------------------------------------- installs
+
+    def _require_user(self) -> str:
+        if not self._user_id:
+            raise RuntimeError("SkillService was constructed without a user_id")
+        return self._user_id
+
+    async def list_installed(self) -> list[tuple[Skill, UserInstalledSkill]]:
+        """The calling user's installed skills (their personal toolbox)."""
+        user_id = self._require_user()
+        stmt = (
+            select(Skill, UserInstalledSkill)
+            .join(UserInstalledSkill, UserInstalledSkill.skill_id == Skill.id)
+            .where(
+                UserInstalledSkill.tenant_id == self._tenant_id,
+                UserInstalledSkill.user_id == user_id,
+            )
+            .order_by(Skill.name.asc())
+        )
+        result = await self._db.execute(stmt)
+        return [(row[0], row[1]) for row in result.all()]
+
+    async def install_skill(
+        self, skill_id: str, *, enabled_by_default: bool = True,
+    ) -> UserInstalledSkill:
+        """Install a skill into the user's toolbox (idempotent on re-install)."""
+        user_id = self._require_user()
+        skill = await self.get_skill(skill_id)  # 404 if not in tenant
+
+        existing = await self._db.execute(
+            select(UserInstalledSkill).where(
+                UserInstalledSkill.tenant_id == self._tenant_id,
+                UserInstalledSkill.user_id == user_id,
+                UserInstalledSkill.skill_id == skill.id,
+            )
+        )
+        row = existing.scalar_one_or_none()
+        if row is not None:
+            row.enabled_by_default = enabled_by_default
+            await self._db.flush()
+            return row
+
+        row = UserInstalledSkill(
+            tenant_id=self._tenant_id,
+            user_id=user_id,
+            skill_id=skill.id,
+            enabled_by_default=enabled_by_default,
+        )
+        self._db.add(row)
+        await self._db.flush()
+        await self._db.refresh(row)
+        return row
+
+    async def uninstall_skill(self, skill_id: str) -> None:
+        """Remove a skill from the user's toolbox (no-op if not installed)."""
+        user_id = self._require_user()
+        result = await self._db.execute(
+            select(UserInstalledSkill).where(
+                UserInstalledSkill.tenant_id == self._tenant_id,
+                UserInstalledSkill.user_id == user_id,
+                UserInstalledSkill.skill_id == skill_id,
+            )
+        )
+        row = result.scalar_one_or_none()
+        if row is not None:
+            await self._db.delete(row)
+            await self._db.flush()
+
     # ----------------------------------------------------------- versions
 
     async def upload_version(
@@ -91,7 +172,7 @@ class SkillService:
         *,
         version: str,
         tarball: bytes,
-        manifest: dict | str | None,
+        manifest: dict[str, Any] | str | None,
         expected_sha256: str | None,
         uploaded_by: str | None,
     ) -> SkillVersion:
@@ -101,7 +182,7 @@ class SkillService:
         if expected_sha256 and expected_sha256.lower() != computed_sha:
             raise SkillSha256MismatchError()
 
-        manifest_dict: dict
+        manifest_dict: dict[str, Any]
         if manifest is None:
             manifest_dict = {}
         elif isinstance(manifest, str):

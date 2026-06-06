@@ -77,15 +77,19 @@ async def chat(
     body = await request.json()
     message_text = body.get("message", "")
     attachment_ids: list[str] = body.get("attachment_ids") or []
+    # Optional per-message skill selection (names); forwarded to the orchestrator
+    # which relays into task.json so the worker loads exactly these skills.
+    skills: list[str] = body.get("skills") or []
 
     async def event_generator():
         async with httpx.AsyncClient(timeout=600) as client:
             headers = foundation_headers(tenant_id, user_id, access_token)
 
-            # 1. Create user message in orchestrator
+            # 1. Create user message in orchestrator (pass attachment_ids so the
+            #    orchestrator can embed attachment metadata on the message row).
             resp = await client.post(
                 f"{orch_url}/sessions/{session_id}/messages",
-                json={"role": "USER", "content": message_text},
+                json={"role": "USER", "content": message_text, "attachment_ids": attachment_ids},
                 headers=headers,
             )
             if resp.status_code >= 400:
@@ -110,7 +114,7 @@ async def chat(
             # 3. Trigger run (pass files so worker downloads them)
             resp = await client.post(
                 f"{orch_url}/sessions/{session_id}/runs",
-                json={"task": message_text, "files": files},
+                json={"task": message_text, "files": files, "skills": skills},
                 headers=headers,
             )
             if resp.status_code >= 400:

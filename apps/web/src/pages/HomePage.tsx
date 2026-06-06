@@ -1,8 +1,10 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { PageHead } from '../components/shell/PageHead';
 import { useWorkspace } from '../lib/workspaceContext';
 import { useSessions } from '../hooks/useSessions';
+import { api } from '../api/client';
+import type { Attachment, Session } from '../api/types';
 import { formatRelativeTimeZh } from '../lib/format';
 import { StatusDot, sessionToDesignStatus } from '../components/shell/StatusDot';
 import { Chip } from '../components/shell/Chip';
@@ -33,6 +35,13 @@ export function HomePage() {
   const [phIdx, setPhIdx] = useState(0);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // Attachments require a session_id (NOT NULL FK), so the session must exist
+  // before we can upload.  We create it lazily on the first file pick and
+  // reuse it on send so the session isn't created twice.
+  const sessionRef = useRef<Session | null>(null);
 
   useEffect(() => {
     if (draft) return;
@@ -40,21 +49,68 @@ export function HomePage() {
     return () => clearInterval(t);
   }, [draft]);
 
+  // Create the session up front (or return the one already created for an
+  // earlier upload).  Title defaults to the current draft text.
+  const ensureSession = async (): Promise<Session | null> => {
+    if (sessionRef.current) return sessionRef.current;
+    const session = await createSession(draft.trim() || undefined);
+    if (session) sessionRef.current = session;
+    return session ?? null;
+  };
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    setSubmitError(null);
+    setUploading(true);
+    try {
+      const session = await ensureSession();
+      if (!session) {
+        setSubmitError('创建任务失败，请稍后重试。');
+        return;
+      }
+      for (const file of files) {
+        const att = await api.attachments.upload(session.id, file);
+        setAttachments((prev) => [...prev, att]);
+      }
+    } catch (err) {
+      setSubmitError('附件上传失败，请稍后重试。');
+      // eslint-disable-next-line no-console
+      console.warn('attachment upload failed', err);
+    } finally {
+      setUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const removeAttachment = (id: string) => {
+    setAttachments((prev) => prev.filter((a) => a.id !== id));
+  };
+
+  const isImage = (mime: string) => mime.startsWith('image/');
+
   const startChat = async () => {
     setSubmitError(null);
     setSubmitting(true);
     try {
       const draftText = draft.trim();
-      const session = await createSession(draftText || undefined);
+      // Reuse the session created during an earlier file upload, if any.
+      const session = await ensureSession();
       if (session) {
-        // Pass the first user message through router state so AgentPage can
-        // dispatch it once the chat store is bound to the new session.  Without
-        // this the draft was being thrown away.
-        navigate(`/tasks/${session.id}?mode=friendly`, { state: { initialMessage: draftText } });
+        // Pass the first user message and any pre-uploaded attachments through
+        // router state so AgentPage can dispatch them once the chat store is
+        // bound to the new session.  Without this the draft was being thrown
+        // away.
+        navigate(`/tasks/${session.id}?mode=friendly`, {
+          state: {
+            initialMessage: draftText,
+            attachmentIds: attachments.map((a) => a.id),
+          },
+        });
       }
     } catch (err) {
       setSubmitError('创建任务失败，请稍后重试。');
-      // eslint-disable-next-line no-console
+       
       console.warn('create session failed', err);
     } finally {
       setSubmitting(false);
@@ -114,19 +170,62 @@ export function HomePage() {
               onChange={(e) => setDraft(e.target.value)}
               placeholder={PLACEHOLDERS[phIdx]}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) startChat();
+                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !submitting && !uploading)
+                  startChat();
               }}
               className="w-full min-h-[110px] resize-none border-none outline-none bg-transparent text-ink text-[17px] leading-[1.45] tracking-[-0.01em] px-5 pt-[18px] pb-2"
             />
+            {/* Attachment chips */}
+            {(attachments.length > 0 || uploading) && (
+              <div className="flex flex-wrap gap-1.5 px-3.5 pt-2 pb-0.5">
+                {attachments.map((att) => (
+                  <div
+                    key={att.id}
+                    className="flex items-center gap-1 px-2 py-1 border border-line rounded-md text-[11px] bg-surface"
+                  >
+                    <span className="text-ink-2">{isImage(att.mime) ? '🖼' : '📎'}</span>
+                    <span className="max-w-[120px] truncate text-ink">{att.filename}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeAttachment(att.id)}
+                      className="font-mono text-dim hover:text-ink ml-0.5 leading-none"
+                      aria-label="移除附件"
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))}
+                {uploading && (
+                  <div className="flex items-center px-2 py-1 text-[11px] text-dim font-mono">
+                    <span className="animate-pulse">上传中…</span>
+                  </div>
+                )}
+              </div>
+            )}
             <div className="flex items-center gap-1.5 px-3.5 py-2.5 border-t border-line-2 bg-paper">
-              <button className="cw-btn cw-btn-ghost cw-btn-sm">
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept="image/*,.pdf,.txt,.csv,.md,.json,.py,.js,.ts,.html,.xml,.yaml,.yml"
+                className="hidden"
+                onChange={handleFileChange}
+                disabled={uploading}
+              />
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading}
+                className="cw-btn cw-btn-ghost cw-btn-sm disabled:opacity-50"
+                title="上传文件或图片"
+              >
                 <span className="font-mono">⊕</span> 文件
               </button>
               <div className="flex-1" />
               <span className="font-mono text-[10.5px] text-dim">sonnet 4.5 · {ws.name}</span>
               <button
                 onClick={startChat}
-                disabled={submitting}
+                disabled={submitting || uploading}
                 className="cw-btn cw-btn-accent cw-btn-sm disabled:opacity-50"
               >
                 {submitting ? '创建中…' : '发送 ↵'}

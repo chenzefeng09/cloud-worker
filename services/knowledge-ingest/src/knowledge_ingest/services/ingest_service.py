@@ -64,7 +64,7 @@ class IngestService:
             .order_by(Document.uploaded_at.desc())
         )
         result = await self._db.execute(stmt)
-        return [(doc, count) for doc, count in result.all()]
+        return [(doc, count) for doc, count in result.all()]  # noqa: C416
 
     async def get_document(self, document_id: str) -> tuple[Document, int]:
         stmt = (
@@ -143,7 +143,7 @@ class IngestService:
         except Exception as exc:
             doc.status = "FAILED"
             await self._db.flush()
-            if isinstance(exc, (IngestFailedError, EmbeddingDimensionError, UnsupportedMimeError)):
+            if isinstance(exc, IngestFailedError | EmbeddingDimensionError | UnsupportedMimeError):
                 raise
             raise IngestFailedError(doc.id, str(exc)) from exc
 
@@ -174,7 +174,7 @@ class IngestService:
 
         vec_text = "[" + ",".join(str(float(v)) for v in qvec) + "]"
         # Build: "chunks.embedding <=> CAST('[x,y,z]' AS vector)" as a column expression.
-        distance = Chunk.embedding.op("<=>")(  # type: ignore[attr-defined]
+        distance = Chunk.embedding.op("<=>")(
             sa_text(f"CAST('{vec_text}' AS vector)")
         )
         stmt = (

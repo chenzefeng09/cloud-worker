@@ -112,8 +112,10 @@ class DockerRuntime:
         user_id: str,
         foundation_token: str,
         skills: list[str] | None = None,
-        files: list[dict] | None = None,
+        files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
+        llm_gateway_url: str | None = None,
+        llm_virtual_key: str | None = None,
     ) -> str:
         """Spawn a sandbox container for one agent run.
 
@@ -132,6 +134,13 @@ class DockerRuntime:
                 dicts describing user-uploaded attachments.  Written to task.json
                 ``files`` field; the runtime_worker downloads them to
                 ``/workspace/inputs/`` before starting the agent.
+            llm_gateway_url: M1-P3 — LLM gateway base URL (with API prefix).
+                Injected as ``LLM_GATEWAY_URL``.  Defaults to
+                ``settings.llm_gateway_url`` when omitted.  The sandbox
+                ignores this env if ``llm_gateway_enforcer`` is not active.
+            llm_virtual_key: tenant virtual key from the gateway.  Required
+                when ``llm_gateway_enforcer`` is active; omitted only for an
+                explicit local direct-connect configuration.
         """
         _check_ids(
             run_id=run_id,
@@ -161,8 +170,25 @@ class DockerRuntime:
             memory=memory or "",
         )
 
+        # When the ``llm_gateway_enforcer`` extension is active, the sandbox
+        # routes all LLM traffic through foundation llm-gateway using a
+        # per-tenant virtual key.  The real upstream provider key lives inside
+        # the gateway and must not be exposed to sandbox code.
+        _extensions = {
+            e.strip()
+            for e in (self._settings.runtime_extensions or "").split(",")
+            if e.strip()
+        }
+        _gateway_mode = "llm_gateway_enforcer" in _extensions
+        if _gateway_mode and not llm_virtual_key:
+            raise SandboxSpawnError(
+                "llm_gateway_enforcer is enabled but no tenant LLM virtual key "
+                "was provided; refusing direct-connect fallback",
+            )
+        _sandbox_llm_api_key = "" if _gateway_mode else self._settings.llm_api_key
+
         env_vars = {
-            "LLM_API_KEY": self._settings.llm_api_key,
+            "LLM_API_KEY": _sandbox_llm_api_key,
             "LLM_MODEL": self._settings.llm_model,
             # Provider selector + base URL are forwarded so the in-sandbox
             # worker can talk to OpenAI-compatible endpoints (DeepSeek, etc.)
@@ -170,6 +196,9 @@ class DockerRuntime:
             # The worker treats the empty string as "fall back to default".
             "LLM_PROVIDER": self._settings.llm_provider,
             "LLM_BASE_URL": self._settings.llm_base_url,
+            # LLM gateway env vars.  The enforcer is enabled by default and
+            # refuses to build a model if either URL or virtual key is absent.
+            "LLM_GATEWAY_URL": llm_gateway_url or self._settings.llm_gateway_url,
             "WORKSPACE_BASE": str(workspace_dir),
             "FOUNDATION_API_URL": self._settings.foundation_api_url,
             "FOUNDATION_API_TOKEN": foundation_token,
@@ -204,7 +233,17 @@ class DockerRuntime:
             # (plan a — no sidecar needed).
             "RUN_ID": run_id,
             "REDIS_URL": self._settings.redis_url,
+            # Web-fetch gateway — the web_fetch extension reads this to
+            # POST fetch requests to the gateway sidecar.  The gateway is
+            # on the foundation network so sandbox containers reach it by
+            # service name without any additional proxy.
+            "WEB_FETCH_GATEWAY_URL": self._settings.web_fetch_gateway_url,
         }
+
+        # M1-P3: inject LLM_VIRTUAL_KEY only when present (omit rather than
+        # blank so the enforcer can reliably detect "no key configured").
+        if llm_virtual_key:
+            env_vars["LLM_VIRTUAL_KEY"] = llm_virtual_key
 
         try:
             container = self.client.containers.run(
@@ -248,17 +287,17 @@ class DockerRuntime:
                 # Token deliberately not logged.
             },
         )
-        return container.id
+        return str(container.id)
 
     # --------------------------------------------------------------- inspect
-    def get_run_status(self, container_id: str) -> dict:
+    def get_run_status(self, container_id: str) -> dict[str, Any]:
         try:
             c = self.client.containers.get(container_id)
         except docker.errors.NotFound:
             return {"status": "NOT_FOUND", "exit_code": None}
 
         status = _CONTAINER_STATUS_MAP.get(c.status, "UNKNOWN")
-        result: dict = {
+        result: dict[str, Any] = {
             "status": status,
             "exit_code": c.attrs["State"].get("ExitCode"),
             "started_at": c.attrs["State"].get("StartedAt"),
@@ -267,49 +306,68 @@ class DockerRuntime:
         if status == "COMPLETED" and result["exit_code"] != 0:
             result["status"] = "FAILED"
 
-        # On terminal states, pull the worker's ``result.json`` from the
-        # per-run workspace so callers (session-orchestrator) can persist
-        # the assistant summary without having to bind-mount workspaces.
-        # Best-effort: the file may be missing if the worker crashed before
-        # it could write it; we surface a None summary in that case.
-        if status in ("COMPLETED", "FAILED"):
-            labels = c.labels or {}
-            run_id = labels.get("agent-platform.run-id", "")
-            session_id = labels.get("agent-platform.session-id", "")
-            tenant_id = labels.get("agent-platform.tenant-id", "")
-            if run_id and session_id and tenant_id:
-                workspace = (
-                    Path(self._settings.workspace_base)
-                    / tenant_id
-                    / session_id
-                    / run_id
-                )
-                result_path = workspace / "result.json"
-                if result_path.is_file():
-                    try:
-                        import json
+        # Read result.json for both terminal AND running states.
+        # For RUNNING runs we only extract plan_steps (written continuously
+        # by the worker after each ToolCallEndEvent) so the orchestrator's
+        # SSE poll can relay real-time plan progress to the frontend.
+        # For terminal states we additionally pull summary/error/status/usage.
+        # Best-effort: missing or malformed file returns empty plan_steps.
+        labels = c.labels or {}
+        run_id = labels.get("agent-platform.run-id", "")
+        session_id = labels.get("agent-platform.session-id", "")
+        tenant_id = labels.get("agent-platform.tenant-id", "")
 
-                        payload = json.loads(result_path.read_text(encoding="utf-8"))
-                    except (OSError, ValueError):
-                        payload = {}
-                    result["result_summary"] = payload.get("summary")
-                    result["result_error"] = payload.get("error")
-                    result["result_status"] = payload.get("status")
-                    # If the worker reported FAILED via result.json (exit 0
-                    # with status="FAILED"), promote that over the docker
-                    # exit-code-based status so callers see the real reason.
-                    if payload.get("status") == "FAILED" and result["status"] == "COMPLETED":
-                        result["status"] = "FAILED"
+        workspace = None
+        if run_id and session_id and tenant_id:
+            workspace = (
+                Path(self._settings.workspace_base)
+                / tenant_id
+                / session_id
+                / run_id
+            )
 
-                # Upload artifacts to S3 and attach the list to the result.
-                # Failure-open: any upload error is logged; the run result
-                # is still returned without the failed artifact.
-                result["artifacts"] = self._upload_artifacts(
-                    workspace=workspace,
-                    tenant_id=tenant_id,
-                    session_id=session_id,
-                    run_id=run_id,
-                )
+        # Always try to read plan_steps (available during RUNNING too).
+        result["plan_steps"] = []
+        if workspace is not None:
+            result_path = workspace / "result.json"
+            if result_path.is_file():
+                try:
+                    import json as _json
+
+                    payload = _json.loads(result_path.read_text(encoding="utf-8"))
+                    result["plan_steps"] = payload.get("plan_steps") or []
+                except (OSError, ValueError):
+                    pass
+
+        if status in ("COMPLETED", "FAILED") and workspace is not None:
+            result_path = workspace / "result.json"
+            if result_path.is_file():
+                try:
+                    import json
+
+                    payload = json.loads(result_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    payload = {}
+                result["result_summary"] = payload.get("summary")
+                result["result_error"] = payload.get("error")
+                result["result_status"] = payload.get("status")
+                result["usage"] = payload.get("usage")
+                result["plan_steps"] = payload.get("plan_steps") or []
+                # If the worker reported FAILED via result.json (exit 0
+                # with status="FAILED"), promote that over the docker
+                # exit-code-based status so callers see the real reason.
+                if payload.get("status") == "FAILED" and result["status"] == "COMPLETED":
+                    result["status"] = "FAILED"
+
+            # Upload artifacts to S3 and attach the list to the result.
+            # Failure-open: any upload error is logged; the run result
+            # is still returned without the failed artifact.
+            result["artifacts"] = self._upload_artifacts(
+                workspace=workspace,
+                tenant_id=tenant_id,
+                session_id=session_id,
+                run_id=run_id,
+            )
         return result
 
     # ---------------------------------------------------------------- artifacts
@@ -396,7 +454,7 @@ class DockerRuntime:
         Returns None if boto3 is unavailable or credentials are unset.
         """
         try:
-            import boto3  # type: ignore[import-not-found]
+            import boto3
             client = boto3.client(
                 "s3",
                 endpoint_url=self._settings.s3_endpoint_url,
@@ -423,7 +481,7 @@ class DockerRuntime:
         tenant = c.labels.get("agent-platform.tenant-id", "")
         if not tenant:
             raise ContainerNotFoundError(container_id)
-        return tenant
+        return str(tenant)
 
     # ---------------------------------------------------------------- cancel
     def cancel_run(self, container_id: str) -> None:
@@ -442,7 +500,7 @@ class DockerRuntime:
             c.remove()
 
     # ------------------------------------------------------------------ list
-    def list_containers(self, *, tenant_id: str) -> list[dict]:
+    def list_containers(self, *, tenant_id: str) -> list[dict[str, Any]]:
         """List agent-platform containers belonging to ``tenant_id``.
 
         The argument is required; callers in the API layer have already
@@ -491,7 +549,7 @@ class DockerRuntime:
         *,
         task: str,
         skills: list[str] | None = None,
-        files: list[dict] | None = None,
+        files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
     ) -> Path:
         """Write the task payload ``runtime_worker`` will read.

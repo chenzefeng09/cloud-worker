@@ -39,6 +39,7 @@ def _restore_hooks():
             "agentscope_ext.llm_gateway_enforcer",
             "agentscope_ext.mcp_tenant_injector",
             "agentscope_ext.skills_loader",
+            "agentscope_ext.web_fetch",
         ):
             mod = sys.modules.get(name)
             if mod is not None and hasattr(mod, "_INSTALLED"):

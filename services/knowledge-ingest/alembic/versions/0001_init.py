@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision: str = "0001_init"
@@ -73,58 +74,67 @@ def upgrade() -> None:
     #     "ON chunks USING ivfflat (embedding vector_cosine_ops) WITH (lists = 100)"
     # )
 
+    # Grant the runtime role schema USAGE + table DML.  app_migrator owns the
+    # knowledge_ingest schema; app_user (non-owner) needs these to reach the
+    # tables.
+    op.execute("GRANT USAGE ON SCHEMA knowledge_ingest TO app_user")
+    op.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON documents TO app_user")
+    op.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON chunks TO app_user")
+
     # RLS — documents direct; chunks via join.  The chunk policy uses an
     # EXISTS lookup against documents.tenant_id to keep tenant boundaries
     # intact without storing tenant_id redundantly on every chunk row.
+    # Each statement runs in its own op.execute: asyncpg (the migrator driver)
+    # uses prepared statements and rejects multiple commands in one execute().
+    op.execute("ALTER TABLE documents ENABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE documents FORCE ROW LEVEL SECURITY")
     op.execute(
-        """
-        ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
-        ALTER TABLE documents FORCE ROW LEVEL SECURITY;
+        "CREATE POLICY documents_tenant_select ON documents"
+        " FOR SELECT TO app_user"
+        " USING (tenant_id = current_setting('app.tenant_id', true))"
+    )
+    op.execute(
+        "CREATE POLICY documents_tenant_insert ON documents"
+        " FOR INSERT TO app_user"
+        " WITH CHECK (tenant_id = current_setting('app.tenant_id', true))"
+    )
+    op.execute(
+        "CREATE POLICY documents_tenant_update ON documents"
+        " FOR UPDATE TO app_user"
+        " USING (tenant_id = current_setting('app.tenant_id', true))"
+        " WITH CHECK (tenant_id = current_setting('app.tenant_id', true))"
+    )
+    op.execute(
+        "CREATE POLICY documents_tenant_delete ON documents"
+        " FOR DELETE TO app_user"
+        " USING (tenant_id = current_setting('app.tenant_id', true))"
+    )
 
-        CREATE POLICY documents_tenant_select ON documents
-            FOR SELECT TO app_user
-            USING (tenant_id = current_setting('app.tenant_id', true));
-
-        CREATE POLICY documents_tenant_insert ON documents
-            FOR INSERT TO app_user
-            WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
-
-        CREATE POLICY documents_tenant_update ON documents
-            FOR UPDATE TO app_user
-            USING (tenant_id = current_setting('app.tenant_id', true))
-            WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
-
-        CREATE POLICY documents_tenant_delete ON documents
-            FOR DELETE TO app_user
-            USING (tenant_id = current_setting('app.tenant_id', true));
-
-        ALTER TABLE chunks ENABLE ROW LEVEL SECURITY;
-        ALTER TABLE chunks FORCE ROW LEVEL SECURITY;
-
-        CREATE POLICY chunks_tenant_select ON chunks
-            FOR SELECT TO app_user
-            USING (EXISTS (
-                SELECT 1 FROM documents d
-                WHERE d.id = chunks.document_id
-                  AND d.tenant_id = current_setting('app.tenant_id', true)
-            ));
-
-        CREATE POLICY chunks_tenant_insert ON chunks
-            FOR INSERT TO app_user
-            WITH CHECK (EXISTS (
-                SELECT 1 FROM documents d
-                WHERE d.id = chunks.document_id
-                  AND d.tenant_id = current_setting('app.tenant_id', true)
-            ));
-
-        CREATE POLICY chunks_tenant_delete ON chunks
-            FOR DELETE TO app_user
-            USING (EXISTS (
-                SELECT 1 FROM documents d
-                WHERE d.id = chunks.document_id
-                  AND d.tenant_id = current_setting('app.tenant_id', true)
-            ));
-        """
+    op.execute("ALTER TABLE chunks ENABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE chunks FORCE ROW LEVEL SECURITY")
+    op.execute(
+        "CREATE POLICY chunks_tenant_select ON chunks"
+        " FOR SELECT TO app_user"
+        " USING (EXISTS ("
+        " SELECT 1 FROM documents d"
+        " WHERE d.id = chunks.document_id"
+        " AND d.tenant_id = current_setting('app.tenant_id', true)))"
+    )
+    op.execute(
+        "CREATE POLICY chunks_tenant_insert ON chunks"
+        " FOR INSERT TO app_user"
+        " WITH CHECK (EXISTS ("
+        " SELECT 1 FROM documents d"
+        " WHERE d.id = chunks.document_id"
+        " AND d.tenant_id = current_setting('app.tenant_id', true)))"
+    )
+    op.execute(
+        "CREATE POLICY chunks_tenant_delete ON chunks"
+        " FOR DELETE TO app_user"
+        " USING (EXISTS ("
+        " SELECT 1 FROM documents d"
+        " WHERE d.id = chunks.document_id"
+        " AND d.tenant_id = current_setting('app.tenant_id', true)))"
     )
 
 

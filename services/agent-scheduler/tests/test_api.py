@@ -72,6 +72,8 @@ def test_create_run_mints_token_then_spawns(
     # And the spawn used the *minted* token, not the scheduler's own.
     spawn_env = mock_docker_client.containers.run.call_args.kwargs["environment"]
     assert spawn_env["FOUNDATION_API_TOKEN"] == "minted-jwt"
+    assert spawn_env["LLM_VIRTUAL_KEY"] == "vk-test-default"
+    assert spawn_env["LLM_API_KEY"] == ""
 
 
 def test_create_run_validation(app_client: TestClient, auth_headers) -> None:

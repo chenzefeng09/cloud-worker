@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 from logging.config import fileConfig
 
-from alembic import context
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from alembic import context
 from knowledge_ingest.config import Settings
 from knowledge_ingest.domain.models import Base
 
@@ -31,7 +31,20 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection) -> None:  # type: ignore[no-untyped-def]
-    context.configure(connection=connection, target_metadata=target_metadata)
+    # Foundation isolates every service in its own schema (app_migrator owns
+    # it; public is not writable).  Create it up-front, route unqualified DDL
+    # into it via search_path, and keep alembic_version in the same schema.
+    schema = settings.db_schema
+    connection.exec_driver_sql(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+    # Include ``public`` on the search_path so extension-provided types (e.g.
+    # pgvector's ``vector``, installed into public by the superuser) resolve
+    # while service tables/DDL still default into the service schema.
+    connection.exec_driver_sql(f'SET search_path TO "{schema}", public')
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        version_table_schema=schema,
+    )
     with context.begin_transaction():
         context.run_migrations()
 
@@ -40,6 +53,10 @@ async def run_migrations_online() -> None:
     connectable = create_async_engine(settings.db_dsn_migrator)
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
+        # ``connect()`` (vs ``begin()``) does not auto-commit; commit the
+        # schema bootstrap + alembic DDL explicitly or asyncpg rolls them
+        # back on connection close.
+        await connection.commit()
     await connectable.dispose()
 
 

@@ -1,0 +1,66 @@
+Agent Platform has been installed!
+
+Profile: {{ .Values.global.profile | default "small" }}
+
+Services deployed:
+{{- if .Values.bff.enabled }}
+  - BFF (api gateway):          ap-bff:{{ .Values.bff.port | default 8005 }}
+{{- end }}
+{{- if .Values.sessionOrchestrator.enabled }}
+  - Session Orchestrator:       ap-session-orchestrator:{{ .Values.sessionOrchestrator.port | default 8006 }}
+{{- end }}
+{{- if .Values.agentScheduler.enabled }}
+  - Agent Scheduler:            ap-agent-scheduler:{{ .Values.agentScheduler.port | default 8007 }}
+    Runtime mode:               {{ .Values.agentScheduler.config.runtime }}
+{{- end }}
+{{- if .Values.sandboxPool.enabled }}
+  - Sandbox Pool:               ap-sandbox-pool:{{ .Values.sandboxPool.port | default 8008 }}
+    KEDA enabled:               {{ .Values.sandboxPool.keda.enabled }}
+{{- end }}
+{{- if .Values.mcpRegistry.enabled }}
+  - MCP Registry:               ap-mcp-registry:{{ .Values.mcpRegistry.port | default 8010 }}
+{{- end }}
+{{- if .Values.skillStore.enabled }}
+  - Skill Store:                ap-skill-store:{{ .Values.skillStore.port | default 8011 }}
+{{- end }}
+{{- if .Values.knowledgeIngest.enabled }}
+  - Knowledge Ingest:           ap-knowledge-ingest:{{ .Values.knowledgeIngest.port | default 8012 }}
+{{- end }}
+{{- if .Values.webFetchGateway.enabled }}
+  - Web Fetch Gateway:          ap-web-fetch-gateway:{{ .Values.webFetchGateway.port | default 8013 }}
+{{- end }}
+{{- if .Values.web.enabled }}
+  - Web UI:                     ap-web:{{ .Values.web.port | default 80 }}
+{{- end }}
+
+{{- if .Values.global.ingress.enabled }}
+
+Ingress:
+  http{{ if .Values.global.ingress.tls }}s{{ end }}://{{ .Values.global.ingress.host }}/       → Web UI
+  http{{ if .Values.global.ingress.tls }}s{{ end }}://{{ .Values.global.ingress.host }}/api/   → BFF API
+{{- end }}
+
+IMPORTANT — before the platform starts correctly:
+1. Ensure the following Secrets exist in namespace {{ .Release.Namespace }}:
+   - {{ .Values.global.foundation.database.existingSecret }} (keys: app_user, app_user_password)
+   - {{ .Values.global.foundation.redis.existingSecret }} (key: password OR url)
+   - {{ .Values.global.foundation.s3.existingSecret }} (keys: access_key_id, secret_access_key)
+   - ap-bff-secrets (key: BFF_COOKIE_SECRET) — or set bff.existingSecret
+   - ap-agent-scheduler-secrets (keys: SCHEDULER_SERVICE_TOKEN, SCHEDULER_KEYCLOAK_CLIENT_SECRET, LLM_API_KEY)
+     — or set agentScheduler.existingSecret
+
+2. Ensure saas-foundation services are reachable at:
+   {{ .Values.global.foundation.identityUrl }}
+   {{ .Values.global.foundation.authzUrl }}
+
+{{- if .Values.sandboxPool.keda.enabled }}
+3. KEDA is required for sandbox-pool autoscaling. Install KEDA before this chart:
+   helm repo add kedacore https://kedacore.github.io/charts
+   helm install keda kedacore/keda --namespace keda --create-namespace
+{{- end }}
+
+{{- if eq .Values.agentScheduler.config.runtime "docker" }}
+3. docker-socket-proxy sidecar requires /var/run/docker.sock on every
+   scheduler node. Ensure the node has Docker daemon running.
+   Production: consider switching to cube runtime (agentScheduler.config.runtime=cube).
+{{- end }}

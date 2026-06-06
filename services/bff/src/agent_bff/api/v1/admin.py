@@ -28,7 +28,7 @@ import asyncio
 import logging
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from agent_bff.api._http import foundation_headers
 from agent_bff.api.dependencies import require_auth
@@ -72,7 +72,7 @@ async def require_super_admin_bff(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="ADMIN: authz service unreachable",
-        )
+        ) from exc
 
     if resp.status_code != 200:
         raise HTTPException(
@@ -86,7 +86,7 @@ async def require_super_admin_bff(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="ADMIN: authz response unparseable",
-        )
+        ) from None
 
     if body.get("allowed") is not True:
         raise HTTPException(
@@ -267,13 +267,20 @@ async def get_tenant_billing_quota(
     Response (QuotaInfo shape expected by the frontend):
         {
           "tenant_id": "<tid>",
-          "plan": { "id": str, "name": str, "tier": str, "limits": {str: int} },
+          "plan": { "id": str, "name": str, "tier": str, "limits": {str: int} } | null,
           "usage": { str: int }
         }
 
-    The BFF merges the two billing responses into this shape.  If the billing
-    service already returns the combined shape from /subscriptions/current the
-    plan details are inlined directly; otherwise the BFF merges /plans.
+    Composition:
+      1. GET /subscriptions/current  → resolve the active subscription's
+         plan_id / status (no plan/usage embedded).
+      2. GET /plans                  → find the matching plan and map its
+         `quotas` field → `limits`.
+      3. GET /quota/usage            → the tenant's current usage map.
+
+    When the tenant has no active subscription the response is
+    ``{tenant_id, plan: None, usage}`` so the frontend can render an empty
+    state instead of crashing.
     """
     admin_tenant_id, user_id, access_token = _auth
     settings = request.app.state.settings
@@ -281,7 +288,7 @@ async def get_tenant_billing_quota(
     target_headers = foundation_headers(tenant_id, user_id, access_token)
 
     async with httpx.AsyncClient(timeout=15) as client:
-        sub_resp, plans_resp = await _gather(
+        sub_resp, plans_resp, usage_resp = await _gather(
             client.get(
                 f"{settings.foundation_billing_url}/subscriptions/current",
                 headers=target_headers,
@@ -290,31 +297,39 @@ async def get_tenant_billing_quota(
                 f"{settings.foundation_billing_url}/plans",
                 headers=target_headers,
             ),
+            client.get(
+                f"{settings.foundation_billing_url}/quota/usage",
+                headers=target_headers,
+            ),
         )
 
     _raise_for_upstream(sub_resp)
+    _raise_for_upstream(plans_resp)
+    _raise_for_upstream(usage_resp)
+
     sub = sub_resp.json()
+    usage: dict = usage_resp.json().get("usage") or {}
 
-    # Build QuotaInfo.  The subscription response may already embed the plan
-    # object; if not we look it up from the plans list.
-    plan_obj: dict = sub.get("plan") or {}
-    if not plan_obj.get("limits") and plans_resp.status_code == 200:
-        try:
-            plans_data = plans_resp.json()
-            plan_id = sub.get("plan_id") or plan_obj.get("id")
-            plans_list = plans_data.get("items") or plans_data if isinstance(plans_data, list) else []
-            for p in plans_list:
-                if p.get("id") == plan_id:
-                    plan_obj = p
-                    break
-        except Exception:
-            pass  # best-effort; return whatever we have
+    # No active subscription → empty plan, but still return usage + valid shape.
+    plan_id = sub.get("plan_id")
+    if sub.get("status") != "ACTIVE" or not plan_id:
+        return {"tenant_id": tenant_id, "plan": None, "usage": usage}
 
-    return {
-        "tenant_id": tenant_id,
-        "plan": plan_obj,
-        "usage": sub.get("usage") or {},
+    # Resolve plan details from the catalogue; billing exposes quotas as
+    # `quotas`, the frontend reads `limits`.
+    plans_list = plans_resp.json().get("items") or []
+    matched = next((p for p in plans_list if p.get("id") == plan_id), None)
+    if matched is None:
+        return {"tenant_id": tenant_id, "plan": None, "usage": usage}
+
+    plan_obj = {
+        "id": matched.get("id"),
+        "name": matched.get("name"),
+        "tier": matched.get("tier"),
+        "limits": matched.get("quotas") or {},
     }
+
+    return {"tenant_id": tenant_id, "plan": plan_obj, "usage": usage}
 
 
 async def _gather(*coros):

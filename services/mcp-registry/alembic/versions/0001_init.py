@@ -10,8 +10,9 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision: str = "0001_init"
 down_revision: str | None = None
@@ -51,28 +52,36 @@ def upgrade() -> None:
         sa.UniqueConstraint("tenant_id", "name", name="uq_mcp_tenant_name"),
     )
 
+    # Grant the runtime role access to the schema + table.  app_migrator owns
+    # the schema; app_user (the non-owner runtime role) needs USAGE + DML.
+    # Tenant isolation is enforced by the RLS policies below.
+    op.execute("GRANT USAGE ON SCHEMA mcp_registry TO app_user")
+    op.execute("GRANT SELECT, INSERT, UPDATE, DELETE ON mcp_servers TO app_user")
+
+    # Each statement runs in its own op.execute: asyncpg (the migrator driver)
+    # uses prepared statements and rejects multiple commands in one execute().
+    op.execute("ALTER TABLE mcp_servers ENABLE ROW LEVEL SECURITY")
+    op.execute("ALTER TABLE mcp_servers FORCE ROW LEVEL SECURITY")
     op.execute(
-        """
-        ALTER TABLE mcp_servers ENABLE ROW LEVEL SECURITY;
-        ALTER TABLE mcp_servers FORCE ROW LEVEL SECURITY;
-
-        CREATE POLICY mcp_servers_tenant_select ON mcp_servers
-            FOR SELECT TO app_user
-            USING (tenant_id = current_setting('app.tenant_id', true));
-
-        CREATE POLICY mcp_servers_tenant_insert ON mcp_servers
-            FOR INSERT TO app_user
-            WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
-
-        CREATE POLICY mcp_servers_tenant_update ON mcp_servers
-            FOR UPDATE TO app_user
-            USING (tenant_id = current_setting('app.tenant_id', true))
-            WITH CHECK (tenant_id = current_setting('app.tenant_id', true));
-
-        CREATE POLICY mcp_servers_tenant_delete ON mcp_servers
-            FOR DELETE TO app_user
-            USING (tenant_id = current_setting('app.tenant_id', true));
-        """
+        "CREATE POLICY mcp_servers_tenant_select ON mcp_servers"
+        " FOR SELECT TO app_user"
+        " USING (tenant_id = current_setting('app.tenant_id', true))"
+    )
+    op.execute(
+        "CREATE POLICY mcp_servers_tenant_insert ON mcp_servers"
+        " FOR INSERT TO app_user"
+        " WITH CHECK (tenant_id = current_setting('app.tenant_id', true))"
+    )
+    op.execute(
+        "CREATE POLICY mcp_servers_tenant_update ON mcp_servers"
+        " FOR UPDATE TO app_user"
+        " USING (tenant_id = current_setting('app.tenant_id', true))"
+        " WITH CHECK (tenant_id = current_setting('app.tenant_id', true))"
+    )
+    op.execute(
+        "CREATE POLICY mcp_servers_tenant_delete ON mcp_servers"
+        " FOR DELETE TO app_user"
+        " USING (tenant_id = current_setting('app.tenant_id', true))"
     )
 
 

@@ -17,7 +17,7 @@ from sqlalchemy import String
 from sqlalchemy.types import TypeDecorator, UserDefinedType
 
 
-class _VectorType(UserDefinedType):
+class _VectorType(UserDefinedType):  # type: ignore[type-arg]
     """Minimal SQLAlchemy type that renders as ``vector`` in DDL / CAST."""
 
     cache_ok = True
@@ -55,7 +55,7 @@ class VectorColumn(TypeDecorator):  # type: ignore[type-arg]
             return "[" + ",".join(str(float(v)) for v in value) + "]"
         return json.dumps(list(value))
 
-    def bind_expression(self, bindvalue: Any) -> Any:  # type: ignore[override]
+    def bind_expression(self, bindvalue: Any) -> Any:
         """Wrap bound param in CAST(… AS vector) for Postgres, so asyncpg
         sends a text string that Postgres can implicitly upcast to vector.
 
@@ -72,7 +72,7 @@ class VectorColumn(TypeDecorator):  # type: ignore[type-arg]
     def process_result_value(self, value: Any, dialect: Any) -> Any:
         if value is None:
             return None
-        if isinstance(value, (list, tuple)):
+        if isinstance(value, list | tuple):
             return [float(v) for v in value]
         if isinstance(value, str):
             s = value.strip()

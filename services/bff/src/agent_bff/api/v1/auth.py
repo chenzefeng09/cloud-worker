@@ -25,12 +25,13 @@ from __future__ import annotations
 import logging
 
 import httpx
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 from fastapi.responses import JSONResponse
 from foundation_sdk import CookieSigner
 from foundation_sdk.fastapi import get_tenant_id, get_user_id
 
 from agent_bff.api._http import foundation_headers
+from agent_bff.api.dependencies import require_auth
 from agent_bff.api.middleware import get_access_token
 from agent_bff.errors import AuthenticationError
 
@@ -174,6 +175,102 @@ async def me(request: Request) -> dict:
             )
     except httpx.HTTPError as exc:
         logger.warning("me: identity unreachable", extra={"exc": str(exc)})
+        raise AuthenticationError("Identity service unavailable") from exc
+
+    if resp.status_code == 401:
+        raise AuthenticationError("Session expired")
+    if resp.status_code >= 400:
+        raise AuthenticationError("Identity rejected token")
+
+    return resp.json()
+
+
+@router.get("/auth/sessions")
+async def list_auth_sessions(
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> list:
+    """Proxy to foundation identity GET /sessions — list all active login sessions
+    for the current user.
+
+    Response shape (list of ActiveSessionRead):
+        [{
+          "id": str,
+          "ip": str | null,
+          "user_agent": str | null,
+          "device": str,          # parsed from user_agent by identity
+          "last_seen_at": str | null,
+          "issued_at": str,
+          "current": bool,
+        }, ...]
+
+    Used by ProfilePage PF_SESSIONS block.
+    """
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+
+    headers = foundation_headers(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        access_token=access_token,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(
+                f"{settings.foundation_identity_url}/sessions",
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("auth/sessions: identity unreachable", extra={"exc": str(exc)})
+        raise AuthenticationError("Identity service unavailable") from exc
+
+    if resp.status_code == 401:
+        raise AuthenticationError("Session expired")
+    if resp.status_code == 404:
+        # endpoint not yet implemented in this identity deployment — return empty
+        return []
+    if resp.status_code >= 400:
+        raise AuthenticationError("Identity rejected request")
+
+    data = resp.json()
+    # identity may return a list directly or {"items": [...]}
+    if isinstance(data, list):
+        return data
+    return data.get("items") or []
+
+
+@router.get("/auth/mfa/methods")
+async def list_mfa_methods(
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> list:
+    """Proxy to foundation identity GET /mfa/methods for the current user.
+
+    Returns the list of active MFA methods.  The frontend uses this to
+    decide whether to show "2FA enabled" or "not enabled".
+
+    Response: list of MfaMethodRead objects:
+        [{ "id": str, "kind": str, "label": str|null,
+           "enrolled_at": datetime, "last_used_at": datetime|null }, ...]
+
+    An empty list means no MFA methods are enrolled.
+    """
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+
+    headers = foundation_headers(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        access_token=access_token,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(
+                f"{settings.foundation_identity_url}/mfa/methods",
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("mfa/methods: identity unreachable", extra={"exc": str(exc)})
         raise AuthenticationError("Identity service unavailable") from exc
 
     if resp.status_code == 401:

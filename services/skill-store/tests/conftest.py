@@ -79,7 +79,7 @@ def mock_authz_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
         def __init__(self, *args: Any, **kw: Any) -> None:
             pass
 
-        async def __aenter__(self) -> "_FakeAsyncClient":
+        async def __aenter__(self) -> _FakeAsyncClient:
             return self
 
         async def __aexit__(self, *args: Any) -> None:
@@ -111,7 +111,7 @@ def mock_quota_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
         def __init__(self, *args: Any, **kw: Any) -> None:
             pass
 
-        async def __aenter__(self) -> "_FakeQuotaClient":
+        async def __aenter__(self) -> _FakeQuotaClient:
             return self
 
         async def __aexit__(self, *args: Any) -> None:
@@ -163,4 +163,8 @@ def other_tenant_headers() -> dict[str, str]:
 
 @pytest.fixture
 def internal_headers() -> dict[str, str]:
-    return {"X-Service-Scopes": "skill.read_internal", "X-User-Id": "svc_skills_loader"}
+    return {
+        "X-Tenant-Id": TEST_TENANT,
+        "X-Service-Scopes": "skill.read_internal",
+        "X-User-Id": "svc_skills_loader",
+    }

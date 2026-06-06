@@ -43,3 +43,9 @@ class Settings(BaseSettings):
     # Foundation authz + billing — RBAC enforcement and quota checks.
     authz_url: str = "http://authz:8002/api/authz/v1"
     foundation_billing_url: str = "http://billing:8007/api/billing/v1"
+
+    # Redis — used to read agent run hot-state (plan/step/cursor) written by the
+    # runtime_worker inside the sandbox.  Key schema: agent:run:{run_id}:state.
+    # Failure-open: if unset or unreachable, the /state endpoint returns DB status
+    # with empty plan/cursor fields rather than 500.
+    redis_url: str | None = None

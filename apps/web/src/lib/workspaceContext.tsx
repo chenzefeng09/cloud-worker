@@ -1,8 +1,10 @@
-import { createContext, useContext, useMemo, useState, type ReactNode } from 'react';
-import { WORKSPACES, WORKSPACE_FILES, type BaseFile, type Workspace } from './workspaceData';
+import { createContext, useContext, useMemo, type ReactNode } from 'react';
+import { DEFAULT_WORKSPACE, type BaseFile, type Workspace } from './workspaceData';
 
 interface WorkspaceContextValue {
   wsId: string;
+  /** No-op: workspace switching was removed with the mock data. Kept so the
+   *  context shape is stable for consumers until phase-2 real workspaces land. */
   setWsId: (id: string) => void;
   ws: Workspace;
   allWs: Workspace[];
@@ -11,32 +13,20 @@ interface WorkspaceContextValue {
 
 const WorkspaceContext = createContext<WorkspaceContextValue | null>(null);
 
-const STORAGE_KEY = 'cw-ws';
-
 export function WorkspaceProvider({ children }: { children: ReactNode }) {
-  const initial = (() => {
-    try {
-      return localStorage.getItem(STORAGE_KEY) ?? 'eng';
-    } catch {
-      return 'eng';
-    }
-  })();
-  const [wsId, setWsIdState] = useState<string>(initial);
-
-  const setWsId = (id: string) => {
-    setWsIdState(id);
-    try {
-      localStorage.setItem(STORAGE_KEY, id);
-    } catch {
-      // localStorage may be unavailable (private mode / SSR); silently ignore.
-    }
-  };
-
-  const value = useMemo<WorkspaceContextValue>(() => {
-    const ws = WORKSPACES.find((w) => w.id === wsId) ?? WORKSPACES[0];
-    const files = WORKSPACE_FILES[ws.id] ?? [];
-    return { wsId, setWsId, ws, allWs: WORKSPACES, files };
-  }, [wsId]);
+  // Single static default workspace — no switching, no fake file lists. When
+  // phase 2 makes "workspace" a real backend entity, this provider becomes the
+  // place that fetches and exposes it.
+  const value = useMemo<WorkspaceContextValue>(
+    () => ({
+      wsId: DEFAULT_WORKSPACE.id,
+      setWsId: () => {},
+      ws: DEFAULT_WORKSPACE,
+      allWs: [DEFAULT_WORKSPACE],
+      files: [],
+    }),
+    [],
+  );
 
   return <WorkspaceContext.Provider value={value}>{children}</WorkspaceContext.Provider>;
 }

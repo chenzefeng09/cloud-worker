@@ -27,7 +27,7 @@ export function LoginPage() {
         setError('邮箱或密码不正确，请重试。');
       } else {
         setError('登录失败，请稍后重试。');
-        // eslint-disable-next-line no-console
+         
         console.warn('login failed', err);
       }
     } finally {

@@ -21,14 +21,21 @@ if str(_PKG_ROOT) not in sys.path:
 class _FakeToolGroup:
     def __init__(self):
         self.name = "basic"
+        self.tools: list = []
         self.mcps: list = []
 
 
 class _RecordingToolkit:
     def __init__(self):
-        self.tools: list = []
         # AgentScope 2.0: tool_groups[0].mcps is where MCPClient objects live.
+        # tool_groups[0].tools is where register_into appends built-in tools.
         self.tool_groups = [_FakeToolGroup()]
+
+    @property
+    def tools(self) -> list:
+        """Unified view: both register_into (tool_groups[0].tools) and
+        register_tool_function (used by skill lambdas) land here."""
+        return self.tool_groups[0].tools
 
     def register_tool_function(self, fn, **_):
         self.tools.append(fn)
@@ -79,6 +86,22 @@ def fresh(monkeypatch, tmp_path):
 
     tool_mod = types.ModuleType("agentscope.tool")
     tool_mod.Toolkit = _RecordingToolkit
+
+    # Stub Read/Grep/Glob so register_into succeeds and the tools land in
+    # toolkit.tools via register_tool_function (the _RecordingToolkit path).
+    class _FakeRead:
+        pass
+
+    class _FakeGrep:
+        pass
+
+    class _FakeGlob:
+        pass
+
+    tool_mod.Read = _FakeRead
+    tool_mod.Grep = _FakeGrep
+    tool_mod.Glob = _FakeGlob
+
     monkeypatch.setitem(sys.modules, "agentscope.tool", tool_mod)
 
     # Stub agentscope.mcp so mcp_tenant_injector can import it without
@@ -142,6 +165,7 @@ def test_install_downloads_and_registers_tool(fresh):
         # loader appends /internal/skills to SKILL_STORE_URL
         if request.url.path == "/api/skills/v1/internal/skills":
             assert request.url.params["tenant_id"] == "tnt-abc"
+            assert request.headers["X-Tenant-Id"] == "tnt-abc"
             assert "csv-tools" in request.url.params.get_list("names")
             return httpx.Response(
                 200,
@@ -172,8 +196,13 @@ def test_install_downloads_and_registers_tool(fresh):
     toolkit = hooks_mod.build_toolkit(
         {"skills": ["csv-tools"]}, "tnt-abc", _env(),
     )
-    assert len(toolkit.tools) == 1
-    assert toolkit.tools[0]() == "csv-tool-ran"
+    # 3 built-in workspace tools (Read, Grep, Glob) + 1 downloaded skill tool
+    assert len(toolkit.tools) == 4
+    # The built-in tools are instances of _FakeRead/_FakeGrep/_FakeGlob (not callables).
+    # The skill lambda is callable and returns "csv-tool-ran".
+    skill_lambdas = [t for t in toolkit.tools if callable(t)]
+    assert len(skill_lambdas) == 1
+    assert skill_lambdas[0]() == "csv-tool-ran"
 
     loader.set_client(None)
 
@@ -212,7 +241,9 @@ def test_sha256_mismatch_is_skipped(fresh, caplog):
         toolkit = hooks_mod.build_toolkit(
             {"skills": ["evil"]}, "tnt-abc", _env(),
         )
-    assert toolkit.tools == []
+    # Only the 3 built-in workspace tools (Read/Grep/Glob); SHA-mismatched skill rejected.
+    # No extra (malicious) skill tool beyond the 3 built-ins.
+    assert len(toolkit.tools) == 3
     assert any("sha256 mismatch" in r.message for r in caplog.records)
 
     loader.set_client(None)
@@ -221,10 +252,11 @@ def test_sha256_mismatch_is_skipped(fresh, caplog):
 def test_no_skills_in_task_is_passthrough(fresh):
     hooks_mod, ext, loader, _ = fresh
     ext.install()
-    # No skills key → no HTTP traffic, base toolkit returned untouched.
+    # No skills key → no HTTP traffic, base toolkit returned with built-in tools.
     toolkit = hooks_mod.build_toolkit({}, "tnt-abc", _env())
     assert isinstance(toolkit, _RecordingToolkit)
-    assert toolkit.tools == []
+    # 3 built-in workspace tools (Read/Grep/Glob) are always present.
+    assert len(toolkit.tools) == 3
 
 
 def test_wrong_content_type_is_skipped(fresh, caplog):
@@ -258,7 +290,8 @@ def test_wrong_content_type_is_skipped(fresh, caplog):
         toolkit = hooks_mod.build_toolkit(
             {"skills": ["weird"]}, "tnt-abc", _env(),
         )
-    assert toolkit.tools == []
+    # Only the 3 built-in workspace tools; the wrong-content-type skill is rejected.
+    assert len(toolkit.tools) == 3
     assert any("content-type" in r.message for r in caplog.records)
 
     loader.set_client(None)
@@ -324,7 +357,12 @@ def test_chained_with_mcp_injector_preserves_both(fresh, monkeypatch):
     )
     # AgentScope 2.0: MCPClient objects live in tool_groups[0].mcps.
     assert [c.name for c in toolkit.basic_mcps] == ["fs"]
-    assert len(toolkit.tools) == 1
+    # 3 built-in workspace tools (Read/Grep/Glob) + 1 downloaded skill tool
+    assert len(toolkit.tools) == 4
+    # The skill lambda is callable; built-in instances are not.
+    skill_lambdas = [t for t in toolkit.tools if callable(t)]
+    assert len(skill_lambdas) == 1
+    assert skill_lambdas[0]() == "skill"
 
     injector.set_client(None)
     loader.set_client(None)
@@ -356,6 +394,7 @@ def test_fetch_sends_x_service_scopes_header(fresh):
         "X-Service-Scopes header not sent to skill-store internal endpoint"
     )
     assert "skill.read_internal" in captured_headers["x-service-scopes"]
+    assert captured_headers.get("x-tenant-id") == "tnt-abc"
 
     loader.set_client(None)
 

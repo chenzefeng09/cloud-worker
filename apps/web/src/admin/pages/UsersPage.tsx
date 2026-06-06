@@ -93,7 +93,7 @@ export function UsersPage() {
                   <td className="px-3 py-2 text-[13px] text-ink">{u.email}</td>
                   <td className="px-3 py-2 text-[13px] text-ink-2">{u.display_name || '—'}</td>
                   <td className="px-3 py-2 font-mono text-[11px] text-dim">
-                    {u.roles.length > 0 ? u.roles.join(', ') : '—'}
+                    {u.roles && u.roles.length > 0 ? u.roles.join(', ') : '—'}
                   </td>
                   <td className="px-3 py-2 font-mono text-[11px] text-dim truncate max-w-[140px]">{u.tenant_id}</td>
                 </tr>

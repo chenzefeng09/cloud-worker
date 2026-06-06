@@ -22,7 +22,10 @@ the call needs to be non-blocking.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from agent_scheduler.config import Settings as _Settings
 
 # The dict types stay loose for now (``dict``) rather than TypedDict because
 # the shape is still settling.  Once CubeSandbox lands and we know what
@@ -74,6 +77,11 @@ class SandboxRuntime(Protocol):
         tenant_id: str,
         user_id: str,
         foundation_token: str,
+        skills: list[str] | None = None,
+        files: list[dict] | None = None,
+        memory: str | None = None,
+        llm_gateway_url: str | None = None,
+        llm_virtual_key: str | None = None,
     ) -> str:
         """Spawn a sandbox for one agent run; return the runtime-specific id.
 
@@ -85,7 +93,7 @@ class SandboxRuntime(Protocol):
         scheduler's own service-account token.
         """
 
-    def get_run_status(self, container_id: str) -> dict:
+    def get_run_status(self, container_id: str) -> dict[str, Any]:
         """Return ``{status, exit_code, started_at, finished_at}``.
 
         ``status`` is normalised across runtimes to one of
@@ -103,7 +111,7 @@ class SandboxRuntime(Protocol):
     def cancel_run(self, container_id: str) -> None:
         """Stop + remove a container.  Idempotent on already-gone containers."""
 
-    def list_containers(self, *, tenant_id: str) -> list[dict]:
+    def list_containers(self, *, tenant_id: str) -> list[dict[str, Any]]:
         """List agent-platform containers belonging to ``tenant_id``.
 
         Required ``tenant_id`` — passing an empty string raises
@@ -120,7 +128,7 @@ class SandboxRuntime(Protocol):
 RUNTIME_REGISTRY: dict[RuntimeKind, type] = {}
 
 
-def build_runtime(kind: RuntimeKind, settings) -> SandboxRuntime:  # noqa: ANN001
+def build_runtime(kind: RuntimeKind, settings: _Settings) -> SandboxRuntime:
     """Instantiate the runtime registered for ``kind``.
 
     Called once at app startup (and per request in tests that
@@ -132,4 +140,5 @@ def build_runtime(kind: RuntimeKind, settings) -> SandboxRuntime:  # noqa: ANN00
         raise ValueError(
             f"Unknown SCHEDULER_RUNTIME={kind!r}; registered: {available}",
         )
-    return RUNTIME_REGISTRY[kind](settings)
+    runtime: SandboxRuntime = RUNTIME_REGISTRY[kind](settings)
+    return runtime

@@ -32,7 +32,7 @@ export function AuthGate() {
         // page.  Anything else is a real error; log it but still proceed
         // to the login page so the user is not stuck on a blank screen.
         if (!(err instanceof ApiError) || err.status !== 401) {
-          // eslint-disable-next-line no-console
+           
           console.warn('auth bootstrap failed', err);
         }
         setBootstrapped(true);

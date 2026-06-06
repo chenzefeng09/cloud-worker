@@ -28,6 +28,7 @@ def _settings(**over: object) -> Settings:
         "idle_low_watermark": 2,
         "idle_high_watermark": 5,
         "max_total": 10,
+        "acquire_timeout_seconds": 0,
         "warmup_templates": ["base"],
         "otel_enabled": False,
         "sandbox_image": "test-image:latest",

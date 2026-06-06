@@ -78,9 +78,7 @@ export function WorkspacePage() {
                     >
                       {w.name}
                     </div>
-                    <div className="font-mono text-[10px] text-dim truncate">
-                      {w.fileCount} 个文件 · {w.taskCount} 个任务
-                    </div>
+                    <div className="font-mono text-[10px] text-dim truncate">{w.desc}</div>
                   </div>
                 </div>
               );
@@ -108,8 +106,6 @@ export function WorkspacePage() {
               <div className="mb-2">{ws.desc}</div>
               <div className="font-mono text-dim text-[10.5px] leading-[1.7]">
                 <div>id · {ws.id}</div>
-                <div>{ws.fileCount} 个基础文件</div>
-                <div>{ws.taskCount} 个活跃任务</div>
               </div>
             </div>
           </div>
@@ -225,15 +221,6 @@ export function WorkspacePage() {
               <span className="font-mono text-[11px] text-dim">{ws.accent}</span>
             </div>
 
-            {/* Count chips */}
-            <div className="flex flex-wrap gap-2">
-              <Chip>
-                <span className="font-mono text-[11px]">{ws.fileCount} 个文件</span>
-              </Chip>
-              <Chip>
-                <span className="font-mono text-[11px]">{ws.taskCount} 个任务</span>
-              </Chip>
-            </div>
           </div>
 
           {/* Files summary */}

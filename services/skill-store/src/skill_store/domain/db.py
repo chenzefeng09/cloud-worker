@@ -31,6 +31,11 @@ async def init_db(settings: Settings) -> None:
             pool_recycle=settings.db_pool_recycle,
             echo=settings.env == "dev",
         )
+        # ORM models are schema-less; on Postgres translate the default schema
+        # (None) to this service's owned schema (SQLite tests never set this).
+        _engine = _engine.execution_options(
+            schema_translate_map={None: settings.db_schema}
+        )
     _session_factory = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
 
 
@@ -52,9 +57,12 @@ async def get_session(
     async with _session_factory() as session, session.begin():
         bind = session.get_bind()
         if bind is not None and bind.dialect.name == "postgresql":
+            # Pin the search_path to our schema (models are not schema-qualified)
+            # and set the RLS context vars in the same round-trip.
             await session.execute(
                 text(
-                    "SELECT set_config('app.tenant_id', :tid, true),"
+                    "SELECT set_config('search_path', 'skill_store', true),"
+                    "       set_config('app.tenant_id', :tid, true),"
                     "       set_config('app.user_id',   :uid, true),"
                     "       set_config('app.actor',     :act, true)"
                 ),

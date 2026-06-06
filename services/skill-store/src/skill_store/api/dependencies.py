@@ -47,10 +47,12 @@ async def internal_db_session(
 
 
 def get_blob_store(request: Request) -> BlobStore:
-    return request.app.state.blob_store
+    blob_store: BlobStore = request.app.state.blob_store
+    return blob_store
 
 
 def require_internal_scope(
+    request: Request,
     x_service_scopes: str | None = Header(default=None, alias="X-Service-Scopes"),
 ) -> None:
     required = Settings().internal_scope
@@ -58,6 +60,10 @@ def require_internal_scope(
         raise InternalScopeRequiredError()
     granted = {s.strip() for s in x_service_scopes.split(",") if s.strip()}
     if required not in granted:
+        raise InternalScopeRequiredError()
+    tenant_from_header = get_tenant_id()
+    tenant_from_query = request.query_params.get("tenant_id")
+    if not tenant_from_header or tenant_from_header != tenant_from_query:
         raise InternalScopeRequiredError()
 
 

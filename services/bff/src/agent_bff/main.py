@@ -12,13 +12,16 @@ from foundation_sdk.fastapi import install_request_context, register_problem_det
 
 from agent_bff.api.middleware import SessionMiddleware
 from agent_bff.config import Settings
+from agent_bff.domain.db import close_db, init_db
 from agent_bff.observability import init_observability
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     init_observability(service_name="agent-bff")
+    await init_db(app.state.settings)
     yield
+    await close_db()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -96,6 +99,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from agent_bff.api.v1.admin import router as admin_router
     app.include_router(admin_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.billing import router as billing_router
+    app.include_router(billing_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.notifications import router as notifications_router
+    app.include_router(notifications_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.api_keys import router as api_keys_router
+    app.include_router(api_keys_router, prefix=settings.api_prefix)
 
     return app
 

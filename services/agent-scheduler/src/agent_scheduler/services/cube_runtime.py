@@ -149,6 +149,11 @@ class CubeSandboxRuntime:
         tenant_id: str,
         user_id: str,
         foundation_token: str,
+        skills: list[str] | None = None,
+        files: list[dict] | None = None,
+        memory: str | None = None,
+        llm_gateway_url: str | None = None,
+        llm_virtual_key: str | None = None,
     ) -> str:
         _check_ids(
             run_id=run_id, session_id=session_id,
@@ -163,12 +168,54 @@ class CubeSandboxRuntime:
             task = task[: _MAX_TASK_LEN - 32] + "\n…[truncated by scheduler]"
 
         client = self._require_client()
+        extensions = {
+            e.strip()
+            for e in (self._settings.runtime_extensions or "").split(",")
+            if e.strip()
+        }
+        gateway_mode = "llm_gateway_enforcer" in extensions
+        if gateway_mode and not llm_virtual_key:
+            raise SandboxSpawnError(
+                "llm_gateway_enforcer is enabled but no tenant LLM virtual key "
+                "was provided; refusing direct-connect fallback",
+            )
+        sandbox_llm_api_key = "" if gateway_mode else self._settings.llm_api_key
+
         # NOTE: CubeSandbox doesn't have docker-style bind mounts, so the
         # task payload is piped through ``env.AGENT_TASK_JSON`` instead of
         # the ``/workspace/task.json`` file the docker runtime uses.  The
         # ``runtime_worker`` checks env first, then file.  See
         # ``agentscope_ext.runtime_worker.__main__`` for the contract.
         import json
+        task_json = {
+            "task": task,
+            "mcp_servers": [],
+            "skills": skills or [],
+            "files": files or [],
+            "memory": memory or "",
+        }
+        env = {
+            "LLM_API_KEY": sandbox_llm_api_key,
+            "LLM_MODEL": self._settings.llm_model,
+            "LLM_PROVIDER": self._settings.llm_provider,
+            "LLM_BASE_URL": self._settings.llm_base_url,
+            "LLM_GATEWAY_URL": llm_gateway_url or self._settings.llm_gateway_url,
+            "FOUNDATION_API_URL": self._settings.foundation_api_url,
+            "FOUNDATION_API_TOKEN": foundation_token,
+            "FOUNDATION_TENANT_ID": tenant_id,
+            "FOUNDATION_USER_ID": user_id,
+            "OTEL_EXPORTER_OTLP_ENDPOINT": self._settings.otel_exporter_endpoint,
+            "MCP_REGISTRY_URL": self._settings.mcp_registry_url,
+            "SKILL_STORE_URL": self._settings.skill_store_url,
+            "WEB_FETCH_GATEWAY_URL": self._settings.web_fetch_gateway_url,
+            "RUNTIME_EXTENSIONS": self._settings.runtime_extensions,
+            "FOUNDATION_SERVICE_SCOPES": SANDBOX_SERVICE_SCOPES,
+            "RUN_ID": run_id,
+            "AGENT_TASK_JSON": json.dumps(task_json, ensure_ascii=False),
+        }
+        if llm_virtual_key:
+            env["LLM_VIRTUAL_KEY"] = llm_virtual_key
+
         body: dict[str, Any] = {
             # E2B-compatible fields
             "template_id": self._settings.agent_image,
@@ -179,27 +226,7 @@ class CubeSandboxRuntime:
                 "agent-platform.session-id": session_id,
                 "agent-platform.tenant-id": tenant_id,
             },
-            "env": {
-                "LLM_API_KEY": self._settings.llm_api_key,
-                "LLM_MODEL": self._settings.llm_model,
-                "FOUNDATION_API_URL": self._settings.foundation_api_url,
-                "FOUNDATION_API_TOKEN": foundation_token,
-                "FOUNDATION_TENANT_ID": tenant_id,
-                "FOUNDATION_USER_ID": user_id,
-                "OTEL_EXPORTER_OTLP_ENDPOINT": self._settings.otel_exporter_endpoint,
-                # Task as inline JSON — see note above.
-                "AGENT_TASK_JSON": json.dumps(
-                    {"task": task, "mcp_servers": [], "skills": []},
-                    ensure_ascii=False,
-                ),
-                # Dev-mode shim: in prod the API gateway translates the verified
-                # Bearer JWT into X-Service-Scopes before requests reach internal
-                # endpoints.  In this deployment (no gateway between sandbox and
-                # these services) the scheduler injects the scopes directly so
-                # mcp_tenant_injector / skills_loader can forward the header.
-                # TODO: remove once the gateway enforces scope injection in prod.
-                "FOUNDATION_SERVICE_SCOPES": SANDBOX_SERVICE_SCOPES,
-            },
+            "env": env,
             # AgentScope worker entry — matches the docker runtime's CMD line.
             "cmd": ["python", "-m", "agentscope_ext.runtime_worker"],
             "timeout_seconds": self._settings.sandbox_timeout,
@@ -216,7 +243,7 @@ class CubeSandboxRuntime:
             raise SandboxSpawnError(
                 f"CubeSandbox refused spawn (HTTP {resp.status_code})",
             )
-        sandbox_id = resp.json().get("sandbox_id")
+        sandbox_id: str = str(resp.json().get("sandbox_id") or "")
         if not sandbox_id:
             raise SandboxSpawnError("CubeSandbox returned no sandbox_id")
         logger.info(
@@ -230,7 +257,7 @@ class CubeSandboxRuntime:
         return sandbox_id
 
     # --------------------------------------------------------------- inspect
-    def get_run_status(self, container_id: str) -> dict:
+    def get_run_status(self, container_id: str) -> dict[str, Any]:
         client = self._require_client()
         try:
             resp = client.get(f"/sandboxes/{container_id}")
@@ -257,7 +284,7 @@ class CubeSandboxRuntime:
         tenant = resp.json().get("metadata", {}).get("agent-platform.tenant-id", "")
         if not tenant:
             raise ContainerNotFoundError(container_id)
-        return tenant
+        return str(tenant)
 
     # ---------------------------------------------------------------- cancel
     def cancel_run(self, container_id: str) -> None:
@@ -277,7 +304,7 @@ class CubeSandboxRuntime:
             )
 
     # ------------------------------------------------------------------ list
-    def list_containers(self, *, tenant_id: str) -> list[dict]:
+    def list_containers(self, *, tenant_id: str) -> list[dict[str, Any]]:
         if not tenant_id:
             raise ValueError("tenant_id is required for list_containers")
         client = self._require_client()
@@ -287,7 +314,7 @@ class CubeSandboxRuntime:
             "/sandboxes",
             params={"metadata.agent-platform.tenant-id": tenant_id},
         )
-        items: list[dict] = []
+        items: list[dict[str, Any]] = []
         for vm in resp.json().get("items", []):
             meta = vm.get("metadata", {})
             if meta.get("agent-platform.tenant-id") != tenant_id:

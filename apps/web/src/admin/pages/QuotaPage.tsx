@@ -3,12 +3,6 @@ import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import type { QuotaInfo } from '../../api/types';
 
-/**
- * TODO: This page calls /admin/billing/quota?tenant_id= which proxies to the
- * billing service. The BFF endpoint `/admin/billing/quota` may not yet be
- * implemented. When it is, remove the placeholder banner and this page will
- * start working automatically.
- */
 export function QuotaPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading, selectedTenantId, setSelectedTenantId } =
     useAdminStore();
@@ -56,12 +50,6 @@ export function QuotaPage() {
         <p className="text-[12px] text-dim mt-0.5">查看租户当前用量与套餐限额</p>
       </div>
 
-      {/* TODO banner */}
-      <div className="border border-warn/30 rounded-md px-4 py-3 bg-warn/5 text-[12px] text-warn font-mono">
-        TODO: BFF 端点 <code className="bg-warn/10 px-1 rounded-sm">/admin/billing/quota</code> 尚未在 BFF 层暴露。
-        该页面 UI 已就绪，接线占位。待 BFF 代理 billing 服务后，本提示可删除。
-      </div>
-
       {/* Tenant selector */}
       <div className="flex items-center gap-3">
         <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
@@ -92,7 +80,13 @@ export function QuotaPage() {
         </div>
       )}
 
-      {quota && (
+      {quota && !quota.plan && (
+        <div className="border border-line rounded-md p-4 text-[13px] text-dim">
+          该租户暂无有效订阅
+        </div>
+      )}
+
+      {quota && quota.plan && (
         <div className="flex flex-col gap-4">
           {/* Plan card */}
           <div className="border border-line rounded-md p-4 bg-surface">
@@ -116,7 +110,7 @@ export function QuotaPage() {
                 </tr>
               </thead>
               <tbody>
-                {Object.entries(quota.plan.limits).map(([key, limit]) => {
+                {Object.entries(quota.plan.limits ?? {}).map(([key, limit]) => {
                   const used = quota.usage[key] ?? 0;
                   const pct = limit > 0 ? Math.round((used / limit) * 100) : 0;
                   return (
