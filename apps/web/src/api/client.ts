@@ -1,16 +1,23 @@
 import type {
+  ActiveSession,
   AdminUser,
+  ApiKey,
+  ApiKeyCreated,
   AuditEvent,
   AuditQueryRequest,
   Attachment,
   AttachmentKind,
   CreateTenantRequest,
   CursorPage,
+  DailyTokenUsageResponse,
+  IngestResult,
   KnowledgeDocument,
   ListPage,
   LoginResponse,
   McpServer,
   Message,
+  MfaMethod,
+  NotifPreferenceItem,
   PatchTenantRequest,
   PoolSnapshot,
   ProbeReport,
@@ -22,7 +29,10 @@ import type {
   Session,
   Skill,
   InstalledSkill,
+  SkillVersion,
   Tenant,
+  TokenUsage,
+  TopologyGraph,
   UserProfile,
 } from './types';
 
@@ -48,7 +58,9 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   });
   if (!res.ok) {
     const problem = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new ApiError(res.status, problem.code || 'UNKNOWN', problem.detail || 'Request failed');
+    const rawDetail = problem.detail || 'Request failed';
+    const detail = typeof rawDetail === 'string' ? rawDetail : JSON.stringify(rawDetail);
+    throw new ApiError(res.status, problem.code || 'UNKNOWN', detail);
   }
   if (res.status === 204) return undefined as T;
   return res.json();
@@ -60,6 +72,23 @@ export const api = {
       request<LoginResponse>('POST', '/auth/login', { email, password }),
     logout: () => request<void>('POST', '/auth/logout'),
     me: () => request<UserProfile>('GET', '/auth/me'),
+    mfaMethods: () => request<MfaMethod[]>('GET', '/auth/mfa/methods'),
+    sessions: () => request<ActiveSession[]>('GET', '/auth/sessions'),
+  },
+
+  runs: {
+    get: (sessionId: string, runId: string) =>
+      request<Run>('GET', `/sessions/${sessionId}/runs/${runId}`),
+    list: (sessionId: string) =>
+      request<{ items: Run[] }>('GET', `/sessions/${sessionId}/runs`),
+    getState: (sessionId: string, runId: string) =>
+      request<RunState>('GET', `/sessions/${sessionId}/runs/${runId}/state`),
+    count: () =>
+      request<{ count: number }>('GET', '/runs/count'),
+    tokenUsage: () =>
+      request<TokenUsage>('GET', '/runs/token-usage'),
+    tokenUsageDaily: (days = 7) =>
+      request<DailyTokenUsageResponse>('GET', `/runs/token-usage/daily?days=${days}`),
   },
 
   sessions: {
@@ -82,13 +111,6 @@ export const api = {
       request<CursorPage<Message>>('GET', `/sessions/${sessionId}/messages${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`),
     deleteFrom: (sessionId: string, fromSequence: number) =>
       request<{ deleted_count: number }>('DELETE', `/sessions/${sessionId}/messages?from_sequence=${fromSequence}`),
-  },
-
-  runs: {
-    list: (sessionId: string) =>
-      request<{ items: Run[] }>('GET', `/sessions/${sessionId}/runs`),
-    getState: (sessionId: string, runId: string) =>
-      request<RunState>('GET', `/sessions/${sessionId}/runs/${runId}/state`),
   },
 
   attachments: {
@@ -146,6 +168,66 @@ export const api = {
       request<void>('DELETE', `/library/skills/${skillId}/install`),
     listDocuments: () =>
       request<ListPage<KnowledgeDocument>>('GET', '/library/documents'),
+
+    installMcpServer: (body: {
+      name: string;
+      transport: McpServer['transport'];
+      endpoint?: string | null;
+      command?: string | null;
+      enabled?: boolean;
+    }) => request<McpServer>('POST', '/library/mcp-servers', body),
+
+    createSkill: (body: {
+      name: string;
+      description?: string | null;
+      owner?: string | null;
+      visibility?: Skill['visibility'];
+    }) => request<Skill>('POST', '/library/skills', body),
+
+    uploadSkillVersion: async (skillId: string, formData: FormData): Promise<SkillVersion> => {
+      const res = await fetch(`${BFF_BASE}/library/skills/${skillId}/versions`, {
+        method: 'POST',
+        body: formData,
+        credentials: 'include',
+        // No Content-Type header — browser sets multipart boundary automatically
+      });
+      if (!res.ok) {
+        const problem = await res.json().catch(() => ({ detail: res.statusText }));
+        const rawDetail = problem.detail || 'Upload failed';
+        const detail = typeof rawDetail === 'string' ? rawDetail : JSON.stringify(rawDetail);
+        throw new ApiError(res.status, problem.code || 'UNKNOWN', detail);
+      }
+      return res.json();
+    },
+
+    uploadDocument: async (formData: FormData): Promise<KnowledgeDocument> => {
+      const res = await fetch(`${BFF_BASE}/library/documents`, {
+        method: 'POST',
+        body: formData,
+        credentials: 'include',
+        // No Content-Type header — browser sets multipart boundary automatically
+      });
+      if (!res.ok) {
+        const problem = await res.json().catch(() => ({ detail: res.statusText }));
+        const rawDetail = problem.detail || 'Upload failed';
+        const detail = typeof rawDetail === 'string' ? rawDetail : JSON.stringify(rawDetail);
+        throw new ApiError(res.status, problem.code || 'UNKNOWN', detail);
+      }
+      return res.json();
+    },
+
+    ingestDocument: (docId: string) =>
+      request<IngestResult>('POST', `/library/documents/${docId}/ingest`),
+  },
+
+  billing: {
+    me: () => request<QuotaInfo>('GET', '/billing/me'),
+  },
+
+  apiKeys: {
+    list: () => request<ApiKey[]>('GET', '/api-keys'),
+    create: (name: string) => request<ApiKeyCreated>('POST', '/api-keys', { name }),
+    revoke: (id: string) => request<void>('DELETE', `/api-keys/${id}`),
   },
 
   fleet: {
@@ -153,6 +235,8 @@ export const api = {
       request<PoolSnapshot>('GET', '/fleet/pool'),
     listSandboxes: () =>
       request<{ items: SandboxItem[] }>('GET', '/fleet/sandboxes'),
+    topology: () =>
+      request<TopologyGraph>('GET', '/fleet/topology'),
   },
 
   admin: {
@@ -184,6 +268,13 @@ export const api = {
       probe: (body: ProbeRequest) =>
         request<ProbeReport>('POST', '/admin/llm/probe', body),
     },
+  },
+
+  notifications: {
+    preferences: () =>
+      request<{ items: NotifPreferenceItem[] }>('GET', '/notifications/preferences'),
+    updatePreferences: (items: { event_key: string; email_enabled: boolean; push_enabled: boolean }[]) =>
+      request<{ items: NotifPreferenceItem[] }>('PUT', '/notifications/preferences', { items }),
   },
 
   chat: {

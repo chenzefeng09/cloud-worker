@@ -31,6 +31,11 @@ async def init_db(settings: Settings) -> None:
             pool_recycle=settings.db_pool_recycle,
             echo=settings.env == "dev",
         )
+        # ORM models are schema-less; on Postgres translate the default schema
+        # (None) to this service's owned schema (SQLite tests never set this).
+        _engine = _engine.execution_options(
+            schema_translate_map={None: settings.db_schema}
+        )
     _session_factory = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
 
 

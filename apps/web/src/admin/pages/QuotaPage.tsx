@@ -3,15 +3,13 @@ import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import type { QuotaInfo } from '../../api/types';
 
-/**
- * Quota viewer — queries /admin/billing/quota (BFF proxy to foundation-billing).
- */
 export function QuotaPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading, selectedTenantId, setSelectedTenantId } =
     useAdminStore();
   const [quota, setQuota] = useState<QuotaInfo | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isTodoEndpoint, setIsTodoEndpoint] = useState(false);
 
   // Bootstrap tenant list
   useEffect(() => {
@@ -29,12 +27,17 @@ export function QuotaPage() {
     let cancelled = false;
     setLoading(true);
     setError(null);
+    setIsTodoEndpoint(false);
     api.admin.billing
       .quota(selectedTenantId)
       .then((data) => { if (!cancelled) setQuota(data); })
       .catch((err) => {
         if (cancelled) return;
-        setError(err instanceof ApiError ? err.message : '加载失败');
+        if (err instanceof ApiError && (err.status === 404 || err.status === 501)) {
+          setIsTodoEndpoint(true);
+        } else {
+          setError(err instanceof ApiError ? err.message : '加载失败');
+        }
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
@@ -71,7 +74,19 @@ export function QuotaPage() {
 
       {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
 
-      {quota && (
+      {isTodoEndpoint && (
+        <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
+          BFF 配额代理端点尚未就绪，当前占位显示。接线后将自动展示用量数据。
+        </div>
+      )}
+
+      {quota && !quota.plan && (
+        <div className="border border-line rounded-md p-4 text-[13px] text-dim">
+          该租户暂无有效订阅
+        </div>
+      )}
+
+      {quota && quota.plan && (
         <div className="flex flex-col gap-4">
           {/* Plan card */}
           <div className="border border-line rounded-md p-4 bg-surface">
@@ -95,7 +110,7 @@ export function QuotaPage() {
                 </tr>
               </thead>
               <tbody>
-                {Object.entries(quota.plan.limits).map(([key, limit]) => {
+                {Object.entries(quota.plan.limits ?? {}).map(([key, limit]) => {
                   const used = quota.usage[key] ?? 0;
                   const pct = limit > 0 ? Math.round((used / limit) * 100) : 0;
                   return (

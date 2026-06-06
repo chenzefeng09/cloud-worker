@@ -31,7 +31,7 @@ Wire contract between agent-scheduler and the sandbox
 
   | path | direction | shape |
   |---|---|---|
-  | ``/workspace/result.json`` | out | ``{"status": "OK"|"FAILED", "summary": str, "error": str|null}`` |
+  | ``/workspace/result.json`` | out | ``{"status": "OK"|"FAILED", "summary": str, "error": str|null, "usage": {"input_tokens": int, "output_tokens": int, "total_tokens": int}}`` |
   | ``/workspace/events.jsonl`` | out | one JSON event per line (reply_stream events) |
 
 * **Exit code** (read by ``DockerRuntime.get_run_status`` /
@@ -75,12 +75,26 @@ from agentscope_ext.runtime_worker import redis_state as _redis
 WORKSPACE = Path("/workspace")
 
 
-def _exit(code: int, *, status: str, summary: str, error: str | None = None) -> int:
+def _exit(
+    code: int,
+    *,
+    status: str,
+    summary: str,
+    error: str | None = None,
+    usage: dict | None = None,
+    plan_steps: list | None = None,
+) -> int:
     """Write result.json + return the exit code; never raises."""
     try:
         (WORKSPACE / "result.json").write_text(
             json.dumps(
-                {"status": status, "summary": summary, "error": error},
+                {
+                    "status": status,
+                    "summary": summary,
+                    "error": error,
+                    "usage": usage or {},
+                    "plan_steps": plan_steps or [],
+                },
                 ensure_ascii=False,
             ),
             encoding="utf-8",
@@ -143,13 +157,74 @@ def _extract_reply_text(reply: object) -> str:
     return str(content)
 
 
+def _extract_plan_steps(agent: object) -> list:
+    """Extract structured plan steps from agent.state.tasks_context.tasks.
+
+    Returns a list of dicts with shape ``{n, t, d, live}`` compatible with
+    the frontend ``PlanStep`` type:
+    * ``n``: 1-based step index
+    * ``t``: task subject string
+    * ``d``: True if state == "completed"
+    * ``live``: True if state == "in_progress"
+
+    Returns ``[]`` if the agent has no tasks or the attribute path is absent
+    (failure-open: never raises).
+    """
+    try:
+        tasks = agent.state.tasks_context.tasks  # type: ignore[union-attr]
+        steps = []
+        for i, task in enumerate(tasks, start=1):
+            state = getattr(task, "state", "pending")
+            steps.append({
+                "n": i,
+                "t": str(getattr(task, "subject", "")),
+                "d": state == "completed",
+                "live": state == "in_progress",
+            })
+        return steps
+    except Exception:  # noqa: BLE001 — never crash the event loop
+        return []
+
+
+def _write_result_json(
+    plan_steps: list,
+    *,
+    status: str = "RUNNING",
+    summary: str = "",
+    error: str | None = None,
+    usage: dict | None = None,
+) -> None:
+    """Overwrite result.json with current plan_steps (and optional status).
+
+    Called on every ToolCallEndEvent (throttled: only when tool events
+    arrive) so the scheduler can read plan_steps while the run is still
+    RUNNING.  Failure-open: any OSError is silently ignored.
+    """
+    try:
+        (WORKSPACE / "result.json").write_text(
+            json.dumps(
+                {
+                    "status": status,
+                    "summary": summary,
+                    "error": error,
+                    "usage": usage or {},
+                    "plan_steps": plan_steps,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
+
+
 async def _dispatch(
     agent: object,
     task_text: str,
     events_path: Path,
     state_client: "_redis.RunStateClient | None" = None,
-) -> str:
-    """Call the agent with the task text and return the final reply text.
+) -> tuple[str, dict, list]:
+    """Call the agent with the task text and return ``(reply_text, usage, plan_steps)``.
 
     We use ``reply_stream`` so every event lands in ``events.jsonl``;
     AgentScope 2.0's ``ReplyEndEvent`` is just a marker (no Msg attached),
@@ -158,6 +233,14 @@ async def _dispatch(
 
     ``state_client`` is optional: when provided, hot-state is written to
     Redis on every event so a restart can detect the last checkpoint.
+
+    Token counts are accumulated across all ``ModelCallEndEvent`` events
+    emitted during the run (a single task may trigger multiple model calls).
+
+    After each ``ToolCallEndEvent`` (which fires when TaskCreate/TaskUpdate
+    completes) we re-read ``agent.state.tasks_context.tasks`` and overwrite
+    ``result.json`` so the scheduler's RUNNING-state poll can surface
+    ``plan_steps`` to the orchestrator's SSE stream.
     """
     from agentscope.message import Msg, TextBlock
 
@@ -172,30 +255,22 @@ async def _dispatch(
     text_blocks: dict[str, str] = {}
     # Track last plan text (from ThinkEvent) so we can surface it in state.
     last_plan: str = ""
-
-    # Per-tool-call accumulation buffers for tool streaming events.
-    # Keys are tool_call_id strings.
-    tool_names: dict[str, str] = {}
-    tool_args: dict[str, str] = {}
-    tool_results: dict[str, str] = {}
+    # Cumulative token counts across all model calls in this run.
+    input_tokens: int = 0
+    output_tokens: int = 0
+    # Current plan_steps — updated on every ToolCallEndEvent.
+    plan_steps: list = []
 
     async for event in agent.reply_stream(user_msg):
         _hooks.write_event(events_path, event)
         event_type = type(event).__name__
 
-        # ------------------------------------------------------------------
-        # ThinkEvent: extract plan text and optionally stream thinking block.
-        # ------------------------------------------------------------------
+        # Extract plan text from ThinkEvent (AgentScope 2.x reasoning event).
         if event_type == "ThinkEvent":
             thought = getattr(event, "thought", None) or getattr(event, "text", None) or ""
             if thought:
                 last_plan = str(thought)
-                if state_client is not None:
-                    state_client.push_thinking(last_plan)
 
-        # ------------------------------------------------------------------
-        # Text token streaming.
-        # ------------------------------------------------------------------
         if event_type == "TextBlockStartEvent":
             block_id = getattr(event, "block_id", None)
             if block_id and block_id not in text_blocks:
@@ -204,73 +279,37 @@ async def _dispatch(
             block_id = getattr(event, "block_id", None) or ""
             delta = getattr(event, "delta", "") or ""
             text_blocks[block_id] = text_blocks.get(block_id, "") + str(delta)
-            # Push token delta to Redis Stream for live streaming (failure-open).
-            if state_client is not None:
-                state_client.push_token(str(delta))
-
-        # ------------------------------------------------------------------
-        # Tool call streaming: accumulate args deltas, push when complete.
-        # ------------------------------------------------------------------
-        elif event_type == "ToolCallStartEvent":
-            tc_id = getattr(event, "tool_call_id", "") or ""
-            tc_name = getattr(event, "tool_call_name", "") or ""
-            if tc_id:
-                tool_names[tc_id] = tc_name
-                tool_args[tc_id] = ""
-
-        elif event_type == "ToolCallDeltaEvent":
-            tc_id = getattr(event, "tool_call_id", "") or ""
-            delta = getattr(event, "delta", "") or ""
-            if tc_id:
-                tool_args[tc_id] = tool_args.get(tc_id, "") + str(delta)
-
+        elif event_type == "ModelCallEndEvent":
+            # Accumulate token usage across multiple model calls in one run.
+            input_tokens += getattr(event, "input_tokens", 0) or 0
+            output_tokens += getattr(event, "output_tokens", 0) or 0
         elif event_type == "ToolCallEndEvent":
-            tc_id = getattr(event, "tool_call_id", "") or ""
-            if tc_id and state_client is not None:
-                state_client.push_tool_call(
-                    tc_id,
-                    tool_names.get(tc_id, ""),
-                    tool_args.get(tc_id, ""),
-                )
-
-        # ------------------------------------------------------------------
-        # Tool result streaming: accumulate result deltas, push when complete.
-        # ------------------------------------------------------------------
-        elif event_type == "ToolResultStartEvent":
-            tc_id = getattr(event, "tool_call_id", "") or ""
-            tc_name = getattr(event, "tool_call_name", "") or ""
-            if tc_id:
-                # name may arrive again here; update if provided
-                if tc_name:
-                    tool_names[tc_id] = tc_name
-                tool_results[tc_id] = ""
-
-        elif event_type == "ToolResultTextDeltaEvent":
-            tc_id = getattr(event, "tool_call_id", "") or ""
-            delta = getattr(event, "delta", "") or ""
-            if tc_id:
-                tool_results[tc_id] = tool_results.get(tc_id, "") + str(delta)
-
-        elif event_type == "ToolResultEndEvent":
-            tc_id = getattr(event, "tool_call_id", "") or ""
-            result_state = getattr(event, "state", "success") or "success"
-            if tc_id and state_client is not None:
-                state_client.push_tool_result(
-                    tc_id,
-                    tool_names.get(tc_id, ""),
-                    tool_results.get(tc_id, ""),
-                    str(result_state),
+            # After each tool call, re-read the task list so plan changes
+            # (TaskCreate, TaskUpdate) are immediately visible.  Write the
+            # updated plan to result.json so the scheduler's RUNNING-state
+            # poll can relay it upstream via SSE.
+            plan_steps = _extract_plan_steps(agent)
+            if plan_steps:
+                _write_result_json(
+                    plan_steps,
+                    status="RUNNING",
+                    usage={"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": input_tokens + output_tokens},
                 )
 
         # Write hot state after every event (failure-open).
         if state_client is not None:
             state_client.write_step(plan=last_plan, cursor=event_type)
 
-    # Signal end-of-stream so the orchestrator SSE bridge knows the reply is done.
-    if state_client is not None:
-        state_client.push_token_end()
+    # Final extraction in case no ToolCallEndEvent fired (simple tasks).
+    plan_steps = _extract_plan_steps(agent)
 
-    return "\n".join(t for t in text_blocks.values() if t).strip()
+    reply_text = "\n".join(t for t in text_blocks.values() if t).strip()
+    usage = {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+    return reply_text, usage, plan_steps
 
 
 def _s3_client(env: dict):
@@ -374,6 +413,9 @@ def _load_prompt_files(env: dict, task: dict) -> str:
     return (
         "你是一个企业级 AI 助理，运行于安全沙箱中。"
         "请使用可用工具完成用户的任务，并以简洁的中文回复你的执行摘要。"
+        "\n\n对于需要 3 步或以上的复杂任务，请先用 TaskCreate 登记结构化计划（每个步骤一个 task）；"
+        "开始执行某步之前用 TaskUpdate 将其标记为 in_progress，完成后标记为 completed。"
+        "这样用户可以实时看到任务进度。"
     )
 
 
@@ -422,17 +464,20 @@ def _download_attachments(task: dict, env: dict) -> list[str]:
     return downloaded
 
 
-def _run_real(task: dict) -> tuple[str, str]:
+def _run_real(task: dict) -> tuple[str, str, dict, list]:
     """Build an Agent from the configured hooks and run the task.
 
-    Returns ``(status, summary)``.  Raises only for unrecoverable
-    infra failures (caught in :func:`main` and surfaced as exit-1).
+    Returns ``(status, summary, usage, plan_steps)``.  Raises only for
+    unrecoverable infra failures (caught in :func:`main` and surfaced as
+    exit-1).  ``usage`` is a dict with keys ``input_tokens``,
+    ``output_tokens``, ``total_tokens``.  ``plan_steps`` is a list of
+    ``{n, t, d, live}`` dicts (empty list when the agent made no tasks).
     """
     logger = logging.getLogger(__name__)
 
     text = str(task.get("task", "")).strip()
     if not text:
-        return "FAILED", "task text is empty"
+        return "FAILED", "task text is empty", {}, []
 
     # Local imports so this module is importable without ``agentscope``;
     # the ImportError flows up to ``main`` and turns into exit code 1.
@@ -492,56 +537,23 @@ def _run_real(task: dict) -> tuple[str, str]:
         file_list = ", ".join(downloaded)
         sys_prompt += (
             f"\n\n用户上传了以下文件，位于 /workspace/inputs/：{file_list}\n"
-            "请使用 Read 工具读取 /workspace/inputs/ 下的文件来完成任务。"
+            "你可以读取这些文件来完成任务。"
         )
 
-    # Pre-create /workspace/outputs/ so the agent can write there without
-    # needing to mkdir first (though Bash mkdir also works).
-    outputs_dir = WORKSPACE / "outputs"
-    try:
-        outputs_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        logger.warning("cannot pre-create /workspace/outputs: %s", exc)
-
-    # File-output policy: reply inline by default; only persist a file when the
-    # user explicitly asks to be *delivered* a file. Let the model judge intent
-    # rather than relying on brittle keyword matching.
+    # Append planning tool guidance so the agent creates structured steps.
     sys_prompt += (
-        "\n\n## 关于文件输出\n"
-        "默认情况下，请把结果（包括代码、文本、表格等）直接写在回复正文里："
-        "代码用 Markdown 代码块（```语言 ... ```）展示，便于用户直接阅读和复制；"
-        "不要为此创建任何文件。\n"
-        "只有当用户明确要求“交付/生成/导出/下载/保存为文件”（例如“生成一个 .docx”、"
-        "“把它导出成 Excel”、“给我一个 txt 文件”）时，才使用 Write 工具把产物写入 "
-        "/workspace/outputs/ 目录（路径示例：/workspace/outputs/report.docx）；"
-        "任务结束后该目录下的文件会自动作为产物回传给用户。如需先创建子目录，可用 Bash 执行 mkdir -p。\n"
-        "判断不确定时，优先直接在正文回复，而不是写文件。"
+        "\n\n## 任务规划（重要）\n"
+        "对于需要 3 步或以上的复杂任务，必须先用 TaskCreate 为每个主要步骤创建一条 task（subject 填简短动作标题）。"
+        "开始执行某步前用 TaskUpdate 将其 status 设为 in_progress；完成后设为 completed。"
+        "用 TaskList 查看当前剩余步骤。"
+        "这样用户可以在前端 PLAN 面板实时看到你的进度。"
     )
-
-    # Build an AgentState with BYPASS permission so tool calls are auto-approved
-    # in the headless sandbox (no human is present to confirm).  Failure-open:
-    # if the permission sub-system is absent in this AgentScope version we fall
-    # back to state=None and Agent uses its default (which may prompt).
-    agent_state = None
-    try:
-        from agentscope.state import AgentState
-        from agentscope.permission import PermissionContext, PermissionMode
-
-        agent_state = AgentState(
-            permission_context=PermissionContext(mode=PermissionMode.BYPASS)
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "could not set BYPASS permission; tool calls may require confirmation: %s",
-            exc,
-        )
 
     agent = Agent(
         name=str(task.get("agent_name") or "Worker"),
         system_prompt=sys_prompt,
         model=model,
         toolkit=toolkit,
-        state=agent_state,
     )
 
     # Make sure events.jsonl exists even if the agent never emits.
@@ -557,9 +569,10 @@ def _run_real(task: dict) -> tuple[str, str]:
     state_client.write_step(plan="", cursor="start", status="RUNNING")
 
     try:
-        summary = asyncio.run(
+        summary, usage, plan_steps = asyncio.run(
             _dispatch(agent, text, events_path, state_client=state_client)
-        ).strip()
+        )
+        summary = summary.strip()
     except Exception:
         state_client.mark_failed()
         raise
@@ -568,7 +581,7 @@ def _run_real(task: dict) -> tuple[str, str]:
         summary = "(agent returned an empty reply)"
 
     state_client.mark_completed()
-    return "OK", summary
+    return "OK", summary, usage, plan_steps
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -593,7 +606,7 @@ def main(argv: list[str] | None = None) -> int:
         return _exit(2, status="FAILED", summary="invalid task.json", error=str(exc))
 
     try:
-        status, summary = _run_real(task)
+        status, summary, usage, plan_steps = _run_real(task)
     except ImportError as exc:
         return _exit(
             1,
@@ -609,7 +622,7 @@ def main(argv: list[str] | None = None) -> int:
             error=f"{type(exc).__name__}: {exc}",
         )
 
-    return _exit(0, status=status, summary=summary)
+    return _exit(0, status=status, summary=summary, usage=usage, plan_steps=plan_steps)
 
 
 if __name__ == "__main__":  # pragma: no cover

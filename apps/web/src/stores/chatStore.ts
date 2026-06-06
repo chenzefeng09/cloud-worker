@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type { Message, Session, ToolCallEntry, UserProfile } from '../api/types';
+import type { PlanStep } from '../lib/designFixtures';
 
 /** Payload for a single tool event from the SSE stream. */
 export interface ToolCallUpdate {
@@ -18,6 +19,12 @@ interface ChatState {
   sessions: Session[];
   activeSessionId: string | null;
   messages: Record<string, Message[]>;
+  /**
+   * Real-time structured plan steps keyed by sessionId.
+   * Populated from the SSE ``plan`` event while a run is in progress.
+   * Shape matches the frontend ``PlanStep`` type: ``{n, t, d, live}``.
+   */
+  planSteps: Record<string, PlanStep[]>;
   isStreaming: boolean;
   isLoggedIn: boolean;
   userProfile: UserProfile | null;
@@ -117,6 +124,7 @@ interface ChatState {
    */
   truncateFromSequence: (sessionId: string, fromSequence: number) => void;
 
+  setPlanSteps: (sessionId: string, steps: PlanStep[]) => void;
   setIsStreaming: (streaming: boolean) => void;
   login: (profile: UserProfile) => void;
   logout: () => void;
@@ -171,6 +179,7 @@ export const useChatStore = create<ChatState>((set) => ({
   sessions: [],
   activeSessionId: null,
   messages: {},
+  planSteps: {},
   isStreaming: false,
   isLoggedIn: false,
   userProfile: null,
@@ -413,6 +422,8 @@ export const useChatStore = create<ChatState>((set) => ({
       return { messages: { ...s.messages, [sessionId]: filtered } };
     }),
 
+  setPlanSteps: (sessionId, steps) =>
+    set((s) => ({ planSteps: { ...s.planSteps, [sessionId]: steps } })),
   setIsStreaming: (isStreaming) => set({ isStreaming }),
   login: (profile) => set({ isLoggedIn: true, userProfile: profile, bootstrapped: true }),
   logout: () =>
@@ -421,6 +432,7 @@ export const useChatStore = create<ChatState>((set) => ({
       userProfile: null,
       sessions: [],
       messages: {},
+      planSteps: {},
       activeSessionId: null,
       bootstrapped: true,
       selectedSkills: {},

@@ -3,9 +3,6 @@ import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import type { AuditEvent } from '../../api/types';
 
-/**
- * Audit log viewer — queries /admin/audit/events:query (BFF proxy to foundation-audit).
- */
 export function AuditPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading } = useAdminStore();
   const [tenantId, setTenantId] = useState('');
@@ -15,6 +12,7 @@ export function AuditPage() {
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isTodoEndpoint, setIsTodoEndpoint] = useState(false);
   const [queried, setQueried] = useState(false);
 
   // Bootstrap tenant list for filter
@@ -31,6 +29,7 @@ export function AuditPage() {
     e.preventDefault();
     setLoading(true);
     setError(null);
+    setIsTodoEndpoint(false);
     setQueried(true);
     try {
       const body: Record<string, unknown> = { limit: 50 };
@@ -41,7 +40,12 @@ export function AuditPage() {
       const data = await api.admin.audit.query(body);
       setEvents(data.items);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '查询失败');
+      if (err instanceof ApiError && (err.status === 404 || err.status === 501)) {
+        setIsTodoEndpoint(true);
+        setEvents([]);
+      } else {
+        setError(err instanceof ApiError ? err.message : '查询失败');
+      }
     } finally {
       setLoading(false);
     }
@@ -117,7 +121,13 @@ export function AuditPage() {
         </div>
       )}
 
-      {queried && !loading && (
+      {isTodoEndpoint && (
+        <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
+          审计代理端点尚未就绪。接线后将自动展示查询结果。
+        </div>
+      )}
+
+      {!isTodoEndpoint && queried && !loading && (
         events.length === 0 ? (
           <div className="font-mono text-[12px] text-dim italic">无匹配事件</div>
         ) : (

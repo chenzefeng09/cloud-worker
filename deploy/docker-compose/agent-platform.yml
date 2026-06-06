@@ -47,6 +47,157 @@ networks:
 
 services:
   # ===========================================================================
+  # migrate — Alembic 迁移 sidecar(一次性 job,镜像复用各服务自身镜像)
+  #
+  # 镜像与对应 app 服务同一个 build context / Dockerfile,因此已经带齐
+  # alembic + alembic.ini + 源码 + 全部依赖,无需挂载源码或 poetry install。
+  # 每个 sidecar 在 /app 下跑 `alembic upgrade head`,把对应服务的表/schema
+  # 迁移到最新版本;app 服务通过
+  #   depends_on: { <svc>-migrate: { condition: service_completed_successfully } }
+  # 等待迁移完成后再启动(镜像因 build cache 复用,只构建一次)。
+  #
+  # 说明:mcp-registry / skill-store / knowledge-ingest 的迁移建表落在 public
+  # schema(模型未声明 schema);session-orchestrator 落在 session_orchestrator
+  # schema(env.py 设置 version_table_schema + 0001_init 里 CREATE SCHEMA)。
+  # 这里只复用各服务自己的 alembic env.py,schema 行为由迁移自身保证。
+  # ===========================================================================
+  # pgvector-init — 以 postgres 超级用户启用 pgvector 扩展(一次性,幂等)
+  #
+  # knowledge-ingest 的 0002_enable_pgvector 需要 `CREATE EXTENSION vector`,
+  # 而该扩展未标记 trusted,只有超级用户能创建;app_migrator 不是超级用户。
+  # 这里用 foundation 的 postgres 镜像 + 超级用户口令(POSTGRES_SUPER_PASSWORD,
+  # 由 foundation 的 .env 提供)连到同一个 foundation 库执行扩展创建。
+  # IF NOT EXISTS 保证幂等;每次 up 都跑一遍,make nuke 后也会自动重建。
+  pgvector-init:
+    image: pgvector/pgvector:${POSTGRES_VERSION:-pg16}
+    container_name: agent-pgvector-init
+    restart: "no"
+    environment:
+      PGPASSWORD: ${POSTGRES_SUPER_PASSWORD:-postgres_super_change_me}
+    entrypoint:
+      - psql
+      - -v
+      - ON_ERROR_STOP=1
+      - -h
+      - postgres
+      - -U
+      - postgres
+      - -d
+      - ${POSTGRES_DB:-foundation}
+      - -c
+      - CREATE EXTENSION IF NOT EXISTS vector;
+    networks: [foundation]
+
+  # ===========================================================================
+  # minio-init — creates the "agent-platform" S3 bucket on foundation-minio
+  #
+  # foundation-minio lives in the saas-foundation compose project; docker-
+  # compose forbids depends_on across projects, so we cannot gate on its
+  # healthcheck here.  Instead we loop until `mc alias set` succeeds (retries
+  # every 2 s, up to 30 attempts / ~60 s) so start-order doesn't matter.
+  # The four storage-using services (knowledge-ingest, skill-store,
+  # session-orchestrator, agent-scheduler) declare
+  #   depends_on: { minio-init: { condition: service_completed_successfully } }
+  # which IS valid within the same compose project.
+  # ===========================================================================
+  minio-init:
+    image: minio/mc:latest
+    container_name: agent-minio-init
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        i=0
+        until mc alias set local http://foundation-minio:9000 \
+              ${MINIO_ROOT_USER:-foundation} \
+              ${MINIO_ROOT_PASSWORD:-minio_change_me_min_12_chars} \
+              >/dev/null 2>&1; do
+          i=$$((i+1))
+          if [ "$$i" -ge 30 ]; then
+            echo "ERROR: foundation-minio not reachable after 30 attempts" >&2
+            exit 1
+          fi
+          echo "Waiting for foundation-minio... attempt $$i/30"
+          sleep 2
+        done
+        mc mb --ignore-existing local/agent-platform
+        echo "=== minio-init: agent-platform bucket ready ==="
+    networks: [foundation]
+
+  mcp-registry-migrate:
+    build:
+      context: ../../services/mcp-registry
+      dockerfile: Dockerfile
+      additional_contexts:
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+      args:
+        PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
+    image: agent-platform-dev-mcp-registry
+    container_name: agent-mcp-registry-migrate
+    restart: "no"
+    working_dir: /app
+    environment:
+      MCP_REGISTRY_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+    entrypoint: ["alembic", "upgrade", "head"]
+    networks: [foundation]
+
+  skill-store-migrate:
+    build:
+      context: ../../services/skill-store
+      dockerfile: Dockerfile
+      additional_contexts:
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+      args:
+        PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
+    image: agent-platform-dev-skill-store
+    container_name: agent-skill-store-migrate
+    restart: "no"
+    working_dir: /app
+    environment:
+      SKILL_STORE_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+    entrypoint: ["alembic", "upgrade", "head"]
+    networks: [foundation]
+
+  knowledge-ingest-migrate:
+    build:
+      context: ../../services/knowledge-ingest
+      dockerfile: Dockerfile
+      additional_contexts:
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+      args:
+        PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
+    image: agent-platform-dev-knowledge-ingest
+    container_name: agent-knowledge-ingest-migrate
+    restart: "no"
+    working_dir: /app
+    environment:
+      KNOWLEDGE_INGEST_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+    entrypoint: ["alembic", "upgrade", "head"]
+    networks: [foundation]
+    depends_on:
+      pgvector-init:
+        condition: service_completed_successfully
+
+  # session-orchestrator 的 app 服务用 Dockerfile.overlay。这里用同一个
+  # build(context + dockerfile 完全一致),compose 会复用同一镜像层缓存,
+  # 并显式把镜像名固定为 agent-platform-dev-session-orchestrator —— 与 app
+  # 服务的默认镜像名(项目名+服务名)一致,确保迁移跑的就是 app 跑的那份
+  # 源码 + migrations。该镜像内 alembic.ini / migrations / 源码均已就位。
+  session-orchestrator-migrate:
+    build:
+      context: ../../services/session-orchestrator
+      dockerfile: Dockerfile.overlay
+    image: agent-platform-dev-session-orchestrator
+    container_name: agent-session-orchestrator-migrate
+    restart: "no"
+    working_dir: /app
+    environment:
+      SESSION_ORCHESTRATOR_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+    entrypoint: ["alembic", "upgrade", "head"]
+    networks: [foundation]
+
+  # ===========================================================================
   # Session Orchestrator — session/message/run CRUD + SSE event streams
   # ===========================================================================
   session-orchestrator:
@@ -92,6 +243,11 @@ services:
     ports:
       - "${PORT_SESSION_ORCHESTRATOR:-8006}:8006"
     networks: [foundation]
+    depends_on:
+      session-orchestrator-migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8006/api/session/v1/healthz').read()\""]
       interval: 10s
@@ -294,6 +450,27 @@ services:
         condition: service_healthy
       docker-socket-proxy:
         condition: service_started
+      minio-init:
+        condition: service_completed_successfully
+
+  # ===========================================================================
+  # bff-migrate — Alembic migration sidecar for agent-bff schema
+  # ===========================================================================
+  bff-migrate:
+    build:
+      context: ../../services/bff
+      dockerfile: Dockerfile
+      additional_contexts:
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+    image: agent-platform-dev-bff
+    container_name: agent-bff-migrate
+    restart: "no"
+    working_dir: /app
+    environment:
+      BFF_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+      BFF_COOKIE_SECRET: ${BFF_COOKIE_SECRET:-abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKL}
+    entrypoint: ["alembic", "upgrade", "head"]
+    networks: [foundation]
 
   # ===========================================================================
   # BFF — 认证网关 + API 聚合 + SSE 中继
@@ -333,6 +510,9 @@ services:
       BFF_CORS_ORIGINS: ${BFF_CORS_ORIGINS:-http://localhost:5173,http://web:5173}
       BFF_OTEL_ENABLED: "true"
       BFF_OTEL_EXPORTER_ENDPOINT: http://otel-collector:4317
+      # BFF-local DB (notification_preferences, future api_keys)
+      BFF_DB_DSN: postgresql+asyncpg://app_user:${APP_USER_PASSWORD:-app_user_change_me}@postgres:5432/foundation
+      BFF_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
     ports:
       - "${PORT_BFF:-8005}:8005"
     networks: [foundation]
@@ -342,6 +522,8 @@ services:
       timeout: 5s
       retries: 10
     depends_on:
+      bff-migrate:
+        condition: service_completed_successfully
       session-orchestrator:
         condition: service_healthy
 
@@ -394,6 +576,9 @@ services:
     ports:
       - "${PORT_MCP_REGISTRY:-8010}:8010"
     networks: [foundation]
+    depends_on:
+      mcp-registry-migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/api/mcp/v1/healthz').read()\""]
       interval: 10s
@@ -433,6 +618,11 @@ services:
     ports:
       - "${PORT_SKILL_STORE:-8011}:8011"
     networks: [foundation]
+    depends_on:
+      skill-store-migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8011/api/skills/v1/healthz').read()\""]
       interval: 10s
@@ -474,6 +664,11 @@ services:
     ports:
       - "${PORT_KNOWLEDGE_INGEST:-8012}:8012"
     networks: [foundation]
+    depends_on:
+      knowledge-ingest-migrate:
+        condition: service_completed_successfully
+      minio-init:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8012/api/knowledge/v1/healthz').read()\""]
       interval: 10s

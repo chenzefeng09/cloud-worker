@@ -76,6 +76,16 @@ function handleSSEEvent(
       break;
     }
 
+    case 'plan': {
+      // Real-time plan steps from the worker's TaskCreate/TaskUpdate calls.
+      // Shape: { run_id: string, plan_steps: PlanStep[] }
+      const steps = data.plan_steps;
+      if (Array.isArray(steps) && steps.length > 0) {
+        store.setPlanSteps(sessionId, steps as import('../lib/designFixtures').PlanStep[]);
+      }
+      break;
+    }
+
     case 'message': {
       // A complete message row from the server.  The orchestrator stores roles
       // lowercase ("assistant"/"user"/"system"/"tool"); compare case-insensitively.
@@ -147,7 +157,7 @@ export function useChat() {
         }
       } catch (err) {
         if (!(err instanceof ApiError) || err.status !== 401) {
-          // eslint-disable-next-line no-console
+           
           console.warn('load messages failed', err);
         }
       }
@@ -246,7 +256,7 @@ export function useChat() {
         }
       } catch (e) {
         if ((e as Error).name !== 'AbortError') {
-          // eslint-disable-next-line no-console
+           
           console.error('Chat error:', e);
         }
       } finally {
@@ -262,7 +272,7 @@ export function useChat() {
     setIsStreaming(false);
     if (sessionId) {
       api.sessions.cancel(sessionId).catch((err) => {
-        // eslint-disable-next-line no-console
+         
         console.warn('backend cancel failed', err);
       });
     }

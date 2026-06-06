@@ -3,34 +3,116 @@ import { PageHead } from '../components/shell/PageHead';
 import { StatusDot } from '../components/shell/StatusDot';
 import { Chip } from '../components/shell/Chip';
 import { api, ApiError } from '../api/client';
-import type { PoolSnapshot, SandboxItem } from '../api/types';
+import type {
+  PoolSnapshot,
+  SandboxItem,
+  TokenUsage,
+  TopologyGraph,
+  TopologyNodeWithPos,
+  TopologyEdge,
+} from '../api/types';
 import { formatRelativeTimeZh } from '../lib/format';
-import {
-  FLEET_TOPOLOGY,
-  type TopologyWorkerNode,
-} from '../lib/designFixtures';
 
-// ── Topology helpers ──────────────────────────────────────────────
+// ── Layout algorithm ──────────────────────────────────────────────────────────
+// Three-column layout: mcp | worker | task
+// Each column is vertically centred and nodes evenly distributed.
+// Canvas logical size: 800 × 460
 
-function statusStroke(s: TopologyWorkerNode['status']): string {
-  switch (s) {
-    case 'thinking': return '#d23a1f';   // accent
-    case 'awaiting': return '#c68a17';   // warn
+const CANVAS_W = 800;
+const CANVAS_H = 460;
+
+/** Attach x/y to every node using a three-column layered layout.
+ *  mcp nodes → left column (x≈130)
+ *  worker nodes → centre column (x≈400)
+ *  task nodes → right column (x≈670)
+ */
+export function computeLayout(graph: TopologyGraph): {
+  nodesWithPos: TopologyNodeWithPos[];
+  edges: TopologyEdge[];
+} {
+  const mcps    = graph.nodes.filter(n => n.type === 'mcp');
+  const workers = graph.nodes.filter(n => n.type === 'worker');
+  const tasks   = graph.nodes.filter(n => n.type === 'task');
+
+  const colX = { mcp: 130, worker: 400, task: 670 };
+  const PAD  = 60; // vertical padding top/bottom
+
+  function spreadY(items: { id: string }[]): Map<string, number> {
+    const result = new Map<string, number>();
+    const count = items.length;
+    if (count === 0) return result;
+    const step = count === 1
+      ? 0
+      : (CANVAS_H - PAD * 2) / (count - 1);
+    items.forEach((item, i) => {
+      const y = count === 1
+        ? CANVAS_H / 2
+        : PAD + i * step;
+      result.set(item.id, y);
+    });
+    return result;
+  }
+
+  const mcpY    = spreadY(mcps);
+  const workerY = spreadY(workers);
+  const taskY   = spreadY(tasks);
+
+  const nodesWithPos: TopologyNodeWithPos[] = [
+    ...mcps.map(n    => ({ ...n, x: colX.mcp,    y: mcpY.get(n.id)    ?? CANVAS_H / 2 })),
+    ...workers.map(n => ({ ...n, x: colX.worker, y: workerY.get(n.id) ?? CANVAS_H / 2 })),
+    ...tasks.map(n   => ({ ...n, x: colX.task,   y: taskY.get(n.id)   ?? CANVAS_H / 2 })),
+  ];
+
+  return { nodesWithPos, edges: graph.edges };
+}
+
+// ── Status → stroke colour ────────────────────────────────────────────────────
+
+function workerStroke(status: string): string {
+  switch (status.toLowerCase()) {
+    case 'running':  return '#d23a1f';   // accent — active
+    case 'starting': return '#c68a17';   // warn
     case 'paused':   return '#75756f';   // dim
-    case 'done':     return '#2c8f5d';   // ok
-    default:         return '#d8d4c6';   // line (idle)
+    case 'stopped':
+    case 'exited':   return '#2c8f5d';   // done/ok
+    default:         return '#d8d4c6';   // idle/line
   }
 }
 
-// ── Static topology canvas (DESIGN FIXTURE — remove when backend provides topology) ──
+function mcpStatusColor(status: string): string {
+  return status === 'enabled' ? '#75756f' : '#d23a1f';
+}
 
-function TopologyCanvas() {
-  const { workers, tasks, mcps, links } = FLEET_TOPOLOGY;
+// ── Topology canvas (real data) ───────────────────────────────────────────────
 
-  // Build lookup maps by id
-  const workerById = Object.fromEntries(workers.map(w => [w.id, w]));
-  const taskById   = Object.fromEntries(tasks.map(t  => [t.id, t]));
-  const mcpById    = Object.fromEntries(mcps.map(m   => [m.id, m]));
+interface TopologyCanvasProps {
+  graph: TopologyGraph;
+}
+
+function TopologyCanvas({ graph }: TopologyCanvasProps) {
+  const { nodesWithPos, edges } = computeLayout(graph);
+
+  const nodeById = Object.fromEntries(nodesWithPos.map(n => [n.id, n]));
+
+  const workers = nodesWithPos.filter(n => n.type === 'worker');
+  const tasks   = nodesWithPos.filter(n => n.type === 'task');
+  const mcps    = nodesWithPos.filter(n => n.type === 'mcp');
+
+  if (workers.length === 0 && tasks.length === 0 && mcps.length === 0) {
+    return (
+      <div
+        className="flex-1 min-h-0"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          background: '#f7f5ee',
+        }}
+      >
+        <span className="cw-label" style={{ fontStyle: 'italic' }}>暂无活跃拓扑</span>
+      </div>
+    );
+  }
 
   return (
     <div style={{ position: 'relative', overflow: 'hidden', background: '#f7f5ee' }} className="flex-1 min-h-0">
@@ -49,15 +131,15 @@ function TopologyCanvas() {
 
       {/* SVG edges + animated motion dots */}
       <svg
-        viewBox="0 0 800 460"
+        viewBox={`0 0 ${CANVAS_W} ${CANVAS_H}`}
         preserveAspectRatio="xMidYMid meet"
         style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
       >
-        {links.map((link, i) => {
-          const a = workerById[link.fromWorker];
-          const b = link.toTask ? taskById[link.toTask] : link.toMcp ? mcpById[link.toMcp] : null;
+        {edges.map((edge, i) => {
+          const a = nodeById[edge.from];
+          const b = nodeById[edge.to];
           if (!a || !b) return null;
-          const live = !!link.live;
+          const live = a.type === 'worker' && a.status.toLowerCase() === 'running' && edge.kind === 'worker→task';
           const pathD = `M${a.x},${a.y} L${b.x},${b.y}`;
           return (
             <g key={i}>
@@ -84,8 +166,8 @@ function TopologyCanvas() {
           key={t.id}
           style={{
             position: 'absolute',
-            left: `calc(${(t.x / 800) * 100}% - 75px)`,
-            top:  `calc(${(t.y / 460) * 100}% - 18px)`,
+            left: `calc(${(t.x / CANVAS_W) * 100}% - 75px)`,
+            top:  `calc(${(t.y / CANVAS_H) * 100}% - 18px)`,
             width: 150,
             background: '#fffdf7',
             border: '1px dashed #d8d4c6',
@@ -112,8 +194,8 @@ function TopologyCanvas() {
           key={m.id}
           style={{
             position: 'absolute',
-            left: `calc(${(m.x / 800) * 100}% - 50px)`,
-            top:  `calc(${(m.y / 460) * 100}% - 14px)`,
+            left: `calc(${(m.x / CANVAS_W) * 100}% - 50px)`,
+            top:  `calc(${(m.y / CANVAS_H) * 100}% - 14px)`,
             width: 100,
             background: '#f0ede3',
             border: '1px solid #d8d4c6',
@@ -128,22 +210,23 @@ function TopologyCanvas() {
             zIndex: 1,
           }}
         >
-          <span style={{ color: m.mcpStatus === 'auth needed' ? '#d23a1f' : '#75756f' }}>⊞</span>
-          <span>{m.label}</span>
+          <span style={{ color: mcpStatusColor(m.status) }}>⊞</span>
+          <span style={{ overflow: 'hidden', whiteSpace: 'nowrap', textOverflow: 'ellipsis' }}>{m.label}</span>
         </div>
       ))}
 
       {/* Worker nodes */}
       {workers.map(w => {
-        const active = w.status === 'thinking';
-        const stroke = statusStroke(w.status);
+        const active = w.status.toLowerCase() === 'running';
+        const stroke = workerStroke(w.status);
+        const glyph  = w.label.slice(0, 1).toUpperCase();
         return (
           <div
             key={w.id}
             style={{
               position: 'absolute',
-              left: `calc(${(w.x / 800) * 100}% - 32px)`,
-              top:  `calc(${(w.y / 460) * 100}% - 32px)`,
+              left: `calc(${(w.x / CANVAS_W) * 100}% - 32px)`,
+              top:  `calc(${(w.y / CANVAS_H) * 100}% - 32px)`,
               width: 64,
               height: 64,
               borderRadius: '50%',
@@ -164,14 +247,18 @@ function TopologyCanvas() {
               color: active ? '#d23a1f' : '#3c3d40',
               letterSpacing: '-0.05em',
             }}>
-              {w.glyph}
+              {glyph}
             </span>
             <span style={{
               fontFamily: "'JetBrains Mono', ui-monospace, monospace",
               fontSize: 10,
               color: '#75756f',
+              overflow: 'hidden',
+              whiteSpace: 'nowrap',
+              maxWidth: 54,
+              textOverflow: 'ellipsis',
             }}>
-              {w.id}
+              {w.label.slice(0, 8)}
             </span>
             {/* status blip */}
             <span
@@ -239,6 +326,9 @@ export function FleetPage() {
   const [sandboxes, setSandboxes] = useState<SandboxItem[]>([]);
   const [loading, setLoading]     = useState(false);
   const [error, setError]         = useState<string | null>(null);
+  const [tokenUsage, setTokenUsage] = useState<TokenUsage | null>(null);
+  const [topology, setTopology]   = useState<TopologyGraph | null>(null);
+  const [topoLoading, setTopoLoading] = useState(false);
 
   const fetchAll = () => {
     setLoading(true);
@@ -266,13 +356,40 @@ export function FleetPage() {
     return () => { cancelled = true; };
   };
 
+  // Fetch topology graph separately — best-effort
+  const fetchTopology = () => {
+    setTopoLoading(true);
+    let cancelled = false;
+    api.fleet.topology()
+      .then(data => { if (!cancelled) setTopology(data); })
+      .catch(() => { /* best-effort — canvas shows empty state */ })
+      .finally(() => { if (!cancelled) setTopoLoading(false); });
+    return () => { cancelled = true; };
+  };
+
   useEffect(fetchAll, []);
+  useEffect(fetchTopology, []);
+
+  // Fetch real token usage totals for the sidebar token block.
+  useEffect(() => {
+    let cancelled = false;
+    api.runs.tokenUsage().then((data) => {
+      if (!cancelled) setTokenUsage(data);
+    }).catch(() => { /* best-effort */ });
+    return () => { cancelled = true; };
+  }, []);
 
   const totalSandboxes = pool?.total ?? 0;
   const idleTotal = pool
     ? Object.values(pool.by_template).reduce((sum, t) => sum + t.idle, 0)
     : 0;
   const busyTotal = totalSandboxes - idleTotal;
+
+  // Refresh both rail + topology
+  const handleRefresh = () => {
+    fetchAll();
+    fetchTopology();
+  };
 
   return (
     <div className="flex flex-col h-full min-w-0 bg-paper">
@@ -281,7 +398,7 @@ export function FleetPage() {
         actions={
           <button
             className="cw-btn cw-btn-sm"
-            onClick={fetchAll}
+            onClick={handleRefresh}
           >
             刷新
           </button>
@@ -293,9 +410,35 @@ export function FleetPage() {
         className="flex-1 min-h-0"
         style={{ display: 'grid', gridTemplateColumns: '1fr 280px' }}
       >
-        {/* LEFT — static topology canvas (DESIGN FIXTURE) */}
+        {/* LEFT — topology canvas (real data) */}
         <div className="flex flex-col min-h-0">
-          <TopologyCanvas />
+          {topoLoading ? (
+            <div
+              className="flex-1 min-h-0"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                background: '#f7f5ee',
+              }}
+            >
+              <span className="cw-label" style={{ fontStyle: 'italic' }}>加载拓扑中…</span>
+            </div>
+          ) : topology ? (
+            <TopologyCanvas graph={topology} />
+          ) : (
+            <div
+              className="flex-1 min-h-0"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                background: '#f7f5ee',
+              }}
+            >
+              <span className="cw-label" style={{ fontStyle: 'italic' }}>暂无活跃拓扑</span>
+            </div>
+          )}
         </div>
 
         {/* RIGHT — real fleet data rail */}
@@ -458,9 +601,9 @@ export function FleetPage() {
             )}
           </div>
 
-          {/* cost block silhouette (DESIGN FIXTURE — replace when backend provides spend data) */}
+          {/* Token usage block — real data from /runs/token-usage */}
           <div style={{ padding: 14, borderTop: '1px solid #d8d4c6' }}>
-            <div className="cw-label" style={{ marginBottom: 6 }}>今日费用</div>
+            <div className="cw-label" style={{ marginBottom: 6 }}>累计 Token</div>
             <div style={{ display: 'flex', alignItems: 'baseline', gap: 6 }}>
               <span
                 style={{
@@ -469,21 +612,22 @@ export function FleetPage() {
                   fontWeight: 600,
                 }}
               >
-                $4.21
+                {tokenUsage !== null
+                  ? tokenUsage.total_tokens.toLocaleString()
+                  : '…'}
               </span>
-              <span className="cw-label" style={{ letterSpacing: 0 }}>/ $50 上限</span>
+              <span className="cw-label" style={{ letterSpacing: 0 }}>tokens</span>
             </div>
-            <div
-              style={{
-                height: 3,
-                background: '#e8e4d8',
-                borderRadius: 2,
-                overflow: 'hidden',
-                marginTop: 6,
-              }}
-            >
-              <div style={{ width: '8.4%', height: '100%', background: '#d23a1f' }} />
-            </div>
+            {tokenUsage !== null && (
+              <div style={{
+                fontFamily: "'JetBrains Mono', ui-monospace, monospace",
+                fontSize: 10,
+                color: 'var(--dim)',
+                marginTop: 4,
+              }}>
+                in {tokenUsage.input_tokens.toLocaleString()} · out {tokenUsage.output_tokens.toLocaleString()}
+              </div>
+            )}
           </div>
         </aside>
       </div>

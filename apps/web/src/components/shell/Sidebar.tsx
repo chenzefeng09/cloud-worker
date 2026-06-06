@@ -175,11 +175,6 @@ export function Sidebar() {
       )}
 
       <div className="mt-auto flex flex-col gap-2 pt-3.5 border-t border-line">
-        <div className="flex items-center gap-2">
-          <span className="w-[7px] h-[7px] rounded-full bg-accent shadow-[0_0_0_3px_rgba(210,58,31,0.08)]" />
-          <span className="font-mono text-[11px] text-ink-2">1 个工作节点 · 运行中</span>
-        </div>
-        <div className="font-mono text-[10.5px] text-dim">$4.21 今日 · $50 预算</div>
         <NavLink
           to="/profile"
           className={({ isActive }) =>

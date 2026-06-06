@@ -243,7 +243,7 @@ class CubeSandboxRuntime:
             raise SandboxSpawnError(
                 f"CubeSandbox refused spawn (HTTP {resp.status_code})",
             )
-        sandbox_id = resp.json().get("sandbox_id")
+        sandbox_id: str = str(resp.json().get("sandbox_id") or "")
         if not sandbox_id:
             raise SandboxSpawnError("CubeSandbox returned no sandbox_id")
         logger.info(
@@ -257,7 +257,7 @@ class CubeSandboxRuntime:
         return sandbox_id
 
     # --------------------------------------------------------------- inspect
-    def get_run_status(self, container_id: str) -> dict:
+    def get_run_status(self, container_id: str) -> dict[str, Any]:
         client = self._require_client()
         try:
             resp = client.get(f"/sandboxes/{container_id}")
@@ -284,7 +284,7 @@ class CubeSandboxRuntime:
         tenant = resp.json().get("metadata", {}).get("agent-platform.tenant-id", "")
         if not tenant:
             raise ContainerNotFoundError(container_id)
-        return tenant
+        return str(tenant)
 
     # ---------------------------------------------------------------- cancel
     def cancel_run(self, container_id: str) -> None:
@@ -304,7 +304,7 @@ class CubeSandboxRuntime:
             )
 
     # ------------------------------------------------------------------ list
-    def list_containers(self, *, tenant_id: str) -> list[dict]:
+    def list_containers(self, *, tenant_id: str) -> list[dict[str, Any]]:
         if not tenant_id:
             raise ValueError("tenant_id is required for list_containers")
         client = self._require_client()
@@ -314,7 +314,7 @@ class CubeSandboxRuntime:
             "/sandboxes",
             params={"metadata.agent-platform.tenant-id": tenant_id},
         )
-        items: list[dict] = []
+        items: list[dict[str, Any]] = []
         for vm in resp.json().get("items", []):
             meta = vm.get("metadata", {})
             if meta.get("agent-platform.tenant-id") != tenant_id:

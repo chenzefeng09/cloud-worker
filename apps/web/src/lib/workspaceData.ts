@@ -14,8 +14,6 @@ export interface Workspace {
   name: string;
   glyph: string;
   desc: string;
-  taskCount: number;
-  fileCount: number;
   accent: string;
 }
 
@@ -39,7 +37,5 @@ export const DEFAULT_WORKSPACE: Workspace = {
   name: '工作区',
   glyph: '◇',
   desc: '上下文 · 文件 · 技能',
-  taskCount: 0,
-  fileCount: 0,
   accent: '#d23a1f',
 };

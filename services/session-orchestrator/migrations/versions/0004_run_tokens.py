@@ -1,4 +1,4 @@
-"""Add input_tokens / output_tokens / total_tokens columns to run.
+"""Add input_tokens / output_tokens / total_tokens columns to run table.
 
 Revision ID: 0004_run_tokens
 Revises: 0003_artifact
@@ -6,10 +6,10 @@ Create Date: 2026-06-04
 
 Notes
 -----
-These three nullable Integer columns persist token usage reported by the
-scheduler's ``GET /runs/{id}`` response under ``usage.{input,output,total}_tokens``.
-They are written by the orchestrator's reconcile path when a run reaches
-COMPLETED or FAILED status.
+These columns store the cumulative token counts for a run (aggregated from
+all ModelCallEndEvents emitted by the worker).  They are nullable so that
+existing rows (completed before this migration) and runs that do not emit
+usage information remain valid.
 """
 
 from collections.abc import Sequence

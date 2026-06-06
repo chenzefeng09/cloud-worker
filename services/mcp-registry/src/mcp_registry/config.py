@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     db_dsn_migrator: str = (
         "postgresql+asyncpg://app_migrator:app_migrator_change_me@localhost:5432/foundation"
     )
+    # Postgres schema that owns this service's tables.  Foundation isolates
+    # every service in its own schema (app_migrator owns it; public is not
+    # writable by app_migrator).  The ORM models are schema-less so SQLite
+    # unit tests keep working; on Postgres we translate the default schema
+    # (None) to ``db_schema`` via SQLAlchemy ``schema_translate_map`` and the
+    # Alembic migrations create + target the same schema.
+    db_schema: str = "mcp_registry"
 
     # Internal scope required for cross-tenant reads (mcp_tenant_injector).
     internal_scope: str = "mcp.read_internal"

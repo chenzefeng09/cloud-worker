@@ -36,7 +36,7 @@ class Session(Base):
     # the MetaData registry).  Map our column to a differently-named Python
     # attribute so the ORM stays happy; the SQL column name in
     # ``migrations/versions/0001_init.py`` is unchanged.
-    agent_metadata: Mapped[dict | None] = mapped_column(
+    agent_metadata: Mapped[dict[str, object] | None] = mapped_column(
         "metadata", JSONB, nullable=True,
     )
 
@@ -44,7 +44,8 @@ class Session(Base):
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
     )
     updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow, server_default=func.now()
+        DateTime(timezone=True), nullable=False,
+        default=utcnow, onupdate=utcnow, server_default=func.now(),
     )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -55,10 +56,12 @@ class Message(Base):
 
     id: Mapped[str] = mapped_column(String(30), primary_key=True, default=lambda: new_id("msg"))
     tenant_id: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
-    session_id: Mapped[str] = mapped_column(String(30), ForeignKey("session_orchestrator.session.id"), nullable=False, index=True)
+    session_id: Mapped[str] = mapped_column(
+        String(30), ForeignKey("session_orchestrator.session.id"), nullable=False, index=True,
+    )
     role: Mapped[str] = mapped_column(String(10), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
-    tool_calls: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    tool_calls: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
     attachments: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     run_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
     sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
@@ -73,7 +76,9 @@ class Run(Base):
 
     id: Mapped[str] = mapped_column(String(30), primary_key=True, default=lambda: new_id("run"))
     tenant_id: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
-    session_id: Mapped[str] = mapped_column(String(30), ForeignKey("session_orchestrator.session.id"), nullable=False, index=True)
+    session_id: Mapped[str] = mapped_column(
+        String(30), ForeignKey("session_orchestrator.session.id"), nullable=False, index=True,
+    )
     sandbox_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
     task_description: Mapped[str] = mapped_column(Text, nullable=False)
@@ -111,10 +116,14 @@ class Attachment(Base):
     )
     user_id: Mapped[str] = mapped_column(String(30), nullable=False)
     filename: Mapped[str] = mapped_column(String(500), nullable=False)
-    mime: Mapped[str] = mapped_column(String(200), nullable=False, default="application/octet-stream")
+    mime: Mapped[str] = mapped_column(
+        String(200), nullable=False, default="application/octet-stream",
+    )
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     blob_key: Mapped[str] = mapped_column(Text, nullable=False)
-    kind: Mapped[str] = mapped_column(String(10), nullable=False, default="input", server_default="input")
+    kind: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="input", server_default="input",
+    )
     run_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()

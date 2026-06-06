@@ -6,20 +6,14 @@
 FROM agent-platform-dev-session-orchestrator:latest
 
 USER root
-# Install redis async client from pre-fetched wheel (avoids PyPI MITM issue).
-# Wheel downloaded offline via: pip download "redis>=4.2.0" --no-deps
-COPY wheels/ /tmp/wheels/
-RUN pip install --no-cache-dir --no-deps /tmp/wheels/redis*.whl \
- && rm -rf /tmp/wheels
 COPY src /app/src
-# Also overlay migrations + alembic config so new revisions (e.g. message
-# attachments) land in the image without a full base rebuild.  The base only
-# COPYs migrations at build time, so source-only rebuilds would otherwise ship
-# stale migration heads.
+# Refresh migrations + alembic.ini too: the migrate sidecar runs
+# ``alembic upgrade head`` from this same image, and the base image may carry
+# a stale migrations/ tree (e.g. only 0001_init).  Copying the in-repo
+# migrations guarantees the sidecar sees 0002/0003/... and reaches head.
 COPY migrations /app/migrations
 COPY alembic.ini /app/alembic.ini
-RUN find /app/src -name __pycache__ -exec rm -rf {} + 2>/dev/null || true \
- && find /app/migrations -name __pycache__ -exec rm -rf {} + 2>/dev/null || true \
+RUN find /app/src /app/migrations -name __pycache__ -exec rm -rf {} + 2>/dev/null || true \
  && chown -R app:app /app/src /app/migrations /app/alembic.ini
 USER app
 WORKDIR /app

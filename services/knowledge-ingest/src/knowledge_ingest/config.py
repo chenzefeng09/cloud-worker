@@ -21,6 +21,10 @@ class Settings(BaseSettings):
     db_dsn_migrator: str = (
         "postgresql+asyncpg://app_migrator:app_migrator_change_me@localhost:5432/foundation"
     )
+    # Postgres schema that owns this service's tables.  See mcp-registry's
+    # config for the rationale (foundation per-service schema isolation;
+    # ORM stays schema-less + schema_translate_map on Postgres).
+    db_schema: str = "knowledge_ingest"
 
     # Embeddings: foundation llm-gateway exposes /v1/embeddings (OpenAI-shape).
     foundation_llm_gateway_url: str = "http://localhost:8011/api/llm-gateway/v1"

@@ -125,6 +125,21 @@ export interface InstalledSkill extends Skill {
   installed_at: string;
 }
 
+export interface SkillVersion {
+  id: string;
+  skill_id: string;
+  version: string;
+  manifest: string | null;
+  sha256: string | null;
+  created_at: string;
+}
+
+export interface IngestResult {
+  document_id: string;
+  status: string;
+  chunks_created: number;
+}
+
 export type DocumentStatus = 'PENDING' | 'INGESTING' | 'READY' | 'FAILED';
 
 export interface KnowledgeDocument {
@@ -228,7 +243,7 @@ export interface BillingPlan {
 
 export interface QuotaInfo {
   tenant_id: string;
-  plan: BillingPlan;
+  plan: BillingPlan | null;
   usage: Record<string, number>;
 }
 
@@ -265,6 +280,21 @@ export interface ProbeReport {
 
 // ─── Runs ────────────────────────────────────────────────────────────────────
 
+export interface TokenUsage {
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+}
+
+export interface DailyTokenUsage {
+  day: string;   // "YYYY-MM-DD"
+  tokens: number;
+}
+
+export interface DailyTokenUsageResponse {
+  days: DailyTokenUsage[];
+}
+
 export type RunStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 
 export interface Run {
@@ -293,6 +323,40 @@ export interface RunState {
   cursor: string;
 }
 
+// ─── Notification Preferences ────────────────────────────────────────────────
+
+export interface NotifPreferenceItem {
+  event_key: string;
+  label: string;
+  sub: string;
+  email_enabled: boolean;
+  push_enabled: boolean;
+}
+
+// ─── Active login sessions (identity) ────────────────────────────────────────
+
+export interface ActiveSession {
+  id: string;
+  ip: string | null;
+  user_agent: string | null;
+  device: string;
+  last_seen_at: string | null;
+  issued_at: string;
+  current: boolean;
+}
+
+// ─── MFA ─────────────────────────────────────────────────────────────────────
+
+export type MfaKind = 'TOTP' | 'SMS_OTP' | 'WEBAUTHN' | 'PUSH';
+
+export interface MfaMethod {
+  id: string;
+  kind: MfaKind;
+  label: string | null;
+  enrolled_at: string;
+  last_used_at: string | null;
+}
+
 // ─── Fleet ──────────────────────────────────────────────────────────────────
 
 export interface PoolTemplateInfo {
@@ -316,4 +380,56 @@ export interface SandboxItem {
   session_id?: string;
   run_id?: string;
   created_at?: string;
+}
+
+// ─── Fleet Topology ──────────────────────────────────────────────────────────
+
+export type TopologyNodeType = 'worker' | 'task' | 'mcp';
+
+/** A single node in the fleet topology graph.
+ *  x/y are NOT present on the wire — the frontend layout algorithm adds them.
+ */
+export interface TopologyNode {
+  id: string;
+  type: TopologyNodeType;
+  label: string;
+  /** Worker: container status ('running', 'idle', etc.)
+   *  Task:   'active'
+   *  Mcp:    'enabled' | 'disabled'
+   */
+  status: string;
+}
+
+/** A node with layout coordinates computed by the frontend. */
+export interface TopologyNodeWithPos extends TopologyNode {
+  x: number;
+  y: number;
+}
+
+export interface TopologyEdge {
+  from: string;
+  to: string;
+  kind: 'worker→task' | 'worker→mcp';
+}
+
+export interface TopologyGraph {
+  nodes: TopologyNode[];
+  edges: TopologyEdge[];
+}
+
+// ─── API Keys ────────────────────────────────────────────────────────────────
+
+/** List item — never contains the raw key or hash. */
+export interface ApiKey {
+  id: string;
+  name: string;
+  key_prefix: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+/** Creation response — includes the raw key exactly once. */
+export interface ApiKeyCreated extends ApiKey {
+  /** The raw key — display once and discard; never retrievable again. */
+  key: string;
 }

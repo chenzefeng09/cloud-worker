@@ -129,6 +129,21 @@ class ReplyEndEvent:
         return {"event_type": "ReplyEndEvent"}
 
 
+class ModelCallEndEvent:
+    """Fake ModelCallEndEvent with token usage fields."""
+
+    def __init__(self, input_tokens: int = 0, output_tokens: int = 0):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+    def model_dump(self):
+        return {
+            "event_type": "ModelCallEndEvent",
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+        }
+
+
 class _FakeAgent:
     """Records its construction args; reply_stream yields canned events (AS 2.x)."""
 
@@ -136,12 +151,11 @@ class _FakeAgent:
     reply_text: str = "ok, did the thing"
     raise_on_call: BaseException | None = None
 
-    def __init__(self, *, name, system_prompt, model, toolkit, state=None, **_kw):
+    def __init__(self, *, name, system_prompt, model, toolkit, **_kw):
         self.name = name
         self.system_prompt = system_prompt
         self.model = model
         self.toolkit = toolkit
-        self.state = state
         _FakeAgent.last_instance = self
 
     async def reply_stream(self, msg):
@@ -200,35 +214,28 @@ def _install_fake_agentscope(monkeypatch):
     tool_mod = types.ModuleType("agentscope.tool")
 
     class _FakeToolkit:
-        def __init__(self):
-            self.tools: list[Any] = []
+        def __init__(self, tools=None, **_kw):
+            self.tools: list[Any] = list(tools or [])
+            self.tool_groups = [types.SimpleNamespace(mcps=[])]
 
         def register_tool_function(self, fn, **_):
             self.tools.append(fn)
 
+    # Minimal stubs for the built-in planning tools so hooks.build_toolkit
+    # can call Toolkit(tools=[TaskCreate(), TaskUpdate(), TaskList()]).
+    class _FakeTaskCreate:
+        pass
+
+    class _FakeTaskUpdate:
+        pass
+
+    class _FakeTaskList:
+        pass
+
     tool_mod.Toolkit = _FakeToolkit
-
-    # Stub agentscope.permission and agentscope.state for the BYPASS path.
-    import enum
-
-    class PermissionMode(enum.Enum):
-        BYPASS = "bypass"
-        CONFIRM = "confirm"
-
-    class PermissionContext:
-        def __init__(self, *, mode: PermissionMode):
-            self.mode = mode
-
-    class AgentState:
-        def __init__(self, *, permission_context: PermissionContext | None = None):
-            self.permission_context = permission_context
-
-    permission_mod = types.ModuleType("agentscope.permission")
-    permission_mod.PermissionMode = PermissionMode
-    permission_mod.PermissionContext = PermissionContext
-
-    state_mod = types.ModuleType("agentscope.state")
-    state_mod.AgentState = AgentState
+    tool_mod.TaskCreate = _FakeTaskCreate
+    tool_mod.TaskUpdate = _FakeTaskUpdate
+    tool_mod.TaskList = _FakeTaskList
 
     for name, mod in [
         ("agentscope", agentscope),
@@ -238,8 +245,6 @@ def _install_fake_agentscope(monkeypatch):
         ("agentscope.model", model_mod),
         ("agentscope.credential", credential_mod),
         ("agentscope.tool", tool_mod),
-        ("agentscope.permission", permission_mod),
-        ("agentscope.state", state_mod),
     ]:
         monkeypatch.setitem(sys.modules, name, mod)
 
@@ -329,7 +334,12 @@ def test_happy_path_writes_result_and_events(workspace, env, monkeypatch):
 
     assert code == 0
     result = json.loads((ws / "result.json").read_text())
-    assert result == {"status": "OK", "summary": "hi back", "error": None}
+    assert result["status"] == "OK"
+    assert result["summary"] == "hi back"
+    assert result["error"] is None
+    # usage is always present (may be all-zeros when no ModelCallEndEvent fired).
+    assert "usage" in result
+    assert isinstance(result["usage"], dict)
 
     # Events come from the fake's reply_stream:
     # TextBlockStartEvent + TextBlockDeltaEvent + ReplyEndEvent = 3 events.
@@ -577,576 +587,344 @@ def test_memory_absent_does_not_break_run(workspace, env, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Tests -- token streaming via _dispatch + RunStateClient
+# Tests -- token accumulation via ModelCallEndEvent
 # ---------------------------------------------------------------------------
 
 
-def _make_mock_state_client():
-    """Return a MagicMock that quacks like RunStateClient."""
-    from unittest.mock import MagicMock
-    client = MagicMock()
-    client.push_token = MagicMock()
-    client.push_token_end = MagicMock()
-    client.write_step = MagicMock()
-    return client
+class _FakeAgentWithTokens:
+    """Like _FakeAgent but emits ModelCallEndEvent(s) to test token accumulation."""
+
+    last_instance: "_FakeAgentWithTokens | None" = None
+    # Each entry is (input_tokens, output_tokens) for one model call.
+    model_call_usages: list[tuple[int, int]] = []
+    reply_text: str = "done"
+
+    def __init__(self, *, name, system_prompt, model, toolkit, **_kw):
+        self.name = name
+        self.system_prompt = system_prompt
+        self.model = model
+        self.toolkit = toolkit
+        _FakeAgentWithTokens.last_instance = self
+
+    async def reply_stream(self, msg):
+        block_id = "blk-t"
+        yield TextBlockStartEvent(block_id)
+        for in_tok, out_tok in _FakeAgentWithTokens.model_call_usages:
+            yield ModelCallEndEvent(input_tokens=in_tok, output_tokens=out_tok)
+        yield TextBlockDeltaEvent(block_id, _FakeAgentWithTokens.reply_text)
+        yield ReplyEndEvent()
 
 
-def test_dispatch_calls_push_token_for_each_delta(tmp_path, monkeypatch):
-    """_dispatch must call push_token once per TextBlockDeltaEvent delta."""
-    import asyncio
-    import sys
-    import types
-    import importlib
+def _install_fake_agentscope_with_tokens(monkeypatch):
+    """Like _install_fake_agentscope but uses _FakeAgentWithTokens."""
+    _FakeAgentWithTokens.last_instance = None
+    _FakeAgentWithTokens.model_call_usages = []
+    _FakeAgentWithTokens.reply_text = "done"
 
-    # Install minimal agentscope stubs needed by _dispatch.
-    class FakeTextBlockLocal:
-        def __init__(self, *, type="text", text=""):
-            self.type = type
-            self.text = text
+    import agentscope_ext.runtime_worker.__main__ as worker_mod
+    import agentscope_ext.runtime_worker.hooks as hooks_mod
+    import agentscope_ext.runtime_worker.redis_state as redis_mod
 
-    class FakeMsgLocal:
-        def __init__(self, name, content, role):
-            pass
+    # Reuse the agentscope stubs from _install_fake_agentscope but swap Agent.
+    import types as _types
 
-    # Class names must exactly match what _dispatch checks via type(event).__name__.
-    class TextBlockStartEvent:  # noqa: N801
-        def __init__(self, block_id):
-            self.block_id = block_id
-        def model_dump(self):
-            return {"event_type": "TextBlockStartEvent", "block_id": self.block_id}
+    agentscope = _types.ModuleType("agentscope")
+    agent_mod = _types.ModuleType("agentscope.agent")
+    agent_mod.Agent = _FakeAgentWithTokens
+    message_mod = _types.ModuleType("agentscope.message")
+    message_mod.Msg = _FakeMsg
+    message_mod.TextBlock = _FakeTextBlock
 
-    class TextBlockDeltaEvent:  # noqa: N801
-        def __init__(self, block_id, delta):
-            self.block_id = block_id
-            self.delta = delta
-        def model_dump(self):
-            return {"event_type": "TextBlockDeltaEvent", "block_id": self.block_id, "delta": self.delta}
+    formatter_mod = _types.ModuleType("agentscope.formatter")
+    formatter_mod.AnthropicChatFormatter = lambda: "fake-anthropic-formatter"
+    formatter_mod.OpenAIChatFormatter = lambda: "fake-openai-formatter"
+    formatter_mod.DeepSeekChatFormatter = lambda: "fake-deepseek-formatter"
 
-    class ReplyEndEvent:  # noqa: N801
-        def model_dump(self):
-            return {"event_type": "ReplyEndEvent"}
+    model_mod = _types.ModuleType("agentscope.model")
+    credential_mod = _types.ModuleType("agentscope.credential")
 
-    class MultiDeltaAgent:
-        """Emits three deltas across two blocks."""
-        async def reply_stream(self, msg):
-            yield TextBlockStartEvent("blk-A")
-            yield TextBlockDeltaEvent("blk-A", "Hello")
-            yield TextBlockDeltaEvent("blk-A", " world")
-            yield TextBlockStartEvent("blk-B")
-            yield TextBlockDeltaEvent("blk-B", "!")
-            yield ReplyEndEvent()
+    class _FakeCred:
+        def __init__(self, **kw):
+            self.kw = kw
 
-    message_mod = types.ModuleType("agentscope.message")
-    message_mod.Msg = FakeMsgLocal
-    message_mod.TextBlock = FakeTextBlockLocal
-    monkeypatch.setitem(sys.modules, "agentscope.message", message_mod)
+    class _FakeAnthropic:
+        def __init__(self, *, credential, model, stream=False, formatter=None):
+            self.credential = credential
+            self.model_name = model
+            self.kind = "anthropic"
 
-    import agentscope_ext.runtime_worker.__main__ as worker
-    importlib.reload(worker)
+    credential_mod.AnthropicCredential = _FakeCred
+    credential_mod.OpenAICredential = _FakeCred
+    credential_mod.DeepSeekCredential = _FakeCred
+    model_mod.AnthropicChatModel = _FakeAnthropic
+    model_mod.OpenAIChatModel = _FakeAnthropic
+    model_mod.DeepSeekChatModel = _FakeAnthropic
 
-    events_path = tmp_path / "events.jsonl"
-    events_path.touch()
+    tool_mod = _types.ModuleType("agentscope.tool")
 
-    mock_client = _make_mock_state_client()
-    agent = MultiDeltaAgent()
-    result = asyncio.run(worker._dispatch(agent, "go", events_path, state_client=mock_client))
+    class _FakeToolkit:
+        def __init__(self, tools=None, **_kw):
+            self.tools: list = list(tools or [])
+            self.tool_groups = [_types.SimpleNamespace(mcps=[])]
 
-    # Three deltas must each produce a push_token call, in order.
-    from unittest.mock import call
-    mock_client.push_token.assert_has_calls([
-        call("Hello"),
-        call(" world"),
-        call("!"),
-    ])
-    assert mock_client.push_token.call_count == 3
+        def register_tool_function(self, fn, **_):
+            self.tools.append(fn)
 
-    # push_token_end must be called exactly once, after all deltas.
-    mock_client.push_token_end.assert_called_once()
+    class _FakeTaskCreate:
+        pass
 
-    # Final text must be the joined deltas.
-    assert result == "Hello world\n!"
+    class _FakeTaskUpdate:
+        pass
 
+    class _FakeTaskList:
+        pass
 
-def test_dispatch_push_token_end_called_even_with_no_deltas(tmp_path, monkeypatch):
-    """push_token_end must be called even when the agent emits no TextBlockDeltaEvent."""
-    import asyncio
-    import sys
-    import types
-    import importlib
+    tool_mod.Toolkit = _FakeToolkit
+    tool_mod.TaskCreate = _FakeTaskCreate
+    tool_mod.TaskUpdate = _FakeTaskUpdate
+    tool_mod.TaskList = _FakeTaskList
 
-    class FakeMsgLocal2:
-        def __init__(self, name, content, role):
-            pass
-
-    class FakeTextBlockLocal2:
-        def __init__(self, *, type="text", text=""):
-            pass
-
-    class ReplyEndEvent:  # noqa: N801 — name must match __name__ check
-        def model_dump(self):
-            return {"event_type": "ReplyEndEvent"}
-
-    class SilentAgent:
-        async def reply_stream(self, msg):
-            yield ReplyEndEvent()
-
-    message_mod = types.ModuleType("agentscope.message")
-    message_mod.Msg = FakeMsgLocal2
-    message_mod.TextBlock = FakeTextBlockLocal2
-    monkeypatch.setitem(sys.modules, "agentscope.message", message_mod)
-
-    import agentscope_ext.runtime_worker.__main__ as worker
-    importlib.reload(worker)
-
-    events_path = tmp_path / "events.jsonl"
-    events_path.touch()
-
-    mock_client = _make_mock_state_client()
-    result = asyncio.run(worker._dispatch(SilentAgent(), "ping", events_path, state_client=mock_client))
-
-    mock_client.push_token.assert_not_called()
-    mock_client.push_token_end.assert_called_once()
-    assert result == ""
+    for name, mod in [
+        ("agentscope", agentscope),
+        ("agentscope.agent", agent_mod),
+        ("agentscope.message", message_mod),
+        ("agentscope.formatter", formatter_mod),
+        ("agentscope.model", model_mod),
+        ("agentscope.credential", credential_mod),
+        ("agentscope.tool", tool_mod),
+    ]:
+        monkeypatch.setitem(sys.modules, name, mod)
 
 
-def test_dispatch_no_state_client_does_not_call_push_token(tmp_path, monkeypatch):
-    """When state_client is None _dispatch must not call any streaming methods."""
-    import asyncio
-    import sys
-    import types
-    import importlib
-
-    class FakeMsgLocal3:
-        def __init__(self, name, content, role):
-            pass
-
-    class FakeTextBlockLocal3:
-        def __init__(self, *, type="text", text=""):
-            pass
-
-    class TextBlockDeltaEvent:  # noqa: N801 — name must match
-        def __init__(self, block_id, delta):
-            self.block_id = block_id
-            self.delta = delta
-        def model_dump(self):
-            return {"event_type": "TextBlockDeltaEvent", "block_id": self.block_id, "delta": self.delta}
-
-    class AgentWithDelta:
-        async def reply_stream(self, msg):
-            yield TextBlockDeltaEvent("blk", "data")
-
-    message_mod = types.ModuleType("agentscope.message")
-    message_mod.Msg = FakeMsgLocal3
-    message_mod.TextBlock = FakeTextBlockLocal3
-    monkeypatch.setitem(sys.modules, "agentscope.message", message_mod)
-
-    import agentscope_ext.runtime_worker.__main__ as worker
-    importlib.reload(worker)
-
-    events_path = tmp_path / "events.jsonl"
-    events_path.touch()
-
-    # Must not raise even with state_client=None.
-    result = asyncio.run(worker._dispatch(AgentWithDelta(), "x", events_path, state_client=None))
-    assert result == "data"
-
-
-def test_dispatch_result_json_unaffected_by_streaming(workspace, env, monkeypatch):
-    """Enabling token streaming must not change result.json output."""
-    from unittest.mock import MagicMock
+def test_token_counts_accumulated_from_model_call_end_events(workspace, env, monkeypatch):
+    """ModelCallEndEvent tokens are accumulated and written to result.json usage."""
     ws, worker_mod = workspace
-    _install_fake_agentscope(monkeypatch)
+    _install_fake_agentscope_with_tokens(monkeypatch)
 
-    # Install a fake RunStateClient that records push calls.
-    import agentscope_ext.runtime_worker.redis_state as rs_mod
-    importlib.reload(rs_mod)
-
-    push_log: list[str] = []
-    end_log: list[bool] = []
-
-    class _TrackingClient:
-        def read_checkpoint(self): return None
-        def write_step(self, **_kw): pass
-        def mark_completed(self): pass
-        def mark_failed(self): pass
-        def push_token(self, delta): push_log.append(delta)
-        def push_token_end(self): end_log.append(True)
-
-    monkeypatch.setattr(rs_mod, "from_env", lambda: _TrackingClient())
-
-    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "stream me"}))
-    _FakeAgent.reply_text = "streamed reply"
+    _FakeAgentWithTokens.model_call_usages = [(100, 50), (200, 80)]
+    _FakeAgentWithTokens.reply_text = "summary"
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "count tokens"}))
 
     code = worker_mod.main([])
 
     assert code == 0
     result = json.loads((ws / "result.json").read_text())
-    assert result == {"status": "OK", "summary": "streamed reply", "error": None}
-
-    # Streaming side-effects happened.
-    assert push_log == ["streamed reply"]
-    assert end_log == [True]
-
-
-# ---------------------------------------------------------------------------
-# Tests -- BYPASS permission context is injected into Agent
-# ---------------------------------------------------------------------------
+    assert result["status"] == "OK"
+    usage = result["usage"]
+    assert usage["input_tokens"] == 300   # 100 + 200
+    assert usage["output_tokens"] == 130  # 50 + 80
+    assert usage["total_tokens"] == 430   # 300 + 130
 
 
-def test_agent_constructed_with_bypass_permission_state(workspace, env, monkeypatch):
-    """_run_real must pass an AgentState with PermissionMode.BYPASS to Agent
-    so headless tool calls are auto-approved without user confirmation."""
+def test_token_counts_zero_when_no_model_call_end_events(workspace, env, monkeypatch):
+    """When no ModelCallEndEvent is emitted, usage is all zeros."""
     ws, worker_mod = workspace
     _install_fake_agentscope(monkeypatch)
 
-    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "do something"}))
-    _FakeAgent.reply_text = "done"
+    _FakeAgent.reply_text = "no tokens"
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "silent"}))
 
     code = worker_mod.main([])
+
     assert code == 0
-
-    inst = _FakeAgent.last_instance
-    assert inst is not None, "Agent was never constructed"
-
-    # state must not be None — BYPASS path succeeded.
-    assert inst.state is not None, (
-        "Agent.state is None; BYPASS permission was not injected. "
-        "Tool calls will require user confirmation in the headless sandbox."
-    )
-
-    ctx = inst.state.permission_context
-    assert ctx is not None, "state.permission_context is None"
-
-    # Import the fake PermissionMode that was installed by _install_fake_agentscope.
-    from agentscope.permission import PermissionMode  # type: ignore[import]
-
-    assert ctx.mode == PermissionMode.BYPASS, (
-        f"Expected PermissionMode.BYPASS but got {ctx.mode!r}"
-    )
+    result = json.loads((ws / "result.json").read_text())
+    usage = result["usage"]
+    assert usage["input_tokens"] == 0
+    assert usage["output_tokens"] == 0
+    assert usage["total_tokens"] == 0
 
 
-def test_agent_bypass_permission_fallback_when_permission_module_absent(
-    workspace, env, monkeypatch
-):
-    """If agentscope.permission / agentscope.state are missing the worker must
-    still complete normally (failure-open) without raising."""
+# ---------------------------------------------------------------------------
+# Tests -- plan_steps extraction + result.json persistence
+# ---------------------------------------------------------------------------
+
+
+class _FakeTask:
+    """Minimal Task stub for plan_steps extraction tests."""
+
+    def __init__(self, subject: str, state: str):
+        self.subject = subject
+        self.state = state
+
+
+class _FakeTasksContext:
+    def __init__(self, tasks):
+        self.tasks = tasks
+
+
+class _ToolCallEndEvent:
+    """Fake ToolCallEndEvent — type().__name__ must equal 'ToolCallEndEvent'."""
+
+    def model_dump(self):
+        return {"event_type": "ToolCallEndEvent"}
+
+
+class _FakeAgentWithTasks:
+    """Agent stub whose state exposes tasks_context for plan extraction."""
+
+    last_instance: "_FakeAgentWithTasks | None" = None
+    reply_text: str = "done"
+    tasks: list = []  # set per-test
+
+    def __init__(self, *, name, system_prompt, model, toolkit, **_kw):
+        self.name = name
+        self.system_prompt = system_prompt
+        self.model = model
+        self.toolkit = toolkit
+        # Attach a state object with tasks_context.
+        self.state = types.SimpleNamespace(
+            tasks_context=_FakeTasksContext(list(_FakeAgentWithTasks.tasks))
+        )
+        _FakeAgentWithTasks.last_instance = self
+
+    async def reply_stream(self, msg):
+        block_id = "blk-plan"
+        yield TextBlockStartEvent(block_id)
+        # Emit a ToolCallEndEvent so _dispatch re-reads tasks.
+        yield _ToolCallEndEvent()
+        yield TextBlockDeltaEvent(block_id, _FakeAgentWithTasks.reply_text)
+        yield ReplyEndEvent()
+
+
+def _install_fake_agentscope_with_tasks(monkeypatch):
+    """Install stubs identical to _install_fake_agentscope but using _FakeAgentWithTasks."""
+    _FakeAgentWithTasks.last_instance = None
+    _FakeAgentWithTasks.tasks = []
+    _FakeAgentWithTasks.reply_text = "done"
+
+    _types = types  # local alias
+
+    agentscope = _types.ModuleType("agentscope")
+    agent_mod = _types.ModuleType("agentscope.agent")
+    agent_mod.Agent = _FakeAgentWithTasks
+    message_mod = _types.ModuleType("agentscope.message")
+    message_mod.Msg = _FakeMsg
+    message_mod.TextBlock = _FakeTextBlock
+
+    formatter_mod = _types.ModuleType("agentscope.formatter")
+    formatter_mod.AnthropicChatFormatter = lambda: "fake-fmt"
+    formatter_mod.OpenAIChatFormatter = lambda: "fake-fmt"
+    formatter_mod.DeepSeekChatFormatter = lambda: "fake-fmt"
+
+    model_mod = _types.ModuleType("agentscope.model")
+    credential_mod = _types.ModuleType("agentscope.credential")
+
+    class _FakeCred:
+        def __init__(self, **kw):
+            pass
+
+    class _FakeAnthropic:
+        def __init__(self, *, credential, model, stream=False, formatter=None):
+            self.model_name = model
+            self.kind = "anthropic"
+
+    credential_mod.AnthropicCredential = _FakeCred
+    credential_mod.OpenAICredential = _FakeCred
+    credential_mod.DeepSeekCredential = _FakeCred
+    model_mod.AnthropicChatModel = _FakeAnthropic
+    model_mod.OpenAIChatModel = _FakeAnthropic
+    model_mod.DeepSeekChatModel = _FakeAnthropic
+
+    tool_mod = _types.ModuleType("agentscope.tool")
+
+    class _FakeToolkit:
+        def __init__(self, tools=None):
+            self.tools: list = tools or []
+            self.tool_groups = [_types.SimpleNamespace(mcps=[])]
+
+    class _FakeTaskCreate:
+        pass
+
+    class _FakeTaskUpdate:
+        pass
+
+    class _FakeTaskList:
+        pass
+
+    tool_mod.Toolkit = _FakeToolkit
+    tool_mod.TaskCreate = _FakeTaskCreate
+    tool_mod.TaskUpdate = _FakeTaskUpdate
+    tool_mod.TaskList = _FakeTaskList
+
+    for name, mod in [
+        ("agentscope", agentscope),
+        ("agentscope.agent", agent_mod),
+        ("agentscope.message", message_mod),
+        ("agentscope.formatter", formatter_mod),
+        ("agentscope.model", model_mod),
+        ("agentscope.credential", credential_mod),
+        ("agentscope.tool", tool_mod),
+    ]:
+        monkeypatch.setitem(sys.modules, name, mod)
+
+
+def test_plan_steps_empty_when_no_tasks(workspace, env, monkeypatch):
+    """result.json always carries plan_steps key; it is [] when agent made no tasks."""
     ws, worker_mod = workspace
     _install_fake_agentscope(monkeypatch)
 
-    # Remove the permission/state stubs to simulate an older AgentScope version.
-    monkeypatch.setitem(sys.modules, "agentscope.permission", None)
-    monkeypatch.setitem(sys.modules, "agentscope.state", None)
-
-    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "do something fallback"}))
-    _FakeAgent.reply_text = "fallback ok"
+    _FakeAgent.reply_text = "no tasks"
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "simple"}))
 
     code = worker_mod.main([])
-    assert code == 0, "Worker must not crash when permission module is absent"
 
+    assert code == 0
+    result = json.loads((ws / "result.json").read_text())
+    assert "plan_steps" in result
+    assert result["plan_steps"] == []
+
+
+def test_plan_steps_extracted_from_agent_tasks(workspace, env, monkeypatch):
+    """plan_steps reflects agent.state.tasks_context.tasks with correct shape."""
+    ws, worker_mod = workspace
+    _install_fake_agentscope_with_tasks(monkeypatch)
+
+    _FakeAgentWithTasks.tasks = [
+        _FakeTask("Research the problem", "completed"),
+        _FakeTask("Write solution", "in_progress"),
+        _FakeTask("Review output", "pending"),
+    ]
+    _FakeAgentWithTasks.reply_text = "done planning"
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "multi-step"}))
+
+    code = worker_mod.main([])
+
+    assert code == 0
     result = json.loads((ws / "result.json").read_text())
     assert result["status"] == "OK"
 
-    # state should be None (fell back gracefully).
-    inst = _FakeAgent.last_instance
+    steps = result["plan_steps"]
+    assert len(steps) == 3
+
+    # n is 1-based
+    assert steps[0] == {"n": 1, "t": "Research the problem", "d": True, "live": False}
+    assert steps[1] == {"n": 2, "t": "Write solution", "d": False, "live": True}
+    assert steps[2] == {"n": 3, "t": "Review output", "d": False, "live": False}
+
+
+def test_extract_plan_steps_returns_empty_on_missing_state(workspace, env, monkeypatch):
+    """_extract_plan_steps never raises; returns [] when agent has no state attr."""
+    import agentscope_ext.runtime_worker.__main__ as worker_mod
+
+    class _BrokenAgent:
+        pass  # no .state attribute at all
+
+    steps = worker_mod._extract_plan_steps(_BrokenAgent())
+    assert steps == []
+
+
+def test_planning_guidance_in_system_prompt(workspace, env, monkeypatch):
+    """The assembled system prompt always contains planning tool guidance."""
+    ws, worker_mod = workspace
+    _install_fake_agentscope_with_tasks(monkeypatch)
+
+    _FakeAgentWithTasks.reply_text = "done"
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "complex task"}))
+
+    code = worker_mod.main([])
+
+    assert code == 0
+    inst = _FakeAgentWithTasks.last_instance
     assert inst is not None
-    assert inst.state is None, (
-        "Expected state=None when permission module unavailable, "
-        f"got {inst.state!r}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Tests -- tool call/result streaming via _dispatch
-# ---------------------------------------------------------------------------
-
-
-def _make_tool_mock_state_client():
-    """Return a MagicMock that quacks like RunStateClient for tool streaming tests."""
-    from unittest.mock import MagicMock
-
-    client = MagicMock()
-    client.push_token = MagicMock()
-    client.push_token_end = MagicMock()
-    client.push_tool_call = MagicMock()
-    client.push_tool_result = MagicMock()
-    client.push_thinking = MagicMock()
-    client.write_step = MagicMock()
-    return client
-
-
-def _make_agentscope_message_stub(monkeypatch):
-    """Install a minimal agentscope.message stub needed by _dispatch."""
-
-    class _FakeTB:
-        def __init__(self, *, type="text", text=""):
-            self.type = type
-            self.text = text
-
-    class _FakeMsg:
-        def __init__(self, name, content, role):
-            pass
-
-    msg_mod = types.ModuleType("agentscope.message")
-    msg_mod.Msg = _FakeMsg
-    msg_mod.TextBlock = _FakeTB
-    monkeypatch.setitem(sys.modules, "agentscope.message", msg_mod)
-
-
-def test_dispatch_tool_call_accumulates_args_and_pushes_on_end(tmp_path, monkeypatch):
-    """_dispatch must accumulate ToolCallDelta args, then call push_tool_call on ToolCallEnd."""
-    _make_agentscope_message_stub(monkeypatch)
-
-    class ToolCallStartEvent:
-        def __init__(self, tool_call_id, tool_call_name):
-            self.tool_call_id = tool_call_id
-            self.tool_call_name = tool_call_name
-        def model_dump(self):
-            return {"event_type": "ToolCallStartEvent", "tool_call_id": self.tool_call_id}
-
-    class ToolCallDeltaEvent:
-        def __init__(self, tool_call_id, delta):
-            self.tool_call_id = tool_call_id
-            self.delta = delta
-        def model_dump(self):
-            return {"event_type": "ToolCallDeltaEvent", "tool_call_id": self.tool_call_id}
-
-    class ToolCallEndEvent:
-        def __init__(self, tool_call_id):
-            self.tool_call_id = tool_call_id
-        def model_dump(self):
-            return {"event_type": "ToolCallEndEvent", "tool_call_id": self.tool_call_id}
-
-    class ReplyEndEvent:
-        def model_dump(self):
-            return {"event_type": "ReplyEndEvent"}
-
-    class ToolCallAgent:
-        async def reply_stream(self, msg):
-            yield ToolCallStartEvent("tc-1", "Read")
-            yield ToolCallDeltaEvent("tc-1", '{"file": "src/')
-            yield ToolCallDeltaEvent("tc-1", 'auth.ts", "limit": 100}')
-            yield ToolCallEndEvent("tc-1")
-            yield ReplyEndEvent()
-
-    import asyncio
-    import importlib
-    import agentscope_ext.runtime_worker.__main__ as worker
-    importlib.reload(worker)
-
-    events_path = tmp_path / "events.jsonl"
-    events_path.touch()
-    mock_client = _make_tool_mock_state_client()
-
-    asyncio.run(worker._dispatch(ToolCallAgent(), "task", events_path, state_client=mock_client))
-
-    # push_tool_call must be called exactly once with the fully accumulated args.
-    mock_client.push_tool_call.assert_called_once_with(
-        "tc-1",
-        "Read",
-        '{"file": "src/auth.ts", "limit": 100}',
-    )
-    # push_tool_result must NOT be called (no result events).
-    mock_client.push_tool_result.assert_not_called()
-
-
-def test_dispatch_tool_result_accumulates_text_and_pushes_on_end(tmp_path, monkeypatch):
-    """_dispatch must accumulate ToolResultTextDelta text, then call push_tool_result on ToolResultEnd."""
-    _make_agentscope_message_stub(monkeypatch)
-
-    class ToolResultStartEvent:
-        def __init__(self, tool_call_id, tool_call_name):
-            self.tool_call_id = tool_call_id
-            self.tool_call_name = tool_call_name
-        def model_dump(self):
-            return {"event_type": "ToolResultStartEvent"}
-
-    class ToolResultTextDeltaEvent:
-        def __init__(self, tool_call_id, delta):
-            self.tool_call_id = tool_call_id
-            self.delta = delta
-        def model_dump(self):
-            return {"event_type": "ToolResultTextDeltaEvent"}
-
-    class ToolResultEndEvent:
-        def __init__(self, tool_call_id, state):
-            self.tool_call_id = tool_call_id
-            self.state = state
-        def model_dump(self):
-            return {"event_type": "ToolResultEndEvent"}
-
-    class ReplyEndEvent:
-        def model_dump(self):
-            return {"event_type": "ReplyEndEvent"}
-
-    class ToolResultAgent:
-        async def reply_stream(self, msg):
-            yield ToolResultStartEvent("tc-2", "Read")
-            yield ToolResultTextDeltaEvent("tc-2", "line 1\n")
-            yield ToolResultTextDeltaEvent("tc-2", "line 2\n")
-            yield ToolResultEndEvent("tc-2", "success")
-            yield ReplyEndEvent()
-
-    import asyncio
-    import importlib
-    import agentscope_ext.runtime_worker.__main__ as worker
-    importlib.reload(worker)
-
-    events_path = tmp_path / "events.jsonl"
-    events_path.touch()
-    mock_client = _make_tool_mock_state_client()
-
-    asyncio.run(worker._dispatch(ToolResultAgent(), "task", events_path, state_client=mock_client))
-
-    mock_client.push_tool_result.assert_called_once_with(
-        "tc-2",
-        "Read",
-        "line 1\nline 2\n",
-        "success",
-    )
-    mock_client.push_tool_call.assert_not_called()
-
-
-def test_dispatch_full_tool_call_and_result_sequence(tmp_path, monkeypatch):
-    """_dispatch handles a full ToolCallStart→Delta→End→ResultStart→ResultDelta→ResultEnd cycle."""
-    _make_agentscope_message_stub(monkeypatch)
-
-    class ToolCallStartEvent:
-        def __init__(self, tool_call_id, tool_call_name):
-            self.tool_call_id = tool_call_id
-            self.tool_call_name = tool_call_name
-        def model_dump(self):
-            return {"event_type": "ToolCallStartEvent"}
-
-    class ToolCallDeltaEvent:
-        def __init__(self, tool_call_id, delta):
-            self.tool_call_id = tool_call_id
-            self.delta = delta
-        def model_dump(self):
-            return {"event_type": "ToolCallDeltaEvent"}
-
-    class ToolCallEndEvent:
-        def __init__(self, tool_call_id):
-            self.tool_call_id = tool_call_id
-        def model_dump(self):
-            return {"event_type": "ToolCallEndEvent"}
-
-    class ToolResultStartEvent:
-        def __init__(self, tool_call_id, tool_call_name):
-            self.tool_call_id = tool_call_id
-            self.tool_call_name = tool_call_name
-        def model_dump(self):
-            return {"event_type": "ToolResultStartEvent"}
-
-    class ToolResultTextDeltaEvent:
-        def __init__(self, tool_call_id, delta):
-            self.tool_call_id = tool_call_id
-            self.delta = delta
-        def model_dump(self):
-            return {"event_type": "ToolResultTextDeltaEvent"}
-
-    class ToolResultEndEvent:
-        def __init__(self, tool_call_id, state):
-            self.tool_call_id = tool_call_id
-            self.state = state
-        def model_dump(self):
-            return {"event_type": "ToolResultEndEvent"}
-
-    class TextBlockStartEvent:
-        def __init__(self, block_id):
-            self.block_id = block_id
-        def model_dump(self):
-            return {"event_type": "TextBlockStartEvent", "block_id": self.block_id}
-
-    class TextBlockDeltaEvent:
-        def __init__(self, block_id, delta):
-            self.block_id = block_id
-            self.delta = delta
-        def model_dump(self):
-            return {"event_type": "TextBlockDeltaEvent", "block_id": self.block_id, "delta": self.delta}
-
-    class ReplyEndEvent:
-        def model_dump(self):
-            return {"event_type": "ReplyEndEvent"}
-
-    class FullCycleAgent:
-        async def reply_stream(self, msg):
-            # Tool use first
-            yield ToolCallStartEvent("tc-A", "Grep")
-            yield ToolCallDeltaEvent("tc-A", '{"pattern": "def ')
-            yield ToolCallDeltaEvent("tc-A", 'main"}')
-            yield ToolCallEndEvent("tc-A")
-            yield ToolResultStartEvent("tc-A", "Grep")
-            yield ToolResultTextDeltaEvent("tc-A", "Found in ")
-            yield ToolResultTextDeltaEvent("tc-A", "main.py:5")
-            yield ToolResultEndEvent("tc-A", "success")
-            # Then text reply
-            yield TextBlockStartEvent("blk-1")
-            yield TextBlockDeltaEvent("blk-1", "Done.")
-            yield ReplyEndEvent()
-
-    import asyncio
-    import importlib
-    from unittest.mock import call as mcall
-    import agentscope_ext.runtime_worker.__main__ as worker
-    importlib.reload(worker)
-
-    events_path = tmp_path / "events.jsonl"
-    events_path.touch()
-    mock_client = _make_tool_mock_state_client()
-
-    result = asyncio.run(
-        worker._dispatch(FullCycleAgent(), "task", events_path, state_client=mock_client)
-    )
-
-    # Tool call: args fully accumulated
-    mock_client.push_tool_call.assert_called_once_with(
-        "tc-A", "Grep", '{"pattern": "def main"}'
-    )
-    # Tool result: text fully accumulated, state preserved
-    mock_client.push_tool_result.assert_called_once_with(
-        "tc-A", "Grep", "Found in main.py:5", "success"
-    )
-    # Token streaming still works
-    mock_client.push_token.assert_called_once_with("Done.")
-    mock_client.push_token_end.assert_called_once()
-
-    # Call order: push_tool_call before push_tool_result before push_token.
-    all_calls = mock_client.method_calls
-    call_names = [c[0] for c in all_calls if c[0] in ("push_tool_call", "push_tool_result", "push_token", "push_token_end")]
-    assert call_names.index("push_tool_call") < call_names.index("push_tool_result")
-    assert call_names.index("push_tool_result") < call_names.index("push_token")
-
-    assert result == "Done."
-
-
-def test_dispatch_thinking_event_pushes_thinking(tmp_path, monkeypatch):
-    """ThinkEvent must call push_thinking with the thought text."""
-    _make_agentscope_message_stub(monkeypatch)
-
-    class ThinkEvent:
-        def __init__(self, thought):
-            self.thought = thought
-        def model_dump(self):
-            return {"event_type": "ThinkEvent", "thought": self.thought}
-
-    class ReplyEndEvent:
-        def model_dump(self):
-            return {"event_type": "ReplyEndEvent"}
-
-    class ThinkingAgent:
-        async def reply_stream(self, msg):
-            yield ThinkEvent("I should read the auth file")
-            yield ReplyEndEvent()
-
-    import asyncio
-    import importlib
-    import agentscope_ext.runtime_worker.__main__ as worker
-    importlib.reload(worker)
-
-    events_path = tmp_path / "events.jsonl"
-    events_path.touch()
-    mock_client = _make_tool_mock_state_client()
-
-    asyncio.run(worker._dispatch(ThinkingAgent(), "task", events_path, state_client=mock_client))
-
-    mock_client.push_thinking.assert_called_once_with("I should read the auth file")
+    # The system prompt must include TaskCreate guidance.
+    assert "TaskCreate" in inst.system_prompt

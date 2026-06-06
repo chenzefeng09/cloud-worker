@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -171,7 +172,7 @@ class SkillService:
         *,
         version: str,
         tarball: bytes,
-        manifest: dict | str | None,
+        manifest: dict[str, Any] | str | None,
         expected_sha256: str | None,
         uploaded_by: str | None,
     ) -> SkillVersion:
@@ -181,7 +182,7 @@ class SkillService:
         if expected_sha256 and expected_sha256.lower() != computed_sha:
             raise SkillSha256MismatchError()
 
-        manifest_dict: dict
+        manifest_dict: dict[str, Any]
         if manifest is None:
             manifest_dict = {}
         elif isinstance(manifest, str):

@@ -10,6 +10,7 @@ import { sessionStatusZh } from '../lib/format';
 import { useWorkspace } from '../lib/workspaceContext';
 import { api } from '../api/client';
 import type { Run, RunState, Attachment, InstalledSkill } from '../api/types';
+import type { PlanStep } from '../lib/designFixtures';
 import { FilePreviewPanel } from '../components/FilePreviewPanel';
 import { OutputFileCards } from '../components/OutputFileCards';
 import { useOutputAttachments } from '../hooks/useOutputAttachments';
@@ -123,6 +124,18 @@ function useRunState(sessionId: string | undefined, run: Run | null) {
   return state;
 }
 
+/** Stable empty-array reference — never recreate inline in a Zustand selector. */
+const EMPTY_PLAN_STEPS: PlanStep[] = [];
+
+/** Format elapsed seconds as "Xm Ys" or "Xs". */
+function fmtElapsed(seconds: number): string {
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${m}m ${rem}s`;
+}
+
 /**
  * Single-task agent view. The URL `/tasks/:id` drives `activeSessionId` in the
  * chat store so the existing `ChatWindow` / `useChat` SSE pipeline (B-M1) keeps
@@ -145,6 +158,11 @@ export function AgentPage() {
   const selectedSkills = useChatStore((s) => (id ? s.selectedSkills[id] : undefined));
   const toggleSkill = useChatStore((s) => s.toggleSkill);
   const seedSkills = useChatStore((s) => s.seedSkills);
+  // Select the raw stored value (stable reference); apply the empty fallback
+  // OUTSIDE the selector — returning `?? []` inside it creates a new array
+  // every render and triggers a getSnapshot infinite loop.
+  const storedPlanSteps = useChatStore((s) => s.planSteps[id ?? '']);
+  const planSteps = storedPlanSteps ?? EMPTY_PLAN_STEPS;
   const { sendMessage, cancel, isStreaming } = useChat();
 
   // Real data hooks for context rail
@@ -232,6 +250,38 @@ export function AgentPage() {
   }, [id, activeSessionId, location.pathname, location.state, navigate, sendMessage]);
 
   const session = sessions.find((s) => s.id === id);
+
+  // Fetch the current run to obtain started_at for the elapsed timer.
+  const [currentRun, setCurrentRun] = useState<Run | null>(null);
+  const [elapsedSec, setElapsedSec] = useState(0);
+
+  useEffect(() => {
+    if (!id || !session?.current_run_id) {
+      setCurrentRun(null);
+      return;
+    }
+    let cancelled = false;
+    api.runs.get(id, session.current_run_id).then((run) => {
+      if (!cancelled) setCurrentRun(run);
+    }).catch(() => { /* best-effort */ });
+    return () => { cancelled = true; };
+  }, [id, session?.current_run_id]);
+
+  // Tick the elapsed counter every second while there's a live run with started_at.
+  useEffect(() => {
+    if (!currentRun?.started_at) {
+      setElapsedSec(0);
+      return;
+    }
+    const startedAt = new Date(currentRun.started_at).getTime();
+    const tick = () => {
+      const now = Date.now();
+      setElapsedSec(Math.max(0, Math.floor((now - startedAt) / 1000)));
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [currentRun?.started_at]);
 
   if (!id) {
     return (
@@ -348,6 +398,11 @@ export function AgentPage() {
                       since {elapsedStr(run.started_at)} ago
                     </div>
                   </div>
+                  <div className="font-mono text-[10px] text-ink-2 shrink-0 text-right">
+                    {run.total_tokens != null && (
+                      <div>{run.total_tokens.toLocaleString()} tok</div>
+                    )}
+                  </div>
                 </div>
               ) : (
                 <span className="font-mono text-[11px] italic text-dim">暂无运行</span>
@@ -378,6 +433,30 @@ export function AgentPage() {
                 )}
               </div>
             </div>
+
+            {/* ── Plan (real-time from agent TaskCreate/TaskUpdate) ── */}
+            {planSteps.length > 0 && (
+              <div>
+                <div className="cw-label mb-1.5">
+                  Plan · {planSteps.length} steps
+                </div>
+                <div className="flex flex-col gap-0.5">
+                  {planSteps.map((s) => (
+                    <div
+                      key={s.n}
+                      className="flex items-center gap-2 px-1.5 py-1"
+                      style={{
+                        borderRadius: 4,
+                        background: s.live ? 'var(--accent-soft)' : 'transparent',
+                      }}
+                    >
+                      <span className="font-mono text-[10px] text-dim shrink-0">{s.n}</span>
+                      <span className="font-mono text-[11px] text-ink-2 truncate">{s.t}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* ── Plan (real data from run state) ── */}
             <div>
@@ -424,13 +503,26 @@ export function AgentPage() {
                   <span className="font-mono text-[10.5px] text-accent">运行中…</span>
                 </div>
               )}
-              <div className="font-mono text-[10.5px] text-ink-2 leading-[1.6]">
-                <div>tokens · {run?.total_tokens != null
-                  ? (run.total_tokens >= 1000
-                    ? `${(run.total_tokens / 1000).toFixed(1)}k`
-                    : String(run.total_tokens))
-                  : '—'}</div>
-              </div>
+              {currentRun?.started_at ? (
+                <div className="font-mono text-[10.5px] text-ink-2 leading-[1.6]">
+                  <div>elapsed · {fmtElapsed(elapsedSec)}</div>
+                  {currentRun.input_tokens != null && (
+                    <div>in · {currentRun.input_tokens.toLocaleString()} tok</div>
+                  )}
+                  {currentRun.output_tokens != null && (
+                    <div>out · {currentRun.output_tokens.toLocaleString()} tok</div>
+                  )}
+                  {currentRun.total_tokens != null && (
+                    <div>total · {currentRun.total_tokens.toLocaleString()} tok</div>
+                  )}
+                </div>
+              ) : (
+                !isStreaming && !currentRun && (
+                  <div className="font-mono text-[10.5px] text-dim italic leading-[1.6]">
+                    无活跃任务
+                  </div>
+                )
+              )}
             </div>
           </aside>
         )}
