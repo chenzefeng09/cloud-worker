@@ -9,15 +9,59 @@ export interface Session {
   updated_at: string;
 }
 
+/** One entry in a TOOL message's tool_calls array. */
+export interface ToolCallEntry {
+  id: string;
+  name: string;
+  /** Parsed input object (may be empty if args couldn't be parsed). */
+  input: Record<string, unknown>;
+  /** Tool output text, present after the tool has returned. */
+  result?: string;
+  /** Execution state, e.g. "success" or "error". */
+  state?: string;
+}
+
+/** Minimal attachment metadata embedded in a user message. */
+export interface MessageAttachment {
+  id: string;
+  filename: string;
+  mime?: string;
+  size?: number;
+}
+
 export interface Message {
   id: string;
   session_id: string;
-  role: 'USER' | 'ASSISTANT' | 'SYSTEM' | 'TOOL';
+  /** The server stores lowercase ("user"/"assistant"/"tool"); normalise with toUpperCase() in components. */
+  role: 'USER' | 'ASSISTANT' | 'SYSTEM' | 'TOOL' | string;
   content: string;
-  tool_calls: Record<string, unknown> | null;
+  tool_calls: ToolCallEntry[] | null;
   run_id: string | null;
   sequence: number;
   created_at: string;
+  /**
+   * Attachment metadata for user messages. Populated by the orchestrator
+   * when the message was created with attachment_ids.
+   */
+  attachments?: MessageAttachment[];
+  /**
+   * True only while the message is an in-flight streaming placeholder.
+   * Never persisted to the server — the field disappears once the stream
+   * finalises or the session is re-hydrated from the DB.
+   */
+  streaming?: boolean;
+
+  /**
+   * "thinking" marks a transient thinking block (ASSISTANT role with
+   * thinking text).  Used only by the interleaved streaming pipeline.
+   */
+  blockKind?: 'text' | 'tool' | 'thinking';
+
+  /**
+   * The run that produced this temporary block.  Used by
+   * clearStreamingBlocks to remove all temp blocks for a run at once.
+   */
+  streamRunId?: string;
 }
 
 export interface CursorPage<T> {
@@ -73,6 +117,12 @@ export interface Skill {
   owner: string | null;
   visibility: 'private' | 'tenant' | 'public';
   created_at: string;
+}
+
+/** A skill in the user's toolbox — Skill fields + install metadata. */
+export interface InstalledSkill extends Skill {
+  enabled_by_default: boolean;
+  installed_at: string;
 }
 
 export type DocumentStatus = 'PENDING' | 'INGESTING' | 'READY' | 'FAILED';
@@ -180,6 +230,67 @@ export interface QuotaInfo {
   tenant_id: string;
   plan: BillingPlan;
   usage: Record<string, number>;
+}
+
+// ─── LLM Endpoint Diagnostics ────────────────────────────────────────────────
+
+export type ProviderType = 'openai_compatible' | 'anthropic' | 'vllm' | 'ollama' | 'bedrock' | 'azure';
+
+export interface ProbeRequest {
+  url: string;
+  api_key: string;
+  provider_type?: ProviderType;
+}
+
+/** Each capability result is boolean (true/false) or "unknown" or an error string. */
+export type ProbeCapabilityResult = boolean | 'unknown' | string;
+
+export interface ProbeResults {
+  list_models: ProbeCapabilityResult;
+  model_count?: string;
+  function_calling: ProbeCapabilityResult;
+  streaming: ProbeCapabilityResult;
+  /** True when the reported context window is >= 32768 tokens. */
+  context_window_32k: ProbeCapabilityResult;
+  /** Raw context window value as string, or "unknown" if not advertised. */
+  context_window_value: string;
+  parallel_tool_calls: ProbeCapabilityResult;
+}
+
+export interface ProbeReport {
+  url: string;
+  provider_type: string;
+  results: ProbeResults;
+}
+
+// ─── Runs ────────────────────────────────────────────────────────────────────
+
+export type RunStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+
+export interface Run {
+  id: string;
+  session_id: string;
+  sandbox_id: string | null;
+  status: RunStatus;
+  task_description: string | null;
+  result_summary: string | null;
+  error_message: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  total_tokens: number | null;
+}
+
+// ─── Run State ───────────────────────────────────────────────────────────────
+
+export interface RunState {
+  run_id: string;
+  plan: string;
+  step: number;
+  status: string;
+  cursor: string;
 }
 
 // ─── Fleet ──────────────────────────────────────────────────────────────────

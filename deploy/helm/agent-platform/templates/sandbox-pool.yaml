@@ -1,0 +1,202 @@
+{{/* =============================================================================
+     Sandbox Pool — Deployment + Service + ServiceAccount + PDB
+                  + KEDA ScaledObject (medium/large) + TriggerAuthentication
+
+     特殊性：
+     - small profile: 固定副本数（keda.enabled=false），使用 HPA 关闭；
+       sandbox-pool 本身是有状态的（in-process 暖池），K3s 单节点不需要弹性。
+     - medium/large: KEDA Prometheus 触发；参照 deploy/operator/ 现有物料模板化。
+     - KEDA ScaledObject 取代 HPA；两者不能同时作用同一 Deployment。
+     ============================================================================= */}}
+
+{{- if .Values.sandboxPool.enabled }}
+{{- $svcName := "sandbox-pool" }}
+{{- $port := .Values.sandboxPool.port | default 8008 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" .) }}
+  labels: {{- include "agent-platform.labels" (dict "svcName" $svcName "root" .) | nindent 4 }}
+spec:
+  # KEDA 管理副本数时不设 replicas（KEDA 会接管）
+  {{- if not .Values.sandboxPool.keda.enabled }}
+  replicas: {{ .Values.sandboxPool.replicaCount | default 1 }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # sandbox-pool 有状态（暖池），maxUnavailable=0 避免冷池窗口
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels: {{- include "agent-platform.selectorLabels" (dict "svcName" $svcName "root" .) | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "agent-platform.selectorLabels" (dict "svcName" $svcName "root" .) | nindent 8 }}
+        app.kubernetes.io/part-of: agent-platform
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $port | quote }}
+        prometheus.io/path: /metrics
+        checksum/config: {{ .Values | toYaml | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" .) }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: 60
+      {{- with .Values.global.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.sandboxPool.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable }}
+          labelSelector:
+            matchLabels: {{- include "agent-platform.selectorLabels" (dict "svcName" "sandbox-pool" "root" $) | nindent 14 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: sandbox-pool
+          image: {{ include "agent-platform.image" (dict "img" .Values.sandboxPool.image "root" .) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ $port }}
+              protocol: TCP
+          env:
+            {{- include "agent-platform.commonEnv" (dict "svcName" $svcName "root" .) | nindent 12 }}
+            - name: SANDBOX_POOL_HTTP_PORT
+              value: {{ $port | quote }}
+            - name: SANDBOX_POOL_IDLE_LOW_WATERMARK
+              value: {{ .Values.sandboxPool.config.idleLowWatermark | quote }}
+            - name: SANDBOX_POOL_IDLE_HIGH_WATERMARK
+              value: {{ .Values.sandboxPool.config.idleHighWatermark | quote }}
+            - name: SANDBOX_POOL_MAX_TOTAL
+              value: {{ .Values.sandboxPool.config.maxTotal | quote }}
+            - name: SANDBOX_POOL_SANDBOX_IMAGE
+              value: {{ .Values.sandboxPool.config.sandboxImage | quote }}
+            # docker-socket-proxy（同 agent-scheduler 共享同一 proxy 时修改此地址）
+            # small profile 可直接用 agent-scheduler sidecar；
+            # medium/large 建议独立部署 socket-proxy Deployment
+            - name: DOCKER_HOST
+              value: "tcp://ap-agent-scheduler-docker-proxy:2375"
+            {{- with .Values.sandboxPool.env }}
+              {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /api/sandbox-pool/v1/healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/sandbox-pool/v1/healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources: {{- toYaml (.Values.sandboxPool.resources | default (dict "requests" (dict "cpu" "100m" "memory" "256Mi") "limits" (dict "cpu" "500m" "memory" "512Mi"))) | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /app/.cache
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" .) }}
+  labels: {{- include "agent-platform.labels" (dict "svcName" $svcName "root" .) | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" .) }}
+  labels: {{- include "agent-platform.labels" (dict "svcName" $svcName "root" .) | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: {{- include "agent-platform.selectorLabels" (dict "svcName" $svcName "root" .) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $port }}
+      targetPort: http
+      protocol: TCP
+{{ include "agent-platform.pdb" (dict "svcName" $svcName "svc" .Values.sandboxPool "root" .) }}
+{{ include "agent-platform.networkPolicy" (dict "svcName" $svcName "svc" .Values.sandboxPool "root" . "port" $port) }}
+
+{{- /* ===========================================================================
+     KEDA ScaledObject（medium/large profile: sandboxPool.keda.enabled=true）
+     参照 deploy/operator/keda-scaledobject-sandbox-pool.yaml 模板化。
+     small profile 固定副本，不渲染 ScaledObject。
+     =========================================================================== */}}
+{{- if .Values.sandboxPool.keda.enabled }}
+---
+# KEDA TriggerAuthentication（若 Prometheus 需要 bearer token）
+{{- if .Values.sandboxPool.keda.authEnabled }}
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "agent-platform.fullname" (dict "svcName" "sandbox-pool-prometheus-auth" "root" .) }}
+  labels: {{- include "agent-platform.labels" (dict "svcName" $svcName "root" .) | nindent 4 }}
+spec:
+  secretTargetRef:
+    - parameter: bearerToken
+      name: {{ .Values.sandboxPool.keda.authSecretName | default "sandbox-pool-prometheus-credentials" }}
+      key: bearerToken
+    - parameter: ca
+      name: {{ .Values.sandboxPool.keda.authSecretName | default "sandbox-pool-prometheus-credentials" }}
+      key: ca
+---
+{{- end }}
+# KEDA ScaledObject — scales sandbox-pool Deployment based on warm-VM idle count
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" .) }}
+  labels: {{- include "agent-platform.labels" (dict "svcName" $svcName "root" .) | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" .) }}
+  # 不允许缩到 0（丢失 in-process 暖池状态意味着下次冷启动全量付出）
+  minReplicaCount: {{ .Values.sandboxPool.keda.minReplicaCount | default 1 }}
+  maxReplicaCount: {{ .Values.sandboxPool.keda.maxReplicaCount | default 10 }}
+  pollingInterval: {{ .Values.sandboxPool.keda.pollingInterval | default 15 }}
+  cooldownPeriod:  {{ .Values.sandboxPool.keda.cooldownPeriod | default 300 }}
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleDown:
+          stabilizationWindowSeconds: 300
+        scaleUp:
+          stabilizationWindowSeconds: 0
+  triggers:
+    - type: prometheus
+      metadata:
+        serverAddress: {{ .Values.sandboxPool.keda.prometheusAddress | default "http://prometheus-operated.monitoring.svc:9090" | quote }}
+        metricName: sandbox_pool_idle
+        # min() 确保任一副本 idle 不足时触发 scale-up
+        query: 'min(sandbox_pool_idle{template="base"})'
+        threshold: {{ .Values.sandboxPool.keda.idleThreshold | default "5" | quote }}
+        activationThreshold: {{ .Values.sandboxPool.keda.idleThreshold | default "5" | quote }}
+      {{- if .Values.sandboxPool.keda.authEnabled }}
+      authenticationRef:
+        name: {{ include "agent-platform.fullname" (dict "svcName" "sandbox-pool-prometheus-auth" "root" .) }}
+      {{- end }}
+{{- end }}
+{{- end }}

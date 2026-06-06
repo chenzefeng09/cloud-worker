@@ -2,12 +2,15 @@ import { useState } from 'react';
 import type { Message, MessageAttachment, ToolCallEntry } from '../api/types';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import rehypeHighlight from 'rehype-highlight';
 import { ToolRow, ThinkingBlock, markdownComponents } from './chatStepRenderers';
+import { useCopied, CopyIcon } from './CopyButton';
 
 interface MessageBubbleProps {
   message: Message;
   friendly?: boolean;
   onPreviewFile?: (att: { id: string; filename: string; mime?: string }) => void;
+  onRewind?: (message: Message) => void;
 }
 
 // ── Live "Working on it…" pill ────────────────────────────────────────────────
@@ -15,10 +18,8 @@ interface MessageBubbleProps {
 
 export function WorkingOnItPill() {
   return (
-    <div className="flex gap-3 items-start">
-      <span className="cw-avatar accent lg shrink-0 font-mono">◆</span>
-      <div className="flex-1 min-w-0">
-        <div
+    <div className="min-w-0">
+      <div
           style={{
             padding: '10px 12px',
             border: '1.5px solid var(--accent-line)',
@@ -41,16 +42,44 @@ export function WorkingOnItPill() {
             Working on it…
           </div>
         </div>
-      </div>
     </div>
   );
 }
 
+// ── Shared user-message action-button styling ─────────────────────────────────
+
+const userActionBtnStyle: React.CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  minWidth: 26,
+  height: 26,
+  padding: '0 6px',
+  background: 'transparent',
+  border: 'none',
+  borderRadius: 'var(--r-sm)',
+  cursor: 'pointer',
+  color: 'var(--ink-2)',
+  fontSize: 13,
+  whiteSpace: 'nowrap',
+  transition: 'color 0.15s, background 0.1s',
+};
+
+const userActionBtnHoverIn = (e: React.MouseEvent<HTMLButtonElement>) => {
+  e.currentTarget.style.background = 'var(--paper-2)';
+  e.currentTarget.style.color = 'var(--ink)';
+};
+const userActionBtnHoverOut = (e: React.MouseEvent<HTMLButtonElement>) => {
+  e.currentTarget.style.background = 'transparent';
+  e.currentTarget.style.color = 'var(--ink-2)';
+};
+
 // ── MessageBubble ─────────────────────────────────────────────────────────────
 
-export function MessageBubble({ message, friendly, onPreviewFile }: MessageBubbleProps) {
+export function MessageBubble({ message, friendly, onPreviewFile, onRewind }: MessageBubbleProps) {
   const [toolExpanded, setToolExpanded] = useState<Record<string, boolean>>({});
   const [groupOpen, setGroupOpen] = useState(() => !friendly);
+  const { copied: userCopied, copy: copyUser } = useCopied();
 
   const role = (message.role || '').toUpperCase();
   const isUser = role === 'USER';
@@ -59,9 +88,11 @@ export function MessageBubble({ message, friendly, onPreviewFile }: MessageBubbl
   // ── USER ──────────────────────────────────────────────────────────────────
   if (isUser) {
     const attachments = message.attachments ?? [];
+    // Only show rewind for persisted messages (non-temp, have a real sequence).
+    const canRewind = !!onRewind && !message.id.startsWith('temp_user_') && message.sequence > 0;
     return (
-      <div className="flex flex-row-reverse gap-3 items-start">
-        <span className="cw-avatar shrink-0 mt-[10px]">Y</span>
+      // `group` lets the action row respond to hover of the outer container.
+      <div className="group flex flex-col items-end gap-0.5">
         <div
           className="max-w-[80%] text-[14px] leading-[1.55] tracking-[-0.005em]"
           style={{
@@ -90,22 +121,49 @@ export function MessageBubble({ message, friendly, onPreviewFile }: MessageBubbl
             </div>
           )}
         </div>
+
+        {/* Action row — hover-reveal. Copy is always available; rewind only for
+            persisted messages. Mirrors the assistant copy-button style. */}
+        <div
+          className="opacity-0 group-hover:opacity-100 transition-opacity duration-150 flex items-center gap-1"
+          aria-label="消息操作"
+        >
+          <button
+            onClick={() => copyUser(message.content)}
+            aria-label="复制消息"
+            title="复制消息"
+            style={userActionBtnStyle}
+            onMouseEnter={userActionBtnHoverIn}
+            onMouseLeave={userActionBtnHoverOut}
+          >
+            {userCopied ? (
+              <span style={{ fontSize: 11, color: 'var(--accent)' }}>已复制</span>
+            ) : (
+              <CopyIcon />
+            )}
+          </button>
+          {canRewind && (
+            <button
+              onClick={() => onRewind(message)}
+              aria-label="回退到这一步"
+              title="回退到这一步（删除此消息及之后的内容，重新编辑）"
+              style={userActionBtnStyle}
+              onMouseEnter={userActionBtnHoverIn}
+              onMouseLeave={userActionBtnHoverOut}
+            >
+              ↺
+            </button>
+          )}
+        </div>
       </div>
     );
   }
 
-  const agentAvatar = (
-    <span className="cw-avatar accent lg shrink-0 font-mono">◆</span>
-  );
-
   // ── THINKING block ────────────────────────────────────────────────────────
   if (blockKind === 'thinking') {
     return (
-      <div className="flex gap-3 items-start">
-        {agentAvatar}
-        <div className="flex-1 min-w-0">
-          <ThinkingBlock content={message.content} friendly={friendly} />
-        </div>
+      <div className="min-w-0">
+        <ThinkingBlock content={message.content} friendly={friendly} />
       </div>
     );
   }
@@ -122,16 +180,13 @@ export function MessageBubble({ message, friendly, onPreviewFile }: MessageBubbl
       if (!tc) return null;
       const key = tc.id;
       return (
-        <div className="flex gap-3 items-start">
-          {agentAvatar}
-          <div className="flex-1 min-w-0">
-            <ToolRow
-              tc={tc}
-              rowKey={key}
-              expanded={!!toolExpanded[key]}
-              onToggle={() => setToolExpanded((p) => ({ ...p, [key]: !p[key] }))}
-            />
-          </div>
+        <div className="min-w-0">
+          <ToolRow
+            tc={tc}
+            rowKey={key}
+            expanded={!!toolExpanded[key]}
+            onToggle={() => setToolExpanded((p) => ({ ...p, [key]: !p[key] }))}
+          />
         </div>
       );
     }
@@ -139,10 +194,8 @@ export function MessageBubble({ message, friendly, onPreviewFile }: MessageBubbl
     // Grouped (multiple tool calls in one message, e.g. hydrated row).
     const itemCount = toolCalls.length || 1;
     return (
-      <div className="flex gap-3 items-start">
-        {agentAvatar}
-        <div className="flex-1 min-w-0">
-          {/* group header */}
+      <div className="min-w-0">
+        {/* group header */}
           <div
             onClick={() => setGroupOpen((v) => !v)}
             className="inline-flex items-center gap-2 cursor-pointer text-dim"
@@ -197,7 +250,6 @@ export function MessageBubble({ message, friendly, onPreviewFile }: MessageBubbl
               )}
             </div>
           )}
-        </div>
       </div>
     );
   }
@@ -213,15 +265,75 @@ export function MessageBubble({ message, friendly, onPreviewFile }: MessageBubbl
   }
 
   // ── ASSISTANT (text block) ────────────────────────────────────────────────
+  return <AssistantTextBlock content={message.content} />;
+}
+
+// ── Assistant text block with hover copy action row ───────────────────────────
+
+function AssistantTextBlock({ content }: { content: string }) {
+  const { copied, copy } = useCopied();
+
   return (
-    <div className="flex gap-3 items-start">
-      {agentAvatar}
-      <div className="flex-1 min-w-0">
-        <div className="prose-cw text-[14px] leading-[1.6] text-ink">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
-            {message.content}
-          </ReactMarkdown>
-        </div>
+    // `group` lets child elements respond to hover of this container.
+    <div className="group min-w-0">
+      <div className="prose-cw text-[14px] leading-[1.6] text-ink">
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+          components={markdownComponents}
+        >
+          {content}
+        </ReactMarkdown>
+      </div>
+
+      {/* Action row — hover-reveal, space left for future actions (e.g. rewind) */}
+      <div
+        className="opacity-0 group-hover:opacity-100 transition-opacity duration-150 flex items-center gap-1 mt-1"
+        aria-label="消息操作"
+      >
+        {/* Copy button */}
+        <button
+          onClick={() => copy(content)}
+          aria-label={copied ? '已复制' : '复制消息'}
+          title={copied ? '已复制' : '复制消息'}
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: 4,
+            width: 26,
+            height: 26,
+            justifyContent: 'center',
+            padding: 0,
+            background: 'transparent',
+            border: 'none',
+            borderRadius: 'var(--r-sm)',
+            cursor: 'pointer',
+            color: copied ? 'var(--accent)' : 'var(--ink-2)',
+            transition: 'color 0.15s, background 0.1s',
+          }}
+          onMouseEnter={(e) => {
+            (e.currentTarget as HTMLButtonElement).style.background = 'var(--paper-2)';
+          }}
+          onMouseLeave={(e) => {
+            (e.currentTarget as HTMLButtonElement).style.background = 'transparent';
+          }}
+        >
+          {copied ? (
+            <span
+              style={{
+                fontFamily: 'var(--font-mono)',
+                fontSize: 10,
+                color: 'var(--accent)',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              已复制
+            </span>
+          ) : (
+            <CopyIcon />
+          )}
+        </button>
+        {/* Placeholder slot for future actions (e.g. rewind) */}
       </div>
     </div>
   );

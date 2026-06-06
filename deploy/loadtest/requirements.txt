@@ -1,0 +1,3 @@
+# Load test dependencies
+# Install with: pip install -r deploy/loadtest/requirements.txt
+locust>=2.29.0,<3.0

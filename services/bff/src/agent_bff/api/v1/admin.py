@@ -302,7 +302,7 @@ async def get_tenant_billing_quota(
         try:
             plans_data = plans_resp.json()
             plan_id = sub.get("plan_id") or plan_obj.get("id")
-            plans_list = plans_data.get("items") or plans_data if isinstance(plans_data, list) else []
+            plans_list = plans_data.get("items") if isinstance(plans_data, dict) else plans_data if isinstance(plans_data, list) else []
             for p in plans_list:
                 if p.get("id") == plan_id:
                     plan_obj = p
@@ -315,6 +315,57 @@ async def get_tenant_billing_quota(
         "plan": plan_obj,
         "usage": sub.get("usage") or {},
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM Endpoint Diagnostics — proxy to foundation llm-gateway /probe
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/admin/llm/probe")
+async def probe_llm_endpoint(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Probe an LLM endpoint for capability compatibility.
+
+    Forwards the request body verbatim to the foundation llm-gateway /probe
+    endpoint and returns the compatibility report.
+
+    Request body (ProbeRequest):
+        url           str   required — base URL of the LLM endpoint to probe
+        api_key       str   required — API key for the endpoint (NOT logged)
+        provider_type str   optional — default "openai_compatible"
+
+    Response (ProbeReport shape):
+        {
+          "url": str,
+          "provider_type": str,
+          "results": {
+            "list_models": bool | str,
+            "model_count": str,
+            "function_calling": bool | str,
+            "streaming": bool | str,
+            "context_window_32k": bool | "unknown",
+            "context_window_value": str,
+            "parallel_tool_calls": bool | str,
+          }
+        }
+
+    Security: the api_key in the request body is forwarded to the foundation
+    llm-gateway service only and is never written to BFF logs.
+    """
+    _tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+    body = await request.json() if await request.body() else {}
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            f"{settings.foundation_llm_gateway_url}/probe",
+            json=body,
+            headers=foundation_headers(_tenant_id, user_id, access_token),
+        )
+    _raise_for_upstream(resp)
+    return resp.json()
 
 
 async def _gather(*coros):

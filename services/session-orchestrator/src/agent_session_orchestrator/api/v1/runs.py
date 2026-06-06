@@ -130,6 +130,9 @@ async def create_run(
                     "agent_config": body.get("agent_config", {}),
                     "files": files,
                     "memory": memory_snippets,
+                    # Per-message skill selection relayed from BFF; scheduler
+                    # writes these into task.json["skills"] for the worker.
+                    "skills": body.get("skills") or [],
                 },
                 headers=headers,
             )
@@ -199,6 +202,9 @@ async def list_runs(
                 "started_at": r.started_at.isoformat() if r.started_at else None,
                 "finished_at": r.finished_at.isoformat() if r.finished_at else None,
                 "created_at": r.created_at.isoformat(),
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+                "total_tokens": r.total_tokens,
             }
             for r in runs
         ]
@@ -226,6 +232,73 @@ async def get_run(
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "finished_at": run.finished_at.isoformat() if run.finished_at else None,
         "created_at": run.created_at.isoformat(),
+        "input_tokens": run.input_tokens,
+        "output_tokens": run.output_tokens,
+        "total_tokens": run.total_tokens,
+    }
+
+
+@router.get("/sessions/{session_id}/runs/{run_id}/state",
+            dependencies=[Depends(require_permission("run.read", "run"))])
+async def get_run_state(
+    session_id: str,
+    run_id: str,
+    request: Request,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+) -> dict:
+    """Return the real-time hot-state for a run from Redis.
+
+    The runtime_worker inside the sandbox writes a JSON blob to
+    ``agent:run:{run_id}:state`` after every ThinkEvent / step boundary.
+    This endpoint reads that blob so the frontend can show live plan/progress.
+
+    Failure-open: if Redis is unavailable or the key has expired, returns
+    200 with ``plan=""``, ``step=0``, ``cursor=""`` and status from the DB row.
+    """
+    import json
+
+    # Validate ownership: raises 404 if run does not belong to this session/tenant.
+    svc = SessionService(db, tenant_id=tenant_id)
+    run = await svc.get_run(session_id, run_id)
+
+    redis_state: dict | None = None
+    redis_url: str | None = request.app.state.settings.redis_url
+    if redis_url:
+        try:
+            import redis.asyncio as aioredis  # type: ignore[import-not-found]
+
+            client = aioredis.Redis.from_url(
+                redis_url,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+                decode_responses=True,
+            )
+            try:
+                raw = await client.get(f"agent:run:{run_id}:state")
+                if raw:
+                    redis_state = json.loads(raw)
+            finally:
+                await client.aclose()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Redis read failed for run_state %s: %s", run_id, exc)
+
+    if redis_state:
+        return {
+            "run_id": run_id,
+            "plan": redis_state.get("plan") or "",
+            "step": redis_state.get("step") or 0,
+            "status": redis_state.get("status") or run.status,
+            "cursor": redis_state.get("cursor") or "",
+        }
+
+    # Redis key absent / Redis unavailable — return DB status, empty plan.
+    return {
+        "run_id": run_id,
+        "plan": "",
+        "step": 0,
+        "status": run.status,
+        "cursor": "",
     }
 
 

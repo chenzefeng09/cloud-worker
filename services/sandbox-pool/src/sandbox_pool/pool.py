@@ -44,6 +44,10 @@ from prometheus_client import CollectorRegistry
 from sandbox_pool.config import Settings
 from sandbox_pool.docker_runtime import PoolDockerRuntime
 from sandbox_pool.errors import PoolExhaustedError, SandboxNotFoundError
+
+# PoolCubeRuntime is imported lazily inside _build_runtime() so that
+# importing cube_runtime (which imports httpx) does not fail in environments
+# where httpx is not installed but only Docker mode is used.
 from sandbox_pool.metrics import PoolMetrics, build_metrics
 
 logger = logging.getLogger(__name__)
@@ -105,7 +109,7 @@ class Pool:
         if runtime is not None:
             self._runtime = runtime
         else:
-            self._runtime = PoolDockerRuntime(settings)
+            self._runtime = _build_runtime(settings)
 
     @property
     def metrics(self) -> PoolMetrics:
@@ -213,10 +217,12 @@ class Pool:
             self._refresh_gauges()
 
     # ------------------------------------------------------------------ release
-    async def release(self, sandbox_id: str) -> None:
+    async def release(self, sandbox_id: str, *, tenant_id: str | None = None) -> None:
         async with self._lock:
             entry = self._state.entries.get(sandbox_id)
             if entry is None:
+                raise SandboxNotFoundError(sandbox_id)
+            if tenant_id is not None and entry.tenant_id != tenant_id:
                 raise SandboxNotFoundError(sandbox_id)
             # Reap on release.  Snapshot-based recycle (→ IDLE) is the
             # KEDA/CubeSandbox follow-up; Docker containers running
@@ -303,3 +309,28 @@ class Pool:
                 extra={"sandbox_id": sandbox_id},
                 exc_info=True,
             )
+
+
+# ---------------------------------------------------------------------------
+# Runtime factory
+# ---------------------------------------------------------------------------
+
+def _build_runtime(settings: Settings) -> PoolDockerRuntime:
+    """Select and instantiate the pool runtime based on ``settings.runtime``.
+
+    When ``runtime="cube"`` a :class:`~sandbox_pool.cube_runtime.PoolCubeRuntime`
+    is returned; otherwise the default :class:`PoolDockerRuntime` is used.
+
+    The cube runtime is imported lazily so that importing this module does not
+    pull in httpx in environments where only the docker runtime is used.
+    """
+    if settings.runtime == "cube":
+        from sandbox_pool.cube_runtime import PoolCubeRuntime  # noqa: PLC0415
+        logger.info(
+            "pool: using CubeSandbox runtime",
+            extra={"cube_controller_url": settings.cube_controller_url},
+        )
+        return PoolCubeRuntime(settings)  # type: ignore[return-value]
+
+    logger.info("pool: using Docker runtime")
+    return PoolDockerRuntime(settings)

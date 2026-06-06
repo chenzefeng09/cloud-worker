@@ -18,6 +18,8 @@ override via env.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -34,8 +36,21 @@ class Settings(BaseSettings):
     http_port: int = 8008
     api_prefix: str = "/api/sandbox-pool/v1"
 
+    # Runtime backend — "docker" for dev/CI (no KVM needed), "cube" for staging/prod.
+    # When set to "cube" the pool uses PoolCubeRuntime instead of PoolDockerRuntime.
+    runtime: str = "docker"
+
     # Upstream — the actual VM controller we hand pool requests off to.
     cube_controller_url: str = "http://cube-controller:8443"
+
+    # mTLS to the CubeSandbox controller — mirrors agent-scheduler's cube_* settings.
+    # Values are read from SANDBOX_POOL_CUBE_TLS_MODE / _CLIENT_CERT / _CLIENT_KEY /
+    # _CA_CERT env vars (or the compose override agent-platform.cube.yml).
+    # "mtls" is the production default; "off" for dev without TLS.
+    cube_tls_mode: Literal["off", "tls", "mtls"] = "mtls"
+    cube_client_cert: str | None = None
+    cube_client_key: str | None = None
+    cube_ca_cert: str | None = None
 
     # Pool sizing
     idle_low_watermark: int = 5

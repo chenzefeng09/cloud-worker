@@ -1,0 +1,140 @@
+# =============================================================================
+# medium profile — 企业私有化 / 3-10 节点 / 100-500 用户 / HA
+#
+# 特点：
+#   - 业务无状态服务 2-3 副本
+#   - HPA 开启（CPU 70%，10-50 上限）
+#   - PDB 开启（minAvailable: 1）
+#   - topologySpread: 跨节点 ScheduleAnyway
+#   - sandbox-pool 用 KEDA（Prometheus 触发）
+#   - NetworkPolicy 开启（服务间最小连通）
+#   - agent-scheduler 仍用 docker runtime（可切 cube）
+#   - HTTPS + mTLS（建议开启）
+#
+# 安装：
+#   helm install agent-platform . -f values-medium.yaml \
+#       -f values-prod-secrets.yaml \
+#       --set global.ingress.host=agent-platform.your.domain
+# =============================================================================
+
+global:
+  profile: medium
+  ingress:
+    enabled: true
+    className: nginx
+    tls: true
+
+# ---------------------------------------------------------------------------
+# 业务服务公共设定（通过 YAML anchors 复用）
+# ---------------------------------------------------------------------------
+_svcDefaults: &svcDefaults
+  replicaCount: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels: {}   # 模板里会注入 app.kubernetes.io/name
+  networkPolicy:
+    enabled: true
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: 1,    memory: 1Gi }
+
+bff:
+  <<: *svcDefaults
+  config:
+    cookieSecure: "true"
+
+sessionOrchestrator:
+  <<: *svcDefaults
+  config:
+    dbPoolSize: "10"
+    dbMaxOverflow: "20"
+
+agentScheduler:
+  <<: *svcDefaults
+  replicaCount: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+  config:
+    runtime: docker   # 切 cube 时改为 cube 并设 cubeControllerUrl
+  dockerSocketProxy:
+    enabled: true
+  workspaceVolume:
+    # medium: 建议用 ReadWriteMany PVC（NFS / CephFS），scheduler 多副本共享 workspace
+    # 若暂无 RWX storageClass，先保持 hostPath 并限制 scheduler 单副本
+    type: hostPath
+    hostPath: /tmp/agent-workspaces
+
+# medium: KEDA 驱动 sandbox-pool 弹伸
+sandboxPool:
+  replicaCount: 2
+  keda:
+    enabled: true
+    minReplicaCount: 1
+    maxReplicaCount: 10
+    idleThreshold: "5"
+    prometheusAddress: http://prometheus-operated.monitoring.svc:9090
+  config:
+    idleLowWatermark: "5"
+    idleHighWatermark: "20"
+    maxTotal: "50"
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: 1,    memory: 1Gi }
+
+mcpRegistry:
+  <<: *svcDefaults
+
+skillStore:
+  <<: *svcDefaults
+
+knowledgeIngest:
+  <<: *svcDefaults
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: 2,    memory: 2Gi }
+
+web:
+  replicaCount: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  networkPolicy:
+    enabled: true
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: 500m, memory: 256Mi }
+
+webFetchGateway:
+  replicaCount: 2
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
+  networkPolicy:
+    enabled: true

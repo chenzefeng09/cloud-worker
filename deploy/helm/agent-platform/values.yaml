@@ -1,0 +1,427 @@
+# =============================================================================
+# Agent Platform Helm chart — 默认值（small profile 基线）
+#
+# 三档 profile 通过专用 values 文件覆盖：
+#   helm install agent-platform . -f values-small.yaml
+#   helm install agent-platform . -f values-medium.yaml
+#   helm install agent-platform . -f values-large.yaml
+#
+# 命名约定与 saas-foundation chart 保持一致，确保两个仓库 chart 风格对齐。
+# =============================================================================
+
+global:
+  # 部署形态：small | medium | large
+  profile: small
+
+  # 镜像仓库（所有服务共用前缀；留空则直接用 image.repository）
+  imageRegistry: ghcr.io/agent-platform
+  imagePullPolicy: IfNotPresent
+  imagePullSecrets: []
+
+  # 时区
+  timezone: Asia/Shanghai
+
+  # 全局 nodeSelector / tolerations / affinity（每个服务可按需覆盖）
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  # ==========================================================================
+  # Foundation 服务端点
+  # 当 foundation.enabled=true 时，这些值会由 subchart 的 Service name 自动填充。
+  # 当 foundation.enabled=false 时（企业已有 foundation），手动填写以下端点。
+  # ==========================================================================
+  foundation:
+    # 数据库（asyncpg 直连，跳过 pgbouncer transaction pool）
+    database:
+      host: foundation-postgresql
+      port: 5432
+      name: foundation
+      # app_user / app_user_password / app_migrator / app_migrator_password
+      existingSecret: foundation-db-credentials
+
+    # Redis
+    redis:
+      url: ""   # 优先用 url；留空则拼 host:port+password
+      host: foundation-redis-master
+      port: 6379
+      existingSecret: foundation-redis-credentials
+
+    # S3 / MinIO
+    s3:
+      endpoint: http://foundation-minio:9000
+      region: us-east-1
+      bucket: agent-platform
+      existingSecret: foundation-s3-credentials
+
+    # Keycloak
+    keycloak:
+      url: http://foundation-keycloak/auth
+      realm: foundation
+
+    # Foundation microservice URLs（identity / authz / org / billing / audit / llm-gateway）
+    identityUrl: http://foundation-identity:80/api/identity/v1
+    authzUrl: http://foundation-authz:80/api/authz/v1
+    orgUrl: http://foundation-org:80/api/org/v1
+    billingUrl: http://foundation-billing:80/api/billing/v1
+    auditUrl: http://foundation-audit:80/api/audit/v1
+    llmGatewayUrl: http://foundation-llm-gateway:80/api/llm/v1
+
+    # OTEL Collector
+    otelCollector:
+      endpoint: http://foundation-otel-collector:4317
+
+  # Ingress
+  ingress:
+    enabled: true
+    className: nginx
+    host: agent-platform.local
+    tls: false
+    annotations: {}
+
+# =============================================================================
+# Foundation subchart 开关
+# small profile 默认关（假设 foundation 已独立部署在同一集群）
+# 若想完全自包含，设 foundation.enabled=true 并提供 foundation values
+# =============================================================================
+foundation:
+  enabled: false
+
+# =============================================================================
+# Service 列表
+# 每个服务的公共字段说明：
+#   enabled          - 是否部署此服务
+#   image.repository - 镜像（不含 registry 前缀）
+#   image.tag        - 镜像 tag（占位；CI/CD 通过 --set 注入）
+#   replicaCount     - 副本数（profile 文件覆盖）
+#   port             - 容器监听端口
+#   resources        - requests/limits
+#   autoscaling      - HPA 配置（medium/large profile 启用）
+#   podDisruptionBudget - PDB（medium/large profile 启用）
+#   topologySpreadConstraints - 跨 AZ 分布（large profile 启用）
+#   networkPolicy    - NetworkPolicy（medium/large profile 启用）
+#   env              - 额外环境变量（追加到服务特定 env 块之后）
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# BFF — 认证网关 + API 聚合 + SSE 中继
+# ---------------------------------------------------------------------------
+bff:
+  enabled: true
+  image:
+    repository: agent-platform/bff
+    tag: ""   # 占位；CI 注入
+  replicaCount: 1
+  port: 8005
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  topologySpreadConstraints: []
+  networkPolicy:
+    enabled: false
+  config:
+    cookieSecret: ""          # 占位；生产通过 existingSecret 或 --set-file 注入
+    cookieName: ap_session
+    cookieMaxAge: "86400"
+    cookieSecure: "true"
+    corsOrigins: ""           # 如 https://agent-platform.example.com
+  existingSecret: ""          # 若设置，从此 Secret 注入 BFF_COOKIE_SECRET 等敏感值
+  env: []
+
+# ---------------------------------------------------------------------------
+# Session Orchestrator — session/message/run CRUD + SSE event streams
+# ---------------------------------------------------------------------------
+sessionOrchestrator:
+  enabled: true
+  image:
+    repository: agent-platform/session-orchestrator
+    tag: ""
+  replicaCount: 1
+  port: 8006
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  topologySpreadConstraints: []
+  networkPolicy:
+    enabled: false
+  config:
+    dbPoolSize: "5"
+    dbMaxOverflow: "10"
+    dbPoolRecycle: "1800"
+  env: []
+
+# ---------------------------------------------------------------------------
+# Agent Scheduler — spawns sandbox containers / cube microVMs
+# ---------------------------------------------------------------------------
+agentScheduler:
+  enabled: true
+  image:
+    repository: agent-platform/agent-scheduler
+    tag: ""
+  replicaCount: 1
+  port: 8007
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: 1,    memory: 1Gi }
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  topologySpreadConstraints: []
+  networkPolicy:
+    enabled: false
+  config:
+    # Runtime 模式：docker | cube
+    # docker: 通过 docker-socket-proxy 启动容器（开发 / small profile）
+    # cube:   通过 cube-controller 启动 microVM（staging/production）
+    #         cube-controller 端点由 W6 staging 物料提供（见 deploy/operator/）
+    runtime: docker
+    agentImage: ghcr.io/agent-platform/agentscope-sandbox:0.1
+    llmModel: claude-sonnet-4-20250514
+    llmProvider: ""
+    llmBaseUrl: ""
+    workspaceBase: /tmp/agent-workspaces
+    sandboxMemoryLimit: "2g"
+    sandboxCpuShares: "1024"
+    sandboxTimeout: "600"
+    runtimeExtensions: "mcp_tenant_injector,skills_loader,web_fetch,event_audit_sink,llm_gateway_enforcer"
+    # Keycloak OIDC bootstrap（scheduler 自举 service-account token）
+    keycloakRealm: foundation
+    keycloakClientId: foundation-identity-service
+  # docker-socket-proxy sidecar（runtime=docker 时才渲染）
+  dockerSocketProxy:
+    enabled: true   # 被 runtime=docker 触发；runtime=cube 时设 false
+    image: tecnativa/docker-socket-proxy:0.3.0
+    # workspace volume 路径（scheduler 和 proxy 共享）
+  workspaceVolume:
+    # hostPath 适用于 small/dev；medium/large 改用 PVC 或 nfs
+    type: hostPath
+    hostPath: /tmp/agent-workspaces
+  # cube-controller URL（runtime=cube 时填写）
+  cubeControllerUrl: ""
+  existingSecret: ""   # BFF_SCHEDULER_SERVICE_TOKEN / KEYCLOAK_CLIENT_SECRET 等
+  env: []
+
+# ---------------------------------------------------------------------------
+# Sandbox Pool — 预热沙箱池
+# ---------------------------------------------------------------------------
+sandboxPool:
+  enabled: true
+  image:
+    repository: agent-platform/sandbox-pool
+    tag: ""
+  replicaCount: 1
+  port: 8008
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+  config:
+    idleLowWatermark: "2"
+    idleHighWatermark: "10"
+    maxTotal: "50"
+    sandboxImage: ghcr.io/agent-platform/agentscope-sandbox:0.1
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  topologySpreadConstraints: []
+  networkPolicy:
+    enabled: false
+  # KEDA ScaledObject（medium/large profile 启用；small profile 固定副本）
+  keda:
+    enabled: false
+    minReplicaCount: 1
+    maxReplicaCount: 10
+    pollingInterval: 15
+    cooldownPeriod: 300
+    prometheusAddress: http://prometheus-operated.monitoring.svc:9090
+    idleThreshold: "5"
+    # 若 Prometheus 需要认证，设 authEnabled=true 并创建对应 Secret
+    authEnabled: false
+    authSecretName: sandbox-pool-prometheus-credentials
+  env: []
+
+# ---------------------------------------------------------------------------
+# MCP Registry — tenant MCP server registry
+# ---------------------------------------------------------------------------
+mcpRegistry:
+  enabled: true
+  image:
+    repository: agent-platform/mcp-registry
+    tag: ""
+  replicaCount: 1
+  port: 8010
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  topologySpreadConstraints: []
+  networkPolicy:
+    enabled: false
+  config:
+    dbPoolSize: "5"
+    dbMaxOverflow: "10"
+    dbPoolRecycle: "1800"
+  env: []
+
+# ---------------------------------------------------------------------------
+# Skill Store — versioned skill package registry
+# ---------------------------------------------------------------------------
+skillStore:
+  enabled: true
+  image:
+    repository: agent-platform/skill-store
+    tag: ""
+  replicaCount: 1
+  port: 8011
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  topologySpreadConstraints: []
+  networkPolicy:
+    enabled: false
+  config:
+    dbPoolSize: "5"
+    dbMaxOverflow: "10"
+    dbPoolRecycle: "1800"
+  env: []
+
+# ---------------------------------------------------------------------------
+# Knowledge Ingest — document → embedding → pgvector pipeline
+# ---------------------------------------------------------------------------
+knowledgeIngest:
+  enabled: true
+  image:
+    repository: agent-platform/knowledge-ingest
+    tag: ""
+  replicaCount: 1
+  port: 8012
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits:   { cpu: 1,    memory: 1Gi }
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  topologySpreadConstraints: []
+  networkPolicy:
+    enabled: false
+  config:
+    dbPoolSize: "5"
+    dbMaxOverflow: "10"
+    dbPoolRecycle: "1800"
+    embeddingBackend: local
+  env: []
+
+# ---------------------------------------------------------------------------
+# Web — React 19 + Vite (production build served by nginx)
+# ---------------------------------------------------------------------------
+web:
+  enabled: true
+  image:
+    repository: agent-platform/web
+    tag: ""
+  replicaCount: 1
+  port: 80   # nginx
+  resources:
+    requests: { cpu: 50m,  memory: 128Mi }
+    limits:   { cpu: 200m, memory: 256Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  topologySpreadConstraints: []
+  networkPolicy:
+    enabled: false
+  env: []
+
+# ---------------------------------------------------------------------------
+# Web Fetch Gateway — sandboxed HTTP egress for agent WebFetch tool
+# ---------------------------------------------------------------------------
+webFetchGateway:
+  enabled: true
+  image:
+    repository: agent-platform/web-fetch-gateway
+    tag: ""
+  replicaCount: 1
+  port: 8013
+  resources:
+    requests: { cpu: 50m,  memory: 128Mi }
+    limits:   { cpu: 200m, memory: 256Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  topologySpreadConstraints: []
+  networkPolicy:
+    enabled: false
+  config:
+    allowedDomains: ""   # 空值默认拒绝所有外部域名；按需配置逗号分隔白名单
+    maxResponseBytes: "1048576"
+    fetchTimeoutSeconds: "15"
+    restrictContentTypes: "true"
+    requireAuth: "true"
+    requiredScope: web_fetch.invoke
+  env: []
+
+# =============================================================================
+# 默认安全上下文（large profile 会覆盖为更严格设置）
+# =============================================================================
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  readOnlyRootFilesystem: true

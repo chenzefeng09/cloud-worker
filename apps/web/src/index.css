@@ -221,4 +221,144 @@ body {
     height: 7px;
     border-radius: 50%;
   }
+
+  /* Live blip (pulsing dot for "Working on it…" pill) */
+  .cw-blip {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent, #d23a1f);
+    animation: cw-blip 1.4s ease-in-out infinite;
+    flex-shrink: 0;
+  }
+}
+
+/* Blip keyframes (outside @layer so animation name is always available) */
+@keyframes cw-blip {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%       { opacity: 0.45; transform: scale(0.85); }
+}
+
+/* ── highlight.js warm-paper theme ──────────────────────────────────────────
+   Tuned for the cream/paper UI. Light background — muted, editor-like.
+   Base: --ink-2 (#3c3d40). Background inherited from .bg-surface (#fffdf7).
+   ─────────────────────────────────────────────────────────────────────────── */
+.hljs {
+  color: #3c3d40;         /* --ink-2: default token color */
+  background: transparent;
+}
+
+/* Keywords: desaturated indigo/violet — distinct but not neon */
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-meta-keyword,
+.hljs-doctag,
+.hljs-section {
+  color: #5c50a8;
+  font-weight: 500;
+}
+
+/* Strings: muted olive-green — readable, warm */
+.hljs-string,
+.hljs-attr,
+.hljs-template-variable,
+.hljs-addition {
+  color: #3d7a4e;
+}
+
+/* Comments: dim + italic — recedes naturally */
+.hljs-comment,
+.hljs-quote {
+  color: #75756f;         /* --dim */
+  font-style: italic;
+}
+
+/* Numbers and literals: warm amber */
+.hljs-number,
+.hljs-literal,
+.hljs-regexp {
+  color: #b05c00;
+}
+
+/* Functions and titles: deep teal / accent-adjacent */
+.hljs-title,
+.hljs-title.function_,
+.hljs-selector-id,
+.hljs-selector-class {
+  color: #1b6b7a;
+  font-weight: 500;
+}
+
+/* Built-ins and types: slate-blue */
+.hljs-built_in,
+.hljs-type,
+.hljs-class,
+.hljs-name {
+  color: #2c5f8a;
+}
+
+/* Variables and params: ink, slightly muted */
+.hljs-variable,
+.hljs-params,
+.hljs-template-tag {
+  color: #4a4b50;
+}
+
+/* Operators and punctuation: ink-2 */
+.hljs-operator,
+.hljs-punctuation {
+  color: #3c3d40;
+}
+
+/* Tags (HTML/JSX): teal */
+.hljs-tag {
+  color: #1b6b7a;
+}
+
+/* Attributes in tags: olive */
+.hljs-attribute {
+  color: #3d7a4e;
+}
+
+/* Deletions: muted red */
+.hljs-deletion {
+  color: #b03030;
+}
+
+/* Meta/preprocessor: dim violet */
+.hljs-meta {
+  color: #7755aa;
+}
+
+/* Emphasis / strong */
+.hljs-emphasis {
+  font-style: italic;
+}
+.hljs-strong {
+  font-weight: 600;
+}
+
+/* Link */
+.hljs-link {
+  color: #1b6b7a;
+  text-decoration: underline;
+}
+
+/* CSS custom properties used by MessageBubble inline styles */
+:root {
+  --paper:       #f7f5ee;
+  --paper-2:     #efece2;
+  --surface:     #fffdf7;
+  --ink:         #15171a;
+  --ink-2:       #3c3d40;
+  --dim:         #75756f;
+  --line:        #d8d4c6;
+  --line-2:      #e6e3d6;
+  --accent:      #d23a1f;
+  --accent-soft: rgba(210, 58, 31, 0.08);
+  --accent-line: rgba(210, 58, 31, 0.5);
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 10px;
 }

@@ -1,20 +1,96 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import type { ToolCallEntry } from '../api/types';
 import ReactMarkdown from 'react-markdown';
+import { useCopied, CopyIcon } from './CopyButton';
+
+// ── Code-block copy button component ─────────────────────────────────────────
+
+function CodeBlockCopyButton({ preRef }: { preRef: React.RefObject<HTMLPreElement | null> }) {
+  const { copied, copy } = useCopied();
+
+  function handleCopy() {
+    const text = preRef.current?.textContent ?? '';
+    copy(text);
+  }
+
+  return (
+    <button
+      onClick={handleCopy}
+      aria-label="复制代码"
+      style={{
+        position: 'absolute',
+        top: 6,
+        right: 6,
+        display: 'flex',
+        alignItems: 'center',
+        gap: 4,
+        padding: '2px 7px',
+        fontFamily: 'var(--font-mono)',
+        fontSize: 10.5,
+        lineHeight: '1.4',
+        color: copied ? 'var(--accent)' : 'var(--ink-2)',
+        background: 'var(--surface)',
+        border: '1px solid var(--line-2)',
+        borderRadius: 'var(--r-sm)',
+        cursor: 'pointer',
+        transition: 'opacity 0.15s, color 0.15s',
+        userSelect: 'none',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      {copied ? <span>已复制</span> : <CopyIcon />}
+    </button>
+  );
+}
+
+// ── Code-block pre wrapper (supports hover-reveal copy button) ────────────────
+
+function CodeBlockPre({ children }: { children?: React.ReactNode }) {
+  const preRef = useRef<HTMLPreElement>(null);
+
+  return (
+    // Outer wrapper: position:relative so the button doesn't scroll with overflow-x.
+    <div className="group relative my-3">
+      {/* Hover-reveal copy button */}
+      <div
+        className="opacity-0 group-hover:opacity-100 transition-opacity duration-150"
+        style={{ position: 'absolute', top: 0, right: 0, zIndex: 10, pointerEvents: 'auto' }}
+      >
+        <CodeBlockCopyButton preRef={preRef} />
+      </div>
+      {/* The actual <pre> — overflow-x-auto, no top margin (handled by outer div) */}
+      <pre
+        ref={preRef}
+        className="rounded-md border border-line overflow-x-auto bg-surface"
+        style={{ margin: 0 }}
+      >
+        {children}
+      </pre>
+    </div>
+  );
+}
 
 // ── Shared markdown components (used by ASSISTANT messages) ──────────────────
 export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] = {
+  // Custom <pre> wrapper: applies the box styling and attaches a hover copy button.
+  pre: ({ children }) => <CodeBlockPre>{children}</CodeBlockPre>,
   code: ({ className, children, ...props }) => {
-    const isBlock = className?.includes('language-');
+    // rehype-highlight adds `language-*` and `hljs` classes to block <code>.
+    // Detect block by presence of a language- class or hljs class.
+    const isBlock =
+      className?.includes('language-') || className?.includes('hljs');
     if (isBlock) {
+      // Pass className through so hljs token spans render with correct colors.
+      // Do NOT hardcode text-ink-2 here — let the hljs theme control colors.
       return (
-        <pre className="my-3 rounded-md border border-line overflow-x-auto bg-surface">
-          <code className="block px-4 py-3 font-mono text-[12.5px] text-ink-2 leading-[1.6]">
-            {children}
-          </code>
-        </pre>
+        <code
+          className={`block px-4 py-3 font-mono text-[12.5px] leading-[1.6] ${className ?? ''}`}
+        >
+          {children}
+        </code>
       );
     }
+    // Inline code: keep the bordered-pill styling.
     return (
       <code
         {...props}

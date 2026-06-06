@@ -11,6 +11,7 @@
 #   Session Orchestrator   8006
 #   Agent Scheduler        8007
 #   Web (Vite dev)         5173
+#   Web Fetch Gateway      8023 (宿主机映射；容器内仍 8013，避开 foundation-audit 的 8013)
 # =============================================================================
 
 name: agent-platform-dev
@@ -35,6 +36,14 @@ networks:
   agent_internal:
     driver: bridge
     internal: true
+  # Egress bridge — attached exclusively to web-fetch-gateway.  This network
+  # is intentionally NOT internal so the gateway container has outbound
+  # internet access (required to fetch public URLs on behalf of agents).
+  # No other service joins this network; all external HTTP traffic from the
+  # platform exits via web-fetch-gateway, which enforces domain allow-listing
+  # and private-range blocking before forwarding the request.
+  egress:
+    driver: bridge
 
 services:
   # ===========================================================================
@@ -77,6 +86,9 @@ services:
       SESSION_ORCHESTRATOR_KNOWLEDGE_INGEST_URL: http://knowledge-ingest:8012/api/knowledge/v1
       SESSION_ORCHESTRATOR_AUTHZ_URL: http://authz:8002/api/authz/v1
       SESSION_ORCHESTRATOR_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
+      # Redis — reads agent run hot-state (plan/step/cursor) written by the sandbox.
+      # Same Redis instance the scheduler forwards into sandboxes (SCHEDULER_REDIS_URL).
+      SESSION_ORCHESTRATOR_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
     ports:
       - "${PORT_SESSION_ORCHESTRATOR:-8006}:8006"
     networks: [foundation]
@@ -226,8 +238,18 @@ services:
       # if your compose project uses different service names / ports.
       SCHEDULER_MCP_REGISTRY_URL: ${MCP_REGISTRY_URL:-http://mcp-registry:8010/api/mcp/v1}
       SCHEDULER_SKILL_STORE_URL: ${SKILL_STORE_URL:-http://skill-store:8011/api/skills/v1}
-      # Activate both B-M3 extensions inside every sandbox container.
-      SCHEDULER_RUNTIME_EXTENSIONS: ${RUNTIME_EXTENSIONS:-mcp_tenant_injector,skills_loader}
+      # Activate B-M3 extensions + web_fetch inside every sandbox container.
+      # Order matters: mcp_tenant_injector first, skills_loader second,
+      # web_fetch third, llm_gateway_enforcer last.
+      # M1-P4: llm_gateway_enforcer routes all sandbox LLM traffic through the
+      # foundation llm-gateway (tenant virtual key + quota + audit).  With it
+      # present, the scheduler stops injecting the direct LLM_API_KEY into the
+      # sandbox (see docker_runtime.py).  One-line rollback: drop
+      # ``,llm_gateway_enforcer`` from this default (or set the RUNTIME_EXTENSIONS
+      # env) and restart the scheduler — direct-connect resumes.
+      SCHEDULER_RUNTIME_EXTENSIONS: ${RUNTIME_EXTENSIONS:-mcp_tenant_injector,skills_loader,web_fetch,event_audit_sink,llm_gateway_enforcer}
+      # Web-fetch gateway — forwarded into sandbox as WEB_FETCH_GATEWAY_URL.
+      SCHEDULER_WEB_FETCH_GATEWAY_URL: ${WEB_FETCH_GATEWAY_URL:-http://web-fetch-gateway:8013}
       # S3 credentials forwarded into sandbox for attachment download
       SCHEDULER_S3_ENDPOINT_URL: http://foundation-minio:9000
       SCHEDULER_S3_BUCKET: agent-platform
@@ -243,6 +265,11 @@ services:
       SCHEDULER_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
       SCHEDULER_AUTHZ_URL: http://authz:8002/api/authz/v1
       SCHEDULER_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
+      # M1-P3: LLM gateway URL — scheduler queries GET /tenant-keys at spawn time
+      # and injects LLM_GATEWAY_URL + LLM_VIRTUAL_KEY into sandbox env.
+      # With llm_gateway_enforcer enabled by default, missing tenant virtual keys
+      # fail sandbox spawn instead of falling back to direct provider credentials.
+      SCHEDULER_LLM_GATEWAY_URL: ${LLM_GATEWAY_URL:-http://llm-gateway:8011/api/llm-gateway/v1}
       # NOTE: FOUNDATION_SERVICE_SCOPES is injected into sandbox env by the
       # scheduler as a dev-mode shim (see agent_scheduler/config.py
       # SANDBOX_SERVICE_SCOPES).  It is not an env var of the *scheduler*
@@ -437,7 +464,7 @@ services:
       KNOWLEDGE_INGEST_S3_ENDPOINT_URL: http://foundation-minio:9000
       KNOWLEDGE_INGEST_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-foundation}
       KNOWLEDGE_INGEST_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_change_me_min_12_chars}
-      KNOWLEDGE_INGEST_FOUNDATION_LLM_GATEWAY_URL: http://llm-gateway:8003/api/llm/v1
+      KNOWLEDGE_INGEST_FOUNDATION_LLM_GATEWAY_URL: http://llm-gateway:8011/api/llm-gateway/v1
       KNOWLEDGE_INGEST_EMBEDDING_BACKEND: local
       KNOWLEDGE_INGEST_DB_POOL_SIZE: "5"
       KNOWLEDGE_INGEST_DB_MAX_OVERFLOW: "10"
@@ -449,6 +476,45 @@ services:
     networks: [foundation]
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8012/api/knowledge/v1/healthz').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ===========================================================================
+  # Web Fetch Gateway — sandboxed HTTP egress for agent WebFetch tool
+  #
+  # Agents call WebFetchTool → gateway POST /api/web-fetch/v1/fetch.
+  # The gateway enforces domain allow-listing, private-range blocking, and
+  # content-type restrictions before forwarding the request externally.
+  # It is on both `foundation` (reachable by sandbox containers on that net)
+  # and `egress` (has outbound internet access).  No other service joins
+  # `egress`, keeping the external-traffic surface minimal.
+  # ===========================================================================
+  web-fetch-gateway:
+    build:
+      context: ../../services/web-fetch-gateway
+    container_name: agent-web-fetch-gateway
+    restart: unless-stopped
+    environment:
+      WEB_FETCH_ENV: ${WEB_FETCH_ENV:-dev}
+      WEB_FETCH_LOG_LEVEL: ${WEB_FETCH_LOG_LEVEL:-INFO}
+      WEB_FETCH_HTTP_PORT: "8013"
+      # Set to a comma-separated list of allowed domains. Empty fails closed.
+      WEB_FETCH_ALLOWED_DOMAINS: ${WEB_FETCH_ALLOWED_DOMAINS:-}
+      WEB_FETCH_REQUIRE_AUTH: "true"
+      WEB_FETCH_REQUIRED_SCOPE: web_fetch.invoke
+      WEB_FETCH_MAX_RESPONSE_BYTES: "1048576"
+      WEB_FETCH_FETCH_TIMEOUT_SECONDS: "15"
+      WEB_FETCH_RESTRICT_CONTENT_TYPES: "true"
+    ports:
+      - "${PORT_WEB_FETCH_GATEWAY:-8023}:8013"
+    networks: [foundation, egress]
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >
+          python -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8013/api/web-fetch/v1/healthz').read()"
       interval: 10s
       timeout: 5s
       retries: 10

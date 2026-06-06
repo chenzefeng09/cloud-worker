@@ -132,4 +132,8 @@ def other_tenant_headers() -> dict[str, str]:
 
 @pytest.fixture
 def internal_headers() -> dict[str, str]:
-    return {"X-Service-Scopes": "mcp.read_internal", "X-User-Id": "svc_mcp_injector"}
+    return {
+        "X-Tenant-Id": TEST_TENANT,
+        "X-Service-Scopes": "mcp.read_internal",
+        "X-User-Id": "svc_mcp_injector",
+    }

@@ -8,11 +8,18 @@ import json
 from fastapi.testclient import TestClient
 
 
-def _create_skill(client: TestClient, headers: dict[str, str], name: str = "poet") -> dict:
+def _create_skill(
+    client: TestClient,
+    headers: dict[str, str],
+    name: str = "poet",
+    visibility: str = "tenant",
+) -> dict:
+    # Default to "tenant" so the skill appears on the shelf (browse list);
+    # pass visibility="private" explicitly to test shelf exclusion.
     resp = client.post(
         "/api/skills/v1/skills",
         headers=headers,
-        json={"name": name, "description": "demo", "visibility": "private"},
+        json={"name": name, "description": "demo", "visibility": visibility},
     )
     assert resp.status_code == 201, resp.text
     return resp.json()
@@ -36,6 +43,59 @@ def test_create_and_list_skill(app_client: TestClient, tenant_headers: dict[str,
     listing = app_client.get("/api/skills/v1/skills", headers=tenant_headers).json()
     assert listing["total"] == 1
     assert listing["items"][0]["id"] == created["id"]
+
+
+def test_private_skill_excluded_from_shelf(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    _create_skill(app_client, tenant_headers, name="hidden", visibility="private")
+    listing = app_client.get("/api/skills/v1/skills", headers=tenant_headers).json()
+    assert listing["total"] == 0
+
+
+def test_install_uninstall_roundtrip(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers, visibility="private")
+
+    # Install (even a private skill the user can reach in their tenant).
+    resp = app_client.post(
+        f"/api/skills/v1/skills/{skill['id']}/install",
+        headers=tenant_headers,
+        json={"enabled_by_default": True},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["enabled_by_default"] is True
+
+    installed = app_client.get(
+        "/api/skills/v1/skills/installed", headers=tenant_headers,
+    ).json()
+    assert installed["total"] == 1
+    assert installed["items"][0]["id"] == skill["id"]
+    assert installed["items"][0]["enabled_by_default"] is True
+
+    # Re-install with a different default updates in place (idempotent).
+    resp = app_client.post(
+        f"/api/skills/v1/skills/{skill['id']}/install",
+        headers=tenant_headers,
+        json={"enabled_by_default": False},
+    )
+    assert resp.status_code == 201
+    installed = app_client.get(
+        "/api/skills/v1/skills/installed", headers=tenant_headers,
+    ).json()
+    assert installed["total"] == 1
+    assert installed["items"][0]["enabled_by_default"] is False
+
+    # Uninstall.
+    resp = app_client.delete(
+        f"/api/skills/v1/skills/{skill['id']}/install", headers=tenant_headers,
+    )
+    assert resp.status_code == 204
+    installed = app_client.get(
+        "/api/skills/v1/skills/installed", headers=tenant_headers,
+    ).json()
+    assert installed["total"] == 0
 
 
 def test_duplicate_skill_conflict(
@@ -169,9 +229,26 @@ def test_internal_endpoint_multi_scope_header_accepted(
     resp = app_client.get(
         "/api/skills/v1/internal/skills",
         params={"tenant_id": "tnt_01J5TEST00000000000000TNT1"},
-        headers={"X-Service-Scopes": "mcp.read_internal,skill.read_internal"},
+        headers={
+            "X-Tenant-Id": "tnt_01J5TEST00000000000000TNT1",
+            "X-Service-Scopes": "mcp.read_internal,skill.read_internal",
+        },
     )
     assert resp.status_code == 200, resp.text
+
+
+def test_internal_endpoint_rejects_query_tenant_mismatch(
+    app_client: TestClient,
+) -> None:
+    resp = app_client.get(
+        "/api/skills/v1/internal/skills",
+        params={"tenant_id": "tnt_01J5TEST00000000000000TNT2"},
+        headers={
+            "X-Tenant-Id": "tnt_01J5TEST00000000000000TNT1",
+            "X-Service-Scopes": "skill.read_internal",
+        },
+    )
+    assert resp.status_code == 403
 
 
 def test_internal_endpoint_returns_skills_with_versions(

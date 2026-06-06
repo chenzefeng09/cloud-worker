@@ -1,5 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import hljs from 'highlight.js';
 import { api, ApiError } from '../api/client';
+import { useCopied, CopyIcon } from './CopyButton';
 
 // ── Kind / glyph helpers ─────────────────────────────────────────────────────
 
@@ -52,6 +54,142 @@ function isTextLikeMime(mime?: string): boolean {
     mime.includes('xml') ||
     mime.includes('markdown') ||
     mime.includes('csv')
+  );
+}
+
+// ── Syntax-highlight language detection (by filename extension) ────────────────
+
+const EXT_TO_LANG: Record<string, string> = {
+  py: 'python',
+  js: 'javascript',
+  mjs: 'javascript',
+  cjs: 'javascript',
+  jsx: 'javascript',
+  ts: 'typescript',
+  tsx: 'typescript',
+  json: 'json',
+  yaml: 'yaml',
+  yml: 'yaml',
+  sh: 'bash',
+  bash: 'bash',
+  zsh: 'bash',
+  sql: 'sql',
+  html: 'xml',
+  xml: 'xml',
+  css: 'css',
+  scss: 'scss',
+  md: 'markdown',
+  markdown: 'markdown',
+  java: 'java',
+  go: 'go',
+  rs: 'rust',
+  c: 'c',
+  h: 'cpp',
+  cpp: 'cpp',
+  cc: 'cpp',
+  hpp: 'cpp',
+  rb: 'ruby',
+  php: 'php',
+  toml: 'ini',
+  ini: 'ini',
+  dockerfile: 'dockerfile',
+};
+
+/** Returns an hljs language for code files, or undefined for plain text (.txt, .csv…). */
+function extToHljsLang(filename: string): string | undefined {
+  const dot = filename.lastIndexOf('.');
+  if (dot < 0) return undefined;
+  const ext = filename.slice(dot + 1).toLowerCase();
+  return EXT_TO_LANG[ext];
+}
+
+const MAX_HIGHLIGHT_BYTES = 200_000;
+
+// ── Copy button (matches chat code-block style) ───────────────────────────────
+
+function PreviewCopyButton({ text }: { text: string }) {
+  const { copied, copy } = useCopied();
+  return (
+    <button
+      onClick={() => copy(text)}
+      aria-label="复制文件内容"
+      title="复制文件内容"
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 4,
+        padding: '2px 7px',
+        fontFamily: 'var(--font-mono)',
+        fontSize: 10.5,
+        lineHeight: '1.4',
+        color: copied ? 'var(--accent)' : 'var(--ink-2)',
+        background: 'var(--surface)',
+        border: '1px solid var(--line-2)',
+        borderRadius: 'var(--r-sm)',
+        cursor: 'pointer',
+        whiteSpace: 'nowrap',
+        userSelect: 'none',
+      }}
+    >
+      {copied ? <span>已复制</span> : <CopyIcon />}
+    </button>
+  );
+}
+
+// ── Text/code preview with syntax highlighting + copy ─────────────────────────
+
+interface TextPreviewProps {
+  contentText: string | null;
+  contentLoading: boolean;
+  contentError: string | null;
+  filename: string;
+}
+
+function TextPreview({ contentText, contentLoading, contentError, filename }: TextPreviewProps) {
+  const lang = extToHljsLang(filename);
+
+  // Highlighted HTML (memoised). Returns null when we should render plain text
+  // (no language detected, file too large, or hljs errored).
+  const highlightedHtml = useMemo(() => {
+    if (contentText === null) return null;
+    if (!lang) return null;
+    if (contentText.length > MAX_HIGHLIGHT_BYTES) return null;
+    try {
+      return hljs.highlight(contentText, { language: lang }).value;
+    } catch {
+      return null; // unregistered language or hljs error → plain fallback
+    }
+  }, [contentText, lang]);
+
+  return (
+    <div className="border border-line rounded-md overflow-hidden bg-surface">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-line-2">
+        <span className="cw-label">文件内容</span>
+        {contentText !== null && !contentLoading && (
+          <PreviewCopyButton text={contentText} />
+        )}
+      </div>
+      {contentLoading && (
+        <div className="px-4 py-3 font-mono text-[11px] text-dim">加载预览…</div>
+      )}
+      {contentError && (
+        <div className="px-4 py-3 font-mono text-[11px] text-accent">{contentError}</div>
+      )}
+      {contentText !== null && !contentLoading && (
+        highlightedHtml !== null ? (
+          <pre className="cw-scroll px-4 py-3 font-mono text-[11.5px] leading-[1.6] overflow-auto max-h-[480px]" style={{ whiteSpace: 'pre' }}>
+            <code
+              className={`hljs language-${lang}`}
+              dangerouslySetInnerHTML={{ __html: highlightedHtml }}
+            />
+          </pre>
+        ) : (
+          <pre className="cw-scroll px-4 py-3 font-mono text-[11.5px] text-ink-2 whitespace-pre-wrap break-words max-h-[480px]">
+            {contentText}
+          </pre>
+        )
+      )}
+    </div>
   );
 }
 
@@ -118,20 +256,12 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
   // Text preview
   if (isText) {
     return (
-      <div className="border border-line rounded-md overflow-hidden bg-surface">
-        <div className="cw-label px-4 py-2 border-b border-line-2">文件内容</div>
-        {contentLoading && (
-          <div className="px-4 py-3 font-mono text-[11px] text-dim">加载预览…</div>
-        )}
-        {contentError && (
-          <div className="px-4 py-3 font-mono text-[11px] text-accent">{contentError}</div>
-        )}
-        {contentText !== null && !contentLoading && (
-          <pre className="cw-scroll px-4 py-3 font-mono text-[11.5px] text-ink-2 whitespace-pre-wrap break-words max-h-[480px]">
-            {contentText}
-          </pre>
-        )}
-      </div>
+      <TextPreview
+        contentText={contentText}
+        contentLoading={contentLoading}
+        contentError={contentError}
+        filename={filename}
+      />
     );
   }
 

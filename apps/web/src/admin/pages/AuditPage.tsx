@@ -4,10 +4,7 @@ import { useAdminStore } from '../../stores/adminStore';
 import type { AuditEvent } from '../../api/types';
 
 /**
- * TODO: This page calls /admin/audit/events:query which proxies the foundation
- * audit service. The BFF endpoint `/admin/audit/events:query` may not yet be
- * implemented. When it is, remove the placeholder banner and this page will
- * start working automatically.
+ * Audit log viewer — queries /admin/audit/events:query (BFF proxy to foundation-audit).
  */
 export function AuditPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading } = useAdminStore();
@@ -18,7 +15,6 @@ export function AuditPage() {
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [isTodoEndpoint, setIsTodoEndpoint] = useState(false);
   const [queried, setQueried] = useState(false);
 
   // Bootstrap tenant list for filter
@@ -35,7 +31,6 @@ export function AuditPage() {
     e.preventDefault();
     setLoading(true);
     setError(null);
-    setIsTodoEndpoint(false);
     setQueried(true);
     try {
       const body: Record<string, unknown> = { limit: 50 };
@@ -46,12 +41,7 @@ export function AuditPage() {
       const data = await api.admin.audit.query(body);
       setEvents(data.items);
     } catch (err) {
-      if (err instanceof ApiError && (err.status === 404 || err.status === 501)) {
-        setIsTodoEndpoint(true);
-        setEvents([]);
-      } else {
-        setError(err instanceof ApiError ? err.message : '查询失败');
-      }
+      setError(err instanceof ApiError ? err.message : '查询失败');
     } finally {
       setLoading(false);
     }
@@ -62,12 +52,6 @@ export function AuditPage() {
       <div>
         <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">审计日志</h1>
         <p className="text-[12px] text-dim mt-0.5">查询平台操作事件</p>
-      </div>
-
-      {/* TODO banner */}
-      <div className="border border-warn/30 rounded-md px-4 py-3 bg-warn/5 text-[12px] text-warn font-mono">
-        TODO: BFF 端点 <code className="bg-warn/10 px-1 rounded-sm">POST /admin/audit/events:query</code> 尚未在 BFF 层暴露。
-        UI 已就绪，接线占位。待 BFF 代理 audit 服务后，本提示可删除。
       </div>
 
       {/* Query form */}
@@ -133,13 +117,7 @@ export function AuditPage() {
         </div>
       )}
 
-      {isTodoEndpoint && (
-        <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          审计代理端点尚未就绪。接线后将自动展示查询结果。
-        </div>
-      )}
-
-      {!isTodoEndpoint && queried && !loading && (
+      {queried && !loading && (
         events.length === 0 ? (
           <div className="font-mono text-[12px] text-dim italic">无匹配事件</div>
         ) : (

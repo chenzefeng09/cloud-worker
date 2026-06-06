@@ -18,7 +18,7 @@ export function FilePreviewPanel({ sessionId, file, onClose }: FilePreviewPanelP
   return (
     <div
       className="flex flex-col h-full bg-paper border-l border-line"
-      style={{ minWidth: 280, maxWidth: 480, width: 360 }}
+      style={{ width: '100%', minWidth: 0, overflow: 'hidden' }}
     >
       {/* Header */}
       <div className="flex items-center gap-2 px-3 py-2.5 border-b border-line shrink-0">

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from foundation_sdk.fastapi import get_tenant_id, get_user_id
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -50,6 +50,7 @@ async def internal_db_session(
 
 
 def require_internal_scope(
+    request: Request,
     x_service_scopes: str | None = Header(default=None, alias="X-Service-Scopes"),
 ) -> None:
     """Enforce the service-account scope on internal endpoints.
@@ -63,6 +64,10 @@ def require_internal_scope(
         raise InternalScopeRequiredError()
     granted = {s.strip() for s in x_service_scopes.split(",") if s.strip()}
     if required not in granted:
+        raise InternalScopeRequiredError()
+    tenant_from_header = get_tenant_id()
+    tenant_from_query = request.query_params.get("tenant_id")
+    if not tenant_from_header or tenant_from_header != tenant_from_query:
         raise InternalScopeRequiredError()
 
 

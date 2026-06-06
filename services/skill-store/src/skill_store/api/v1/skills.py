@@ -17,7 +17,13 @@ from skill_store.api.dependencies import (
 )
 from skill_store.blob.base import BlobStore
 from skill_store.schemas.common import ListPage
-from skill_store.schemas.skill import SkillCreate, SkillOut, SkillVersionOut
+from skill_store.schemas.skill import (
+    InstalledSkillOut,
+    SkillCreate,
+    SkillInstallRequest,
+    SkillOut,
+    SkillVersionOut,
+)
 from skill_store.services.skill_service import SkillService
 
 router = APIRouter(tags=["Skills"])
@@ -29,12 +35,80 @@ async def list_skills(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
 ) -> ListPage:
+    """Browse list — skills published to the tenant shelf (tenant/public)."""
     svc = SkillService(db, blob=_no_blob(), tenant_id=tenant_id)
     items = await svc.list_skills()
     return ListPage(
         items=[SkillOut.model_validate(s).model_dump(mode="json") for s in items],
         total=len(items),
     )
+
+
+@router.get("/skills/installed", response_model=ListPage,
+            dependencies=[Depends(require_permission("skill.read", "skill"))])
+async def list_installed_skills(
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+    user_id: str = TUserId,
+) -> ListPage:
+    """The calling user's installed skills (their personal toolbox)."""
+    svc = SkillService(db, blob=_no_blob(), tenant_id=tenant_id, user_id=user_id)
+    pairs = await svc.list_installed()
+    items = []
+    for skill, install in pairs:
+        entry = InstalledSkillOut.model_validate(
+            {
+                **SkillOut.model_validate(skill).model_dump(),
+                "enabled_by_default": install.enabled_by_default,
+                "installed_at": install.installed_at,
+            }
+        ).model_dump(mode="json")
+        items.append(entry)
+    return ListPage(items=items, total=len(items))
+
+
+@router.post(
+    "/skills/{skill_id}/install",
+    response_model=InstalledSkillOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("skill.read", "skill"))],
+)
+async def install_skill(
+    skill_id: str,
+    body: SkillInstallRequest | None = None,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+    user_id: str = TUserId,
+) -> InstalledSkillOut:
+    """Install a tenant skill into the calling user's toolbox (idempotent)."""
+    svc = SkillService(db, blob=_no_blob(), tenant_id=tenant_id, user_id=user_id)
+    enabled = body.enabled_by_default if body is not None else True
+    install = await svc.install_skill(skill_id, enabled_by_default=enabled)
+    skill = await svc.get_skill(skill_id)
+    return InstalledSkillOut.model_validate(
+        {
+            **SkillOut.model_validate(skill).model_dump(),
+            "enabled_by_default": install.enabled_by_default,
+            "installed_at": install.installed_at,
+        }
+    )
+
+
+@router.delete(
+    "/skills/{skill_id}/install",
+    status_code=204,
+    dependencies=[Depends(require_permission("skill.read", "skill"))],
+)
+async def uninstall_skill(
+    skill_id: str,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+    user_id: str = TUserId,
+) -> Response:
+    """Remove a skill from the calling user's toolbox (no-op if absent)."""
+    svc = SkillService(db, blob=_no_blob(), tenant_id=tenant_id, user_id=user_id)
+    await svc.uninstall_skill(skill_id)
+    return Response(status_code=204)
 
 
 @router.post(

@@ -259,7 +259,7 @@ export function FilesPage() {
 
           <div className="px-3 py-2.5 border-t border-line-2 font-mono text-[10.5px] text-ink-2 leading-[1.7]">
             <div className="cw-label mb-1.5">
-              工作区 · {ws.name}
+              {ws.name}
             </div>
             {activeSessionId ? (
               <div>{inputFiles.length} 个上传 · {outputFiles.length} 个产物 · {docs.length} 个知识文档</div>

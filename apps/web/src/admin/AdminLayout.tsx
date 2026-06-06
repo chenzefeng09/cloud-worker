@@ -4,6 +4,8 @@ import { TenantsPage } from './pages/TenantsPage';
 import { UsersPage } from './pages/UsersPage';
 import { QuotaPage } from './pages/QuotaPage';
 import { AuditPage } from './pages/AuditPage';
+import { SessionReplayPage } from './pages/SessionReplayPage';
+import { EndpointDiagnosticsPage } from './pages/EndpointDiagnosticsPage';
 
 interface AdminNavSpec {
   to: string;
@@ -16,6 +18,8 @@ const ADMIN_NAV: AdminNavSpec[] = [
   { to: '/admin/users', label: '用户管理', glyph: '◎' },
   { to: '/admin/quota', label: '配额套餐', glyph: '◷' },
   { to: '/admin/audit', label: '审计日志', glyph: '≡' },
+  { to: '/admin/replay', label: '会话回放', glyph: '▷' },
+  { to: '/admin/diagnostics', label: '端点诊断', glyph: '⊕' },
 ];
 
 /**
@@ -96,6 +100,8 @@ export function AdminLayout() {
           <Route path="users" element={<UsersPage />} />
           <Route path="quota" element={<QuotaPage />} />
           <Route path="audit" element={<AuditPage />} />
+          <Route path="replay" element={<SessionReplayPage />} />
+          <Route path="diagnostics" element={<EndpointDiagnosticsPage />} />
           <Route path="*" element={<Navigate to="/admin/tenants" replace />} />
         </Routes>
       </main>

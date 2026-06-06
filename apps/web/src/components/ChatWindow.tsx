@@ -1,7 +1,9 @@
 import { useEffect, useRef } from 'react';
 import { useChat } from '../hooks/useChat';
+import { useOutputAttachments } from '../hooks/useOutputAttachments';
 import { MessageBubble, WorkingOnItPill } from './MessageBubble';
 import { StepGroup } from './StepGroup';
+import { OutputFileCards } from './OutputFileCards';
 import { InputBar } from './InputBar';
 import { api } from '../api/client';
 import type { Attachment, MessageAttachment } from '../api/types';
@@ -44,21 +46,11 @@ function FixtureMessageInner({
   });
   const [toolExpanded, setToolExpanded] = useState<Record<string, boolean>>({});
 
-  const avatar = (
-    <span
-      className="cw-avatar accent lg shrink-0 font-mono"
-      style={{ marginTop: 2 }}
-    >
-      ◆
-    </span>
-  );
-
   if (m.from === 'user') {
     return (
-      <div className="flex gap-3 items-start">
-        <span className="cw-avatar shrink-0" style={{ marginTop: 2 }}>Y</span>
+      <div className="flex justify-end">
         <div
-          className="flex-1 text-[14px] leading-[1.55] tracking-[-0.005em]"
+          className="max-w-[80%] text-[14px] leading-[1.55] tracking-[-0.005em]"
           style={{
             background: 'var(--paper-2)',
             padding: '10px 14px',
@@ -74,9 +66,7 @@ function FixtureMessageInner({
 
   if (m.kind === 'thought') {
     return (
-      <div className="flex gap-3">
-        {avatar}
-        <div className="flex-1 min-w-0">
+      <div className="min-w-0">
           <div
             onClick={() => setOpen((v) => !v)}
             className="flex items-center gap-2 cursor-pointer text-ink-2"
@@ -104,7 +94,6 @@ function FixtureMessageInner({
               ))}
             </div>
           )}
-        </div>
       </div>
     );
   }
@@ -112,9 +101,7 @@ function FixtureMessageInner({
   if (m.kind === 'tools') {
     const itemCount = m.items.length;
     return (
-      <div className="flex gap-3">
-        {avatar}
-        <div className="flex-1 min-w-0">
+      <div className="min-w-0">
           <div
             onClick={() => setOpen((v) => !v)}
             className="inline-flex items-center gap-2 cursor-pointer text-dim"
@@ -204,41 +191,32 @@ function FixtureMessageInner({
               })}
             </div>
           )}
-        </div>
       </div>
     );
   }
 
   if (m.kind === 'text') {
     return (
-      <div className="flex gap-3">
-        {avatar}
-        <div
-          className="flex-1 text-[14px] leading-[1.6] text-ink"
-          style={{ paddingTop: 3 }}
-        >
-          {m.text.split(/(`[^`]+`)/).map((part, i) =>
-            part.startsWith('`') ? (
-              <span
-                key={i}
-                className="font-mono text-[12.5px] px-1.5 py-0.5 bg-paper-2 border border-line-2 rounded"
-              >
-                {part.slice(1, -1)}
-              </span>
-            ) : (
-              <span key={i}>{part}</span>
-            )
-          )}
-        </div>
+      <div className="min-w-0 text-[14px] leading-[1.6] text-ink" style={{ paddingTop: 3 }}>
+        {m.text.split(/(`[^`]+`)/).map((part, i) =>
+          part.startsWith('`') ? (
+            <span
+              key={i}
+              className="font-mono text-[12.5px] px-1.5 py-0.5 bg-paper-2 border border-line-2 rounded"
+            >
+              {part.slice(1, -1)}
+            </span>
+          ) : (
+            <span key={i}>{part}</span>
+          )
+        )}
       </div>
     );
   }
 
   if (m.kind === 'live') {
     return (
-      <div className="flex gap-3">
-        {avatar}
-        <div className="flex-1 min-w-0">
+      <div className="min-w-0">
           <div
             className="flex items-start gap-2.5"
             style={{
@@ -273,13 +251,13 @@ function FixtureMessageInner({
               )}
             </div>
           </div>
-        </div>
       </div>
     );
   }
 
   return null;
 }
+
 
 // ── ChatWindow ────────────────────────────────────────────────────────────────
 
@@ -292,12 +270,24 @@ export function ChatWindow({
   friendly?: boolean;
   onPreviewFile?: (att: { id: string; filename: string; mime?: string }) => void;
 }) {
-  const { messages, isStreaming, sendMessage, cancel } = useChat();
+  const { messages, isStreaming, sendMessage, cancel, prefillText, clearPrefill, rewindTo } = useChat();
+  const { byRunId, refresh: refreshOutputs } = useOutputAttachments(sessionId);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // Track previous isStreaming value so we can detect the true→false edge.
+  const prevStreamingRef = useRef(isStreaming);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isStreaming]);
+
+  // Refresh output attachments when streaming transitions true → false
+  // (i.e. a run just completed). This surfaces newly written files quickly.
+  useEffect(() => {
+    if (prevStreamingRef.current && !isStreaming) {
+      refreshOutputs();
+    }
+    prevStreamingRef.current = isStreaming;
+  }, [isStreaming, refreshOutputs]);
 
   const handleUpload = async (file: File): Promise<Attachment> => {
     return api.attachments.upload(sessionId, file);
@@ -324,23 +314,64 @@ export function ChatWindow({
       <div className="cw-scroll flex-1 px-8 py-5 flex flex-col gap-[18px]">
         <div style={{ maxWidth: 780, margin: '0 auto', width: '100%', display: 'flex', flexDirection: 'column', gap: 18 }}>
           {/* ── Real messages ── */}
-          {groupSteps(messages, isStreaming).map((u) =>
-            u.kind === 'message' ? (
-              <MessageBubble
-                key={u.message.id}
-                message={u.message}
-                friendly={friendly}
-                onPreviewFile={onPreviewFile}
-              />
-            ) : (
-              <StepGroup
-                key={`steps_${u.runId}_${u.steps[0]?.id ?? '0'}`}
-                group={u}
-                friendly={friendly}
-                onPreviewFile={onPreviewFile}
-              />
-            )
-          )}
+          {(() => {
+            const units = groupSteps(messages, isStreaming);
+
+            // Pre-compute: for each run_id that has output files, find the
+            // index of the LAST assistant message unit with that run_id.
+            // We only attach file cards to that final unit to avoid duplication.
+            const lastAssistantUnitIdx = new Map<string, number>();
+            units.forEach((u, idx) => {
+              if (u.kind === 'message') {
+                const role = (u.message.role || '').toUpperCase();
+                const runId = u.message.run_id;
+                if (role === 'ASSISTANT' && runId && byRunId.has(runId)) {
+                  lastAssistantUnitIdx.set(runId, idx);
+                }
+              }
+            });
+
+            return units.map((u, idx) => {
+              if (u.kind === 'message') {
+                const role = (u.message.role || '').toUpperCase();
+                const runId = u.message.run_id;
+                // Show output file cards only under the last assistant message
+                // for a given run_id (prevents duplicate cards if a run has
+                // multiple assistant text blocks).
+                const showCards =
+                  role === 'ASSISTANT' &&
+                  runId != null &&
+                  byRunId.has(runId) &&
+                  lastAssistantUnitIdx.get(runId) === idx;
+
+                return (
+                  <div key={u.message.id}>
+                    <MessageBubble
+                      message={u.message}
+                      friendly={friendly}
+                      onPreviewFile={onPreviewFile}
+                      onRewind={rewindTo}
+                    />
+                    {showCards && (
+                      <OutputFileCards
+                        files={byRunId.get(runId!)!}
+                        sessionId={sessionId}
+                        onPreviewFile={onPreviewFile}
+                      />
+                    )}
+                  </div>
+                );
+              }
+              return (
+                <StepGroup
+                  key={`steps_${u.runId}_${u.steps[0]?.id ?? '0'}`}
+                  group={u}
+                  friendly={friendly}
+                  onPreviewFile={onPreviewFile}
+                />
+              );
+            });
+          })()}
 
           {/* ── Design fixture fallback (no real messages yet) ── */}
           {/* DESIGN FIXTURE — remove when backend provides transcript data */}
@@ -370,6 +401,8 @@ export function ChatWindow({
         isStreaming={isStreaming}
         onStop={cancel}
         onUpload={handleUpload}
+        prefill={prefillText}
+        onPrefillConsumed={clearPrefill}
       />
     </div>
   );

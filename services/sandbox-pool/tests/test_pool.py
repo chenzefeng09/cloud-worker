@@ -26,6 +26,7 @@ def _settings(**over: object) -> Settings:
         "idle_low_watermark": 2,
         "idle_high_watermark": 5,
         "max_total": 10,
+        "acquire_timeout_seconds": 0,
         "warmup_templates": ["base"],
         "otel_enabled": False,
         # Minimal docker-related settings (not used — runtime is mocked)
@@ -110,7 +111,7 @@ async def test_acquire_refuses_above_max_total() -> None:
 async def test_release_unknown_raises_not_found() -> None:
     pool, _runtime = _make_pool()
     with pytest.raises(SandboxNotFoundError):
-        await pool.release("sb_does_not_exist")
+        await pool.release("sb_does_not_exist", tenant_id="t1")
 
 
 @pytest.mark.asyncio
@@ -119,7 +120,7 @@ async def test_release_calls_stop_container() -> None:
     pool, runtime = _make_pool(idle_low_watermark=0)
     entry = await pool.acquire(tenant_id="t1")
     sid = entry.sandbox_id
-    await pool.release(sid)
+    await pool.release(sid, tenant_id="t1")
     assert pool.snapshot()["total"] == 0
     runtime.stop_container.assert_called_once_with(sid)
 
@@ -128,8 +129,18 @@ async def test_release_calls_stop_container() -> None:
 async def test_release_removes_from_pool() -> None:
     pool, _runtime = _make_pool(idle_low_watermark=0)
     entry = await pool.acquire(tenant_id="t1")
-    await pool.release(entry.sandbox_id)
+    await pool.release(entry.sandbox_id, tenant_id="t1")
     assert pool.snapshot()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_release_rejects_wrong_tenant() -> None:
+    pool, runtime = _make_pool(idle_low_watermark=0)
+    entry = await pool.acquire(tenant_id="t1")
+    with pytest.raises(SandboxNotFoundError):
+        await pool.release(entry.sandbox_id, tenant_id="t2")
+    assert pool.snapshot()["total"] == 1
+    runtime.stop_container.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #

@@ -10,19 +10,19 @@ interface NavSpec {
   label: string;
   glyph: string;
   count?: string;
-  countFrom?: 'tasks' | 'files';
+  countFrom?: 'tasks';
 }
 
 const NAV: NavSpec[] = [
   { to: '/home', label: '首页', glyph: '◇' },
   { to: '/tasks', label: '任务', glyph: '▤', countFrom: 'tasks' },
-  { to: '/files', label: '基础文件', glyph: '⌗', countFrom: 'files' },
+  { to: '/files', label: '基础文件', glyph: '⌗' },
   { to: '/library', label: '资源库', glyph: '✦', count: '13' },
   { to: '/fleet', label: '工作节点', glyph: '◈', count: '6' },
 ];
 
 export function Sidebar() {
-  const { ws, files } = useWorkspace();
+  const { ws } = useWorkspace();
   const { sessions } = useSessions();
   const userProfile = useChatStore((s) => s.userProfile);
   const logout = useChatStore((s) => s.logout);
@@ -30,7 +30,6 @@ export function Sidebar() {
 
   const navCounts = {
     tasks: String(sessions.length),
-    files: String(files.length),
   };
 
   const recent = sessions.slice(0, 3);

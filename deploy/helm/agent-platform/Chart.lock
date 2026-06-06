@@ -1,0 +1,6 @@
+dependencies:
+- name: foundation
+  repository: file:///Users/chenzefeng/Development/saas-foundation/deploy/helm/foundation
+  version: 0.1.0
+digest: sha256:2f8a8d5f63b3d3ba131b954d95a72f6df5cd53ed528a8d655be0214b6ba4eac8
+generated: "2026-06-05T16:25:57.173275+08:00"

@@ -60,11 +60,9 @@ export function StepGroup({ group, friendly }: StepGroupProps) {
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
-    <div className="flex gap-3 items-start">
-      <span className="cw-avatar accent lg shrink-0 font-mono">◆</span>
-      <div className="flex-1 min-w-0">
-        {/* Collapse chip header */}
-        <div
+    <div className="min-w-0">
+      {/* Collapse chip header */}
+      <div
           onClick={() => setStepsOpen((v) => !v)}
           className="inline-flex items-center gap-2 cursor-pointer text-dim"
           style={
@@ -120,7 +118,6 @@ export function StepGroup({ group, friendly }: StepGroupProps) {
             })}
           </div>
         )}
-      </div>
     </div>
   );
 }

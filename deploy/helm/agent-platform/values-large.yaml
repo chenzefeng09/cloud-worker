@@ -1,0 +1,164 @@
+# =============================================================================
+# large profile — 跨 AZ / 1000+ 用户 / SaaS 主集群 / Karpenter
+#
+# 特点：
+#   - 跨 3 AZ，topologySpread DoNotSchedule
+#   - 业务服务 3-10 副本，HPA 上限 50
+#   - KEDA sandbox-pool，idle 阈值 10
+#   - 严格 NetworkPolicy，readonly rootfs，non-root
+#   - agent-scheduler 推荐切换到 cube runtime（W6 staging 物料）
+#   - Karpenter NodePool 注解（通过 nodeSelector 触发）
+#   - 所有基础设施组件假设客户已部署（外部 PG/Redis/MinIO）
+# =============================================================================
+
+global:
+  profile: large
+  ingress:
+    enabled: true
+    className: nginx
+    tls: true
+  # Karpenter spot 节点优先用于无状态服务
+  nodeSelector:
+    karpenter.sh/capacity-type: on-demand
+  tolerations: []
+  affinity: {}
+
+# 严格安全上下文
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  readOnlyRootFilesystem: true
+
+# ---------------------------------------------------------------------------
+# 业务服务公共设定
+# ---------------------------------------------------------------------------
+_svcDefaults: &svcDefaults
+  replicaCount: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 50
+    targetCPUUtilizationPercentage: 60
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels: {}
+    - maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels: {}
+  networkPolicy:
+    enabled: true
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: 2,    memory: 2Gi }
+
+bff:
+  <<: *svcDefaults
+  replicaCount: 5
+  config:
+    cookieSecure: "true"
+
+sessionOrchestrator:
+  <<: *svcDefaults
+  replicaCount: 5
+  config:
+    dbPoolSize: "20"
+    dbMaxOverflow: "40"
+
+agentScheduler:
+  <<: *svcDefaults
+  replicaCount: 3
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 60
+  config:
+    # large profile 推荐切换到 cube runtime（W6 staging 物料）
+    # 切换方式：
+    #   1. 将 runtime 改为 cube
+    #   2. 填写 cubeControllerUrl（由 W6 operator 提供的 cube-controller service）
+    #   3. 将 dockerSocketProxy.enabled 改为 false
+    runtime: cube
+  # cube-controller 端点（runtime=cube 时必填；由 W6 operator 物料的 Service 提供）
+  cubeControllerUrl: http://cube-controller.cube-system.svc:8443
+  dockerSocketProxy:
+    enabled: false   # cube runtime 不需要 docker-socket-proxy
+  workspaceVolume:
+    # large: 必须使用 ReadWriteMany PVC（多副本 scheduler 共享 workspace）
+    type: pvc
+    storageClass: cephfs   # 或 nfs-csi；需预先创建 PVC
+    pvcName: agent-workspaces-pvc
+    size: 100Gi
+
+# large: KEDA + 高水位
+sandboxPool:
+  replicaCount: 3
+  keda:
+    enabled: true
+    minReplicaCount: 2
+    maxReplicaCount: 50
+    idleThreshold: "10"
+    prometheusAddress: http://prometheus-operated.monitoring.svc:9090
+    authEnabled: true
+    authSecretName: sandbox-pool-prometheus-credentials
+  config:
+    idleLowWatermark: "10"
+    idleHighWatermark: "50"
+    maxTotal: "200"
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 2
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+      labelSelector:
+        matchLabels: {}
+  networkPolicy:
+    enabled: true
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: 2,    memory: 2Gi }
+
+mcpRegistry:
+  <<: *svcDefaults
+
+skillStore:
+  <<: *svcDefaults
+
+knowledgeIngest:
+  <<: *svcDefaults
+  replicaCount: 5
+  resources:
+    requests: { cpu: 1,  memory: 2Gi }
+    limits:   { cpu: 4,  memory: 4Gi }
+
+web:
+  <<: *svcDefaults
+  replicaCount: 3
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { cpu: 500m, memory: 256Mi }
+
+webFetchGateway:
+  <<: *svcDefaults
+  replicaCount: 3
+  resources:
+    requests: { cpu: 200m, memory: 256Mi }
+    limits:   { cpu: 1,    memory: 512Mi }

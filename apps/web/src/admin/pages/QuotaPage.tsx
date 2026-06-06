@@ -4,10 +4,7 @@ import { useAdminStore } from '../../stores/adminStore';
 import type { QuotaInfo } from '../../api/types';
 
 /**
- * TODO: This page calls /admin/billing/quota?tenant_id= which proxies to the
- * billing service. The BFF endpoint `/admin/billing/quota` may not yet be
- * implemented. When it is, remove the placeholder banner and this page will
- * start working automatically.
+ * Quota viewer — queries /admin/billing/quota (BFF proxy to foundation-billing).
  */
 export function QuotaPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading, selectedTenantId, setSelectedTenantId } =
@@ -15,7 +12,6 @@ export function QuotaPage() {
   const [quota, setQuota] = useState<QuotaInfo | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [isTodoEndpoint, setIsTodoEndpoint] = useState(false);
 
   // Bootstrap tenant list
   useEffect(() => {
@@ -33,17 +29,12 @@ export function QuotaPage() {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    setIsTodoEndpoint(false);
     api.admin.billing
       .quota(selectedTenantId)
       .then((data) => { if (!cancelled) setQuota(data); })
       .catch((err) => {
         if (cancelled) return;
-        if (err instanceof ApiError && (err.status === 404 || err.status === 501)) {
-          setIsTodoEndpoint(true);
-        } else {
-          setError(err instanceof ApiError ? err.message : '加载失败');
-        }
+        setError(err instanceof ApiError ? err.message : '加载失败');
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
@@ -54,12 +45,6 @@ export function QuotaPage() {
       <div>
         <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">配额套餐</h1>
         <p className="text-[12px] text-dim mt-0.5">查看租户当前用量与套餐限额</p>
-      </div>
-
-      {/* TODO banner */}
-      <div className="border border-warn/30 rounded-md px-4 py-3 bg-warn/5 text-[12px] text-warn font-mono">
-        TODO: BFF 端点 <code className="bg-warn/10 px-1 rounded-sm">/admin/billing/quota</code> 尚未在 BFF 层暴露。
-        该页面 UI 已就绪，接线占位。待 BFF 代理 billing 服务后，本提示可删除。
       </div>
 
       {/* Tenant selector */}
@@ -85,12 +70,6 @@ export function QuotaPage() {
       )}
 
       {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
-
-      {isTodoEndpoint && (
-        <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          BFF 配额代理端点尚未就绪，当前占位显示。接线后将自动展示用量数据。
-        </div>
-      )}
 
       {quota && (
         <div className="flex flex-col gap-4">

@@ -74,6 +74,11 @@ class SandboxRuntime(Protocol):
         tenant_id: str,
         user_id: str,
         foundation_token: str,
+        skills: list[str] | None = None,
+        files: list[dict] | None = None,
+        memory: str | None = None,
+        llm_gateway_url: str | None = None,
+        llm_virtual_key: str | None = None,
     ) -> str:
         """Spawn a sandbox for one agent run; return the runtime-specific id.
 

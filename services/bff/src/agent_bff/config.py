@@ -29,6 +29,8 @@ class Settings(BaseSettings):
     foundation_billing_url: str = "http://billing:8007/api/billing/v1"
     # Audit service — added to dev.yml as port 8013 (8005 conflicts with BFF).
     foundation_audit_url: str = "http://audit:8013/api/audit/v1"
+    # LLM Gateway — capability probe endpoint (POST /probe).
+    foundation_llm_gateway_url: str = "http://llm-gateway:8011/api/llm-gateway/v1"
 
     session_orchestrator_url: str = "http://localhost:8006/api/session/v1"
 

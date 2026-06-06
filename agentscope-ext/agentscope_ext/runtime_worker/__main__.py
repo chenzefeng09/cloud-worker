@@ -173,16 +173,29 @@ async def _dispatch(
     # Track last plan text (from ThinkEvent) so we can surface it in state.
     last_plan: str = ""
 
+    # Per-tool-call accumulation buffers for tool streaming events.
+    # Keys are tool_call_id strings.
+    tool_names: dict[str, str] = {}
+    tool_args: dict[str, str] = {}
+    tool_results: dict[str, str] = {}
+
     async for event in agent.reply_stream(user_msg):
         _hooks.write_event(events_path, event)
         event_type = type(event).__name__
 
-        # Extract plan text from ThinkEvent (AgentScope 2.x reasoning event).
+        # ------------------------------------------------------------------
+        # ThinkEvent: extract plan text and optionally stream thinking block.
+        # ------------------------------------------------------------------
         if event_type == "ThinkEvent":
             thought = getattr(event, "thought", None) or getattr(event, "text", None) or ""
             if thought:
                 last_plan = str(thought)
+                if state_client is not None:
+                    state_client.push_thinking(last_plan)
 
+        # ------------------------------------------------------------------
+        # Text token streaming.
+        # ------------------------------------------------------------------
         if event_type == "TextBlockStartEvent":
             block_id = getattr(event, "block_id", None)
             if block_id and block_id not in text_blocks:
@@ -191,10 +204,71 @@ async def _dispatch(
             block_id = getattr(event, "block_id", None) or ""
             delta = getattr(event, "delta", "") or ""
             text_blocks[block_id] = text_blocks.get(block_id, "") + str(delta)
+            # Push token delta to Redis Stream for live streaming (failure-open).
+            if state_client is not None:
+                state_client.push_token(str(delta))
+
+        # ------------------------------------------------------------------
+        # Tool call streaming: accumulate args deltas, push when complete.
+        # ------------------------------------------------------------------
+        elif event_type == "ToolCallStartEvent":
+            tc_id = getattr(event, "tool_call_id", "") or ""
+            tc_name = getattr(event, "tool_call_name", "") or ""
+            if tc_id:
+                tool_names[tc_id] = tc_name
+                tool_args[tc_id] = ""
+
+        elif event_type == "ToolCallDeltaEvent":
+            tc_id = getattr(event, "tool_call_id", "") or ""
+            delta = getattr(event, "delta", "") or ""
+            if tc_id:
+                tool_args[tc_id] = tool_args.get(tc_id, "") + str(delta)
+
+        elif event_type == "ToolCallEndEvent":
+            tc_id = getattr(event, "tool_call_id", "") or ""
+            if tc_id and state_client is not None:
+                state_client.push_tool_call(
+                    tc_id,
+                    tool_names.get(tc_id, ""),
+                    tool_args.get(tc_id, ""),
+                )
+
+        # ------------------------------------------------------------------
+        # Tool result streaming: accumulate result deltas, push when complete.
+        # ------------------------------------------------------------------
+        elif event_type == "ToolResultStartEvent":
+            tc_id = getattr(event, "tool_call_id", "") or ""
+            tc_name = getattr(event, "tool_call_name", "") or ""
+            if tc_id:
+                # name may arrive again here; update if provided
+                if tc_name:
+                    tool_names[tc_id] = tc_name
+                tool_results[tc_id] = ""
+
+        elif event_type == "ToolResultTextDeltaEvent":
+            tc_id = getattr(event, "tool_call_id", "") or ""
+            delta = getattr(event, "delta", "") or ""
+            if tc_id:
+                tool_results[tc_id] = tool_results.get(tc_id, "") + str(delta)
+
+        elif event_type == "ToolResultEndEvent":
+            tc_id = getattr(event, "tool_call_id", "") or ""
+            result_state = getattr(event, "state", "success") or "success"
+            if tc_id and state_client is not None:
+                state_client.push_tool_result(
+                    tc_id,
+                    tool_names.get(tc_id, ""),
+                    tool_results.get(tc_id, ""),
+                    str(result_state),
+                )
 
         # Write hot state after every event (failure-open).
         if state_client is not None:
             state_client.write_step(plan=last_plan, cursor=event_type)
+
+    # Signal end-of-stream so the orchestrator SSE bridge knows the reply is done.
+    if state_client is not None:
+        state_client.push_token_end()
 
     return "\n".join(t for t in text_blocks.values() if t).strip()
 
@@ -418,7 +492,48 @@ def _run_real(task: dict) -> tuple[str, str]:
         file_list = ", ".join(downloaded)
         sys_prompt += (
             f"\n\n用户上传了以下文件，位于 /workspace/inputs/：{file_list}\n"
-            "你可以读取这些文件来完成任务。"
+            "请使用 Read 工具读取 /workspace/inputs/ 下的文件来完成任务。"
+        )
+
+    # Pre-create /workspace/outputs/ so the agent can write there without
+    # needing to mkdir first (though Bash mkdir also works).
+    outputs_dir = WORKSPACE / "outputs"
+    try:
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("cannot pre-create /workspace/outputs: %s", exc)
+
+    # File-output policy: reply inline by default; only persist a file when the
+    # user explicitly asks to be *delivered* a file. Let the model judge intent
+    # rather than relying on brittle keyword matching.
+    sys_prompt += (
+        "\n\n## 关于文件输出\n"
+        "默认情况下，请把结果（包括代码、文本、表格等）直接写在回复正文里："
+        "代码用 Markdown 代码块（```语言 ... ```）展示，便于用户直接阅读和复制；"
+        "不要为此创建任何文件。\n"
+        "只有当用户明确要求“交付/生成/导出/下载/保存为文件”（例如“生成一个 .docx”、"
+        "“把它导出成 Excel”、“给我一个 txt 文件”）时，才使用 Write 工具把产物写入 "
+        "/workspace/outputs/ 目录（路径示例：/workspace/outputs/report.docx）；"
+        "任务结束后该目录下的文件会自动作为产物回传给用户。如需先创建子目录，可用 Bash 执行 mkdir -p。\n"
+        "判断不确定时，优先直接在正文回复，而不是写文件。"
+    )
+
+    # Build an AgentState with BYPASS permission so tool calls are auto-approved
+    # in the headless sandbox (no human is present to confirm).  Failure-open:
+    # if the permission sub-system is absent in this AgentScope version we fall
+    # back to state=None and Agent uses its default (which may prompt).
+    agent_state = None
+    try:
+        from agentscope.state import AgentState
+        from agentscope.permission import PermissionContext, PermissionMode
+
+        agent_state = AgentState(
+            permission_context=PermissionContext(mode=PermissionMode.BYPASS)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "could not set BYPASS permission; tool calls may require confirmation: %s",
+            exc,
         )
 
     agent = Agent(
@@ -426,6 +541,7 @@ def _run_real(task: dict) -> tuple[str, str]:
         system_prompt=sys_prompt,
         model=model,
         toolkit=toolkit,
+        state=agent_state,
     )
 
     # Make sure events.jsonl exists even if the agent never emits.

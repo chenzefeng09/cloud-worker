@@ -164,6 +164,18 @@ def fake_identity(monkeypatch: pytest.MonkeyPatch) -> FakeIdentity:
         async def __aexit__(self, *args) -> None:
             return None
 
+        async def get(self, url: str, **kw) -> httpx.Response:
+            # Enterprise default: a successful create_run path needs a tenant
+            # virtual key because llm_gateway_enforcer is enabled by default.
+            # Tests that need a missing/down key path patch httpx.AsyncClient
+            # directly rather than relying on fake_identity.
+            if "/tenant-keys" in url:
+                return httpx.Response(
+                    200,
+                    json=[{"key": "vk-test-default", "enabled": True}],
+                )
+            return httpx.Response(404, json={"detail": "not found"})
+
         async def post(self, url: str, **kw) -> httpx.Response:
             # Route calls to the right stub so authz/quota guards still pass
             # even when fake_identity overwrites httpx.AsyncClient.

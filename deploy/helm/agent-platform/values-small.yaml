@@ -1,0 +1,92 @@
+# =============================================================================
+# small profile — POC / 单节点 K3s / 固定沙箱池 / ≤50 用户
+#
+# 特点：
+#   - 所有服务 1 副本，无 HA
+#   - 无 HPA、无 PDB、无 topologySpread
+#   - sandbox-pool 固定副本（KEDA 关闭），pool 大小靠 POOL_* 环境变量控制
+#   - 假设 foundation 已单独部署（foundation.enabled=false）
+#   - K3s 默认 Ingress class: traefik
+#   - agent-scheduler 使用 docker runtime + docker-socket-proxy
+#
+# 安装：
+#   helm install agent-platform . -f values-small.yaml \
+#       --set global.ingress.host=agent-platform.your.domain \
+#       --set global.foundation.database.existingSecret=foundation-db-credentials \
+#       --set bff.config.cookieSecret=<>=32-chars-random>
+# =============================================================================
+
+global:
+  profile: small
+  ingress:
+    enabled: true
+    className: traefik   # K3s 默认
+    tls: false
+
+# small profile: 1 副本，无 HPA
+bff:
+  replicaCount: 1
+  autoscaling: { enabled: false }
+  podDisruptionBudget: { enabled: false }
+  networkPolicy: { enabled: false }
+  config:
+    cookieSecure: "false"   # small/dev 不强制 HTTPS
+
+sessionOrchestrator:
+  replicaCount: 1
+  autoscaling: { enabled: false }
+  podDisruptionBudget: { enabled: false }
+  networkPolicy: { enabled: false }
+
+agentScheduler:
+  replicaCount: 1
+  autoscaling: { enabled: false }
+  podDisruptionBudget: { enabled: false }
+  networkPolicy: { enabled: false }
+  config:
+    runtime: docker    # small profile 用 docker-socket-proxy
+  dockerSocketProxy:
+    enabled: true
+  workspaceVolume:
+    type: hostPath
+    hostPath: /tmp/agent-workspaces
+
+# small profile: 固定 1 副本 sandbox-pool；KEDA 关闭
+sandboxPool:
+  replicaCount: 1
+  keda:
+    enabled: false
+  config:
+    idleLowWatermark: "2"
+    idleHighWatermark: "5"
+    maxTotal: "20"
+
+mcpRegistry:
+  replicaCount: 1
+  autoscaling: { enabled: false }
+  podDisruptionBudget: { enabled: false }
+  networkPolicy: { enabled: false }
+
+skillStore:
+  replicaCount: 1
+  autoscaling: { enabled: false }
+  podDisruptionBudget: { enabled: false }
+  networkPolicy: { enabled: false }
+
+knowledgeIngest:
+  replicaCount: 1
+  autoscaling: { enabled: false }
+  podDisruptionBudget: { enabled: false }
+  networkPolicy: { enabled: false }
+
+web:
+  replicaCount: 1
+  autoscaling: { enabled: false }
+  podDisruptionBudget: { enabled: false }
+  networkPolicy: { enabled: false }
+
+webFetchGateway:
+  replicaCount: 1
+  autoscaling: { enabled: false }
+  podDisruptionBudget: { enabled: false }
+  networkPolicy: { enabled: false }
