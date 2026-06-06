@@ -19,11 +19,6 @@ opentelemetry-exporter-otlp = "^1.28.0"
 python-jose = { extras = ["cryptography"], version = "^3.3.0" }
 # CookieSigner + identity SDK
 itsdangerous = "^2.2.0"
-# BFF-local DB — notification preferences (and future: api_keys)
-sqlalchemy = { extras = ["asyncio"], version = "^2.0.36" }
-asyncpg = "^0.30.0"
-aiosqlite = "^0.20.0"
-alembic = "^1.14.0"
 # Foundation SDK — injected at image-build time via the docker-compose
 # `additional_contexts: foundation_sdk` entry (see the service Dockerfile,
 # which `pip install /sdk[fastapi]` before poetry runs).  When the internal
@@ -49,35 +44,10 @@ line-length = 100
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM"]
 
-[tool.ruff.lint.per-file-ignores]
-# FastAPI uses Depends/File/Form in function default args — this is the official pattern
-"src/agent_bff/api/**/*.py" = ["B008"]
-
 [tool.mypy]
 python_version = "3.12"
 strict = true
 ignore_missing_imports = true
-
-# The API layer proxies httpx responses whose .json() returns Any.
-# Suppressing type-arg and no-any-return for proxy endpoints is intentional —
-# full typing would require Pydantic models for every upstream response shape.
-[[tool.mypy.overrides]]
-module = [
-    "agent_bff.api.middleware",
-    "agent_bff.api.v1.admin",
-    "agent_bff.api.v1.api_keys",
-    "agent_bff.api.v1.auth",
-    "agent_bff.api.v1.billing",
-    "agent_bff.api.v1.conversations",
-    "agent_bff.api.v1.fleet",
-    "agent_bff.api.v1.library",
-    "agent_bff.api.v1.notifications",
-    "agent_bff.api.v1.sessions",
-]
-disallow_untyped_defs = false
-disallow_untyped_calls = false
-warn_return_any = false
-disallow_any_generics = false
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
