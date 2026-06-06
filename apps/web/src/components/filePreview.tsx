@@ -1,7 +1,14 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState, lazy, Suspense } from 'react';
 import hljs from 'highlight.js';
 import { api, ApiError } from '../api/client';
 import { useCopied, CopyIcon } from './CopyButton';
+
+// 重依赖的预览器全部懒加载：react-pdf / xlsx / docx-preview 只有在用户真正
+// 点开对应格式时才下载,绝不进入首屏主 bundle。FilePreviewBody 是基础文件页
+// 与任务页面板共用的预览组件,在此接入即两处同时获得能力。
+const PdfPreview = lazy(() => import('./previews/PdfPreview'));
+const ExcelPreview = lazy(() => import('./previews/ExcelPreview'));
+const DocxPreview = lazy(() => import('./previews/DocxPreview'));
 
 // ── Kind / glyph helpers ─────────────────────────────────────────────────────
 
@@ -204,16 +211,31 @@ export interface FilePreviewBodyProps {
 
 export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePreviewBodyProps) {
   const contentUrl = `/api/bff/v1/sessions/${sessionId}/files/${fileId}/content`;
+  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
   const isImage = mime?.startsWith('image/') ?? false;
   const isText = isTextLikeMime(mime);
+  const isPdf = mime === 'application/pdf' || ext === 'pdf';
+  // Office 文件的 mime 常不准(有时是 octet-stream),用扩展名兜底。
+  const isExcel =
+    ['xlsx', 'xls'].includes(ext) ||
+    (mime?.includes('spreadsheet') ?? false) ||
+    (mime?.includes('excel') ?? false);
+  const isWord =
+    ['docx', 'doc'].includes(ext) ||
+    (mime?.includes('officedocument.wordprocessing') ?? false) ||
+    (mime?.includes('msword') ?? false);
+  const needsBlob = isExcel || isWord;
 
   const [contentText, setContentText] = useState<string | null>(null);
+  const [contentBlob, setContentBlob] = useState<Blob | null>(null);
   const [contentLoading, setContentLoading] = useState(false);
   const [contentError, setContentError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!isText) {
+    // 文本走 text,Excel/Word 走 blob;PDF 用 URL、图片用 <img>,都无需 fetch。
+    if (!isText && !needsBlob) {
       setContentText(null);
+      setContentBlob(null);
       setContentError(null);
       return;
     }
@@ -222,11 +244,13 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
     setContentLoading(true);
     setContentError(null);
     setContentText(null);
+    setContentBlob(null);
 
     api.attachments.getContent(sessionId, fileId)
       .then((res) => {
         if (cancelled) return;
-        setContentText(res.text);
+        if (isText) setContentText(res.text);
+        if (needsBlob) setContentBlob(res.blob);
       })
       .catch((e) => {
         if (cancelled) return;
@@ -237,7 +261,7 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
       });
 
     return () => { cancelled = true; };
-  }, [sessionId, fileId, isText]);
+  }, [sessionId, fileId, isText, needsBlob]);
 
   // Image preview
   if (isImage) {
@@ -262,6 +286,25 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
         contentError={contentError}
         filename={filename}
       />
+    );
+  }
+
+  // PDF / Excel / Word — 懒加载预览器
+  if (isPdf || isExcel || isWord) {
+    return (
+      <Suspense fallback={<div className="font-mono text-[11px] text-dim">加载预览组件…</div>}>
+        {contentError ? (
+          <div className="font-mono text-[11px] text-accent">{contentError}</div>
+        ) : isPdf ? (
+          <PdfPreview url={contentUrl} />
+        ) : contentBlob ? (
+          isExcel ? <ExcelPreview blob={contentBlob} /> : <DocxPreview blob={contentBlob} />
+        ) : (
+          <div className="font-mono text-[11px] text-dim">
+            {isExcel ? '加载表格…' : '加载文档…'}
+          </div>
+        )}
+      </Suspense>
     );
   }
 
