@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -177,7 +178,25 @@ async def get_file_content(
         content=data,
         media_type=att.mime or "application/octet-stream",
         headers={
-            "Content-Disposition": f'inline; filename="{att.filename}"',
+            "Content-Disposition": _content_disposition(att.filename),
             "Content-Length": str(len(data)),
         },
+    )
+
+
+def _content_disposition(filename: str, disposition: str = "inline") -> str:
+    """Build an RFC 6266 Content-Disposition header.
+
+    HTTP header values are encoded as latin-1, so a non-ASCII ``filename``
+    (e.g. Chinese characters) would raise ``UnicodeEncodeError`` during
+    response serialization and surface as a 500. Emit an ASCII-safe
+    ``filename`` fallback plus a percent-encoded ``filename*`` (UTF-8) for
+    clients that support it.
+    """
+    name = filename or "download"
+    ascii_fallback = name.encode("ascii", "replace").decode("ascii").replace('"', "'")
+    quoted = quote(name, safe="")
+    return (
+        f"{disposition}; filename=\"{ascii_fallback}\"; "
+        f"filename*=UTF-8''{quoted}"
     )
