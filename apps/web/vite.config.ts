@@ -2,6 +2,9 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 
+const devBuildStamp = new Date().toISOString().slice(11, 19);
+process.env.VITE_DEV_BUILD_STAMP = devBuildStamp;
+
 export default defineConfig({
   plugins: [react()],
   resolve: { alias: { '@': '/src' } },

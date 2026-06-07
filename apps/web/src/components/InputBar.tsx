@@ -17,8 +17,12 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const [pendingSend, setPendingSend] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // Tracks in-flight uploads + the attachments they produce, so a Send that
+  // races an upload can await it instead of silently sending an empty list.
+  const uploadRef = useRef<Promise<Attachment[]> | null>(null);
 
   // Apply prefill when it arrives (e.g. after rewind).
   useEffect(() => {
@@ -35,14 +39,33 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
     });
   }, [prefill, onPrefillConsumed]);
 
-  const handleSubmit = (e?: FormEvent) => {
+  const handleSubmit = async (e?: FormEvent) => {
     e?.preventDefault();
-    if ((!text.trim() && attachments.length === 0) || disabled) return;
-    const ids = attachments.map((a) => a.id);
+    if (disabled || pendingSend) return;
+
+    // If an upload is still in flight, wait for it so we never send with an
+    // empty attachment list while a file is mid-upload. The button shows a
+    // pending state meanwhile.
+    let ready = attachments;
+    if (uploadRef.current) {
+      setPendingSend(true);
+      try {
+        ready = await uploadRef.current;
+      } catch {
+        // Upload failed — handleFileChange already surfaced the error.
+        setPendingSend(false);
+        return;
+      }
+      setPendingSend(false);
+    }
+
+    if (!text.trim() && ready.length === 0) return;
+    const ids = ready.map((a) => a.id);
     // Pass full attachment objects so callers can populate optimistic messages.
-    onSend(text.trim(), ids, attachments.slice());
+    onSend(text.trim(), ids, ready.slice());
     setText('');
     setAttachments([]);
+    uploadRef.current = null;
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
     }
@@ -67,18 +90,32 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
     if (!files.length || !onUpload) return;
     setUploading(true);
     setUploadError(null);
-    try {
-      for (const file of files) {
-        const att = await onUpload(file);
-        setAttachments((prev) => [...prev, att]);
+
+    // Snapshot the current attachments so the promise resolves to the full
+    // list (existing + newly uploaded), letting a racing Send await it.
+    const run = (async (): Promise<Attachment[]> => {
+      const added: Attachment[] = [];
+      try {
+        for (const file of files) {
+          const att = await onUpload(file);
+          added.push(att);
+          setAttachments((prev) => [...prev, att]);
+        }
+        return [...attachments, ...added];
+      } catch (err) {
+        const name = err instanceof Error ? err.message : '上传失败，请重试';
+        setUploadError(name);
+        throw err;
+      } finally {
+        setUploading(false);
+        if (fileInputRef.current) fileInputRef.current.value = '';
       }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : '上传失败，请重试';
-      setUploadError(msg);
-    } finally {
-      setUploading(false);
-      if (fileInputRef.current) fileInputRef.current.value = '';
-    }
+    })();
+
+    uploadRef.current = run;
+    // Swallow rejection here so it doesn't surface as an unhandled rejection;
+    // handleSubmit re-awaits and handles the failure path.
+    run.catch(() => {});
   };
 
   const removeAttachment = (id: string) => {
@@ -117,14 +154,18 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
         </div>
       )}
 
-      {/* Upload error */}
+      {/* Upload error — prominent so it isn't missed. */}
       {uploadError && (
-        <div className="flex items-center gap-2 mb-2 max-w-3xl text-[11px] font-mono text-red-600">
-          <span>⚠ {uploadError}</span>
+        <div
+          role="alert"
+          className="flex items-start gap-2 mb-2 max-w-3xl px-3 py-2 rounded-md border border-red-300 bg-red-50 text-[12.5px] text-red-700"
+        >
+          <span className="shrink-0 leading-[1.5]">⚠</span>
+          <span className="flex-1 leading-[1.5]">附件上传失败：{uploadError}</span>
           <button
             type="button"
             onClick={() => setUploadError(null)}
-            className="text-dim hover:text-ink leading-none"
+            className="shrink-0 text-red-400 hover:text-red-700 leading-none"
             aria-label="关闭错误提示"
           >
             ×
@@ -138,7 +179,7 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
           ref={fileInputRef}
           type="file"
           multiple
-          accept="image/*,.pdf,.txt,.csv,.md,.json,.py,.js,.ts,.html,.xml,.yaml,.yml"
+          accept="image/*,.pdf,.txt,.csv,.md,.json,.py,.js,.ts,.html,.xml,.yaml,.yml,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.wps,.et,.dps"
           className="hidden"
           onChange={handleFileChange}
           disabled={!onUpload || uploading}
@@ -183,10 +224,14 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
             <button
               type="button"
               onClick={() => handleSubmit()}
-              disabled={disabled || (!text.trim() && attachments.length === 0)}
+              disabled={
+                disabled ||
+                pendingSend ||
+                (!text.trim() && attachments.length === 0 && !uploading)
+              }
               className="px-2.5 py-1 bg-accent text-white rounded-md font-mono text-[11.5px] font-medium hover:opacity-90 disabled:opacity-40"
             >
-              发送 ↵
+              {pendingSend ? '等待上传…' : '发送 ↵'}
             </button>
           )}
         </div>

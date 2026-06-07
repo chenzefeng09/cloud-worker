@@ -146,6 +146,12 @@ class SessionService:
                     for a in att_rows
                 ]
             except Exception:  # noqa: BLE001 — failure-open; don't block message creation
+                # Log instead of silently swallowing — a swallowed error here
+                # previously hid attachments being dropped from messages.
+                logger.exception(
+                    "attachment metadata resolution failed",
+                    extra={"attachment_ids": attachment_ids, "session_id": session_id},
+                )
                 attachments_meta = None
 
         msg = Message(

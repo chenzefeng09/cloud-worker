@@ -507,6 +507,100 @@ def test_stream_tokens_yields_delta_events_and_stops_on_end() -> None:
         assert ev.startswith("event: token\n"), f"Wrong event name: {ev!r}"
 
 
+def test_stream_tokens_waits_through_worker_coldstart() -> None:
+    """Regression: with wait_for_worker=True the tail must NOT bail out while the
+    worker is still cold-starting (empty xreads), and must yield the deltas once
+    they finally arrive.  Guards the cold-start race that killed live streaming.
+    """
+    from agent_session_orchestrator.api.v1.messages import _stream_tokens
+
+    fake_entries = [
+        ("1-0", {"type": "delta", "text": "spring"}),
+        ("2-0", {"type": "end", "text": ""}),
+    ]
+
+    class _ColdStartRedis:
+        _call_count = 0
+
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def xread(self, streams, block=0, count=None):
+            key = list(streams.keys())[0]
+            # First 4 reads are empty (worker cold-starting) — the old logic
+            # would have returned after read #2.  Then the deltas arrive.
+            if self._call_count < 4:
+                self.__class__._call_count += 1
+                return []
+            if self._call_count == 4:
+                self.__class__._call_count += 1
+                return [(key, fake_entries)]
+            return []
+
+        async def aclose(self): pass
+
+    async def _run():
+        with _patch_redis_asyncio(_ColdStartRedis):
+            _ColdStartRedis._call_count = 0
+            deadline = asyncio.get_event_loop().time() + 30.0
+            events = []
+            async for ev in _stream_tokens(
+                redis_url="redis://localhost:6379",
+                run_id="run_cold",
+                deadline=deadline,
+                wait_for_worker=True,
+            ):
+                events.append(ev)
+        return events
+
+    events = asyncio.get_event_loop().run_until_complete(_run())
+
+    assert len(events) == 1, f"Expected the post-coldstart delta, got: {events}"
+    parsed = json.loads(events[0].split("data: ")[1].strip())
+    assert parsed == {"run_id": "run_cold", "delta": "spring"}
+    assert events[0].startswith("event: token\n")
+
+
+def test_stream_tokens_replay_bails_out_fast_when_empty() -> None:
+    """With wait_for_worker=False (terminal replay) the tail must return quickly
+    when no entries are present, instead of waiting the full cold-start grace.
+    """
+    from agent_session_orchestrator.api.v1.messages import _stream_tokens
+
+    class _EmptyRedis:
+        call_count = 0
+
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def xread(self, streams, block=0, count=None):
+            self.__class__.call_count += 1
+            return []
+
+        async def aclose(self): pass
+
+    async def _run():
+        with _patch_redis_asyncio(_EmptyRedis):
+            _EmptyRedis.call_count = 0
+            deadline = asyncio.get_event_loop().time() + 30.0
+            events = []
+            async for ev in _stream_tokens(
+                redis_url="redis://localhost:6379",
+                run_id="run_replay",
+                deadline=deadline,
+                wait_for_worker=False,
+            ):
+                events.append(ev)
+        return events, _EmptyRedis.call_count
+
+    events, call_count = asyncio.get_event_loop().run_until_complete(_run())
+    assert events == []
+    # Old fast-exit preserved: returns after the 2nd idle read, not 30s of polls.
+    assert call_count <= 3, f"Replay should bail fast, did {call_count} xreads"
+
+
 def test_stream_tokens_failure_open_on_redis_error() -> None:
     """_stream_tokens silently returns (no exception) when Redis raises."""
     from agent_session_orchestrator.api.v1.messages import _stream_tokens
@@ -1774,3 +1868,52 @@ def test_read_ordered_blocks_multiple_tools_interleaved() -> None:
     assert blocks[1] == {"kind": "text", "text": "mid text"}
     assert blocks[2]["kind"] == "tool" and blocks[2]["tool_call_id"] == "tc2"
     assert blocks[3] == {"kind": "text", "text": "end text"}
+
+
+def test_read_ordered_blocks_sanitizes_nul_tool_result() -> None:
+    """Postgres JSONB rejects strings containing NUL; replay must sanitize them."""
+    from agent_session_orchestrator.api.v1.messages import _read_ordered_blocks_from_redis
+
+    class _FakeRedis:
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def xrange(self, key, min="-", max="+"):
+            return [
+                (
+                    "1-0",
+                    {
+                        "type": "tool_call",
+                        "tool_call_id": "tc1",
+                        "name": "Read",
+                        "args": "{}",
+                    },
+                ),
+                (
+                    "2-0",
+                    {
+                        "type": "tool_result",
+                        "tool_call_id": "tc1",
+                        "result": "a\x00b",
+                        "state": "ok",
+                    },
+                ),
+                ("3-0", {"type": "end"}),
+            ]
+
+        async def aclose(self):
+            return None
+
+    async def _run():
+        with _patch_redis_asyncio(_FakeRedis):
+            return await _read_ordered_blocks_from_redis(
+                redis_url="redis://localhost:6379",
+                run_id="run_g_nul",
+            )
+
+    blocks = asyncio.get_event_loop().run_until_complete(_run())
+
+    assert blocks[0]["kind"] == "tool"
+    assert blocks[0]["result"] == "ab"
+    assert "\x00" not in blocks[0]["result"]

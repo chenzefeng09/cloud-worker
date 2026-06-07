@@ -144,6 +144,122 @@ class ModelCallEndEvent:
         }
 
 
+class ToolCallStartEvent:
+    def __init__(self, tool_call_id: str, tool_call_name: str):
+        self.tool_call_id = tool_call_id
+        self.tool_call_name = tool_call_name
+
+    def model_dump(self):
+        return {
+            "event_type": "ToolCallStartEvent",
+            "tool_call_id": self.tool_call_id,
+            "tool_call_name": self.tool_call_name,
+        }
+
+
+class ToolCallDeltaEvent:
+    def __init__(self, tool_call_id: str, delta: str):
+        self.tool_call_id = tool_call_id
+        self.delta = delta
+
+    def model_dump(self):
+        return {
+            "event_type": "ToolCallDeltaEvent",
+            "tool_call_id": self.tool_call_id,
+            "delta": self.delta,
+        }
+
+
+class ToolCallEndEvent:
+    def __init__(self, tool_call_id: str):
+        self.tool_call_id = tool_call_id
+
+    def model_dump(self):
+        return {
+            "event_type": "ToolCallEndEvent",
+            "tool_call_id": self.tool_call_id,
+        }
+
+
+class ToolResultStartEvent:
+    def __init__(self, tool_call_id: str, tool_call_name: str):
+        self.tool_call_id = tool_call_id
+        self.tool_call_name = tool_call_name
+
+    def model_dump(self):
+        return {
+            "event_type": "ToolResultStartEvent",
+            "tool_call_id": self.tool_call_id,
+            "tool_call_name": self.tool_call_name,
+        }
+
+
+class ToolResultTextDeltaEvent:
+    def __init__(self, tool_call_id: str, delta: str):
+        self.tool_call_id = tool_call_id
+        self.delta = delta
+
+    def model_dump(self):
+        return {
+            "event_type": "ToolResultTextDeltaEvent",
+            "tool_call_id": self.tool_call_id,
+            "delta": self.delta,
+        }
+
+
+class ToolResultEndEvent:
+    def __init__(self, tool_call_id: str, state: str):
+        self.tool_call_id = tool_call_id
+        self.state = state
+
+    def model_dump(self):
+        return {
+            "event_type": "ToolResultEndEvent",
+            "tool_call_id": self.tool_call_id,
+            "state": self.state,
+        }
+
+
+class _FakeRedisClient:
+    """Minimal redis.Redis client stub for worker integration tests."""
+
+    def __init__(self) -> None:
+        self.xadd_calls: list[tuple[str, dict[str, str], dict[str, Any]]] = []
+        self.set_calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.expire_calls: list[tuple[str, int]] = []
+        self.get_value: str | None = None
+
+    def ping(self) -> bool:
+        return True
+
+    def get(self, key: str) -> str | None:
+        del key
+        return self.get_value
+
+    def set(self, key: str, value: str, **kwargs: Any) -> None:
+        self.set_calls.append((key, value, kwargs))
+
+    def expire(self, key: str, ttl: int) -> None:
+        self.expire_calls.append((key, ttl))
+
+    def xadd(self, key: str, fields: dict[str, str], **kwargs: Any) -> None:
+        self.xadd_calls.append((key, fields, kwargs))
+
+
+def _install_fake_redis(monkeypatch) -> _FakeRedisClient:
+    client = _FakeRedisClient()
+
+    class _FakeRedis:
+        @staticmethod
+        def from_url(*_args: Any, **_kwargs: Any) -> _FakeRedisClient:
+            return client
+
+    redis_mod = types.ModuleType("redis")
+    redis_mod.Redis = _FakeRedis
+    monkeypatch.setitem(sys.modules, "redis", redis_mod)
+    return client
+
+
 class _FakeAgent:
     """Records its construction args; reply_stream yields canned events (AS 2.x)."""
 
@@ -164,6 +280,24 @@ class _FakeAgent:
         block_id = "blk-1"
         yield TextBlockStartEvent(block_id)
         yield TextBlockDeltaEvent(block_id, _FakeAgent.reply_text)
+        yield ReplyEndEvent()
+
+
+class _FakeAgentWithToolStream(_FakeAgent):
+    """Emits tool call/result events interleaved with assistant text."""
+
+    async def reply_stream(self, msg):
+        del msg
+        block_id = "blk-tool"
+        yield ToolCallStartEvent("tc-1", "Bash")
+        yield ToolCallDeltaEvent("tc-1", '{"cmd":')
+        yield ToolCallDeltaEvent("tc-1", '"pwd"}')
+        yield ToolCallEndEvent("tc-1")
+        yield ToolResultStartEvent("tc-1", "Bash")
+        yield ToolResultTextDeltaEvent("tc-1", "/workspace")
+        yield ToolResultEndEvent("tc-1", "success")
+        yield TextBlockStartEvent(block_id)
+        yield TextBlockDeltaEvent(block_id, "done")
         yield ReplyEndEvent()
 
 
@@ -247,6 +381,12 @@ def _install_fake_agentscope(monkeypatch):
         ("agentscope.tool", tool_mod),
     ]:
         monkeypatch.setitem(sys.modules, name, mod)
+
+
+def _install_fake_agentscope_with_tool_stream(monkeypatch):
+    _install_fake_agentscope(monkeypatch)
+    agent_mod = sys.modules["agentscope.agent"]
+    agent_mod.Agent = _FakeAgentWithToolStream
 
 
 # ---------------------------------------------------------------------------
@@ -353,6 +493,66 @@ def test_happy_path_writes_result_and_events(workspace, env, monkeypatch):
     # The delta carries the reply text.
     delta_event = next(p for p in parsed if p.get("event_type") == "TextBlockDeltaEvent")
     assert delta_event["delta"] == "hi back"
+
+
+def test_worker_pushes_reply_deltas_to_redis_token_stream(workspace, env, monkeypatch):
+    ws, worker = workspace
+    _install_fake_agentscope(monkeypatch)
+    redis_client = _install_fake_redis(monkeypatch)
+    env.setenv("REDIS_URL", "redis://host:6379/0")
+    env.setenv("RUN_ID", "run_stream")
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "say hi"}))
+    _FakeAgent.reply_text = "hi back"
+
+    code = worker.main([])
+
+    assert code == 0
+    assert json.loads((ws / "result.json").read_text())["summary"] == "hi back"
+
+    token_entries = [
+        fields for key, fields, _kwargs in redis_client.xadd_calls
+        if key == "agent:run:run_stream:tokens"
+    ]
+    assert token_entries == [
+        {"type": "delta", "text": "hi back"},
+        {"type": "end", "text": ""},
+    ]
+
+
+def test_worker_pushes_tool_events_to_redis_token_stream(workspace, env, monkeypatch):
+    ws, worker = workspace
+    _install_fake_agentscope_with_tool_stream(monkeypatch)
+    redis_client = _install_fake_redis(monkeypatch)
+    env.setenv("REDIS_URL", "redis://host:6379/0")
+    env.setenv("RUN_ID", "run_tools")
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "use a tool"}))
+
+    code = worker.main([])
+
+    assert code == 0
+    assert json.loads((ws / "result.json").read_text())["summary"] == "done"
+
+    token_entries = [
+        fields for key, fields, _kwargs in redis_client.xadd_calls
+        if key == "agent:run:run_tools:tokens"
+    ]
+    assert token_entries == [
+        {
+            "type": "tool_call",
+            "tool_call_id": "tc-1",
+            "name": "Bash",
+            "args": '{"cmd":"pwd"}',
+        },
+        {
+            "type": "tool_result",
+            "tool_call_id": "tc-1",
+            "name": "Bash",
+            "result": "/workspace",
+            "state": "success",
+        },
+        {"type": "delta", "text": "done"},
+        {"type": "end", "text": ""},
+    ]
 
 
 def test_empty_task_text_returns_failed_status_zero(workspace, env, monkeypatch):
@@ -911,20 +1111,3 @@ def test_extract_plan_steps_returns_empty_on_missing_state(workspace, env, monke
 
     steps = worker_mod._extract_plan_steps(_BrokenAgent())
     assert steps == []
-
-
-def test_planning_guidance_in_system_prompt(workspace, env, monkeypatch):
-    """The assembled system prompt always contains planning tool guidance."""
-    ws, worker_mod = workspace
-    _install_fake_agentscope_with_tasks(monkeypatch)
-
-    _FakeAgentWithTasks.reply_text = "done"
-    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "complex task"}))
-
-    code = worker_mod.main([])
-
-    assert code == 0
-    inst = _FakeAgentWithTasks.last_instance
-    assert inst is not None
-    # The system prompt must include TaskCreate guidance.
-    assert "TaskCreate" in inst.system_prompt

@@ -59,9 +59,12 @@ with exit code 1.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any, Mapping
+
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -101,7 +104,7 @@ def build_model(task: dict, env: Mapping[str, str]) -> Any:
         return AnthropicChatModel(
             credential=AnthropicCredential(**cred_kwargs),
             model=model_name,
-            stream=False,
+            stream=True,
             formatter=formatter,
         )
 
@@ -115,7 +118,7 @@ def build_model(task: dict, env: Mapping[str, str]) -> Any:
         return OpenAIChatModel(
             credential=OpenAICredential(**cred_kwargs),
             model=model_name,
-            stream=False,
+            stream=True,
             formatter=formatter,
         )
 
@@ -129,7 +132,7 @@ def build_model(task: dict, env: Mapping[str, str]) -> Any:
         return DeepSeekChatModel(
             credential=DeepSeekCredential(**cred_kwargs),
             model=model_name,
-            stream=False,
+            stream=True,
             formatter=formatter,
         )
 
@@ -174,26 +177,35 @@ def _provider_default_model(provider: str) -> str:
 
 
 def build_toolkit(task: dict, tenant_id: str, env: Mapping[str, str]) -> Any:
-    """Default toolkit — pre-loaded with built-in planning tools.
+    """Default toolkit — pre-loaded with built-in workspace file tools.
 
-    ``TaskCreate``, ``TaskUpdate``, and ``TaskList`` are always registered so
-    the agent can emit structured plan steps that are read by the worker and
-    streamed to the frontend PLAN panel in real time.
+    The built-in tools (``read_file``, ``list_files``) are always registered
+    so the agent can read files that were uploaded to ``/workspace/inputs/``
+    regardless of whether any tenant MCP servers are configured.
 
-    The ``mcp_tenant_injector`` extension is expected to resolve the
-    tenant's MCP server list from ``foundation.mcp-registry`` and feed
-    the resulting MCP clients into the returned Toolkit (appending to the
-    basic group's mcps list — it does NOT replace the Toolkit, so the
-    planning tools are preserved).  The ``skills_loader`` extension layers
-    package-defined Skills on top via the same append pattern.
+    The ``mcp_tenant_injector`` extension resolves the tenant's MCP server
+    list from ``foundation.mcp-registry`` and appends the resulting MCP
+    clients to the toolkit returned here.  The ``skills_loader`` extension
+    layers package-defined Skills on top.  Both extensions chain on top of
+    this toolkit, so the built-in tools and tenant-scoped tools coexist.
 
-    Returning a toolkit with the planning tools by default keeps the worker
-    runnable in smoke tests where no foundation services exist.
+    Returning a non-empty toolkit by default ensures that even in smoke tests
+    where no foundation services exist, the agent still has file-reading
+    capability.
     """
     del task, tenant_id, env  # arguments are part of the override contract
-    from agentscope.tool import Toolkit, TaskCreate, TaskUpdate, TaskList
+    from agentscope.tool import Toolkit
 
-    return Toolkit(tools=[TaskCreate(), TaskUpdate(), TaskList()])
+    toolkit = Toolkit()
+
+    try:
+        from agentscope_ext.runtime_worker._workspace_tools import register_into
+
+        register_into(toolkit)
+    except Exception as exc:  # pragma: no cover — defensive
+        _log.warning("built-in workspace tools registration failed: %s", exc)
+
+    return toolkit
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +269,16 @@ def snapshot_env() -> dict[str, str]:
         # worker can write step/plan/cursor to Redis for breakpoint resume.
         "REDIS_URL",
         "RUN_ID",
+        # Web-fetch gateway — injected by the scheduler so the web_fetch
+        # extension can POST to the gateway sidecar inside the foundation net.
+        "WEB_FETCH_GATEWAY_URL",
+        # LLM gateway enforcer (M1) — injected by the scheduler when the
+        # llm_gateway_enforcer extension is active.  LLM_GATEWAY_URL points
+        # at the OpenAI-compatible gateway endpoint (includes /api/llm-gateway/v1
+        # prefix).  LLM_VIRTUAL_KEY is the tenant virtual key used for quota
+        # accounting and model routing; if absent, the bearer token is used.
+        "LLM_GATEWAY_URL",
+        "LLM_VIRTUAL_KEY",
     )
     return {k: os.environ[k] for k in keys if k in os.environ}
 

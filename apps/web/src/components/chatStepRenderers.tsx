@@ -70,6 +70,117 @@ function CodeBlockPre({ children }: { children?: React.ReactNode }) {
   );
 }
 
+// ── Table CSV export ─────────────────────────────────────────────────────────
+
+/** Quote a CSV field per RFC 4180: wrap in quotes if it contains `,`, `"` or newline. */
+function csvField(value: string): string {
+  const v = value.replace(/\s+/g, ' ').trim();
+  if (/[",\n\r]/.test(v)) {
+    return `"${v.replace(/"/g, '""')}"`;
+  }
+  return v;
+}
+
+/** Read a rendered <table> DOM node and serialize its rows/cells to CSV text. */
+function tableToCSV(table: HTMLTableElement): string {
+  const rows: string[] = [];
+  for (const tr of Array.from(table.rows)) {
+    const cells = Array.from(tr.cells).map((c) => csvField(c.textContent ?? ''));
+    rows.push(cells.join(','));
+  }
+  // Prefix a UTF-8 BOM so Excel opens Chinese text without mojibake.
+  return '﻿' + rows.join('\r\n');
+}
+
+function downloadCSV(table: HTMLTableElement) {
+  const blob = new Blob([tableToCSV(table)], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'table.csv';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// ── Table wrapper (supports hover-reveal CSV download button) ─────────────────
+
+function TableBlock({ children }: { children?: React.ReactNode }) {
+  const tableRef = useRef<HTMLTableElement>(null);
+
+  function handleDownload() {
+    if (tableRef.current) downloadCSV(tableRef.current);
+  }
+
+  return (
+    // position:relative so the button stays put while the table scrolls horizontally.
+    <div className="group relative my-3">
+      <button
+        onClick={handleDownload}
+        aria-label="导出 CSV"
+        className="opacity-0 group-hover:opacity-100 transition-opacity duration-150"
+        style={{
+          position: 'absolute',
+          top: 6,
+          right: 6,
+          zIndex: 10,
+          display: 'flex',
+          alignItems: 'center',
+          gap: 4,
+          padding: '2px 7px',
+          fontFamily: 'var(--font-mono)',
+          fontSize: 10.5,
+          lineHeight: '1.4',
+          color: 'var(--ink-2)',
+          background: 'var(--surface)',
+          border: '1px solid var(--line-2)',
+          borderRadius: 'var(--r-sm)',
+          cursor: 'pointer',
+          userSelect: 'none',
+          whiteSpace: 'nowrap',
+        }}
+      >
+        <DownloadIcon />
+        <span>CSV</span>
+      </button>
+      <div className="overflow-x-auto">
+        <table
+          ref={tableRef}
+          style={{
+            borderCollapse: 'collapse',
+            width: '100%',
+            fontSize: '13.5px',
+            lineHeight: '1.55',
+          }}
+        >
+          {children}
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function DownloadIcon() {
+  return (
+    <svg
+      width="11"
+      height="11"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" />
+      <line x1="12" y1="15" x2="12" y2="3" />
+    </svg>
+  );
+}
+
 // ── Shared markdown components (used by ASSISTANT messages) ──────────────────
 export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] = {
   // Custom <pre> wrapper: applies the box styling and attaches a hover copy button.
@@ -128,20 +239,7 @@ export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>['com
       {children}
     </a>
   ),
-  table: ({ children }) => (
-    <div className="overflow-x-auto my-3">
-      <table
-        style={{
-          borderCollapse: 'collapse',
-          width: '100%',
-          fontSize: '13.5px',
-          lineHeight: '1.55',
-        }}
-      >
-        {children}
-      </table>
-    </div>
-  ),
+  table: ({ children }) => <TableBlock>{children}</TableBlock>,
   thead: ({ children }) => (
     <thead style={{ background: 'var(--paper-2)' }}>{children}</thead>
   ),

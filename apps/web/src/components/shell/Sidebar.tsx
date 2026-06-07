@@ -33,6 +33,9 @@ export function Sidebar() {
   };
 
   const recent = sessions.slice(0, 3);
+  const devBuildLabel = import.meta.env.DEV
+    ? `dev ${import.meta.env.VITE_DEV_BUILD_STAMP ?? 'local'}`
+    : null;
 
   const handleLogout = async () => {
     try {
@@ -195,6 +198,11 @@ export function Sidebar() {
         >
           登出
         </button>
+        {devBuildLabel && (
+          <div className="pl-[30px] font-mono text-[9px] text-dim" title="Frontend dev build stamp">
+            {devBuildLabel}
+          </div>
+        )}
       </div>
     </aside>
   );

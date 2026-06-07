@@ -609,9 +609,12 @@ def test_worker_detects_checkpoint_and_injects_memory(monkeypatch, tmp_path):
     tool_mod = types.ModuleType("agentscope.tool")
 
     class _FT:
-        def __init__(self): self.tools = []
+        def __init__(self, tools=None, **_kw): self.tools = list(tools or [])
 
     tool_mod.Toolkit = _FT
+    tool_mod.TaskCreate = type("TaskCreate", (), {})
+    tool_mod.TaskUpdate = type("TaskUpdate", (), {})
+    tool_mod.TaskList = type("TaskList", (), {})
 
     for name, mod in [
         ("agentscope", agentscope),
@@ -649,7 +652,7 @@ def test_worker_detects_checkpoint_and_injects_memory(monkeypatch, tmp_path):
     monkeypatch.setattr(worker, "WORKSPACE", tmp_path)
 
     task = {"task": "continue the analysis"}
-    status, summary = worker._run_real(task)
+    status, summary, _usage, _plan_steps = worker._run_real(task)
 
     assert status == "OK"
     # The resume note must be injected into the system prompt via the memory path.

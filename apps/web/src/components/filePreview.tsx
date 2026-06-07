@@ -54,6 +54,13 @@ export function kindGlyph(mime?: string): string {
 
 function isTextLikeMime(mime?: string): boolean {
   if (!mime) return false;
+  // Office Open XML docs (docx/xlsx/pptx) are binary zip containers whose MIME
+  // contains "...wordprocessingml..."/"...spreadsheetml..." — i.e. the 'xml'
+  // substring. Exclude them up front so they aren't mistaken for text and dumped
+  // as garbled ZIP bytes; they route to DocxPreview/ExcelPreview instead.
+  if (mime.includes('officedocument') || mime.includes('msword') || mime.includes('ms-excel')) {
+    return false;
+  }
   return (
     mime.startsWith('text/') ||
     mime.includes('json') ||
@@ -213,7 +220,6 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
   const contentUrl = `/api/bff/v1/sessions/${sessionId}/files/${fileId}/content`;
   const ext = filename.split('.').pop()?.toLowerCase() ?? '';
   const isImage = mime?.startsWith('image/') ?? false;
-  const isText = isTextLikeMime(mime);
   const isPdf = mime === 'application/pdf' || ext === 'pdf';
   // Office 文件的 mime 常不准(有时是 octet-stream),用扩展名兜底。
   const isExcel =
@@ -225,6 +231,9 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
     (mime?.includes('officedocument.wordprocessing') ?? false) ||
     (mime?.includes('msword') ?? false);
   const needsBlob = isExcel || isWord;
+  // Office docs take precedence: never treat them as text even if MIME/ext is
+  // ambiguous, otherwise the binary zip renders as garbled bytes.
+  const isText = !isWord && !isExcel && isTextLikeMime(mime);
 
   const [contentText, setContentText] = useState<string | null>(null);
   const [contentBlob, setContentBlob] = useState<Blob | null>(null);
@@ -260,7 +269,13 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
         if (!cancelled) setContentLoading(false);
       });
 
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+      // Drop large content refs on unmount / file switch so the blob and
+      // decoded text become eligible for GC when the preview panel closes.
+      setContentBlob(null);
+      setContentText(null);
+    };
   }, [sessionId, fileId, isText, needsBlob]);
 
   // Image preview

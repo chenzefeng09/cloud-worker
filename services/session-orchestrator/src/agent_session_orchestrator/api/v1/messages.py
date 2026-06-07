@@ -31,6 +31,7 @@ import datetime as dt
 import json
 import logging
 from collections.abc import AsyncGenerator
+from contextlib import suppress
 from typing import Any
 
 import httpx
@@ -51,6 +52,272 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 1.0
 _MAX_POLLS = 300  # 5 minutes wall-clock at 1 s/poll
+_MAX_TOOL_TEXT_CHARS = 8000
+# Grace window for the FIRST token when tailing an active run.  The agent worker
+# runs in a freshly-spawned Docker container that cold-starts (pull/import/model
+# connect) for several seconds before writing its first delta.  Without this,
+# _stream_tokens would give up after ~2 idle reads and the client would never see
+# the live token stream — only the all-at-once DB-polled reply.  Far larger than a
+# real cold start; it only guards against a worker that never emits anything.
+_WORKER_COLDSTART_GRACE_SECONDS = 90.0
+
+
+def _run_token_stream_key(run_id: str) -> str:
+    return f"agent:run:{run_id}:tokens"
+
+
+def _sanitize_tool_text(value: Any, *, limit: int = _MAX_TOOL_TEXT_CHARS) -> str:
+    text = "" if value is None else str(value)
+    text = text.replace("\x00", "")
+    if len(text) > limit:
+        omitted = len(text) - limit
+        text = f"{text[:limit]}\n...[truncated {omitted} chars]"
+    return text
+
+
+def _sanitize_json_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _sanitize_tool_text(value)
+    if isinstance(value, list):
+        return [_sanitize_json_value(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            _sanitize_tool_text(key): _sanitize_json_value(val)
+            for key, val in value.items()
+        }
+    return value
+
+
+def _coerce_redis_entry(entry: Any) -> dict[str, Any]:
+    raw = entry if isinstance(entry, dict) else dict(entry)
+
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        k = key.decode("utf-8") if isinstance(key, bytes) else str(key)
+        if isinstance(value, bytes):
+            out[k] = value.decode("utf-8")
+        else:
+            out[k] = value
+    return out
+
+
+def _sse(event: str, payload: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+async def _stream_tokens(
+    *,
+    redis_url: str,
+    run_id: str,
+    deadline: float,
+    wait_for_worker: bool = False,
+) -> AsyncGenerator[str, None]:
+    """Tail a run token stream from Redis and yield frontend SSE events.
+
+    Failure-open: Redis is a hot-path convenience. If it is unavailable, the
+    caller falls back to DB message polling and final run reconciliation.
+
+    ``wait_for_worker`` controls the no-token-yet early-exit:
+
+    * ``False`` (default, replay of an already-terminal run): the stream is
+      fully written, so bail out fast after a couple of idle reads.
+    * ``True`` (run is still RUNNING/PENDING): the worker container may still be
+      cold-starting, so keep waiting for the first token up to
+      ``_WORKER_COLDSTART_GRACE_SECONDS`` (or ``deadline``).  Without this the
+      live token stream is lost to the cold-start race.
+    """
+    try:
+        import redis.asyncio as aioredis  # type: ignore[import-not-found]
+
+        client = aioredis.Redis.from_url(
+            redis_url,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+            decode_responses=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis token stream connect failed: %s", exc)
+        return
+
+    stream_key = _run_token_stream_key(run_id)
+    last_id = "0-0"
+    saw_entry = False
+    idle_reads = 0
+    started_at = asyncio.get_event_loop().time()
+    try:
+        while asyncio.get_event_loop().time() < deadline:
+            batches = await client.xread({stream_key: last_id}, block=1000, count=100)
+            if not batches:
+                idle_reads += 1
+                # Once tokens have started flowing, a short run of idle reads
+                # means the worker has stalled or finished without an `end`
+                # marker — end the stream so the SSE connection doesn't hang.
+                if saw_entry and idle_reads >= 5:
+                    return
+                if not saw_entry:
+                    if wait_for_worker:
+                        # Active run: the worker may still be cold-starting.
+                        # Keep waiting for the first token up to the grace cap.
+                        if (
+                            asyncio.get_event_loop().time() - started_at
+                            >= _WORKER_COLDSTART_GRACE_SECONDS
+                        ):
+                            return
+                    elif idle_reads >= 2:
+                        # Replay of a terminal run: the stream is already fully
+                        # written, so nothing-yet means nothing-coming.
+                        return
+                continue
+
+            for _key, entries in batches:
+                for entry_id, raw_entry in entries:
+                    saw_entry = True
+                    idle_reads = 0
+                    last_id = (
+                        entry_id.decode("utf-8")
+                        if isinstance(entry_id, bytes)
+                        else str(entry_id)
+                    )
+                    entry = _coerce_redis_entry(raw_entry)
+                    entry_type = entry.get("type")
+
+                    if entry_type == "end":
+                        return
+                    if entry_type == "delta":
+                        text = entry.get("text") or ""
+                        if text:
+                            yield _sse("token", {"run_id": run_id, "delta": text})
+                    elif entry_type == "tool_call":
+                        yield _sse(
+                            "tool",
+                            {
+                                "run_id": run_id,
+                                "kind": "call",
+                                "tool_call_id": entry.get("tool_call_id") or "",
+                                "name": entry.get("name") or "tool",
+                                "args": entry.get("args") or "",
+                            },
+                        )
+                    elif entry_type == "tool_result":
+                        yield _sse(
+                            "tool",
+                            {
+                                "run_id": run_id,
+                                "kind": "result",
+                                "tool_call_id": entry.get("tool_call_id") or "",
+                                "name": entry.get("name") or "tool",
+                                "result": _sanitize_tool_text(entry.get("result")),
+                                "state": entry.get("state") or "",
+                            },
+                        )
+                    elif entry_type == "thinking":
+                        text = entry.get("text") or ""
+                        if text:
+                            yield _sse("thinking", {"run_id": run_id, "text": text})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis token stream read failed: %s", exc)
+        return
+    finally:
+        with suppress(Exception):
+            await client.aclose()
+
+
+async def _read_ordered_blocks_from_redis(
+    *,
+    redis_url: str,
+    run_id: str,
+) -> list[dict[str, Any]]:
+    """Replay Redis token/tool entries into ordered persistable blocks."""
+    try:
+        import redis.asyncio as aioredis  # type: ignore[import-not-found]
+
+        client = aioredis.Redis.from_url(
+            redis_url,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+            decode_responses=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis ordered replay connect failed: %s", exc)
+        return []
+
+    blocks: list[dict[str, Any]] = []
+    text_parts: list[str] = []
+    tools_by_id: dict[str, dict[str, Any]] = {}
+
+    def flush_text() -> None:
+        if text_parts:
+            text = "".join(text_parts)
+            if text:
+                blocks.append({"kind": "text", "text": text})
+            text_parts.clear()
+
+    try:
+        entries = await client.xrange(_run_token_stream_key(run_id), min="-", max="+")
+        for _entry_id, raw_entry in entries:
+            entry = _coerce_redis_entry(raw_entry)
+            entry_type = entry.get("type")
+            if entry_type == "end":
+                break
+            if entry_type == "delta":
+                text_parts.append(str(entry.get("text") or ""))
+                continue
+            if entry_type == "thinking":
+                flush_text()
+                text = str(entry.get("text") or "")
+                if text:
+                    blocks.append({"kind": "thinking", "text": text})
+                continue
+            if entry_type == "tool_call":
+                flush_text()
+                tool_call_id = str(entry.get("tool_call_id") or "")
+                args = entry.get("args") or "{}"
+                try:
+                    parsed_args = json.loads(str(args))
+                    input_payload = (
+                        parsed_args if isinstance(parsed_args, dict)
+                        else {"value": parsed_args}
+                    )
+                except Exception:  # noqa: BLE001
+                    input_payload = {"value": str(args)}
+
+                block = {
+                    "kind": "tool",
+                    "tool_call_id": tool_call_id,
+                    "name": str(entry.get("name") or "tool"),
+                    "input": input_payload,
+                    "result": None,
+                    "state": None,
+                }
+                tools_by_id[tool_call_id] = block
+                blocks.append(block)
+                continue
+            if entry_type == "tool_result":
+                tool_call_id = str(entry.get("tool_call_id") or "")
+                block = tools_by_id.get(tool_call_id)
+                if block is None:
+                    flush_text()
+                    block = {
+                        "kind": "tool",
+                        "tool_call_id": tool_call_id,
+                        "name": str(entry.get("name") or "tool"),
+                        "input": {},
+                        "result": None,
+                        "state": None,
+                    }
+                    tools_by_id[tool_call_id] = block
+                    blocks.append(block)
+                block["result"] = _sanitize_tool_text(entry.get("result"))
+                block["state"] = entry.get("state") or ""
+
+        flush_text()
+        return blocks
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis ordered replay failed: %s", exc)
+        return []
+    finally:
+        with suppress(Exception):
+            await client.aclose()
 
 
 async def _write_memory(
@@ -116,6 +383,7 @@ async def _reconcile_run_completion(
     run: Run,
     svc: SessionService,
     knowledge_ingest_url: str = "",
+    redis_url: str | None = None,
 ) -> tuple[bool, list[Any]]:
     """Poll the scheduler for a RUNNING run; persist result on terminal exit.
 
@@ -172,8 +440,52 @@ async def _reconcile_run_completion(
     run.output_tokens = usage.get("output_tokens")
     run.total_tokens = usage.get("total_tokens")
 
-    # Write an assistant message so the UI sees the reply.
-    if summary:
+    persisted_from_stream = False
+    already_persisted_for_run = False
+    if redis_url:
+        existing_messages, _ = await svc.list_messages(run.session_id, limit=200)
+        already_persisted_for_run = any(
+            m.run_id == run.id and (m.role or "").lower() in {"assistant", "tool"}
+            for m in existing_messages
+        )
+        if not already_persisted_for_run:
+            blocks = await _read_ordered_blocks_from_redis(
+                redis_url=redis_url,
+                run_id=run.id,
+            )
+            for block in blocks:
+                if block.get("kind") == "text":
+                    text = str(block.get("text") or "")
+                    if text:
+                        await svc.create_message(
+                            session_id=run.session_id,
+                            role="assistant",
+                            content=text,
+                            tool_calls=None,
+                            run_id=run.id,
+                        )
+                        persisted_from_stream = True
+                elif block.get("kind") == "tool":
+                    tool_call = {
+                        "id": _sanitize_tool_text(block.get("tool_call_id") or ""),
+                        "name": _sanitize_tool_text(block.get("name") or "tool"),
+                        "input": _sanitize_json_value(block.get("input") or {}),
+                        "result": _sanitize_tool_text(block.get("result")),
+                        "state": _sanitize_tool_text(block.get("state")),
+                    }
+                    await svc.create_message(
+                        session_id=run.session_id,
+                        role="tool",
+                        content=_sanitize_tool_text(block.get("name") or "tool"),
+                        tool_calls=[tool_call],
+                        run_id=run.id,
+                    )
+                    persisted_from_stream = True
+
+    # Write an assistant message so the UI sees the reply. If Redis replay
+    # already produced ordered text/tool blocks, avoid appending a duplicate
+    # summary row for the same run.
+    if summary and not persisted_from_stream and not already_persisted_for_run:
         await svc.create_message(
             session_id=run.session_id,
             role="assistant",
@@ -266,6 +578,7 @@ async def list_messages(
         runs = await svc.list_runs(session_id)
         scheduler_url = request.app.state.settings.agent_scheduler_url
         knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
+        redis_url = request.app.state.settings.redis_url
         # Fetch the session's real user_id so the scheduler poll header
         # carries the originating user rather than the "SYSTEM" sentinel
         # (which the scheduler's authz guard rejects with 403).
@@ -278,6 +591,7 @@ async def list_messages(
                 run=run,
                 svc=svc,
                 knowledge_ingest_url=knowledge_ingest_url,
+                redis_url=redis_url,
             )
             # Note: plan_steps from list_messages are discarded — this path is
             # a page-refresh reconcile; SSE is the real-time channel for plans.
@@ -309,6 +623,7 @@ async def create_message(
         content=body.content,
         tool_calls=body.tool_calls,
         run_id=body.run_id,
+        attachment_ids=body.attachment_ids,
     )
     return MessageOut.model_validate(msg)
 
@@ -326,6 +641,59 @@ async def stream_messages(
 
     async def event_generator() -> AsyncGenerator[str, None]:
         last_seq = 0
+        redis_url = request.app.state.settings.redis_url
+        if redis_url:
+            stream_run_id: str | None = None
+            # True when stream_run_id is an active (RUNNING/PENDING) run whose
+            # worker may still be cold-starting; False for terminal replay.
+            stream_run_active = False
+            async for db in acquire_db_session(tenant_id=tenant_id):
+                svc = SessionService(db, tenant_id=tenant_id)
+                runs = await svc.list_runs(session_id)
+                active = next(
+                    (r for r in runs if r.status in ("RUNNING", "PENDING")),
+                    None,
+                )
+                if active is not None:
+                    stream_run_id = active.id
+                    stream_run_active = True
+                else:
+                    terminal = next(
+                        (
+                            r for r in runs
+                            if r.status in ("COMPLETED", "FAILED", "CANCELLED")
+                        ),
+                        None,
+                    )
+                    if terminal is not None:
+                        existing, _ = await svc.list_messages(session_id, limit=200)
+                        already_persisted = any(
+                            m.run_id == terminal.id
+                            and (m.role or "").lower() in {"assistant", "tool"}
+                            for m in existing
+                        )
+                        if not already_persisted:
+                            stream_run_id = terminal.id
+
+            if stream_run_id is not None:
+                deadline = asyncio.get_event_loop().time() + (
+                    _MAX_POLLS * _POLL_INTERVAL_SECONDS
+                )
+                async for ev in _stream_tokens(
+                    redis_url=redis_url,
+                    run_id=stream_run_id,
+                    deadline=deadline,
+                    wait_for_worker=stream_run_active,
+                ):
+                    yield ev
+
+        # Runs already terminal when this stream opened. A NEW message's run is
+        # not among these, so we must not let a pre-existing completed run from
+        # session history fire run_complete/done and end the stream before the
+        # current run finishes — that was causing replies to only appear on
+        # manual refresh.
+        preexisting_terminal: set[str] = set()
+        primed = False
         try:
             for _ in range(_MAX_POLLS):
                 # Per-poll DB session: collect events into a local buffer,
@@ -345,15 +713,20 @@ async def stream_messages(
                     # the scheduler so terminal exits get persisted (status,
                     # result_summary) and an assistant message lands in the
                     # messages table for the UI.
-                    # Fetch session once per poll to get the real user_id for
-                    # the scheduler authz header (SYSTEM is rejected with 403).
-                    session_obj = await svc.get_session(session_id)
                     runs = await svc.list_runs(session_id)
                     # Collect plan_steps from any running run this poll.
                     latest_plan_steps: list[Any] = []
                     latest_run_id: str = ""
-                    for r in runs:
-                        if r.status in ("RUNNING", "PENDING"):
+                    running_runs = [
+                        r for r in runs if r.status in ("RUNNING", "PENDING")
+                    ]
+                    session_obj = (
+                        await svc.get_session(session_id)
+                        if running_runs
+                        else None
+                    )
+                    for r in running_runs:
+                        if session_obj is not None:
                             _terminal, _plan = await _reconcile_run_completion(
                                 scheduler_url=scheduler_url,
                                 tenant_id=tenant_id,
@@ -361,6 +734,7 @@ async def stream_messages(
                                 run=r,
                                 svc=svc,
                                 knowledge_ingest_url=knowledge_ingest_url,
+                                redis_url=redis_url,
                             )
                             if _plan:
                                 latest_plan_steps = _plan
@@ -389,8 +763,23 @@ async def stream_messages(
 
                     # Run-completion bookkeeping (re-read after reconcile).
                     runs = await svc.list_runs(session_id)
+                    terminal_statuses = ("COMPLETED", "FAILED", "CANCELLED")
+                    active_exists = any(r.status in ("RUNNING", "PENDING") for r in runs)
+                    # On the first poll, snapshot runs that were ALREADY terminal
+                    # (session history) so they don't end the stream — we only
+                    # care about a run completing while this stream is open.
+                    if not primed and active_exists:
+                        preexisting_terminal = {
+                            r.id for r in runs if r.status in terminal_statuses
+                        }
+                        primed = True
                     terminal = next(
-                        (r for r in runs if r.status in ("COMPLETED", "FAILED", "CANCELLED")),
+                        (
+                            r
+                            for r in runs
+                            if r.status in terminal_statuses
+                            and r.id not in preexisting_terminal
+                        ),
                         None,
                     )
                     if terminal is not None:

@@ -253,6 +253,10 @@ async def _dispatch(
     # Accumulate delta chunks per text-block id; preserve insertion order
     # so concurrent blocks come out in stream order.
     text_blocks: dict[str, str] = {}
+    thinking_blocks: dict[str, str] = {}
+    tool_names: dict[str, str] = {}
+    tool_call_args: dict[str, str] = {}
+    tool_result_text: dict[str, str] = {}
     # Track last plan text (from ThinkEvent) so we can surface it in state.
     last_plan: str = ""
     # Cumulative token counts across all model calls in this run.
@@ -270,6 +274,8 @@ async def _dispatch(
             thought = getattr(event, "thought", None) or getattr(event, "text", None) or ""
             if thought:
                 last_plan = str(thought)
+                if state_client is not None:
+                    state_client.push_thinking(last_plan)
 
         if event_type == "TextBlockStartEvent":
             block_id = getattr(event, "block_id", None)
@@ -279,11 +285,47 @@ async def _dispatch(
             block_id = getattr(event, "block_id", None) or ""
             delta = getattr(event, "delta", "") or ""
             text_blocks[block_id] = text_blocks.get(block_id, "") + str(delta)
+            if delta and state_client is not None:
+                state_client.push_token(str(delta))
+        elif event_type == "ThinkingBlockStartEvent":
+            block_id = getattr(event, "block_id", None)
+            if block_id and block_id not in thinking_blocks:
+                thinking_blocks[block_id] = ""
+        elif event_type == "ThinkingBlockDeltaEvent":
+            block_id = getattr(event, "block_id", None) or ""
+            delta = getattr(event, "delta", "") or ""
+            thinking_blocks[block_id] = thinking_blocks.get(block_id, "") + str(delta)
+        elif event_type == "ThinkingBlockEndEvent":
+            block_id = getattr(event, "block_id", None) or ""
+            text = thinking_blocks.pop(block_id, "")
+            if text and state_client is not None:
+                state_client.push_thinking(text)
         elif event_type == "ModelCallEndEvent":
             # Accumulate token usage across multiple model calls in one run.
             input_tokens += getattr(event, "input_tokens", 0) or 0
             output_tokens += getattr(event, "output_tokens", 0) or 0
+        elif event_type == "ToolCallStartEvent":
+            tool_call_id = getattr(event, "tool_call_id", "") or ""
+            if tool_call_id:
+                tool_names[tool_call_id] = str(
+                    getattr(event, "tool_call_name", None) or "tool"
+                )
+                tool_call_args[tool_call_id] = ""
+        elif event_type == "ToolCallDeltaEvent":
+            tool_call_id = getattr(event, "tool_call_id", "") or ""
+            if tool_call_id:
+                tool_call_args[tool_call_id] = (
+                    tool_call_args.get(tool_call_id, "")
+                    + str(getattr(event, "delta", "") or "")
+                )
         elif event_type == "ToolCallEndEvent":
+            tool_call_id = getattr(event, "tool_call_id", "") or ""
+            if tool_call_id and state_client is not None:
+                state_client.push_tool_call(
+                    tool_call_id,
+                    tool_names.get(tool_call_id, "tool"),
+                    tool_call_args.get(tool_call_id, ""),
+                )
             # After each tool call, re-read the task list so plan changes
             # (TaskCreate, TaskUpdate) are immediately visible.  Write the
             # updated plan to result.json so the scheduler's RUNNING-state
@@ -294,6 +336,39 @@ async def _dispatch(
                     plan_steps,
                     status="RUNNING",
                     usage={"input_tokens": input_tokens, "output_tokens": output_tokens, "total_tokens": input_tokens + output_tokens},
+                )
+        elif event_type == "ToolResultStartEvent":
+            tool_call_id = getattr(event, "tool_call_id", "") or ""
+            if tool_call_id:
+                tool_names[tool_call_id] = str(
+                    getattr(event, "tool_call_name", None)
+                    or tool_names.get(tool_call_id)
+                    or "tool"
+                )
+                tool_result_text[tool_call_id] = ""
+        elif event_type == "ToolResultTextDeltaEvent":
+            tool_call_id = getattr(event, "tool_call_id", "") or ""
+            if tool_call_id:
+                tool_result_text[tool_call_id] = (
+                    tool_result_text.get(tool_call_id, "")
+                    + str(getattr(event, "delta", "") or "")
+                )
+        elif event_type == "ToolResultDataDeltaEvent":
+            tool_call_id = getattr(event, "tool_call_id", "") or ""
+            if tool_call_id:
+                media_type = getattr(event, "media_type", "") or "application/octet-stream"
+                tool_result_text[tool_call_id] = (
+                    tool_result_text.get(tool_call_id, "")
+                    + f"[data: {media_type}]"
+                )
+        elif event_type == "ToolResultEndEvent":
+            tool_call_id = getattr(event, "tool_call_id", "") or ""
+            if tool_call_id and state_client is not None:
+                state_client.push_tool_result(
+                    tool_call_id,
+                    tool_names.get(tool_call_id, "tool"),
+                    tool_result_text.get(tool_call_id, ""),
+                    str(getattr(event, "state", "") or ""),
                 )
 
         # Write hot state after every event (failure-open).
@@ -309,6 +384,8 @@ async def _dispatch(
         "output_tokens": output_tokens,
         "total_tokens": input_tokens + output_tokens,
     }
+    if state_client is not None:
+        state_client.push_token_end()
     return reply_text, usage, plan_steps
 
 
@@ -413,9 +490,6 @@ def _load_prompt_files(env: dict, task: dict) -> str:
     return (
         "你是一个企业级 AI 助理，运行于安全沙箱中。"
         "请使用可用工具完成用户的任务，并以简洁的中文回复你的执行摘要。"
-        "\n\n对于需要 3 步或以上的复杂任务，请先用 TaskCreate 登记结构化计划（每个步骤一个 task）；"
-        "开始执行某步之前用 TaskUpdate 将其标记为 in_progress，完成后标记为 completed。"
-        "这样用户可以实时看到任务进度。"
     )
 
 
@@ -537,23 +611,56 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
         file_list = ", ".join(downloaded)
         sys_prompt += (
             f"\n\n用户上传了以下文件，位于 /workspace/inputs/：{file_list}\n"
-            "你可以读取这些文件来完成任务。"
+            "请使用 Read 工具读取 /workspace/inputs/ 下的文件来完成任务。"
         )
 
-    # Append planning tool guidance so the agent creates structured steps.
+    # Pre-create /workspace/outputs/ so the agent can write there without
+    # needing to mkdir first (though Bash mkdir also works).
+    outputs_dir = WORKSPACE / "outputs"
+    try:
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("cannot pre-create /workspace/outputs: %s", exc)
+
+    # File-output policy: reply inline by default; only persist a file when the
+    # user explicitly asks to be *delivered* a file. Let the model judge intent
+    # rather than relying on brittle keyword matching.
     sys_prompt += (
-        "\n\n## 任务规划（重要）\n"
-        "对于需要 3 步或以上的复杂任务，必须先用 TaskCreate 为每个主要步骤创建一条 task（subject 填简短动作标题）。"
-        "开始执行某步前用 TaskUpdate 将其 status 设为 in_progress；完成后设为 completed。"
-        "用 TaskList 查看当前剩余步骤。"
-        "这样用户可以在前端 PLAN 面板实时看到你的进度。"
+        "\n\n## 关于文件输出\n"
+        "默认情况下，请把结果（包括代码、文本、表格等）直接写在回复正文里："
+        "代码用 Markdown 代码块（```语言 ... ```）展示，便于用户直接阅读和复制；"
+        "不要为此创建任何文件。\n"
+        "只有当用户明确要求“交付/生成/导出/下载/保存为文件”（例如“生成一个 .docx”、"
+        "“把它导出成 Excel”、“给我一个 txt 文件”）时，才使用 Write 工具把产物写入 "
+        "/workspace/outputs/ 目录（路径示例：/workspace/outputs/report.docx）；"
+        "任务结束后该目录下的文件会自动作为产物回传给用户。如需先创建子目录，可用 Bash 执行 mkdir -p。\n"
+        "判断不确定时，优先直接在正文回复，而不是写文件。"
     )
+
+    # Build an AgentState with BYPASS permission so tool calls are auto-approved
+    # in the headless sandbox (no human is present to confirm).  Failure-open:
+    # if the permission sub-system is absent in this AgentScope version we fall
+    # back to state=None and Agent uses its default (which may prompt).
+    agent_state = None
+    try:
+        from agentscope.state import AgentState
+        from agentscope.permission import PermissionContext, PermissionMode
+
+        agent_state = AgentState(
+            permission_context=PermissionContext(mode=PermissionMode.BYPASS)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "could not set BYPASS permission; tool calls may require confirmation: %s",
+            exc,
+        )
 
     agent = Agent(
         name=str(task.get("agent_name") or "Worker"),
         system_prompt=sys_prompt,
         model=model,
         toolkit=toolkit,
+        state=agent_state,
     )
 
     # Make sure events.jsonl exists even if the agent never emits.
