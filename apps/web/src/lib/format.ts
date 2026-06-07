@@ -21,6 +21,21 @@ export function formatRelativeTimeZh(value: string | Date | null | undefined): s
   return d.toISOString().slice(0, 10);
 }
 
+/**
+ * Format an ISO timestamp as an absolute local date-time string
+ * (e.g. "2026-06-07 21:13:27"), used in hover tooltips.
+ */
+export function formatAbsoluteTimeZh(value: string | Date | null | undefined): string {
+  if (!value) return '—';
+  const d = typeof value === 'string' ? new Date(value) : value;
+  if (Number.isNaN(d.getTime())) return '—';
+  const p = (n: number) => String(n).padStart(2, '0');
+  return (
+    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ` +
+    `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+  );
+}
+
 /** Map session status enum from the API to a Chinese label. */
 export function sessionStatusZh(status: string | null | undefined): string {
   switch (status) {

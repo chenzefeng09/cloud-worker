@@ -5,12 +5,18 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { ToolRow, ThinkingBlock, markdownComponents } from './chatStepRenderers';
 import { useCopied, CopyIcon } from './CopyButton';
+import { formatRelativeTimeZh, formatAbsoluteTimeZh } from '../lib/format';
 
 interface MessageBubbleProps {
   message: Message;
   friendly?: boolean;
   onPreviewFile?: (att: { id: string; filename: string; mime?: string }) => void;
   onRewind?: (message: Message) => void;
+  /** True when this is the LAST assistant text message of its run — only then
+   *  is the copy button shown, and it copies the whole round's text. */
+  showRoundCopy?: boolean;
+  /** Concatenated text of all assistant messages in this round. */
+  roundCopyText?: string;
 }
 
 // ── Live "Working on it…" pill ────────────────────────────────────────────────
@@ -76,7 +82,7 @@ const userActionBtnHoverOut = (e: React.MouseEvent<HTMLButtonElement>) => {
 
 // ── MessageBubble ─────────────────────────────────────────────────────────────
 
-export function MessageBubble({ message, friendly, onPreviewFile, onRewind }: MessageBubbleProps) {
+export function MessageBubble({ message, friendly, onPreviewFile, onRewind, showRoundCopy, roundCopyText }: MessageBubbleProps) {
   const [toolExpanded, setToolExpanded] = useState<Record<string, boolean>>({});
   const [groupOpen, setGroupOpen] = useState(() => !friendly);
   const { copied: userCopied, copy: copyUser } = useCopied();
@@ -265,12 +271,29 @@ export function MessageBubble({ message, friendly, onPreviewFile, onRewind }: Me
   }
 
   // ── ASSISTANT (text block) ────────────────────────────────────────────────
-  return <AssistantTextBlock content={message.content} />;
+  return (
+    <AssistantTextBlock
+      content={message.content}
+      showCopy={showRoundCopy}
+      copyText={roundCopyText}
+      createdAt={message.created_at}
+    />
+  );
 }
 
 // ── Assistant text block with hover copy action row ───────────────────────────
 
-function AssistantTextBlock({ content }: { content: string }) {
+function AssistantTextBlock({
+  content,
+  showCopy,
+  copyText,
+  createdAt,
+}: {
+  content: string;
+  showCopy?: boolean;
+  copyText?: string;
+  createdAt?: string;
+}) {
   const { copied, copy } = useCopied();
 
   return (
@@ -286,14 +309,16 @@ function AssistantTextBlock({ content }: { content: string }) {
         </ReactMarkdown>
       </div>
 
-      {/* Action row — hover-reveal, space left for future actions (e.g. rewind) */}
+      {/* Action row — shown ONLY on the last assistant message of the round.
+          Sits below the text; copies the whole round's assistant text. */}
+      {showCopy && (
       <div
         className="opacity-0 group-hover:opacity-100 transition-opacity duration-150 flex items-center gap-1 mt-1"
         aria-label="消息操作"
       >
         {/* Copy button */}
         <button
-          onClick={() => copy(content)}
+          onClick={() => copy(copyText ?? content)}
           aria-label={copied ? '已复制' : '复制消息'}
           title={copied ? '已复制' : '复制消息'}
           style={{
@@ -333,8 +358,24 @@ function AssistantTextBlock({ content }: { content: string }) {
             <CopyIcon />
           )}
         </button>
+        {/* Timestamp — relative text, absolute time on hover (native tooltip) */}
+        {createdAt && (
+          <time
+            dateTime={createdAt}
+            title={formatAbsoluteTimeZh(createdAt)}
+            style={{
+              fontSize: 11,
+              color: 'var(--dim)',
+              whiteSpace: 'nowrap',
+              cursor: 'default',
+            }}
+          >
+            {formatRelativeTimeZh(createdAt)}
+          </time>
+        )}
         {/* Placeholder slot for future actions (e.g. rewind) */}
       </div>
+      )}
     </div>
   );
 }

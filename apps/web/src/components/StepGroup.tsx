@@ -57,6 +57,41 @@ export function StepGroup({ group, friendly }: StepGroupProps) {
     ? `worked through ${stepCount} step${stepCount !== 1 ? 's' : ''}`
     : `${toolCount} tool call${toolCount !== 1 ? 's' : ''}`;
 
+  // ── Single-step fast path ─────────────────────────────────────────────────
+  // A group of exactly one step (one tool call or one thinking block) is shown
+  // inline as a single expandable row — NO collapse chip wrapper. This matches
+  // the "one line per tool, click to expand" feel of Claude Code / Codex.
+  // Multi-step groups keep the chip so they don't flood the transcript.
+  if (group.steps.length === 1) {
+    const step = group.steps[0];
+
+    if (step.blockKind === 'thinking') {
+      return (
+        <div className="min-w-0">
+          <ThinkingBlock content={step.content} friendly={friendly} />
+        </div>
+      );
+    }
+
+    const tcs = step.tool_calls ?? [];
+    if (tcs.length === 1) {
+      const tc = tcs[0];
+      return (
+        <div className="min-w-0">
+          <ToolRow
+            tc={tc}
+            rowKey={tc.id}
+            expanded={!!toolExpanded[tc.id]}
+            onToggle={() =>
+              setToolExpanded((p) => ({ ...p, [tc.id]: !p[tc.id] }))
+            }
+          />
+        </div>
+      );
+    }
+    // step with 0 or 2+ tool_calls → fall through to the grouped chip below
+  }
+
   // ── Render ────────────────────────────────────────────────────────────────
 
   return (
@@ -73,7 +108,7 @@ export function StepGroup({ group, friendly }: StepGroupProps) {
                   borderRadius: 'var(--r-sm)',
                   background: 'var(--paper)',
                 }
-              : { padding: '4px 8px' }
+              : { padding: '2px 8px' }
           }
         >
           <span className="font-mono text-[10.5px]">{stepsOpen ? '▾' : '▸'}</span>

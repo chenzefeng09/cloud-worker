@@ -628,6 +628,24 @@ async def create_message(
     return MessageOut.model_validate(msg)
 
 
+@router.delete("/sessions/{session_id}/messages",
+               dependencies=[Depends(require_permission("session.message.delete", "session"))])
+async def delete_messages_from_sequence(
+    session_id: str,
+    from_sequence: int,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+) -> dict[str, int]:
+    """Delete all messages with sequence >= ``from_sequence`` (conversation rewind).
+
+    Lets the frontend rewind a conversation to a specific user turn by removing
+    that message and everything after it (including orphaned output attachments).
+    """
+    svc = SessionService(db, tenant_id=tenant_id)
+    deleted_count = await svc.delete_messages_from_sequence(session_id, from_sequence)
+    return {"deleted_count": deleted_count}
+
+
 @router.get("/sessions/{session_id}/messages/stream",
             dependencies=[Depends(require_permission("session.message.read", "session"))])
 async def stream_messages(

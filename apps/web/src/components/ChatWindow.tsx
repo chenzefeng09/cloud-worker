@@ -5,6 +5,7 @@ import { MessageBubble, WorkingOnItPill } from './MessageBubble';
 import { StepGroup } from './StepGroup';
 import { OutputFileCards } from './OutputFileCards';
 import { InputBar } from './InputBar';
+import { RewindConfirmModal } from './RewindConfirmModal';
 import { api } from '../api/client';
 import type { Attachment, MessageAttachment } from '../api/types';
 import { groupSteps } from '../lib/groupSteps';
@@ -270,7 +271,20 @@ export function ChatWindow({
   friendly?: boolean;
   onPreviewFile?: (att: { id: string; filename: string; mime?: string }) => void;
 }) {
-  const { messages, isStreaming, sendMessage, cancel, prefillText, clearPrefill, rewindTo } = useChat();
+  const {
+    messages,
+    isStreaming,
+    sendMessage,
+    cancel,
+    prefillText,
+    clearPrefill,
+    rewindTo,
+    pendingRewind,
+    confirmRewind,
+    cancelRewind,
+    rewindBusy,
+    rewindError,
+  } = useChat();
   const { byRunId, refresh: refreshOutputs } = useOutputAttachments(sessionId);
   const bottomRef = useRef<HTMLDivElement>(null);
   // Track previous isStreaming value so we can detect the true→false edge.
@@ -311,8 +325,8 @@ export function ChatWindow({
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      <div className="cw-scroll flex-1 px-8 py-5 flex flex-col gap-[18px]">
-        <div style={{ maxWidth: 780, margin: '0 auto', width: '100%', display: 'flex', flexDirection: 'column', gap: 18 }}>
+      <div className="cw-scroll flex-1 px-8 py-5 flex flex-col gap-[8px]">
+        <div style={{ maxWidth: 780, margin: '0 auto', width: '100%', display: 'flex', flexDirection: 'column', gap: 8 }}>
           {/* ── Real messages ── */}
           {(() => {
             const units = groupSteps(messages, isStreaming);
@@ -331,6 +345,31 @@ export function ChatWindow({
               }
             });
 
+            // Per-run copy support: for each run, find the LAST assistant TEXT
+            // message unit (so the copy button appears only there), and build
+            // the concatenated text of ALL assistant messages in that round.
+            const isAssistantText = (u: typeof units[number]) =>
+              u.kind === 'message' &&
+              (u.message.role || '').toUpperCase() === 'ASSISTANT' &&
+              u.message.blockKind !== 'tool' &&
+              u.message.blockKind !== 'thinking';
+            const roundKeyOf = (m: { run_id: string | null; streamRunId?: string }) =>
+              m.run_id ?? m.streamRunId ?? null;
+
+            const lastAssistantTextUnitIdx = new Map<string, number>();
+            const roundCopyText = new Map<string, string>();
+            units.forEach((u, idx) => {
+              if (!isAssistantText(u) || u.kind !== 'message') return;
+              const key = roundKeyOf(u.message);
+              if (!key) return;
+              lastAssistantTextUnitIdx.set(key, idx);
+              const prev = roundCopyText.get(key);
+              roundCopyText.set(
+                key,
+                prev ? `${prev}\n\n${u.message.content}` : u.message.content,
+              );
+            });
+
             return units.map((u, idx) => {
               if (u.kind === 'message') {
                 const role = (u.message.role || '').toUpperCase();
@@ -344,6 +383,10 @@ export function ChatWindow({
                   byRunId.has(runId) &&
                   lastAssistantUnitIdx.get(runId) === idx;
 
+                const roundKey = u.message.run_id ?? u.message.streamRunId ?? null;
+                const showRoundCopy =
+                  roundKey != null && lastAssistantTextUnitIdx.get(roundKey) === idx;
+
                 return (
                   <div key={u.message.id}>
                     <MessageBubble
@@ -351,6 +394,8 @@ export function ChatWindow({
                       friendly={friendly}
                       onPreviewFile={onPreviewFile}
                       onRewind={rewindTo}
+                      showRoundCopy={showRoundCopy}
+                      roundCopyText={roundKey != null ? roundCopyText.get(roundKey) : undefined}
                     />
                     {showCards && (
                       <OutputFileCards
@@ -404,6 +449,15 @@ export function ChatWindow({
         prefill={prefillText}
         onPrefillConsumed={clearPrefill}
       />
+      {pendingRewind && (
+        <RewindConfirmModal
+          message={pendingRewind}
+          busy={rewindBusy}
+          error={rewindError}
+          onConfirm={confirmRewind}
+          onCancel={cancelRewind}
+        />
+      )}
     </div>
   );
 }

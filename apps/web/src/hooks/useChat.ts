@@ -139,6 +139,10 @@ export function useChat() {
   const loadedRef = useRef<Set<string>>(new Set());
   // Prefill text to inject into InputBar after a rewind (cleared once consumed).
   const [prefillText, setPrefillText] = useState<string>('');
+  // Rewind confirmation state — drives the app-level confirm modal.
+  const [pendingRewind, setPendingRewind] = useState<Message | null>(null);
+  const [rewindBusy, setRewindBusy] = useState<boolean>(false);
+  const [rewindError, setRewindError] = useState<string>('');
 
   // Hydrate transcript from server when the active session changes (page
   // refresh, deep-link, session switch).
@@ -278,29 +282,42 @@ export function useChat() {
     }
   }, [setIsStreaming]);
 
-  const rewindTo = useCallback(
-    async (message: Message) => {
-      if (!activeSessionId) return;
-      const sessionId = activeSessionId;
-      const { sequence, content } = message;
+  // rewindTo only *requests* a rewind — it opens an app-level confirm modal by
+  // recording the pending message.  The actual delete happens in confirmRewind
+  // once the user confirms (no native window.confirm).
+  const rewindTo = useCallback((message: Message) => {
+    setRewindError('');
+    setPendingRewind(message);
+  }, []);
 
-      if (
-        !window.confirm('回退到这一步？这之后的对话（包括该消息本身）会被删除。')
-      ) {
-        return;
-      }
+  const cancelRewind = useCallback(() => {
+    setPendingRewind(null);
+    setRewindError('');
+  }, []);
 
-      try {
-        await api.messages.deleteFrom(sessionId, sequence);
-        useChatStore.getState().truncateFromSequence(sessionId, sequence);
-        setPrefillText(content);
-      } catch (err) {
-        // eslint-disable-next-line no-console
-        console.error('rewind failed', err);
-      }
-    },
-    [activeSessionId],
-  );
+  const confirmRewind = useCallback(async () => {
+    if (!activeSessionId || !pendingRewind) return;
+    const sessionId = activeSessionId;
+    const { sequence, content } = pendingRewind;
+
+    setRewindBusy(true);
+    setRewindError('');
+    try {
+      await api.messages.deleteFrom(sessionId, sequence);
+      useChatStore.getState().truncateFromSequence(sessionId, sequence);
+      setPrefillText(content);
+      setPendingRewind(null);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('rewind failed', err);
+      // Surface the failure inline; keep the modal open so the user notices.
+      setRewindError(
+        err instanceof ApiError ? `回退失败：${err.message}` : '回退失败，请重试。',
+      );
+    } finally {
+      setRewindBusy(false);
+    }
+  }, [activeSessionId, pendingRewind]);
 
   return {
     sendMessage: sendMessage as (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => Promise<void>,
@@ -310,5 +327,10 @@ export function useChat() {
     prefillText,
     clearPrefill: () => setPrefillText(''),
     rewindTo,
+    pendingRewind,
+    confirmRewind,
+    cancelRewind,
+    rewindBusy,
+    rewindError,
   };
 }
