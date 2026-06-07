@@ -199,6 +199,20 @@ class SessionService:
             rows = rows[:limit]
         return rows, next_cursor
 
+    async def list_all_messages(self, session_id: str) -> list[Message]:
+        """Return every message in the session, oldest first (no paging).
+
+        Used to assemble multi-turn conversation history for a new run.
+        """
+        await self.get_session(session_id)
+        stmt = (
+            select(Message)
+            .where(Message.session_id == session_id)
+            .order_by(Message.sequence.asc())
+        )
+        result = await self._db.execute(stmt)
+        return list(result.scalars().all())
+
     async def create_run(self, session_id: str, task: str) -> Run:
         await self.get_session(session_id)
         run = Run(

@@ -114,6 +114,7 @@ class DockerRuntime:
         skills: list[str] | None = None,
         files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
+        history: list[dict[str, Any]] | None = None,
         llm_gateway_url: str | None = None,
         llm_virtual_key: str | None = None,
     ) -> str:
@@ -168,6 +169,7 @@ class DockerRuntime:
             skills=skills or [],
             files=files or [],
             memory=memory or "",
+            history=history or [],
         )
 
         # When the ``llm_gateway_enforcer`` extension is active, the sandbox
@@ -551,6 +553,7 @@ class DockerRuntime:
         skills: list[str] | None = None,
         files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
+        history: list[dict[str, Any]] | None = None,
     ) -> Path:
         """Write the task payload ``runtime_worker`` will read.
 
@@ -562,6 +565,9 @@ class DockerRuntime:
               "skills": [str, ...] # skill names; skills_loader fetches manifests
               "files": [{"key": s3key, "filename": name, "mime": mime}, ...]
               "memory": str        # pre-fetched memory snippets (may be empty)
+              "history": [...]     # prior-turn conversation the worker restores
+                                   # into AgentState.context for multi-turn memory;
+                                   # items: {"role","type",...} incl. tool calls
             }
 
         ``mcp_servers`` stays empty because the in-sandbox ``mcp_tenant_injector``
@@ -591,6 +597,7 @@ class DockerRuntime:
             "skills": list(skills) if skills else [],
             "files": list(files) if files else [],
             "memory": memory or "",
+            "history": list(history) if history else [],
         }
         task_path = workspace_dir / "task.json"
         task_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

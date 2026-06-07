@@ -87,6 +87,62 @@ async def _fetch_memory(*, knowledge_ingest_url: str, tenant_id: str, query: str
         return ""
 
 
+async def _assemble_history(
+    svc: SessionService, session_id: str, *, current_task: str
+) -> list[dict[str, Any]]:
+    """Build structured prior-turn history for the worker to restore.
+
+    Returns a list of items shaped like::
+
+        {"role": "user", "type": "text", "content": "..."}
+        {"role": "assistant", "type": "text", "content": "..."}
+        {"role": "tool", "type": "tool", "tool": {id,name,input,result,state}}
+
+    The current user message — already persisted by BFF just before this run
+    was triggered — is excluded (it's this turn's input, not history).  SYSTEM
+    rows are dropped; empty ASSISTANT/TOOL rows are skipped.  Failure-open:
+    returns an empty list on any error so a history glitch never blocks a run.
+    """
+    try:
+        messages = await svc.list_all_messages(session_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("history assembly failed (failure-open): %s", exc)
+        return []
+
+    # Drop the most recent USER row whose content matches this run's task —
+    # that's the message BFF just wrote as this turn's input.
+    # NB: the message table stores role inconsistently ("USER" upper-cased,
+    # but "assistant"/"tool"/"system" lower-cased), so compare case-insensitively
+    # — otherwise assistant/tool history is silently dropped and the model only
+    # sees a stream of unanswered user questions.
+    task_norm = current_task.strip()
+    for i in range(len(messages) - 1, -1, -1):
+        if (messages[i].role or "").upper() == "USER":
+            if (messages[i].content or "").strip() == task_norm:
+                messages.pop(i)
+            break
+
+    history: list[dict[str, Any]] = []
+    for msg in messages:
+        role = (msg.role or "").upper()
+        if role == "USER":
+            history.append(
+                {"role": "user", "type": "text", "content": msg.content or ""}
+            )
+        elif role == "ASSISTANT":
+            if (msg.content or "").strip():
+                history.append(
+                    {"role": "assistant", "type": "text", "content": msg.content}
+                )
+        elif role == "TOOL":
+            calls = msg.tool_calls or []
+            tool = calls[0] if isinstance(calls, list) and calls else None
+            if isinstance(tool, dict) and tool:
+                history.append({"role": "tool", "type": "tool", "tool": tool})
+        # SYSTEM rows are intentionally skipped.
+    return history
+
+
 async def _get_scheduler_url(request: Request) -> str:
     url: str = request.app.state.settings.agent_scheduler_url
     return url
@@ -123,6 +179,12 @@ async def create_run(
         query=task,
     )
 
+    # Assemble prior-turn conversation history so the worker can restore it
+    # into the agent's context (multi-turn memory).  BFF writes the current
+    # user message *before* triggering this run, so it's already in the table
+    # as the latest USER row — we drop it (it's this run's input, not history).
+    history = await _assemble_history(svc, session_id, current_task=task)
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
@@ -137,6 +199,8 @@ async def create_run(
                     # Per-message skill selection relayed from BFF; scheduler
                     # writes these into task.json["skills"] for the worker.
                     "skills": body.get("skills") or [],
+                    # Prior-turn conversation history for multi-turn memory.
+                    "history": history,
                 },
                 headers=headers,
             )

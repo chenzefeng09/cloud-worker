@@ -655,6 +655,77 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
             exc,
         )
 
+    # Restore prior-turn conversation history (multi-turn memory).  The
+    # orchestrator assembles task["history"] from the session's message rows;
+    # we rebuild it as agentscope Msg objects and pre-populate
+    # ``agent_state.context`` so the agent sees the full prior conversation —
+    # including tool calls/results — before the current instruction.
+    #
+    # Constraints (verified against agentscope 2.0):
+    #  * We populate ``context`` directly rather than calling ``observe()``,
+    #    which only accepts user/assistant text and would reject tool blocks.
+    #  * Tool blocks MUST ride on role="assistant" Msgs (a ToolResultBlock on a
+    #    role="user" Msg raises ValidationError); the OpenAI formatter still
+    #    emits them as the standard tool_calls + role:tool pair.
+    #  * ToolCallBlock.id and ToolResultBlock.id share the same id to pair up.
+    # Failure-open: a bad item is skipped, never crashes the run.
+    history = task.get("history") or []
+    if agent_state is not None and isinstance(history, list):
+        from agentscope.message import (
+            Msg,
+            TextBlock,
+            ToolCallBlock,
+            ToolResultBlock,
+        )
+
+        restored: list = []
+        for item in history:
+            try:
+                role = item.get("role")
+                if role == "user":
+                    content = str(item.get("content") or "")
+                    if content:
+                        restored.append(
+                            Msg(name="user", role="user",
+                                content=[TextBlock(type="text", text=content)])
+                        )
+                elif role == "assistant":
+                    content = str(item.get("content") or "")
+                    if content:
+                        restored.append(
+                            Msg(name="assistant", role="assistant",
+                                content=[TextBlock(type="text", text=content)])
+                        )
+                elif role == "tool":
+                    t = item.get("tool") or {}
+                    cid = str(t.get("id") or "")
+                    if not cid:
+                        continue
+                    tname = str(t.get("name") or "tool")
+                    raw_input = t.get("input")
+                    input_str = (
+                        raw_input if isinstance(raw_input, str)
+                        else json.dumps(raw_input or {}, ensure_ascii=False)
+                    )
+                    output_str = str(t.get("result") or "")
+                    restored.append(
+                        Msg(name="assistant", role="assistant", content=[
+                            ToolCallBlock(type="tool_call", id=cid,
+                                          name=tname, input=input_str)
+                        ])
+                    )
+                    restored.append(
+                        Msg(name="assistant", role="assistant", content=[
+                            ToolResultBlock(type="tool_result", id=cid,
+                                            name=tname, output=output_str)
+                        ])
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("skip restoring one history item: %s", exc)
+        if restored:
+            agent_state.context.extend(restored)
+            logger.info("restored %d history messages into context", len(restored))
+
     agent = Agent(
         name=str(task.get("agent_name") or "Worker"),
         system_prompt=sys_prompt,

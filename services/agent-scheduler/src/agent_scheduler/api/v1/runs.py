@@ -334,6 +334,15 @@ async def create_run(
     # from the orchestrator's create_run).  Written to task.json["memory"] so
     # the runtime_worker can prepend them to the agent's system prompt.
     memory: str = str(body.get("memory") or "")
+    # Optional: prior-turn conversation history (forwarded from the
+    # orchestrator's create_run).  Written to task.json["history"]; the
+    # runtime_worker restores it into AgentState.context for multi-turn memory.
+    history_raw = body.get("history")
+    history: list[dict[str, Any]] = (
+        [h for h in history_raw if isinstance(h, dict) and h.get("role")]
+        if isinstance(history_raw, list)
+        else []
+    )
 
     if not (session_id and run_id and task):
         raise HTTPException(
@@ -387,6 +396,7 @@ async def create_run(
             skills=skills,
             files=files,
             memory=memory,
+            history=history,
             llm_gateway_url=_settings.llm_gateway_url,
             llm_virtual_key=virtual_key,
         )
