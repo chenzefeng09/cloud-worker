@@ -59,9 +59,14 @@ export default function DocxPreview({ blob }: { blob: Blob }) {
       wrapper.style.gap = '12px';
 
       // 先还原再测量，否则会拿到已缩放后的尺寸，多次 resize 后越测越小。
+      // 同时压缩文档自带的 Word 页边距（原始左右各约 1 英寸 ≈ 96px，导致正文只占中间 ⅔、
+      // 缩放后字偏小）：用 border-box + 小 padding 让正文区填满页面，缩放后字更大更易读。
       pages.forEach((p) => {
         p.style.transform = '';
         p.style.margin = '0';
+        p.style.boxSizing = 'border-box';
+        // 四周页边距统一压到 32px（原始 Word 页边距上下 96 / 左右 96），收窄留白、放大正文。
+        p.style.padding = '32px';
       });
       const first = pages[0];
       const contentWidth = first.getBoundingClientRect().width;
