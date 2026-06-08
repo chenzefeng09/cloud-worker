@@ -47,8 +47,9 @@ _log = logging.getLogger(__name__)
 # (unit tests / lint), so the module stays importable everywhere.
 # ---------------------------------------------------------------------------
 try:  # pragma: no cover - exercised in the sandbox image, stubbed in tests
-    from agentscope.tool import ToolBase as _ToolBase, ToolResponse as _ToolResponse
-    from agentscope.message import TextBlock as _TextBlock
+    from agentscope.tool import ToolBase as _ToolBase
+    from agentscope.tool._response import ToolChunk as _ToolChunk
+    from agentscope.message import TextBlock as _TextBlock, ToolResultState as _ToolResultState
     from agentscope.permission import (
         PermissionBehavior as _PermissionBehavior,
         PermissionContext as _PermissionContext,
@@ -58,8 +59,9 @@ try:  # pragma: no cover - exercised in the sandbox image, stubbed in tests
     _AGENTSCOPE_TOOLS = True
 except Exception:  # noqa: BLE001 - keep importable without agentscope
     _ToolBase = object  # type: ignore[assignment,misc]
-    _ToolResponse = None  # type: ignore[assignment]
+    _ToolChunk = None  # type: ignore[assignment]
     _TextBlock = None  # type: ignore[assignment]
+    _ToolResultState = None  # type: ignore[assignment]
     _PermissionBehavior = None  # type: ignore[assignment]
     _PermissionContext = Any  # type: ignore[assignment]
     _PermissionDecision = None  # type: ignore[assignment]
@@ -171,16 +173,14 @@ class WebFetchTool(_ToolBase):
         )
 
     def __call__(self, url: str, max_bytes: Optional[int] = 1048576) -> Any:
-        """Fetch ``url`` and return an AgentScope ``ToolResponse``.
-
-        The heavy lifting lives in :meth:`_fetch_text`, which returns the
-        agent-readable text; we wrap it in a ``ToolResponse`` so the value
-        conforms to the toolkit's expected tool-result type.
-        """
+        """Fetch ``url`` and return an AgentScope ``ToolChunk``."""
         text = self._fetch_text(url, max_bytes)
-        if _AGENTSCOPE_TOOLS and _ToolResponse is not None:
-            return _ToolResponse(content=[_TextBlock(type="text", text=text)])
-        # Fallback for environments without agentscope (tests): return raw text.
+        if _AGENTSCOPE_TOOLS and _ToolChunk is not None:
+            return _ToolChunk(
+                content=[_TextBlock(type="text", text=text)],
+                state=_ToolResultState.SUCCESS,
+                is_last=True,
+            )
         return text
 
     def _fetch_text(self, url: str, max_bytes: Optional[int] = 1048576) -> str:

@@ -47,7 +47,8 @@ def _run_security_checks(url: str, settings: Settings) -> None:
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
     check_domain_allowed(hostname, settings.allowed_domains)
-    resolve_and_check_ip(hostname)
+    if not settings.skip_ip_check:
+        resolve_and_check_ip(hostname)
 
 
 async def fetch(

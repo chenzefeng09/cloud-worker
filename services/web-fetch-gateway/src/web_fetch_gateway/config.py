@@ -39,3 +39,8 @@ class Settings(BaseSettings):
     # completely unauthenticated egress endpoint.
     require_auth: bool = True
     required_scope: str = "web_fetch.invoke"
+
+    # Skip the SSRF private-IP check.  Use ONLY in local dev environments
+    # where a transparent proxy (e.g. Clash tun) maps all DNS results to
+    # fake-ip ranges that look "private" to Python's ipaddress module.
+    skip_ip_check: bool = False
