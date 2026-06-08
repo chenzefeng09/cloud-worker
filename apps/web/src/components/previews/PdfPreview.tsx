@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Document, Page, pdfjs } from 'react-pdf';
 import 'react-pdf/dist/Page/AnnotationLayer.css';
 import 'react-pdf/dist/Page/TextLayer.css';
@@ -15,6 +15,23 @@ const DOC_OPTIONS = { withCredentials: true } as const;
 export default function PdfPreview({ url }: { url: string }) {
   const [numPages, setNumPages] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // 让 PDF 页面宽度跟随滚动容器实际内容宽度，拖动预览窗口时自适应、不出横向滚动。
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [pageWidth, setPageWidth] = useState<number | null>(null);
+
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const measure = () => {
+      // clientWidth 已扣掉滚动条，再减去左右 padding（px-3 = 24px）让页面正好贴合内容区。
+      const w = el.clientWidth - 24;
+      setPageWidth(w > 200 ? w : 200);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   return (
     <div className="border border-line rounded-md overflow-hidden bg-surface">
@@ -24,7 +41,7 @@ export default function PdfPreview({ url }: { url: string }) {
           <span className="font-mono text-[10px] text-dim">共 {numPages} 页</span>
         )}
       </div>
-      <div className="cw-scroll px-3 py-3 max-h-[640px] overflow-auto flex flex-col items-center gap-3 bg-paper-2">
+      <div ref={scrollRef} className="cw-scroll px-3 py-3 max-h-[640px] overflow-auto flex flex-col items-center gap-3 bg-paper-2">
         {error ? (
           <div className="font-mono text-[11px] text-accent py-4">{error}</div>
         ) : (
@@ -36,16 +53,17 @@ export default function PdfPreview({ url }: { url: string }) {
             loading={<div className="font-mono text-[11px] text-dim py-4">加载 PDF…</div>}
             error={<div className="font-mono text-[11px] text-accent py-4">无法渲染该 PDF</div>}
           >
-            {Array.from({ length: numPages ?? 0 }, (_, i) => (
-              <Page
-                key={i}
-                pageNumber={i + 1}
-                width={680}
-                className="shadow-sm mb-2"
-                renderAnnotationLayer={false}
-                renderTextLayer
-              />
-            ))}
+            {pageWidth != null &&
+              Array.from({ length: numPages ?? 0 }, (_, i) => (
+                <Page
+                  key={i}
+                  pageNumber={i + 1}
+                  width={pageWidth}
+                  className="shadow-sm mb-2"
+                  renderAnnotationLayer={false}
+                  renderTextLayer
+                />
+              ))}
           </Document>
         )}
       </div>
