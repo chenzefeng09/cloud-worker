@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import type { Attachment } from '../api/types';
+import type { Attachment, InstalledSkill } from '../api/types';
+import { Chip } from './shell/Chip';
 
 interface Props {
   onSend: (text: string, attachmentIds?: string[], attachments?: Attachment[]) => void;
@@ -10,16 +11,35 @@ interface Props {
   /** Pre-populate the input (e.g. after a rewind). Cleared after consumed. */
   prefill?: string;
   onPrefillConsumed?: () => void;
+  /** Per-session skill toggles, surfaced in the "+" popover. */
+  sessionId?: string;
+  skills?: InstalledSkill[];
+  selectedSkills?: string[];
+  onToggleSkill?: (name: string) => void;
 }
 
-export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, prefill, onPrefillConsumed }: Props) {
+export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, prefill, onPrefillConsumed, skills, selectedSkills, onToggleSkill }: Props) {
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [pendingSend, setPendingSend] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  // Close the "+" popover when clicking outside it.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+        setMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [menuOpen]);
   // Tracks in-flight uploads + the attachments they produce, so a Send that
   // races an upload can await it instead of silently sending an empty list.
   const uploadRef = useRef<Promise<Attachment[]> | null>(null);
@@ -124,6 +144,10 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
 
   const isImage = (mime: string) => mime.startsWith('image/');
 
+  // Only show the skills section when the consumer wires both list + toggle.
+  const showSkills = !!skills && !!onToggleSkill;
+  const selectedCount = selectedSkills?.length ?? 0;
+
   return (
     <div className="border-t border-line bg-paper px-4 py-3 shrink-0">
       {/* Attachment chips */}
@@ -173,7 +197,7 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
         </div>
       )}
 
-      <div className="flex gap-2 items-end bg-surface border border-line rounded-lg overflow-hidden shadow-[0_4px_12px_-4px_rgba(15,17,20,0.06)]">
+      <div className="flex gap-2 items-end bg-surface border border-line rounded-lg shadow-[0_4px_12px_-4px_rgba(15,17,20,0.06)]">
         {/* Hidden file input */}
         <input
           ref={fileInputRef}
@@ -185,17 +209,70 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
           disabled={!onUpload || uploading}
         />
 
-        {/* File button */}
-        {onUpload && (
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={uploading}
-            className="px-3 py-3 font-mono text-[13px] text-ink-2 hover:bg-paper rounded-l-lg disabled:opacity-40 shrink-0"
-            title="上传文件或图片"
-          >
-            ⊕
-          </button>
+        {/* "+" popover — upload + per-session skill toggles */}
+        {(onUpload || showSkills) && (
+          <div ref={menuRef} className="relative shrink-0">
+            <button
+              type="button"
+              onClick={() => setMenuOpen((o) => !o)}
+              disabled={uploading}
+              className="px-3 py-3 font-mono text-[13px] text-ink-2 hover:bg-paper rounded-l-lg disabled:opacity-40"
+              title="附件与 Skill"
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+            >
+              ⊕
+            </button>
+            {menuOpen && (
+              <div
+                role="menu"
+                className="absolute bottom-full left-0 mb-2 w-60 z-20 bg-surface border border-line rounded-lg shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-2"
+              >
+                {/* Upload action */}
+                {onUpload && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      fileInputRef.current?.click();
+                      setMenuOpen(false);
+                    }}
+                    disabled={uploading}
+                    className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md font-mono text-[12px] text-ink-2 hover:bg-paper disabled:opacity-40 text-left"
+                  >
+                    <span aria-hidden>📎</span>
+                    上传文件 / 图片
+                  </button>
+                )}
+
+                {/* Skills — click to enable/disable for this session */}
+                {showSkills && (
+                  <div className={onUpload ? 'mt-2 pt-2 border-t border-line' : ''}>
+                    <div className="cw-label mb-1.5 px-1">
+                      Skills · {selectedCount}/{skills!.length}
+                    </div>
+                    <div className="flex flex-wrap gap-1 px-1">
+                      {skills!.map((s) => {
+                        const on = selectedSkills?.includes(s.name) ?? false;
+                        return (
+                          <Chip
+                            key={s.id}
+                            accent={on}
+                            dashed={!on}
+                            onClick={() => onToggleSkill?.(s.name)}
+                          >
+                            {s.name}
+                          </Chip>
+                        );
+                      })}
+                      {skills!.length === 0 && (
+                        <span className="font-mono text-[11px] italic text-dim">暂无 skill</span>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
         )}
 
         <textarea

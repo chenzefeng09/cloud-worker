@@ -11,7 +11,6 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class SessionStatus(str, Enum):
     ACTIVE = "ACTIVE"
-    PAUSED = "PAUSED"
     COMPLETED = "COMPLETED"
     ERROR = "ERROR"
     ARCHIVED = "ARCHIVED"

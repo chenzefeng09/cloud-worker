@@ -1,10 +1,13 @@
 import { useEffect, useRef } from 'react';
 import { useChat } from '../hooks/useChat';
 import { useOutputAttachments } from '../hooks/useOutputAttachments';
+import { useInstalledSkills } from '../hooks/useInstalledSkills';
+import { useChatStore } from '../stores/chatStore';
 import { MessageBubble, WorkingOnItPill } from './MessageBubble';
 import { StepGroup } from './StepGroup';
 import { OutputFileCards } from './OutputFileCards';
 import { InputBar } from './InputBar';
+import { PlanBlock } from './PlanBlock';
 import { RewindConfirmModal } from './RewindConfirmModal';
 import { api } from '../api/client';
 import type { Attachment, MessageAttachment } from '../api/types';
@@ -290,6 +293,22 @@ export function ChatWindow({
   // Track previous isStreaming value so we can detect the true→false edge.
   const prevStreamingRef = useRef(isStreaming);
 
+  // Per-session skill toggles, surfaced in the InputBar "+" popover.
+  const skills = useInstalledSkills();
+  const selectedSkills = useChatStore((s) => s.selectedSkills[sessionId]);
+  const toggleSkill = useChatStore((s) => s.toggleSkill);
+  const seedSkills = useChatStore((s) => s.seedSkills);
+
+  // Live plan steps for this session — rendered at the bottom of the transcript.
+  const planSteps = useChatStore((s) => s.planSteps[sessionId]);
+
+  // Seed this session's enabled skills from the user's install defaults, once
+  // the installed list loads — only if the user hasn't chosen yet this session.
+  useEffect(() => {
+    if (skills.length === 0) return;
+    seedSkills(sessionId, skills.filter((s) => s.enabled_by_default).map((s) => s.name));
+  }, [sessionId, skills, seedSkills]);
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isStreaming]);
@@ -434,6 +453,9 @@ export function ChatWindow({
             </div>
           )}
 
+          {/* ── Current plan steps (live from agent TaskCreate/TaskUpdate) ── */}
+          {planSteps && planSteps.length > 0 && <PlanBlock steps={planSteps} />}
+
           {/* ── Live "Working on it…" pill — shown while streaming, regardless of mode ── */}
           {isStreaming && <WorkingOnItPill />}
 
@@ -448,6 +470,10 @@ export function ChatWindow({
         onUpload={handleUpload}
         prefill={prefillText}
         onPrefillConsumed={clearPrefill}
+        sessionId={sessionId}
+        skills={skills}
+        selectedSkills={selectedSkills}
+        onToggleSkill={(name) => toggleSkill(sessionId, name)}
       />
       {pendingRewind && (
         <RewindConfirmModal
