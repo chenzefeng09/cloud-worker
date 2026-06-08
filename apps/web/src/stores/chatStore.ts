@@ -38,6 +38,10 @@ interface ChatState {
    * time and forwards them in the /chat body → task.json["skills"]).
    */
   selectedSkills: Record<string, string[]>;
+  /** Per-session selected model id (gateway routing key). Read at send time. */
+  selectedModel: Record<string, string>;
+  /** Per-session reasoning effort ('' = off). Read at send time. */
+  selectedEffort: Record<string, string>;
 
   setSessions: (sessions: Session[]) => void;
   addSession: (session: Session) => void;
@@ -64,8 +68,10 @@ interface ChatState {
   //   thinking → seal the current text segment, create a thinking block.
   //
   // When the real DB messages arrive (event: message) we call
-  // clearStreamingBlocks to remove all temp blocks for the run, then addMessage
-  // each real row.
+  // clearStreamingBlocks to swap temp blocks for real rows.  Clearing is
+  // kind-aware: a durable row only clears the streaming blocks of the SAME
+  // kind it replaces (e.g. a THINKING row must not wipe the live-streamed
+  // assistant text, which is replaced separately by its own ASSISTANT row).
 
   /**
    * Append a token delta to the currently-open text block for `runId`.
@@ -92,10 +98,16 @@ interface ChatState {
   appendStreamingThinking: (sessionId: string, runId: string, text: string) => void;
 
   /**
-   * Remove all temporary blocks (id prefix `stream_`, `tool_`, `thinking_`)
-   * whose `streamRunId` matches `runId`.  Called when real DB messages arrive.
+   * Remove temporary blocks whose `streamRunId` matches `runId`.  Called when
+   * real DB messages arrive.  When `kind` is given, only streaming blocks of
+   * that `blockKind` are removed (so a THINKING row leaves the streamed text
+   * intact); when omitted, all streaming blocks for the run are removed.
    */
-  clearStreamingBlocks: (sessionId: string, runId: string) => void;
+  clearStreamingBlocks: (
+    sessionId: string,
+    runId: string,
+    kind?: 'text' | 'tool' | 'thinking',
+  ) => void;
 
   // ── Legacy compat (kept for tests that import them directly) ──────────────
 
@@ -137,6 +149,10 @@ interface ChatState {
    * the user already made this session).
    */
   seedSkills: (sessionId: string, names: string[]) => void;
+  /** Set the model for a session (composer dropdown). */
+  setSessionModel: (sessionId: string, model: string) => void;
+  /** Set the reasoning effort for a session ('' = off). */
+  setSessionEffort: (sessionId: string, effort: string) => void;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -185,6 +201,8 @@ export const useChatStore = create<ChatState>((set) => ({
   userProfile: null,
   bootstrapped: false,
   selectedSkills: {},
+  selectedModel: {},
+  selectedEffort: {},
 
   setSessions: (sessions) => set({ sessions }),
   addSession: (session) => set((s) => ({ sessions: [session, ...s.sessions] })),
@@ -194,6 +212,13 @@ export const useChatStore = create<ChatState>((set) => ({
 
   addMessage: (sessionId, message) =>
     set((s) => {
+      // Normalize persisted reasoning rows (role='thinking') into a thinking
+      // block so the renderer (StepGroup → ThinkingBlock) shows them collapsed.
+      // DB rows carry no blockKind; streaming thinking blocks already set it.
+      if ((message.role || '').toUpperCase() === 'THINKING' && message.blockKind !== 'thinking') {
+        message = { ...message, blockKind: 'thinking' };
+      }
+
       const existing = getMessages(s, sessionId);
 
       // 1. Hard dedup by id.
@@ -364,10 +389,14 @@ export const useChatStore = create<ChatState>((set) => ({
       };
     }),
 
-  clearStreamingBlocks: (sessionId, runId) =>
+  clearStreamingBlocks: (sessionId, runId, kind) =>
     set((s) => {
       const existing = getMessages(s, sessionId);
-      const filtered = existing.filter((m) => m.streamRunId !== runId);
+      const filtered = existing.filter((m) => {
+        if (m.streamRunId !== runId) return true; // other runs untouched
+        if (kind && m.blockKind !== kind) return true; // keep other-kind blocks
+        return false; // drop this run's matching streaming block
+      });
       if (filtered.length === existing.length) return s;
       return { messages: { ...s.messages, [sessionId]: filtered } };
     }),
@@ -436,6 +465,8 @@ export const useChatStore = create<ChatState>((set) => ({
       activeSessionId: null,
       bootstrapped: true,
       selectedSkills: {},
+      selectedModel: {},
+      selectedEffort: {},
     }),
   setBootstrapped: (value) => set({ bootstrapped: value }),
   toggleSkill: (sessionId, name) =>
@@ -452,4 +483,8 @@ export const useChatStore = create<ChatState>((set) => ({
       if (s.selectedSkills[sessionId] !== undefined) return {};
       return { selectedSkills: { ...s.selectedSkills, [sessionId]: names } };
     }),
+  setSessionModel: (sessionId, model) =>
+    set((s) => ({ selectedModel: { ...s.selectedModel, [sessionId]: model } })),
+  setSessionEffort: (sessionId, effort) =>
+    set((s) => ({ selectedEffort: { ...s.selectedEffort, [sessionId]: effort } })),
 }));

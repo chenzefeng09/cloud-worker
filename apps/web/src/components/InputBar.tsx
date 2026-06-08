@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import type { Attachment, InstalledSkill } from '../api/types';
 import { Chip } from './shell/Chip';
+import { Dropdown } from './shell/Dropdown';
+import { MODEL_OPTIONS, EFFORT_OPTIONS } from '../lib/modelOptions';
 
 interface Props {
   onSend: (text: string, attachmentIds?: string[], attachments?: Attachment[]) => void;
@@ -16,9 +18,14 @@ interface Props {
   skills?: InstalledSkill[];
   selectedSkills?: string[];
   onToggleSkill?: (name: string) => void;
+  /** Per-session model + reasoning effort, surfaced as toolbar dropdowns. */
+  model?: string;
+  effort?: string;
+  onModelChange?: (id: string) => void;
+  onEffortChange?: (id: string) => void;
 }
 
-export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, prefill, onPrefillConsumed, skills, selectedSkills, onToggleSkill }: Props) {
+export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, prefill, onPrefillConsumed, skills, selectedSkills, onToggleSkill, model, effort, onModelChange, onEffortChange }: Props) {
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -287,7 +294,23 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
           className="flex-1 resize-none border-none outline-none bg-transparent text-ink text-[14px] leading-[1.5] px-4 py-3 min-h-[44px] max-h-[200px] disabled:opacity-50 font-sans"
           style={{ scrollbarWidth: 'none' }}
         />
-        <div className="flex items-center gap-1 px-3 py-2.5 shrink-0">
+        <div className="flex items-center gap-1.5 px-3 py-2.5 shrink-0">
+          {onModelChange && (
+            <Dropdown
+              value={model ?? ''}
+              options={MODEL_OPTIONS}
+              onChange={onModelChange}
+              title="选择模型"
+            />
+          )}
+          {onEffortChange && (
+            <Dropdown
+              value={effort ?? ''}
+              options={EFFORT_OPTIONS}
+              onChange={onEffortChange}
+              title="推理强度"
+            />
+          )}
           {isStreaming ? (
             <button
               type="button"

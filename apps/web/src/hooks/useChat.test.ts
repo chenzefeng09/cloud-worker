@@ -43,8 +43,10 @@ function dispatchSSE(sessionId: string, event: string, data: Record<string, unkn
   } else if (event === 'message') {
     const msg = data as unknown as Message;
     const roleUpper = (msg.role || '').toUpperCase();
-    if ((roleUpper === 'ASSISTANT' || roleUpper === 'TOOL') && msg.run_id) {
-      store.clearStreamingBlocks(sessionId, msg.run_id);
+    if ((roleUpper === 'ASSISTANT' || roleUpper === 'TOOL' || roleUpper === 'THINKING') && msg.run_id) {
+      const kindForRole =
+        roleUpper === 'THINKING' ? 'thinking' : roleUpper === 'TOOL' ? 'tool' : 'text';
+      store.clearStreamingBlocks(sessionId, msg.run_id, kindForRole);
       store.addMessage(sessionId, msg);
     } else {
       store.addMessage(sessionId, msg);
@@ -170,6 +172,29 @@ describe('SSE → store routing', () => {
     expect(msgs[0].id).toBe('final_msg');
     expect(msgs[0].streaming).toBeFalsy();
     expect(msgs[0].blockKind).toBeUndefined();
+  });
+
+  it('THINKING durable message does not wipe the live-streamed assistant text', () => {
+    // Live stream: assistant text + thinking for the same run.
+    dispatchSSE('ses_A', 'token', { run_id: 'run_t', delta: 'the answer' });
+    dispatchSSE('ses_A', 'thinking', { run_id: 'run_t', text: 'let me think' });
+    // Durable THINKING row arrives FIRST (orchestrator order) — must only
+    // replace the streamed thinking block, not the streamed text.
+    dispatchSSE('ses_A', 'message', {
+      id: 'think_row',
+      session_id: 'ses_A',
+      role: 'thinking',
+      content: 'let me think',
+      tool_calls: null,
+      run_id: 'run_t',
+      sequence: 1,
+      created_at: '2026-01-01',
+    });
+    const after = useChatStore.getState().messages['ses_A'];
+    // Streamed text survives; thinking swapped for the durable row.
+    expect(after.some((m) => m.blockKind === 'text' && m.content === 'the answer')).toBe(true);
+    expect(after.some((m) => m.id === 'think_row')).toBe(true);
+    expect(after.some((m) => m.id === 'thinking_run_t_0')).toBe(false);
   });
 
   it('message event with TOOL role clears temp tool blocks', () => {

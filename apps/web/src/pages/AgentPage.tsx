@@ -26,7 +26,7 @@ export function AgentPage() {
   const { sessions } = useSessions();
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const setActiveSession = useChatStore((s) => s.setActiveSession);
-  const { sendMessage, cancel, isStreaming } = useChat();
+  const { sendMessage } = useChat();
 
   const [previewFile, setPreviewFile] = useState<{ id: string; filename: string; mime?: string } | null>(null);
   // Resizable preview panel width (px). Persisted across opens within a session.
@@ -121,11 +121,6 @@ export function AgentPage() {
               >
                 <span className="font-mono">⌗</span> 文件
               </button>
-              {isStreaming && (
-                <button onClick={cancel} className="cw-btn cw-btn-sm" style={{ color: '#d23a1f', borderColor: '#f5c2ba', background: '#fef2f0' }}>
-                  停止
-                </button>
-              )}
             </>
           )
         }

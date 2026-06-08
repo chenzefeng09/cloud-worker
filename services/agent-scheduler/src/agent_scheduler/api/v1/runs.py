@@ -344,6 +344,14 @@ async def create_run(
         else []
     )
 
+    # Optional per-message LLM selection (model + reasoning effort), nested in
+    # agent_config by the orchestrator. Falls back to top-level for direct callers.
+    agent_config: dict[str, Any] = body.get("agent_config") or {}
+    model_override: str | None = agent_config.get("model") or body.get("model") or None
+    reasoning_effort: str | None = (
+        agent_config.get("reasoning_effort") or body.get("reasoning_effort") or None
+    )
+
     if not (session_id and run_id and task):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -399,6 +407,8 @@ async def create_run(
             history=history,
             llm_gateway_url=_settings.llm_gateway_url,
             llm_virtual_key=virtual_key,
+            model_override=model_override,
+            reasoning_effort=reasoning_effort,
         )
     except SandboxSpawnError as exc:
         raise HTTPException(

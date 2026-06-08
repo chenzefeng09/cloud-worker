@@ -193,7 +193,11 @@ async def create_run(
                     "session_id": session_id,
                     "run_id": run.id,
                     "task": task,
-                    "agent_config": body.get("agent_config", {}),
+                    "agent_config": {
+                        **(body.get("agent_config") or {}),
+                        "model": body.get("model"),
+                        "reasoning_effort": body.get("reasoning_effort"),
+                    },
                     "files": files,
                     "memory": memory_snippets,
                     # Per-message skill selection relayed from BFF; scheduler

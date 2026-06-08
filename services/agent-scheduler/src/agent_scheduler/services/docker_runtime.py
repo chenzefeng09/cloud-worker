@@ -117,6 +117,8 @@ class DockerRuntime:
         history: list[dict[str, Any]] | None = None,
         llm_gateway_url: str | None = None,
         llm_virtual_key: str | None = None,
+        model_override: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         """Spawn a sandbox container for one agent run.
 
@@ -170,6 +172,8 @@ class DockerRuntime:
             files=files or [],
             memory=memory or "",
             history=history or [],
+            model_override=model_override,
+            reasoning_effort=reasoning_effort,
         )
 
         # When the ``llm_gateway_enforcer`` extension is active, the sandbox
@@ -554,6 +558,8 @@ class DockerRuntime:
         files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
         history: list[dict[str, Any]] | None = None,
+        model_override: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> Path:
         """Write the task payload ``runtime_worker`` will read.
 
@@ -598,6 +604,10 @@ class DockerRuntime:
             "files": list(files) if files else [],
             "memory": memory or "",
             "history": list(history) if history else [],
+            # Per-message LLM selection: model routing key + reasoning effort.
+            # The gateway model builder reads these; both may be None (defaults).
+            "model_override": model_override,
+            "reasoning_effort": reasoning_effort,
         }
         task_path = workspace_dir / "task.json"
         task_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

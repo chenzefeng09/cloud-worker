@@ -47,3 +47,7 @@ make lint        # ruff + mypy
 make test        # pytest with coverage
 make conformance # run conformance suite
 ```
+
+## Roadmap
+
+- [Claude Code Web gap plan](docs/roadmap/claude-code-web-gap-plan.md)

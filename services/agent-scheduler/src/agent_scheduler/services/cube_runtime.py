@@ -154,6 +154,8 @@ class CubeSandboxRuntime:
         memory: str | None = None,
         llm_gateway_url: str | None = None,
         llm_virtual_key: str | None = None,
+        model_override: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> str:
         _check_ids(
             run_id=run_id, session_id=session_id,
@@ -193,6 +195,9 @@ class CubeSandboxRuntime:
             "skills": skills or [],
             "files": files or [],
             "memory": memory or "",
+            # Per-message LLM selection (model routing key + reasoning effort).
+            "model_override": model_override,
+            "reasoning_effort": reasoning_effort,
         }
         env = {
             "LLM_API_KEY": sandbox_llm_api_key,

@@ -8,6 +8,14 @@ import type { Attachment, Session } from '../api/types';
 import { formatRelativeTimeZh } from '../lib/format';
 import { StatusDot, sessionToDesignStatus } from '../components/shell/StatusDot';
 import { Chip } from '../components/shell/Chip';
+import { Dropdown } from '../components/shell/Dropdown';
+import { useChatStore } from '../stores/chatStore';
+import {
+  MODEL_OPTIONS,
+  EFFORT_OPTIONS,
+  DEFAULT_MODEL,
+  DEFAULT_EFFORT,
+} from '../lib/modelOptions';
 
 const PLACEHOLDERS = [
   '帮我安排明天的团队站会…',
@@ -37,6 +45,10 @@ export function HomePage() {
   const [submitting, setSubmitting] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [model, setModel] = useState<string>(DEFAULT_MODEL);
+  const [effort, setEffort] = useState<string>(DEFAULT_EFFORT);
+  const setSessionModel = useChatStore((s) => s.setSessionModel);
+  const setSessionEffort = useChatStore((s) => s.setSessionEffort);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Attachments require a session_id (NOT NULL FK), so the session must exist
   // before we can upload.  We create it lazily on the first file pick and
@@ -97,6 +109,10 @@ export function HomePage() {
       // Reuse the session created during an earlier file upload, if any.
       const session = await ensureSession();
       if (session) {
+        // Persist the composer's model + effort choice onto the new session so
+        // useChat picks them up at send time (same store the chat page reads).
+        setSessionModel(session.id, model);
+        setSessionEffort(session.id, effort);
         // Pass the first user message and any pre-uploaded attachments through
         // router state so AgentPage can dispatch them once the chat store is
         // bound to the new session.  Without this the draft was being thrown
@@ -222,7 +238,20 @@ export function HomePage() {
                 <span className="font-mono">⊕</span> 文件
               </button>
               <div className="flex-1" />
-              <span className="font-mono text-[10.5px] text-dim">sonnet 4.5 · {ws.name}</span>
+              <Dropdown
+                value={model}
+                options={MODEL_OPTIONS}
+                onChange={setModel}
+                title="选择模型"
+              />
+              <span className="text-line-2 text-[10px] select-none">·</span>
+              <Dropdown
+                value={effort}
+                options={EFFORT_OPTIONS}
+                onChange={setEffort}
+                title="推理强度"
+              />
+              <span className="font-mono text-[10.5px] text-dim select-none">· {ws.name}</span>
               <button
                 onClick={startChat}
                 disabled={submitting || uploading}

@@ -104,6 +104,7 @@ def _build_openai_gateway_model(
     model_name: str,
     formatter: Any,
     tenant_id: str = "",
+    reasoning_effort: str | None = None,
 ) -> Any:
     """Return a ``_GatewayOpenAIChatModel`` that talks to the foundation gateway.
 
@@ -187,8 +188,22 @@ def _build_openai_gateway_model(
                 kwargs["temperature"] = self.parameters.temperature
             if self.parameters.top_p is not None:
                 kwargs["top_p"] = self.parameters.top_p
-            if self.parameters.thinking_enable and self.parameters.reasoning_effort:
-                kwargs["reasoning_effort"] = self.parameters.reasoning_effort
+            # Per-message reasoning effort (DeepSeek/V4): the gateway upstream
+            # requires BOTH the ``reasoning_effort`` field AND the ``extra_body``
+            # thinking flag to enter thinking mode. When effort is absent we send
+            # neither (non-thinking mode). The closure ``reasoning_effort`` is the
+            # per-run value resolved from task.json; we fall back to the model's
+            # own parameters for callers that configure it that way.
+            effort = reasoning_effort or (
+                self.parameters.reasoning_effort
+                if self.parameters.thinking_enable
+                else None
+            )
+            if effort:
+                kwargs["reasoning_effort"] = effort
+                extra_body = dict(kwargs.get("extra_body") or {})
+                extra_body["thinking"] = {"type": "enabled"}
+                kwargs["extra_body"] = extra_body
 
             kwargs.update(generate_kwargs)
 
@@ -256,7 +271,11 @@ def make_gateway_model(*, task: dict, env: Mapping[str, str]) -> Any:
     An ``OpenAIChatModel`` subclass instance when agentscope + openai are
     importable, otherwise raises ``ImportError``.
     """
-    del task
+    # Per-message overrides resolved from task.json (written by the scheduler).
+    # The model override wins over the env default; reasoning_effort drives the
+    # gateway thinking flags. Both may be absent (defaults / non-thinking).
+    model_override = (task or {}).get("model_override")
+    reasoning_effort = (task or {}).get("reasoning_effort") or None
 
     gateway_url = env.get("LLM_GATEWAY_URL", "").rstrip("/")
     if not gateway_url:
@@ -265,7 +284,7 @@ def make_gateway_model(*, task: dict, env: Mapping[str, str]) -> Any:
             "set it to the gateway base URL (e.g. http://llm-gw:8011/api/llm-gateway/v1)"
         )
 
-    model_name = env.get("LLM_MODEL", "").strip()
+    model_name = (model_override or env.get("LLM_MODEL", "")).strip()
     if not model_name:
         raise ValueError("LLM_MODEL is required for llm_gateway_enforcer")
 
@@ -297,6 +316,7 @@ def make_gateway_model(*, task: dict, env: Mapping[str, str]) -> Any:
         model_name=model_name,
         formatter=formatter,
         tenant_id=tenant_id,
+        reasoning_effort=reasoning_effort,
     )
 
 

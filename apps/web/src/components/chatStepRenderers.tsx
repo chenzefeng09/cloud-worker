@@ -463,8 +463,8 @@ export interface ThinkingBlockProps {
 }
 
 export function ThinkingBlock({ content, friendly }: ThinkingBlockProps) {
-  // Default: friendly → collapsed, technical → open
-  const [open, setOpen] = useState(() => !friendly);
+  // Default: always collapsed once thinking finishes (both modes); user expands manually.
+  const [open, setOpen] = useState(false);
 
   // Split content into bullet points (by newline or paragraph)
   const lines = content

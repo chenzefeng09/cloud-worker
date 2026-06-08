@@ -327,6 +327,20 @@ describe('chatStore', () => {
     expect(useChatStore.getState().messages['ses_1']).toHaveLength(1);
   });
 
+  it('clearStreamingBlocks with kind only removes blocks of that kind', () => {
+    // Streamed text + streamed thinking for the same run.
+    useChatStore.getState().appendStreamingToken('ses_1', 'run_1', 'answer text');
+    useChatStore.getState().appendStreamingThinking('ses_1', 'run_1', 'reasoning');
+
+    // A durable THINKING row arriving must NOT wipe the live-streamed text.
+    useChatStore.getState().clearStreamingBlocks('ses_1', 'run_1', 'thinking');
+
+    const msgs = useChatStore.getState().messages['ses_1'];
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].blockKind).toBe('text');
+    expect(msgs[0].content).toBe('answer text');
+  });
+
   // ─── finalizeStreaming (legacy compat) ────────────────────────────────────────
 
   it('finalizeStreaming clears temp blocks and appends the final message', () => {

@@ -80,6 +80,10 @@ async def chat(
     # Optional per-message skill selection (names); forwarded to the orchestrator
     # which relays into task.json so the worker loads exactly these skills.
     skills: list[str] = body.get("skills") or []
+    # Optional per-message model + reasoning effort selection (forwarded to the
+    # orchestrator → scheduler → worker → gateway request).
+    model: str | None = body.get("model") or None
+    reasoning_effort: str | None = body.get("reasoning_effort") or None
 
     async def event_generator():
         async with httpx.AsyncClient(timeout=600) as client:
@@ -114,7 +118,13 @@ async def chat(
             # 3. Trigger run (pass files so worker downloads them)
             resp = await client.post(
                 f"{orch_url}/sessions/{session_id}/runs",
-                json={"task": message_text, "files": files, "skills": skills},
+                json={
+                    "task": message_text,
+                    "files": files,
+                    "skills": skills,
+                    "model": model,
+                    "reasoning_effort": reasoning_effort,
+                },
                 headers=headers,
             )
             if resp.status_code >= 400:

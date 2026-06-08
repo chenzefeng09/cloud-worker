@@ -91,11 +91,16 @@ function handleSSEEvent(
       // lowercase ("assistant"/"user"/"system"/"tool"); compare case-insensitively.
       const msg = data as unknown as Message;
       const roleUpper = (msg.role || '').toUpperCase();
-      if ((roleUpper === 'ASSISTANT' || roleUpper === 'TOOL') && msg.run_id) {
-        // Clear temp streaming blocks on the first real message for this run,
-        // then add the real DB row.  Subsequent real messages for the same run
-        // will not find temp blocks (already cleared) but addMessage deduplicates.
-        store.clearStreamingBlocks(sessionId, msg.run_id);
+      if ((roleUpper === 'ASSISTANT' || roleUpper === 'TOOL' || roleUpper === 'THINKING') && msg.run_id) {
+        // Swap the transient streaming block for the durable DB row — but only
+        // the block of the SAME kind this row replaces.  Durable rows arrive
+        // THINKING-first, then ASSISTANT text; a non-kind-aware clear would wipe
+        // the live-streamed text when the THINKING row lands, and if the text's
+        // own durable row is delayed (or the stream closes first) the run would
+        // show a lone THOUGHT block with no answer.  addMessage deduplicates.
+        const kindForRole =
+          roleUpper === 'THINKING' ? 'thinking' : roleUpper === 'TOOL' ? 'tool' : 'text';
+        store.clearStreamingBlocks(sessionId, msg.run_id, kindForRole);
         store.addMessage(sessionId, msg);
       } else {
         store.addMessage(sessionId, msg);
@@ -203,6 +208,9 @@ export function useChat() {
         // Skills enabled for this session in the context rail; forwarded so the
         // worker loads exactly these (BFF → orchestrator → task.json["skills"]).
         const skills = useChatStore.getState().selectedSkills[sessionId] || [];
+        // Per-session model + reasoning effort, set via the composer dropdowns.
+        const model = useChatStore.getState().selectedModel[sessionId] || undefined;
+        const effortSel = useChatStore.getState().selectedEffort[sessionId] || '';
 
         const res = await fetch(`/api/bff/v1/sessions/${sessionId}/chat`, {
           method: 'POST',
@@ -211,6 +219,8 @@ export function useChat() {
             message: text,
             attachment_ids: attachmentIds || [],
             skills,
+            ...(model ? { model } : {}),
+            ...(effortSel ? { reasoning_effort: effortSel } : {}),
           }),
           credentials: 'include',
           signal: abortRef.current.signal,

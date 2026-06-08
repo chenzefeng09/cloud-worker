@@ -12,6 +12,7 @@ import { RewindConfirmModal } from './RewindConfirmModal';
 import { api } from '../api/client';
 import type { Attachment, MessageAttachment } from '../api/types';
 import { groupSteps } from '../lib/groupSteps';
+import { DEFAULT_MODEL, DEFAULT_EFFORT } from '../lib/modelOptions';
 import {
   SHOW_DESIGN_FIXTURES,
   AGENT_TRANSCRIPT_FIXTURE,
@@ -299,6 +300,12 @@ export function ChatWindow({
   const toggleSkill = useChatStore((s) => s.toggleSkill);
   const seedSkills = useChatStore((s) => s.seedSkills);
 
+  // Per-session model + reasoning effort, surfaced in the InputBar toolbar.
+  const selectedModel = useChatStore((s) => s.selectedModel[sessionId]);
+  const selectedEffort = useChatStore((s) => s.selectedEffort[sessionId]);
+  const setSessionModel = useChatStore((s) => s.setSessionModel);
+  const setSessionEffort = useChatStore((s) => s.setSessionEffort);
+
   // Live plan steps for this session — rendered at the bottom of the transcript.
   const planSteps = useChatStore((s) => s.planSteps[sessionId]);
 
@@ -474,6 +481,10 @@ export function ChatWindow({
         skills={skills}
         selectedSkills={selectedSkills}
         onToggleSkill={(name) => toggleSkill(sessionId, name)}
+        model={selectedModel ?? DEFAULT_MODEL}
+        effort={selectedEffort ?? DEFAULT_EFFORT}
+        onModelChange={(m) => setSessionModel(sessionId, m)}
+        onEffortChange={(e) => setSessionEffort(sessionId, e)}
       />
       {pendingRewind && (
         <RewindConfirmModal

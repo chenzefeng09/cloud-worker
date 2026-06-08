@@ -49,7 +49,10 @@ export function groupSteps(messages: Message[], isStreaming: boolean): RenderUni
 
     const isStep =
       key != null &&
-      (role === 'TOOL' || message.blockKind === 'tool' || message.blockKind === 'thinking');
+      (role === 'TOOL' ||
+        role === 'THINKING' ||
+        message.blockKind === 'tool' ||
+        message.blockKind === 'thinking');
 
     if (isStep) {
       // key is narrowed to string here (key != null)

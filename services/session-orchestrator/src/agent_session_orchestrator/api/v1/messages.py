@@ -263,7 +263,12 @@ async def _read_ordered_blocks_from_redis(
                 text_parts.append(str(entry.get("text") or ""))
                 continue
             if entry_type == "thinking":
-                flush_text()
+                # Do NOT flush_text() here. Thinking is interleaved reasoning
+                # that does not break the surrounding assistant text — and it is
+                # not persisted as a message row below. Flushing on thinking
+                # split one continuous reply (e.g. "你好" + "！我是…") into two
+                # adjacent assistant rows with nothing between them. Only a tool
+                # call must flush, because its block is ordered between text.
                 text = str(entry.get("text") or "")
                 if text:
                     blocks.append({"kind": "thinking", "text": text})
@@ -445,7 +450,7 @@ async def _reconcile_run_completion(
     if redis_url:
         existing_messages, _ = await svc.list_messages(run.session_id, limit=200)
         already_persisted_for_run = any(
-            m.run_id == run.id and (m.role or "").lower() in {"assistant", "tool"}
+            m.run_id == run.id and (m.role or "").lower() in {"assistant", "tool", "thinking"}
             for m in existing_messages
         )
         if not already_persisted_for_run:
@@ -454,7 +459,24 @@ async def _reconcile_run_completion(
                 run_id=run.id,
             )
             for block in blocks:
-                if block.get("kind") == "text":
+                if block.get("kind") == "thinking":
+                    # Persist reasoning as a dedicated role='thinking' row so the
+                    # UI can show a collapsible "已思考" section after the run
+                    # (DeepSeek/Claude-style). It is ordered before the assistant
+                    # text in `blocks`, so the thinking row gets a lower sequence
+                    # and renders above the answer. role is a free String(10)
+                    # column (no enum/CHECK), so 'thinking' is accepted.
+                    text = str(block.get("text") or "")
+                    if text:
+                        await svc.create_message(
+                            session_id=run.session_id,
+                            role="thinking",
+                            content=text,
+                            tool_calls=None,
+                            run_id=run.id,
+                        )
+                        persisted_from_stream = True
+                elif block.get("kind") == "text":
                     text = str(block.get("text") or "")
                     if text:
                         await svc.create_message(
