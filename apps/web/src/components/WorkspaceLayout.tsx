@@ -7,6 +7,9 @@ import { Sidebar } from './shell/Sidebar';
 import { HomePage } from '../pages/HomePage';
 import { TasksPage } from '../pages/TasksPage';
 import { AgentPage } from '../pages/AgentPage';
+import { AppRunPage } from '../pages/AppRunPage';
+import { AppResultPage } from '../pages/AppResultPage';
+import { AppEditorPage } from '../pages/AppEditorPage';
 import { FilesPage } from '../pages/FilesPage';
 import { LibraryPage } from '../pages/LibraryPage';
 import { FleetPage } from '../pages/FleetPage';
@@ -57,6 +60,12 @@ export function WorkspaceLayout() {
                     <Route path="/home" element={<HomePage />} />
                     <Route path="/tasks" element={<TasksPage />} />
                     <Route path="/tasks/:id" element={<AgentPage />} />
+                    {/* App routes — static/longer paths first so react-router v6
+                        ranking never lets `/apps/:id` shadow `/apps/new` etc. */}
+                    <Route path="/apps/new" element={<AppEditorPage />} />
+                    <Route path="/apps/runs/:sessionId/:runId" element={<AppResultPage />} />
+                    <Route path="/apps/:id/edit" element={<AppEditorPage />} />
+                    <Route path="/apps/:id" element={<AppRunPage />} />
                     <Route path="/files" element={<FilesPage />} />
                     <Route path="/library" element={<LibraryPage />} />
                     <Route path="/fleet" element={<FleetPage />} />

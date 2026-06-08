@@ -39,6 +39,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
 from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, TUserId
+# Reuse the chat path's run-completion reconciler verbatim (poll scheduler,
+# map container status, persist result_summary/status/finished_at/tokens, write
+# the assistant message, failure-open).  It is module-private in messages.py but
+# both modules live in the same ``api.v1`` package, so importing the
+# ``_``-prefixed helper here is the least-invasive way to share it without
+# duplicating any of its logic.
+from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
 from agent_session_orchestrator.domain.models import Run
 from agent_session_orchestrator.services.session_service import SessionService
 
@@ -162,7 +169,17 @@ async def create_run(
     session = await svc.get_session(session_id)
 
     task = body.get("task", "")
-    run = await svc.create_run(session_id, task)
+
+    # App-harness fields (optional; only App runs send these — chat runs omit
+    # them and keep working unchanged).  ``sys_prompt`` is appended to the
+    # system prompt by the worker; ``sampling_params`` is applied per-run by
+    # the gateway model builder; ``app_snapshot`` is persisted on the run row.
+    sys_prompt = body.get("sys_prompt")
+    sampling_params = body.get("sampling_params") or {}
+    app_snapshot = body.get("app_snapshot")
+
+    # Persist the snapshot atomically with the run row (same transaction).
+    run = await svc.create_run(session_id, task, app_snapshot=app_snapshot)
 
     # Relay to agent-scheduler.
     scheduler_url = await _get_scheduler_url(request)
@@ -205,6 +222,12 @@ async def create_run(
                     "skills": body.get("skills") or [],
                     # Prior-turn conversation history for multi-turn memory.
                     "history": history,
+                    # App-harness fields (empty/absent for chat runs).  The
+                    # scheduler writes these into task.json for the worker:
+                    # ``sys_prompt`` is appended to the system prompt;
+                    # ``sampling_params`` is applied per-run by the gateway model.
+                    "sys_prompt": sys_prompt,
+                    "sampling_params": sampling_params,
                 },
                 headers=headers,
             )
@@ -277,6 +300,7 @@ async def list_runs(
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
                 "total_tokens": r.total_tokens,
+                "app_snapshot": r.app_snapshot,
             }
             for r in runs
         ]
@@ -288,11 +312,50 @@ async def list_runs(
 async def get_run(
     session_id: str,
     run_id: str,
+    request: Request,
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
 ) -> dict[str, Any]:
     svc = SessionService(db, tenant_id=tenant_id)
     run = await svc.get_run(session_id, run_id)
+
+    # Opportunistically reconcile a still-running run before returning.
+    #
+    # App runs are triggered via POST /sessions/{id}/runs directly (not the
+    # chat path), and the App result page polls THIS endpoint for terminal
+    # status + result_summary.  It never calls list_messages or opens the chat
+    # SSE stream — the only two places that used to invoke reconciliation.  So
+    # without this, the sandbox container exits but the run row stays RUNNING
+    # forever and the page polls indefinitely.  We reuse the exact same helper
+    # (and the same failure-open + flush discipline) as list_messages so the
+    # chat path behaviour is unchanged.
+    if run.status in ("RUNNING", "PENDING"):
+        try:
+            scheduler_url = request.app.state.settings.agent_scheduler_url
+            knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
+            redis_url = request.app.state.settings.redis_url
+            # The scheduler's authz guard rejects the "SYSTEM" sentinel, so use
+            # the session's originating user for the poll header (as list_messages does).
+            session_obj = await svc.get_session(session_id)
+            await _reconcile_run_completion(
+                scheduler_url=scheduler_url,
+                tenant_id=tenant_id,
+                user_id=session_obj.user_id,
+                run=run,
+                svc=svc,
+                knowledge_ingest_url=knowledge_ingest_url,
+                redis_url=redis_url,
+            )
+            # Flush (not commit) so the reconciled status/result_summary/tokens
+            # land in this transaction; the db_session dependency commits on
+            # return.  ``run`` is the same ORM instance the helper mutated, so
+            # the response below already reflects the new values.
+            await db.flush()
+        except Exception as exc:  # best-effort — never block the run read
+            logger.warning(
+                "reconcile in get_run failed", extra={"run_id": run_id, "err": str(exc)}
+            )
+
     return {
         "id": run.id,
         "session_id": run.session_id,
@@ -307,6 +370,7 @@ async def get_run(
         "input_tokens": run.input_tokens,
         "output_tokens": run.output_tokens,
         "total_tokens": run.total_tokens,
+        "app_snapshot": run.app_snapshot,
     }
 
 

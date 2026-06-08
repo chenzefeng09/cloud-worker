@@ -119,6 +119,8 @@ class DockerRuntime:
         llm_virtual_key: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
+        sys_prompt: str | None = None,
+        sampling_params: dict[str, Any] | None = None,
     ) -> str:
         """Spawn a sandbox container for one agent run.
 
@@ -174,6 +176,8 @@ class DockerRuntime:
             history=history or [],
             model_override=model_override,
             reasoning_effort=reasoning_effort,
+            sys_prompt=sys_prompt,
+            sampling_params=sampling_params,
         )
 
         # When the ``llm_gateway_enforcer`` extension is active, the sandbox
@@ -560,6 +564,8 @@ class DockerRuntime:
         history: list[dict[str, Any]] | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
+        sys_prompt: str | None = None,
+        sampling_params: dict[str, Any] | None = None,
     ) -> Path:
         """Write the task payload ``runtime_worker`` will read.
 
@@ -574,6 +580,11 @@ class DockerRuntime:
               "history": [...]     # prior-turn conversation the worker restores
                                    # into AgentState.context for multi-turn memory;
                                    # items: {"role","type",...} incl. tool calls
+              "sys_prompt": str    # App-harness system prompt the worker appends
+                                   # to identity/soul/user prompts (empty for chat)
+              "sampling_params": {} # App-harness per-run LLM sampling overrides
+                                   # (e.g. temperature/top_p/max_tokens); empty for
+                                   # chat runs; applied by the gateway model builder
             }
 
         ``mcp_servers`` stays empty because the in-sandbox ``mcp_tenant_injector``
@@ -608,6 +619,11 @@ class DockerRuntime:
             # The gateway model builder reads these; both may be None (defaults).
             "model_override": model_override,
             "reasoning_effort": reasoning_effort,
+            # App-harness fields (empty for ordinary chat runs).  The worker
+            # appends ``sys_prompt`` to the system prompt and applies
+            # ``sampling_params`` per-run in the gateway model builder.
+            "sys_prompt": sys_prompt or "",
+            "sampling_params": sampling_params or {},
         }
         task_path = workspace_dir / "task.json"
         task_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

@@ -10,6 +10,7 @@ import { StatusDot, sessionToDesignStatus } from '../components/shell/StatusDot'
 import { Chip } from '../components/shell/Chip';
 import { Dropdown } from '../components/shell/Dropdown';
 import { useChatStore } from '../stores/chatStore';
+import { useApps } from '../hooks/useApps';
 import {
   MODEL_OPTIONS,
   EFFORT_OPTIONS,
@@ -26,18 +27,13 @@ const PLACEHOLDERS = [
 
 const SUGGESTIONS = ['帮我规划明天', '概括这份 PDF', '回复供应商邮件', 'Q3 发布命名头脑风暴'];
 
-const TEMPLATES = [
-  { id: 'code-refactor', name: '代码重构', desc: '指定仓库，描述变更。工作节点会读取、规划并逐步修改。', glyph: '⌥', kind: 'code' },
-  { id: 'research', name: '研究简报', desc: '收集来源、评估并撰写一份结构化的单页报告。', glyph: '◐', kind: 'research' },
-  { id: 'deck', name: '演示构建', desc: '把笔记或文档转换成可用于幻灯片的提纲。', glyph: '▤', kind: 'deck' },
-  { id: 'inbox', name: '收件箱处理', desc: '整理消息、草拟回复，其余的升级处理。', glyph: '✉', kind: 'ops' },
-  { id: 'data', name: '数据整理', desc: 'CSV 输入，整洁的表格 + 摘要输出。', glyph: '⌗', kind: 'data' },
-  { id: 'blank', name: '空白任务', desc: '从零开始 — 用日常语言描述目标。', glyph: '+', kind: '—' },
-];
+/** Default glyph for an App card when the App has no icon set. */
+const DEFAULT_APP_GLYPH = '▤';
 
 export function HomePage() {
   const { ws } = useWorkspace();
   const { sessions, createSession } = useSessions();
+  const { apps, loading: appsLoading } = useApps('published');
   const navigate = useNavigate();
   const [draft, setDraft] = useState('');
   const [phIdx, setPhIdx] = useState(0);
@@ -50,6 +46,7 @@ export function HomePage() {
   const setSessionModel = useChatStore((s) => s.setSessionModel);
   const setSessionEffort = useChatStore((s) => s.setSessionEffort);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   // Attachments require a session_id (NOT NULL FK), so the session must exist
   // before we can upload.  We create it lazily on the first file pick and
   // reuse it on send so the session isn't created twice.
@@ -87,7 +84,6 @@ export function HomePage() {
       }
     } catch (err) {
       setSubmitError('附件上传失败，请稍后重试。');
-      // eslint-disable-next-line no-console
       console.warn('attachment upload failed', err);
     } finally {
       setUploading(false);
@@ -131,6 +127,22 @@ export function HomePage() {
     } finally {
       setSubmitting(false);
     }
+  };
+
+  // "空白任务" (free chat) — scroll to and focus the composer so the user can
+  // type a goal and send via the existing startChat flow. We deliberately keep
+  // the composer/startChat path intact for free chat (option a).
+  const focusComposer = () => {
+    composerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    composerRef.current?.focus();
+  };
+
+  const openSession = (s: Session) => {
+    if (s.metadata?.kind === 'app_run' && s.current_run_id) {
+      navigate(`/apps/runs/${s.id}/${s.current_run_id}`);
+      return;
+    }
+    navigate(`/tasks/${s.id}`);
   };
 
   const dateLabel = new Date().toLocaleDateString('zh-CN', {
@@ -182,6 +194,7 @@ export function HomePage() {
           {/* composer */}
           <div className="w-[min(720px,95%)] bg-surface border border-line rounded-lg shadow-[0_10px_30px_-10px_rgba(15,17,20,0.08)] overflow-hidden shrink-0">
             <textarea
+              ref={composerRef}
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               placeholder={PLACEHOLDERS[phIdx]}
@@ -280,34 +293,81 @@ export function HomePage() {
           <div className="w-[min(960px,95%)] flex items-center gap-3.5 mt-1">
             <div className="flex-1 h-px bg-line" />
             <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim">
-              或从模板开始
+              或选择一个应用
             </span>
+            <button
+              type="button"
+              onClick={() => navigate('/apps/new')}
+              className="cw-btn cw-btn-ghost cw-btn-sm"
+              title="从零创建一个应用"
+            >
+              <span className="font-mono">+</span> 创建应用
+            </button>
             <div className="flex-1 h-px bg-line" />
           </div>
 
-          {/* templates */}
+          {/* apps + blank-task card */}
           <div className="w-[min(960px,95%)] grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-            {TEMPLATES.map((t) => (
+            {/* 空白任务 — free chat: focuses the composer */}
+            <div
+              onClick={focusComposer}
+              className="border border-line bg-surface rounded-md p-3.5 cursor-pointer flex flex-col gap-1.5 min-h-[120px] transition-all hover:border-ink-2 hover:-translate-y-px"
+            >
+              <div className="flex items-center gap-2.5 mb-0.5">
+                <div className="w-7 h-7 border border-line rounded-sm flex items-center justify-center font-mono text-[13px] text-ink bg-paper">
+                  +
+                </div>
+                <div className="text-[14px] font-semibold tracking-[-0.01em]">空白任务</div>
+                <div className="flex-1" />
+                <span className="font-mono text-[10.5px] text-dim">→</span>
+              </div>
+              <div className="text-[12px] text-dim leading-[1.45]">
+                从零开始 — 用日常语言描述目标。
+              </div>
+              <div className="flex-1" />
+              <div className="flex gap-1 flex-wrap">
+                <Chip>自由会话</Chip>
+              </div>
+            </div>
+
+            {/* real published apps */}
+            {apps.map((app) => (
               <div
-                key={t.id}
-                onClick={() => navigate('/tasks')}
+                key={app.id}
+                onClick={() => navigate(`/apps/${app.id}`)}
                 className="border border-line bg-surface rounded-md p-3.5 cursor-pointer flex flex-col gap-1.5 min-h-[120px] transition-all hover:border-ink-2 hover:-translate-y-px"
               >
                 <div className="flex items-center gap-2.5 mb-0.5">
                   <div className="w-7 h-7 border border-line rounded-sm flex items-center justify-center font-mono text-[13px] text-ink bg-paper">
-                    {t.glyph}
+                    {app.icon || DEFAULT_APP_GLYPH}
                   </div>
-                  <div className="text-[14px] font-semibold tracking-[-0.01em]">{t.name}</div>
+                  <div className="text-[14px] font-semibold tracking-[-0.01em]">{app.name}</div>
                   <div className="flex-1" />
                   <span className="font-mono text-[10.5px] text-dim">→</span>
                 </div>
-                <div className="text-[12px] text-dim leading-[1.45]">{t.desc}</div>
+                <div className="text-[12px] text-dim leading-[1.45]">
+                  {app.description || '运行此应用'}
+                </div>
                 <div className="flex-1" />
                 <div className="flex gap-1 flex-wrap">
-                  <Chip>{t.kind}</Chip>
+                  <Chip>应用</Chip>
                 </div>
               </div>
             ))}
+
+            {/* empty state — no published apps yet */}
+            {!appsLoading && apps.length === 0 && (
+              <div className="border border-line border-dashed bg-surface rounded-md p-3.5 flex flex-col gap-2 items-start justify-center min-h-[120px]">
+                <div className="font-mono italic text-dim text-[12px]">暂无应用</div>
+                <button
+                  type="button"
+                  onClick={() => navigate('/apps/new')}
+                  className="cw-btn cw-btn-ghost cw-btn-sm"
+                >
+                  <span className="font-mono">+</span> 创建应用
+                </button>
+              </div>
+            )}
           </div>
         </div>
 
@@ -328,7 +388,7 @@ export function HomePage() {
             {sessions.slice(0, 4).map((s) => (
               <div
                 key={s.id}
-                onClick={() => navigate(`/tasks/${s.id}`)}
+                onClick={() => openSession(s)}
                 className="border border-line rounded-md p-3 bg-surface cursor-pointer flex flex-col gap-2 hover:border-ink-2 hover:-translate-y-px transition-all"
               >
                 <div className="flex items-center gap-2">

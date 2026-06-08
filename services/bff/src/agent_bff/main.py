@@ -94,6 +94,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from agent_bff.api.v1.library import router as library_router
     app.include_router(library_router, prefix=settings.api_prefix)
 
+    from agent_bff.api.v1.apps import router as apps_router
+    app.include_router(apps_router, prefix=settings.api_prefix)
+
     from agent_bff.api.v1.fleet import router as fleet_router
     app.include_router(fleet_router, prefix=settings.api_prefix)
 

@@ -213,13 +213,20 @@ class SessionService:
         result = await self._db.execute(stmt)
         return list(result.scalars().all())
 
-    async def create_run(self, session_id: str, task: str) -> Run:
+    async def create_run(
+        self,
+        session_id: str,
+        task: str,
+        *,
+        app_snapshot: dict | None = None,
+    ) -> Run:
         await self.get_session(session_id)
         run = Run(
             tenant_id=self._tenant_id,
             session_id=session_id,
             task_description=task,
             status="PENDING",
+            app_snapshot=app_snapshot,
         )
         self._db.add(run)
         await self._db.flush()

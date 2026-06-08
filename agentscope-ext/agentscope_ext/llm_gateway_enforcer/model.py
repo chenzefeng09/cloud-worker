@@ -105,6 +105,7 @@ def _build_openai_gateway_model(
     formatter: Any,
     tenant_id: str = "",
     reasoning_effort: str | None = None,
+    sampling_params: Mapping[str, Any] | None = None,
 ) -> Any:
     """Return a ``_GatewayOpenAIChatModel`` that talks to the foundation gateway.
 
@@ -182,12 +183,20 @@ def _build_openai_gateway_model(
                 "stream": self.stream,
             }
 
-            if self.parameters.max_tokens is not None:
-                kwargs["max_tokens"] = self.parameters.max_tokens
-            if self.parameters.temperature is not None:
-                kwargs["temperature"] = self.parameters.temperature
-            if self.parameters.top_p is not None:
-                kwargs["top_p"] = self.parameters.top_p
+            # Per-run sampling overrides (App harness, task.json["sampling_params"])
+            # take precedence over the model's own ``self.parameters.*`` defaults.
+            # Each kwarg is set only when the resolved value is not None, so chat
+            # runs (empty ``sampling``) preserve the prior behaviour exactly.
+            _sampling = sampling_params or {}
+            max_tokens = _sampling.get("max_tokens", self.parameters.max_tokens)
+            temperature = _sampling.get("temperature", self.parameters.temperature)
+            top_p = _sampling.get("top_p", self.parameters.top_p)
+            if max_tokens is not None:
+                kwargs["max_tokens"] = max_tokens
+            if temperature is not None:
+                kwargs["temperature"] = temperature
+            if top_p is not None:
+                kwargs["top_p"] = top_p
             # Per-message reasoning effort (DeepSeek/V4): the gateway upstream
             # requires BOTH the ``reasoning_effort`` field AND the ``extra_body``
             # thinking flag to enter thinking mode. When effort is absent we send
@@ -276,6 +285,12 @@ def make_gateway_model(*, task: dict, env: Mapping[str, str]) -> Any:
     # gateway thinking flags. Both may be absent (defaults / non-thinking).
     model_override = (task or {}).get("model_override")
     reasoning_effort = (task or {}).get("reasoning_effort") or None
+    # App-harness per-run sampling overrides (temperature/top_p/max_tokens).
+    # Absent/empty for chat runs, in which case the model defaults apply.
+    sampling_params_raw = (task or {}).get("sampling_params")
+    sampling_params = (
+        sampling_params_raw if isinstance(sampling_params_raw, dict) else {}
+    )
 
     gateway_url = env.get("LLM_GATEWAY_URL", "").rstrip("/")
     if not gateway_url:
@@ -317,6 +332,7 @@ def make_gateway_model(*, task: dict, env: Mapping[str, str]) -> Any:
         formatter=formatter,
         tenant_id=tenant_id,
         reasoning_effort=reasoning_effort,
+        sampling_params=sampling_params,
     )
 
 

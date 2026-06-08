@@ -27,6 +27,14 @@ export function TasksPage() {
     if (s) navigate(`/tasks/${s.id}`);
   };
 
+  const openSession = (s: Session) => {
+    if (s.metadata?.kind === 'app_run' && s.current_run_id) {
+      navigate(`/apps/runs/${s.id}/${s.current_run_id}`);
+      return;
+    }
+    navigate(`/tasks/${s.id}`);
+  };
+
   const groups = STATUS_ORDER.map((status) => ({
     status,
     items: sessions.filter((s) => s.status === status),
@@ -72,7 +80,7 @@ export function TasksPage() {
                   return (
                     <div
                       key={s.id}
-                      onClick={() => navigate(`/tasks/${s.id}`)}
+                      onClick={() => openSession(s)}
                       className="border border-line bg-surface rounded-md cursor-pointer hover:border-ink-2"
                       style={{
                         display: 'flex',
@@ -104,7 +112,7 @@ export function TasksPage() {
 
                       {/* Row 2: session meta (replaces design's free-text summary) */}
                       <div className="text-dim" style={{ fontSize: 12 }}>
-                        会话 {s.id.slice(0, 12)}
+                        {s.metadata?.kind === 'app_run' ? '应用任务' : '会话'} {s.id.slice(0, 12)}
                       </div>
 
                       {/* Row 3: progress bar (static placeholder) */}

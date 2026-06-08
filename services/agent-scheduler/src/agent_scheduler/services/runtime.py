@@ -80,8 +80,13 @@ class SandboxRuntime(Protocol):
         skills: list[str] | None = None,
         files: list[dict] | None = None,
         memory: str | None = None,
+        history: list[dict[str, Any]] | None = None,
         llm_gateway_url: str | None = None,
         llm_virtual_key: str | None = None,
+        model_override: str | None = None,
+        reasoning_effort: str | None = None,
+        sys_prompt: str | None = None,
+        sampling_params: dict[str, Any] | None = None,
     ) -> str:
         """Spawn a sandbox for one agent run; return the runtime-specific id.
 

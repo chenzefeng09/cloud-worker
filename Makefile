@@ -11,7 +11,8 @@ FOUNDATION_DIR := /Users/chenzefeng/Development/saas-foundation
 COMPOSE_FOUNDATION := docker compose -f $(FOUNDATION_DIR)/deploy/docker-compose/dev.yml --env-file $(FOUNDATION_DIR)/deploy/docker-compose/.env
 COMPOSE_AGENT := docker compose -f deploy/docker-compose/agent-platform.yml --env-file $(FOUNDATION_DIR)/deploy/docker-compose/.env --env-file deploy/docker-compose/.env
 
-SERVICES := bff session-orchestrator agent-scheduler sandbox-pool skill-store knowledge-ingest mcp-registry
+SERVICES := $(shell find services -mindepth 2 -maxdepth 2 -name pyproject.toml -print | sed -e 's|^services/||' -e 's|/pyproject.toml$$||' | sort)
+SDK_SERVICES := $(filter-out web-fetch-gateway,$(SERVICES))
 
 BOLD := \033[1m
 GREEN := \033[32m
@@ -80,7 +81,7 @@ install-sdk: ## Install foundation_sdk[fastapi] editable into each service venv
 	  echo "$(RED)foundation SDK not found at $(FOUNDATION_DIR)/sdks/python$(RESET)"; \
 	  exit 1; \
 	fi
-	@for svc in $(SERVICES); do \
+	@for svc in $(SDK_SERVICES); do \
 	  echo "$(BOLD)→ install SDK into $$svc venv$(RESET)"; \
 	  cd services/$$svc && \
 	    poetry run pip install -e "$(FOUNDATION_DIR)/sdks/python[fastapi]" && \

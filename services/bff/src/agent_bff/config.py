@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     mcp_registry_url: str = "http://localhost:8010/api/mcp/v1"
     skill_store_url: str = "http://localhost:8011/api/skills/v1"
     knowledge_ingest_url: str = "http://localhost:8012/api/knowledge/v1"
+    # App registry — App/AppVersion CRUD, versions, review, internal resolve.
+    app_registry_url: str = "http://app-registry:8013/api/apps/v1"
 
     # Fleet services
     sandbox_pool_url: str = "http://localhost:8008/api/sandbox-pool/v1"

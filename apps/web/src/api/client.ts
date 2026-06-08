@@ -3,6 +3,13 @@ import type {
   AdminUser,
   ApiKey,
   ApiKeyCreated,
+  App,
+  AppCreate,
+  AppReviewItem,
+  AppRunResult,
+  AppUpdate,
+  AppVersion,
+  AppVersionCreate,
   AuditEvent,
   AuditQueryRequest,
   Attachment,
@@ -94,8 +101,8 @@ export const api = {
   sessions: {
     list: (cursor?: string) =>
       request<CursorPage<Session>>('GET', `/sessions?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`),
-    create: (title?: string) =>
-      request<Session>('POST', '/sessions', { title }),
+    create: (title?: string, agentConfig?: Record<string, unknown>) =>
+      request<Session>('POST', '/sessions', { title, agent_config: agentConfig }),
     get: (id: string) =>
       request<Session>('GET', `/sessions/${id}`),
     update: (id: string, data: { title?: string; status?: string }) =>
@@ -218,6 +225,43 @@ export const api = {
 
     ingestDocument: (docId: string) =>
       request<IngestResult>('POST', `/library/documents/${docId}/ingest`),
+  },
+
+  apps: {
+    list: (scope?: 'mine' | 'published') => {
+      const qs = scope ? `?scope=${encodeURIComponent(scope)}` : '';
+      return request<ListPage<App>>('GET', `/apps${qs}`);
+    },
+    get: (id: string) =>
+      request<App>('GET', `/apps/${id}`),
+    create: (body: AppCreate) =>
+      request<App>('POST', '/apps', body),
+    update: (id: string, body: AppUpdate) =>
+      request<App>('PUT', `/apps/${id}`, body),
+    remove: (id: string) =>
+      request<void>('DELETE', `/apps/${id}`),
+    createVersion: (id: string, body: AppVersionCreate) =>
+      request<AppVersion>('POST', `/apps/${id}/versions`, body),
+    updateVersion: (id: string, vid: string, body: AppVersionCreate) =>
+      request<AppVersion>('PUT', `/apps/${id}/versions/${vid}`, body),
+    submit: (id: string, vid: string) =>
+      request<AppVersion>('POST', `/apps/${id}/versions/${vid}/submit`),
+    publish: (id: string, vid: string) =>
+      request<AppVersion>('POST', `/apps/${id}/versions/${vid}/publish`),
+    reviewPending: () =>
+      request<ListPage<AppReviewItem>>('GET', '/apps/review/pending'),
+    approve: (vid: string, note?: string) =>
+      request<AppVersion>('POST', `/apps/review/${vid}/approve`, { note }),
+    reject: (vid: string, note: string) =>
+      request<AppVersion>('POST', `/apps/review/${vid}/reject`, { note }),
+    run: (
+      id: string,
+      body: {
+        inputs: Record<string, unknown>;
+        file_inputs: Record<string, string[]>;
+        session_id?: string;
+      },
+    ) => request<AppRunResult>('POST', `/apps/${id}/run`, body),
   },
 
   billing: {

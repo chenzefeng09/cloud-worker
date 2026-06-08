@@ -57,8 +57,9 @@ services:
   # 等待迁移完成后再启动(镜像因 build cache 复用,只构建一次)。
   #
   # 说明:mcp-registry / skill-store / knowledge-ingest 的迁移建表落在 public
-  # schema(模型未声明 schema);session-orchestrator 落在 session_orchestrator
-  # schema(env.py 设置 version_table_schema + 0001_init 里 CREATE SCHEMA)。
+  # schema(模型未声明 schema);session-orchestrator 与 app-registry 落在各自
+  # 的 session_orchestrator / app_registry schema(env.py 设置
+  # version_table_schema + 0001_init 里 CREATE SCHEMA)。
   # 这里只复用各服务自己的 alembic env.py,schema 行为由迁移自身保证。
   # ===========================================================================
   # pgvector-init — 以 postgres 超级用户启用 pgvector 扩展(一次性,幂等)
@@ -156,6 +157,21 @@ services:
     working_dir: /app
     environment:
       SKILL_STORE_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+    entrypoint: ["alembic", "upgrade", "head"]
+    networks: [foundation]
+
+  # app-registry migrate sidecar — creates the app_registry schema + apps /
+  # app_versions tables + RLS (alembic env.py owns CREATE SCHEMA + search_path).
+  app-registry-migrate:
+    build:
+      context: ../../services/app-registry
+      dockerfile: Dockerfile
+    image: agent-platform-dev-app-registry
+    container_name: agent-app-registry-migrate
+    restart: "no"
+    working_dir: /app
+    environment:
+      APP_REGISTRY_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
     entrypoint: ["alembic", "upgrade", "head"]
     networks: [foundation]
 
@@ -499,6 +515,7 @@ services:
       BFF_MCP_REGISTRY_URL: http://mcp-registry:8010/api/mcp/v1
       BFF_SKILL_STORE_URL: http://skill-store:8011/api/skills/v1
       BFF_KNOWLEDGE_INGEST_URL: http://knowledge-ingest:8012/api/knowledge/v1
+      BFF_APP_REGISTRY_URL: http://app-registry:8013/api/apps/v1
       BFF_SANDBOX_POOL_URL: http://sandbox-pool:8008/api/sandbox-pool/v1
       BFF_AGENT_SCHEDULER_URL: http://agent-scheduler:8007/api/scheduler/v1
       # MUST be supplied via env in any deployment beyond local dev.
@@ -525,6 +542,8 @@ services:
       bff-migrate:
         condition: service_completed_successfully
       session-orchestrator:
+        condition: service_healthy
+      app-registry:
         condition: service_healthy
 
   # ===========================================================================
@@ -625,6 +644,39 @@ services:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8011/api/skills/v1/healthz').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ===========================================================================
+  # App Registry — templatized agent tasks (Apps): versioned harness + review
+  # ===========================================================================
+  app-registry:
+    build:
+      context: ../../services/app-registry
+      dockerfile: Dockerfile
+    container_name: agent-app-registry
+    restart: unless-stopped
+    environment:
+      APP_REGISTRY_ENV: dev
+      APP_REGISTRY_LOG_LEVEL: DEBUG
+      APP_REGISTRY_HTTP_PORT: "8013"
+      APP_REGISTRY_DB_DSN: postgresql+asyncpg://app_user:${APP_USER_PASSWORD:-app_user_change_me}@postgres:5432/foundation
+      APP_REGISTRY_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+      APP_REGISTRY_DB_POOL_SIZE: "5"
+      APP_REGISTRY_DB_MAX_OVERFLOW: "10"
+      APP_REGISTRY_DB_POOL_RECYCLE: "1800"
+      APP_REGISTRY_AUTHZ_URL: http://authz:8002/api/authz/v1
+    ports:
+      # Host 8014 (container 8013): host 8013 is already taken by
+      # foundation-audit in the shared foundation stack.
+      - "${PORT_APP_REGISTRY:-8014}:8013"
+    networks: [foundation]
+    depends_on:
+      app-registry-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8013/api/apps/v1/healthz').read()\""]
       interval: 10s
       timeout: 5s
       retries: 10

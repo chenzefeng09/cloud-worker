@@ -344,6 +344,16 @@ async def create_run(
         else []
     )
 
+    # Optional App-harness fields (forwarded from the orchestrator's
+    # create_run; absent/empty for ordinary chat runs).  ``sys_prompt`` is
+    # appended to the system prompt by the worker; ``sampling_params`` is
+    # applied per-run by the gateway model builder.
+    sys_prompt: str | None = body.get("sys_prompt") or None
+    sampling_params_raw = body.get("sampling_params")
+    sampling_params: dict[str, Any] = (
+        sampling_params_raw if isinstance(sampling_params_raw, dict) else {}
+    )
+
     # Optional per-message LLM selection (model + reasoning effort), nested in
     # agent_config by the orchestrator. Falls back to top-level for direct callers.
     agent_config: dict[str, Any] = body.get("agent_config") or {}
@@ -409,6 +419,8 @@ async def create_run(
             llm_virtual_key=virtual_key,
             model_override=model_override,
             reasoning_effort=reasoning_effort,
+            sys_prompt=sys_prompt,
+            sampling_params=sampling_params,
         )
     except SandboxSpawnError as exc:
         raise HTTPException(

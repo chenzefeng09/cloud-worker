@@ -152,10 +152,13 @@ class CubeSandboxRuntime:
         skills: list[str] | None = None,
         files: list[dict] | None = None,
         memory: str | None = None,
+        history: list[dict[str, Any]] | None = None,
         llm_gateway_url: str | None = None,
         llm_virtual_key: str | None = None,
         model_override: str | None = None,
         reasoning_effort: str | None = None,
+        sys_prompt: str | None = None,
+        sampling_params: dict[str, Any] | None = None,
     ) -> str:
         _check_ids(
             run_id=run_id, session_id=session_id,
@@ -195,9 +198,13 @@ class CubeSandboxRuntime:
             "skills": skills or [],
             "files": files or [],
             "memory": memory or "",
+            "history": list(history) if history else [],
             # Per-message LLM selection (model routing key + reasoning effort).
             "model_override": model_override,
             "reasoning_effort": reasoning_effort,
+            # App-harness fields (empty for ordinary chat runs).
+            "sys_prompt": sys_prompt or "",
+            "sampling_params": sampling_params or {},
         }
         env = {
             "LLM_API_KEY": sandbox_llm_api_key,

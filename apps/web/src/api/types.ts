@@ -5,6 +5,7 @@ export interface Session {
   title: string | null;
   status: 'ACTIVE' | 'PAUSED' | 'COMPLETED' | 'ERROR' | 'ARCHIVED';
   current_run_id: string | null;
+  metadata?: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
 }
@@ -156,6 +157,155 @@ export interface KnowledgeDocument {
 export interface ListPage<T> {
   items: T[];
   total: number;
+}
+
+// ─── Apps ─────────────────────────────────────────────────────────────────────
+
+export type AppVisibility = 'private' | 'tenant';
+export type AppVersionStatus = 'draft' | 'pending_review' | 'published' | 'rejected';
+export type InputFieldType = 'text' | 'textarea' | 'select' | 'multiselect' | 'file';
+
+/** Per-run sampling overrides applied at the gateway model layer. */
+export interface SamplingParams {
+  temperature?: number;
+  top_p?: number;
+  max_tokens?: number;
+}
+
+/** A single option for select / multiselect input fields. */
+export interface InputFieldOption {
+  value: string;
+  label: string;
+}
+
+/** Upload constraints for a `file`-type input field. */
+export interface InputFieldFileConstraint {
+  accept: string[];
+  max_size_bytes: number;
+  multiple: boolean;
+}
+
+/** One field in an App's input form (ordered within `input_schema`). */
+export interface InputField {
+  key: string;
+  type: InputFieldType;
+  label: string;
+  help?: string;
+  required: boolean;
+  default?: string | string[] | null;
+  options?: InputFieldOption[];
+  file?: InputFieldFileConstraint;
+}
+
+/** An immutable harness version of an App (frozen at publish time). */
+export interface AppVersion {
+  id: string;
+  app_id: string;
+  tenant_id: string;
+  version: string;
+  status: AppVersionStatus;
+  system_prompt: string;
+  user_prompt_template: string;
+  model: string;
+  reasoning_effort?: string | null;
+  sampling_params: SamplingParams;
+  forced_skills: string[];
+  forced_mcp_server_ids: string[];
+  input_schema: InputField[];
+  submitted_by?: string | null;
+  submitted_at?: string | null;
+  reviewed_by?: string | null;
+  reviewed_at?: string | null;
+  review_note?: string | null;
+  created_by?: string | null;
+  created_at: string;
+}
+
+/** Request body for creating a draft version (or the App's initial draft). */
+export interface AppVersionCreate {
+  /** Deprecated request field; app-registry now assigns monotonically increasing versions. */
+  version?: string | null;
+  system_prompt: string;
+  user_prompt_template: string;
+  model: string;
+  reasoning_effort?: string | null;
+  sampling_params: SamplingParams;
+  forced_skills: string[];
+  forced_mcp_server_ids: string[];
+  input_schema: InputField[];
+}
+
+/** Stable App identity + its versions. */
+export interface App {
+  id: string;
+  tenant_id: string;
+  name: string;
+  description?: string | null;
+  icon?: string | null;
+  author_id: string;
+  visibility: AppVisibility;
+  current_version_id?: string | null;
+  created_at: string;
+  updated_at: string;
+  versions?: AppVersion[];
+}
+
+/** Request body for creating an App + its initial draft version (atomic). */
+export interface AppCreate {
+  name: string;
+  description?: string | null;
+  icon?: string | null;
+  visibility: AppVisibility;
+  version: AppVersionCreate;
+}
+
+/** Partial App-level field edits (does not touch versions). */
+export interface AppUpdate {
+  name?: string;
+  description?: string | null;
+  icon?: string | null;
+  visibility?: AppVisibility;
+}
+
+/** One row in the admin review queue: a pending version + its App context. */
+export interface AppReviewItem {
+  version: AppVersion;
+  app_id: string;
+  app_name: string;
+  author_id: string;
+}
+
+/** One resolved input value recorded in an App run snapshot. */
+export interface AppRunSnapshotInput {
+  key: string;
+  label: string;
+  type: string;
+  value: unknown;
+}
+
+/** Immutable record of the harness + inputs that produced an App run. */
+export interface AppRunSnapshot {
+  app_id: string;
+  app_name: string;
+  app_version: string;
+  app_version_id: string;
+  model: string;
+  reasoning_effort?: string | null;
+  sampling_params: SamplingParams;
+  forced_skills: string[];
+  forced_mcp_server_ids?: string[];
+  system_prompt?: string;
+  user_prompt_template?: string;
+  rendered_task_preview: string;
+  inputs: AppRunSnapshotInput[];
+  snapshot_at: string;
+}
+
+/** Result of triggering an App run. */
+export interface AppRunResult {
+  session_id: string;
+  run_id: string;
+  status: string;
 }
 
 // ─── Attachments ────────────────────────────────────────────────────────────
@@ -311,6 +461,13 @@ export interface Run {
   input_tokens: number | null;
   output_tokens: number | null;
   total_tokens: number | null;
+  /**
+   * Immutable snapshot of the App harness + resolved inputs, present only on
+   * runs triggered via `POST /apps/{id}/run`. The orchestrator returns it in
+   * get_run/list_runs. Used by AppResultPage to render the read-only form +
+   * model/version that produced the output.
+   */
+  app_snapshot?: AppRunSnapshot | null;
 }
 
 // ─── Run State ───────────────────────────────────────────────────────────────
