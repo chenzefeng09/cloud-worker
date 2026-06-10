@@ -23,10 +23,14 @@ class FakeAdminFoundation:
 
     def __init__(self, *, authz_allowed: bool = True) -> None:
         self.calls: list[tuple[str, str]] = []
+        # (method, url, headers) for every forwarded call — lets tests assert
+        # the X-Actor header on llm-gateway proxies.
+        self.requests: list[tuple[str, str, dict]] = []
         self.authz_allowed = authz_allowed
 
     def route(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         self.calls.append((method, url))
+        self.requests.append((method, url, dict(kwargs.get("headers") or {})))
 
         # authz /check
         if "/check" in url:
@@ -277,19 +281,17 @@ class FakeBillingFoundation(FakeAdminFoundation):
     """Extends FakeAdminFoundation to stub the billing service."""
 
     def route(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        # billing /subscriptions/current
+        # billing /subscriptions/current — bare subscription record, no
+        # embedded plan/usage (matches foundation-billing's real response)
         if "/subscriptions/current" in url and method == "GET":
             return httpx.Response(200, json={
+                "id": "sub_01J5TEST0000000000000SUB1",
+                "tenant_id": "tnt_01J5TEST00000000000000TNT1",
                 "plan_id": "plan_pro",
-                "plan": {
-                    "id": "plan_pro",
-                    "name": "Pro",
-                    "tier": "PRO",
-                    "limits": {"sessions": 100, "tokens": 1000000},
-                },
-                "usage": {"sessions": 12, "tokens": 45000},
+                "mode": "SYSTEM",
+                "status": "ACTIVE",
             })
-        # billing /plans — called only when plan.limits is missing
+        # billing /plans — catalogue; quota field is `quotas` upstream
         if "/plans" in url and method == "GET":
             return httpx.Response(200, json={
                 "items": [
@@ -297,9 +299,15 @@ class FakeBillingFoundation(FakeAdminFoundation):
                         "id": "plan_pro",
                         "name": "Pro",
                         "tier": "PRO",
-                        "limits": {"sessions": 100, "tokens": 1000000},
+                        "quotas": {"sessions": 100, "tokens": 1000000},
+                        "price_monthly_usd": 49.0,
                     }
                 ]
+            })
+        # billing /quota/usage — current usage map
+        if "/quota/usage" in url and method == "GET":
+            return httpx.Response(200, json={
+                "usage": {"sessions": 12, "tokens": 45000},
             })
         return super().route(method, url, **kwargs)
 
@@ -374,16 +382,19 @@ def test_billing_quota_merges_plans_when_limits_missing(
     authed_cookie: dict,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When /subscriptions/current returns plan without limits, BFF fetches /plans."""
+    """Subscription carries only plan_id; BFF resolves plan details (and maps
+    upstream `quotas` → frontend `limits`) from the /plans catalogue."""
 
     class FakeBillingNoLimits(FakeAdminFoundation):
         def route(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
             if "/subscriptions/current" in url and method == "GET":
-                # plan without limits — BFF should fall back to /plans
+                # bare subscription — plan details live in /plans
                 return httpx.Response(200, json={
+                    "id": "sub_01J5TEST0000000000000SUB2",
+                    "tenant_id": "tnt_01J5TEST00000000000000TNT1",
                     "plan_id": "plan_free",
-                    "plan": {"id": "plan_free", "name": "Free", "tier": "FREE"},
-                    "usage": {"sessions": 2},
+                    "mode": "SYSTEM",
+                    "status": "ACTIVE",
                 })
             if "/plans" in url and method == "GET":
                 return httpx.Response(200, json={
@@ -392,10 +403,13 @@ def test_billing_quota_merges_plans_when_limits_missing(
                             "id": "plan_free",
                             "name": "Free",
                             "tier": "FREE",
-                            "limits": {"sessions": 5},
+                            "quotas": {"sessions": 5},
+                            "price_monthly_usd": 0.0,
                         },
                     ]
                 })
+            if "/quota/usage" in url and method == "GET":
+                return httpx.Response(200, json={"usage": {"sessions": 2}})
             return super().route(method, url, **kwargs)
 
     fake = FakeBillingNoLimits(authz_allowed=True)
@@ -419,3 +433,193 @@ def test_billing_quota_merges_plans_when_limits_missing(
     body = resp.json()
     # BFF should have merged plan from /plans list
     assert body["plan"]["limits"] == {"sessions": 5}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Audit effective_tenant_id + fallback (Task 2)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_audit_query_echoes_effective_tenant_id(
+    client,
+    authed_cookie: dict,
+    fake_audit_foundation: FakeAuditFoundation,
+) -> None:
+    """Response must surface the tenant actually queried for RLS."""
+    resp = client.post(
+        "/api/bff/v1/admin/audit/events:query",
+        json={"tenant_id": "tnt_TARGET00000000000000000001", "limit": 10},
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["effective_tenant_id"] == "tnt_TARGET00000000000000000001"
+
+
+def test_audit_query_fallback_effective_tenant_id(
+    client,
+    authed_cookie: dict,
+    fake_audit_foundation: FakeAuditFoundation,
+) -> None:
+    """When tenant_id is omitted, fallback tenant is echoed explicitly."""
+    resp = client.post(
+        "/api/bff/v1/admin/audit/events:query",
+        json={"limit": 10},
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    # Falls back to the admin's own tenant (from the stubbed session).
+    assert resp.json()["effective_tenant_id"] == "tnt_01J5TEST00000000000000TNT1"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LLM tenant-defaults — X-Actor header + body validation (Tasks 1 & 5)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class FakeLlmGatewayFoundation(FakeAdminFoundation):
+    """Stubs the llm-gateway /tenant-defaults + /providers routes."""
+
+    def route(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        if "/tenant-defaults" in url and method in ("GET", "PUT"):
+            self.calls.append((method, url))
+            self.requests.append((method, url, dict(kwargs.get("headers") or {})))
+            return httpx.Response(200, json={"ok": True})
+        if "/providers" in url and method in ("POST", "PATCH"):
+            self.calls.append((method, url))
+            self.requests.append((method, url, dict(kwargs.get("headers") or {})))
+            return httpx.Response(201 if method == "POST" else 200, json={"id": "prov_1"})
+        return super().route(method, url, **kwargs)
+
+
+@pytest.fixture
+def fake_llm_gateway(monkeypatch: pytest.MonkeyPatch) -> FakeLlmGatewayFoundation:
+    fake = FakeLlmGatewayFoundation(authz_allowed=True)
+
+    class _AC:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return None
+        async def get(self, url, **kw): return fake.route("GET", url, **kw)
+        async def post(self, url, **kw): return fake.route("POST", url, **kw)
+        async def put(self, url, **kw): return fake.route("PUT", url, **kw)
+        async def patch(self, url, **kw): return fake.route("PATCH", url, **kw)
+        async def delete(self, url, **kw): return fake.route("DELETE", url, **kw)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AC)
+    return fake
+
+
+def test_tenant_defaults_put_sends_x_actor_admin(
+    client,
+    authed_cookie: dict,
+    fake_llm_gateway: FakeLlmGatewayFoundation,
+) -> None:
+    """PUT /tenant-defaults must forward X-Actor: ADMIN to the gateway."""
+    resp = client.put(
+        "/api/bff/v1/admin/llm/tenant-defaults",
+        json={"purpose": "llm", "model_id": "gpt-4o", "provider_id": "prov_1"},
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    td_reqs = [
+        h for (m, u, h) in fake_llm_gateway.requests
+        if "/tenant-defaults" in u and m == "PUT"
+    ]
+    assert td_reqs, "PUT /tenant-defaults was not forwarded"
+    assert td_reqs[0].get("X-Actor") == "ADMIN"
+
+
+def test_tenant_defaults_put_rejects_bad_purpose(
+    client,
+    authed_cookie: dict,
+    fake_llm_gateway: FakeLlmGatewayFoundation,
+) -> None:
+    """Invalid purpose → 422 before any upstream call."""
+    resp = client.put(
+        "/api/bff/v1/admin/llm/tenant-defaults",
+        json={"purpose": "bogus", "model_id": "m", "provider_id": "p"},
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 422
+
+
+def test_tenant_defaults_put_rejects_missing_fields(
+    client,
+    authed_cookie: dict,
+    fake_llm_gateway: FakeLlmGatewayFoundation,
+) -> None:
+    """Missing model_id/provider_id → 422."""
+    resp = client.put(
+        "/api/bff/v1/admin/llm/tenant-defaults",
+        json={"purpose": "llm"},
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 422
+
+
+def test_providers_post_rejects_empty_body(
+    client,
+    authed_cookie: dict,
+    fake_llm_gateway: FakeLlmGatewayFoundation,
+) -> None:
+    """POST /providers with empty body → 400 (gateway owns field schema)."""
+    resp = client.post(
+        "/api/bff/v1/admin/llm/providers",
+        json={},
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 400
+
+
+def test_providers_post_passthrough_with_x_actor(
+    client,
+    authed_cookie: dict,
+    fake_llm_gateway: FakeLlmGatewayFoundation,
+) -> None:
+    """Non-empty provider body is passed through with X-Actor: ADMIN."""
+    resp = client.post(
+        "/api/bff/v1/admin/llm/providers",
+        json={"name": "OpenAI", "base_url": "http://x"},
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 201
+    prov_reqs = [
+        h for (m, u, h) in fake_llm_gateway.requests
+        if "/providers" in u and m == "POST"
+    ]
+    assert prov_reqs and prov_reqs[0].get("X-Actor") == "ADMIN"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Billing gather connection-failure → 502 (Task 3)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_billing_quota_gather_connect_error_is_502(
+    client,
+    authed_cookie: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connection-level failure on a billing leg → readable 502, not 500."""
+
+    class FakeBillingBroken(FakeAdminFoundation):
+        async def _broken_get(self, url, **kw):
+            if "/subscriptions/current" in url:
+                raise httpx.ConnectError("billing down")
+            return self.route("GET", url, **kw)
+
+    fake = FakeBillingBroken(authz_allowed=True)
+
+    class _AC:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return None
+        async def get(self, url, **kw): return await fake._broken_get(url, **kw)
+        async def post(self, url, **kw): return fake.route("POST", url, **kw)
+        async def patch(self, url, **kw): return fake.route("PATCH", url, **kw)
+        async def delete(self, url, **kw): return fake.route("DELETE", url, **kw)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AC)
+
+    resp = client.get(
+        "/api/bff/v1/admin/billing/quota?tenant_id=tnt_01J5TEST00000000000000TNT1",
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 502

@@ -6,20 +6,23 @@ All endpoints require the caller to be an authenticated super_admin.
 The BFF enforces this check client-side (fast 403 before hitting foundation),
 and foundation-identity enforces it again server-side (double check).
 
-Security design (aligned with Task 1 middleware hardening):
-──────────────────────────────────────────────────────────
-  The foundation identity service now REJECTS any inbound X-Actor=ADMIN header
-  from external callers (it is silently downgraded to USER in middleware).
-  actor=ADMIN is set server-side by the platform-admin endpoint ONLY after the
-  super_admin authz check passes — it never travels over HTTP.
+Security design:
+────────────────
+  foundation-identity (/platform/*) sets actor=ADMIN server-side after its own
+  super_admin re-check, so those proxies forward only the normal foundation
+  headers (X-Tenant-Id, X-User-Id, Authorization).
 
-  Therefore, this BFF proxy does NOT add X-Actor=ADMIN to forwarded requests.
+  The llm-gateway, by contrast, trusts an explicit ``X-Actor`` header from the
+  BFF for privileged LLM-management mutations: it requires
+  ``X-Actor ∈ {ADMIN, SERVICE}`` (e.g. PUT /tenant-defaults) and rejects others
+  with 403.  Since every LLM-management endpoint here has already passed
+  ``require_super_admin_bff``, the BFF asserts ``X-Actor: ADMIN`` to the gateway
+  via ``admin_headers(...)``.
+
   The BFF's job is:
     1. Verify the caller's session cookie is valid (require_auth).
     2. Verify the caller has action=platform.admin (require_super_admin_bff).
-    3. Forward to identity /platform/* with normal foundation headers
-       (X-Tenant-Id, X-User-Id, Authorization).  foundation-identity will
-       re-run the authz check internally and set actor=ADMIN in DB scope.
+    3. Forward to the upstream with the appropriate header set.
 """
 
 from __future__ import annotations
@@ -29,6 +32,7 @@ import logging
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, ValidationError, field_validator
 
 from agent_bff.api._http import foundation_headers
 from agent_bff.api.dependencies import require_auth
@@ -37,6 +41,78 @@ router = APIRouter(tags=["Platform Admin"])
 logger = logging.getLogger(__name__)
 
 _AUTHZ_TIMEOUT = 2.0
+
+# Allowed LLM purposes — kept in sync with the gateway's enum.
+_ALLOWED_PURPOSES = frozenset({"llm", "embedding", "rerank", "tts", "stt"})
+
+
+def admin_headers(
+    tenant_id: str, user_id: str, access_token: str,
+) -> dict[str, str]:
+    """foundation_headers + X-Actor: ADMIN.
+
+    Every endpoint that uses this has already passed ``require_super_admin_bff``,
+    so it is safe for the BFF to assert an ADMIN actor to the gateway.  The
+    gateway requires ``X-Actor ∈ {ADMIN, SERVICE}`` for privileged LLM-management
+    mutations (e.g. PUT /tenant-defaults).
+    """
+    headers = foundation_headers(tenant_id, user_id, access_token)
+    headers["X-Actor"] = "ADMIN"
+    return headers
+
+
+class TenantDefaultsRequest(BaseModel):
+    """Minimal validation for PUT /admin/llm/tenant-defaults.
+
+    The gateway owns the full field set; the BFF only guards the three
+    required identifiers so a malformed write fails fast at the edge.
+    """
+
+    model_config = {"extra": "allow"}
+
+    purpose: str
+    model_id: str
+    provider_id: str
+
+    @field_validator("purpose")
+    @classmethod
+    def _validate_purpose(cls, v: str) -> str:
+        if v not in _ALLOWED_PURPOSES:
+            raise ValueError(
+                f"purpose must be one of {sorted(_ALLOWED_PURPOSES)}"
+            )
+        return v
+
+    @field_validator("model_id", "provider_id")
+    @classmethod
+    def _non_empty(cls, v: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError("must be a non-empty string")
+        return v
+
+
+async def _parse_model(request: Request, model: type[BaseModel]) -> BaseModel:
+    """Parse + validate the request body against ``model``, → 422 on failure."""
+    raw = await request.json() if await request.body() else {}
+    try:
+        return model.model_validate(raw)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_url=False, include_context=False),
+        ) from exc
+
+
+async def _require_nonempty_body(request: Request) -> dict:
+    """Parse the JSON body, rejecting an empty/blank payload with 400.
+
+    Field-level validation is owned by the gateway for pass-through endpoints
+    (providers CRUD, probe); the BFF only refuses a completely empty body.
+    """
+    raw = await request.json() if await request.body() else {}
+    if not raw:
+        raise HTTPException(status_code=400, detail="request body must not be empty")
+    return raw
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,7 +318,13 @@ async def query_audit_events(
             },
         )
     _raise_for_upstream(resp)
-    return resp.json()
+    # The frontend audit page omits tenant_id when no tenant filter is selected,
+    # so the fallback to the admin's own tenant is retained.  Surface the tenant
+    # actually queried so the caller is never silently misled about scope.
+    result = resp.json()
+    if isinstance(result, dict):
+        result["effective_tenant_id"] = target_tenant_id
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,7 +370,7 @@ async def get_tenant_billing_quota(
     target_headers = foundation_headers(tenant_id, user_id, access_token)
 
     async with httpx.AsyncClient(timeout=15) as client:
-        sub_resp, plans_resp, usage_resp = await _gather(
+        results = await asyncio.gather(
             client.get(
                 f"{settings.foundation_billing_url}/subscriptions/current",
                 headers=target_headers,
@@ -301,7 +383,21 @@ async def get_tenant_billing_quota(
                 f"{settings.foundation_billing_url}/quota/usage",
                 headers=target_headers,
             ),
+            return_exceptions=True,
         )
+
+    # A connection-level failure on any leg must surface as a readable 502
+    # rather than a bare 500 from the unhandled exception.
+    for r in results:
+        if isinstance(r, httpx.HTTPError):
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=f"billing upstream unreachable: {r}",
+            )
+        if isinstance(r, BaseException):
+            raise r
+
+    sub_resp, plans_resp, usage_resp = results
 
     _raise_for_upstream(sub_resp)
     _raise_for_upstream(plans_resp)
@@ -332,9 +428,161 @@ async def get_tenant_billing_quota(
     return {"tenant_id": tenant_id, "plan": plan_obj, "usage": usage}
 
 
-async def _gather(*coros):
-    """Run coroutines concurrently and return results in order."""
-    return await asyncio.gather(*coros)
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM Model Management — proxy to llm-gateway
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post("/admin/llm/probe")
+async def probe_llm_endpoint(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Probe an LLM endpoint for capability compatibility."""
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+    body = await _require_nonempty_body(request)
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{settings.foundation_llm_gateway_url}/probe",
+            json=body,
+            headers=admin_headers(tenant_id, user_id, access_token),
+        )
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.get("/admin/llm/providers")
+async def list_llm_providers(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """List all registered LLM providers."""
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{settings.foundation_llm_gateway_url}/providers",
+            headers=admin_headers(tenant_id, user_id, access_token),
+        )
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.post("/admin/llm/providers", status_code=201)
+async def register_llm_provider(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Register a new LLM provider."""
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+    body = await _require_nonempty_body(request)
+    async with httpx.AsyncClient(timeout=30) as client:
+        resp = await client.post(
+            f"{settings.foundation_llm_gateway_url}/providers",
+            json=body,
+            headers=admin_headers(tenant_id, user_id, access_token),
+        )
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.patch("/admin/llm/providers/{pid}")
+async def update_llm_provider(
+    pid: str,
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Update an LLM provider (enable/disable, rename, etc.)."""
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+    body = await _require_nonempty_body(request)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.patch(
+            f"{settings.foundation_llm_gateway_url}/providers/{pid}",
+            json=body,
+            headers=admin_headers(tenant_id, user_id, access_token),
+        )
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.delete("/admin/llm/providers/{pid}")
+async def delete_llm_provider(
+    pid: str,
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Delete an LLM provider."""
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.delete(
+            f"{settings.foundation_llm_gateway_url}/providers/{pid}",
+            headers=admin_headers(tenant_id, user_id, access_token),
+        )
+    _raise_for_upstream(resp)
+    return {"status": "deleted"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM Tenant Defaults — proxy to llm-gateway /tenant-defaults
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/llm/tenant-defaults")
+async def get_tenant_defaults(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Return the tenant-level LLM defaults."""
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{settings.foundation_llm_gateway_url}/tenant-defaults",
+            headers=admin_headers(tenant_id, user_id, access_token),
+        )
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.put("/admin/llm/tenant-defaults")
+async def update_tenant_defaults(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Update the tenant-level LLM defaults."""
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+    model = await _parse_model(request, TenantDefaultsRequest)
+    body = model.model_dump()
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.put(
+            f"{settings.foundation_llm_gateway_url}/tenant-defaults",
+            json=body,
+            headers=admin_headers(tenant_id, user_id, access_token),
+        )
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.get("/admin/llm/tenant-defaults/resolve")
+async def resolve_tenant_defaults(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Resolve the effective tenant-level LLM defaults for a given purpose."""
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+    params = dict(request.query_params)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{settings.foundation_llm_gateway_url}/tenant-defaults/resolve",
+            params=params,
+            headers=admin_headers(tenant_id, user_id, access_token),
+        )
+    _raise_for_upstream(resp)
+    return resp.json()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

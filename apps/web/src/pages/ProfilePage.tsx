@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { PageHead } from '../components/shell/PageHead';
 import { Chip } from '../components/shell/Chip';
@@ -6,11 +6,10 @@ import { useChatStore } from '../stores/chatStore';
 import { useWorkspace } from '../lib/workspaceContext';
 import { api } from '../api/client';
 import { formatRelativeTimeZh } from '../lib/format';
-import type { ActiveSession, ApiKey, ApiKeyCreated, DailyTokenUsage, MfaMethod, NotifPreferenceItem, QuotaInfo, TokenUsage, UserProfile } from '../api/types';
-import {
-  SHOW_DESIGN_FIXTURES,
-  PF_STATS,
-} from '../lib/designFixtures';
+import type { ActiveSession, ApiKey, ApiKeyCreated, DailyTokenUsage, MfaMethod, ModelCatalogProvider, ModelPurpose, NotifPreferenceItem, QuotaInfo, TokenUsage, UserModelPreference, UserProfile } from '../api/types';
+import { useDefaultModel, clearModelCache } from '../hooks/useDefaultModel';
+import { MODEL_OPTIONS, SYSTEM_FALLBACK_MODEL, modelLabel } from '../lib/modelOptions';
+import { findProviderForModel, getModelsForTypes } from '../lib/providerModels';
 
 // ── Local sub-components ──────────────────────────────────────────
 
@@ -366,9 +365,126 @@ export function ProfilePage() {
 
   const [tab,      setTab]      = useState<TabId>('account');
   const [name,     setName]     = useState(displayName);
-  const [model,    setModel]    = useState('sonnet 4.5');
   const [autonomy, setAuto]     = useState('assist');
   const [digestOn, setDigest]   = useState(true);
+
+  // ── Default model preference (real data) ────────────────────────
+  const purpose: ModelPurpose = 'llm';
+  const { modelId: resolvedModelId, source: modelSource, refetch: refetchDefault } = useDefaultModel(purpose);
+
+  // User's explicit preference (if any) from the API
+  const [userPref, setUserPref] = useState<UserModelPreference | null>(null);
+  const [userPrefLoading, setUserPrefLoading] = useState(true);
+  const [userPrefError, setUserPrefError] = useState<string | null>(null);
+
+  const fetchUserPref = () => {
+    setUserPrefLoading(true);
+    setUserPrefError(null);
+    api.modelPreferences.list().then((prefs) => {
+      const match = prefs.find((p) => p.purpose === purpose);
+      setUserPref(match ?? null);
+    }).catch(() => {
+      setUserPrefError('加载模型偏好失败');
+    }).finally(() => {
+      setUserPrefLoading(false);
+    });
+  };
+
+  useEffect(() => { fetchUserPref(); }, [purpose]);
+
+  // Available providers for the model dropdown
+  const [providers, setProviders] = useState<ModelCatalogProvider[]>([]);
+  const [providersError, setProvidersError] = useState<string | null>(null);
+
+  useEffect(() => {
+    // Non-admin, sanitized catalogue endpoint (no credentials). Only enabled
+    // providers are returned by the BFF, so no client-side filter is needed.
+    api.modelPreferences.listModels().then((items) => {
+      setProviders(items);
+      setProvidersError(null);
+    }).catch((err) => {
+      // Don't fail silently — the dropdown falls back to MODEL_OPTIONS, but a
+      // failure here also breaks findProviderForModel, so surface it.
+      console.warn('加载模型列表失败', err);
+      setProvidersError('加载模型列表失败，已使用内置模型列表');
+    });
+  }, []);
+
+  // Build option list: enumerate each provider's LLM models (covering both the
+  // model_type_map['llm'] entries and the flat `models` list), falling back to
+  // the static MODEL_OPTIONS when no provider advertises any model.
+  const modelOptions = (() => {
+    const opts = providers.flatMap((p) => {
+      const ids = new Set([...getModelsForTypes(p, ['llm']), ...(p.models ?? [])]);
+      return Array.from(ids).map((m) => ({ id: m, label: `${m} (${p.name})` }));
+    });
+    return opts.length > 0 ? opts : MODEL_OPTIONS;
+  })();
+
+  // Currently selected model in the dropdown (editable, not yet saved)
+  const [draftModel, setDraftModel] = useState<string | null>(null);
+  const [savingModel, setSavingModel] = useState(false);
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  // Once the user picks a model manually, stop overwriting the draft from
+  // async loads (userPref / resolve race in whichever order they land).
+  const draftTouched = useRef(false);
+
+  // Sync draft with the loaded user preference or resolved default
+  useEffect(() => {
+    if (!userPrefLoading && !draftTouched.current) {
+      setDraftModel(userPref?.model_id ?? resolvedModelId ?? SYSTEM_FALLBACK_MODEL);
+    }
+  }, [userPrefLoading, userPref, resolvedModelId]);
+
+  const handleSaveModel = async () => {
+    if (!draftModel) return;
+    // Resolve the owning provider via type_map + flat models. A model with no
+    // resolvable provider must not be saved with an empty provider_id.
+    const providerId = findProviderForModel(providers, draftModel, ['llm']);
+    if (!providerId) {
+      setSaveMsg('无法确定该模型所属的 Provider');
+      setTimeout(() => setSaveMsg(null), 3000);
+      return;
+    }
+    setSavingModel(true);
+    setSaveMsg(null);
+    try {
+      await api.modelPreferences.upsert({
+        purpose,
+        model_id: draftModel,
+        provider_id: providerId,
+      });
+      clearModelCache(purpose);
+      draftTouched.current = false; // re-sync draft from the refreshed data
+      refetchDefault();
+      fetchUserPref();
+      setSaveMsg('已保存');
+      setTimeout(() => setSaveMsg(null), 2000);
+    } catch {
+      setSaveMsg('保存失败');
+    } finally {
+      setSavingModel(false);
+    }
+  };
+
+  const handleResetModel = async () => {
+    setSavingModel(true);
+    setSaveMsg(null);
+    try {
+      await api.modelPreferences.delete(purpose);
+      clearModelCache(purpose);
+      draftTouched.current = false;
+      refetchDefault();
+      fetchUserPref();
+      setDraftModel(null); // force re-sync from effect
+      setSaveMsg('已恢复默认');
+      setTimeout(() => setSaveMsg(null), 2000);
+    } catch {
+      setSaveMsg('恢复失败');
+    } finally {
+      setSavingModel(false);
+    }
+  };
 
   // Real notification preferences
   const [notifPrefs, setNotifPrefs] = useState<NotifPreferenceItem[]>([]);
@@ -489,10 +605,6 @@ export function ProfilePage() {
                       ? tokenUsage.total_tokens.toLocaleString()
                       : '…',
                   },
-                  ...(SHOW_DESIGN_FIXTURES ? [
-                    { l: '工作节点',   v: String(PF_STATS.workers) },
-                    { l: '注册时间',   v: PF_STATS.memberSince     },
-                  ] : []),
                 ].map((s) => (
                   <div key={s.l} style={{
                     padding: '5px 12px',
@@ -569,13 +681,72 @@ export function ProfilePage() {
 
               <PfSection title="工作节点默认设置">
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
-                  <PfRow label="默认模型" sub="未指定模板时使用的模型">
-                    <SegPicker
-                      options={['haiku 3.5', 'sonnet 4.5', 'opus 4']}
-                      value={model}
-                      onChange={setModel}
-                    />
+                  <PfRow label="默认模型" sub={
+                    userPrefLoading ? '加载中…'
+                      : userPref ? `来源：用户偏好 (${modelLabel(userPref.model_id)})`
+                      : modelSource === 'tenant' ? '来源：租户默认'
+                      : modelSource === 'system' ? '来源：系统默认'
+                      : '未指定模板时使用的模型'
+                  }>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <select
+                        value={draftModel ?? ''}
+                        onChange={(e) => {
+                          draftTouched.current = true;
+                          setDraftModel(e.target.value);
+                        }}
+                        style={{
+                          padding: '5px 10px',
+                          border: '1px solid var(--line)',
+                          borderRadius: 'var(--r-sm)',
+                          fontFamily: 'var(--font-mono)',
+                          fontSize: 11,
+                          background: 'var(--surface)',
+                          color: 'var(--ink)',
+                          outline: 'none',
+                          cursor: 'pointer',
+                          minWidth: 180,
+                        }}
+                      >
+                        {modelOptions.map((o) => (
+                          <option key={o.id} value={o.id}>{o.label}</option>
+                        ))}
+                      </select>
+                      <button
+                        className="cw-btn cw-btn-sm cw-btn-primary"
+                        onClick={handleSaveModel}
+                        disabled={savingModel || !draftModel}
+                        style={{ fontSize: 11 }}
+                      >
+                        {savingModel ? '保存中…' : '保存'}
+                      </button>
+                      {userPref && (
+                        <button
+                          className="cw-btn cw-btn-sm cw-btn-ghost"
+                          onClick={handleResetModel}
+                          disabled={savingModel}
+                          style={{ fontSize: 11 }}
+                        >
+                          恢复默认
+                        </button>
+                      )}
+                      {saveMsg && (
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: saveMsg.includes('失败') ? 'var(--accent)' : 'var(--ink-2)' }}>
+                          {saveMsg}
+                        </span>
+                      )}
+                    </div>
                   </PfRow>
+                  {userPrefError && (
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--accent)' }}>
+                      {userPrefError}
+                    </div>
+                  )}
+                  {providersError && (
+                    <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--accent)' }}>
+                      {providersError}
+                    </div>
+                  )}
                   <div className="cw-divider" />
                   <PfRow label="默认自主度" sub="工作节点无需确认即可执行的程度">
                     <SegPicker

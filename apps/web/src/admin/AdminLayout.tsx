@@ -5,8 +5,9 @@ import { UsersPage } from './pages/UsersPage';
 import { QuotaPage } from './pages/QuotaPage';
 import { AuditPage } from './pages/AuditPage';
 import { SessionReplayPage } from './pages/SessionReplayPage';
-import { EndpointDiagnosticsPage } from './pages/EndpointDiagnosticsPage';
+import { ModelManagementPage } from './pages/ModelManagementPage';
 import { AppReviewPage } from './pages/AppReviewPage';
+import { DefaultModelSettingsPage } from './pages/DefaultModelSettingsPage';
 
 interface AdminNavSpec {
   to: string;
@@ -21,7 +22,8 @@ const ADMIN_NAV: AdminNavSpec[] = [
   { to: '/admin/quota', label: '配额套餐', glyph: '◷' },
   { to: '/admin/audit', label: '审计日志', glyph: '≡' },
   { to: '/admin/replay', label: '会话回放', glyph: '▷' },
-  { to: '/admin/diagnostics', label: '端点诊断', glyph: '⊕' },
+  { to: '/admin/models', label: '模型管理', glyph: '⊕' },
+  { to: '/admin/defaults', label: '默认模型设置', glyph: '⊛' },
 ];
 
 /**
@@ -37,7 +39,7 @@ export function AdminLayout() {
   }
 
   return (
-    <div className="h-full flex min-w-0">
+    <div className="h-full w-full flex min-w-0">
       {/* Admin sidebar */}
       <aside className="w-[220px] shrink-0 border-r border-line p-3.5 flex flex-col gap-5 bg-paper overflow-hidden">
         {/* Header */}
@@ -96,17 +98,20 @@ export function AdminLayout() {
       </aside>
 
       {/* Admin main content */}
-      <main className="flex-1 flex flex-col min-w-0 overflow-hidden">
-        <Routes>
-          <Route path="tenants" element={<TenantsPage />} />
-          <Route path="users" element={<UsersPage />} />
-          <Route path="apps" element={<AppReviewPage />} />
-          <Route path="quota" element={<QuotaPage />} />
-          <Route path="audit" element={<AuditPage />} />
-          <Route path="replay" element={<SessionReplayPage />} />
-          <Route path="diagnostics" element={<EndpointDiagnosticsPage />} />
-          <Route path="*" element={<Navigate to="/admin/tenants" replace />} />
-        </Routes>
+      <main className="flex-1 min-w-0 overflow-hidden">
+        <div className="h-full w-full flex flex-col">
+          <Routes>
+            <Route path="tenants" element={<TenantsPage />} />
+            <Route path="users" element={<UsersPage />} />
+            <Route path="apps" element={<AppReviewPage />} />
+            <Route path="quota" element={<QuotaPage />} />
+            <Route path="audit" element={<AuditPage />} />
+            <Route path="replay" element={<SessionReplayPage />} />
+            <Route path="models" element={<ModelManagementPage />} />
+            <Route path="defaults" element={<DefaultModelSettingsPage />} />
+            <Route path="*" element={<Navigate to="/admin/tenants" replace />} />
+          </Routes>
+        </div>
       </main>
     </div>
   );

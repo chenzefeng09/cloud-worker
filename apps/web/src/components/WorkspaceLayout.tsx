@@ -62,7 +62,7 @@ export function WorkspaceLayout() {
                     <Route path="/tasks/:id" element={<AgentPage />} />
                     {/* App routes — static/longer paths first so react-router v6
                         ranking never lets `/apps/:id` shadow `/apps/new` etc. */}
-                    <Route path="/apps/new" element={<AppEditorPage />} />
+                    <Route path="/apps/new" element={<Navigate to="/home" replace />} />
                     <Route path="/apps/runs/:sessionId/:runId" element={<AppResultPage />} />
                     <Route path="/apps/:id/edit" element={<AppEditorPage />} />
                     <Route path="/apps/:id" element={<AppRunPage />} />

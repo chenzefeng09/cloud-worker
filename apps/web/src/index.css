@@ -232,6 +232,24 @@ body {
     animation: cw-blip 1.4s ease-in-out infinite;
     flex-shrink: 0;
   }
+  /* Prompt parameter chip (contenteditable inline tag) */
+  .prompt-chip {
+    display: inline;
+    color: #2c5f8a;
+    background: rgba(44, 95, 138, 0.08);
+    border-radius: 3px;
+    padding: 1px 3px;
+    font-family: 'JetBrains Mono', ui-monospace, monospace;
+    font-size: 12px;
+    cursor: pointer;
+    user-select: all;
+    white-space: nowrap;
+    text-decoration: none;
+    border-bottom: 1px solid rgba(44, 95, 138, 0.3);
+  }
+  .prompt-chip::selection {
+    background: rgba(44, 95, 138, 0.25);
+  }
 }
 
 /* Blip keyframes (outside @layer so animation name is always available) */

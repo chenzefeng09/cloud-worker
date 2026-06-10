@@ -106,6 +106,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from agent_bff.api.v1.billing import router as billing_router
     app.include_router(billing_router, prefix=settings.api_prefix)
 
+    from agent_bff.api.v1.llm_preferences import router as llm_preferences_router
+    app.include_router(llm_preferences_router, prefix=settings.api_prefix)
+
     from agent_bff.api.v1.notifications import router as notifications_router
     app.include_router(notifications_router, prefix=settings.api_prefix)
 

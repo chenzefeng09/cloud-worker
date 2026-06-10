@@ -397,9 +397,71 @@ export interface QuotaInfo {
   usage: Record<string, number>;
 }
 
-// ─── LLM Endpoint Diagnostics ────────────────────────────────────────────────
+// ─── LLM Model Management ────────────────────────────────────────────────────
 
-export type ProviderType = 'openai_compatible' | 'anthropic' | 'vllm' | 'ollama' | 'bedrock' | 'azure';
+export type ProviderType = 'openai_compatible' | 'anthropic' | 'vllm' | 'ollama' | 'bedrock' | 'azure' | 'zhipu' | 'deepseek' | 'moonshot' | 'minimax' | 'aliyun' | 'baidu' | 'tencent';
+
+/** Model type categories following Dify conventions. */
+export type ModelType = 'llm' | 'text_embedding' | 'rerank';
+
+/** Mapping from model type to list of model IDs. */
+export type ModelTypeMap = Partial<Record<ModelType, string[]>>;
+
+export interface ModelSetting {
+  model_type: ModelType;
+  context_length?: number;
+  max_tokens?: number;
+  vision_support?: boolean;
+  structured_output?: boolean;
+}
+
+/** Mapping from model ID to its specific settings. */
+export type ModelSettingsMap = Record<string, ModelSetting>;
+
+/** A registered model provider with credentials and model catalogue. */
+export interface ModelProvider {
+  id: string;
+  name: string;
+  kind: ProviderType;
+  base_url: string;
+  models: string[] | null;
+  default_model: string;
+  capabilities: Record<string, unknown>;
+  enabled: boolean;
+  created_at: string | null;
+}
+
+/**
+ * Sanitized provider catalogue entry returned by the non-admin
+ * GET /llm/models endpoint. A subset of ModelProvider — credentials and
+ * base_url are never present — structurally compatible with the
+ * providerModels helpers (which only read id/name/models/capabilities).
+ */
+export type ModelCatalogProvider = Pick<
+  ModelProvider,
+  'id' | 'name' | 'kind' | 'enabled' | 'models' | 'capabilities'
+>;
+
+export interface RegisterProviderRequest {
+  name: string;
+  api_base: string;
+  api_key: string;
+  provider_type: ProviderType;
+  models: string[];
+  model_type_map: ModelTypeMap;
+  model_settings: ModelSettingsMap;
+}
+
+export interface UpdateProviderRequest {
+  enabled?: boolean;
+  name?: string;
+  models?: string[];
+  default_model?: string;
+  model_type_map?: ModelTypeMap;
+  model_settings?: ModelSettingsMap;
+}
+
+// ─── LLM Probe (credential validation) ──────────────────────────────────────
 
 export interface ProbeRequest {
   url: string;
@@ -412,6 +474,7 @@ export type ProbeCapabilityResult = boolean | 'unknown' | string;
 
 export interface ProbeResults {
   list_models: ProbeCapabilityResult;
+  model_list?: string[];
   model_count?: string;
   function_calling: ProbeCapabilityResult;
   streaming: ProbeCapabilityResult;
@@ -589,4 +652,38 @@ export interface ApiKey {
 export interface ApiKeyCreated extends ApiKey {
   /** The raw key — display once and discard; never retrievable again. */
   key: string;
+}
+
+// ─── Model Defaults & User Preferences ──────────────────────────────────────
+
+/** Purpose categories for model defaults / preferences. */
+export type ModelPurpose = 'llm' | 'embedding' | 'rerank' | 'tts' | 'stt';
+
+/** Admin-configured default model for a given purpose. */
+export interface TenantDefaultModel {
+  id: string;
+  purpose: ModelPurpose;
+  model_id: string;
+  provider_id: string;
+  provider_name?: string;
+  updated_at: string;
+  created_by?: string;
+}
+
+/** Per-user model preference for a given purpose. */
+export interface UserModelPreference {
+  id: string;
+  purpose: ModelPurpose;
+  model_id: string;
+  provider_id: string;
+  provider_name?: string;
+  updated_at: string;
+}
+
+/** Resolved model for a purpose — indicates which layer provided it. */
+export interface ResolvedDefault {
+  purpose: ModelPurpose;
+  model_id: string;
+  provider_id: string;
+  source: 'user' | 'tenant' | 'system';
 }

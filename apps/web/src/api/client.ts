@@ -24,12 +24,17 @@ import type {
   McpServer,
   Message,
   MfaMethod,
+  ModelCatalogProvider,
+  ModelProvider,
+  ModelPurpose,
   NotifPreferenceItem,
   PatchTenantRequest,
   PoolSnapshot,
   ProbeReport,
   ProbeRequest,
   QuotaInfo,
+  RegisterProviderRequest,
+  ResolvedDefault,
   Run,
   RunState,
   SandboxItem,
@@ -38,8 +43,11 @@ import type {
   InstalledSkill,
   SkillVersion,
   Tenant,
+  TenantDefaultModel,
   TokenUsage,
   TopologyGraph,
+  UpdateProviderRequest,
+  UserModelPreference,
   UserProfile,
 } from './types';
 
@@ -311,6 +319,22 @@ export const api = {
     llm: {
       probe: (body: ProbeRequest) =>
         request<ProbeReport>('POST', '/admin/llm/probe', body),
+      listProviders: () =>
+        request<{ items: ModelProvider[] }>('GET', '/admin/llm/providers'),
+      registerProvider: (body: RegisterProviderRequest) =>
+        request<ModelProvider>('POST', '/admin/llm/providers', body),
+      updateProvider: (id: string, body: UpdateProviderRequest) =>
+        request<ModelProvider>('PATCH', `/admin/llm/providers/${id}`, body),
+      deleteProvider: (id: string) =>
+        request<void>('DELETE', `/admin/llm/providers/${id}`),
+      // Tenant-level model defaults — proxied via BFF /admin/llm/tenant-defaults*.
+      // GET returns a {items: [...]} envelope; unwrap to an array for callers.
+      listTenantDefaults: () =>
+        request<{ items: TenantDefaultModel[] }>('GET', '/admin/llm/tenant-defaults').then((r) => r.items),
+      upsertTenantDefault: (body: { purpose: ModelPurpose; model_id: string; provider_id: string }) =>
+        request<TenantDefaultModel>('PUT', '/admin/llm/tenant-defaults', body),
+      resolveTenantDefault: (purpose: ModelPurpose) =>
+        request<ResolvedDefault>('GET', `/admin/llm/tenant-defaults/resolve?purpose=${purpose}`),
     },
   },
 
@@ -319,6 +343,22 @@ export const api = {
       request<{ items: NotifPreferenceItem[] }>('GET', '/notifications/preferences'),
     updatePreferences: (items: { event_key: string; email_enabled: boolean; push_enabled: boolean }[]) =>
       request<{ items: NotifPreferenceItem[] }>('PUT', '/notifications/preferences', { items }),
+  },
+
+  // User-level model preferences — proxied via BFF /llm/user-preferences*.
+  // GET returns a {items: [...]} envelope; unwrap to an array for callers.
+  modelPreferences: {
+    // Sanitized provider catalogue for non-admin model selection (no creds).
+    listModels: () =>
+      request<{ items: ModelCatalogProvider[] }>('GET', '/llm/models').then((r) => r.items),
+    list: () =>
+      request<{ items: UserModelPreference[] }>('GET', '/llm/user-preferences').then((r) => r.items),
+    upsert: (body: { purpose: ModelPurpose; model_id: string; provider_id: string }) =>
+      request<UserModelPreference>('PUT', '/llm/user-preferences', body),
+    delete: (purpose: ModelPurpose) =>
+      request<void>('DELETE', `/llm/user-preferences/${encodeURIComponent(purpose)}`),
+    resolve: (purpose: ModelPurpose) =>
+      request<ResolvedDefault>('GET', `/llm/user-preferences/resolve?purpose=${purpose}`),
   },
 
   chat: {

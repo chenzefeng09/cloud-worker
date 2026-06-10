@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { api, ApiError } from '../api/client';
 import { PageHead } from '../components/shell/PageHead';
@@ -14,22 +14,17 @@ import {
 import {
   InputSchemaBuilder,
   validateSchema,
+  blankField,
 } from '../components/app/InputSchemaBuilder';
 import type {
   App,
   AppVersion,
   AppVersionCreate,
-  AppVisibility,
   InputField,
   McpServer,
   SamplingParams,
   Skill,
 } from '../api/types';
-
-const VISIBILITY_OPTIONS: { id: AppVisibility; label: string }[] = [
-  { id: 'private', label: '私有（仅自己）' },
-  { id: 'tenant', label: '租户（提交发布后可见）' },
-];
 
 /** Local editor state for the version harness. */
 interface HarnessForm {
@@ -58,7 +53,7 @@ function emptyHarness(): HarnessForm {
     max_tokens: '',
     forced_skills: [],
     forced_mcp_server_ids: [],
-    input_schema: [],
+    input_schema: [blankField()],
   };
 }
 
@@ -88,7 +83,7 @@ function harnessFromVersion(v: AppVersion): HarnessForm {
     max_tokens: sp.max_tokens != null ? String(sp.max_tokens) : '',
     forced_skills: v.forced_skills ?? [],
     forced_mcp_server_ids: v.forced_mcp_server_ids ?? [],
-    input_schema: v.input_schema ?? [],
+    input_schema: v.input_schema && v.input_schema.length > 0 ? v.input_schema : [blankField()],
   };
 }
 
@@ -165,8 +160,8 @@ function StepTabs({
   return (
     <div className="grid grid-cols-2 gap-2">
       {[
-        { id: 1 as const, title: '1 定义自定义参数', sub: '用户填写项、默认值、文件限制' },
-        { id: 2 as const, title: '2 定义 Prompt 与模型', sub: '固定流程、Skills、MCP、发布权限' },
+        { id: 1 as const, title: '1 定义任务输入', sub: '用户填写项、默认值、文件限制' },
+        { id: 2 as const, title: '2 定义执行环境', sub: '固定流程、Skills、MCP、发布权限' },
       ].map((item) => {
         const active = step === item.id;
         return (
@@ -187,10 +182,77 @@ function StepTabs({
   );
 }
 
-function fieldReferenceLabel(field: InputField): string {
-  if (field.type === 'file') return `/${field.key} · 文件路径`;
-  if (field.type === 'multiselect') return `/${field.key} · 多选值`;
-  return `/${field.key}`;
+/** Token type for PromptTemplateEditor internal representation */
+const PARAM_RE = /(\/[a-zA-Z][a-zA-Z0-9_-]*)/g;
+
+/** Parse plain text value into alternating text/param segments */
+function parseTokens(text: string): { type: 'text' | 'param'; value: string }[] {
+  const tokens: { type: 'text' | 'param'; value: string }[] = [];
+  let lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = PARAM_RE.exec(text)) !== null) {
+    if (m.index > lastIndex) {
+      tokens.push({ type: 'text', value: text.slice(lastIndex, m.index) });
+    }
+    tokens.push({ type: 'param', value: m[1] });
+    lastIndex = PARAM_RE.lastIndex;
+  }
+  if (lastIndex < text.length) {
+    tokens.push({ type: 'text', value: text.slice(lastIndex) });
+  }
+  PARAM_RE.lastIndex = 0;
+  return tokens;
+}
+
+/** Build innerHTML from the plain-text value, highlighting known param keys as chips */
+function buildHtml(text: string, fieldKeys: Set<string>): string {
+  const tokens = parseTokens(text);
+  return tokens.map((t) => {
+    if (t.type === 'param') {
+      const key = t.value.slice(1); // remove leading /
+      if (fieldKeys.has(key)) {
+        return `<span class="prompt-chip" contenteditable="false" data-param-key="${key}">${t.value}</span>`;
+      }
+    }
+    // Escape HTML for text nodes
+    return t.value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }).join('');
+}
+
+/** Extract plain text from the contenteditable div's DOM */
+function extractText(el: HTMLElement): string {
+  let result = '';
+  el.childNodes.forEach((node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      result += node.textContent ?? '';
+    } else if (node.nodeType === Node.ELEMENT_NODE) {
+      const elem = node as HTMLElement;
+      if (elem.dataset.paramKey) {
+        result += `/${elem.dataset.paramKey}`;
+      } else if (elem.tagName === 'BR') {
+        result += '\n';
+      } else if (elem.tagName === 'DIV' || elem.tagName === 'P') {
+        // Browser sometimes wraps lines in divs
+        if (result.length > 0 && !result.endsWith('\n')) result += '\n';
+        result += extractText(elem);
+      } else {
+        result += extractText(elem);
+      }
+    }
+  });
+  return result;
+}
+
+/** Get caret pixel position for positioning the floating popup */
+function getCaretCoords(): { top: number; left: number } | null {
+  const sel = window.getSelection();
+  if (!sel || sel.rangeCount === 0) return null;
+  const range = sel.getRangeAt(0).cloneRange();
+  range.collapse(true);
+  const rect = range.getBoundingClientRect();
+  // If rect is zero (e.g. empty line), fall back
+  if (rect.top === 0 && rect.left === 0) return null;
+  return { top: rect.bottom, left: rect.left };
 }
 
 function PromptTemplateEditor({
@@ -200,6 +262,7 @@ function PromptTemplateEditor({
   fields,
   placeholder,
   minHeight = 120,
+  error,
 }: {
   label: string;
   value: string;
@@ -207,105 +270,234 @@ function PromptTemplateEditor({
   fields: InputField[];
   placeholder: string;
   minHeight?: number;
+  error?: string;
 }) {
-  const ref = useRef<HTMLTextAreaElement | null>(null);
-  const [slash, setSlash] = useState<{ start: number; query: string } | null>(null);
+  const editorRef = useRef<HTMLDivElement | null>(null);
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+  const [slashQuery, setSlashQuery] = useState<string | null>(null);
+  const [popupPos, setPopupPos] = useState<{ top: number; left: number } | null>(null);
+  const [activeIdx, setActiveIdx] = useState(0);
+  const suppressSync = useRef(false);
 
-  const detectSlash = (text: string, caret: number) => {
-    const before = text.slice(0, caret);
-    const match = before.match(/(^|\s)\/([a-z0-9_]*)$/);
-    if (!match) return null;
-    return {
-      start: caret - (match[2]?.length ?? 0) - 1,
-      query: match[2] ?? '',
-    };
-  };
-
-  const updateSlash = (text?: string, caret?: number) => {
-    const el = ref.current;
-    if (!el) return;
-    setSlash(detectSlash(text ?? el.value, caret ?? el.selectionStart ?? 0));
-  };
+  const fieldKeys = useMemo(() => new Set(fields.map((f) => f.key)), [fields]);
 
   const matches = useMemo(() => {
-    if (!slash) return [];
-    const q = slash.query.toLowerCase();
+    if (slashQuery === null) return [];
+    const q = slashQuery.toLowerCase();
     return fields
-      .filter((f) => {
-        if (!q) return true;
-        return f.key.includes(q) || f.label.toLowerCase().includes(q);
-      })
+      .filter((f) => !q || f.key.includes(q) || f.label.toLowerCase().includes(q))
       .slice(0, 8);
-  }, [fields, slash]);
+  }, [fields, slashQuery]);
 
-  const insertField = (field: InputField, activeSlash = slash) => {
-    const el = ref.current;
-    const text = el?.value ?? value;
-    const caret = el?.selectionStart ?? text.length;
-    const start = activeSlash?.start ?? caret;
-    const next = `${text.slice(0, start)}/${field.key} ${text.slice(caret)}`;
-    onChange(next);
-    setSlash(null);
-    requestAnimationFrame(() => {
-      const pos = start + field.key.length + 2;
-      ref.current?.focus();
-      ref.current?.setSelectionRange(pos, pos);
+  // Sync DOM from value when value changes externally
+  useEffect(() => {
+    const el = editorRef.current;
+    if (!el || suppressSync.current) {
+      suppressSync.current = false;
+      return;
+    }
+    const html = buildHtml(value, fieldKeys);
+    if (el.innerHTML !== html) {
+      el.innerHTML = html;
+    }
+  }, [value, fieldKeys]);
+
+  const detectSlashAtCaret = useCallback(() => {
+    const el = editorRef.current;
+    if (!el) return;
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) { setSlashQuery(null); return; }
+    const node = sel.anchorNode;
+    if (!node || node.nodeType !== Node.TEXT_NODE) { setSlashQuery(null); return; }
+    const text = node.textContent ?? '';
+    const offset = sel.anchorOffset;
+    const before = text.slice(0, offset);
+    // Match slash followed by optional filter chars at the end of the text before caret
+    const m = before.match(/(^|[\s\n])\/([a-zA-Z0-9_-]*)$/);
+    if (!m) { setSlashQuery(null); setPopupPos(null); return; }
+    const newQuery = m[2];
+    setSlashQuery((prev) => {
+      if (prev !== newQuery) setActiveIdx(0);
+      return newQuery;
     });
-  };
+    const coords = getCaretCoords();
+    if (coords && wrapperRef.current) {
+      const wrapperRect = wrapperRef.current.getBoundingClientRect();
+      setPopupPos({
+        top: coords.top - wrapperRect.top + 4,
+        left: coords.left - wrapperRect.left,
+      });
+    }
+  }, []);
+
+  const handleInput = useCallback(() => {
+    const el = editorRef.current;
+    if (!el) return;
+    const plain = extractText(el);
+    suppressSync.current = true;
+    onChange(plain);
+    detectSlashAtCaret();
+  }, [onChange, detectSlashAtCaret]);
+
+  const insertParamChip = useCallback((field: InputField) => {
+    const el = editorRef.current;
+    if (!el) return;
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+
+    // Find and delete the slash + query text
+    const node = sel.anchorNode;
+    if (node && node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent ?? '';
+      const offset = sel.anchorOffset;
+      const before = text.slice(0, offset);
+      const m = before.match(/(^|[\s\n])\/([a-zA-Z0-9_-]*)$/);
+      if (m) {
+        const slashStart = offset - m[0].length + (m[1]?.length ?? 0);
+        // Delete the /query text
+        const range = document.createRange();
+        range.setStart(node, slashStart);
+        range.setEnd(node, offset);
+        range.deleteContents();
+      }
+    }
+
+    // Create the chip span
+    const chip = document.createElement('span');
+    chip.className = 'prompt-chip';
+    chip.contentEditable = 'false';
+    chip.dataset.paramKey = field.key;
+    chip.textContent = `/${field.key}`;
+
+    // Insert chip + trailing space
+    const range2 = sel.getRangeAt(0);
+    range2.collapse(true);
+    range2.insertNode(chip);
+    // Add a space after chip for caret placement
+    const space = document.createTextNode(' ');
+    chip.after(space);
+    // Move caret after the space
+    const newRange = document.createRange();
+    newRange.setStartAfter(space);
+    newRange.collapse(true);
+    sel.removeAllRanges();
+    sel.addRange(newRange);
+
+    setSlashQuery(null);
+    setPopupPos(null);
+
+    // Sync plain text
+    suppressSync.current = true;
+    onChange(extractText(el));
+  }, [onChange]);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (slashQuery !== null && matches.length > 0) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setActiveIdx((i) => Math.min(i + 1, matches.length - 1));
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setActiveIdx((i) => Math.max(i - 1, 0));
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault();
+        insertParamChip(matches[activeIdx]);
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        setSlashQuery(null);
+        setPopupPos(null);
+        return;
+      }
+    }
+  }, [slashQuery, matches, activeIdx, insertParamChip]);
+
+  const handleChipClick = useCallback((field: InputField) => {
+    const el = editorRef.current;
+    if (!el) return;
+    el.focus();
+    // Append at end
+    const chip = document.createElement('span');
+    chip.className = 'prompt-chip';
+    chip.contentEditable = 'false';
+    chip.dataset.paramKey = field.key;
+    chip.textContent = `/${field.key}`;
+    const space = document.createTextNode(' ');
+    el.appendChild(chip);
+    el.appendChild(space);
+    const sel = window.getSelection();
+    const range = document.createRange();
+    range.setStartAfter(space);
+    range.collapse(true);
+    sel?.removeAllRanges();
+    sel?.addRange(range);
+    suppressSync.current = true;
+    onChange(extractText(el));
+  }, [onChange]);
+
+  const showPlaceholder = !value || !value.trim();
 
   return (
-    <div className="flex flex-col gap-1">
+    <div ref={wrapperRef} className="flex flex-col gap-1 relative">
       <label className="cw-label">{label}</label>
-      <textarea
-        ref={ref}
-        className={`${inputCls} resize-y font-mono text-[12px] leading-[1.55]`}
-        style={{ minHeight }}
-        value={value}
-        onChange={(e) => {
-          const next = e.target.value;
-          onChange(next);
-          updateSlash(next, e.target.selectionStart ?? next.length);
-        }}
-        onClick={() => updateSlash()}
-        onKeyUp={() => updateSlash()}
-        onKeyDown={(e) => {
-          const el = ref.current;
-          const activeSlash = el ? detectSlash(el.value, el.selectionStart ?? 0) : slash;
-          const q = activeSlash?.query.toLowerCase() ?? '';
-          const activeMatches = activeSlash
-            ? fields
-                .filter((f) => !q || f.key.includes(q) || f.label.toLowerCase().includes(q))
-                .slice(0, 8)
-            : [];
-          if ((e.key === 'Enter' || e.key === 'Tab') && activeMatches[0]) {
-            e.preventDefault();
-            insertField(activeMatches[0], activeSlash);
-          }
-          if (e.key === 'Escape') setSlash(null);
-        }}
-        placeholder={placeholder}
-      />
+      <div className="relative">
+        <div
+          ref={editorRef}
+          contentEditable
+          suppressContentEditableWarning
+          className={`${inputCls.replace('border-line', error ? 'border-accent' : 'border-line')} resize-y font-mono text-[12px] leading-[1.55] whitespace-pre-wrap break-words overflow-auto outline-none`}
+          style={{ minHeight }}
+          onInput={handleInput}
+          onClick={() => detectSlashAtCaret()}
+          onKeyUp={(e) => {
+            if (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'Enter' || e.key === 'Tab') return;
+            detectSlashAtCaret();
+          }}
+          onKeyDown={handleKeyDown}
+        />
+        {showPlaceholder && (
+          <div
+            className="absolute top-0 left-0 px-2 py-1.5 text-[12px] font-mono text-dim pointer-events-none select-none"
+            style={{ lineHeight: '1.55' }}
+          >
+            {placeholder}
+          </div>
+        )}
+      </div>
+      {error && (
+        <span className="text-[10.5px] text-accent mt-[-2px]">{error}</span>
+      )}
       <div className="flex flex-wrap gap-1.5">
         {fields.map((f) => (
-          <Chip key={f.key} dashed onClick={() => insertField(f)}>
-            {fieldReferenceLabel(f)}
+          <Chip key={f.key} dashed onClick={() => handleChipClick(f)}>
+            {f.type === 'file' ? `/${f.key} \u00b7 文件路径` : f.type === 'multiselect' ? `/${f.key} \u00b7 多选值` : `/${f.key}`}
           </Chip>
         ))}
         {fields.length === 0 && (
           <span className="font-mono text-[11px] text-dim">先在上一步定义参数后，可在这里用 / 引用。</span>
         )}
       </div>
-      {slash && matches.length > 0 && (
-        <div className="border border-line rounded-md bg-surface shadow-[0_8px_24px_-12px_rgba(15,17,20,0.18)] p-1 w-[min(360px,100%)]">
-          {matches.map((f) => (
+      {slashQuery !== null && matches.length > 0 && popupPos && (
+        <div
+          className="absolute z-50 border border-line rounded-md bg-surface shadow-[0_8px_24px_-12px_rgba(15,17,20,0.18)] p-1 w-[min(320px,90%)]"
+          style={{ top: popupPos.top, left: popupPos.left }}
+        >
+          {matches.map((f, i) => (
             <button
               key={f.key}
               type="button"
               onMouseDown={(e) => {
                 e.preventDefault();
-                insertField(f);
+                insertParamChip(f);
               }}
-              className="w-full flex items-center gap-2 px-2 py-1.5 rounded-sm hover:bg-paper text-left"
+              className={`w-full flex items-center gap-2 px-2 py-1.5 rounded-sm text-left ${
+                i === activeIdx ? 'bg-paper' : 'hover:bg-paper'
+              }`}
             >
               <span className="font-mono text-[12px] text-ink">/{f.key}</span>
               <span className="text-[11.5px] text-dim truncate">{f.label}</span>
@@ -326,17 +518,14 @@ function PromptTemplateEditor({
 export function AppEditorPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const isEdit = Boolean(id);
 
   const userProfile = useChatStore((s) => s.userProfile);
   const isAdmin = Boolean(userProfile?.roles?.includes('super_admin'));
   const [step, setStep] = useState<1 | 2>(1);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
-  // App-level fields
-  const [name, setName] = useState('');
-  const [description, setDescription] = useState('');
-  const [icon, setIcon] = useState('');
-  const [visibility, setVisibility] = useState<AppVisibility>('private');
+  // App name for breadcrumb display (read-only; edited via the creation modal)
+  const [appName, setAppName] = useState('');
 
   // Version harness
   const [harness, setHarness] = useState<HarnessForm>(emptyHarness());
@@ -349,10 +538,17 @@ export function AppEditorPage() {
   const [draftVersionId, setDraftVersionId] = useState<string | null>(null);
   const [draftEditable, setDraftEditable] = useState(false);
 
-  const [loading, setLoading] = useState(isEdit);
+  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [fieldErrors, setFieldErrors] = useState<Record<number, string>>({});
+  const [fieldErrors, setFieldErrors] = useState<Record<number, { path: string; msg: string }>>({});
+  const [harnessErrors, setHarnessErrors] = useState<{
+    system_prompt?: string;
+    user_prompt_template?: string;
+    temperature?: string;
+    top_p?: string;
+    max_tokens?: string;
+  }>({});
 
   // ── Load library lists + (edit mode) the app ──────────────────────────────
   useEffect(() => {
@@ -369,7 +565,10 @@ export function AppEditorPage() {
   }, []);
 
   useEffect(() => {
-    if (!id) return;
+    if (!id) {
+      navigate('/home', { replace: true });
+      return;
+    }
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -377,10 +576,7 @@ export function AppEditorPage() {
       .get(id)
       .then((app) => {
         if (cancelled) return;
-        setName(app.name);
-        setDescription(app.description ?? '');
-        setIcon(app.icon ?? '');
-        setVisibility(app.visibility);
+        setAppName(app.name);
         const v = pickEditableVersion(app);
         if (v) {
           const next = harnessFromVersion(v);
@@ -396,7 +592,7 @@ export function AppEditorPage() {
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [id]);
+  }, [id, navigate]);
 
   const skillSelected = useMemo(
     () => new Set(harness.forced_skills),
@@ -428,11 +624,6 @@ export function AppEditorPage() {
 
   // ── Validation ────────────────────────────────────────────────────────────
   const validateInputStep = (): boolean => {
-    if (!name.trim()) {
-      setError('请填写应用名称');
-      setStep(1);
-      return false;
-    }
     const { errors, ok } = validateSchema(harness.input_schema);
     setFieldErrors(errors);
     if (!ok) {
@@ -447,66 +638,58 @@ export function AppEditorPage() {
   /** Returns true when the whole form is structurally valid; sets errors otherwise. */
   const validate = (): boolean => {
     if (!validateInputStep()) return false;
+    
+    let ok = true;
+    const he: typeof harnessErrors = {};
+
     if (!harness.system_prompt.trim()) {
-      setError('请填写系统提示词');
-      setStep(2);
-      return false;
+      he.system_prompt = '请填写系统提示词';
+      ok = false;
     }
     if (!harness.user_prompt_template.trim()) {
-      setError('请填写用户提示词模板');
-      setStep(2);
-      return false;
+      he.user_prompt_template = '请填写用户提示词模板';
+      ok = false;
     }
     const t = harness.temperature ? parseFloat(harness.temperature) : undefined;
     const p = harness.top_p ? parseFloat(harness.top_p) : undefined;
     const m = harness.max_tokens ? parseInt(harness.max_tokens, 10) : undefined;
     if (t != null && (!Number.isFinite(t) || t < 0)) {
-      setError('temperature 必须为大于等于 0 的数字');
-      setStep(2);
-      return false;
+      he.temperature = 'temperature 必须为大于等于 0 的数字';
+      ok = false;
     }
     if (p != null && (!Number.isFinite(p) || p < 0 || p > 1)) {
-      setError('top_p 必须在 0 到 1 之间');
-      setStep(2);
-      return false;
+      he.top_p = 'top_p 必须在 0 到 1 之间';
+      ok = false;
     }
     if (m != null && (!Number.isFinite(m) || m < 1)) {
-      setError('max_tokens 必须为大于 0 的整数');
+      he.max_tokens = 'max_tokens 必须为大于 0 的整数';
+      ok = false;
+    }
+    
+    setHarnessErrors(he);
+
+    if (!ok) {
+      setError('运行配置有误，请检查标红项');
+      if (he.temperature || he.top_p || he.max_tokens) {
+        setShowAdvanced(true);
+      }
       setStep(2);
       return false;
     }
+
     setError(null);
     return true;
   };
 
   // ── Save: returns {appId, versionId} or null on failure ───────────────────
   /**
-   * CREATE mode → api.apps.create (App + initial draft, atomic).
-   * EDIT mode  → api.apps.update for app-level fields; for the harness, if the
-   *   picked version is an editable draft we updateVersion in place, otherwise
-   *   (published/pending/rejected) we createVersion to produce a fresh draft.
+   * Update the harness version. If the picked version is an
+   * editable draft we updateVersion in place, otherwise we createVersion
+   * to produce a fresh draft.
    */
   const persist = async (): Promise<{ appId: string; versionId: string } | null> => {
-    const vc = buildVersionCreate(harness);
-    if (!isEdit) {
-      const created = await api.apps.create({
-        name: name.trim(),
-        description: description.trim() || null,
-        icon: icon.trim() || null,
-        visibility,
-        version: vc,
-      });
-      const v = pickEditableVersion(created) ?? created.versions?.[0] ?? null;
-      return { appId: created.id, versionId: v?.id ?? '' };
-    }
-    // EDIT
     const appId = id!;
-    await api.apps.update(appId, {
-      name: name.trim(),
-      description: description.trim() || null,
-      icon: icon.trim() || null,
-      visibility,
-    });
+    const vc = buildVersionCreate(harness);
     let versionId: string;
     if (draftEditable && draftVersionId) {
       const v = await api.apps.updateVersion(appId, draftVersionId, vc);
@@ -522,13 +705,17 @@ export function AppEditorPage() {
     return { appId, versionId };
   };
 
-  // ── Actions ───────────────────────────────────────────────────────────────
+
+  const handleNextStep = () => {
+    if (validateInputStep()) setStep(2);
+  };
+
   const handleSaveDraft = async () => {
     if (!validate()) return;
     setSaving(true);
     try {
-      const res = await persist();
-      if (res) navigate(`/apps/${res.appId}/edit`);
+      await persist();
+      window.alert('已保存为草稿。需要发布后更改才生效。');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '保存失败');
     } finally {
@@ -536,8 +723,10 @@ export function AppEditorPage() {
     }
   };
 
-  const handleNextStep = () => {
-    if (validateInputStep()) setStep(2);
+  const handleCancel = () => {
+    if (window.confirm('你所做的更改不会被保存，确认离开吗？')) {
+      navigate('/home');
+    }
   };
 
   const handleSubmit = async () => {
@@ -585,21 +774,29 @@ export function AppEditorPage() {
     );
   }
 
+
   return (
     <div className="flex flex-col h-full min-w-0 bg-paper">
       <PageHead
         crumbs={[
           { label: '首页', to: '/home' },
-          { label: isEdit ? '编辑应用' : '创建应用' },
+          { label: appName || '编辑应用' },
         ]}
         actions={
           <>
             <button
-              onClick={() => navigate('/home')}
+              onClick={handleCancel}
               className="cw-btn cw-btn-ghost cw-btn-sm"
               disabled={saving}
             >
               取消
+            </button>
+            <button
+              onClick={handleSaveDraft}
+              className="cw-btn cw-btn-sm"
+              disabled={saving}
+            >
+              {saving ? '保存中…' : '保存'}
             </button>
             {step === 1 ? (
               <button
@@ -619,28 +816,12 @@ export function AppEditorPage() {
                   上一步
                 </button>
                 <button
-                  onClick={handleSaveDraft}
-                  className="cw-btn cw-btn-sm"
-                  disabled={saving}
-                >
-                  {saving ? '保存中…' : '保存草稿'}
-                </button>
-                <button
-                  onClick={handleSubmit}
+                  onClick={isAdmin ? handlePublish : handleSubmit}
                   className="cw-btn cw-btn-primary cw-btn-sm"
                   disabled={saving}
                 >
-                  提交审核
+                  {saving ? '发布中…' : '发布'}
                 </button>
-                {isAdmin && (
-                  <button
-                    onClick={handlePublish}
-                    className="cw-btn cw-btn-accent cw-btn-sm"
-                    disabled={saving}
-                  >
-                    发布
-                  </button>
-                )}
               </>
             )}
           </>
@@ -663,84 +844,20 @@ export function AppEditorPage() {
             }}
           />
 
-          {step === 1 && (
-            <>
-          {/* ── App-level fields ── */}
-          <Section title="基本信息">
-            <div className="grid grid-cols-1 sm:grid-cols-[1fr_120px] gap-3">
-              <div className="flex flex-col gap-1">
-                <label className="cw-label">名称 *</label>
-                <input
-                  className={inputCls}
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="合同审查助手"
-                />
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="cw-label">图标 / Emoji</label>
-                <input
-                  className={inputCls}
-                  value={icon}
-                  onChange={(e) => setIcon(e.target.value)}
-                  placeholder="◐"
-                  maxLength={4}
-                />
-              </div>
-            </div>
-            <div className="flex flex-col gap-1">
-              <label className="cw-label">描述</label>
-              <textarea
-                className={`${inputCls} min-h-[60px] resize-y`}
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                placeholder="一句话说明这个应用做什么"
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <label className="cw-label">可见性</label>
-              <div className="border border-line rounded-sm px-2 py-1.5 bg-paper inline-flex items-center w-fit">
-                <Dropdown
-                  value={visibility}
-                  options={VISIBILITY_OPTIONS}
-                  onChange={(v) => setVisibility(v as AppVisibility)}
-                  align="left"
-                  title="可见性"
-                />
-              </div>
-            </div>
-          </Section>
-            </>
-          )}
-
           {step === 2 && (
             <>
           {/* ── Harness ── */}
           <Section
             title="运行配置 (Harness)"
-            hint={`版本 ${harness.version}${
-              isEdit && !draftEditable
-                ? ' · 当前版本不可改，保存将创建新草稿版本'
-                : ''
-            }`}
+            hint={!draftEditable ? '当前配置不可改，保存将创建新草稿' : ''}
           >
-            <div className="grid grid-cols-1 sm:grid-cols-[120px_1fr] gap-3">
-              <div className="flex flex-col gap-1">
-                <label className="cw-label">版本号</label>
-                <div className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper font-mono text-ink">
-                  v{harness.version}
-                </div>
-              </div>
-              <div className="flex items-end text-[11px] text-dim pb-1">
-                版本号由服务端按应用自增分配；编辑草稿会保留当前版本，基于已发布版本保存会生成下一版草稿。
-              </div>
-            </div>
             <PromptTemplateEditor
               label="系统提示词 (system prompt)"
               value={harness.system_prompt}
               onChange={(system_prompt) => patchHarness({ system_prompt })}
               fields={harness.input_schema}
               placeholder="你是一名严谨的合同审查专家。必须按组织标准输出审查摘要、风险清单和修改建议…"
+              error={harnessErrors.system_prompt}
             />
             <PromptTemplateEditor
               label="用户提示词模板 (user prompt template)"
@@ -749,76 +866,100 @@ export function AppEditorPage() {
               fields={harness.input_schema}
               placeholder="请审查 /contract，重点关注 /focus。若有附件，请读取 /attachment。"
               minHeight={140}
+              error={harnessErrors.user_prompt_template}
             />
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div className="flex flex-col gap-1">
-                <label className="cw-label">模型</label>
-                <div className="border border-line rounded-sm px-2 py-1.5 bg-paper inline-flex items-center">
-                  <Dropdown
-                    value={harness.model}
-                    options={MODEL_OPTIONS}
-                    onChange={(m) => patchHarness({ model: m })}
-                    align="left"
-                    title="模型"
-                  />
-                </div>
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="cw-label">推理强度</label>
-                <div className="border border-line rounded-sm px-2 py-1.5 bg-paper inline-flex items-center">
-                  <Dropdown
-                    value={harness.reasoning_effort}
-                    options={EFFORT_OPTIONS}
-                    onChange={(e) => patchHarness({ reasoning_effort: e })}
-                    align="left"
-                    title="推理强度"
-                  />
-                </div>
+            <div className="flex flex-col gap-1 max-w-xs">
+              <label className="cw-label">模型</label>
+              <div className="border border-line rounded-sm px-2 py-1.5 bg-paper inline-flex items-center">
+                <Dropdown
+                  value={harness.model}
+                  options={MODEL_OPTIONS}
+                  onChange={(m) => patchHarness({ model: m })}
+                  align="left"
+                  title="模型"
+                  fullWidth
+                />
               </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-              <div className="flex flex-col gap-1">
-                <label className="cw-label">temperature</label>
-                <input
-                  type="number"
-                  step={0.1}
-                  className={inputCls}
-                  value={harness.temperature}
-                  onChange={(e) => patchHarness({ temperature: e.target.value })}
-                  placeholder="（默认）"
-                />
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="cw-label">top_p</label>
-                <input
-                  type="number"
-                  step={0.05}
-                  className={inputCls}
-                  value={harness.top_p}
-                  onChange={(e) => patchHarness({ top_p: e.target.value })}
-                  placeholder="（默认）"
-                />
-              </div>
-              <div className="flex flex-col gap-1">
-                <label className="cw-label">max_tokens</label>
-                <input
-                  type="number"
-                  step={1}
-                  className={inputCls}
-                  value={harness.max_tokens}
-                  onChange={(e) => patchHarness({ max_tokens: e.target.value })}
-                  placeholder="（默认）"
-                />
-              </div>
+            <div className="border-t border-line pt-4 mt-2">
+              <button
+                type="button"
+                onClick={() => setShowAdvanced(!showAdvanced)}
+                className="flex items-center gap-1.5 text-[12px] text-dim hover:text-ink font-medium select-none"
+              >
+                <span>{showAdvanced ? '▼' : '▶'}</span> 高级设置
+              </button>
+              {showAdvanced && (
+                <div className="mt-3 flex flex-col gap-4">
+                  <div className="flex flex-col gap-1 max-w-xs">
+                    <label className="cw-label">推理强度</label>
+                    <div className="border border-line rounded-sm px-2 py-1.5 bg-paper inline-flex items-center">
+                      <Dropdown
+                        value={harness.reasoning_effort}
+                        options={EFFORT_OPTIONS}
+                        onChange={(e) => patchHarness({ reasoning_effort: e })}
+                        align="left"
+                        title="推理强度"
+                        fullWidth
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div className="flex flex-col gap-1">
+                      <label className="cw-label">temperature</label>
+                      <input
+                        type="number"
+                        step={0.1}
+                        className={harnessErrors.temperature ? inputCls.replace('border-line', 'border-accent') : inputCls}
+                        value={harness.temperature}
+                        onChange={(e) => patchHarness({ temperature: e.target.value })}
+                        placeholder="（默认）"
+                      />
+                      {harnessErrors.temperature && (
+                        <span className="text-[10.5px] text-accent">{harnessErrors.temperature}</span>
+                      )}
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="cw-label">top_p</label>
+                      <input
+                        type="number"
+                        step={0.05}
+                        className={harnessErrors.top_p ? inputCls.replace('border-line', 'border-accent') : inputCls}
+                        value={harness.top_p}
+                        onChange={(e) => patchHarness({ top_p: e.target.value })}
+                        placeholder="（默认）"
+                      />
+                      {harnessErrors.top_p && (
+                        <span className="text-[10.5px] text-accent">{harnessErrors.top_p}</span>
+                      )}
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <label className="cw-label">max_tokens</label>
+                      <input
+                        type="number"
+                        step={1}
+                        className={harnessErrors.max_tokens ? inputCls.replace('border-line', 'border-accent') : inputCls}
+                        value={harness.max_tokens}
+                        onChange={(e) => patchHarness({ max_tokens: e.target.value })}
+                        placeholder="（默认）"
+                      />
+                      {harnessErrors.max_tokens && (
+                        <span className="text-[10.5px] text-accent">{harnessErrors.max_tokens}</span>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           </Section>
 
-          {/* ── Forced skills ── */}
+          {/* ── Skills ── */}
           <Section
-            title="强制启用 Skills"
-            hint="运行该应用时固定开启这些技能，忽略用户个人工具箱。"
+            title="配置技能 (Skills)"
+            hint="运行该应用时固定开启这些技能。"
           >
             {skills.length === 0 ? (
               <span className="text-[12px] text-dim italic font-mono">
@@ -840,10 +981,10 @@ export function AppEditorPage() {
             )}
           </Section>
 
-          {/* ── Forced MCP servers ── */}
+          {/* ── MCP servers ── */}
           <Section
-            title="强制 MCP 服务（前向兼容，仅记录）"
-            hint="v1 仅存储不强制过滤，运行时仍由租户全局注入。"
+            title="MCP 服务配置（前向兼容，仅记录）"
+            hint="v1 仅存储不进行过滤，运行时仍由租户全局注入。"
           >
             {mcpServers.length === 0 ? (
               <span className="text-[12px] text-dim italic font-mono">
@@ -883,6 +1024,20 @@ export function AppEditorPage() {
 
           {/* ── Footer actions (mirror header for long forms) ── */}
           <div className="flex items-center justify-end gap-2 pb-8">
+            <button
+              onClick={handleCancel}
+              className="cw-btn cw-btn-ghost cw-btn-sm"
+              disabled={saving}
+            >
+              取消
+            </button>
+            <button
+              onClick={handleSaveDraft}
+              className="cw-btn cw-btn-sm"
+              disabled={saving}
+            >
+              {saving ? '保存中…' : '保存'}
+            </button>
             {step === 1 ? (
               <button
                 onClick={handleNextStep}
@@ -901,28 +1056,12 @@ export function AppEditorPage() {
                   上一步
                 </button>
                 <button
-                  onClick={handleSaveDraft}
-                  className="cw-btn cw-btn-sm"
-                  disabled={saving}
-                >
-                  {saving ? '保存中…' : '保存草稿'}
-                </button>
-                <button
-                  onClick={handleSubmit}
+                  onClick={isAdmin ? handlePublish : handleSubmit}
                   className="cw-btn cw-btn-primary cw-btn-sm"
                   disabled={saving}
                 >
-                  提交审核
+                  {saving ? '发布中…' : '发布'}
                 </button>
-                {isAdmin && (
-                  <button
-                    onClick={handlePublish}
-                    className="cw-btn cw-btn-accent cw-btn-sm"
-                    disabled={saving}
-                  >
-                    发布
-                  </button>
-                )}
               </>
             )}
           </div>

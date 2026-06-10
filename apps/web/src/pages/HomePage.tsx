@@ -11,12 +11,14 @@ import { Chip } from '../components/shell/Chip';
 import { Dropdown } from '../components/shell/Dropdown';
 import { useChatStore } from '../stores/chatStore';
 import { useApps } from '../hooks/useApps';
+import { CreateAppModal } from '../components/app/CreateAppModal';
 import {
   MODEL_OPTIONS,
   EFFORT_OPTIONS,
-  DEFAULT_MODEL,
+  SYSTEM_FALLBACK_MODEL,
   DEFAULT_EFFORT,
 } from '../lib/modelOptions';
+import { useDefaultModel } from '../hooks/useDefaultModel';
 
 const PLACEHOLDERS = [
   '帮我安排明天的团队站会…',
@@ -34,15 +36,32 @@ export function HomePage() {
   const { ws } = useWorkspace();
   const { sessions, createSession } = useSessions();
   const { apps, loading: appsLoading } = useApps('published');
+  const { apps: myApps, loading: myAppsLoading } = useApps('mine');
   const navigate = useNavigate();
   const [draft, setDraft] = useState('');
+  const [showCreateModal, setShowCreateModal] = useState(false);
   const [phIdx, setPhIdx] = useState(0);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
-  const [model, setModel] = useState<string>(DEFAULT_MODEL);
+  const { modelId: defaultModelId, isLoading: defaultModelLoading } = useDefaultModel('llm');
+  const [model, setModelRaw] = useState<string>(SYSTEM_FALLBACK_MODEL);
   const [effort, setEffort] = useState<string>(DEFAULT_EFFORT);
+  // Track whether the user has manually picked a model in the composer.
+  // If so, don't overwrite it when the hook resolves later.
+  const userModelChosen = useRef(false);
+  const setModel = (m: string) => {
+    userModelChosen.current = true;
+    setModelRaw(m);
+  };
+  // When the hook finishes loading, auto-fill the resolved default — but only
+  // if the user hasn't already made a manual selection.
+  useEffect(() => {
+    if (!defaultModelLoading && defaultModelId && !userModelChosen.current) {
+      setModelRaw(defaultModelId);
+    }
+  }, [defaultModelLoading, defaultModelId]);
   const setSessionModel = useChatStore((s) => s.setSessionModel);
   const setSessionEffort = useChatStore((s) => s.setSessionEffort);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -129,13 +148,6 @@ export function HomePage() {
     }
   };
 
-  // "空白任务" (free chat) — scroll to and focus the composer so the user can
-  // type a goal and send via the existing startChat flow. We deliberately keep
-  // the composer/startChat path intact for free chat (option a).
-  const focusComposer = () => {
-    composerRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    composerRef.current?.focus();
-  };
 
   const openSession = (s: Session) => {
     if (s.metadata?.kind === 'app_run' && s.current_run_id) {
@@ -297,7 +309,7 @@ export function HomePage() {
             </span>
             <button
               type="button"
-              onClick={() => navigate('/apps/new')}
+              onClick={() => setShowCreateModal(true)}
               className="cw-btn cw-btn-ghost cw-btn-sm"
               title="从零创建一个应用"
             >
@@ -306,11 +318,11 @@ export function HomePage() {
             <div className="flex-1 h-px bg-line" />
           </div>
 
-          {/* apps + blank-task card */}
+          {/* 应用中心 — published apps */}
           <div className="w-[min(960px,95%)] grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-            {/* 空白任务 — free chat: focuses the composer */}
+            {/* 空白任务 */}
             <div
-              onClick={focusComposer}
+              onClick={() => setShowCreateModal(true)}
               className="border border-line bg-surface rounded-md p-3.5 cursor-pointer flex flex-col gap-1.5 min-h-[120px] transition-all hover:border-ink-2 hover:-translate-y-px"
             >
               <div className="flex items-center gap-2.5 mb-0.5">
@@ -330,7 +342,7 @@ export function HomePage() {
               </div>
             </div>
 
-            {/* real published apps */}
+            {/* published apps */}
             {apps.map((app) => (
               <div
                 key={app.id}
@@ -355,13 +367,65 @@ export function HomePage() {
               </div>
             ))}
 
-            {/* empty state — no published apps yet */}
             {!appsLoading && apps.length === 0 && (
               <div className="border border-line border-dashed bg-surface rounded-md p-3.5 flex flex-col gap-2 items-start justify-center min-h-[120px]">
-                <div className="font-mono italic text-dim text-[12px]">暂无应用</div>
+                <div className="font-mono italic text-dim text-[12px]">暂无已发布应用</div>
+              </div>
+            )}
+          </div>
+
+          {/* 我的应用 divider */}
+          <div className="w-[min(960px,95%)] flex items-center gap-3.5 mt-1">
+            <div className="flex-1 h-px bg-line" />
+            <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim">
+              我的应用
+            </span>
+            <div className="flex-1 h-px bg-line" />
+          </div>
+
+          {/* 我的应用 — my apps */}
+          <div className="w-[min(960px,95%)] grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+            {myApps.map((app) => {
+              const latestVersion = app.versions?.length
+                ? app.versions[app.versions.length - 1]
+                : null;
+              const statusLabel =
+                latestVersion?.status === 'draft' ? '草稿'
+                : latestVersion?.status === 'pending_review' ? '待审核'
+                : latestVersion?.status === 'published' ? '已发布'
+                : latestVersion?.status === 'rejected' ? '已拒绝'
+                : '草稿';
+              return (
+                <div
+                  key={app.id}
+                  onClick={() => navigate(`/apps/${app.id}/edit`)}
+                  className="border border-line bg-surface rounded-md p-3.5 cursor-pointer flex flex-col gap-1.5 min-h-[120px] transition-all hover:border-ink-2 hover:-translate-y-px"
+                >
+                  <div className="flex items-center gap-2.5 mb-0.5">
+                    <div className="w-7 h-7 border border-line rounded-sm flex items-center justify-center font-mono text-[13px] text-ink bg-paper">
+                      {app.icon || DEFAULT_APP_GLYPH}
+                    </div>
+                    <div className="text-[14px] font-semibold tracking-[-0.01em]">{app.name}</div>
+                    <div className="flex-1" />
+                    <span className="font-mono text-[10.5px] text-dim">→</span>
+                  </div>
+                  <div className="text-[12px] text-dim leading-[1.45]">
+                    {app.description || '点击编辑此应用'}
+                  </div>
+                  <div className="flex-1" />
+                  <div className="flex gap-1 flex-wrap">
+                    <Chip>{statusLabel}</Chip>
+                  </div>
+                </div>
+              );
+            })}
+
+            {!myAppsLoading && myApps.length === 0 && (
+              <div className="border border-line border-dashed bg-surface rounded-md p-3.5 flex flex-col gap-2 items-start justify-center min-h-[120px]">
+                <div className="font-mono italic text-dim text-[12px]">你还没有创建应用</div>
                 <button
                   type="button"
-                  onClick={() => navigate('/apps/new')}
+                  onClick={() => setShowCreateModal(true)}
                   className="cw-btn cw-btn-ghost cw-btn-sm"
                 >
                   <span className="font-mono">+</span> 创建应用
@@ -409,6 +473,11 @@ export function HomePage() {
           </div>
         </div>
       </div>
+
+      <CreateAppModal
+        open={showCreateModal}
+        onClose={() => setShowCreateModal(false)}
+      />
     </div>
   );
 }

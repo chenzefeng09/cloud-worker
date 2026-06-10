@@ -13,6 +13,8 @@ interface Props {
   title?: string;
   /** Which edge the popover aligns to. Defaults to 'right'. */
   align?: 'left' | 'right';
+  /** Render as a full-width bordered input-like trigger. */
+  fullWidth?: boolean;
 }
 
 /**
@@ -20,7 +22,7 @@ interface Props {
  * Opens UPWARD (it lives in a bottom toolbar). Closes on outside click and on
  * selection — same pattern as InputBar's "+" popover.
  */
-export function Dropdown({ value, options, onChange, disabled, title, align = 'right' }: Props) {
+export function Dropdown({ value, options, onChange, disabled, title, align = 'right', fullWidth }: Props) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -36,7 +38,7 @@ export function Dropdown({ value, options, onChange, disabled, title, align = 'r
   const current = options.find((o) => o.id === value)?.label ?? value;
 
   return (
-    <div ref={ref} className="relative shrink-0">
+    <div ref={ref} className={`relative shrink-0${fullWidth ? ' w-full' : ''}`}>
       <button
         type="button"
         disabled={disabled}
@@ -44,7 +46,11 @@ export function Dropdown({ value, options, onChange, disabled, title, align = 'r
         title={title}
         aria-haspopup="menu"
         aria-expanded={open}
-        className="font-mono text-[10.5px] text-dim hover:text-ink disabled:opacity-50 leading-none inline-flex items-center gap-0.5"
+        className={
+          fullWidth
+            ? 'w-full border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper text-left flex items-center justify-between gap-1 hover:border-ink-2 focus:outline-none focus:border-accent'
+            : 'font-mono text-[10.5px] text-dim hover:text-ink disabled:opacity-50 leading-none inline-flex items-center gap-0.5'
+        }
       >
         {current}
         <span aria-hidden className="text-[8px]">▾</span>
