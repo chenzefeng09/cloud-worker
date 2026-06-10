@@ -28,7 +28,7 @@ from typing import Any
 
 import docker
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
@@ -442,6 +442,50 @@ async def create_run(
         "task_description": task,
         "created_at": datetime.now(UTC).isoformat(),
     }
+
+
+@router.get("/runs",
+            dependencies=[Depends(require_permission("run.read", "run"))])
+async def list_runs(
+    request: Request,
+    status_filter: str | None = Query(None, alias="status"),
+    limit: int = Query(50, ge=1, le=200),
+    tenant_id: str = TTenantId,
+    user_id: str = TUserId,
+) -> dict[str, Any]:
+    """Tenant-scoped run history — proxies the session-orchestrator.
+
+    The scheduler keeps no run history of its own; the orchestrator's
+    Postgres is the source of truth.  We forward the caller's tenant/user
+    headers so the orchestrator applies the same tenant isolation, normalise
+    the optional ``status`` filter to upper-case, and return the orchestrator
+    payload (``{"items": [...]}``) verbatim.  Any orchestrator failure or
+    non-2xx surfaces as a 502 — never a partial / fabricated list.
+    """
+    settings: Settings = request.app.state.settings
+    params: dict[str, Any] = {"limit": limit}
+    if status_filter:
+        params["status"] = status_filter.upper()
+
+    url = f"{settings.session_orchestrator_url.rstrip('/')}/runs"
+    headers = {"X-Tenant-Id": tenant_id, "X-User-Id": user_id}
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params=params, headers=headers)
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="session-orchestrator unreachable while listing runs",
+        ) from exc
+
+    if resp.status_code < 200 or resp.status_code >= 300:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"session-orchestrator returned HTTP {resp.status_code} for GET /runs",
+        )
+
+    return resp.json()
 
 
 @router.get("/runs/{run_id}",

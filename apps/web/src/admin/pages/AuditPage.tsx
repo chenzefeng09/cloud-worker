@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
-import type { AuditEvent } from '../../api/types';
+import type { AuditEvent, AuditChainVerifyResult } from '../../api/types';
 
 export function AuditPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading } = useAdminStore();
@@ -15,6 +15,35 @@ export function AuditPage() {
   const [isTodoEndpoint, setIsTodoEndpoint] = useState(false);
   const [queried, setQueried] = useState(false);
 
+  // Chain integrity verification state.
+  const [verifying, setVerifying] = useState(false);
+  const [verifyResult, setVerifyResult] = useState<AuditChainVerifyResult | null>(null);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
+  const [verifyTodo, setVerifyTodo] = useState(false);
+
+  const handleVerifyChain = async () => {
+    setVerifying(true);
+    setVerifyResult(null);
+    setVerifyError(null);
+    setVerifyTodo(false);
+    try {
+      // tenant_id drives the upstream X-Tenant-Id; the verifier blocks
+      // cross-tenant checks, so this must be the selected tenant.
+      const result = await api.admin.audit.verifyChain({
+        tenant_id: tenantId || undefined,
+      });
+      setVerifyResult(result);
+    } catch (err) {
+      if (err instanceof ApiError && (err.status === 404 || err.status === 501 || err.status === 502)) {
+        setVerifyTodo(true);
+      } else {
+        setVerifyError(err instanceof ApiError ? err.message : '校验失败');
+      }
+    } finally {
+      setVerifying(false);
+    }
+  };
+
   // Bootstrap tenant list for filter
   if (tenants.length === 0 && !tenantsLoading) {
     setTenantsLoading(true);
@@ -27,14 +56,22 @@ export function AuditPage() {
 
   const handleQuery = async (e: React.FormEvent) => {
     e.preventDefault();
+    // Upstream audit query is tenant-scoped and rejects a missing tenant_id (422).
+    // Require an explicit tenant rather than surfacing the raw validation error.
+    if (!tenantId) {
+      setEvents([]);
+      setQueried(true);
+      setIsTodoEndpoint(false);
+      setError('请先选择一个租户后再查询审计事件。');
+      return;
+    }
     setLoading(true);
     setError(null);
     setIsTodoEndpoint(false);
     setQueried(true);
     try {
-      const body: Record<string, unknown> = { limit: 50 };
-      if (tenantId) body.tenant_id = tenantId;
-      if (action) body.action = action;
+      const body: Record<string, unknown> = { limit: 50, tenant_id: tenantId };
+      if (action) body.event_type = action;
       if (from) body.from = from;
       if (to) body.to = to;
       const data = await api.admin.audit.query(body);
@@ -104,7 +141,7 @@ export function AuditPage() {
             />
           </div>
         </div>
-        <div>
+        <div className="flex items-center gap-2">
           <button
             type="submit"
             disabled={loading}
@@ -112,8 +149,95 @@ export function AuditPage() {
           >
             {loading ? '查询中…' : '查询'}
           </button>
+          <button
+            type="button"
+            onClick={handleVerifyChain}
+            disabled={verifying}
+            className="px-3 py-1.5 text-[12px] font-mono border border-line bg-paper rounded-sm hover:bg-paper-2 disabled:opacity-50"
+          >
+            {verifying ? '校验中…' : '链完整性校验'}
+          </button>
+          <span className="text-[11px] text-dim">
+            校验所选租户的审计哈希链与 Merkle 签名（未选租户时校验当前管理员租户）
+          </span>
         </div>
       </form>
+
+      {/* Chain integrity verification result */}
+      {verifyTodo && (
+        <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
+          该能力服务未启用（链校验代理端点不可达）。
+        </div>
+      )}
+      {verifyError && (
+        <div className="border border-accent-line rounded-md px-4 py-3 bg-accent-soft text-[13px] text-accent">
+          {verifyError}
+        </div>
+      )}
+      {verifyResult && (
+        <div
+          className={[
+            'border rounded-md p-4 flex flex-col gap-3',
+            verifyResult.valid
+              ? 'border-green-200 bg-green-50'
+              : 'border-red-200 bg-red-50',
+          ].join(' ')}
+        >
+          <div className="flex items-center gap-2">
+            <span
+              className={`inline-flex items-center justify-center w-5 h-5 rounded-full text-[12px] font-bold ${verifyResult.valid ? 'bg-green-600 text-white' : 'bg-red-600 text-white'}`}
+            >
+              {verifyResult.valid ? '✓' : '✗'}
+            </span>
+            <span className={`text-[14px] font-display ${verifyResult.valid ? 'text-green-800' : 'text-red-800'}`}>
+              {verifyResult.valid ? '哈希链完整' : '检测到链断裂'}
+            </span>
+          </div>
+          <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[11.5px]">
+            {verifyResult.events_checked !== undefined && (
+              <>
+                <span className="font-mono text-dim">已校验事件</span>
+                <span className="font-mono text-ink-2">{verifyResult.events_checked.toLocaleString()}</span>
+              </>
+            )}
+            {verifyResult.signatures_verified !== undefined && (
+              <>
+                <span className="font-mono text-dim">签名验证通过</span>
+                <span className="font-mono text-ink-2">{verifyResult.signatures_verified.toLocaleString()}</span>
+              </>
+            )}
+            {verifyResult.signatures_failed !== undefined && (
+              <>
+                <span className="font-mono text-dim">签名验证失败</span>
+                <span className={`font-mono ${verifyResult.signatures_failed > 0 ? 'text-red-700' : 'text-ink-2'}`}>
+                  {verifyResult.signatures_failed.toLocaleString()}
+                </span>
+              </>
+            )}
+            {verifyResult.tsa_present !== undefined && (
+              <>
+                <span className="font-mono text-dim">含可信时间戳</span>
+                <span className="font-mono text-ink-2">{verifyResult.tsa_present.toLocaleString()}</span>
+              </>
+            )}
+            {verifyResult.effective_tenant_id && (
+              <>
+                <span className="font-mono text-dim">校验租户</span>
+                <span className="font-mono text-ink-2 truncate">{verifyResult.effective_tenant_id}</span>
+              </>
+            )}
+            {!verifyResult.valid && verifyResult.first_break_event_id && (
+              <>
+                <span className="font-mono text-red-700">首个断链事件</span>
+                <span className="font-mono text-red-800 truncate">{verifyResult.first_break_event_id}</span>
+              </>
+            )}
+          </div>
+          {verifyResult.message && (
+            <div className="text-[11.5px] text-dim font-mono">{verifyResult.message}</div>
+          )}
+        </div>
+      )}
 
       {error && (
         <div className="border border-accent-line rounded-md px-4 py-3 bg-accent-soft text-[13px] text-accent">
@@ -144,16 +268,16 @@ export function AuditPage() {
               </thead>
               <tbody>
                 {events.map((ev) => (
-                  <tr key={ev.id} className="border-b border-line-2 hover:bg-paper-2 transition-colors">
+                  <tr key={ev.event_id} className="border-b border-line-2 hover:bg-paper-2 transition-colors">
                     <td className="px-3 py-2 font-mono text-[11px] text-dim whitespace-nowrap">
-                      {new Date(ev.created_at).toLocaleString('zh-CN')}
+                      {ev.occurred_at ? new Date(ev.occurred_at).toLocaleString('zh-CN') : '—'}
                     </td>
-                    <td className="px-3 py-2 font-mono text-[12px] text-ink">{ev.action}</td>
+                    <td className="px-3 py-2 font-mono text-[12px] text-ink">{ev.event_type}</td>
                     <td className="px-3 py-2 font-mono text-[11px] text-ink-2">
                       {ev.resource_type ? `${ev.resource_type}/${ev.resource_id ?? ''}` : '—'}
                     </td>
                     <td className="px-3 py-2 font-mono text-[11px] text-dim truncate max-w-[120px]">
-                      {ev.actor_id ?? '—'}
+                      {ev.actor_user_id ?? ev.actor_kind ?? '—'}
                     </td>
                     <td className="px-3 py-2 font-mono text-[11px] text-dim truncate max-w-[120px]">
                       {ev.tenant_id}

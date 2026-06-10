@@ -170,10 +170,17 @@ def test_auth_me_includes_roles(
 class FakeAuditFoundation(FakeAdminFoundation):
     """Extends FakeAdminFoundation to stub the audit service as well."""
 
+    def __init__(self, *, authz_allowed: bool = True) -> None:
+        super().__init__(authz_allowed=authz_allowed)
+        # Forwarded JSON bodies for each audit /events:query call — lets tests
+        # assert the BFF injected the effective tenant_id into the body.
+        self.audit_bodies: list[Any] = []
+
     def route(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
-        # Audit events:query — record call and return stub
+        # Audit events:query — record call (+ forwarded body) and return stub
         if "/events:query" in url and method == "POST":
             self.calls.append((method, url))
+            self.audit_bodies.append(kwargs.get("json"))
             return httpx.Response(200, json={
                 "items": [
                     {
@@ -468,6 +475,29 @@ def test_audit_query_fallback_effective_tenant_id(
     assert resp.status_code == 200
     # Falls back to the admin's own tenant (from the stubbed session).
     assert resp.json()["effective_tenant_id"] == "tnt_01J5TEST00000000000000TNT1"
+
+
+def test_audit_query_fallback_injects_tenant_id_into_body(
+    client,
+    authed_cookie: dict,
+    fake_audit_foundation: FakeAuditFoundation,
+) -> None:
+    """When tenant_id is omitted, the BFF must inject the caller's tenant into
+    the forwarded *body* (not just the X-Tenant-Id header) — foundation-audit
+    validates tenant_id from the body, so without this the fallback 422s."""
+    resp = client.post(
+        "/api/bff/v1/admin/audit/events:query",
+        json={"limit": 10},
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    # Exactly one audit call was forwarded; its body must carry the caller's
+    # tenant injected by the BFF (matching the X-Tenant-Id fallback).
+    assert fake_audit_foundation.audit_bodies, "audit /events:query body not captured"
+    forwarded = fake_audit_foundation.audit_bodies[-1]
+    assert forwarded["tenant_id"] == "tnt_01J5TEST00000000000000TNT1"
+    # Other fields are still forwarded verbatim.
+    assert forwarded["limit"] == 10
 
 
 # ──────────────────────────────────────────────────────────────────────────────

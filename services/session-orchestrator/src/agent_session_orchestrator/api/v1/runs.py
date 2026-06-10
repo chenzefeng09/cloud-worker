@@ -59,6 +59,26 @@ def _now() -> dt.datetime:
     return dt.datetime.now(tz=dt.UTC)
 
 
+def _serialize_run(r: Run) -> dict[str, Any]:
+    """Run → dict for list responses (session-level and tenant-level share this)."""
+    return {
+        "id": r.id,
+        "session_id": r.session_id,
+        "sandbox_id": r.sandbox_id,
+        "status": r.status,
+        "task_description": r.task_description,
+        "result_summary": r.result_summary,
+        "error_message": r.error_message,
+        "started_at": r.started_at.isoformat() if r.started_at else None,
+        "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+        "created_at": r.created_at.isoformat(),
+        "input_tokens": r.input_tokens,
+        "output_tokens": r.output_tokens,
+        "total_tokens": r.total_tokens,
+        "app_snapshot": r.app_snapshot,
+    }
+
+
 async def _fetch_memory(*, knowledge_ingest_url: str, tenant_id: str, query: str) -> str:
     """Query knowledge-ingest for relevant memories and return a formatted string.
 
@@ -284,27 +304,27 @@ async def list_runs(
 ) -> dict[str, Any]:
     svc = SessionService(db, tenant_id=tenant_id)
     runs = await svc.list_runs(session_id)
-    return {
-        "items": [
-            {
-                "id": r.id,
-                "session_id": r.session_id,
-                "sandbox_id": r.sandbox_id,
-                "status": r.status,
-                "task_description": r.task_description,
-                "result_summary": r.result_summary,
-                "error_message": r.error_message,
-                "started_at": r.started_at.isoformat() if r.started_at else None,
-                "finished_at": r.finished_at.isoformat() if r.finished_at else None,
-                "created_at": r.created_at.isoformat(),
-                "input_tokens": r.input_tokens,
-                "output_tokens": r.output_tokens,
-                "total_tokens": r.total_tokens,
-                "app_snapshot": r.app_snapshot,
-            }
-            for r in runs
-        ]
-    }
+    return {"items": [_serialize_run(r) for r in runs]}
+
+
+@router.get("/runs",
+            dependencies=[Depends(require_permission("run.read", "run"))])
+async def list_tenant_runs(
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+    status: str | None = None,
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict[str, Any]:
+    """List runs for the current tenant across all sessions.
+
+    Tenant is scoped from the X-Tenant-Id middleware (same as every other
+    endpoint here).  ``status`` is normalised to upper-case before filtering;
+    ``limit`` is capped at 200.  Response shape matches the session-level list.
+    """
+    svc = SessionService(db, tenant_id=tenant_id)
+    status_norm = status.upper() if status else None
+    runs = await svc.list_tenant_runs(status=status_norm, limit=limit)
+    return {"items": [_serialize_run(r) for r in runs]}
 
 
 @router.get("/sessions/{session_id}/runs/{run_id}",

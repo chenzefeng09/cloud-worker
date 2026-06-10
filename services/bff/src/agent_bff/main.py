@@ -103,6 +103,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from agent_bff.api.v1.admin import router as admin_router
     app.include_router(admin_router, prefix=settings.api_prefix)
 
+    # Admin console v2 — foundation + platform governance proxies.
+    from agent_bff.api.v1.admin_authz import router as admin_authz_router
+    app.include_router(admin_authz_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_org import router as admin_org_router
+    app.include_router(admin_org_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_identity import router as admin_identity_router
+    app.include_router(admin_identity_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_billing import router as admin_billing_router
+    app.include_router(admin_billing_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_audit import router as admin_audit_router
+    app.include_router(admin_audit_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_flags import router as admin_flags_router
+    app.include_router(admin_flags_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_platform import router as admin_platform_router
+    app.include_router(admin_platform_router, prefix=settings.api_prefix)
+
     from agent_bff.api.v1.billing import router as billing_router
     app.include_router(billing_router, prefix=settings.api_prefix)
 

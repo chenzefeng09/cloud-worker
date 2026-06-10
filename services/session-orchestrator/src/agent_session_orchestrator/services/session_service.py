@@ -309,6 +309,23 @@ class SessionService:
         result = await self._db.execute(stmt)
         return list(result.scalars().all())
 
+    async def list_tenant_runs(
+        self, status: str | None = None, limit: int = 50
+    ) -> list[Run]:
+        """List all runs for the current tenant (across every session).
+
+        Tenant-scoped via ``self._tenant_id`` (sourced from the X-Tenant-Id
+        middleware, same as every other method here).  ``status`` filters on an
+        exact match when provided; callers normalise casing.  Ordered newest
+        first and capped by ``limit``.
+        """
+        stmt = select(Run).where(Run.tenant_id == self._tenant_id)
+        if status is not None:
+            stmt = stmt.where(Run.status == status)
+        stmt = stmt.order_by(Run.created_at.desc()).limit(limit)
+        result = await self._db.execute(stmt)
+        return list(result.scalars().all())
+
     async def delete_messages_from_sequence(self, session_id: str, from_sequence: int) -> int:
         """Delete all messages with sequence >= from_sequence for this session.
 

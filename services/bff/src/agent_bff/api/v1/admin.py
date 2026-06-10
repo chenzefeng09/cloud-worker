@@ -289,12 +289,16 @@ async def query_audit_events(
 
     If ``tenant_id`` is omitted from the body the BFF falls back to the
     admin's own tenant (which typically yields no cross-tenant data —
-    callers should always supply it).
+    callers should always supply it).  In that case the BFF also writes the
+    effective tenant back into the forwarded body's ``tenant_id`` field so it
+    stays consistent with the ``X-Tenant-Id`` header: foundation-audit
+    validates ``tenant_id`` in the request body, so without this the fallback
+    would never take effect (the downstream would 422).
 
     Request body (AuditQueryRequest subset forwarded verbatim):
         tenant_id   str       required for meaningful cross-tenant admin view
         actor_id    str       optional
-        action      str       optional  (e.g. "tenant.create")
+        event_type  str       optional  (e.g. "tenant.create")
         from        str       optional  ISO-8601 datetime
         to          str       optional  ISO-8601 datetime
         limit       int       optional  default 50
@@ -308,6 +312,14 @@ async def query_audit_events(
 
     # Determine the target tenant for RLS — prefer body.tenant_id.
     target_tenant_id: str = body.get("tenant_id") or admin_tenant_id
+
+    # foundation-audit validates ``tenant_id`` in the request body (not the
+    # X-Tenant-Id header), so when the caller omits it we must inject the
+    # effective tenant into the forwarded body to keep the two in sync —
+    # otherwise the documented fallback never takes effect and the downstream
+    # rejects the query with a 422.
+    if not body.get("tenant_id"):
+        body["tenant_id"] = target_tenant_id
 
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(

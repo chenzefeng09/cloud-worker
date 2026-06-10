@@ -1,5 +1,9 @@
 import type {
   ActiveSession,
+  AddTeamMemberRequest,
+  AdminRole,
+  AdminSkill,
+  AdminSkillVersion,
   AdminUser,
   ApiKey,
   ApiKeyCreated,
@@ -10,14 +14,29 @@ import type {
   AppUpdate,
   AppVersion,
   AppVersionCreate,
+  AuditChainVerifyRequest,
+  AuditChainVerifyResult,
   AuditEvent,
+  AuditExport,
+  AuditExportRequest,
   AuditQueryRequest,
   Attachment,
   AttachmentKind,
+  BillingPlanDef,
+  CancelSubscriptionRequest,
+  ChangePlanRequest,
+  CreateBindingRequest,
+  CreateOrgUnitRequest,
+  CreateRoleRequest,
+  CreateTeamRequest,
   CreateTenantRequest,
   CursorPage,
   DailyTokenUsageResponse,
+  FeatureFlag,
+  FeatureFlagUpdate,
   IngestResult,
+  InviteUserRequest,
+  KillSwitchRequest,
   KnowledgeDocument,
   ListPage,
   LoginResponse,
@@ -27,26 +46,40 @@ import type {
   ModelCatalogProvider,
   ModelProvider,
   ModelPurpose,
+  MoveOrgUnitRequest,
   NotifPreferenceItem,
+  OpsRun,
+  OrgUnit,
+  PatchMcpServerRequest,
   PatchTenantRequest,
+  PermissionDefinition,
   PoolSnapshot,
   ProbeReport,
   ProbeRequest,
   QuotaInfo,
+  RegisterMcpServerRequest,
   RegisterProviderRequest,
   ResolvedDefault,
+  RoleBinding,
   Run,
   RunState,
+  SandboxInfo,
   SandboxItem,
   Session,
   Skill,
   InstalledSkill,
   SkillVersion,
+  Team,
+  TeamMember,
   Tenant,
   TenantDefaultModel,
+  TenantSubscription,
   TokenUsage,
   TopologyGraph,
+  UpdateOrgUnitRequest,
   UpdateProviderRequest,
+  UpdateRoleRequest,
+  UsageRecord,
   UserModelPreference,
   UserProfile,
 } from './types';
@@ -79,6 +112,19 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   }
   if (res.status === 204) return undefined as T;
   return res.json();
+}
+
+/**
+ * Build a query string from a flat params object, dropping null/undefined
+ * values. Returns "" or "?a=1&b=2". Used by the admin console v2 namespaces
+ * where most list endpoints accept optional cross-tenant / filter params.
+ */
+function qs(params?: Record<string, string | number | boolean | undefined | null>): string {
+  if (!params) return '';
+  const pairs = Object.entries(params)
+    .filter(([, v]) => v !== undefined && v !== null && v !== '')
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`);
+  return pairs.length ? `?${pairs.join('&')}` : '';
 }
 
 export const api = {
@@ -304,17 +350,175 @@ export const api = {
     },
     users: {
       list: (tenantId?: string) => {
-        const qs = tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : '';
-        return request<{ items: AdminUser[] }>('GET', `/admin/users${qs}`);
+        const query = tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : '';
+        return request<{ items: AdminUser[] }>('GET', `/admin/users${query}`);
       },
+      // Invite a new user. Cross-tenant: pass tenant_id in the body.
+      invite: (body: InviteUserRequest) =>
+        request<AdminUser>('POST', '/admin/users', body),
+      freeze: (id: string, tenantId?: string) =>
+        request<void>('POST', `/admin/users/${id}/freeze${qs({ tenant_id: tenantId })}`),
+      unfreeze: (id: string, tenantId?: string) =>
+        request<void>('POST', `/admin/users/${id}/unfreeze${qs({ tenant_id: tenantId })}`),
+      resetPassword: (id: string, tenantId?: string) =>
+        request<void>('POST', `/admin/users/${id}/password:reset${qs({ tenant_id: tenantId })}`),
     },
     audit: {
       query: (body: AuditQueryRequest) =>
         request<{ items: AuditEvent[]; next_cursor?: string }>('POST', '/admin/audit/events:query', body),
+      // Verify hash-chain integrity over a time window.
+      verifyChain: (body: AuditChainVerifyRequest) =>
+        request<AuditChainVerifyResult>('POST', '/admin/audit/chain:verify', body),
+      // Kick off an async export job; poll getExport(id) until READY.
+      createExport: (body: AuditExportRequest) =>
+        request<AuditExport>('POST', '/admin/audit/export', body),
+      getExport: (id: string) =>
+        request<AuditExport>('GET', `/admin/audit/export/${id}`),
     },
     billing: {
       quota: (tenantId: string) =>
         request<QuotaInfo>('GET', `/admin/billing/quota?tenant_id=${encodeURIComponent(tenantId)}`),
+      // Plan catalogue — GET returns a {items: [...]} envelope; unwrap to array.
+      plans: () =>
+        request<{ items: BillingPlanDef[] }>('GET', '/admin/billing/plans').then((r) => r.items),
+      // Current subscription for a tenant (scoped via tenant_id query).
+      subscription: (tenantId?: string) =>
+        request<TenantSubscription>('GET', `/admin/billing/subscription${qs({ tenant_id: tenantId })}`),
+      changePlan: (body: ChangePlanRequest) =>
+        request<TenantSubscription>('POST', '/admin/billing/subscription/change-plan', body),
+      cancelSubscription: (body: CancelSubscriptionRequest) =>
+        request<TenantSubscription>('POST', '/admin/billing/subscription/cancel', body),
+      // Usage query — params (tenant_id, dimension, time range, granularity) passed through.
+      usage: (params?: Record<string, string | number | undefined>) =>
+        request<UsageRecord>('GET', `/admin/billing/usage${qs(params)}`),
+    },
+    // RBAC (→ foundation-authz). List endpoints return {items:[...]} — unwrapped to arrays.
+    authz: {
+      roles: {
+        list: (tenantId?: string) =>
+          request<{ items: AdminRole[] }>('GET', `/admin/authz/roles${qs({ tenant_id: tenantId })}`).then((r) => r.items),
+        create: (body: CreateRoleRequest, tenantId?: string) =>
+          request<AdminRole>('POST', `/admin/authz/roles${qs({ tenant_id: tenantId })}`, body),
+        get: (roleId: string, tenantId?: string) =>
+          request<AdminRole>('GET', `/admin/authz/roles/${roleId}${qs({ tenant_id: tenantId })}`),
+        patch: (roleId: string, body: UpdateRoleRequest, tenantId?: string) =>
+          request<AdminRole>('PATCH', `/admin/authz/roles/${roleId}${qs({ tenant_id: tenantId })}`, body),
+        delete: (roleId: string, tenantId?: string) =>
+          request<void>('DELETE', `/admin/authz/roles/${roleId}${qs({ tenant_id: tenantId })}`),
+      },
+      permissions: {
+        // Permission catalogue. Optional `service` filter passed through.
+        // Upstream (authz) returns a *bare array*, not an {items} envelope.
+        list: (params?: { service?: string }) =>
+          request<PermissionDefinition[] | { items: PermissionDefinition[] }>(
+            'GET',
+            `/admin/authz/permissions${qs(params)}`,
+          ).then((r) => (Array.isArray(r) ? r : r.items)),
+      },
+      bindings: {
+        list: (tenantId?: string) =>
+          request<{ items: RoleBinding[] }>('GET', `/admin/authz/bindings${qs({ tenant_id: tenantId })}`).then((r) => r.items),
+        create: (body: CreateBindingRequest, tenantId?: string) =>
+          request<RoleBinding>('POST', `/admin/authz/bindings${qs({ tenant_id: tenantId })}`, body),
+        delete: (bindingId: string, tenantId?: string) =>
+          request<void>('DELETE', `/admin/authz/bindings/${bindingId}${qs({ tenant_id: tenantId })}`),
+      },
+    },
+    // Organisation structure (→ foundation-org). List endpoints unwrap {items:[...]}.
+    org: {
+      orgUnits: {
+        list: (tenantId?: string) =>
+          request<{ items: OrgUnit[] }>('GET', `/admin/org/org-units${qs({ tenant_id: tenantId })}`).then((r) => r.items),
+        create: (body: CreateOrgUnitRequest, tenantId?: string) =>
+          request<OrgUnit>('POST', `/admin/org/org-units${qs({ tenant_id: tenantId })}`, body),
+        get: (id: string, tenantId?: string) =>
+          request<OrgUnit>('GET', `/admin/org/org-units/${id}${qs({ tenant_id: tenantId })}`),
+        patch: (id: string, body: UpdateOrgUnitRequest, tenantId?: string) =>
+          request<OrgUnit>('PATCH', `/admin/org/org-units/${id}${qs({ tenant_id: tenantId })}`, body),
+        delete: (id: string, tenantId?: string) =>
+          request<void>('DELETE', `/admin/org/org-units/${id}${qs({ tenant_id: tenantId })}`),
+        move: (id: string, body: MoveOrgUnitRequest, tenantId?: string) =>
+          request<OrgUnit>('POST', `/admin/org/org-units/${id}/move${qs({ tenant_id: tenantId })}`, body),
+      },
+      teams: {
+        list: (tenantId?: string) =>
+          request<{ items: Team[] }>('GET', `/admin/org/teams${qs({ tenant_id: tenantId })}`).then((r) => r.items),
+        create: (body: CreateTeamRequest, tenantId?: string) =>
+          request<Team>('POST', `/admin/org/teams${qs({ tenant_id: tenantId })}`, body),
+        members: {
+          list: (teamId: string, tenantId?: string) =>
+            request<{ items: TeamMember[] }>('GET', `/admin/org/teams/${teamId}/members${qs({ tenant_id: tenantId })}`).then((r) => r.items),
+          add: (teamId: string, body: AddTeamMemberRequest, tenantId?: string) =>
+            request<TeamMember>('POST', `/admin/org/teams/${teamId}/members${qs({ tenant_id: tenantId })}`, body),
+          remove: (teamId: string, userId: string, tenantId?: string) =>
+            request<void>('DELETE', `/admin/org/teams/${teamId}/members/${userId}${qs({ tenant_id: tenantId })}`),
+        },
+      },
+    },
+    // Feature flags (→ foundation-feature-flag). Upstream returns a bare array;
+    // tolerate a legacy {items:[...]} wrapper as well.
+    flags: {
+      list: () =>
+        request<FeatureFlag[] | { items: FeatureFlag[] }>('GET', '/admin/flags').then((r) =>
+          Array.isArray(r) ? r : (r.items ?? []),
+        ),
+      get: (key: string) =>
+        request<FeatureFlag>('GET', `/admin/flags/${encodeURIComponent(key)}`),
+      put: (key: string, body: FeatureFlagUpdate) =>
+        request<FeatureFlag>('PUT', `/admin/flags/${encodeURIComponent(key)}`, body),
+      killSwitch: (key: string, body: KillSwitchRequest) =>
+        request<FeatureFlag>('POST', `/admin/flags/${encodeURIComponent(key)}/kill-switch`, body),
+    },
+    // Skills governance (→ skill-store). list/versions unwrap {items:[...]}.
+    skills: {
+      list: () =>
+        request<{ items: AdminSkill[] }>('GET', '/admin/skills').then((r) => r.items),
+      get: (name: string) =>
+        request<AdminSkill>('GET', `/admin/skills/${encodeURIComponent(name)}`),
+      versions: (name: string) =>
+        request<{ items: AdminSkillVersion[] }>('GET', `/admin/skills/${encodeURIComponent(name)}/versions`).then((r) => r.items),
+      delete: (name: string) =>
+        request<void>('DELETE', `/admin/skills/${encodeURIComponent(name)}`),
+    },
+    // MCP servers governance (→ mcp-registry). list() unwraps {items:[...]}.
+    mcp: {
+      list: () =>
+        request<{ items: McpServer[] }>('GET', '/admin/mcp/servers').then((r) => r.items),
+      register: (body: RegisterMcpServerRequest) =>
+        request<McpServer>('POST', '/admin/mcp/servers', body),
+      get: (id: string) =>
+        request<McpServer>('GET', `/admin/mcp/servers/${id}`),
+      patch: (id: string, body: PatchMcpServerRequest) =>
+        request<McpServer>('PATCH', `/admin/mcp/servers/${id}`, body),
+      delete: (id: string) =>
+        request<void>('DELETE', `/admin/mcp/servers/${id}`),
+    },
+    // Knowledge base governance (→ knowledge-ingest). documents.list unwraps {items:[...]}.
+    knowledge: {
+      documents: {
+        list: (tenantId?: string) =>
+          request<{ items: KnowledgeDocument[] }>('GET', `/admin/knowledge/documents${qs({ tenant_id: tenantId })}`).then((r) => r.items),
+        get: (id: string, tenantId?: string) =>
+          request<KnowledgeDocument>('GET', `/admin/knowledge/documents/${id}${qs({ tenant_id: tenantId })}`),
+        reingest: (id: string, tenantId?: string) =>
+          request<IngestResult>('POST', `/admin/knowledge/documents/${id}/reingest${qs({ tenant_id: tenantId })}`),
+      },
+    },
+    // Run & sandbox governance (→ scheduler / sandbox-pool / orchestrator).
+    // runs / sandboxes unwrap {items:[...]}; pool / usageDaily return objects.
+    ops: {
+      runs: (params?: Record<string, string | number | undefined>) =>
+        request<{ items: OpsRun[] }>('GET', `/admin/ops/runs${qs(params)}`).then((r) => r.items),
+      cancelRun: (id: string) =>
+        request<void>('POST', `/admin/ops/runs/${id}/cancel`),
+      sandboxes: () =>
+        request<{ items: SandboxInfo[] }>('GET', '/admin/ops/sandboxes').then((r) => r.items),
+      stopSandbox: (id: string) =>
+        request<void>('POST', `/admin/ops/sandboxes/${id}/stop`),
+      pool: () =>
+        request<PoolSnapshot>('GET', '/admin/ops/pool'),
+      usageDaily: (params?: Record<string, string | number | undefined>) =>
+        request<DailyTokenUsageResponse>('GET', `/admin/ops/usage/daily${qs(params)}`),
     },
     llm: {
       probe: (body: ProbeRequest) =>

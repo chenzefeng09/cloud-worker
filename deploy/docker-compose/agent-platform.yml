@@ -437,6 +437,7 @@ services:
       SCHEDULER_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
       SCHEDULER_AUTHZ_URL: http://authz:8002/api/authz/v1
       SCHEDULER_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
+      SCHEDULER_SESSION_ORCHESTRATOR_URL: http://session-orchestrator:8006/api/session/v1
       # M1-P3: LLM gateway URL — scheduler queries GET /tenant-keys at spawn time
       # and injects LLM_GATEWAY_URL + LLM_VIRTUAL_KEY into sandbox env.
       # With llm_gateway_enforcer enabled by default, missing tenant virtual keys
@@ -511,6 +512,7 @@ services:
       BFF_FOUNDATION_ORG_URL: http://org:8003/api/org/v1
       BFF_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
       BFF_FOUNDATION_AUDIT_URL: http://audit:8013/api/audit/v1
+      BFF_FOUNDATION_FEATURE_FLAG_URL: http://feature-flag:8012/api/feature-flag/v1
       BFF_SESSION_ORCHESTRATOR_URL: http://session-orchestrator:8006/api/session/v1
       BFF_MCP_REGISTRY_URL: http://mcp-registry:8010/api/mcp/v1
       BFF_SKILL_STORE_URL: http://skill-store:8011/api/skills/v1

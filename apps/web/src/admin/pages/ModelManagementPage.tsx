@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
+import { useConfirm } from '../components/dialogs';
 import type {
   ModelProvider,
   ModelType,
@@ -956,6 +957,7 @@ export function ModelManagementPage() {
   const [editingProvider, setEditingProvider] = useState<ModelProvider | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [toggling, setToggling] = useState<string | null>(null);
+  const confirm = useConfirm();
 
   const loadProviders = useCallback(async () => {
     try {
@@ -986,7 +988,15 @@ export function ModelManagementPage() {
   };
 
   const handleDelete = async (provider: ModelProvider) => {
-    if (!confirm(`确定要删除 Provider "${provider.name}" 吗？此操作不可恢复。`)) return;
+    if (
+      !(await confirm({
+        title: '删除 Provider',
+        message: `确定要删除 Provider "${provider.name}" 吗？此操作不可恢复。`,
+        tone: 'danger',
+        confirmText: '删除',
+      }))
+    )
+      return;
     setDeleting(provider.id);
     try {
       await api.admin.llm.deleteProvider(provider.id);

@@ -147,3 +147,115 @@ def test_cancel_run_for_owner(
     assert resp.status_code == 200
     assert resp.json()["status"] == "CANCELLED"
     container.stop.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+# GET /runs — tenant-scoped list, proxied from session-orchestrator
+# --------------------------------------------------------------------------- #
+
+
+class _FakeOrchClient:
+    """Stub httpx.AsyncClient used by the runs router's list_runs proxy.
+
+    Records the GET call so tests can assert forwarded headers/params, and
+    returns a configurable status + JSON body or raises a connection error.
+    """
+
+    last_call: dict | None = None
+
+    def __init__(self, status_code: int = 200, body: dict | None = None,
+                 raise_connect: bool = False) -> None:
+        self._status = status_code
+        self._body = body if body is not None else {"items": []}
+        self._raise = raise_connect
+
+    def __call__(self, *args, **kwargs):  # mimic httpx.AsyncClient(timeout=...)
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return None
+
+    async def get(self, url, **kwargs):
+        import httpx as _httpx
+        type(self).last_call = {"url": url, **kwargs}
+        if self._raise:
+            raise _httpx.ConnectError("orchestrator down")
+        return _httpx.Response(self._status, json=self._body)
+
+    async def post(self, url, **kwargs):
+        # Patching the runs module's httpx.AsyncClient also swaps the shared
+        # httpx.AsyncClient used by the authz/quota guards (same module object).
+        # Route their POST /check calls to an allowed response so the guards
+        # still pass; only GET is the orchestrator proxy under test.
+        import httpx as _httpx
+        return _httpx.Response(
+            200,
+            json={"allowed": True, "dimension": "agent_sessions", "remaining": 100},
+        )
+
+
+def _patch_orch(monkeypatch, **kw) -> _FakeOrchClient:
+    fake = _FakeOrchClient(**kw)
+    _FakeOrchClient.last_call = None
+    monkeypatch.setattr(
+        "agent_scheduler.api.v1.runs.httpx.AsyncClient", fake,
+    )
+    return fake
+
+
+def test_list_runs_proxies_items_and_forwards_tenant(
+    app_client: TestClient, auth_headers, monkeypatch,
+) -> None:
+    payload = {"items": [{"id": "run_1", "status": "RUNNING"}]}
+    fake = _patch_orch(monkeypatch, status_code=200, body=payload)
+
+    resp = app_client.get(
+        "/api/scheduler/v1/runs?status=RUNNING&limit=10", headers=auth_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    # Body is returned verbatim, no re-wrapping.
+    assert resp.json() == payload
+
+    call = fake.last_call
+    assert call is not None
+    assert call["headers"]["X-Tenant-Id"] == auth_headers["X-Tenant-Id"]
+    assert call["headers"]["X-User-Id"] == auth_headers["X-User-Id"]
+    assert call["params"]["status"] == "RUNNING"
+    assert call["params"]["limit"] == 10
+
+
+def test_list_runs_normalises_status_to_upper(
+    app_client: TestClient, auth_headers, monkeypatch,
+) -> None:
+    fake = _patch_orch(monkeypatch, status_code=200, body={"items": []})
+
+    resp = app_client.get(
+        "/api/scheduler/v1/runs?status=running", headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    assert fake.last_call["params"]["status"] == "RUNNING"
+
+
+def test_list_runs_requires_tenant_header(app_client: TestClient) -> None:
+    # No X-Tenant-Id: authz guard / tenant dependency rejects before proxying.
+    resp = app_client.get("/api/scheduler/v1/runs")
+    assert resp.status_code in (401, 403)
+
+
+def test_list_runs_orchestrator_500_maps_to_502(
+    app_client: TestClient, auth_headers, monkeypatch,
+) -> None:
+    _patch_orch(monkeypatch, status_code=500, body={"detail": "boom"})
+    resp = app_client.get("/api/scheduler/v1/runs", headers=auth_headers)
+    assert resp.status_code == 502
+
+
+def test_list_runs_orchestrator_unreachable_maps_to_502(
+    app_client: TestClient, auth_headers, monkeypatch,
+) -> None:
+    _patch_orch(monkeypatch, raise_connect=True)
+    resp = app_client.get("/api/scheduler/v1/runs", headers=auth_headers)
+    assert resp.status_code == 502

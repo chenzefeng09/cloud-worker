@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     foundation_audit_url: str = "http://audit:8013/api/audit/v1"
     # LLM Gateway — capability probe endpoint (POST /probe).
     foundation_llm_gateway_url: str = "http://llm-gateway:8011/api/llm-gateway/v1"
+    # Feature-flag service — flag catalogue + kill-switch (dev compose port 8012,
+    # api_prefix=/api/feature-flag/v1).
+    foundation_feature_flag_url: str = (
+        "http://feature-flag:8012/api/feature-flag/v1"
+    )
 
     session_orchestrator_url: str = "http://localhost:8006/api/session/v1"
 

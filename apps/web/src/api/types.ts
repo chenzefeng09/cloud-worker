@@ -363,21 +363,32 @@ export interface AdminUser {
 
 // ─── Audit / Billing (proxy DTOs, BFF may not expose all) ────────────────────
 
+/**
+ * Audit event as returned by foundation-audit (`/events:query`).
+ * Field names mirror the upstream schema (event_id / occurred_at / event_type …),
+ * not a BFF-renamed shape.
+ */
 export interface AuditEvent {
-  id: string;
+  event_id: string;
   tenant_id: string;
-  actor_id?: string;
-  action: string;
-  resource_type?: string;
-  resource_id?: string;
-  meta?: Record<string, unknown>;
-  created_at: string;
+  occurred_at: string;
+  event_type: string;
+  severity?: string;
+  outcome?: string;
+  actor_kind?: string;
+  actor_user_id?: string | null;
+  actor_api_key_id?: string | null;
+  resource_type?: string | null;
+  resource_id?: string | null;
+  resource_path?: string | null;
+  payload?: Record<string, unknown> | null;
 }
 
 export interface AuditQueryRequest {
+  /** Required by upstream: the audit verifier scopes every query to a tenant. */
   tenant_id?: string;
-  actor_id?: string;
-  action?: string;
+  /** Upstream filters by event_type (e.g. "foundation.tenant.create"). */
+  event_type?: string;
   from?: string;
   to?: string;
   limit?: number;
@@ -687,3 +698,369 @@ export interface ResolvedDefault {
   provider_id: string;
   source: 'user' | 'tenant' | 'system';
 }
+
+// ─── Admin Console v2 ─────────────────────────────────────────────────────────
+//
+// DTOs for the enterprise admin console (RBAC / org / billing / audit / flags /
+// platform governance). Modelled loosely against the saas-foundation OpenAPI
+// contracts and agent-platform service schemas — most fields are optional since
+// the BFF re-shapes upstream payloads and may omit some on cross-tenant calls.
+
+// ─── RBAC (→ foundation-authz) ────────────────────────────────────────────────
+
+export type RoleScope = 'TENANT' | 'ORG_UNIT' | 'TEAM' | 'RESOURCE';
+export type BindingSubjectType = 'USER' | 'TEAM' | 'ORG_UNIT';
+
+/** A role: a named bundle of permission strings, scoped to a level. */
+export interface AdminRole {
+  id: string;
+  tenant_id?: string;
+  name: string;
+  description?: string | null;
+  scope?: RoleScope;
+  permissions?: string[];
+  /** System-builtin roles cannot be edited or deleted. */
+  is_system?: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface CreateRoleRequest {
+  name: string;
+  description?: string;
+  scope: RoleScope;
+  permissions: string[];
+}
+
+export interface UpdateRoleRequest {
+  description?: string | null;
+  permissions?: string[];
+}
+
+/** One entry in the permission catalogue (the universe of grantable actions). */
+export interface PermissionDefinition {
+  name: string;
+  description?: string;
+  owner_service?: string;
+  /** true → the permission must route through OPA policy evaluation. */
+  requires_policy?: boolean;
+}
+
+/** A grant of a role to a subject (user / team / org-unit), optionally scoped. */
+export interface RoleBinding {
+  id: string;
+  tenant_id?: string;
+  subject_type?: BindingSubjectType;
+  subject_id?: string;
+  role_id?: string;
+  /** Restricts the role's scope to a single resource id. */
+  scope_resource_id?: string | null;
+  granted_by?: string;
+  granted_at?: string;
+  /** JIT elevation: auto-revoked at this time when set. */
+  expires_at?: string | null;
+  reason?: string | null;
+}
+
+export interface CreateBindingRequest {
+  subject_type: BindingSubjectType;
+  subject_id: string;
+  role_id: string;
+  scope_resource_id?: string;
+  expires_at?: string;
+  reason?: string;
+}
+
+// ─── Organisation structure (→ foundation-org) ────────────────────────────────
+
+/** A node in the org-unit tree. `path` is a materialised path like /eng/infra. */
+export interface OrgUnit {
+  id: string;
+  tenant_id?: string;
+  parent_id?: string | null;
+  name: string;
+  path?: string;
+  depth?: number;
+  descendants_count?: number;
+  members_count?: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface CreateOrgUnitRequest {
+  name: string;
+  parent_id?: string;
+}
+
+export interface UpdateOrgUnitRequest {
+  name?: string;
+}
+
+export interface MoveOrgUnitRequest {
+  /** New parent org-unit id; null/omitted moves the node to the root. */
+  parent_id?: string | null;
+}
+
+/** A team — a flat membership group, optionally attached to an org-unit. */
+export interface Team {
+  id: string;
+  tenant_id?: string;
+  org_unit_id?: string | null;
+  name: string;
+  description?: string | null;
+  members_count?: number;
+  created_at?: string;
+}
+
+export interface CreateTeamRequest {
+  name: string;
+  org_unit_id?: string;
+  description?: string;
+}
+
+export type TeamRole = 'OWNER' | 'MAINTAINER' | 'MEMBER' | 'VIEWER';
+
+/** A membership row linking a user to a team with a team-scoped role. */
+export interface TeamMember {
+  team_id?: string;
+  user_id: string;
+  role?: TeamRole;
+  joined_at?: string;
+}
+
+export interface AddTeamMemberRequest {
+  user_id: string;
+  role?: TeamRole;
+}
+
+// ─── User management actions (→ foundation-identity) ──────────────────────────
+
+export interface InviteUserRequest {
+  email: string;
+  display_name?: string;
+  roles?: string[];
+  send_invite_email?: boolean;
+  /** Optional target tenant for cross-tenant super-admin invites. */
+  tenant_id?: string;
+}
+
+// ─── Billing & quota (writeable, → foundation-billing) ────────────────────────
+
+export type PlanKind = 'FREE' | 'PRO' | 'BUSINESS' | 'ENTERPRISE' | 'CUSTOM';
+export type BillingCycle = 'MONTHLY' | 'YEARLY' | 'ONE_TIME';
+export type SubscriptionStatus = 'TRIAL' | 'ACTIVE' | 'PAST_DUE' | 'CANCELED' | 'SUSPENDED';
+
+/** A purchasable plan from the billing catalogue. */
+export interface BillingPlanDef {
+  id: string;
+  name: string;
+  description?: string;
+  kind?: PlanKind;
+  billing_cycle?: BillingCycle;
+  /** Price in the smallest currency unit (cents). */
+  price_amount?: number;
+  currency?: string;
+  /** Per-dimension included quota allotments. */
+  included_quotas?: Record<string, number>;
+  features?: string[];
+  active?: boolean;
+}
+
+/** A tenant's current subscription to a plan. */
+export interface TenantSubscription {
+  id: string;
+  tenant_id?: string;
+  plan_id: string;
+  status?: SubscriptionStatus;
+  provider?: string;
+  provider_subscription_id?: string | null;
+  current_period_start?: string;
+  current_period_end?: string;
+  trial_ends_at?: string | null;
+  canceled_at?: string | null;
+  grace_period_ends_at?: string | null;
+  created_at?: string;
+}
+
+export interface ChangePlanRequest {
+  /** The subscription to mutate (BFF may resolve current when omitted). */
+  subscription_id?: string;
+  new_plan_id: string;
+  proration?: boolean;
+  /** Optional target tenant for cross-tenant super-admin operations. */
+  tenant_id?: string;
+}
+
+export interface CancelSubscriptionRequest {
+  subscription_id?: string;
+  immediate?: boolean;
+  reason?: string;
+  tenant_id?: string;
+}
+
+/** One bucket in a usage time-series response. */
+export interface UsageSeriesPoint {
+  ts?: string;
+  amount?: number;
+}
+
+/** Aggregated usage query result (a series plus a total). */
+export interface UsageRecord {
+  dimension?: string;
+  series?: UsageSeriesPoint[];
+  total?: number;
+}
+
+// ─── Audit enhancements (→ foundation-audit) ──────────────────────────────────
+
+export interface AuditChainVerifyRequest {
+  /**
+   * Target tenant — drives the forwarded X-Tenant-Id on the BFF and is
+   * required by the upstream verifier (cross-tenant checks are blocked).
+   */
+  tenant_id?: string;
+  /** Optional — restrict verification to a single service's events. */
+  service?: string;
+  /** Optional — start of the event range (event_id for keyset scan). */
+  from_event_id?: string;
+  /** Optional — max number of events to check (upstream default 1000). */
+  limit?: number;
+}
+
+/**
+ * Result of verifying the integrity of a hash-chain segment.
+ * Mirrors foundation-audit ``VerifyIntegrityResponse`` plus the
+ * BFF-injected ``effective_tenant_id``.
+ */
+export interface AuditChainVerifyResult {
+  valid?: boolean;
+  events_checked?: number;
+  first_break_event_id?: string | null;
+  signatures_verified?: number;
+  signatures_failed?: number;
+  tsa_present?: number;
+  message?: string;
+  /** Tenant the BFF actually scoped the verification to. */
+  effective_tenant_id?: string;
+}
+
+export type AuditExportFormat = 'CSV' | 'PDF' | 'NDJSON';
+export type AuditExportPurpose = 'REGULATORY_AUDIT' | 'INTERNAL_AUDIT' | 'INCIDENT' | 'LEGAL_DISCOVERY';
+export type AuditExportStatus = 'QUEUED' | 'RUNNING' | 'READY' | 'FAILED';
+
+export interface AuditExportRequest {
+  format: AuditExportFormat;
+  time_start: string;
+  time_end: string;
+  filter?: Record<string, unknown>;
+  include_signatures?: boolean;
+  purpose?: AuditExportPurpose;
+  tenant_id?: string;
+}
+
+/** An async audit export job — poll getExport(id) until status is READY. */
+export interface AuditExport {
+  export_id: string;
+  status?: AuditExportStatus;
+  download_url?: string | null;
+  signature_url?: string | null;
+  expires_at?: string | null;
+}
+
+// ─── Feature flags (→ foundation-feature-flag) ────────────────────────────────
+
+/** A feature flag view — the read model surfaced by the admin console. */
+export interface FeatureFlag {
+  key: string;
+  name?: string;
+  description?: string | null;
+  enabled: boolean;
+  default_value?: boolean;
+  fail_open?: boolean;
+  owner_team?: string | null;
+  tags?: Record<string, unknown> | null;
+  kill_switch_active?: boolean;
+  unleash_synced_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+/** Body for PUT /admin/flags/{key} — partial flag upsert. */
+export interface FeatureFlagUpdate {
+  enabled?: boolean;
+  name?: string;
+  description?: string | null;
+  default_value?: boolean;
+  fail_open?: boolean;
+  owner_team?: string | null;
+  tags?: Record<string, unknown> | null;
+}
+
+export interface KillSwitchRequest {
+  /** true → trip the kill switch (force-off); false → release it. */
+  active: boolean;
+  reason?: string;
+}
+
+// ─── Platform governance: Skills (→ skill-store) ──────────────────────────────
+
+/** Admin view of a stored skill (governance/listing — not the toolbox view). */
+export interface AdminSkill {
+  id: string;
+  tenant_id?: string;
+  name: string;
+  description?: string | null;
+  owner?: string | null;
+  visibility?: 'private' | 'tenant' | 'public';
+  created_at?: string;
+}
+
+/** A stored skill version with its blob + manifest metadata. */
+export interface AdminSkillVersion {
+  id: string;
+  skill_id: string;
+  version: string;
+  manifest?: Record<string, unknown>;
+  blob_url?: string;
+  sha256?: string;
+  uploaded_by?: string | null;
+  uploaded_at?: string;
+}
+
+// ─── Platform governance: MCP servers (→ mcp-registry) ────────────────────────
+//
+// The wire shape matches the existing `McpServer` type above; admin
+// register / patch bodies are declared here.
+
+export interface RegisterMcpServerRequest {
+  name: string;
+  transport: McpTransport;
+  endpoint?: string | null;
+  command?: string | null;
+  env?: Record<string, string>;
+  scopes?: string[];
+  enabled?: boolean;
+}
+
+export interface PatchMcpServerRequest {
+  endpoint?: string | null;
+  command?: string | null;
+  env?: Record<string, string> | null;
+  scopes?: string[] | null;
+  enabled?: boolean | null;
+}
+
+// ─── Platform governance: Ops / runs / sandboxes ──────────────────────────────
+//
+// Ops listing reuses the orchestrator run shape (`Run`), the sandbox-pool
+// snapshot (`PoolSnapshot`) and sandbox rows (`SandboxItem`) declared above.
+// Aliases are exported under the spec's names for page-level clarity.
+
+/** A run row in the ops dashboard (orchestrator-shaped). */
+export type OpsRun = Run;
+
+/** A live sandbox container row (scheduler / sandbox-pool shaped). */
+export type SandboxInfo = SandboxItem;
+
+/** Per-day token usage point for the ops usage chart. */
+export type DailyUsage = DailyTokenUsage;
