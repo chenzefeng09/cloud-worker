@@ -185,6 +185,7 @@ class Settings(BaseSettings):
     # Foundation authz + billing — RBAC enforcement and quota checks.
     authz_url: str = "http://authz:8002/api/authz/v1"
     foundation_billing_url: str = "http://billing:8007/api/billing/v1"
+    feature_flag_url: str = "http://feature-flag:8012/api/feature-flag/v1"
 
     # Session-orchestrator base URL *with* API version prefix.  The scheduler
     # has no DB of its own; run history lives in the orchestrator's Postgres.

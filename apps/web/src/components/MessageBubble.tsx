@@ -6,6 +6,7 @@ import rehypeHighlight from 'rehype-highlight';
 import { ToolRow, ThinkingBlock, markdownComponents } from './chatStepRenderers';
 import { useCopied, CopyIcon } from './CopyButton';
 import { formatRelativeTimeZh, formatAbsoluteTimeZh } from '../lib/format';
+import { useFeatureFlag } from '../hooks/useFeatureFlags';
 
 interface MessageBubbleProps {
   message: Message;
@@ -86,6 +87,7 @@ export function MessageBubble({ message, friendly, onPreviewFile, onRewind, show
   const [toolExpanded, setToolExpanded] = useState<Record<string, boolean>>({});
   const [groupOpen, setGroupOpen] = useState(() => !friendly);
   const { copied: userCopied, copy: copyUser } = useCopied();
+  const showThinking = useFeatureFlag('ai.thinking_ui');
 
   const role = (message.role || '').toUpperCase();
   const isUser = role === 'USER';
@@ -165,8 +167,9 @@ export function MessageBubble({ message, friendly, onPreviewFile, onRewind, show
     );
   }
 
-  // ── THINKING block ────────────────────────────────────────────────────────
+  // ── THINKING block (gated by ai.thinking_ui flag) ─────────────────────────
   if (blockKind === 'thinking') {
+    if (!showThinking) return null;
     return (
       <div className="min-w-0">
         <ThinkingBlock content={message.content} friendly={friendly} />

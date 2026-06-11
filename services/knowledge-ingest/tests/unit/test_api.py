@@ -81,6 +81,35 @@ def test_ingest_unknown_returns_404(
     assert resp.status_code == 404
 
 
+def test_delete_document(app_client: TestClient, tenant_headers: dict[str, str]) -> None:
+    created = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=tenant_headers,
+        data={"title": "doc", "mime": "text/plain"},
+        files={"file": ("doc.txt", b"hello world", "text/plain")},
+    ).json()
+
+    resp = app_client.delete(
+        f"/api/knowledge/v1/documents/{created['id']}", headers=tenant_headers,
+    )
+    assert resp.status_code == 204, resp.text
+
+    # Document no longer fetchable.
+    detail = app_client.get(
+        f"/api/knowledge/v1/documents/{created['id']}", headers=tenant_headers,
+    )
+    assert detail.status_code == 404
+
+
+def test_delete_unknown_document_returns_404(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    resp = app_client.delete(
+        "/api/knowledge/v1/documents/doc_missing", headers=tenant_headers,
+    )
+    assert resp.status_code == 404
+
+
 def test_search_returns_hits(
     app_client: TestClient, tenant_headers: dict[str, str],
 ) -> None:

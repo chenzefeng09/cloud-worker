@@ -1,0 +1,16 @@
+[project]
+name = "feature-flag-client"
+version = "0.1.0"
+description = "Lightweight async client for the foundation feature-flag service"
+requires-python = ">=3.12"
+dependencies = ["httpx>=0.27"]
+
+[project.optional-dependencies]
+fastapi = ["fastapi>=0.115"]
+
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -67,6 +67,45 @@ async def test_ingest_round_trip(
 
 
 @pytest.mark.asyncio
+async def test_delete_document_drops_row_and_blob(
+    svc: IngestService, blob_store: InMemoryBlobStore,
+) -> None:
+    doc = await svc.create_document(
+        title="d", filename="d.txt", mime="text/plain", data=b"hello world",
+    )
+    assert blob_store.size == 1
+    await svc.delete_document(doc.id)
+    assert blob_store.size == 0
+    with pytest.raises(DocumentNotFoundError):
+        await svc.get_document(doc.id)
+
+
+@pytest.mark.asyncio
+async def test_delete_unknown_document_raises(svc: IngestService) -> None:
+    with pytest.raises(DocumentNotFoundError):
+        await svc.delete_document("doc_missing")
+
+
+@pytest.mark.asyncio
+async def test_delete_document_tolerates_blob_failure(
+    svc: IngestService, blob_store: InMemoryBlobStore,
+) -> None:
+    """A blob delete failure must not abort the DB row removal."""
+    doc = await svc.create_document(
+        title="d", filename="d.txt", mime="text/plain", data=b"hello world",
+    )
+
+    def _boom(_key: str) -> None:
+        raise RuntimeError("blob backend down")
+
+    blob_store.delete = _boom  # type: ignore[method-assign]
+
+    await svc.delete_document(doc.id)
+    with pytest.raises(DocumentNotFoundError):
+        await svc.get_document(doc.id)
+
+
+@pytest.mark.asyncio
 async def test_ingest_missing_document(svc: IngestService) -> None:
     with pytest.raises(DocumentNotFoundError):
         await svc.ingest_document("doc_missing")

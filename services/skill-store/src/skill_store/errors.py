@@ -4,10 +4,21 @@ from __future__ import annotations
 
 
 class SkillStoreError(Exception):
-    def __init__(self, detail: str, *, code: str, status: int = 400) -> None:
+    def __init__(
+        self,
+        detail: str,
+        *,
+        code: str,
+        status: int = 400,
+        user_message: str | None = None,
+    ) -> None:
         self.detail = detail
         self.code = code
         self.status = status
+        # Human-facing (Chinese) message safe to render to the uploader as-is.
+        # Falls back to ``detail`` when not explicitly provided so every error
+        # carries a displayable message.
+        self.user_message = user_message or detail
 
 
 class SkillNotFoundError(SkillStoreError):
@@ -53,6 +64,24 @@ class SkillSha256MismatchError(SkillStoreError):
             code="SKILL.SHA256_MISMATCH",
             status=422,
         )
+
+
+class SkillPackageInvalidError(SkillStoreError):
+    """Uploaded tarball failed structural / content validation.
+
+    ``message`` is a Chinese, user-facing explanation of *why* the package was
+    rejected (e.g. "缺少 SKILL.md").  It is surfaced both as ``detail`` and
+    ``user_message`` so the API/BFF/frontend can show it verbatim.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(
+            message,
+            code="SKILL.PACKAGE.INVALID",
+            status=400,
+            user_message=message,
+        )
+        self.message = message
 
 
 class InternalScopeRequiredError(SkillStoreError):

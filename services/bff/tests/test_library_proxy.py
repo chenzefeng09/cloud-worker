@@ -238,6 +238,53 @@ def test_create_skill_version_with_manifest(
     assert resp.status_code == 201
 
 
+def test_create_skill_version_rejects_oversized_upload(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Payloads above MAX_UPLOAD_BYTES are rejected at the edge with 413 and a
+    user_message, and must NOT be forwarded to skill-store."""
+    from agent_bff.api.v1 import library
+
+    fake = FakeLibraryUpstream(status=201, body={"id": "sv_99"})
+    _patch_async_client(fake, monkeypatch)
+
+    oversized = b"x" * (library.MAX_UPLOAD_BYTES + 1)
+    resp = client.post(
+        "/api/bff/v1/library/skills/sk_01/versions",
+        cookies=authed_cookie,
+        data={"version": "9.9.9"},
+        files={"file": ("huge.tar.gz", oversized, "application/gzip")},
+    )
+    assert resp.status_code == 413
+    assert resp.json()["detail"]["user_message"] == "技能包超过大小上限 20 MB"
+    # Upstream must never be reached for an oversized payload.
+    assert fake.calls == []
+
+
+def test_create_skill_version_accepts_upload_at_limit(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A payload exactly at the limit is allowed through (boundary is inclusive)."""
+    from agent_bff.api.v1 import library
+
+    fake = FakeLibraryUpstream(status=201, body={"id": "sv_03", "version": "3.0.0"})
+    _patch_async_client(fake, monkeypatch)
+
+    at_limit = b"x" * library.MAX_UPLOAD_BYTES
+    resp = client.post(
+        "/api/bff/v1/library/skills/sk_01/versions",
+        cookies=authed_cookie,
+        data={"version": "3.0.0"},
+        files={"file": ("ok.tar.gz", at_limit, "application/gzip")},
+    )
+    assert resp.status_code == 201
+    assert any("versions" in c[1] for c in fake.calls)
+
+
 # ---------------------------------------------------------------------------
 # Knowledge documents
 # ---------------------------------------------------------------------------

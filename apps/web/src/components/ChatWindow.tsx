@@ -14,6 +14,7 @@ import type { Attachment, MessageAttachment } from '../api/types';
 import { groupSteps } from '../lib/groupSteps';
 import { DEFAULT_EFFORT, SYSTEM_FALLBACK_MODEL } from '../lib/modelOptions';
 import { useDefaultModel } from '../hooks/useDefaultModel';
+import { useFeatureFlag } from '../hooks/useFeatureFlags';
 import {
   SHOW_DESIGN_FIXTURES,
   AGENT_TRANSCRIPT_FIXTURE,
@@ -302,6 +303,7 @@ export function ChatWindow({
   const seedSkills = useChatStore((s) => s.seedSkills);
 
   // Per-session model + reasoning effort, surfaced in the InputBar toolbar.
+  const showThinkingUi = useFeatureFlag('ai.thinking_ui');
   const selectedModel = useChatStore((s) => s.selectedModel[sessionId]);
   const selectedEffort = useChatStore((s) => s.selectedEffort[sessionId]);
   const setSessionModel = useChatStore((s) => s.setSessionModel);
@@ -485,8 +487,8 @@ export function ChatWindow({
         onToggleSkill={(name) => toggleSkill(sessionId, name)}
         model={selectedModel ?? defaultModelId ?? SYSTEM_FALLBACK_MODEL}
         effort={selectedEffort ?? DEFAULT_EFFORT}
-        onModelChange={(m) => setSessionModel(sessionId, m)}
-        onEffortChange={(e) => setSessionEffort(sessionId, e)}
+        onModelChange={showThinkingUi ? (m) => setSessionModel(sessionId, m) : undefined}
+        onEffortChange={showThinkingUi ? (e) => setSessionEffort(sessionId, e) : undefined}
       />
       {pendingRewind && (
         <RewindConfirmModal

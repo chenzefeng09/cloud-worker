@@ -15,7 +15,7 @@ from skill_store.api.dependencies import (
     TUserId,
     internal_db_session,
 )
-from skill_store.blob.base import BlobStore
+from skill_store.blob.base import BlobStore, make_key
 from skill_store.schemas.common import ListPage
 from skill_store.schemas.skill import (
     InstalledSkillOut,
@@ -155,6 +155,23 @@ async def get_skill(
     return SkillOut.model_validate(skill)
 
 
+@router.delete(
+    "/skills/{skill_id}",
+    status_code=204,
+    dependencies=[Depends(require_permission("skill.delete", "skill"))],
+)
+async def delete_skill(
+    skill_id: str,
+    db: AsyncSession = TDbSession,
+    blob: BlobStore = TBlobStore,
+    tenant_id: str = TTenantId,
+) -> Response:
+    """Delete a skill outright — all versions (blobs + rows) and installs."""
+    svc = SkillService(db, blob=blob, tenant_id=tenant_id)
+    await svc.delete_skill(skill_id)
+    return Response(status_code=204)
+
+
 @router.post(
     "/skills/{skill_id}/versions",
     response_model=SkillVersionOut,
@@ -183,6 +200,22 @@ async def upload_version(
         uploaded_by=user_id,
     )
     return SkillVersionOut.model_validate(sv)
+
+
+@router.get("/skills/{skill_id}/versions", response_model=ListPage,
+            dependencies=[Depends(require_permission("skill.read", "skill"))])
+async def list_skill_versions(
+    skill_id: str,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+) -> ListPage:
+    """List all versions of a skill (newest upload first)."""
+    svc = SkillService(db, blob=_no_blob(), tenant_id=tenant_id)
+    versions = await svc.list_versions(skill_id)
+    return ListPage(
+        items=[SkillVersionOut.model_validate(v).model_dump(mode="json") for v in versions],
+        total=len(versions),
+    )
 
 
 @router.get("/skills/{skill_id}/versions/{version}/download",
@@ -227,20 +260,34 @@ async def delete_version(
 )
 async def internal_list(
     tenant_id: str,
+    request: Request,
     names: str | None = None,
     db: AsyncSession = Depends(internal_db_session),
     blob: BlobStore = TBlobStore,
 ) -> ListPage:
     """For skills_loader — list skills (with versions) for a tenant."""
     svc = SkillService(db, blob=blob, tenant_id=tenant_id)
+    settings = request.app.state.settings
     name_list = [n.strip() for n in names.split(",")] if names else None
     pairs = await svc.list_internal(tenant_id, names=name_list)
+    # blob_url 存在 DB 里的是内部 storage key 形态(如 s3://...),worker
+    # 用 httpx 直拉下载不到。在 internal 端点出口处把它替换成短期预签名 HTTP
+    # URL,让 sandbox 里的 skills_loader 可直接 GET 到 tarball。
     items = []
     for skill, versions in pairs:
         entry = SkillOut.model_validate(skill).model_dump(mode="json")
-        entry["versions"] = [
-            SkillVersionOut.model_validate(v).model_dump(mode="json") for v in versions
-        ]
+        version_dicts = []
+        for v in versions:
+            vd = SkillVersionOut.model_validate(v).model_dump(mode="json")
+            try:
+                key = make_key(tenant_id, v.skill_id, v.version)
+                vd["blob_url"] = blob.presign_get(
+                    key, ttl_seconds=settings.presign_ttl_seconds,
+                )
+            except Exception:  # noqa: BLE001 -- 失败保留原 blob_url,worker 端会再 failure-open
+                pass
+            version_dicts.append(vd)
+        entry["versions"] = version_dicts
         items.append(entry)
     return ListPage(items=items, total=len(items))
 

@@ -389,6 +389,8 @@ export interface AuditQueryRequest {
   tenant_id?: string;
   /** Upstream filters by event_type (e.g. "foundation.tenant.create"). */
   event_type?: string;
+  /** Multi-select filter: restrict to any of these event types. */
+  event_types?: string[];
   from?: string;
   to?: string;
   limit?: number;
@@ -797,8 +799,8 @@ export interface UpdateOrgUnitRequest {
 }
 
 export interface MoveOrgUnitRequest {
-  /** New parent org-unit id; null/omitted moves the node to the root. */
-  parent_id?: string | null;
+  /** New parent org-unit id; null moves the node to the root. */
+  new_parent_id: string | null;
 }
 
 /** A team — a flat membership group, optionally attached to an org-unit. */
@@ -814,7 +816,8 @@ export interface Team {
 
 export interface CreateTeamRequest {
   name: string;
-  org_unit_id?: string;
+  code: string;
+  org_unit_id: string;
   description?: string;
 }
 
@@ -840,8 +843,6 @@ export interface InviteUserRequest {
   display_name?: string;
   roles?: string[];
   send_invite_email?: boolean;
-  /** Optional target tenant for cross-tenant super-admin invites. */
-  tenant_id?: string;
 }
 
 // ─── Billing & quota (writeable, → foundation-billing) ────────────────────────
@@ -896,6 +897,18 @@ export interface CancelSubscriptionRequest {
   immediate?: boolean;
   reason?: string;
   tenant_id?: string;
+}
+
+export interface CreatePlanRequest {
+  name: string;
+  tier: string;
+  quotas: Record<string, number>;
+  price_monthly_usd: number;
+}
+
+export interface CreateSubscriptionRequest {
+  plan_id: string;
+  mode?: string;
 }
 
 /** One bucket in a usage time-series response. */
@@ -977,6 +990,8 @@ export interface FeatureFlag {
   enabled: boolean;
   default_value?: boolean;
   fail_open?: boolean;
+  user_overridable?: boolean;
+  user_override?: boolean | null;
   owner_team?: string | null;
   tags?: Record<string, unknown> | null;
   kill_switch_active?: boolean;
@@ -992,8 +1007,15 @@ export interface FeatureFlagUpdate {
   description?: string | null;
   default_value?: boolean;
   fail_open?: boolean;
+  user_overridable?: boolean;
   owner_team?: string | null;
   tags?: Record<string, unknown> | null;
+}
+
+export interface UserFlagOverride {
+  flag_key: string;
+  enabled: boolean;
+  updated_at?: string | null;
 }
 
 export interface KillSwitchRequest {
@@ -1064,3 +1086,469 @@ export type SandboxInfo = SandboxItem;
 
 /** Per-day token usage point for the ops usage chart. */
 export type DailyUsage = DailyTokenUsage;
+
+// ─── Notification center (→ foundation-notification) ──────────────────────────
+//
+// Wire shapes are kept intentionally loose — list payloads vary by upstream and
+// pages render defensively.
+
+export interface NotificationTemplate {
+  id?: string;
+  key?: string;
+  name?: string;
+  event_type?: string;
+  channel?: string;
+  subject?: string;
+  /** Real foundation field: the rendered subject line template. */
+  subject_template?: string;
+  /** Real foundation field: whether the template is active. */
+  enabled?: boolean;
+  body?: string;
+  locale?: string;
+  created_at?: string;
+}
+
+/** POST /admin/notification/send body (foundation SendRequest). */
+export interface NotificationSendRequest {
+  event_type: string;
+  recipients: string[];
+  channel?: string;
+  template?: string | null;
+  context?: Record<string, unknown>;
+  priority?: string;
+}
+
+// ─── API platform (→ foundation-api-platform) ─────────────────────────────────
+
+export interface PlatformApiKey {
+  id?: string;
+  name?: string;
+  scopes?: string[];
+  rate_limit_rpm?: number;
+  /** Returned only on creation. */
+  api_key?: string;
+  created_at?: string;
+}
+
+export interface CreatePlatformApiKeyRequest {
+  name: string;
+  scopes: string[];
+  ip_whitelist?: string[] | null;
+  rate_limit_rpm?: number;
+  expires_in_days?: number | null;
+}
+
+export interface OAuthApp {
+  id?: string;
+  name?: string;
+  client_id?: string;
+  scopes?: string[];
+  redirect_uris?: string[];
+}
+
+export interface RegisterOAuthAppRequest {
+  name: string;
+  redirect_uris: string[];
+  scopes: string[];
+}
+
+export interface Webhook {
+  id?: string;
+  url?: string;
+  event_types?: string[];
+  enabled?: boolean;
+}
+
+export interface SubscribeWebhookRequest {
+  url: string;
+  event_types: string[];
+  secret?: string | null;
+}
+
+// ─── SSO — identity source management (→ foundation-identity) ────────────────
+
+export type SsoKind = 'OIDC' | 'SAML' | 'AD' | 'LDAP' | 'DINGTALK_ENTERPRISE' | 'FEISHU_ENTERPRISE' | 'WECOM';
+
+export type SsoScope = 'TENANT' | 'PLATFORM';
+
+export type SsoMatchType = 'EMAIL_DOMAIN' | 'EQUALS' | 'CONTAINS' | 'REGEX';
+
+export interface SsoProvider {
+  id: string;
+  kind: SsoKind;
+  name: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  created_at: string;
+  scope?: SsoScope;
+  tenant_id?: string | null;
+  default_tenant_id?: string | null;
+}
+
+export interface CreateSsoProviderRequest {
+  kind: SsoKind;
+  name: string;
+  config: Record<string, unknown>;
+}
+
+export interface SsoRoutingRule {
+  id: string;
+  provider_id: string;
+  priority: number;
+  match_attribute: string;
+  match_type: SsoMatchType;
+  match_value: string;
+  target_tenant_id: string;
+  default_role?: string | null;
+  enabled: boolean;
+  created_at?: string;
+}
+
+export interface CreateSsoRoutingRuleRequest {
+  priority?: number;
+  match_attribute: string;
+  match_type: SsoMatchType;
+  match_value: string;
+  target_tenant_id: string;
+  default_role?: string | null;
+  enabled?: boolean;
+}
+
+export interface CreatePlatformSsoProviderRequest {
+  kind: SsoKind;
+  name: string;
+  config: Record<string, unknown>;
+  scope: SsoScope;
+  tenant_id?: string | null;
+  default_tenant_id?: string | null;
+}
+
+// ─── PAM — privileged access (→ foundation-pam) ───────────────────────────────
+
+export interface PamElevation {
+  id?: string;
+  user_id?: string;
+  reason?: string;
+  status?: string;
+  duration_minutes?: number;
+  requested_at?: string;
+  approved_by?: string;
+  expires_at?: string | null;
+}
+
+export interface PamSession {
+  id?: string;
+  user_id?: string;
+  permissions?: string[];
+  expires_at?: string | null;
+}
+
+export interface RequestElevationRequest {
+  reason: string;
+  duration_minutes?: number;
+  target_resources?: string[];
+}
+
+export interface ApproveElevationRequest {
+  justification?: string;
+}
+
+// ─── DLP — data-loss prevention (→ foundation-dlp) ────────────────────────────
+
+export type DlpSensitivity = 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
+
+export interface DlpScanRequest {
+  content: string;
+  resource_type: string;
+  resource_id: string;
+}
+
+export interface DlpScanResult {
+  matches?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+}
+
+export interface DlpTagRequest {
+  resource_type: string;
+  resource_id: string;
+  sensitivity: DlpSensitivity;
+  tags?: string[] | null;
+  reason?: string | null;
+}
+
+export interface DlpClassification {
+  id?: string;
+  sensitivity?: string;
+  tags?: string[] | null;
+  downgradable?: boolean;
+  [key: string]: unknown;
+}
+
+// ─── Compliance center (→ foundation-compliance) ──────────────────────────────
+
+export interface RopaRecord {
+  id?: string;
+  service?: string;
+  purpose?: string;
+  legal_basis?: string;
+  data_category?: string;
+}
+
+export interface RecordProcessingRequest {
+  service: string;
+  data_category: string;
+  purpose: string;
+  legal_basis: string;
+  data_subjects: string[];
+  recipients: string[];
+  retention_days?: number;
+  cross_border?: boolean;
+  destination_countries?: string[];
+}
+
+export interface ComplianceReport {
+  id?: string;
+  report_type?: string;
+  compliance_modes?: string[];
+  content?: Record<string, unknown>;
+}
+
+export interface GenerateReportRequest {
+  report_type: string;
+  compliance_modes: string[];
+}
+
+export interface DsarRecord {
+  id?: string;
+  user_id?: string;
+  request_type?: string;
+  status?: string;
+}
+
+export interface RequestDsarRequest {
+  user_id: string;
+  request_type: string;
+  details: string;
+}
+
+export interface DpiaRecord {
+  id?: string;
+  project_name?: string;
+  conclusion?: string;
+  residual_risks?: string;
+}
+
+export interface AssessDpiaRequest {
+  project_name: string;
+  description: string;
+  data_categories: string[];
+  risks: Array<Record<string, string>>;
+  mitigations: Array<Record<string, string>>;
+}
+
+export interface CompleteDpiaRequest {
+  conclusion: string;
+  residual_risks: string;
+}
+
+// ─── Security operations (→ foundation-security-ops) ────────────────────────────
+
+export type VulnSeverity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
+
+export interface VulnSlaDashboard {
+  overdue_by_severity?: Record<string, number>;
+  by_owner?: Record<string, Record<string, number>>;
+  mttr_days?: Record<string, number>;
+}
+
+export interface Vulnerability {
+  id?: string;
+  cve_id?: string;
+  title?: string;
+  severity?: string;
+  cvss_score?: number;
+  package_affected?: string;
+  status?: string;
+  due_at?: string;
+  assignee?: string;
+  fix_pr_url?: string;
+  notes_md?: string;
+}
+
+export interface RiskAcceptRequest {
+  rationale: string;
+  mitigations: string[];
+  expires_at?: string | null;
+}
+
+export interface SecurityIncident {
+  id?: string;
+  severity?: string;
+  category?: string;
+  title?: string;
+  status?: string;
+  detected_at?: string;
+  ic?: string;
+  customers_notified?: boolean;
+  regulators_notified?: boolean;
+}
+
+export interface CreateIncidentRequest {
+  severity: string;
+  category: string;
+  title: string;
+  ic?: string | null;
+  affected_tenants: string[];
+}
+
+export interface ResolveIncidentRequest {
+  root_cause: string;
+  pir_s3_key: string;
+}
+
+export interface ScanRun {
+  id?: string;
+  type?: string;
+  tool?: string;
+  target?: string;
+  status?: string;
+  started_at?: string;
+  findings_count?: number;
+}
+
+export interface SbomWatch {
+  image_ref?: string;
+  registered_at?: string;
+  last_scanned_at?: string;
+  notify?: string[];
+  new_cves_count?: number;
+}
+
+export interface RegisterSbomWatchRequest {
+  image_ref: string;
+  notify: string[];
+}
+
+export interface SecurityDrill {
+  id?: string;
+  kind?: string;
+  scheduled_at?: string;
+  status?: string;
+  participants?: string[];
+}
+
+export interface ScheduleDrillRequest {
+  kind: string;
+  scheduled_at: string;
+  participants: string[];
+  scenario_runbook?: string | null;
+}
+
+// ─── Data lifecycle (→ foundation-lifecycle) ────────────────────────────────────
+
+export interface RecycleBinItem {
+  id?: string;
+  resource_type?: string;
+  resource_id?: string;
+  deleted_at?: string;
+  expires_at?: string;
+}
+
+export interface RecycleBinPage {
+  items?: RecycleBinItem[];
+  next_cursor?: string | null;
+}
+
+export interface SoftDeleteRequest {
+  resource_type_id: string;
+  resource_id: string;
+  resource_name?: string | null;
+}
+
+export interface HardDeleteRequest {
+  destroyed_by: string;
+  witness_user_id?: string | null;
+}
+
+export interface SweepResult {
+  destroyed?: number;
+  [key: string]: unknown;
+}
+
+export interface LegalHold {
+  id?: string;
+  resource_type?: string;
+  resource_id?: string;
+  reason?: string;
+  placed_at?: string;
+}
+
+export interface PlaceLegalHoldRequest {
+  resource_type_id: string;
+  resource_id: string;
+  reason: string;
+  case_reference?: string | null;
+}
+
+export interface ReleaseLegalHoldRequest {
+  released_by: string;
+}
+
+// ─── Data protection (→ foundation-data-protection) ─────────────────────────────
+
+export interface MaskingRule {
+  name?: string;
+  method?: string;
+}
+
+export interface MaskingRulesResponse {
+  rules?: MaskingRule[];
+}
+
+export interface DataResidency {
+  primary_region?: string;
+  restricted_destinations?: string[];
+  policy?: string;
+}
+
+export interface CrossBorderCheckRequest {
+  destination_country: string;
+  data_categories: string[];
+}
+
+export interface CrossBorderResult {
+  allowed?: boolean;
+  decision?: string;
+  risks?: string[];
+  required_actions?: string[];
+}
+
+export interface DestructionRequest {
+  id?: string;
+  status?: string;
+  resource_ids?: string[];
+  method?: string;
+  [key: string]: unknown;
+}
+
+export interface CreateDestructionRequest {
+  resource_ids: string[];
+  method: string;
+}
+
+export interface ConsentRecord {
+  id?: string;
+  user_id?: string;
+  consent_type?: string;
+  purpose?: string;
+  granted?: boolean;
+  recorded_at?: string;
+}
+
+export interface RecordConsentRequest {
+  user_id: string;
+  consent_type: string;
+  purpose: string;
+  granted: boolean;
+  ip_address?: string | null;
+}

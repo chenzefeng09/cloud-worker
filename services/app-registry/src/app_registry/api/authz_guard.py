@@ -43,6 +43,10 @@ def require_permission(action: str, resource_type: str) -> Callable[..., Any]:
     """
 
     async def _guard(request: Request) -> None:
+        # ── Admin bypass: BFF already enforced platform.admin ───────────────
+        if request.headers.get("X-Actor") == "ADMIN":
+            return
+
         # ── Deny point 1: identity checks (no network) ──────────────────────
         tenant_id = get_tenant_id()
         user_id = get_user_id()
@@ -120,6 +124,9 @@ def is_reviewer(action: str = "app.review", resource_type: str = "app") -> Calla
     """
 
     async def _resolve(request: Request) -> bool:
+        if request.headers.get("X-Actor") == "ADMIN":
+            return True
+
         tenant_id = get_tenant_id()
         user_id = get_user_id()
         if not tenant_id or not user_id or user_id == "SYSTEM":

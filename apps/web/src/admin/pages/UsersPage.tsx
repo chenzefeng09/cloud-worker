@@ -3,6 +3,7 @@ import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import type { AdminUser, InviteUserRequest } from '../../api/types';
 import { useConfirm, useToast } from '../components/dialogs';
+import { CustomSelect } from '../components/CustomSelect';
 
 /**
  * AdminUser may carry an optional `status` field on some upstream payloads
@@ -55,8 +56,8 @@ function InviteUserDialog({
         .map((r) => r.trim())
         .filter(Boolean);
       if (roleList.length > 0) body.roles = roleList;
-      if (tenantId) body.tenant_id = tenantId;
-      await api.admin.users.invite(body);
+      // tenant_id is a query param, not a body field (cross-tenant invite).
+      await api.admin.users.invite(body, tenantId ?? undefined);
       onInvited();
       onClose();
     } catch (err) {
@@ -288,17 +289,13 @@ export function UsersPage() {
       {/* Tenant filter */}
       <div className="flex items-center gap-3">
         <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">筛选租户</label>
-        <select
-          className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent min-w-[200px]"
+        <CustomSelect
+          options={[{ value: '', label: '全部租户' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
           value={selectedTenantId ?? ''}
-          onChange={(e) => setSelectedTenantId(e.target.value || null)}
+          onChange={(v) => setSelectedTenantId(v || null)}
           disabled={tenantsLoading}
-        >
-          <option value="">全部租户</option>
-          {tenants.map((t) => (
-            <option key={t.id} value={t.id}>{t.name}</option>
-          ))}
-        </select>
+          className="min-w-[200px]"
+        />
       </div>
 
       {usersError && (

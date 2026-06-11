@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import { useConfirm } from '../components/dialogs';
+import { CustomSelect } from '../components/CustomSelect';
 import type {
   AdminRole,
   BindingSubjectType,
@@ -214,15 +215,11 @@ function CreateRoleForm({
       </div>
       <div className="flex flex-col gap-1">
         <label className="text-[11px] text-dim font-mono">作用域 (Scope)</label>
-        <select
-          className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
+        <CustomSelect
+          options={SCOPES.map((s) => ({ value: s, label: s }))}
           value={scope}
-          onChange={(e) => setScope(e.target.value as RoleScope)}
-        >
-          {SCOPES.map((s) => (
-            <option key={s} value={s}>{s}</option>
-          ))}
-        </select>
+          onChange={(v) => setScope(v as RoleScope)}
+        />
       </div>
       <div className="flex flex-col gap-1">
         <label className="text-[11px] text-dim font-mono">权限 (从权限目录多选)</label>
@@ -436,6 +433,46 @@ function RolesTab({
 
 // ─── Permissions Tab ──────────────────────────────────────────────────────────
 
+const PERM_DESC_ZH: Record<string, string> = {
+  'app.create': '创建应用记录',
+  'app.publish': '发布已审核通过的应用版本（仅管理员/审核员）',
+  'app.read': '查看应用列表与版本详情',
+  'app.review': '审核提交的应用（批准/驳回，仅管理员/审核员）',
+  'app.run': '从应用定义发起运行',
+  'app.update': '更新应用元数据或发布新版本',
+  'document.create': '上传文档到知识库',
+  'document.delete': '删除知识库文档及其分块',
+  'document.read': '查看知识库文档列表与详情',
+  'document.search': '搜索知识库文档',
+  'document.update': '更新知识库文档',
+  'mcp_server.create': '注册新的 MCP 服务器',
+  'mcp_server.delete': '删除 MCP 服务器',
+  'mcp_server.read': '查看 MCP 服务器列表与详情',
+  'mcp_server.update': '更新 MCP 服务器配置',
+  'model.read': '查看可用模型列表',
+  'model.admin': '管理模型配置与默认设置',
+  'quota.read': '查看配额与用量',
+  'quota.admin': '管理配额限制',
+  'run.cancel': '取消正在执行的运行',
+  'run.create': '创建并发起新的运行',
+  'run.read': '查看运行记录与详情',
+  'sandbox.read': '查看沙箱状态',
+  'sandbox.stop': '停止运行中的沙箱',
+  'session.attachment.create': '上传会话附件',
+  'session.attachment.read': '查看会话附件',
+  'session.create': '创建新会话',
+  'session.delete': '删除会话',
+  'session.message.create': '发送会话消息',
+  'session.message.delete': '删除会话消息',
+  'session.message.read': '查看会话消息',
+  'session.read': '查看会话列表与详情',
+  'session.update': '更新会话设置',
+  'skill.create': '创建新技能',
+  'skill.delete': '删除技能',
+  'skill.read': '查看技能列表与详情',
+  'skill.update': '更新技能配置',
+};
+
 function PermissionsTab({ permissions }: { permissions: PermissionExtra[] }) {
   const [serviceFilter, setServiceFilter] = useState('');
   const [search, setSearch] = useState('');
@@ -450,7 +487,12 @@ function PermissionsTab({ permissions }: { permissions: PermissionExtra[] }) {
     const s = search.trim().toLowerCase();
     const filtered = permissions.filter((p) => {
       if (serviceFilter && permService(p) !== serviceFilter) return false;
-      if (s && !permKey(p).toLowerCase().includes(s) && !(p.description ?? '').toLowerCase().includes(s))
+      if (
+        s &&
+        !permKey(p).toLowerCase().includes(s) &&
+        !(p.description ?? '').toLowerCase().includes(s) &&
+        !(PERM_DESC_ZH[permKey(p)] ?? '').includes(s)
+      )
         return false;
       return true;
     });
@@ -466,16 +508,11 @@ function PermissionsTab({ permissions }: { permissions: PermissionExtra[] }) {
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-3 flex-wrap">
-        <select
-          className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper focus:outline-none focus:border-accent font-mono"
+        <CustomSelect
+          options={[{ value: '', label: '全部服务' }, ...services.map((s) => ({ value: s, label: s }))]}
           value={serviceFilter}
-          onChange={(e) => setServiceFilter(e.target.value)}
-        >
-          <option value="">全部服务</option>
-          {services.map((s) => (
-            <option key={s} value={s}>{s}</option>
-          ))}
-        </select>
+          onChange={(v) => setServiceFilter(v)}
+        />
         <input
           className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper focus:outline-none focus:border-accent font-mono flex-1 min-w-[180px]"
           placeholder="搜索权限名/描述…"
@@ -497,8 +534,8 @@ function PermissionsTab({ permissions }: { permissions: PermissionExtra[] }) {
                 <div key={permKey(p)} className="px-3 py-2 flex items-start gap-3">
                   <div className="flex-1 min-w-0">
                     <div className="font-mono text-[12px] text-ink truncate">{permKey(p)}</div>
-                    {p.description && (
-                      <div className="text-[11px] text-dim mt-0.5">{p.description}</div>
+                    {(PERM_DESC_ZH[permKey(p)] || p.description) && (
+                      <div className="text-[11px] text-dim mt-0.5">{PERM_DESC_ZH[permKey(p)] ?? p.description}</div>
                     )}
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0">
@@ -609,29 +646,19 @@ function CreateBindingForm({
       <div className="grid grid-cols-2 gap-3">
         <div className="flex flex-col gap-1">
           <label className="text-[11px] text-dim font-mono">主体类型</label>
-          <select
-            className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
+          <CustomSelect
+            options={SUBJECT_TYPES.map((s) => ({ value: s, label: s }))}
             value={subjectType}
-            onChange={(e) => setSubjectType(e.target.value as BindingSubjectType)}
-          >
-            {SUBJECT_TYPES.map((s) => (
-              <option key={s} value={s}>{s}</option>
-            ))}
-          </select>
+            onChange={(v) => setSubjectType(v as BindingSubjectType)}
+          />
         </div>
         <div className="flex flex-col gap-1">
           <label className="text-[11px] text-dim font-mono">角色</label>
-          <select
-            className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
+          <CustomSelect
+            options={[{ value: '', label: '— 选择角色 —' }, ...roles.map((r) => ({ value: r.id, label: r.name }))]}
             value={roleId}
-            onChange={(e) => setRoleId(e.target.value)}
-            required
-          >
-            <option value="">— 选择角色 —</option>
-            {roles.map((r) => (
-              <option key={r.id} value={r.id}>{r.name}</option>
-            ))}
-          </select>
+            onChange={(v) => setRoleId(v)}
+          />
         </div>
       </div>
       <div className="flex flex-col gap-1">
@@ -833,17 +860,13 @@ export function RbacPage() {
       {/* Tenant selector */}
       <div className="flex items-center gap-3">
         <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
-        <select
-          className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent min-w-[200px]"
+        <CustomSelect
+          options={[{ value: '', label: '（默认 / 当前租户）' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
           value={selectedTenantId ?? ''}
-          onChange={(e) => setSelectedTenantId(e.target.value || null)}
+          onChange={(v) => setSelectedTenantId(v || null)}
           disabled={tenantsLoading}
-        >
-          <option value="">（默认 / 当前租户）</option>
-          {tenants.map((t) => (
-            <option key={t.id} value={t.id}>{t.name}</option>
-          ))}
-        </select>
+          className="min-w-[200px]"
+        />
       </div>
 
       {/* Tabs */}

@@ -21,6 +21,7 @@ def register_exception_handlers(app: FastAPI) -> None:
                 "detail": exc.detail,
                 "instance": str(request.url.path),
                 "code": exc.code,
+                "user_message": exc.user_message,
                 "request_id": get_request_id(),
             },
         )

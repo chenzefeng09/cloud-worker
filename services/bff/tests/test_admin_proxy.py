@@ -51,8 +51,19 @@ class FakeAdminFoundation:
                 "locale": "zh-CN",
             })
 
-        # identity /platform/tenants
-        if "/platform/tenants" in url and method == "GET" and "{" not in url:
+        # identity /platform/tenants/{tid} — single tenant lookup (full object)
+        if "/platform/tenants/" in url and method == "GET":
+            tid = url.rstrip("/").rsplit("/", 1)[-1]
+            return httpx.Response(200, json={
+                "id": tid,
+                "name": "Test Corp",
+                "tier": "FREE",
+                "status": "active",
+                "created_at": "2026-01-01T00:00:00Z",
+            })
+
+        # identity /platform/tenants — list
+        if "/platform/tenants" in url and method == "GET":
             return httpx.Response(200, json={"items": [], "next_cursor": None})
 
         if "/platform/tenants" in url and method == "POST":
@@ -146,7 +157,11 @@ def test_admin_create_tenant_super_admin(
     )
     assert resp.status_code == 201
     body = resp.json()
-    assert "tenant_id" in body
+    # BFF now re-fetches the full tenant object after provisioning so the admin
+    # UI gets {id, name, tier, status, created_at} instead of the bare
+    # provisioning envelope ({tenant_id, ...}) that crashed the frontend.
+    assert body["id"] == "tnt_NEWONE0000000000000000001"
+    assert "name" in body and "status" in body
 
 
 def test_auth_me_includes_roles(

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useConfirm } from '../components/dialogs';
+import { CustomSelect, MultiChipSelect } from '../components/CustomSelect';
 import type {
   McpServer,
   McpTransport,
@@ -17,7 +18,7 @@ function RegisterMcpModal({ onClose, onRegistered }: { onClose: () => void; onRe
   const [transport, setTransport] = useState<McpTransport>('http');
   const [endpoint, setEndpoint] = useState('');
   const [command, setCommand] = useState('');
-  const [scopes, setScopes] = useState('');
+  const [scopes, setScopes] = useState<string[]>([]);
   const [enabled, setEnabled] = useState(true);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -29,7 +30,7 @@ function RegisterMcpModal({ onClose, onRegistered }: { onClose: () => void; onRe
       name: name.trim(),
       transport,
       enabled,
-      scopes: scopes.trim() ? scopes.split(',').map((s) => s.trim()).filter(Boolean) : [],
+      scopes,
     };
     if (transport === 'http') body.endpoint = endpoint.trim() || null;
     if (transport === 'stdio') body.command = command.trim() || null;
@@ -69,13 +70,11 @@ function RegisterMcpModal({ onClose, onRegistered }: { onClose: () => void; onRe
 
         <div className="flex flex-col gap-1">
           <label className="text-[11px] text-dim font-mono">传输方式</label>
-          <select
-            className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
+          <CustomSelect
+            options={TRANSPORTS.map((t) => ({ value: t, label: t }))}
             value={transport}
-            onChange={(e) => setTransport(e.target.value as McpTransport)}
-          >
-            {TRANSPORTS.map((t) => <option key={t} value={t}>{t}</option>)}
-          </select>
+            onChange={(v) => setTransport(v as McpTransport)}
+          />
         </div>
 
         {transport === 'http' ? (
@@ -101,13 +100,8 @@ function RegisterMcpModal({ onClose, onRegistered }: { onClose: () => void; onRe
         )}
 
         <div className="flex flex-col gap-1">
-          <label className="text-[11px] text-dim font-mono">Scopes（逗号分隔）</label>
-          <input
-            className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
-            value={scopes}
-            onChange={(e) => setScopes(e.target.value)}
-            placeholder="read, write"
-          />
+          <label className="text-[11px] text-dim font-mono">Scopes</label>
+          <MultiChipSelect options={['read', 'write', 'admin']} value={scopes} onChange={setScopes} />
         </div>
 
         <label className="flex items-center gap-2 text-[12px] text-ink-2">

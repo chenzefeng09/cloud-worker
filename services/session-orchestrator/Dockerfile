@@ -14,6 +14,9 @@ RUN pip install --no-cache-dir poetry==2.1.4
 COPY --from=foundation_sdk . /sdk
 RUN pip install --no-cache-dir "/sdk[fastapi]"
 
+COPY --from=feature_flag_client . /ff-client
+RUN pip install --no-cache-dir "/ff-client[fastapi]"
+
 COPY pyproject.toml poetry.lock* ./
 RUN poetry config virtualenvs.create false \
  && poetry install --no-root --without dev --no-interaction --no-ansi

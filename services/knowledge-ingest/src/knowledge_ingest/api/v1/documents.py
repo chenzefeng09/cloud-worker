@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 
-from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Request, Response, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge_ingest.api.authz_guard import require_permission
@@ -125,6 +125,25 @@ async def get_document(
     out = DocumentOut.model_validate(doc).model_dump(mode="json")
     out["chunk_count"] = count
     return DocumentOut(**out)
+
+
+@router.delete(
+    "/documents/{document_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("document.delete", "document"))],
+)
+async def delete_document(
+    document_id: str,
+    request: Request,
+    db: AsyncSession = TDbSession,
+    blob: BlobStore = TBlobStore,
+    embeddings: EmbeddingClient = TEmbeddings,
+    tenant_id: str = TTenantId,
+) -> Response:
+    """Delete a document — its chunks (cascade) and source blob (best-effort)."""
+    svc = _make_service(request, db, blob, embeddings, tenant_id)
+    await svc.delete_document(document_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post(

@@ -117,6 +117,7 @@ class FakePlatform:
             ("DELETE", "/mcp-servers/"): (204, None),
             ("GET", "/documents/"): (200, {"id": "doc_1", "title": "t"}),
             ("GET", "/documents"): (200, {"items": [], "total": 0}),
+            ("DELETE", "/documents/"): (204, None),
             ("POST", "/ingest"): (200, {"document_id": "doc_1", "status": "READY"}),
             ("POST", "/cancel"): (200, {"id": "run_1", "status": "CANCELLED"}),
             ("GET", "/runs"): (200, {"items": []}),
@@ -199,6 +200,7 @@ ALL_ENDPOINTS = [
     ("/admin/knowledge/documents", "GET", None),
     ("/admin/knowledge/documents/doc_1", "GET", None),
     ("/admin/knowledge/documents/doc_1/reingest", "POST", None),
+    ("/admin/knowledge/documents/doc_1", "DELETE", None),
     ("/admin/ops/runs", "GET", None),
     ("/admin/ops/runs/run_1/cancel", "POST", None),
     ("/admin/ops/sandboxes", "GET", None),
@@ -265,6 +267,18 @@ def test_reingest_maps_to_ingest(client, authed_cookie, fake_allowed) -> None:
         u == f"{KNOW_URL}/documents/doc_1/ingest"
         for (_, u, _) in fake_allowed.requests
     ), "reingest did not map to /ingest"
+
+
+def test_delete_document_hits_knowledge_ingest(client, authed_cookie, fake_allowed) -> None:
+    resp = client.delete(
+        "/api/bff/v1/admin/knowledge/documents/doc_1", cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "deleted"
+    assert any(
+        m == "DELETE" and u == f"{KNOW_URL}/documents/doc_1"
+        for (m, u, _) in fake_allowed.requests
+    ), "delete document did not hit knowledge-ingest /documents/{id}"
 
 
 def test_pool_snapshot_hits_sandbox_pool(client, authed_cookie, fake_allowed) -> None:

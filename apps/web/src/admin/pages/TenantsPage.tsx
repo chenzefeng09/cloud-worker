@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
+import { Dialog } from '../components/Dialog';
+import { useToast } from '../components/dialogs';
+import { CustomSelect } from '../components/CustomSelect';
 import type { CreateTenantRequest, PatchTenantRequest, Tenant, TenantStatus, TenantTier } from '../../api/types';
 
 const TIERS: TenantTier[] = ['FREE', 'PRO', 'BUSINESS', 'ENTERPRISE', 'DEDICATED'];
@@ -16,12 +19,18 @@ const STATUS_COLOR: Record<TenantStatus, string> = {
 // ─── Create Tenant Form ───────────────────────────────────────────────────────
 
 function CreateTenantForm({ onCreated }: { onCreated: (t: Tenant) => void }) {
+  const toast = useToast();
   const [open, setOpen] = useState(false);
   const [name, setName] = useState('');
   const [tier, setTier] = useState<TenantTier>('FREE');
   const [adminEmail, setAdminEmail] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const close = () => {
+    setOpen(false);
+    setError(null);
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -32,6 +41,7 @@ function CreateTenantForm({ onCreated }: { onCreated: (t: Tenant) => void }) {
       const body: CreateTenantRequest = { name: name.trim(), tier, admin_email: adminEmail.trim() };
       const created = await api.admin.tenants.create(body);
       onCreated(created);
+      toast.success(`租户「${created.name ?? name.trim()}」已创建`);
       setName('');
       setAdminEmail('');
       setTier('FREE');
@@ -43,76 +53,70 @@ function CreateTenantForm({ onCreated }: { onCreated: (t: Tenant) => void }) {
     }
   };
 
-  if (!open) {
-    return (
+  return (
+    <>
       <button
         onClick={() => setOpen(true)}
         className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 transition-opacity"
       >
         + 新建租户
       </button>
-    );
-  }
-
-  return (
-    <form
-      onSubmit={handleSubmit}
-      className="border border-line rounded-md p-4 bg-surface flex flex-col gap-3 max-w-md"
-    >
-      <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-dim">新建租户</div>
-      {error && (
-        <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>
+      {open && (
+        <Dialog title="新建租户" onClose={close} dismissable={!loading} className="w-full max-w-md">
+          <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+            {error && (
+              <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>
+            )}
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">租户名称</label>
+              <input
+                className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder="acme-corp"
+                required
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">套餐</label>
+              <CustomSelect
+                options={TIERS.map((t) => ({ value: t, label: t }))}
+                value={tier}
+                onChange={(v) => setTier(v as TenantTier)}
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">管理员邮箱</label>
+              <input
+                className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
+                type="email"
+                value={adminEmail}
+                onChange={(e) => setAdminEmail(e.target.value)}
+                placeholder="admin@acme.co"
+                required
+              />
+            </div>
+            <div className="flex justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={close}
+                disabled={loading}
+                className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                disabled={loading}
+                className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
+              >
+                {loading ? '创建中…' : '创建'}
+              </button>
+            </div>
+          </form>
+        </Dialog>
       )}
-      <div className="flex flex-col gap-1">
-        <label className="text-[11px] text-dim font-mono">租户名称</label>
-        <input
-          className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="acme-corp"
-          required
-        />
-      </div>
-      <div className="flex flex-col gap-1">
-        <label className="text-[11px] text-dim font-mono">套餐</label>
-        <select
-          className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
-          value={tier}
-          onChange={(e) => setTier(e.target.value as TenantTier)}
-        >
-          {TIERS.map((t) => (
-            <option key={t} value={t}>{t}</option>
-          ))}
-        </select>
-      </div>
-      <div className="flex flex-col gap-1">
-        <label className="text-[11px] text-dim font-mono">管理员邮箱</label>
-        <input
-          className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
-          type="email"
-          value={adminEmail}
-          onChange={(e) => setAdminEmail(e.target.value)}
-          placeholder="admin@acme.co"
-          required
-        />
-      </div>
-      <div className="flex gap-2">
-        <button
-          type="submit"
-          disabled={loading}
-          className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
-        >
-          {loading ? '创建中…' : '创建'}
-        </button>
-        <button
-          type="button"
-          onClick={() => setOpen(false)}
-          className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink"
-        >
-          取消
-        </button>
-      </div>
-    </form>
+    </>
   );
 }
 
@@ -146,12 +150,12 @@ function EditTenantRow({ tenant, onPatched }: { tenant: Tenant; onPatched: (t: T
   if (!editing) {
     return (
       <tr className="border-b border-line-2 hover:bg-paper-2 transition-colors group">
-        <td className="px-3 py-2 font-mono text-[12px] text-dim truncate max-w-[120px]">{tenant.id.slice(0, 8)}…</td>
-        <td className="px-3 py-2 text-[13px] text-ink">{tenant.name}</td>
-        <td className="px-3 py-2 font-mono text-[11px] text-ink-2">{tenant.tier}</td>
-        <td className={`px-3 py-2 font-mono text-[11px] ${STATUS_COLOR[tenant.status]}`}>{tenant.status}</td>
+        <td className="px-3 py-2 font-mono text-[12px] text-dim truncate max-w-[120px]">{tenant.id?.slice(0, 8) ?? '—'}…</td>
+        <td className="px-3 py-2 text-[13px] text-ink">{tenant.name ?? '—'}</td>
+        <td className="px-3 py-2 font-mono text-[11px] text-ink-2">{tenant.tier ?? '—'}</td>
+        <td className={`px-3 py-2 font-mono text-[11px] ${(tenant.status && STATUS_COLOR[tenant.status]) ?? 'text-dim'}`}>{tenant.status ?? '—'}</td>
         <td className="px-3 py-2 font-mono text-[11px] text-dim">
-          {new Date(tenant.created_at).toLocaleDateString('zh-CN')}
+          {tenant.created_at ? new Date(tenant.created_at).toLocaleDateString('zh-CN') : '—'}
         </td>
         <td className="px-3 py-2">
           <button
@@ -167,28 +171,24 @@ function EditTenantRow({ tenant, onPatched }: { tenant: Tenant; onPatched: (t: T
 
   return (
     <tr className="border-b border-line bg-surface">
-      <td className="px-3 py-2 font-mono text-[12px] text-dim">{tenant.id.slice(0, 8)}…</td>
-      <td className="px-3 py-2 text-[13px] text-ink">{tenant.name}</td>
+      <td className="px-3 py-2 font-mono text-[12px] text-dim">{tenant.id?.slice(0, 8) ?? '—'}…</td>
+      <td className="px-3 py-2 text-[13px] text-ink">{tenant.name ?? '—'}</td>
       <td className="px-3 py-2">
-        <select
-          className="border border-line rounded-sm px-1.5 py-0.5 text-[12px] bg-paper focus:outline-none focus:border-accent font-mono"
+        <CustomSelect
+          options={TIERS.map((t) => ({ value: t, label: t }))}
           value={tier}
-          onChange={(e) => setTier(e.target.value as TenantTier)}
-        >
-          {TIERS.map((t) => <option key={t} value={t}>{t}</option>)}
-        </select>
+          onChange={(v) => setTier(v as TenantTier)}
+        />
       </td>
       <td className="px-3 py-2">
-        <select
-          className="border border-line rounded-sm px-1.5 py-0.5 text-[12px] bg-paper focus:outline-none focus:border-accent font-mono"
+        <CustomSelect
+          options={STATUSES.map((s) => ({ value: s, label: s }))}
           value={status}
-          onChange={(e) => setStatus(e.target.value as TenantStatus)}
-        >
-          {STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
-        </select>
+          onChange={(v) => setStatus(v as TenantStatus)}
+        />
       </td>
       <td className="px-3 py-2 font-mono text-[11px] text-dim">
-        {new Date(tenant.created_at).toLocaleDateString('zh-CN')}
+        {tenant.created_at ? new Date(tenant.created_at).toLocaleDateString('zh-CN') : '—'}
       </td>
       <td className="px-3 py-2 flex items-center gap-2">
         {error && <span className="text-[11px] text-accent">{error}</span>}

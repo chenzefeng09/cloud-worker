@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import type { StepGroupUnit } from '../lib/groupSteps';
 import { ToolRow, ThinkingBlock } from './chatStepRenderers';
+import { useFeatureFlag } from '../hooks/useFeatureFlags';
 
 interface StepGroupProps {
   group: StepGroupUnit;
@@ -11,6 +12,7 @@ interface StepGroupProps {
 export function StepGroup({ group, friendly }: StepGroupProps) {
   const [stepsOpen, setStepsOpen] = useState<boolean>(group.isActive);
   const [toolExpanded, setToolExpanded] = useState<Record<string, boolean>>({});
+  const showThinking = useFeatureFlag('ai.thinking_ui');
 
   // Auto-collapse when run finishes; auto-open when (re)activated.
   // Only fires on active↔inactive transitions, not on ordinary re-renders.
@@ -66,6 +68,7 @@ export function StepGroup({ group, friendly }: StepGroupProps) {
     const step = group.steps[0];
 
     if (step.blockKind === 'thinking') {
+      if (!showThinking) return null;
       return (
         <div className="min-w-0">
           <ThinkingBlock content={step.content} friendly={friendly} />
@@ -130,6 +133,7 @@ export function StepGroup({ group, friendly }: StepGroupProps) {
           >
             {group.steps.map((step) => {
               if (step.blockKind === 'thinking') {
+                if (!showThinking) return null;
                 return (
                   <ThinkingBlock key={step.id} content={step.content} friendly={friendly} />
                 );

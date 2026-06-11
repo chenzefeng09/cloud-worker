@@ -637,6 +637,35 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
         "判断不确定时，优先直接在正文回复，而不是写文件。"
     )
 
+    # ------------------------------------------------------------------
+    # Available skills (progressive disclosure).  We download + unpack the
+    # task's skill packages into /workspace/skills/<name>-<version>/ and tell
+    # the agent each skill's name/description + the absolute SKILL.md path so
+    # it can Read the full instructions on demand.  No user-uploaded code is
+    # ever imported or executed.  Failure-open: collect_skill_prompts swallows
+    # all per-skill errors and returns only the successfully-unpacked ones.
+    # ------------------------------------------------------------------
+    try:
+        from agentscope_ext.skills_loader import collect_skill_prompts
+
+        skill_prompts = collect_skill_prompts(task, tenant_id, env)
+    except Exception as exc:  # noqa: BLE001 -- never let skills crash the run
+        logger.warning("skills_loader: collect_skill_prompts failed: %s", exc)
+        skill_prompts = []
+
+    if skill_prompts:
+        lines = [
+            "\n\n## 可用技能\n"
+            "你可以使用以下技能。每个技能的完整说明在对应的 SKILL.md 里，"
+            "需要时用 Read 工具读取该文件（及其同目录的 scripts/references）："
+        ]
+        for sp in skill_prompts:
+            lines.append(
+                f"- {sp['name']}：{sp.get('description', '')}"
+                f"  指令文件：{sp['skill_md_abspath']}"
+            )
+        sys_prompt += "\n".join(lines)
+
     # Build an AgentState with BYPASS permission so tool calls are auto-approved
     # in the headless sandbox (no human is present to confirm).  Failure-open:
     # if the permission sub-system is absent in this AgentScope version we fall

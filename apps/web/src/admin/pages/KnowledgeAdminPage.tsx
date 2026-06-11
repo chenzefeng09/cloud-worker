@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
-import { useConfirm } from '../components/dialogs';
+import { useConfirm, useToast } from '../components/dialogs';
+import { Dialog } from '../components/Dialog';
+import { CustomSelect } from '../components/CustomSelect';
 import type { DocumentStatus, IngestResult, KnowledgeDocument } from '../../api/types';
 
 const STATUS_COLOR: Record<DocumentStatus, string> = {
@@ -41,11 +43,7 @@ function DocDetailPanel({
   const d = detail ?? doc;
 
   return (
-    <div className="border border-line rounded-md bg-surface p-4 flex flex-col gap-3 max-w-2xl">
-      <div className="flex items-center justify-between">
-        <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-dim">文档详情</div>
-        <button onClick={onClose} className="text-[11px] font-mono text-dim hover:text-ink">关闭</button>
-      </div>
+    <Dialog title="文档详情" onClose={onClose} className="w-full max-w-lg">
       {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
       <div className="grid grid-cols-[120px_1fr] gap-y-2 gap-x-3 text-[12px]">
@@ -64,7 +62,7 @@ function DocDetailPanel({
         <span className="font-mono text-dim">上传时间</span>
         <span className="font-mono text-ink-2">{new Date(d.uploaded_at).toLocaleString('zh-CN')}</span>
       </div>
-    </div>
+    </Dialog>
   );
 }
 
@@ -75,15 +73,19 @@ function DocRow({
   tenantId,
   onSelect,
   selected,
+  onDeleted,
 }: {
   doc: KnowledgeDocument;
   tenantId: string;
   onSelect: (d: KnowledgeDocument) => void;
   selected: boolean;
+  onDeleted: () => void;
 }) {
   const [reingesting, setReingesting] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
   const confirm = useConfirm();
+  const toast = useToast();
 
   const reingest = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -97,6 +99,28 @@ function DocRow({
       setMsg(err instanceof ApiError ? `失败：${err.message}` : '重新摄取失败');
     } finally {
       setReingesting(false);
+    }
+  };
+
+  const remove = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (
+      !(await confirm({
+        title: '删除文档',
+        message: `确定删除文档「${doc.title}」吗？此操作不可撤销。`,
+        tone: 'danger',
+        confirmText: '删除',
+      }))
+    )
+      return;
+    setDeleting(true);
+    try {
+      await api.admin.knowledge.documents.delete(doc.id, tenantId);
+      toast.success('已删除文档');
+      onDeleted();
+    } catch (err) {
+      toast.error(err instanceof ApiError ? err.message : '删除失败');
+      setDeleting(false);
     }
   };
 
@@ -118,10 +142,17 @@ function DocRow({
           {msg && <span className="text-[11px] font-mono text-dim">{msg}</span>}
           <button
             onClick={reingest}
-            disabled={reingesting}
+            disabled={reingesting || deleting}
             className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-dim hover:text-ink transition-opacity disabled:opacity-50"
           >
             {reingesting ? '摄取中…' : '重新摄取'}
+          </button>
+          <button
+            onClick={remove}
+            disabled={reingesting || deleting}
+            className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-red-600 hover:text-red-700 transition-opacity disabled:opacity-50"
+          >
+            {deleting ? '删除中…' : '删除'}
           </button>
         </div>
       </td>
@@ -139,6 +170,7 @@ export function KnowledgeAdminPage() {
   const [error, setError] = useState<string | null>(null);
   const [isTodoEndpoint, setIsTodoEndpoint] = useState(false);
   const [selected, setSelected] = useState<KnowledgeDocument | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   // Bootstrap tenant list
   useEffect(() => {
@@ -171,7 +203,7 @@ export function KnowledgeAdminPage() {
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [selectedTenantId]);
+  }, [selectedTenantId, reloadKey]);
 
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
@@ -182,17 +214,13 @@ export function KnowledgeAdminPage() {
 
       <div className="flex items-center gap-3">
         <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
-        <select
-          className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent min-w-[200px]"
+        <CustomSelect
+          options={[{ value: '', label: '— 请选择 —' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
           value={selectedTenantId ?? ''}
-          onChange={(e) => { setSelectedTenantId(e.target.value || null); setDocs([]); setSelected(null); }}
+          onChange={(v) => { setSelectedTenantId(v || null); setDocs([]); setSelected(null); }}
           disabled={tenantsLoading}
-        >
-          <option value="">— 请选择 —</option>
-          {tenants.map((t) => (
-            <option key={t.id} value={t.id}>{t.name}</option>
-          ))}
-        </select>
+          className="min-w-[200px]"
+        />
       </div>
 
       {error && (
@@ -237,6 +265,7 @@ export function KnowledgeAdminPage() {
                   tenantId={selectedTenantId}
                   onSelect={setSelected}
                   selected={selected?.id === d.id}
+                  onDeleted={() => { setSelected(null); setReloadKey((k) => k + 1); }}
                 />
               ))}
             </tbody>

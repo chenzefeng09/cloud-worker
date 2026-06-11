@@ -7,7 +7,6 @@ import { AuditPage } from './pages/AuditPage';
 import { SessionReplayPage } from './pages/SessionReplayPage';
 import { ModelManagementPage } from './pages/ModelManagementPage';
 import { AppReviewPage } from './pages/AppReviewPage';
-import { DefaultModelSettingsPage } from './pages/DefaultModelSettingsPage';
 import { RbacPage } from './pages/RbacPage';
 import { OrgStructurePage } from './pages/OrgStructurePage';
 import { FeatureFlagsPage } from './pages/FeatureFlagsPage';
@@ -15,7 +14,18 @@ import { SkillsAdminPage } from './pages/SkillsAdminPage';
 import { McpServersPage } from './pages/McpServersPage';
 import { KnowledgeAdminPage } from './pages/KnowledgeAdminPage';
 import { OpsDashboardPage } from './pages/OpsDashboardPage';
+import { PamPage } from './pages/PamPage';
+import { ApiPlatformPage } from './pages/ApiPlatformPage';
+import { NotificationAdminPage } from './pages/NotificationAdminPage';
+import { PlanCataloguePage } from './pages/PlanCataloguePage';
+import { DlpPage } from './pages/DlpPage';
+import { CompliancePage } from './pages/CompliancePage';
+import { SecurityOpsPage } from './pages/SecurityOpsPage';
+import { LifecyclePage } from './pages/LifecyclePage';
+import { DataProtectionPage } from './pages/DataProtectionPage';
+import { SsoPage } from './pages/SsoPage';
 import { DialogProvider } from './components/dialogs';
+import { ErrorBoundary } from './components/ErrorBoundary';
 
 interface AdminNavSpec {
   to: string;
@@ -41,19 +51,21 @@ const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
     items: [
       { to: '/admin/users', label: '用户管理', glyph: '◎' },
       { to: '/admin/rbac', label: '角色与权限', glyph: '⊙' },
+      { to: '/admin/pam', label: '特权访问', glyph: '⊘' },
+      { to: '/admin/sso', label: '身份源管理', glyph: '⊜' },
     ],
   },
   {
     title: '计费与配额',
     items: [
-      { to: '/admin/quota', label: '计费与配额', glyph: '◷' },
+      { to: '/admin/plans', label: '套餐目录', glyph: '◈' },
+      { to: '/admin/quota', label: '订阅与配额', glyph: '◷' },
     ],
   },
   {
     title: '模型与 AI',
     items: [
       { to: '/admin/models', label: '模型管理', glyph: '⊕' },
-      { to: '/admin/defaults', label: '默认模型设置', glyph: '⊛' },
     ],
   },
   {
@@ -64,6 +76,7 @@ const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
       { to: '/admin/mcp', label: 'MCP 服务器', glyph: '⊟' },
       { to: '/admin/knowledge', label: '知识库', glyph: '❖' },
       { to: '/admin/ops', label: '运行与沙箱', glyph: '◳' },
+      { to: '/admin/api-platform', label: 'API 平台', glyph: '⌘' },
     ],
   },
   {
@@ -72,6 +85,12 @@ const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
       { to: '/admin/flags', label: 'Feature Flags', glyph: '⚑' },
       { to: '/admin/audit', label: '审计日志', glyph: '≡' },
       { to: '/admin/replay', label: '会话回放', glyph: '▷' },
+      { to: '/admin/notification', label: '通知中心', glyph: '✉' },
+      { to: '/admin/dlp', label: '数据防泄漏', glyph: '⛨' },
+      { to: '/admin/compliance', label: '合规中心', glyph: '⚖' },
+      { to: '/admin/security-ops', label: '安全运营', glyph: '⊛' },
+      { to: '/admin/lifecycle', label: '数据生命周期', glyph: '♺' },
+      { to: '/admin/data-protection', label: '数据保护', glyph: '⛉' },
     ],
   },
 ];
@@ -158,24 +177,35 @@ export function AdminLayout() {
       {/* Admin main content */}
       <main className="flex-1 min-w-0 overflow-hidden">
         <div className="h-full w-full flex flex-col">
+          <ErrorBoundary>
           <Routes>
             <Route path="tenants" element={<TenantsPage />} />
             <Route path="org" element={<OrgStructurePage />} />
             <Route path="users" element={<UsersPage />} />
             <Route path="rbac" element={<RbacPage />} />
+            <Route path="plans" element={<PlanCataloguePage />} />
             <Route path="quota" element={<QuotaPage />} />
             <Route path="models" element={<ModelManagementPage />} />
-            <Route path="defaults" element={<DefaultModelSettingsPage />} />
             <Route path="apps" element={<AppReviewPage />} />
             <Route path="skills" element={<SkillsAdminPage />} />
             <Route path="mcp" element={<McpServersPage />} />
             <Route path="knowledge" element={<KnowledgeAdminPage />} />
             <Route path="ops" element={<OpsDashboardPage />} />
+            <Route path="pam" element={<PamPage />} />
+            <Route path="sso" element={<SsoPage />} />
+            <Route path="api-platform" element={<ApiPlatformPage />} />
             <Route path="flags" element={<FeatureFlagsPage />} />
             <Route path="audit" element={<AuditPage />} />
             <Route path="replay" element={<SessionReplayPage />} />
+            <Route path="notification" element={<NotificationAdminPage />} />
+            <Route path="dlp" element={<DlpPage />} />
+            <Route path="compliance" element={<CompliancePage />} />
+            <Route path="security-ops" element={<SecurityOpsPage />} />
+            <Route path="lifecycle" element={<LifecyclePage />} />
+            <Route path="data-protection" element={<DataProtectionPage />} />
             <Route path="*" element={<Navigate to="/admin/tenants" replace />} />
           </Routes>
+          </ErrorBoundary>
         </div>
       </main>
     </div>

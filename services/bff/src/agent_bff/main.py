@@ -113,6 +113,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from agent_bff.api.v1.admin_identity import router as admin_identity_router
     app.include_router(admin_identity_router, prefix=settings.api_prefix)
 
+    from agent_bff.api.v1.admin_sso import router as admin_sso_router
+    app.include_router(admin_sso_router, prefix=settings.api_prefix)
+
     from agent_bff.api.v1.admin_billing import router as admin_billing_router
     app.include_router(admin_billing_router, prefix=settings.api_prefix)
 
@@ -122,8 +125,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from agent_bff.api.v1.admin_flags import router as admin_flags_router
     app.include_router(admin_flags_router, prefix=settings.api_prefix)
 
+    from agent_bff.api.v1.flags import router as flags_router
+    app.include_router(flags_router, prefix=settings.api_prefix)
+
     from agent_bff.api.v1.admin_platform import router as admin_platform_router
     app.include_router(admin_platform_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_notification import (
+        router as admin_notification_router,
+    )
+    app.include_router(admin_notification_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_api_platform import (
+        router as admin_api_platform_router,
+    )
+    app.include_router(admin_api_platform_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_pam import router as admin_pam_router
+    app.include_router(admin_pam_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.pam import router as pam_router
+    app.include_router(pam_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_dlp import router as admin_dlp_router
+    app.include_router(admin_dlp_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_compliance import (
+        router as admin_compliance_router,
+    )
+    app.include_router(admin_compliance_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_security_ops import (
+        router as admin_security_ops_router,
+    )
+    app.include_router(admin_security_ops_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_lifecycle import (
+        router as admin_lifecycle_router,
+    )
+    app.include_router(admin_lifecycle_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.admin_data_protection import (
+        router as admin_data_protection_router,
+    )
+    app.include_router(admin_data_protection_router, prefix=settings.api_prefix)
 
     from agent_bff.api.v1.billing import router as billing_router
     app.include_router(billing_router, prefix=settings.api_prefix)

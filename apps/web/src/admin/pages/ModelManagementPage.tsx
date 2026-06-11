@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useConfirm } from '../components/dialogs';
+import { CustomSelect } from '../components/CustomSelect';
+import { DefaultModelsDialog } from '../components/DefaultModelsDialog';
 import type {
   ModelProvider,
   ModelType,
@@ -294,15 +296,11 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
             </div>
             <div className="flex flex-col gap-1">
               <label className="text-[11px] font-mono text-dim">Provider 类型</label>
-              <select
-                className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
+              <CustomSelect
+                options={PROVIDER_OPTIONS}
                 value={providerType}
-                onChange={(e) => setProviderType(e.target.value as ProviderType)}
-              >
-                {PROVIDER_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value}>{o.label}</option>
-                ))}
-              </select>
+                onChange={(v) => setProviderType(v as ProviderType)}
+              />
             </div>
             <div className="flex flex-col gap-1 col-span-2 md:col-span-1">
               <label className="text-[11px] font-mono text-dim">Base URL</label>
@@ -417,22 +415,20 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
                       <button type="button" onClick={() => removeSelectedModel(idx)} className="text-[11px] text-red-500 hover:text-red-700">移除</button>
                     </div>
                     
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 items-start">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-start">
                       <div className="flex flex-col gap-1">
                         <label className="text-[10px] text-dim">类型</label>
-                        <select
-                          className="border border-line rounded-sm px-1.5 py-1 text-[11px] bg-paper"
+                        <CustomSelect
+                          options={MODEL_TYPES}
                           value={sm.model_type}
-                          onChange={(e) => updateSelectedModel(idx, 'model_type', e.target.value)}
-                        >
-                          {MODEL_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
-                        </select>
+                          onChange={(v) => updateSelectedModel(idx, 'model_type', v)}
+                        />
                       </div>
                       <div className="flex flex-col gap-1">
                         <label className="text-[10px] text-dim">上下文长度</label>
                         <input
                           type="number"
-                          className="border border-line rounded-sm px-1.5 py-1 text-[11px] bg-paper font-mono"
+                          className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper font-mono"
                           placeholder="例如: 128000"
                           value={sm.context_length}
                           onChange={(e) => updateSelectedModel(idx, 'context_length', e.target.value)}
@@ -442,30 +438,30 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
                         <label className="text-[10px] text-dim">Max Tokens</label>
                         <input
                           type="number"
-                          className="border border-line rounded-sm px-1.5 py-1 text-[11px] bg-paper font-mono"
+                          className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper font-mono"
                           placeholder="例如: 4096"
                           value={sm.max_tokens}
                           onChange={(e) => updateSelectedModel(idx, 'max_tokens', e.target.value)}
                         />
                       </div>
-                      <div className="flex flex-col gap-2 pt-4">
-                        <label className="flex items-center gap-1.5 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={sm.vision_support}
-                            onChange={(e) => updateSelectedModel(idx, 'vision_support', e.target.checked)}
-                          />
-                          <span className="text-[11px] text-ink-2">支持视觉</span>
-                        </label>
-                        <label className="flex items-center gap-1.5 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={sm.structured_output}
-                            onChange={(e) => updateSelectedModel(idx, 'structured_output', e.target.checked)}
-                          />
-                          <span className="text-[11px] text-ink-2">格式化输出</span>
-                        </label>
-                      </div>
+                    </div>
+                    <div className="flex items-center gap-5">
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={sm.vision_support}
+                          onChange={(e) => updateSelectedModel(idx, 'vision_support', e.target.checked)}
+                        />
+                        <span className="text-[11px] text-ink-2">支持视觉</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={sm.structured_output}
+                          onChange={(e) => updateSelectedModel(idx, 'structured_output', e.target.checked)}
+                        />
+                        <span className="text-[11px] text-ink-2">格式化输出</span>
+                      </label>
                     </div>
                   </div>
                 ))}
@@ -707,22 +703,20 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
                       <button type="button" onClick={() => removeSelectedModel(idx)} className="text-[11px] text-red-500 hover:text-red-700">移除</button>
                     </div>
                     
-                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3 items-start">
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-start">
                       <div className="flex flex-col gap-1">
                         <label className="text-[10px] text-dim">类型</label>
-                        <select
-                          className="border border-line rounded-sm px-1.5 py-1 text-[11px] bg-paper"
+                        <CustomSelect
+                          options={MODEL_TYPES}
                           value={sm.model_type}
-                          onChange={(e) => updateSelectedModel(idx, 'model_type', e.target.value)}
-                        >
-                          {MODEL_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
-                        </select>
+                          onChange={(v) => updateSelectedModel(idx, 'model_type', v)}
+                        />
                       </div>
                       <div className="flex flex-col gap-1">
                         <label className="text-[10px] text-dim">上下文长度</label>
                         <input
                           type="number"
-                          className="border border-line rounded-sm px-1.5 py-1 text-[11px] bg-paper font-mono"
+                          className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper font-mono"
                           placeholder="例如: 128000"
                           value={sm.context_length}
                           onChange={(e) => updateSelectedModel(idx, 'context_length', e.target.value)}
@@ -732,30 +726,30 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
                         <label className="text-[10px] text-dim">Max Tokens</label>
                         <input
                           type="number"
-                          className="border border-line rounded-sm px-1.5 py-1 text-[11px] bg-paper font-mono"
+                          className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper font-mono"
                           placeholder="例如: 4096"
                           value={sm.max_tokens}
                           onChange={(e) => updateSelectedModel(idx, 'max_tokens', e.target.value)}
                         />
                       </div>
-                      <div className="flex flex-col gap-2 pt-4">
-                        <label className="flex items-center gap-1.5 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={sm.vision_support}
-                            onChange={(e) => updateSelectedModel(idx, 'vision_support', e.target.checked)}
-                          />
-                          <span className="text-[11px] text-ink-2">支持视觉</span>
-                        </label>
-                        <label className="flex items-center gap-1.5 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={sm.structured_output}
-                            onChange={(e) => updateSelectedModel(idx, 'structured_output', e.target.checked)}
-                          />
-                          <span className="text-[11px] text-ink-2">格式化输出</span>
-                        </label>
-                      </div>
+                    </div>
+                    <div className="flex items-center gap-5">
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={sm.vision_support}
+                          onChange={(e) => updateSelectedModel(idx, 'vision_support', e.target.checked)}
+                        />
+                        <span className="text-[11px] text-ink-2">支持视觉</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={sm.structured_output}
+                          onChange={(e) => updateSelectedModel(idx, 'structured_output', e.target.checked)}
+                        />
+                        <span className="text-[11px] text-ink-2">格式化输出</span>
+                      </label>
                     </div>
                   </div>
                 ))}
@@ -957,6 +951,7 @@ export function ModelManagementPage() {
   const [editingProvider, setEditingProvider] = useState<ModelProvider | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [toggling, setToggling] = useState<string | null>(null);
+  const [showDefaults, setShowDefaults] = useState(false);
   const confirm = useConfirm();
 
   const loadProviders = useCallback(async () => {
@@ -976,6 +971,18 @@ export function ModelManagementPage() {
   }, [loadProviders]);
 
   const handleToggleEnabled = async (provider: ModelProvider) => {
+    // Disabling a Provider takes its models offline platform-wide, so confirm
+    // first. Re-enabling is harmless and needs no confirmation.
+    if (
+      provider.enabled &&
+      !(await confirm({
+        title: '停用 Provider',
+        message: `确定要停用 Provider "${provider.name}" 吗？停用后其下所有模型将不可用。`,
+        tone: 'danger',
+        confirmText: '停用',
+      }))
+    )
+      return;
     setToggling(provider.id);
     try {
       await api.admin.llm.updateProvider(provider.id, { enabled: !provider.enabled });
@@ -1036,15 +1043,24 @@ export function ModelManagementPage() {
             管理 LLM、嵌入和重排序模型的 Provider 接入配置
           </p>
         </div>
-        {providers.length > 0 && (
+        <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => setShowAdd(true)}
-            className="px-4 py-2 bg-ink text-paper text-[13px] font-mono rounded-md shadow hover:bg-ink-2 transition-colors"
+            onClick={() => setShowDefaults(true)}
+            className="px-4 py-2 border border-line bg-paper text-ink text-[13px] font-mono rounded-md shadow-sm hover:bg-paper-2 transition-colors"
           >
-            + 添加 Provider
+            默认模型设置
           </button>
-        )}
+          {providers.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowAdd(true)}
+              className="px-4 py-2 bg-ink text-paper text-[13px] font-mono rounded-md shadow hover:bg-ink-2 transition-colors"
+            >
+              + 添加 Provider
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Model type summary */}
@@ -1132,6 +1148,9 @@ export function ModelManagementPage() {
         onClose={() => setEditingProvider(null)}
         onUpdated={loadProviders}
       />
+
+      {/* Default models dialog */}
+      {showDefaults && <DefaultModelsDialog onClose={() => setShowDefaults(false)} />}
     </div>
     </div>
   );

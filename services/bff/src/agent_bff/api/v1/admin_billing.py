@@ -2,23 +2,24 @@
 
 Proxy target: foundation-billing (``settings.foundation_billing_url``).
 
-NOTE on spec vs. base reality (see delivery report):
-  The admin-console spec assumed ``POST /subscriptions/{id}/change-plan`` and
-  ``POST /subscriptions/{id}/cancel`` (per billing.yaml).  The *running*
-  foundation-billing service (packages/billing api/v1/billing.py) does NOT
-  implement those routes — it exposes only ``/plans``, ``/subscriptions``
-  (POST), ``/subscriptions/current`` (GET) and ``/quota/usage``.  Therefore the
-  change-plan / cancel proxies are NOT shipped here; they are listed as skipped
-  in the report.  The "usage" endpoint maps to the real ``GET /quota/usage``
-  (no query params upstream — tenant scope comes from X-Tenant-Id).
+foundation-billing now exposes subscription mutations directly:
+  ``POST /subscriptions/change-plan`` (body {new_plan_id}) and
+  ``POST /subscriptions/cancel`` (empty body); both return the subscription
+  object.  These are proxied as ``/admin/billing/subscription/change-plan`` and
+  ``/admin/billing/subscription/cancel``.  The "usage" read maps to the real
+  ``GET /quota/usage`` (no query params upstream — tenant scope comes from
+  X-Tenant-Id).
 
-Tenant scope: pass ``tenant_id`` to inspect another tenant (overrides
+Tenant scope: pass ``tenant_id`` to inspect / act on another tenant (overrides
 ``X-Tenant-Id``).
 
 Upstream paths:
-    GET /plans                 → {items: BillingPlan[]}
-    GET /subscriptions/current → TenantSubscription | {status: NO_SUBSCRIPTION}
-    GET /quota/usage           → {usage: {dimension: value}}
+    GET  /plans                      → {items: BillingPlan[]}
+    POST /plans                      → BillingPlan (create)
+    GET  /subscriptions/current      → TenantSubscription | {status: NO_SUBSCRIPTION}
+    POST /subscriptions             → TenantSubscription (create)
+    POST /subscriptions/change-plan  → TenantSubscription
+    POST /subscriptions/cancel       → TenantSubscription
 """
 
 from __future__ import annotations
@@ -67,6 +68,48 @@ async def list_plans(
     return resp.json()
 
 
+@router.post("/admin/billing/plans", status_code=201)
+async def create_plan(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Create a new billing plan."""
+    settings = request.app.state.settings
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(
+                f"{settings.foundation_billing_url}/plans",
+                json=body,
+                headers=_headers(request, _auth),
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise _connect_502(exc) from exc
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.post("/admin/billing/subscriptions", status_code=201)
+async def create_subscription(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Create a subscription for a tenant (admin-initiated)."""
+    settings = request.app.state.settings
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(
+                f"{settings.foundation_billing_url}/subscriptions",
+                json=body,
+                headers=_headers(request, _auth),
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise _connect_502(exc) from exc
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
 @router.get("/admin/billing/subscription")
 async def get_current_subscription(
     request: Request,
@@ -78,6 +121,56 @@ async def get_current_subscription(
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.get(
                 f"{settings.foundation_billing_url}/subscriptions/current",
+                headers=_headers(request, _auth),
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise _connect_502(exc) from exc
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.post("/admin/billing/subscription/change-plan")
+async def change_plan(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Change the target tenant's subscription plan.
+
+    Forwards ``{new_plan_id}`` to foundation-billing
+    ``POST /subscriptions/change-plan``; returns the updated subscription.
+    """
+    settings = request.app.state.settings
+    body = await request.json() if await request.body() else {}
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(
+                f"{settings.foundation_billing_url}/subscriptions/change-plan",
+                json=body,
+                headers=_headers(request, _auth),
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise _connect_502(exc) from exc
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.post("/admin/billing/subscription/cancel")
+async def cancel_subscription(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Cancel the target tenant's subscription.
+
+    Proxies to foundation-billing ``POST /subscriptions/cancel`` (empty body);
+    returns the updated subscription.
+    """
+    settings = request.app.state.settings
+    body = await request.json() if await request.body() else {}
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.post(
+                f"{settings.foundation_billing_url}/subscriptions/cancel",
+                json=body,
                 headers=_headers(request, _auth),
             )
     except (httpx.ConnectError, httpx.TimeoutException) as exc:

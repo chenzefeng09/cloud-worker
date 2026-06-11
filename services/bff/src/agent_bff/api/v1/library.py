@@ -25,6 +25,12 @@ from agent_bff.api.dependencies import require_auth
 
 router = APIRouter(tags=["Library"])
 
+# Hard cap on the compressed bytes accepted for a skill-version upload at the
+# BFF edge. skill-store also bounds the *decompressed* footprint (block 1,
+# MAX_TOTAL_SIZE=50MiB), but we reject oversized payloads here so GB-scale
+# files never tunnel through to the backend just to be rejected.
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20 MiB
+
 
 def _raise_for_upstream(resp: httpx.Response) -> None:
     """Surface upstream 4xx/5xx as HTTPException so the SPA gets a readable error."""
@@ -192,10 +198,16 @@ async def create_skill_version(
         data["manifest"] = manifest
     if expected_sha256 is not None:
         data["expected_sha256"] = expected_sha256
+    content = await file.read()
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"user_message": "技能包超过大小上限 20 MB"},
+        )
     files = {
         "file": (
             file.filename,
-            await file.read(),
+            content,
             file.content_type or "application/octet-stream",
         )
     }

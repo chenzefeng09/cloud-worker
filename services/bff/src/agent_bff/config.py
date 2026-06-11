@@ -36,6 +36,34 @@ class Settings(BaseSettings):
     foundation_feature_flag_url: str = (
         "http://feature-flag:8012/api/feature-flag/v1"
     )
+    # Notification service — templates + send (single / batch).
+    foundation_notification_url: str = (
+        "http://localhost:18008/api/notification/v1"
+    )
+    # API-platform — API keys, OAuth apps, webhooks.
+    foundation_api_platform_url: str = (
+        "http://localhost:18010/api/api-platform/v1"
+    )
+    # PAM — privileged-access elevations + sessions.
+    foundation_pam_url: str = "http://localhost:18015/api/pam/v1"
+    # DLP — data-loss-prevention classification / checks / scan.
+    foundation_dlp_url: str = "http://localhost:18007/api/dlp/v1"
+    # Compliance — ROPA / DPIA / DSAR / reports.
+    foundation_compliance_url: str = (
+        "http://localhost:18014/api/compliance/v1"
+    )
+    # Security-ops — vulnerabilities / incidents / scans / SBOM / drills.
+    foundation_security_ops_url: str = (
+        "http://localhost:18019/api/security-ops/v1"
+    )
+    # Lifecycle — recycle-bin / sweep / legal-holds.
+    foundation_lifecycle_url: str = (
+        "http://localhost:18006/api/lifecycle/v1"
+    )
+    # Data-protection — masking / residency / cross-border / destruction / consent.
+    foundation_data_protection_url: str = (
+        "http://localhost:18016/api/data-protection/v1"
+    )
 
     session_orchestrator_url: str = "http://localhost:8006/api/session/v1"
 

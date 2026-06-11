@@ -1,12 +1,117 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
+import { CustomSelect } from '../components/CustomSelect';
 import type { AuditEvent, AuditChainVerifyResult } from '../../api/types';
+import { AUDIT_ACTIONS, AUDIT_ACTION_GROUPS } from '../auditActions';
+
+// ─── Action multi-select popover ───────────────────────────────────────────────
+
+function ActionMultiSelect({
+  selected,
+  onChange,
+}: {
+  selected: string[];
+  onChange: (next: string[]) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onClickOutside = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onClickOutside);
+    return () => document.removeEventListener('mousedown', onClickOutside);
+  }, [open]);
+
+  const toggle = (value: string) => {
+    onChange(
+      selected.includes(value)
+        ? selected.filter((v) => v !== value)
+        : [...selected, value],
+    );
+  };
+
+  const selectedOptions = AUDIT_ACTIONS.filter((a) => selected.includes(a.value));
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        className="w-full flex items-center justify-between gap-2 border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper text-left hover:border-accent focus:outline-none focus:border-accent"
+      >
+        <span className="flex-1 min-w-0 truncate">
+          {selected.length === 0 ? (
+            <span className="text-dim">全部操作</span>
+          ) : selected.length <= 2 ? (
+            <span className="flex items-center gap-1 flex-wrap">
+              {selectedOptions.map((o) => (
+                <span
+                  key={o.value}
+                  className="inline-flex items-center bg-paper-2 border border-line rounded-sm px-1.5 py-0.5 text-[11px] text-ink-2"
+                >
+                  {o.label}
+                </span>
+              ))}
+            </span>
+          ) : (
+            <span className="text-ink-2">已选 {selected.length} 项</span>
+          )}
+        </span>
+        <span className="font-mono text-[10px] text-dim shrink-0">{open ? '▲' : '▼'}</span>
+      </button>
+
+      {open && (
+        <div className="absolute z-30 mt-1 w-full max-h-72 overflow-auto border border-line rounded-sm bg-surface shadow-lg p-1">
+          {selected.length > 0 && (
+            <button
+              type="button"
+              onClick={() => onChange([])}
+              className="w-full text-left px-2 py-1 text-[11px] font-mono text-dim hover:text-ink hover:bg-paper-2 rounded-sm"
+            >
+              清除已选 ({selected.length})
+            </button>
+          )}
+          {AUDIT_ACTION_GROUPS.map((group) => (
+            <div key={group} className="mt-1">
+              <div className="px-2 py-1 font-mono text-[9.5px] uppercase tracking-[0.1em] text-dim">
+                {group}
+              </div>
+              {AUDIT_ACTIONS.filter((a) => a.group === group).map((a) => {
+                const checked = selected.includes(a.value);
+                return (
+                  <label
+                    key={a.value}
+                    className="flex items-start gap-2 px-2 py-1 rounded-sm hover:bg-paper-2 cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => toggle(a.value)}
+                      className="mt-0.5 accent-accent"
+                    />
+                    <span className="flex flex-col leading-tight">
+                      <span className="text-[12px] text-ink">{a.label}</span>
+                      <span className="font-mono text-[10px] text-dim">{a.value}</span>
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
 export function AuditPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading } = useAdminStore();
   const [tenantId, setTenantId] = useState('');
-  const [action, setAction] = useState('');
+  const [actions, setActions] = useState<string[]>([]);
   const [from, setFrom] = useState('');
   const [to, setTo] = useState('');
   const [events, setEvents] = useState<AuditEvent[]>([]);
@@ -20,6 +125,44 @@ export function AuditPage() {
   const [verifyResult, setVerifyResult] = useState<AuditChainVerifyResult | null>(null);
   const [verifyError, setVerifyError] = useState<string | null>(null);
   const [verifyTodo, setVerifyTodo] = useState(false);
+
+  // CSV export state.
+  const [exporting, setExporting] = useState(false);
+
+  const currentFilter = (): Record<string, unknown> => {
+    const filter: Record<string, unknown> = {};
+    if (actions.length) filter.event_types = actions;
+    if (from) filter.from = from;
+    if (to) filter.to = to;
+    return filter;
+  };
+
+  const handleExportCsv = async () => {
+    if (!tenantId) {
+      setError('请先选择一个租户后再导出。');
+      return;
+    }
+    setExporting(true);
+    setError(null);
+    try {
+      const blob = await api.admin.audit.exportEvents(currentFilter(), {
+        format: 'csv',
+        tenantId,
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `audit-events-${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '导出失败');
+    } finally {
+      setExporting(false);
+    }
+  };
 
   const handleVerifyChain = async () => {
     setVerifying(true);
@@ -71,7 +214,7 @@ export function AuditPage() {
     setQueried(true);
     try {
       const body: Record<string, unknown> = { limit: 50, tenant_id: tenantId };
-      if (action) body.event_type = action;
+      if (actions.length) body.event_types = actions;
       if (from) body.from = from;
       if (to) body.to = to;
       const data = await api.admin.audit.query(body);
@@ -101,26 +244,16 @@ export function AuditPage() {
         <div className="grid grid-cols-2 gap-3">
           <div className="flex flex-col gap-1">
             <label className="text-[11px] font-mono text-dim">租户</label>
-            <select
-              className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
+            <CustomSelect
+              options={[{ value: '', label: '全部' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
               value={tenantId}
-              onChange={(e) => setTenantId(e.target.value)}
+              onChange={(v) => setTenantId(v)}
               disabled={tenantsLoading}
-            >
-              <option value="">全部</option>
-              {tenants.map((t) => (
-                <option key={t.id} value={t.id}>{t.name}</option>
-              ))}
-            </select>
+            />
           </div>
           <div className="flex flex-col gap-1">
             <label className="text-[11px] font-mono text-dim">操作 (action)</label>
-            <input
-              className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
-              placeholder="如 tenant.create"
-              value={action}
-              onChange={(e) => setAction(e.target.value)}
-            />
+            <ActionMultiSelect selected={actions} onChange={setActions} />
           </div>
           <div className="flex flex-col gap-1">
             <label className="text-[11px] font-mono text-dim">开始时间</label>
@@ -144,7 +277,8 @@ export function AuditPage() {
         <div className="flex items-center gap-2">
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || !tenantId}
+            title={!tenantId ? '请先选择租户' : undefined}
             className="px-3 py-1.5 bg-ink text-paper text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
           >
             {loading ? '查询中…' : '查询'}
@@ -156,6 +290,15 @@ export function AuditPage() {
             className="px-3 py-1.5 text-[12px] font-mono border border-line bg-paper rounded-sm hover:bg-paper-2 disabled:opacity-50"
           >
             {verifying ? '校验中…' : '链完整性校验'}
+          </button>
+          <button
+            type="button"
+            onClick={handleExportCsv}
+            disabled={exporting || !tenantId}
+            title={!tenantId ? '请先选择租户' : undefined}
+            className="px-3 py-1.5 text-[12px] font-mono border border-line bg-paper rounded-sm hover:bg-paper-2 disabled:opacity-50"
+          >
+            {exporting ? '导出中…' : '导出 CSV'}
           </button>
           <span className="text-[11px] text-dim">
             校验所选租户的审计哈希链与 Merkle 签名（未选租户时校验当前管理员租户）

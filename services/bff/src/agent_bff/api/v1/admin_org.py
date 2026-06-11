@@ -15,6 +15,7 @@ Upstream paths (foundation-org):
     POST   /org-units/{ou_id}/move             → OrgUnit  (body: new_parent_id, reason)
     GET    /teams                              → CursorPage[Team]
     POST   /teams                              → 201 Team
+    DELETE /teams/{team_id}                     → 204
     GET    /teams/{team_id}/members            → list[TeamMember]
     POST   /teams/{team_id}/members            → 201 TeamMember (body: user_id, role_in_team)
     DELETE /teams/{team_id}/members/{user_id}  → 204
@@ -139,13 +140,29 @@ async def delete_org_unit(
     request: Request,
     _auth: tuple = Depends(require_super_admin_bff),
 ) -> dict:
+    """Delete an org unit, archiving it first.
+
+    foundation requires an org unit to be archived before it can be deleted
+    (``delete`` rejects a live unit with NOT_EMPTY/reason=not_archived). The
+    SPA only exposes a single "delete" action, so we run the two foundation
+    calls — archive then delete — here, keeping the operation atomic from the
+    SPA's point of view. ``archive`` is idempotent (returns the unit unchanged
+    if already archived) and is the call that enforces the real emptiness
+    checks, so a genuinely non-empty unit surfaces its NOT_EMPTY problem (with
+    reason has_children / has_teams / has_members) at this step.
+    """
     settings = request.app.state.settings
+    headers = _headers(request, _auth)
+    base = f"{settings.foundation_org_url}/org-units/{ou_id}"
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
-            resp = await client.delete(
-                f"{settings.foundation_org_url}/org-units/{ou_id}",
-                headers=_headers(request, _auth),
+            archive_resp = await client.post(
+                f"{base}/archive",
+                json={"reason": "Archived automatically before deletion."},
+                headers=headers,
             )
+            _raise_for_upstream(archive_resp)
+            resp = await client.delete(base, headers=headers)
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         raise _connect_502(exc) from exc
     _raise_for_upstream(resp)
@@ -209,6 +226,32 @@ async def create_team(
         raise _connect_502(exc) from exc
     _raise_for_upstream(resp)
     return resp.json()
+
+
+@router.delete("/admin/org/teams/{team_id}")
+async def delete_team(
+    team_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Delete a team.
+
+    Unlike org-units, teams delete directly (no archive step). foundation
+    rejects a team that still has active members with 409 TEAM_CODE_CONFLICT
+    ("Team has active members; remove them first."); that problem is passed
+    through unchanged so the SPA can prompt the operator to remove members.
+    """
+    settings = request.app.state.settings
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.delete(
+                f"{settings.foundation_org_url}/teams/{team_id}",
+                headers=_headers(request, _auth),
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise _connect_502(exc) from exc
+    _raise_for_upstream(resp)
+    return {"status": "deleted"}
 
 
 @router.get("/admin/org/teams/{team_id}/members")

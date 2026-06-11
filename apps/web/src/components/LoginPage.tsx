@@ -1,13 +1,60 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { api, ApiError } from '../api/client';
 import { useChatStore } from '../stores/chatStore';
+
+type SsoOption = { id: string; name: string; kind: string };
 
 export function LoginPage() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [ssoOptions, setSsoOptions] = useState<SsoOption[]>([]);
   const login = useChatStore((s) => s.login);
+
+  // Surface a failed enterprise-login round-trip: the BFF callback bounces
+  // the browser back here with ?sso_error=... on any failure.  Show a
+  // generic message (the raw code is for ops, not end users) and scrub it
+  // from the URL so a refresh doesn't keep re-showing it.
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.has('sso_error')) {
+      setError('企业登录失败，请重试或联系管理员。');
+      params.delete('sso_error');
+      const qs = params.toString();
+      window.history.replaceState(
+        {},
+        '',
+        window.location.pathname + (qs ? `?${qs}` : '') + window.location.hash,
+      );
+    }
+  }, []);
+
+  // Fetch the configured enterprise SSO options once on mount.  Failures
+  // (and an empty list) are silent — the password form still works and we
+  // simply render no extra buttons.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const { items } = await api.auth.ssoOptions();
+        if (!cancelled && Array.isArray(items)) setSsoOptions(items);
+      } catch {
+        // SSO not configured / identity unreachable — ignore.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleSsoLogin = (id: string) => {
+    window.location.href =
+      '/api/bff/v1/auth/sso/' +
+      encodeURIComponent(id) +
+      '/start?return_to=' +
+      encodeURIComponent(window.location.origin);
+  };
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -72,6 +119,33 @@ export function LoginPage() {
             {loading ? '登录中…' : '登录'}
           </button>
         </form>
+
+        {ssoOptions.length > 0 && (
+          <div className="mt-6">
+            <div className="flex items-center gap-3 mb-4">
+              <span className="flex-1 h-px bg-surface-200" />
+              <span className="text-xs text-gray-400">或使用企业账号登录</span>
+              <span className="flex-1 h-px bg-surface-200" />
+            </div>
+            <div className="space-y-2">
+              {ssoOptions.map((opt) => (
+                <button
+                  key={opt.id}
+                  type="button"
+                  onClick={() => handleSsoLogin(opt.id)}
+                  className="w-full py-2 px-3 flex items-center justify-center gap-2 border border-surface-200 rounded-lg hover:bg-surface-50 font-medium text-gray-700"
+                >
+                  <span>{opt.name}</span>
+                  {opt.kind && (
+                    <span className="text-xs text-gray-400 uppercase">
+                      {opt.kind}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

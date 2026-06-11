@@ -1,25 +1,20 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
+import { useConfirm, useToast } from '../components/dialogs';
+import { CustomSelect } from '../components/CustomSelect';
 import type {
   QuotaInfo,
-  BillingPlanDef,
   TenantSubscription,
   UsageRecord,
 } from '../../api/types';
 
-const PLAN_KIND_LABELS: Record<string, string> = {
+const TIER_LABELS: Record<string, string> = {
   FREE: '免费版',
   PRO: '专业版',
   BUSINESS: '商业版',
   ENTERPRISE: '企业版',
   CUSTOM: '定制',
-};
-
-const CYCLE_LABELS: Record<string, string> = {
-  MONTHLY: '按月',
-  YEARLY: '按年',
-  ONE_TIME: '一次性',
 };
 
 const STATUS_LABELS: Record<string, string> = {
@@ -38,11 +33,21 @@ const STATUS_STYLES: Record<string, string> = {
   SUSPENDED: 'text-red-700 bg-red-50 border-red-200',
 };
 
-function formatPrice(plan: BillingPlanDef): string {
-  if (plan.price_amount === undefined || plan.price_amount === null) return '—';
-  const amount = plan.price_amount / 100;
-  const currency = plan.currency ?? 'CNY';
-  return `${amount.toLocaleString()} ${currency}`;
+type UpstreamPlan = {
+  id: string;
+  name: string;
+  tier?: string;
+  quotas?: Record<string, number>;
+  price_monthly_usd?: number;
+  active?: boolean;
+  kind?: string;
+  included_quotas?: Record<string, number>;
+  price_amount?: number;
+  currency?: string;
+};
+
+function planTier(p: UpstreamPlan): string {
+  return p.tier ?? p.kind ?? '';
 }
 
 function formatDate(iso?: string | null): string {
@@ -52,6 +57,182 @@ function formatDate(iso?: string | null): string {
   return d.toLocaleString('zh-CN');
 }
 
+// ─── Bind Plan (create subscription for tenant without one) ─────────────────
+
+function BindPlanForm({
+  tenantId,
+  plans,
+  onBound,
+}: {
+  tenantId: string;
+  plans: UpstreamPlan[];
+  onBound: () => void;
+}) {
+  const toast = useToast();
+  const [selectedPlan, setSelectedPlan] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleBind = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedPlan) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.admin.billing.createSubscription({ plan_id: selectedPlan }, tenantId);
+      toast.success('已为租户绑定套餐');
+      onBound();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '绑定失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const activePlans = plans.filter((p) => p.active !== false);
+
+  return (
+    <form onSubmit={handleBind} className="flex items-end gap-2 flex-wrap mt-2">
+      {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm w-full">{error}</div>}
+      <label className="flex flex-col gap-1">
+        <span className="font-mono text-[10px] text-dim uppercase tracking-[0.08em]">选择套餐</span>
+        <CustomSelect
+          options={[
+            { value: '', label: '— 请选择 —' },
+            ...activePlans.map((p) => ({
+              value: p.id,
+              label: `${p.name} (${TIER_LABELS[planTier(p)] ?? planTier(p)})`,
+            })),
+          ]}
+          value={selectedPlan}
+          onChange={setSelectedPlan}
+          className="min-w-[220px]"
+        />
+      </label>
+      <button
+        type="submit"
+        disabled={busy || !selectedPlan}
+        className="px-3 py-1.5 text-[11px] font-mono bg-ink text-surface rounded-sm hover:opacity-90 disabled:opacity-50"
+      >
+        {busy ? '绑定中…' : '绑定套餐'}
+      </button>
+    </form>
+  );
+}
+
+// ─── Subscription actions (change plan / cancel) ────────────────────────────
+
+function SubscriptionActions({
+  tenantId,
+  subscription,
+  plans,
+  onChanged,
+}: {
+  tenantId: string;
+  subscription: TenantSubscription;
+  plans: UpstreamPlan[];
+  onChanged: () => void;
+}) {
+  const confirm = useConfirm();
+  const toast = useToast();
+  const [changing, setChanging] = useState(false);
+  const [targetPlan, setTargetPlan] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleChangePlan = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!targetPlan) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.admin.billing.changePlan({ new_plan_id: targetPlan }, tenantId);
+      toast.success('已提交套餐变更');
+      setChanging(false);
+      setTargetPlan('');
+      onChanged();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '变更失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleCancel = async () => {
+    if (
+      !(await confirm({
+        title: '取消订阅',
+        message: '确定取消该租户的当前订阅吗？此操作可能影响其服务可用性。',
+        tone: 'danger',
+        confirmText: '取消订阅',
+      }))
+    )
+      return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.admin.billing.cancelSubscription({}, tenantId);
+      toast.success('已提交取消订阅');
+      onChanged();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '取消失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const candidates = plans.filter((p) => p.active !== false && p.id !== subscription.plan_id);
+
+  return (
+    <div className="border-t border-line-2 pt-3 flex flex-col gap-2">
+      {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
+      {changing ? (
+        <form onSubmit={handleChangePlan} className="flex items-center gap-2 flex-wrap">
+          <CustomSelect
+            options={[{ value: '', label: '— 选择目标套餐 —' }, ...candidates.map((p) => ({ value: p.id, label: p.name }))]}
+            value={targetPlan}
+            onChange={(v) => setTargetPlan(v)}
+            className="min-w-[180px]"
+          />
+          <button
+            type="submit"
+            disabled={busy || !targetPlan}
+            className="px-2.5 py-1.5 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50"
+          >
+            {busy ? '提交中…' : '确认变更'}
+          </button>
+          <button
+            type="button"
+            onClick={() => { setChanging(false); setTargetPlan(''); setError(null); }}
+            className="px-2.5 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink"
+          >
+            取消
+          </button>
+        </form>
+      ) : (
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setChanging(true)}
+            disabled={busy}
+            className="px-2.5 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2 disabled:opacity-50"
+          >
+            变更套餐
+          </button>
+          <button
+            onClick={handleCancel}
+            disabled={busy}
+            className="px-2.5 py-1.5 text-[11px] font-mono border border-red-200 text-red-600 rounded-sm hover:bg-red-50 disabled:opacity-50"
+          >
+            取消订阅
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Main Page ──────────────────────────────────────────────────────────────
+
 export function QuotaPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading, selectedTenantId, setSelectedTenantId } =
     useAdminStore();
@@ -60,13 +241,12 @@ export function QuotaPage() {
   const [quotaLoading, setQuotaLoading] = useState(false);
   const [quotaTodo, setQuotaTodo] = useState(false);
 
-  const [plans, setPlans] = useState<BillingPlanDef[]>([]);
-  const [plansLoading, setPlansLoading] = useState(false);
-  const [plansTodo, setPlansTodo] = useState(false);
+  const [plans, setPlans] = useState<UpstreamPlan[]>([]);
 
   const [subscription, setSubscription] = useState<TenantSubscription | null>(null);
   const [subLoading, setSubLoading] = useState(false);
   const [subTodo, setSubTodo] = useState(false);
+  const [subReloadKey, setSubReloadKey] = useState(0);
 
   const [usage, setUsage] = useState<UsageRecord | null>(null);
   const [usageLoading, setUsageLoading] = useState(false);
@@ -85,21 +265,13 @@ export function QuotaPage() {
       .finally(() => setTenantsLoading(false));
   }, [tenants.length, setTenants, setTenantsLoading]);
 
-  // Plan catalogue — independent of tenant selection.
+  // Plan catalogue — needed for BindPlanForm and SubscriptionActions.
   useEffect(() => {
     let cancelled = false;
-    setPlansLoading(true);
-    setPlansTodo(false);
     api.admin.billing
       .plans()
-      .then((items) => { if (!cancelled) setPlans(items); })
-      .catch((err) => {
-        if (cancelled) return;
-        if (err instanceof ApiError && (err.status === 404 || err.status === 501 || err.status === 502)) {
-          setPlansTodo(true);
-        }
-      })
-      .finally(() => { if (!cancelled) setPlansLoading(false); });
+      .then((items) => { if (!cancelled) setPlans(items as unknown as UpstreamPlan[]); })
+      .catch(() => {});
     return () => { cancelled = true; };
   }, []);
 
@@ -152,15 +324,18 @@ export function QuotaPage() {
       .finally(() => { if (!cancelled) setUsageLoading(false); });
 
     return () => { cancelled = true; };
-  }, [selectedTenantId]);
+  }, [selectedTenantId, subReloadKey]);
 
   const planNameById = (id: string) => plans.find((p) => p.id === id)?.name ?? id;
+  const refreshSubscription = () => setSubReloadKey((k) => k + 1);
+
+  const noSubscription = !subLoading && !subTodo && (subscription?.status as string) === 'NO_SUBSCRIPTION';
 
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">计费与配额</h1>
-        <p className="text-[12px] text-dim mt-0.5">套餐目录、租户订阅与用量明细</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">订阅与配额</h1>
+        <p className="text-[12px] text-dim mt-0.5">租户订阅管理与用量明细</p>
       </div>
 
       {error && (
@@ -169,93 +344,21 @@ export function QuotaPage() {
         </div>
       )}
 
-      {/* ─── 套餐目录 ─────────────────────────────────────────── */}
-      <section className="flex flex-col gap-2">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">套餐目录</div>
-        {plansLoading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
-        {plansTodo && (
-          <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-            该能力服务未启用（套餐目录代理端点不可达）。
-          </div>
-        )}
-        {!plansLoading && !plansTodo && plans.length === 0 && (
-          <div className="font-mono text-[12px] text-dim italic">暂无可用套餐</div>
-        )}
-        {!plansLoading && !plansTodo && plans.length > 0 && (
-          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-            {plans.map((plan) => (
-              <div key={plan.id} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2">
-                <div className="flex items-start justify-between gap-2">
-                  <div>
-                    <div className="text-[15px] font-display text-ink">{plan.name}</div>
-                    <div className="flex items-center gap-1.5 mt-1">
-                      {plan.kind && (
-                        <span className="inline-flex items-center font-mono text-[10px] text-ink-2 bg-paper-2 border border-line rounded-sm px-1.5 py-0.5">
-                          {PLAN_KIND_LABELS[plan.kind] ?? plan.kind}
-                        </span>
-                      )}
-                      {plan.active === false && (
-                        <span className="inline-flex items-center font-mono text-[10px] text-dim bg-paper-2 border border-line rounded-sm px-1.5 py-0.5">
-                          已下架
-                        </span>
-                      )}
-                    </div>
-                  </div>
-                  <div className="text-right">
-                    <div className="font-mono text-[13px] text-ink">{formatPrice(plan)}</div>
-                    {plan.billing_cycle && (
-                      <div className="font-mono text-[10px] text-dim mt-0.5">
-                        {CYCLE_LABELS[plan.billing_cycle] ?? plan.billing_cycle}
-                      </div>
-                    )}
-                  </div>
-                </div>
-                {plan.description && <p className="text-[11.5px] text-dim">{plan.description}</p>}
-                {plan.included_quotas && Object.keys(plan.included_quotas).length > 0 && (
-                  <div className="border-t border-line-2 pt-2 mt-1 flex flex-col gap-1">
-                    <div className="font-mono text-[10px] uppercase tracking-[0.08em] text-dim">配额维度</div>
-                    {Object.entries(plan.included_quotas).map(([dim, amount]) => (
-                      <div key={dim} className="flex items-center justify-between text-[11px]">
-                        <span className="font-mono text-ink-2">{dim}</span>
-                        <span className="font-mono text-dim">{amount.toLocaleString()}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                {plan.features && plan.features.length > 0 && (
-                  <div className="flex flex-wrap gap-1 mt-1">
-                    {plan.features.map((f) => (
-                      <span key={f} className="font-mono text-[10px] text-ink-2 bg-paper-2 border border-line rounded-sm px-1.5 py-0.5">
-                        {f}
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
-
       {/* ─── 租户选择 ─────────────────────────────────────────── */}
-      <div className="flex items-center gap-3 border-t border-line-2 pt-4">
+      <div className="flex items-center gap-3">
         <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
-        <select
-          className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent min-w-[200px]"
+        <CustomSelect
+          options={[{ value: '', label: '— 请选择 —' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
           value={selectedTenantId ?? ''}
-          onChange={(e) => {
-            setSelectedTenantId(e.target.value || null);
+          onChange={(v) => {
+            setSelectedTenantId(v || null);
             setQuota(null);
             setSubscription(null);
             setUsage(null);
           }}
           disabled={tenantsLoading}
-        >
-          <option value="">— 请选择 —</option>
-          {tenants.map((t) => (
-            <option key={t.id} value={t.id}>{t.name}</option>
-          ))}
-        </select>
+          className="min-w-[200px]"
+        />
       </div>
 
       {!selectedTenantId && (
@@ -274,14 +377,23 @@ export function QuotaPage() {
               </div>
             )}
             {!quotaLoading && !quotaTodo && quota && !quota.plan && (
-              <div className="border border-line rounded-md p-4 text-[13px] text-dim">该租户暂无有效订阅</div>
+              <div className="border border-line rounded-md p-4 flex flex-col gap-2">
+                <div className="text-[13px] text-dim">该租户暂无有效订阅</div>
+                <BindPlanForm
+                  tenantId={selectedTenantId}
+                  plans={plans}
+                  onBound={refreshSubscription}
+                />
+              </div>
             )}
             {!quotaLoading && !quotaTodo && quota && quota.plan && (
               <div className="flex flex-col gap-4">
                 <div className="border border-line rounded-md p-4 bg-surface">
                   <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim mb-2">当前套餐</div>
                   <div className="text-[18px] font-display text-ink">{quota.plan.name}</div>
-                  <div className="font-mono text-[11px] text-dim mt-1">{quota.plan.tier}</div>
+                  <div className="font-mono text-[11px] text-dim mt-1">
+                    {TIER_LABELS[quota.plan.tier] ?? quota.plan.tier}
+                  </div>
                 </div>
                 <div className="border border-line rounded-md overflow-hidden">
                   <div className="bg-paper-2 px-3 py-2 border-b border-line font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
@@ -335,10 +447,10 @@ export function QuotaPage() {
                 该能力服务未启用（订阅代理端点不可达）。
               </div>
             )}
-            {!subLoading && !subTodo && !subscription && (
+            {!subLoading && !subTodo && (noSubscription || !subscription) && (
               <div className="border border-line rounded-md p-4 text-[13px] text-dim">该租户暂无订阅记录</div>
             )}
-            {!subLoading && !subTodo && subscription && (
+            {!subLoading && !subTodo && subscription && !noSubscription && (
               <div className="border border-line rounded-md p-4 bg-surface flex flex-col gap-3">
                 <div className="flex items-center gap-3">
                   <div className="text-[15px] font-display text-ink">{planNameById(subscription.plan_id)}</div>
@@ -376,9 +488,14 @@ export function QuotaPage() {
                     </>
                   )}
                 </div>
-                <div className="border-t border-line-2 pt-2 text-[11px] text-dim italic">
-                  套餐变更暂由实施侧线下配置。
-                </div>
+                {selectedTenantId && (
+                  <SubscriptionActions
+                    tenantId={selectedTenantId}
+                    subscription={subscription}
+                    plans={plans}
+                    onChanged={refreshSubscription}
+                  />
+                )}
               </div>
             )}
           </section>

@@ -3,9 +3,48 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import io
+import tarfile
 
 from fastapi.testclient import TestClient
+
+VALID_FRONTMATTER = "---\nname: poet\ndescription: writes poetry\n---\n# Poet\nbody\n"
+
+
+def _make_tarball(
+    members: dict[str, bytes],
+    *,
+    add_symlink: tuple[str, str] | None = None,
+) -> bytes:
+    """Build a gzip tar from ``{archive_path: content_bytes}``.
+
+    ``add_symlink=(linkname, target)`` injects a symlink member (used to test
+    the symlink-rejection path).
+    """
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for path, content in members.items():
+            info = tarfile.TarInfo(name=path)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+        if add_symlink is not None:
+            linkname, target = add_symlink
+            link = tarfile.TarInfo(name=linkname)
+            link.type = tarfile.SYMTYPE
+            link.linkname = target
+            tar.addfile(link)
+    return buf.getvalue()
+
+
+def _valid_skill_tarball(*, subdir: str | None = None) -> bytes:
+    """A minimal valid skill package (root or single-subdir layout)."""
+    prefix = f"{subdir}/" if subdir else ""
+    return _make_tarball(
+        {
+            f"{prefix}SKILL.md": VALID_FRONTMATTER.encode("utf-8"),
+            f"{prefix}references/notes.md": b"see also",
+        }
+    )
 
 
 def _create_skill(
@@ -110,50 +149,196 @@ def test_duplicate_skill_conflict(
     assert resp.status_code == 409
 
 
+def _upload(
+    client: TestClient,
+    headers: dict[str, str],
+    skill_id: str,
+    *,
+    version: str = "1.0.0",
+    tarball: bytes,
+    expected_sha256: str | None = None,
+) -> object:
+    data: dict[str, str] = {"version": version}
+    # Pass a (now-ignored) uploader manifest to prove the server overrides it.
+    data["manifest"] = '{"attacker": "controlled"}'
+    if expected_sha256 is not None:
+        data["expected_sha256"] = expected_sha256
+    return client.post(
+        f"/api/skills/v1/skills/{skill_id}/versions",
+        headers=headers,
+        data=data,
+        files={"file": ("skill.tar.gz", tarball, "application/gzip")},
+    )
+
+
 def test_upload_version(app_client: TestClient, tenant_headers: dict[str, str]) -> None:
     skill = _create_skill(app_client, tenant_headers)
-    tarball = b"fake-tarball-payload"
+    tarball = _valid_skill_tarball()
     expected = hashlib.sha256(tarball).hexdigest()
-    resp = app_client.post(
-        f"/api/skills/v1/skills/{skill['id']}/versions",
-        headers=tenant_headers,
-        data={
-            "version": "1.0.0",
-            "manifest": json.dumps({"entry": "main.py"}),
-            "expected_sha256": expected,
-        },
-        files={"file": ("skill.tar.gz", tarball, "application/gzip")},
+    resp = _upload(
+        app_client, tenant_headers, skill["id"], tarball=tarball, expected_sha256=expected,
     )
     assert resp.status_code == 201, resp.text
     body = resp.json()
     assert body["sha256"] == expected
-    assert body["manifest"] == {"entry": "main.py"}
+    # Manifest is server-authoritative, derived from SKILL.md — NOT the
+    # uploader-supplied manifest form value.
+    assert body["manifest"] == {
+        "name": "poet",
+        "description": "writes poetry",
+        "skill_md_path": "SKILL.md",
+        "format": "skill_md_v1",
+        "sha256": expected,
+    }
+
+
+def test_upload_version_subdir_layout(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    tarball = _valid_skill_tarball(subdir="poet")
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["manifest"]["skill_md_path"] == "poet/SKILL.md"
 
 
 def test_upload_version_sha_mismatch(
     app_client: TestClient, tenant_headers: dict[str, str],
 ) -> None:
     skill = _create_skill(app_client, tenant_headers)
-    resp = app_client.post(
-        f"/api/skills/v1/skills/{skill['id']}/versions",
-        headers=tenant_headers,
-        data={"version": "1.0.0", "expected_sha256": "deadbeef"},
-        files={"file": ("x.tar.gz", b"x", "application/gzip")},
+    resp = _upload(
+        app_client, tenant_headers, skill["id"],
+        tarball=_valid_skill_tarball(), expected_sha256="deadbeef",
     )
     assert resp.status_code == 422
     assert resp.json()["code"] == "SKILL.SHA256_MISMATCH"
+
+
+def _assert_invalid(resp: object, *, contains: str) -> None:
+    assert resp.status_code == 400, resp.text  # type: ignore[attr-defined]
+    body = resp.json()  # type: ignore[attr-defined]
+    assert body["code"] == "SKILL.PACKAGE.INVALID"
+    assert contains in body["user_message"]
+
+
+def test_upload_rejects_non_gzip(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=b"not a tarball")
+    _assert_invalid(resp, contains="gzip")
+
+
+def test_upload_rejects_missing_skill_md(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    tarball = _make_tarball({"README.md": b"no skill md here"})
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+    _assert_invalid(resp, contains="缺少 SKILL.md")
+
+
+def test_upload_rejects_multiple_skill_md(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    tarball = _make_tarball(
+        {
+            "SKILL.md": VALID_FRONTMATTER.encode("utf-8"),
+            "other/SKILL.md": VALID_FRONTMATTER.encode("utf-8"),
+        }
+    )
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+    _assert_invalid(resp, contains="多个 SKILL.md")
+
+
+def test_upload_rejects_missing_name(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    fm = "---\ndescription: only a description\n---\nbody\n"
+    tarball = _make_tarball({"SKILL.md": fm.encode("utf-8")})
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+    _assert_invalid(resp, contains="name")
+
+
+def test_upload_rejects_missing_description(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    fm = "---\nname: poet\n---\nbody\n"
+    tarball = _make_tarball({"SKILL.md": fm.encode("utf-8")})
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+    _assert_invalid(resp, contains="description")
+
+
+def test_upload_rejects_malformed_yaml(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    fm = "---\nname: [unclosed\ndescription: x\n---\nbody\n"
+    tarball = _make_tarball({"SKILL.md": fm.encode("utf-8")})
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+    _assert_invalid(resp, contains="frontmatter 格式错误")
+
+
+def test_upload_rejects_path_traversal(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    tarball = _make_tarball(
+        {
+            "SKILL.md": VALID_FRONTMATTER.encode("utf-8"),
+            "../evil.sh": b"rm -rf /",
+        }
+    )
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+    _assert_invalid(resp, contains="..")
+
+
+def test_upload_rejects_symlink(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    tarball = _make_tarball(
+        {"SKILL.md": VALID_FRONTMATTER.encode("utf-8")},
+        add_symlink=("evil", "/etc/passwd"),
+    )
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+    _assert_invalid(resp, contains="符号链接")
+
+
+def test_upload_rejects_too_many_members(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    members = {"SKILL.md": VALID_FRONTMATTER.encode("utf-8")}
+    for i in range(2001):
+        members[f"f{i}.txt"] = b"x"
+    tarball = _make_tarball(members)
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+    _assert_invalid(resp, contains="成员数过多")
+
+
+def test_upload_rejects_total_size_bomb(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    # 12 members of ~5 MiB each => > 50 MiB decompressed, but compresses tiny.
+    chunk = b"\0" * (5 * 1024 * 1024)
+    members = {"SKILL.md": VALID_FRONTMATTER.encode("utf-8")}
+    for i in range(12):
+        members[f"big{i}.bin"] = chunk
+    tarball = _make_tarball(members)
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+    _assert_invalid(resp, contains="总大小")
 
 
 def test_download_redirects_to_presigned(
     app_client: TestClient, tenant_headers: dict[str, str],
 ) -> None:
     skill = _create_skill(app_client, tenant_headers)
-    app_client.post(
-        f"/api/skills/v1/skills/{skill['id']}/versions",
-        headers=tenant_headers,
-        data={"version": "1.0.0"},
-        files={"file": ("x.tar.gz", b"x", "application/gzip")},
-    )
+    _upload(app_client, tenant_headers, skill["id"], tarball=_valid_skill_tarball())
     resp = app_client.get(
         f"/api/skills/v1/skills/{skill['id']}/versions/1.0.0/download",
         headers=tenant_headers,
@@ -167,12 +352,7 @@ def test_delete_version(
     app_client: TestClient, tenant_headers: dict[str, str], blob_store,
 ) -> None:
     skill = _create_skill(app_client, tenant_headers)
-    app_client.post(
-        f"/api/skills/v1/skills/{skill['id']}/versions",
-        headers=tenant_headers,
-        data={"version": "1.0.0"},
-        files={"file": ("x.tar.gz", b"x", "application/gzip")},
-    )
+    _upload(app_client, tenant_headers, skill["id"], tarball=_valid_skill_tarball())
     assert blob_store.size == 1
     resp = app_client.delete(
         f"/api/skills/v1/skills/{skill['id']}/versions/1.0.0",
@@ -180,6 +360,67 @@ def test_delete_version(
     )
     assert resp.status_code == 204
     assert blob_store.size == 0
+
+
+def test_delete_skill(
+    app_client: TestClient, tenant_headers: dict[str, str], blob_store,
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    for ver in ("1.0.0", "2.0.0"):
+        _upload(
+            app_client, tenant_headers, skill["id"],
+            version=ver, tarball=_valid_skill_tarball(),
+        )
+    assert blob_store.size == 2
+
+    resp = app_client.delete(
+        f"/api/skills/v1/skills/{skill['id']}", headers=tenant_headers,
+    )
+    assert resp.status_code == 204
+    # All version blobs cleaned up.
+    assert blob_store.size == 0
+    # Skill no longer fetchable nor on the shelf.
+    assert app_client.get(
+        f"/api/skills/v1/skills/{skill['id']}", headers=tenant_headers,
+    ).status_code == 404
+    listing = app_client.get(
+        "/api/skills/v1/skills", headers=tenant_headers,
+    ).json()
+    assert listing["total"] == 0
+
+
+def test_delete_skill_404(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    resp = app_client.delete(
+        "/api/skills/v1/skills/skl_unknown", headers=tenant_headers,
+    )
+    assert resp.status_code == 404
+
+
+def test_list_versions(app_client: TestClient, tenant_headers: dict[str, str]) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    for ver in ("1.0.0", "2.0.0"):
+        _upload(
+            app_client, tenant_headers, skill["id"],
+            version=ver, tarball=_valid_skill_tarball(),
+        )
+    resp = app_client.get(
+        f"/api/skills/v1/skills/{skill['id']}/versions", headers=tenant_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["total"] == 2
+    assert {v["version"] for v in body["items"]} == {"1.0.0", "2.0.0"}
+
+
+def test_list_versions_unknown_skill_404(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    resp = app_client.get(
+        "/api/skills/v1/skills/skl_unknown/versions", headers=tenant_headers,
+    )
+    assert resp.status_code == 404
 
 
 def test_get_skill_404(app_client: TestClient, tenant_headers: dict[str, str]) -> None:
@@ -257,12 +498,7 @@ def test_internal_endpoint_returns_skills_with_versions(
     internal_headers: dict[str, str],
 ) -> None:
     skill = _create_skill(app_client, tenant_headers)
-    app_client.post(
-        f"/api/skills/v1/skills/{skill['id']}/versions",
-        headers=tenant_headers,
-        data={"version": "1.0.0"},
-        files={"file": ("x.tar.gz", b"x", "application/gzip")},
-    )
+    _upload(app_client, tenant_headers, skill["id"], tarball=_valid_skill_tarball())
     resp = app_client.get(
         "/api/skills/v1/internal/skills",
         params={"tenant_id": "tnt_01J5TEST00000000000000TNT1", "names": "poet"},

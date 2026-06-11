@@ -17,6 +17,7 @@ asynchronously by reusing ``IngestService.ingest_document``.
 
 from __future__ import annotations
 
+import logging
 import math
 
 from sqlalchemy import func, select
@@ -33,6 +34,8 @@ from knowledge_ingest.errors import (
 )
 from knowledge_ingest.parsers.base import chunk_text, parse_document
 from knowledge_ingest.schemas.document import SearchHit
+
+logger = logging.getLogger(__name__)
 
 
 class IngestService:
@@ -105,6 +108,33 @@ class IngestService:
         doc.source_uri = blob_url
         await self._db.flush()
         return doc
+
+    async def delete_document(self, document_id: str) -> None:
+        """Delete a document and its chunks (cascade) + best-effort source blob.
+
+        The DB row is dropped via the ORM (chunks cascade on the FK).  The
+        source blob is NOT covered by the DB cascade, so we delete it
+        best-effort first: a blob delete failure is logged and skipped rather
+        than aborting the whole operation — object storage cleanup is
+        idempotent and any leaked object can be GC'd later.
+        """
+        doc, _ = await self.get_document(document_id)
+
+        if doc.source_uri is not None:
+            key = doc.source_uri.replace("memory://", "")
+            if doc.source_uri.startswith("s3://"):
+                key = doc.source_uri.split("/", 3)[-1]
+            try:
+                self._blob.delete(key)
+            except Exception:  # noqa: BLE001 — tolerate blob leak, keep going
+                logger.warning(
+                    "blob delete failed during document delete; leaking object",
+                    extra={"document_id": doc.id, "key": key},
+                    exc_info=True,
+                )
+
+        await self._db.delete(doc)
+        await self._db.flush()
 
     async def ingest_document(self, document_id: str) -> tuple[Document, int]:
         doc, _ = await self.get_document(document_id)

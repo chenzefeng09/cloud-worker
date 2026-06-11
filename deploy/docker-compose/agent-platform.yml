@@ -204,6 +204,8 @@ services:
     build:
       context: ../../services/session-orchestrator
       dockerfile: Dockerfile.overlay
+      additional_contexts:
+        feature_flag_client: ../../libs/feature-flag-client
     image: agent-platform-dev-session-orchestrator
     container_name: agent-session-orchestrator-migrate
     restart: "no"
@@ -224,6 +226,8 @@ services:
       # swaps in the current src/. This avoids the PyPI MITM issue on rebuild
       # while keeping the image up to date with code changes.
       dockerfile: Dockerfile.overlay
+      additional_contexts:
+        feature_flag_client: ../../libs/feature-flag-client
     container_name: agent-session-orchestrator
     restart: unless-stopped
     environment:
@@ -253,6 +257,7 @@ services:
       SESSION_ORCHESTRATOR_KNOWLEDGE_INGEST_URL: http://knowledge-ingest:8012/api/knowledge/v1
       SESSION_ORCHESTRATOR_AUTHZ_URL: http://authz:8002/api/authz/v1
       SESSION_ORCHESTRATOR_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
+      SESSION_ORCHESTRATOR_FEATURE_FLAG_URL: http://feature-flag:8012/api/feature-flag/v1
       # Redis — reads agent run hot-state (plan/step/cursor) written by the sandbox.
       # Same Redis instance the scheduler forwards into sandboxes (SCHEDULER_REDIS_URL).
       SESSION_ORCHESTRATOR_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
@@ -353,6 +358,7 @@ services:
       dockerfile: Dockerfile
       additional_contexts:
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+        feature_flag_client: ../../libs/feature-flag-client
       args:
         PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
     container_name: agent-scheduler
@@ -437,6 +443,7 @@ services:
       SCHEDULER_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
       SCHEDULER_AUTHZ_URL: http://authz:8002/api/authz/v1
       SCHEDULER_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
+      SCHEDULER_FEATURE_FLAG_URL: http://feature-flag:8012/api/feature-flag/v1
       SCHEDULER_SESSION_ORCHESTRATOR_URL: http://session-orchestrator:8006/api/session/v1
       # M1-P3: LLM gateway URL — scheduler queries GET /tenant-keys at spawn time
       # and injects LLM_GATEWAY_URL + LLM_VIRTUAL_KEY into sandbox env.
@@ -520,6 +527,16 @@ services:
       BFF_APP_REGISTRY_URL: http://app-registry:8013/api/apps/v1
       BFF_SANDBOX_POOL_URL: http://sandbox-pool:8008/api/sandbox-pool/v1
       BFF_AGENT_SCHEDULER_URL: http://agent-scheduler:8007/api/scheduler/v1
+      # Admin-console governance proxies (notification / api-platform / pam /
+      # dlp / compliance).
+      BFF_FOUNDATION_NOTIFICATION_URL: http://notification:8008/api/notification/v1
+      BFF_FOUNDATION_API_PLATFORM_URL: http://api-platform:8010/api/api-platform/v1
+      BFF_FOUNDATION_PAM_URL: http://pam:8015/api/pam/v1
+      BFF_FOUNDATION_DLP_URL: http://dlp:8007/api/dlp/v1
+      BFF_FOUNDATION_COMPLIANCE_URL: http://compliance:8014/api/compliance/v1
+      BFF_FOUNDATION_SECURITY_OPS_URL: http://security-ops:8019/api/security-ops/v1
+      BFF_FOUNDATION_LIFECYCLE_URL: http://lifecycle:8006/api/lifecycle/v1
+      BFF_FOUNDATION_DATA_PROTECTION_URL: http://data-protection:8016/api/data-protection/v1
       # MUST be supplied via env in any deployment beyond local dev.
       # CookieSigner refuses to start if the value looks like a placeholder.
       BFF_COOKIE_SECRET: ${BFF_COOKIE_SECRET:?BFF_COOKIE_SECRET must be set (>=32 chars, no placeholder text)}
@@ -615,6 +632,7 @@ services:
       dockerfile: Dockerfile
       additional_contexts:
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+        feature_flag_client: ../../libs/feature-flag-client
       args:
         PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
     container_name: agent-skill-store
@@ -636,6 +654,7 @@ services:
       SKILL_STORE_DB_POOL_RECYCLE: "1800"
       SKILL_STORE_AUTHZ_URL: http://authz:8002/api/authz/v1
       SKILL_STORE_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
+      SKILL_STORE_FEATURE_FLAG_URL: http://feature-flag:8012/api/feature-flag/v1
     ports:
       - "${PORT_SKILL_STORE:-8011}:8011"
     networks: [foundation]

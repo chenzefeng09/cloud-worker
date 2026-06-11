@@ -12,8 +12,7 @@ The service composes DB writes with blob-store operations.  Order matters:
 
 from __future__ import annotations
 
-import hashlib
-import json
+import logging
 from typing import Any
 
 from sqlalchemy import select
@@ -30,12 +29,15 @@ from skill_store.errors import (
     VersionConflictError,
     VersionNotFoundError,
 )
+from skill_store.services.skill_package import validate_and_parse
 
 # Visibility levels that make a skill visible on the shared shelf (browse list).
 # "private" skills are excluded from the shelf. This filter applies ONLY to the
 # user-facing browse list — NOT to ``list_internal`` (the worker load path),
 # which must load any skill a user actually selected regardless of visibility.
 _SHELF_VISIBILITIES = ("tenant", "public")
+
+logger = logging.getLogger(__name__)
 
 
 class SkillService:
@@ -95,6 +97,41 @@ class SkillService:
         if skill is None:
             raise SkillNotFoundError(skill_id)
         return skill
+
+    async def delete_skill(self, skill_id: str) -> None:
+        """Delete a skill and all of its versions.
+
+        DB rows for versions and per-user install records are removed via the
+        ORM cascade on ``Skill.versions`` (delete-orphan) and the
+        ``UserInstalledSkill`` FK (ondelete CASCADE).  Blobs are NOT covered by
+        the DB cascade, so we delete each version's tarball best-effort first.
+        A single blob delete failure is logged and skipped rather than aborting
+        the whole operation — object storage cleanup is idempotent and any
+        leaked object can be GC'd later.
+        """
+        stmt = (
+            select(Skill)
+            .where(Skill.id == skill_id, Skill.tenant_id == self._tenant_id)
+            .options(selectinload(Skill.versions))
+        )
+        result = await self._db.execute(stmt)
+        skill = result.scalar_one_or_none()
+        if skill is None:
+            raise SkillNotFoundError(skill_id)
+
+        for sv in list(skill.versions):
+            key = make_key(self._tenant_id, skill.id, sv.version)
+            try:
+                self._blob.delete(key)
+            except Exception:  # noqa: BLE001 — tolerate blob leak, keep going
+                logger.warning(
+                    "blob delete failed during skill delete; leaking object",
+                    extra={"skill_id": skill.id, "version": sv.version, "key": key},
+                    exc_info=True,
+                )
+
+        await self._db.delete(skill)
+        await self._db.flush()
 
     # ------------------------------------------------------- installs
 
@@ -178,17 +215,27 @@ class SkillService:
     ) -> SkillVersion:
         skill = await self.get_skill(skill_id)
 
-        computed_sha = hashlib.sha256(tarball).hexdigest()
+        # Trust boundary: validate the tarball is a well-formed Claude skill
+        # package and derive authoritative metadata from its SKILL.md.  Raises
+        # SkillPackageInvalidError (HTTP 400) on any structural/content problem.
+        parsed = validate_and_parse(tarball)
+
+        # validate_and_parse computes the sha256 of the raw bytes; reuse it as
+        # the canonical hash and still honour a caller-supplied expectation.
+        computed_sha = parsed.computed_sha256
         if expected_sha256 and expected_sha256.lower() != computed_sha:
             raise SkillSha256MismatchError()
 
-        manifest_dict: dict[str, Any]
-        if manifest is None:
-            manifest_dict = {}
-        elif isinstance(manifest, str):
-            manifest_dict = json.loads(manifest) if manifest.strip() else {}
-        else:
-            manifest_dict = manifest
+        # Manifest is server-authoritative — derived from the parsed package,
+        # never from the uploader's ``manifest`` form value (which is ignored).
+        del manifest
+        manifest_dict: dict[str, Any] = {
+            "name": parsed.name,
+            "description": parsed.description,
+            "skill_md_path": parsed.skill_md_path,
+            "format": "skill_md_v1",
+            "sha256": parsed.computed_sha256,
+        }
 
         key = make_key(self._tenant_id, skill.id, version)
         blob_url = self._blob.put(key, tarball)
@@ -210,6 +257,17 @@ class SkillService:
             raise VersionConflictError(version) from exc
         await self._db.refresh(sv)
         return sv
+
+    async def list_versions(self, skill_id: str) -> list[SkillVersion]:
+        """All versions of a skill, newest upload first (404 if skill absent)."""
+        await self.get_skill(skill_id)  # 404 if not in tenant
+        stmt = (
+            select(SkillVersion)
+            .where(SkillVersion.skill_id == skill_id)
+            .order_by(SkillVersion.uploaded_at.desc())
+        )
+        result = await self._db.execute(stmt)
+        return list(result.scalars().all())
 
     async def get_version(self, skill_id: str, version: str) -> SkillVersion:
         skill = await self.get_skill(skill_id)

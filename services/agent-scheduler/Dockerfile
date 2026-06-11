@@ -11,6 +11,9 @@ USER root
 WORKDIR /app
 RUN rm -rf /app/src 2>/dev/null || true
 
+COPY --from=feature_flag_client . /tmp/ff-client
+RUN pip install --no-cache-dir "/tmp/ff-client[fastapi]" && rm -rf /tmp/ff-client
+
 COPY wheels/ /tmp/wheels/
 RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl \
  && rm -rf /tmp/wheels

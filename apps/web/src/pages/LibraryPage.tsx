@@ -6,6 +6,24 @@ import { api } from '../api/client';
 import { ApiError } from '../api/client';
 import type { KnowledgeDocument, McpServer, Skill } from '../api/types';
 import { formatRelativeTimeZh } from '../lib/format';
+import { sha256Hex } from '../lib/sha256';
+
+// Skill tarball upload limits — kept in lockstep with the BFF (20 MiB) and the
+// skill-store backend, which also enforces the SKILL.md / gzip checks.
+const SKILL_MAX_BYTES = 20 * 1024 * 1024;
+const SKILL_ACCEPT = '.tar.gz,.tgz,application/gzip,application/x-gzip';
+
+// Local preflight: reject obviously-bad packages before hitting the network.
+// Returns a Chinese error message, or null when the file looks acceptable.
+function preflightSkillFile(file: File): string | null {
+  const name = file.name.toLowerCase();
+  const okExt = name.endsWith('.tar.gz') || name.endsWith('.tgz');
+  const okMime =
+    file.type === 'application/gzip' || file.type === 'application/x-gzip';
+  if (!okExt && !okMime) return '请上传 .tar.gz 格式的技能包';
+  if (file.size > SKILL_MAX_BYTES) return '技能包超过大小上限 20 MB';
+  return null;
+}
 
 type Tab = 'mcp' | 'skills' | 'docs';
 
@@ -326,6 +344,13 @@ function InstallModal({
         if (!skName.trim()) throw new ApiError(400, 'VALIDATION', '请填写名称');
         if (!skVersion.trim()) throw new ApiError(400, 'VALIDATION', '请填写版本号');
         if (!skFile) throw new ApiError(400, 'VALIDATION', '请选择技能包文件 (tarball)');
+        // Local preflight: catch wrong format / oversized packages before any
+        // network round-trip (and before we create the skill record).
+        const preflightErr = preflightSkillFile(skFile);
+        if (preflightErr) throw new ApiError(400, 'VALIDATION', preflightErr);
+        // sha256 of the compressed bytes — the backend re-verifies integrity
+        // against this. Optional: if Web Crypto is unavailable we skip it.
+        const sha = await sha256Hex(skFile);
         const skill = await api.library.createSkill({
           name: skName.trim(),
           description: skDesc.trim() || null,
@@ -334,6 +359,7 @@ function InstallModal({
         const fd = new FormData();
         fd.append('version', skVersion.trim());
         fd.append('file', skFile, skFile.name);
+        if (sha) fd.append('expected_sha256', sha);
         await api.library.uploadSkillVersion(skill.id, fd);
         onInstalled();
       } else {
@@ -470,7 +496,7 @@ function InstallModal({
                 <input
                   type="file"
                   className="text-[12px] text-ink-2 file:mr-2 file:px-2 file:py-1 file:text-[11px] file:font-mono file:border file:border-line file:rounded-md file:bg-paper file:cursor-pointer"
-                  accept=".tar,.tar.gz,.tgz,application/gzip,application/x-tar"
+                  accept={SKILL_ACCEPT}
                   onChange={(e) => setSkFile(e.target.files?.[0] ?? null)}
                 />
               </Field>

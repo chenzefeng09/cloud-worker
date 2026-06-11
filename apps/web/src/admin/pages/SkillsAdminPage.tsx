@@ -1,10 +1,47 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
+import { useConfirm, useToast } from '../components/dialogs';
+import { Dialog } from '../components/Dialog';
 import type { AdminSkill, AdminSkillVersion } from '../../api/types';
 
 // ─── Skill detail / versions panel ───────────────────────────────────────────
 
-function SkillDetailPanel({ skill, onClose }: { skill: AdminSkill; onClose: () => void }) {
+function SkillDetailPanel({
+  skill,
+  onClose,
+  onDeleted,
+}: {
+  skill: AdminSkill;
+  onClose: () => void;
+  onDeleted: () => void;
+}) {
+  const confirm = useConfirm();
+  const toast = useToast();
+  const [deleting, setDeleting] = useState(false);
+
+  const handleDelete = async () => {
+    if (
+      !(await confirm({
+        title: '删除技能',
+        message: `确定删除技能「${skill.name}」吗？此操作不可撤销。`,
+        tone: 'danger',
+        confirmText: '删除',
+      }))
+    )
+      return;
+    setDeleting(true);
+    try {
+      await api.admin.skills.delete(skill.id);
+      toast.success('已删除技能');
+      onDeleted();
+    } catch (err) {
+      const msg = err instanceof ApiError ? err.message : '删除失败';
+      toast.error(msg);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const [detail, setDetail] = useState<AdminSkill | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -47,12 +84,7 @@ function SkillDetailPanel({ skill, onClose }: { skill: AdminSkill; onClose: () =
   const d = detail ?? skill;
 
   return (
-    <div className="border border-line rounded-md bg-surface p-4 flex flex-col gap-3 max-w-2xl">
-      <div className="flex items-center justify-between">
-        <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-dim">技能详情</div>
-        <button onClick={onClose} className="text-[11px] font-mono text-dim hover:text-ink">关闭</button>
-      </div>
-
+    <Dialog title="技能详情" onClose={onClose} className="w-full max-w-2xl">
       {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
       {error && (
         <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>
@@ -86,17 +118,17 @@ function SkillDetailPanel({ skill, onClose }: { skill: AdminSkill; onClose: () =
             {versionsLoading ? '加载版本中…' : '查看版本'}
           </button>
           <button
-            disabled
-            title="skill-store 暂不支持技能级删除"
-            className="px-2.5 py-1 border border-line text-[11px] font-mono rounded-sm text-dim opacity-50 cursor-not-allowed"
+            onClick={handleDelete}
+            disabled={deleting}
+            className="px-2.5 py-1 border border-red-200 text-[11px] font-mono rounded-sm text-red-600 hover:bg-red-50 disabled:opacity-50"
           >
-            删除
+            {deleting ? '删除中…' : '删除'}
           </button>
         </div>
 
         {versionsTodo && (
           <div className="border border-line rounded-md p-3 text-[12px] text-dim italic">
-            下游 skill-store 暂不支持技能版本查询，接线后将自动展示。
+            未能加载该技能的版本列表。
           </div>
         )}
         {versionsError && (
@@ -106,7 +138,7 @@ function SkillDetailPanel({ skill, onClose }: { skill: AdminSkill; onClose: () =
           <div className="font-mono text-[12px] text-dim italic">暂无版本</div>
         )}
         {versions && versions.length > 0 && (
-          <div className="border border-line rounded-md overflow-hidden">
+          <div className="border border-line rounded-md overflow-hidden max-h-[40vh] overflow-y-auto">
             <table className="w-full text-left border-collapse">
               <thead className="bg-paper-2 border-b border-line">
                 <tr>
@@ -134,7 +166,7 @@ function SkillDetailPanel({ skill, onClose }: { skill: AdminSkill; onClose: () =
           </div>
         )}
       </div>
-    </div>
+    </Dialog>
   );
 }
 
@@ -146,6 +178,7 @@ export function SkillsAdminPage() {
   const [error, setError] = useState<string | null>(null);
   const [isTodoEndpoint, setIsTodoEndpoint] = useState(false);
   const [selected, setSelected] = useState<AdminSkill | null>(null);
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -165,7 +198,7 @@ export function SkillsAdminPage() {
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, []);
+  }, [reloadKey]);
 
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
@@ -227,7 +260,13 @@ export function SkillsAdminPage() {
         )
       )}
 
-      {selected && <SkillDetailPanel skill={selected} onClose={() => setSelected(null)} />}
+      {selected && (
+        <SkillDetailPanel
+          skill={selected}
+          onClose={() => setSelected(null)}
+          onDeleted={() => { setSelected(null); setReloadKey((k) => k + 1); }}
+        />
+      )}
     </div>
   );
 }

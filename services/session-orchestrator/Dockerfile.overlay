@@ -6,6 +6,8 @@
 FROM agent-platform-dev-session-orchestrator:latest
 
 USER root
+COPY --from=feature_flag_client . /tmp/ff-client
+RUN pip install --no-cache-dir "/tmp/ff-client[fastapi]" && rm -rf /tmp/ff-client
 COPY src /app/src
 # Refresh migrations + alembic.ini too: the migrate sidecar runs
 # ``alembic upgrade head`` from this same image, and the base image may carry

@@ -209,8 +209,27 @@ async def create_tenant(
             json=body,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    _raise_for_upstream(resp)
-    return resp.json()
+        _raise_for_upstream(resp)
+        provisioning = resp.json()
+        new_tid = provisioning.get("tenant_id")
+
+        # Provisioning returns {tenant_id, admin_user_id, root_ou_id,
+        # subscription_id, steps} — not the full tenant shape the frontend
+        # renders ({id, name, tier, status, created_at}). Fetch the full tenant
+        # object so the admin UI doesn't crash on missing fields.
+        if new_tid:
+            tenant_resp = await client.get(
+                f"{settings.foundation_identity_url}/platform/tenants/{new_tid}",
+                headers=foundation_headers(tenant_id, user_id, access_token),
+            )
+            if tenant_resp.is_success:
+                return tenant_resp.json()
+
+    # Fallback: full lookup failed (or no tenant_id) — return the provisioning
+    # body but guarantee an ``id`` field so the frontend has something to key on.
+    if new_tid:
+        provisioning.setdefault("id", new_tid)
+    return provisioning
 
 
 @router.get("/admin/tenants/{tid}")
@@ -299,6 +318,7 @@ async def query_audit_events(
         tenant_id   str       required for meaningful cross-tenant admin view
         actor_id    str       optional
         event_type  str       optional  (e.g. "tenant.create")
+        event_types list[str] optional  filter by multiple event types
         from        str       optional  ISO-8601 datetime
         to          str       optional  ISO-8601 datetime
         limit       int       optional  default 50
@@ -602,10 +622,26 @@ async def resolve_tenant_defaults(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _raise_for_upstream(resp: httpx.Response) -> None:
-    """Surface upstream 4xx/5xx as HTTPException to the SPA."""
+    """Surface upstream 4xx/5xx as HTTPException to the SPA.
+
+    The full upstream body is preserved under ``detail``. When the upstream
+    speaks RFC7807 problem+json, its user-facing ``user_message`` is also
+    lifted alongside the nested document so the SPA can show a friendly message
+    without digging through the problem body. Note that header transport is
+    avoided on purpose: ``user_message`` is frequently non-ASCII (Chinese) and
+    HTTP header values are latin-1, which would crash on encode.
+    """
     if resp.status_code >= 400:
         try:
-            detail = resp.json()
+            body = resp.json()
         except Exception:
-            detail = resp.text
-        raise HTTPException(status_code=resp.status_code, detail=detail)
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        if isinstance(body, dict) and body.get("user_message") is not None:
+            # Keep the original problem document under ``detail`` (backward
+            # compatible: callers still read detail["detail"], detail["code"],
+            # …) and surface ``user_message`` at the same level for the SPA.
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail={"detail": body, "user_message": body["user_message"]},
+            )
+        raise HTTPException(status_code=resp.status_code, detail=body)

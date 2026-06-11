@@ -130,6 +130,8 @@ class FakeFoundation:
         if "/teams" in url:
             if method == "POST":
                 return httpx.Response(201, json={"id": "tm_1", "name": "Squad"})
+            if method == "DELETE":
+                return httpx.Response(204)
             return httpx.Response(200, json={"items": [], "next_cursor": None})
 
         # ── identity (user actions) ──────────────────────────────────────────
@@ -143,6 +145,10 @@ class FakeFoundation:
         # ── billing ──────────────────────────────────────────────────────────
         if "/plans" in url:
             return httpx.Response(200, json={"items": [{"id": "plan_pro", "name": "Pro"}]})
+        if "/subscriptions/change-plan" in url:
+            return httpx.Response(200, json={"id": "sub_1", "status": "ACTIVE", "plan_id": "plan_ent"})
+        if "/subscriptions/cancel" in url:
+            return httpx.Response(200, json={"id": "sub_1", "status": "CANCELLED", "plan_id": "plan_pro"})
         if "/subscriptions/current" in url:
             return httpx.Response(200, json={"id": "sub_1", "status": "ACTIVE", "plan_id": "plan_pro"})
         if "/quota/usage" in url:
@@ -151,6 +157,15 @@ class FakeFoundation:
         # ── audit ────────────────────────────────────────────────────────────
         if "/events:verify-integrity" in url:
             return httpx.Response(200, json={"valid": True, "events_checked": 5})
+        if "/events:export" in url:
+            return httpx.Response(
+                200,
+                text="id,action\nevt_1,tenant.create\n",
+                headers={
+                    "content-type": "text/csv; charset=utf-8",
+                    "content-disposition": 'attachment; filename="audit_export.csv"',
+                },
+            )
 
         # ── feature-flag ─────────────────────────────────────────────────────
         if "/flags" in url:
@@ -342,6 +357,59 @@ def test_org_member_remove_path(foundation_client, authed_cookie, allowed) -> No
     assert resp.json()["status"] == "removed"
 
 
+def test_org_team_delete_path(foundation_client, authed_cookie, allowed) -> None:
+    """Team delete is a direct DELETE (no archive step); 204 upstream is
+    normalised to {status: deleted}."""
+    resp = foundation_client.delete(
+        PREFIX + "/admin/org/teams/tm_1", cookies=authed_cookie
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "deleted"
+    # The single SPA DELETE maps to exactly one upstream DELETE …/teams/tm_1
+    # (no archive step, unlike org-units).
+    downstream = [(m, u) for (m, u, _h) in allowed.requests if "/teams/tm_1" in u]
+    assert downstream == [m for m in downstream if m[0] == "DELETE"]
+    assert downstream[-1][0] == "DELETE" and downstream[-1][1].endswith("/teams/tm_1")
+
+
+def test_org_team_delete_conflict_surfaces_user_message(
+    foundation_client, authed_cookie, monkeypatch,
+) -> None:
+    """A team with active members fails upstream with 409 TEAM_CODE_CONFLICT;
+    the BFF must pass the problem (with its user_message) through, not swallow it."""
+    fake = FakeFoundation(authz_allowed=True)
+    problem = {
+        "type": "https://errors.foundation.example.com/foundation/org/state/team_code_conflict",
+        "title": "Team has active members",
+        "status": 409,
+        "code": "FOUNDATION.ORG.STATE.TEAM_CODE_CONFLICT",
+        "detail": "Team has active members; remove them first.",
+        "user_message": "团队仍有活跃成员，请先移除成员。",
+    }
+
+    class _AC:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return None
+        async def get(self, url, **kw): return fake.route("GET", url, **kw)
+        async def post(self, url, **kw): return fake.route("POST", url, **kw)
+        async def put(self, url, **kw): return fake.route("PUT", url, **kw)
+        async def patch(self, url, **kw): return fake.route("PATCH", url, **kw)
+        async def delete(self, url, **kw):
+            if url.endswith("/check"):
+                return fake.route("DELETE", url, **kw)
+            return httpx.Response(409, json=problem)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AC)
+    resp = foundation_client.delete(
+        PREFIX + "/admin/org/teams/tm_1", cookies=authed_cookie,
+    )
+    assert resp.status_code == 409
+    body = resp.json()
+    assert body["detail"]["user_message"] == problem["user_message"]
+    assert body["detail"]["detail"]["code"] == "FOUNDATION.ORG.STATE.TEAM_CODE_CONFLICT"
+
+
 def test_identity_freeze_unfreeze_reset(foundation_client, authed_cookie, allowed) -> None:
     for path, key in (
         ("/admin/users/usr_1/freeze", "frozen"),
@@ -401,3 +469,208 @@ def test_flags_list_does_not_assert_admin_actor(
     ).status_code == 200
     get_calls = [h for (m, u, h) in allowed.requests if u.endswith("/flags") and m == "GET"]
     assert get_calls and all("X-Actor" not in h for h in get_calls)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Billing subscription mutations (change-plan / cancel)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_billing_change_plan(foundation_client, authed_cookie, allowed) -> None:
+    resp = foundation_client.post(
+        PREFIX + "/admin/billing/subscription/change-plan",
+        json={"new_plan_id": "plan_ent"}, cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["plan_id"] == "plan_ent"
+    calls = [h for (m, u, h) in allowed.requests if "/subscriptions/change-plan" in u]
+    assert calls
+
+
+def test_billing_change_plan_tenant_override(foundation_client, authed_cookie, allowed) -> None:
+    target = "tnt_BILL00000000000000000000001"
+    resp = foundation_client.post(
+        PREFIX + f"/admin/billing/subscription/change-plan?tenant_id={target}",
+        json={"new_plan_id": "plan_ent"}, cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    calls = [h for (m, u, h) in allowed.requests if "/subscriptions/change-plan" in u]
+    assert calls and calls[-1].get("X-Tenant-Id") == target
+
+
+def test_billing_cancel(foundation_client, authed_cookie, allowed) -> None:
+    resp = foundation_client.post(
+        PREFIX + "/admin/billing/subscription/cancel",
+        json={}, cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "CANCELLED"
+
+
+def test_billing_change_plan_unauthenticated(foundation_client) -> None:
+    resp = foundation_client.post(
+        PREFIX + "/admin/billing/subscription/change-plan",
+        json={"new_plan_id": "plan_ent"},
+    )
+    assert resp.status_code in (401, 403)
+
+
+def test_billing_change_plan_denied(foundation_client, authed_cookie, denied) -> None:
+    resp = foundation_client.post(
+        PREFIX + "/admin/billing/subscription/change-plan",
+        json={"new_plan_id": "plan_ent"}, cookies=authed_cookie,
+    )
+    assert resp.status_code == 403
+
+
+def test_billing_change_plan_4xx_passthrough(foundation_client, authed_cookie, upstream_404) -> None:
+    resp = foundation_client.post(
+        PREFIX + "/admin/billing/subscription/change-plan",
+        json={"new_plan_id": "plan_ent"}, cookies=authed_cookie,
+    )
+    assert resp.status_code == 404
+
+
+def test_billing_cancel_unreachable_502(foundation_client, authed_cookie, unreachable) -> None:
+    resp = foundation_client.post(
+        PREFIX + "/admin/billing/subscription/cancel",
+        json={}, cookies=authed_cookie,
+    )
+    assert resp.status_code == 502
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Audit export (CSV passthrough)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_audit_export_unauthenticated(foundation_client) -> None:
+    resp = foundation_client.post(PREFIX + "/admin/audit/export", json={})
+    assert resp.status_code in (401, 403)
+
+
+def test_audit_export_denied(foundation_client, authed_cookie, denied) -> None:
+    resp = foundation_client.post(
+        PREFIX + "/admin/audit/export?format=csv",
+        json={"tenant_id": "tnt_01J5TEST00000000000000TNT1"}, cookies=authed_cookie,
+    )
+    assert resp.status_code == 403
+
+
+def test_audit_export_passes_content_type_and_disposition(
+    foundation_client, authed_cookie, allowed,
+) -> None:
+    resp = foundation_client.post(
+        PREFIX + "/admin/audit/export?format=csv",
+        json={"tenant_id": "tnt_01J5TEST00000000000000TNT1"}, cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/csv")
+    assert resp.headers["content-disposition"] == 'attachment; filename="audit_export.csv"'
+    assert "evt_1,tenant.create" in resp.text
+
+
+def test_audit_export_uses_body_tenant(foundation_client, authed_cookie, allowed) -> None:
+    target = "tnt_EXPORT0000000000000000000001"
+    resp = foundation_client.post(
+        PREFIX + "/admin/audit/export?format=csv",
+        json={"tenant_id": target}, cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    calls = [h for (m, u, h) in allowed.requests if "/events:export" in u]
+    assert calls and calls[-1].get("X-Tenant-Id") == target
+
+
+def test_audit_export_4xx_passthrough(foundation_client, authed_cookie, upstream_404) -> None:
+    resp = foundation_client.post(
+        PREFIX + "/admin/audit/export?format=csv",
+        json={"tenant_id": "tnt_01J5TEST00000000000000TNT1"}, cookies=authed_cookie,
+    )
+    assert resp.status_code == 404
+
+
+def test_audit_export_unreachable_502(foundation_client, authed_cookie, unreachable) -> None:
+    resp = foundation_client.post(
+        PREFIX + "/admin/audit/export?format=csv",
+        json={"tenant_id": "tnt_01J5TEST00000000000000TNT1"}, cookies=authed_cookie,
+    )
+    assert resp.status_code == 502
+
+
+_OU = "ou_01KTREC5M1GZF191CHNT3HF7EV"
+
+
+def _org_delete_client(monkeypatch, *, archive_status, archive_body):
+    """A fake foundation where POST /org-units/{id}/archive returns the given
+    status/body and DELETE always succeeds (204). Records calls on .seen."""
+    seen: list[tuple[str, str]] = []
+
+    class _AC:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return None
+        async def post(self, url, **kw):
+            seen.append(("POST", url))
+            if url.endswith("/check"):
+                return httpx.Response(200, json={"allowed": True})
+            if url.endswith("/archive"):
+                return httpx.Response(archive_status, json=archive_body)
+            return httpx.Response(200, json={})
+        async def get(self, url, **kw):
+            seen.append(("GET", url))
+            return httpx.Response(200, json={"allowed": True}) if url.endswith("/check") \
+                else httpx.Response(200, json={})
+        async def delete(self, url, **kw):
+            seen.append(("DELETE", url))
+            return httpx.Response(204)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AC)
+    return seen
+
+
+def test_org_unit_delete_archives_then_deletes(
+    foundation_client, authed_cookie, monkeypatch,
+) -> None:
+    """The SPA's single DELETE drives archive→delete: foundation must see a
+    POST …/archive followed by a DELETE, and the SPA gets {status: deleted}."""
+    seen = _org_delete_client(
+        monkeypatch, archive_status=200, archive_body={"id": _OU, "is_archived": True},
+    )
+    resp = foundation_client.delete(
+        PREFIX + f"/admin/org/org-units/{_OU}", cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "deleted"}
+    downstream = [(m, u) for (m, u) in seen if not u.endswith("/check")]
+    assert len(downstream) == 2
+    assert downstream[0][0] == "POST" and downstream[0][1].endswith(f"/org-units/{_OU}/archive")
+    assert downstream[1][0] == "DELETE" and downstream[1][1].endswith(f"/org-units/{_OU}")
+
+
+def test_org_unit_delete_not_empty_surfaces_reason_and_user_message(
+    foundation_client, authed_cookie, monkeypatch,
+) -> None:
+    """When the unit is genuinely non-empty the *archive* step fails with
+    NOT_EMPTY; the SPA must get the localised ``user_message`` lifted to the top
+    of ``detail``, the machine ``reason`` preserved, and DELETE must NOT run."""
+    problem = {
+        "type": "https://errors.foundation.example.com/foundation/org/state/not_empty",
+        "title": "Org unit is not empty",
+        "status": 422,
+        "code": "FOUNDATION.ORG.STATE.NOT_EMPTY",
+        "detail": "Cannot archive or delete an org-unit that still has descendants, teams, or members.",
+        "user_message": "该部门下仍有子部门 / 团队 / 成员，无法归档或删除。",
+        "reason": "has_members",  # foundation flattens FoundationError.extra onto the body
+    }
+    seen = _org_delete_client(monkeypatch, archive_status=422, archive_body=problem)
+    resp = foundation_client.delete(
+        PREFIX + f"/admin/org/org-units/{_OU}", cookies=authed_cookie,
+    )
+    assert resp.status_code == 422
+    body = resp.json()
+    # Friendly message lifted to the top of the FastAPI detail envelope …
+    assert body["detail"]["user_message"] == problem["user_message"]
+    # … the precise machine reason preserved for the SPA to specialise on …
+    assert body["detail"]["detail"]["reason"] == "has_members"
+    # … the original problem document preserved underneath …
+    assert body["detail"]["detail"]["code"] == "FOUNDATION.ORG.STATE.NOT_EMPTY"
+    # … and the failed archive must short-circuit before any DELETE.
+    assert not any(m == "DELETE" for (m, _u) in seen)

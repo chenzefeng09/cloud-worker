@@ -43,6 +43,10 @@ def require_permission(action: str, resource_type: str) -> Callable[..., Any]:
     """
 
     async def _guard(request: Request) -> None:
+        # ── Admin bypass: BFF already enforced platform.admin ───────────────
+        if request.headers.get("X-Actor") == "ADMIN":
+            return
+
         # ── Deny point 1: identity checks (no network) ──────────────────────
         tenant_id = get_tenant_id()
         user_id = get_user_id()

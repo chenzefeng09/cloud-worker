@@ -56,7 +56,9 @@ def _scope_headers(
     """
     caller_tenant, user_id, access_token = auth
     effective = tenant_id or caller_tenant
-    return foundation_headers(effective, user_id, access_token)
+    hdrs = foundation_headers(effective, user_id, access_token)
+    hdrs["X-Actor"] = "ADMIN"
+    return hdrs
 
 
 def _forward_params(request: Request) -> dict[str, str]:
@@ -95,10 +97,9 @@ async def _proxy_get(
 #   * Skills are addressed by ``skill_id``, not ``name``.  The BFF path
 #     segment ``{name}`` is forwarded verbatim as the skill identifier; the
 #     frontend should pass the skill id.
-#   * There is NO ``GET /skills/{id}/versions`` endpoint and NO skill-level
-#     ``DELETE /skills/{id}`` in skill-store.  These BFF endpoints forward to
-#     the natural paths anyway; until skill-store adds them the upstream
-#     responds 404/405 which ``_raise_for_upstream`` surfaces transparently.
+#   * skill-store now supports both ``GET /skills/{id}/versions`` (list all
+#     versions of a skill) and skill-level ``DELETE /skills/{id}`` (delete the
+#     skill plus all versions); the BFF endpoints below proxy to those paths.
 
 @router.get("/admin/skills")
 async def admin_list_skills(
@@ -132,9 +133,8 @@ async def admin_list_skill_versions(
 ) -> dict:
     """List a skill's versions.
 
-    NOTE: skill-store has no public ``/skills/{id}/versions`` route today;
-    this proxies to that path so the endpoint lights up automatically once
-    skill-store adds it.  Until then the upstream 404 is surfaced verbatim.
+    Proxies to skill-store ``GET /skills/{id}/versions``, which returns a
+    ``{items, total}`` envelope of the skill's versions (newest upload first).
     """
     url = f"{request.app.state.settings.skill_store_url}/skills/{name}/versions"
     return await _proxy_get(request, url, _auth, tenant_id)
@@ -149,10 +149,8 @@ async def admin_delete_skill(
 ) -> dict:
     """Delete a skill.
 
-    NOTE: skill-store currently exposes only per-version delete
-    (``DELETE /skills/{id}/versions/{version}``), not skill-level delete.
-    This proxies to ``DELETE /skills/{id}`` so it works once skill-store
-    adds it; until then the upstream 404/405 is surfaced verbatim.
+    Proxies to skill-store ``DELETE /skills/{id}``, which removes the skill
+    along with all of its versions (blobs + rows) and per-user install records.
     """
     headers = _scope_headers(_auth, tenant_id=tenant_id)
     url = f"{request.app.state.settings.skill_store_url}/skills/{name}"
@@ -267,7 +265,7 @@ async def admin_delete_mcp_server(
 # Downstream (knowledge-ingest api/v1/documents.py):
 #   GET /documents, GET /documents/{document_id},
 #   POST /documents/{document_id}/ingest   (= "reingest" — re-runs chunk+embed)
-#   There is NO DELETE for documents → the spec's optional delete is omitted.
+#   DELETE /documents/{document_id}        (removes the doc row + chunks + blob)
 
 @router.get("/admin/knowledge/documents")
 async def admin_list_documents(
@@ -322,18 +320,43 @@ async def admin_reingest_document(
     return resp.json()
 
 
+@router.delete("/admin/knowledge/documents/{document_id}")
+async def admin_delete_document(
+    document_id: str,
+    request: Request,
+    tenant_id: str | None = None,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Delete a knowledge document.
+
+    Proxies to knowledge-ingest ``DELETE /documents/{id}``, which removes the
+    document row (chunks cascade) and best-effort deletes the source blob.
+    """
+    headers = _scope_headers(_auth, tenant_id=tenant_id)
+    url = (
+        f"{request.app.state.settings.knowledge_ingest_url}"
+        f"/documents/{document_id}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.delete(url, headers=headers)
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"knowledge-ingest unreachable ({exc})",
+        ) from exc
+    _raise_for_upstream(resp)
+    return {"status": "deleted"}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Module 10 — Runs & sandbox governance (→ scheduler / sandbox-pool / orch.)
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Downstream divergences:
-#   * agent-scheduler has NO list-runs route (only POST /runs,
-#     GET/POST /runs/{run_id}[/cancel]).  The authoritative run *list* lives in
-#     session-orchestrator, but it is session-scoped
-#     (GET /sessions/{id}/runs) — there is no tenant-wide runs list anywhere.
-#     ``GET /admin/ops/runs`` therefore proxies to the scheduler /runs path
-#     (params透传) so it works the instant a list route is added; today the
-#     upstream 404/405 is surfaced verbatim.  See report for the gap.
+#   * agent-scheduler exposes GET /runs (tenant-wide list); ``GET /admin/ops/runs``
+#     proxies to it (params透传).  Per-run detail/cancel live at
+#     GET/POST /runs/{run_id}[/cancel].
 #   * Scheduler cancel is POST /runs/{run_id}/cancel and looks the container up
 #     by the *sandbox/container id*, not the orchestrator run id — the caller
 #     must pass the scheduler's run/container id as {run_id}.
@@ -347,11 +370,7 @@ async def admin_list_runs(
     tenant_id: str | None = None,
     _auth: tuple = Depends(require_super_admin_bff),
 ) -> dict:
-    """List runs (scheduler params透传).
-
-    See module note: the scheduler currently has no list-runs route, so this
-    surfaces the upstream's response verbatim (404 until one is added).
-    """
+    """List runs via the scheduler's tenant-wide ``GET /runs`` (params透传)."""
     url = f"{request.app.state.settings.agent_scheduler_url}/runs"
     return await _proxy_get(request, url, _auth, tenant_id, forward_params=True)
 

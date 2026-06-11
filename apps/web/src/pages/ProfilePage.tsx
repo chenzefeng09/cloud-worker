@@ -6,10 +6,21 @@ import { useChatStore } from '../stores/chatStore';
 import { useWorkspace } from '../lib/workspaceContext';
 import { api } from '../api/client';
 import { formatRelativeTimeZh } from '../lib/format';
-import type { ActiveSession, ApiKey, ApiKeyCreated, DailyTokenUsage, MfaMethod, ModelCatalogProvider, ModelPurpose, NotifPreferenceItem, QuotaInfo, TokenUsage, UserModelPreference, UserProfile } from '../api/types';
+import type { ActiveSession, ApiKey, ApiKeyCreated, DailyTokenUsage, FeatureFlag, MfaMethod, ModelCatalogProvider, ModelPurpose, NotifPreferenceItem, PamElevation, QuotaInfo, TokenUsage, UserModelPreference, UserProfile } from '../api/types';
 import { useDefaultModel, clearModelCache } from '../hooks/useDefaultModel';
 import { MODEL_OPTIONS, SYSTEM_FALLBACK_MODEL, modelLabel } from '../lib/modelOptions';
 import { findProviderForModel, getModelsForTypes } from '../lib/providerModels';
+
+const FLAG_DESCRIPTIONS: Record<string, string> = {
+  'ai.thinking_ui': 'AI 思考过程',
+  'billing.saas_mode': 'SaaS 计费模式',
+  'auth.social_login.google': 'Google 社交登录',
+  'auth.social_login.github': 'GitHub 社交登录',
+  'auth.social_login.wechat': '微信社交登录',
+  'compliance.gmtls_enabled': '国密 TLS',
+  'compliance.sm_algorithms': '国密算法 SM2/SM3/SM4',
+  'export.allow_l4_download': 'L4 数据下载',
+};
 
 // ── Local sub-components ──────────────────────────────────────────
 
@@ -519,6 +530,107 @@ export function ProfilePage() {
     });
   };
 
+  // ── Feature flag preferences (user-overridable flags) ───────────
+  const [featureFlags, setFeatureFlags] = useState<FeatureFlag[]>([]);
+  const [ffSaving, setFfSaving] = useState<string | null>(null);
+  const [ffError, setFfError] = useState<string | null>(null);
+
+  const fetchFlags = () => {
+    api.featureFlags.list()
+      .then(setFeatureFlags)
+      .catch(() => setFfError('加载功能设置失败'));
+  };
+  useEffect(() => { fetchFlags(); }, []);
+
+  const overridableFlags = featureFlags.filter((f) => f.user_overridable);
+
+  const handleToggleFlag = async (key: string, currentEnabled: boolean) => {
+    setFfSaving(key);
+    setFfError(null);
+    try {
+      await api.userFlagOverrides.put(key, { enabled: !currentEnabled });
+      fetchFlags();
+    } catch {
+      setFfError('保存失败');
+      setTimeout(() => setFfError(null), 3000);
+    } finally {
+      setFfSaving(null);
+    }
+  };
+
+  const handleResetFlag = async (key: string) => {
+    setFfSaving(key);
+    setFfError(null);
+    try {
+      await api.userFlagOverrides.delete(key);
+      fetchFlags();
+    } catch {
+      setFfError('重置失败');
+      setTimeout(() => setFfError(null), 3000);
+    } finally {
+      setFfSaving(null);
+    }
+  };
+
+  // ── PAM elevation (user-facing) ─────────────────────────────────
+  const RESOURCE_OPTIONS = [
+    { value: 'db:read', label: '数据库只读' },
+    { value: 'db:write', label: '数据库读写' },
+    { value: 'secrets:read', label: '密钥查看' },
+    { value: 'secrets:write', label: '密钥管理' },
+    { value: 'audit:read', label: '审计日志' },
+    { value: 'logs:read', label: '运行日志' },
+    { value: 'config:write', label: '配置变更' },
+    { value: 'user:admin', label: '用户管理' },
+  ];
+  const MAX_DURATION = 480;
+
+  const [myElevations, setMyElevations] = useState<PamElevation[]>([]);
+  const [elevLoading, setElevLoading] = useState(false);
+  const [elevError, setElevError] = useState<string | null>(null);
+  const [showElevForm, setShowElevForm] = useState(false);
+  const [elevReason, setElevReason] = useState('');
+  const [elevDuration, setElevDuration] = useState('60');
+  const [elevResources, setElevResources] = useState<Set<string>>(new Set());
+  const [elevBusy, setElevBusy] = useState(false);
+  const [elevMsg, setElevMsg] = useState<string | null>(null);
+
+  const fetchElevations = () => {
+    setElevLoading(true);
+    setElevError(null);
+    api.pam.myElevations()
+      .then(setMyElevations)
+      .catch(() => setElevError('加载升权记录失败'))
+      .finally(() => setElevLoading(false));
+  };
+
+  useEffect(() => { fetchElevations(); }, []);
+
+  const handleRequestElevation = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!elevReason.trim()) return;
+    setElevBusy(true);
+    setElevMsg(null);
+    try {
+      const mins = Math.min(Math.max(Number(elevDuration) || 60, 1), MAX_DURATION);
+      await api.pam.requestElevation({
+        reason: elevReason.trim(),
+        duration_minutes: mins,
+        target_resources: Array.from(elevResources),
+      });
+      setElevMsg('升权申请已提交，等待管理员审批');
+      setElevReason(''); setElevDuration('60'); setElevResources(new Set());
+      setShowElevForm(false);
+      fetchElevations();
+      setTimeout(() => setElevMsg(null), 4000);
+    } catch {
+      setElevMsg('申请失败');
+      setTimeout(() => setElevMsg(null), 3000);
+    } finally {
+      setElevBusy(false);
+    }
+  };
+
   const handleLogout = async () => {
     try {
       await api.auth.logout();
@@ -761,6 +873,49 @@ export function ProfilePage() {
                   </PfRow>
                 </div>
               </PfSection>
+
+              {overridableFlags.length > 0 && (
+                <PfSection title="功能设置">
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
+                    {ffError && (
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--accent)' }}>
+                        {ffError}
+                      </div>
+                    )}
+                    {overridableFlags.map((flag, i) => (
+                      <div key={flag.key}>
+                        {i > 0 && <div className="cw-divider" style={{ marginBottom: 13 }} />}
+                        <PfRow
+                          label={FLAG_DESCRIPTIONS[flag.key] || flag.name || flag.key}
+                          sub={flag.key}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <PfToggle
+                              on={!!flag.enabled && !flag.kill_switch_active}
+                              onChange={() => handleToggleFlag(flag.key, !!flag.enabled && !flag.kill_switch_active)}
+                            />
+                            {flag.user_override != null && (
+                              <button
+                                className="cw-btn cw-btn-sm cw-btn-ghost"
+                                style={{ fontSize: 11 }}
+                                onClick={() => handleResetFlag(flag.key)}
+                                disabled={ffSaving === flag.key}
+                              >
+                                恢复默认
+                              </button>
+                            )}
+                            {ffSaving === flag.key && (
+                              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--dim)' }}>
+                                保存中…
+                              </span>
+                            )}
+                          </div>
+                        </PfRow>
+                      </div>
+                    ))}
+                  </div>
+                </PfSection>
+              )}
 
               <PfSection title="工作空间">
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
@@ -1081,6 +1236,143 @@ export function ProfilePage() {
                   <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>无活跃会话记录</span>
                 </PfSection>
               )}
+
+              {/* ── 权限与升权 ─────────────────────────────── */}
+              <PfSection
+                title="权限与升权"
+                action={
+                  <button className="cw-btn cw-btn-sm" onClick={() => setShowElevForm((v) => !v)}>
+                    {showElevForm ? '取消' : '发起升权申请'}
+                  </button>
+                }
+              >
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                  {elevMsg && (
+                    <div style={{
+                      padding: '8px 12px',
+                      borderRadius: 'var(--r-sm)',
+                      border: `1px solid ${elevMsg.includes('失败') ? 'var(--accent)' : 'var(--accent-line)'}`,
+                      background: elevMsg.includes('失败') ? undefined : 'var(--accent-soft)',
+                      fontFamily: 'var(--font-mono)',
+                      fontSize: 12,
+                      color: elevMsg.includes('失败') ? 'var(--accent)' : 'var(--ink-2)',
+                    }}>
+                      {elevMsg}
+                    </div>
+                  )}
+
+                  {showElevForm && (
+                    <form onSubmit={handleRequestElevation} style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: 12,
+                      padding: '14px 16px',
+                      border: '1px solid var(--line)',
+                      borderRadius: 'var(--r-sm)',
+                      background: 'var(--paper)',
+                    }}>
+                      <PfField label="申请理由" value={elevReason} onChange={setElevReason} />
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                        <label className="cw-label">时长（分钟，上限 {MAX_DURATION}）</label>
+                        <input
+                          type="number"
+                          min={1}
+                          max={MAX_DURATION}
+                          value={elevDuration}
+                          onChange={(e) => setElevDuration(e.target.value)}
+                          style={{
+                            padding: '7px 10px',
+                            border: '1px solid var(--line)',
+                            borderRadius: 'var(--r-sm)',
+                            fontFamily: 'var(--font-mono)',
+                            fontSize: 13,
+                            width: 120,
+                            background: 'var(--surface)',
+                            outline: 'none',
+                          }}
+                        />
+                      </div>
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                        <label className="cw-label">目标资源</label>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 24px' }}>
+                          {RESOURCE_OPTIONS.map((r) => (
+                            <label key={r.value} style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 13 }}>
+                              <input
+                                type="checkbox"
+                                checked={elevResources.has(r.value)}
+                                onChange={() => setElevResources((prev) => {
+                                  const next = new Set(prev);
+                                  next.has(r.value) ? next.delete(r.value) : next.add(r.value);
+                                  return next;
+                                })}
+                              />
+                              <span style={{ color: 'var(--ink-2)' }}>{r.label}</span>
+                            </label>
+                          ))}
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                        <button
+                          type="button"
+                          className="cw-btn cw-btn-sm cw-btn-ghost"
+                          onClick={() => setShowElevForm(false)}
+                          disabled={elevBusy}
+                        >
+                          取消
+                        </button>
+                        <button
+                          type="submit"
+                          className="cw-btn cw-btn-sm cw-btn-primary"
+                          disabled={elevBusy || !elevReason.trim()}
+                        >
+                          {elevBusy ? '提交中…' : '提交申请'}
+                        </button>
+                      </div>
+                    </form>
+                  )}
+
+                  {elevLoading && (
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)' }}>加载中…</span>
+                  )}
+                  {elevError && (
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)', fontStyle: 'italic' }}>{elevError}</span>
+                  )}
+                  {!elevLoading && !elevError && myElevations.length === 0 && (
+                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)', fontStyle: 'italic' }}>暂无升权记录</span>
+                  )}
+                  {myElevations.length > 0 && (
+                    <div style={{ display: 'flex', flexDirection: 'column' }}>
+                      <div style={{
+                        display: 'grid',
+                        gridTemplateColumns: '1.5fr 0.6fr 0.8fr',
+                        gap: '6px 14px',
+                        padding: '5px 4px 9px',
+                        borderBottom: '1px solid var(--line-2)',
+                      }}>
+                        {['理由', '状态', '申请时间'].map((h) => (
+                          <span key={h} className="cw-label">{h}</span>
+                        ))}
+                      </div>
+                      {myElevations.map((el, i) => (
+                        <div key={el.id ?? i} style={{
+                          display: 'grid',
+                          gridTemplateColumns: '1.5fr 0.6fr 0.8fr',
+                          gap: '6px 14px',
+                          padding: '10px 4px',
+                          borderBottom: '1px solid var(--line-2)',
+                          alignItems: 'center',
+                        }}>
+                          <span style={{ fontSize: 13 }}>{el.reason ?? '—'}</span>
+                          <Chip accent={el.status === 'APPROVED'}>{el.status ?? '—'}</Chip>
+                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)' }}>
+                            {el.requested_at ? new Date(el.requested_at).toLocaleString('zh-CN') : '—'}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </PfSection>
 
               <PfSection title="身份验证">
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
