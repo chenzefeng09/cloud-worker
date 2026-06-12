@@ -65,6 +65,11 @@ class Settings(BaseSettings):
         "http://localhost:18016/api/data-protection/v1"
     )
 
+    # Prometheus — admin storage trend charts query Prometheus via the BFF
+    # (so the browser does not need cross-origin access).  Defaults to the
+    # dev compose hostname; override in production to the in-cluster URL.
+    prometheus_url: str = "http://prometheus:9090"
+
     session_orchestrator_url: str = "http://localhost:8006/api/session/v1"
 
     # Large-attachment gating threshold (bytes).  A selected attachment at or

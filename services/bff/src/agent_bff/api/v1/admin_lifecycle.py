@@ -22,6 +22,11 @@ Upstream paths (foundation lifecycle):
     POST /legal-holds/{hold_id}:release
     GET  /legal-holds:check                (query: resource_type_id/resource_id)
     GET  /legal-holds                      (query: cursor/limit)
+    GET  /storage-quotas/admin/summary     (scope: storage.admin)
+    PATCH /storage-quotas/admin/{tenant_id}/{bucket_purpose}
+                                           (scope: storage.quota.write)
+    GET  /orphan-reports                   (query: limit/before_id)
+    GET  /orphan-reports/{report_id}
 """
 
 from __future__ import annotations
@@ -42,6 +47,21 @@ def _headers(request: Request, auth: tuple) -> dict[str, str]:
     tenant_id, user_id, access_token = auth
     target_tenant = request.query_params.get("tenant_id") or tenant_id
     return foundation_headers(target_tenant, user_id, access_token)
+
+
+def _admin_scoped_headers(request: Request, auth: tuple) -> dict[str, str]:
+    """Headers for cross-tenant *storage* admin calls.
+
+    Attaches ``X-Foundation-Scopes: storage.admin storage.quota.write`` so
+    the upstream (foundation-lifecycle) admits the request — the storage
+    admin surface is scope-gated on top of the platform.admin authz check
+    the BFF already enforces via require_super_admin_bff.
+    """
+    tenant_id, user_id, access_token = auth
+    target_tenant = request.query_params.get("tenant_id") or tenant_id
+    return foundation_headers(
+        target_tenant, user_id, access_token, super_admin=True,
+    )
 
 
 def _forward_params(request: Request) -> dict[str, str]:
@@ -239,6 +259,96 @@ async def list_legal_holds(
                 f"{settings.foundation_lifecycle_url}/legal-holds",
                 params=_forward_params(request),
                 headers=_headers(request, _auth),
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise _connect_502(exc) from exc
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+# ── Storage quotas (cross-tenant admin) ────────────────────────────────────────
+#
+# These three surfaces are scope-gated upstream (storage.admin /
+# storage.quota.write) — the BFF asserts those scopes via the super_admin
+# branch of foundation_headers().  The downstream paths sit under
+# /storage-quotas/admin/... (not the per-tenant /storage-quotas/{purpose}
+# read endpoint, which is unrelated to this admin console).
+
+@router.get("/admin/lifecycle/storage-quotas/summary")
+async def storage_quota_summary(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    settings = request.app.state.settings
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{settings.foundation_lifecycle_url}/storage-quotas/admin/summary",
+                params=_forward_params(request),
+                headers=_admin_scoped_headers(request, _auth),
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise _connect_502(exc) from exc
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.patch("/admin/lifecycle/storage-quotas/{tenant_id}/{bucket_purpose}")
+async def patch_storage_quota(
+    tenant_id: str,
+    bucket_purpose: str,
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    settings = request.app.state.settings
+    body = await _body(request)
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.patch(
+                f"{settings.foundation_lifecycle_url}"
+                f"/storage-quotas/admin/{tenant_id}/{bucket_purpose}",
+                json=body,
+                headers=_admin_scoped_headers(request, _auth),
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise _connect_502(exc) from exc
+    _raise_for_upstream(resp)
+    return resp.json() if resp.content else {"status": "patched"}
+
+
+# ── Orphan reconcile reports ───────────────────────────────────────────────────
+
+@router.get("/admin/lifecycle/orphan-reports")
+async def list_orphan_reports(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    settings = request.app.state.settings
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{settings.foundation_lifecycle_url}/orphan-reports",
+                params=_forward_params(request),
+                headers=_admin_scoped_headers(request, _auth),
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise _connect_502(exc) from exc
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.get("/admin/lifecycle/orphan-reports/{report_id}")
+async def get_orphan_report(
+    report_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    settings = request.app.state.settings
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{settings.foundation_lifecycle_url}/orphan-reports/{report_id}",
+                headers=_admin_scoped_headers(request, _auth),
             )
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         raise _connect_502(exc) from exc

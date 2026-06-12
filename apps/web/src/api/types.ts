@@ -1574,3 +1574,61 @@ export interface RecordConsentRequest {
   granted: boolean;
   ip_address?: string | null;
 }
+
+// ─── Storage admin (→ foundation-lifecycle Phase 7) ─────────────────────────────
+
+export type BucketPurpose = 'audit' | 'workspace' | 'kb_raw' | 'kb_derived';
+
+export interface StorageQuotaSummaryItem {
+  tenant_id: string;
+  bucket_purpose: BucketPurpose;
+  used_bytes: number;
+  limit_bytes: number;
+  used_pct: number;
+  soft_warn_pct: number;
+  updated_at: string;
+}
+
+export interface StorageQuotaSummaryResponse {
+  items: StorageQuotaSummaryItem[];
+  total: number;
+}
+
+export interface StorageQuotaPatch {
+  limit_bytes?: number;
+  soft_warn_pct?: number;
+}
+
+export interface OrphanReport {
+  id: string;
+  started_at: string;
+  completed_at: string;
+  duration_ms: number;
+  dry_run: boolean;
+  grace_period_days: number;
+  direction_a_orphans: number;
+  direction_a_deleted: number;
+  direction_b_missing: number;
+}
+
+export interface OrphanReportListResponse {
+  items: OrphanReport[];
+  next_cursor: string | null;
+}
+
+// Prometheus range-query response (just the slice the admin UI needs).
+export interface PromSeries {
+  metric: Record<string, string>;
+  // Pairs of [unix_seconds, "value-as-string"] as Prometheus returns them.
+  values: [number, string][];
+}
+
+export interface PromQueryRangeResponse {
+  status: 'success' | 'error';
+  data?: {
+    resultType: 'matrix';
+    result: PromSeries[];
+  };
+  errorType?: string;
+  error?: string;
+}

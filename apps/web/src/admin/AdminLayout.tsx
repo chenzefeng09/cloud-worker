@@ -25,6 +25,8 @@ import { LifecyclePage } from './pages/LifecyclePage';
 import { LargeAttachmentPage } from './pages/LargeAttachmentPage';
 import { PoolMonitorPage } from './pages/PoolMonitorPage';
 import { DataProtectionPage } from './pages/DataProtectionPage';
+import { StorageManagementPage } from './pages/StorageManagementPage';
+import { OrphanReportsPage } from './pages/OrphanReportsPage';
 import { SsoPage } from './pages/SsoPage';
 import { DialogProvider } from './components/dialogs';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -95,6 +97,13 @@ const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
       { to: '/admin/security-ops', label: '安全运营', glyph: '⊛' },
       { to: '/admin/lifecycle', label: '数据生命周期', glyph: '♺' },
       { to: '/admin/data-protection', label: '数据保护', glyph: '⛉' },
+    ],
+  },
+  {
+    title: '存储管理',
+    items: [
+      { to: '/admin/storage-quotas', label: '租户配额', glyph: '▤' },
+      { to: '/admin/storage-orphans', label: '孤儿对账', glyph: '◌' },
     ],
   },
 ];
@@ -209,6 +218,8 @@ export function AdminLayout() {
             <Route path="security-ops" element={<SecurityOpsPage />} />
             <Route path="lifecycle" element={<LifecyclePage />} />
             <Route path="data-protection" element={<DataProtectionPage />} />
+            <Route path="storage-quotas" element={<StorageManagementPage />} />
+            <Route path="storage-orphans" element={<OrphanReportsPage />} />
             <Route path="*" element={<Navigate to="/admin/tenants" replace />} />
           </Routes>
           </ErrorBoundary>
