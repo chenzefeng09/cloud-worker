@@ -142,6 +142,13 @@ import type {
   SsoRoutingRule,
   CreateSsoRoutingRuleRequest,
   CreatePlatformSsoProviderRequest,
+  StorageQuotaSummaryResponse,
+  StorageQuotaSummaryItem,
+  StorageQuotaPatch,
+  OrphanReport,
+  OrphanReportListResponse,
+  PromQueryRangeResponse,
+  BucketPurpose,
 } from './types';
 
 const BFF_BASE = '/api/bff/v1';
@@ -990,6 +997,52 @@ export const api = {
             body,
           ),
       },
+      // Storage admin (Phase 7-8): cross-tenant quota summary + adjust + the
+      // orphan reconcile report archive.  All four go through the
+      // require_super_admin_bff guard and the BFF attaches the scope header.
+      storageQuotas: {
+        summary: () =>
+          request<StorageQuotaSummaryResponse>(
+            'GET',
+            '/admin/lifecycle/storage-quotas/summary',
+          ),
+        patch: (
+          tenantId: string,
+          bucketPurpose: BucketPurpose,
+          body: StorageQuotaPatch,
+        ) =>
+          request<StorageQuotaSummaryItem>(
+            'PATCH',
+            `/admin/lifecycle/storage-quotas/${encodeURIComponent(tenantId)}/${encodeURIComponent(bucketPurpose)}`,
+            body,
+          ),
+      },
+      orphanReports: {
+        list: (params?: { limit?: number; before_id?: string }) =>
+          request<OrphanReportListResponse>(
+            'GET',
+            `/admin/lifecycle/orphan-reports${qs(params)}`,
+          ),
+        get: (reportId: string) =>
+          request<OrphanReport>(
+            'GET',
+            `/admin/lifecycle/orphan-reports/${encodeURIComponent(reportId)}`,
+          ),
+      },
+    },
+    // Admin metrics (→ Prometheus via BFF).  Today only the storage-admin
+    // trend chart uses this; new chart surfaces should add a sibling entry.
+    metrics: {
+      getStorageQuotaSeries: (params: {
+        range: string;
+        step: string;
+        purpose?: BucketPurpose;
+        tenant_id?: string;
+      }) =>
+        request<PromQueryRangeResponse>(
+          'GET',
+          `/admin/metrics/storage-quotas/series${qs(params)}`,
+        ),
     },
     // Large-attachment entitlement (→ foundation lifecycle): two-layer
     // boolean admission (tenant switch + per-user allowlist). Tenant-scoped via
