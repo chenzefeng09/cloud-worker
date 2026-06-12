@@ -110,6 +110,23 @@ class FakeLifecycle:
                 return httpx.Response(201, json={"hold_id": "hold_new"})
             return httpx.Response(200, json={"items": [], "next_cursor": None})
 
+        if "/storage-quotas/admin/summary" in url:
+            return httpx.Response(200, json={"items": [], "total": 0})
+        if "/storage-quotas/admin/" in url and method == "PATCH":
+            return httpx.Response(
+                200,
+                json={
+                    "tenant_id": "tnt_X",
+                    "bucket_purpose": "workspace",
+                    "limit_bytes": 1024,
+                    "soft_warn_pct": 80,
+                },
+            )
+        if "/orphan-reports/" in url:
+            return httpx.Response(200, json={"id": "orr_1", "dry_run": True})
+        if "/orphan-reports" in url:
+            return httpx.Response(200, json={"items": [], "next_cursor": None})
+
         return httpx.Response(200, json={"ok": True})
 
 
@@ -178,6 +195,10 @@ ENDPOINTS = [
     ("POST",   "/admin/lifecycle/legal-holds/hold_1:release", {"released_by": "u"}, 200),
     ("GET",    "/admin/lifecycle/legal-holds:check?resource_type_id=t&resource_id=r", None, 200),
     ("GET",    "/admin/lifecycle/legal-holds", None, 200),
+    ("GET",    "/admin/lifecycle/storage-quotas/summary", None, 200),
+    ("PATCH",  "/admin/lifecycle/storage-quotas/tnt_X/workspace", {"limit_bytes": 1024}, 200),
+    ("GET",    "/admin/lifecycle/orphan-reports?limit=20", None, 200),
+    ("GET",    "/admin/lifecycle/orphan-reports/orr_1", None, 200),
 ]
 
 
@@ -281,3 +302,34 @@ def test_user_id_forwarded(lc_client, lc_cookie, lc_allowed) -> None:
         h for (_, u, h, _) in lc_allowed.requests if u == f"{LIFECYCLE_URL}/recycle-bin"
     ]
     assert calls and calls[-1].get("X-User-Id") == "usr_01J5TEST0000000000000USER1"
+
+
+def test_storage_admin_routes_send_scopes_header(
+    lc_client, lc_cookie, lc_allowed,
+) -> None:
+    """Storage admin (summary / patch / orphan-reports) forwards
+    X-Foundation-Scopes; the unrelated recycle-bin route does not."""
+    lc_client.get(
+        PREFIX + "/admin/lifecycle/storage-quotas/summary", cookies=lc_cookie,
+    )
+    lc_client.patch(
+        PREFIX + "/admin/lifecycle/storage-quotas/tnt_X/workspace",
+        json={"limit_bytes": 1024},
+        cookies=lc_cookie,
+    )
+    lc_client.get(PREFIX + "/admin/lifecycle/orphan-reports", cookies=lc_cookie)
+    lc_client.get(PREFIX + "/admin/lifecycle/recycle-bin", cookies=lc_cookie)
+
+    scoped_urls = {
+        f"{LIFECYCLE_URL}/storage-quotas/admin/summary",
+        f"{LIFECYCLE_URL}/storage-quotas/admin/tnt_X/workspace",
+        f"{LIFECYCLE_URL}/orphan-reports",
+    }
+    for _, url, headers, _ in lc_allowed.requests:
+        if url in scoped_urls:
+            scopes = headers.get("X-Foundation-Scopes", "")
+            assert "storage.admin" in scopes, (url, scopes)
+            assert "storage.quota.write" in scopes, (url, scopes)
+        elif url == f"{LIFECYCLE_URL}/recycle-bin":
+            # Non-scoped surface — header must NOT leak there.
+            assert "X-Foundation-Scopes" not in headers, headers
