@@ -75,6 +75,8 @@ import type {
   MoveOrgUnitRequest,
   NotifPreferenceItem,
   OpsRun,
+  LargeAttachmentTenantSetting,
+  LargeAttachmentUserAllow,
   OrgUnit,
   PatchMcpServerRequest,
   PatchTenantRequest,
@@ -315,6 +317,15 @@ export const api = {
       }
       return res.json();
     },
+    // Pre-upload gate: ask the BFF whether a file of this size may be uploaded.
+    // Large attachments (>= BFF threshold) trigger the large-memory sandbox tier
+    // and require the `large-attachment` entitlement; small files are always
+    // allowed. The BFF owns the threshold (no hardcoded size in the frontend).
+    largeCheck: (sizeBytes: number) =>
+      request<{ allowed: boolean; is_large: boolean; reason: string | null }>(
+        'GET',
+        `/attachments/large-check?size_bytes=${encodeURIComponent(sizeBytes)}`,
+      ),
     list: (sessionId: string, kind?: AttachmentKind) => {
       const qs = kind ? `?kind=${encodeURIComponent(kind)}` : '';
       return request<{ items: Attachment[] }>('GET', `/sessions/${sessionId}/attachments${qs}`);
@@ -346,12 +357,27 @@ export const api = {
       request<ListPage<Skill>>('GET', '/library/skills'),
     listInstalledSkills: () =>
       request<ListPage<InstalledSkill>>('GET', '/library/skills/installed'),
-    installSkill: (skillId: string, enabledByDefault = true) =>
-      request<InstalledSkill>('POST', `/library/skills/${skillId}/install`, {
+    // Install a skill into the calling user's toolbox.
+    //   pinnedVersion = undefined / ''  → omit the `version` field, backend
+    //                                     defaults to null → follow latest.
+    //   pinnedVersion = "0.2.0"         → lock the install to that exact
+    //                                     skill-store version.
+    // The body field name is `version` (matches skill-store InstallSkillBody).
+    installSkill: (skillId: string, enabledByDefault = true, pinnedVersion?: string) => {
+      const body: { enabled_by_default: boolean; version?: string } = {
         enabled_by_default: enabledByDefault,
-      }),
+      };
+      if (pinnedVersion) body.version = pinnedVersion;
+      return request<InstalledSkill>('POST', `/library/skills/${skillId}/install`, body);
+    },
     uninstallSkill: (skillId: string) =>
       request<void>('DELETE', `/library/skills/${skillId}/install`),
+    // Unwrap the ListPage envelope: the BFF returns {items, total} from
+    // skill-store, but the install modal only needs the array.
+    listSkillVersions: (skillId: string) =>
+      request<ListPage<SkillVersion>>('GET', `/library/skills/${skillId}/versions`).then(
+        (r) => r.items,
+      ),
     listDocuments: () =>
       request<ListPage<KnowledgeDocument>>('GET', '/library/documents'),
 
@@ -964,6 +990,39 @@ export const api = {
             body,
           ),
       },
+    },
+    // Large-attachment entitlement (→ foundation lifecycle): two-layer
+    // boolean admission (tenant switch + per-user allowlist). Tenant-scoped via
+    // the optional tenant_id query override. The user-allows list may arrive
+    // either as {items:[...]} (current) or a bare array — both are unwrapped.
+    largeAttachment: {
+      tenantSetting: (tenantId?: string) =>
+        request<LargeAttachmentTenantSetting>(
+          'GET',
+          `/admin/large-attachment/tenant-setting${qs({ tenant_id: tenantId })}`,
+        ),
+      setTenantSetting: (enabled: boolean, tenantId?: string) =>
+        request<LargeAttachmentTenantSetting>(
+          'PUT',
+          `/admin/large-attachment/tenant-setting${qs({ tenant_id: tenantId })}`,
+          { enabled },
+        ),
+      userAllows: (tenantId?: string) =>
+        request<{ items: LargeAttachmentUserAllow[] } | LargeAttachmentUserAllow[]>(
+          'GET',
+          `/admin/large-attachment/user-allows${qs({ tenant_id: tenantId })}`,
+        ).then((r) => (Array.isArray(r) ? r : r.items ?? [])),
+      setUserAllow: (userId: string, allowed: boolean, tenantId?: string) =>
+        request<LargeAttachmentUserAllow>(
+          'PUT',
+          `/admin/large-attachment/user-allows${qs({ tenant_id: tenantId })}`,
+          { user_id: userId, allowed },
+        ),
+      removeUserAllow: (userId: string, tenantId?: string) =>
+        request<{ deleted: boolean; user_id: string }>(
+          'DELETE',
+          `/admin/large-attachment/user-allows/${encodeURIComponent(userId)}${qs({ tenant_id: tenantId })}`,
+        ),
     },
     // Data protection (→ foundation-data-protection): masking / residency /
     // cross-border / destruction / consent. Tenant-scoped.

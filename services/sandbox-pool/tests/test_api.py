@@ -29,6 +29,12 @@ def settings() -> Settings:
         otel_enabled=False,
         sandbox_image="test-image:latest",
         docker_network="test_net",
+        # Both buckets, but idle_low=0 so background warming stays off and the
+        # acquire/release round-trip tests start from an empty pool.
+        memory_tier_watermarks={
+            "small": {"idle_low": 0, "idle_high": 5, "max_total": 10},
+            "large": {"idle_low": 0, "idle_high": 5, "max_total": 10},
+        },
     )
 
 
@@ -36,7 +42,7 @@ def _mock_runtime_factory() -> MagicMock:
     runtime = MagicMock()
     _counter = itertools.count()
     runtime.start_idle_container.side_effect = (
-        lambda template: f"{next(_counter):012x}"
+        lambda template, memory_limit=None: f"{next(_counter):012x}"
     )
     return runtime
 
@@ -99,6 +105,34 @@ def test_acquire_and_release_round_trip(client: TestClient) -> None:
 
     snap = client.get("/api/sandbox-pool/v1/sandboxes/_pool")
     assert snap.json()["total"] == 0
+
+
+def test_acquire_large_tier_reports_in_snapshot(client: TestClient) -> None:
+    """Acquiring memory_tier=large registers under the large bucket."""
+    headers = {"X-Tenant-Id": "tnt_01J5TEST00000000000000TNT1"}
+    acq = client.post(
+        "/api/sandbox-pool/v1/sandboxes/acquire",
+        headers=headers,
+        json={"template": "base", "memory_tier": "large"},
+    )
+    assert acq.status_code == 201, acq.text
+
+    snap = client.get("/api/sandbox-pool/v1/sandboxes/_pool").json()
+    assert snap["by_memory_tier"]["large"]["total"] == 1
+    assert snap["by_memory_tier"]["small"]["total"] == 0
+
+
+def test_acquire_defaults_to_small_tier(client: TestClient) -> None:
+    """Omitting memory_tier defaults to the small bucket (back-compat)."""
+    headers = {"X-Tenant-Id": "tnt_01J5TEST00000000000000TNT1"}
+    acq = client.post(
+        "/api/sandbox-pool/v1/sandboxes/acquire",
+        headers=headers,
+        json={"template": "base"},
+    )
+    assert acq.status_code == 201, acq.text
+    snap = client.get("/api/sandbox-pool/v1/sandboxes/_pool").json()
+    assert snap["by_memory_tier"]["small"]["total"] == 1
 
 
 def test_release_rejects_cross_tenant(client: TestClient) -> None:

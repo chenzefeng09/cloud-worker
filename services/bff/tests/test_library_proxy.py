@@ -188,6 +188,46 @@ def test_create_skill_surfaces_upstream_error(
     assert resp.status_code == 409
 
 
+def test_list_skill_versions_requires_auth(client: TestClient) -> None:
+    resp = client.get("/api/bff/v1/library/skills/sk_01/versions")
+    assert resp.status_code == 401
+
+
+def test_list_skill_versions_proxied(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /library/skills/{id}/versions surfaces the upstream items[] envelope.
+
+    skill-store returns ``{items: [...], total: N}`` (ListPage). The BFF passes
+    that through untouched — the SPA's install-to-toolbox modal renders the
+    items in a dropdown so the user can pin a specific version (or leave null
+    → follow latest).
+    """
+    fake = FakeLibraryUpstream(
+        body={
+            "items": [
+                {"id": "sv_01", "skill_id": "sk_01", "version": "0.1.0"},
+                {"id": "sv_02", "skill_id": "sk_01", "version": "0.2.0"},
+            ],
+            "total": 2,
+        },
+    )
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.get(
+        "/api/bff/v1/library/skills/sk_01/versions",
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 2
+    assert body["items"][0]["version"] == "0.1.0"
+    assert body["items"][1]["version"] == "0.2.0"
+    assert any("sk_01/versions" in c[1] and c[0] == "GET" for c in fake.calls)
+
+
 def test_create_skill_version_requires_auth(client: TestClient) -> None:
     resp = client.post(
         "/api/bff/v1/library/skills/sk_01/versions",

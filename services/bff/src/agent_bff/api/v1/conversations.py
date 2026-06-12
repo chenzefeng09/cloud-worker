@@ -1,4 +1,4 @@
-"""Chat/SSE endpoint — send message + relay agent SSE events."""
+"""Chat endpoint (fire-and-forget trigger) + standalone SSE stream relay."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import logging
 
 import httpx
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from agent_bff.api._http import foundation_headers
 from agent_bff.api.dependencies import require_auth
@@ -64,90 +64,118 @@ async def chat(
     session_id: str,
     request: Request,
     _auth: tuple = Depends(require_auth()),
-) -> StreamingResponse:
-    """Send a user message, trigger run, relay SSE stream from orchestrator.
+) -> JSONResponse:
+    """Persist user message, trigger run, return run_id + message_id.
 
     Body fields:
-    * ``message``        — required, user text
-    * ``attachment_ids`` — optional list of attachment ids already uploaded to
-                           this session; they will be downloaded into the sandbox
+    * ``message``          — required, user text
+    * ``attachment_ids``   — optional list of attachment ids already uploaded to
+                             this session
+    * ``skills``           — optional list of skill names
+    * ``model``            — optional model name
+    * ``reasoning_effort`` — optional reasoning effort string
+
+    Returns JSON ``{"run_id": "...", "message_id": "...", "run": {...}}``.
+    On upstream failure returns a JSON error with the upstream status code.
     """
     tenant_id, user_id, access_token = _auth
     orch_url = request.app.state.settings.session_orchestrator_url
     body = await request.json()
     message_text = body.get("message", "")
     attachment_ids: list[str] = body.get("attachment_ids") or []
-    # Optional per-message skill selection (names); forwarded to the orchestrator
-    # which relays into task.json so the worker loads exactly these skills.
     skills: list[str] = body.get("skills") or []
-    # Optional per-message model + reasoning effort selection (forwarded to the
-    # orchestrator → scheduler → worker → gateway request).
     model: str | None = body.get("model") or None
     reasoning_effort: str | None = body.get("reasoning_effort") or None
 
+    async with httpx.AsyncClient(timeout=30) as client:
+        headers = foundation_headers(tenant_id, user_id, access_token)
+
+        # 1. Persist user message
+        resp = await client.post(
+            f"{orch_url}/sessions/{session_id}/messages",
+            json={"role": "USER", "content": message_text, "attachment_ids": attachment_ids},
+            headers=headers,
+        )
+        if resp.status_code >= 400:
+            return JSONResponse(
+                status_code=resp.status_code if resp.status_code < 600 else 502,
+                content={"detail": "Failed to save message", "status": resp.status_code},
+            )
+        msg = resp.json()
+        message_id = msg.get("id")
+
+        # 2. Resolve attachment files (failure-open)
+        files = await _resolve_attachment_files(
+            client=client,
+            orch_url=orch_url,
+            session_id=session_id,
+            attachment_ids=attachment_ids,
+            headers=headers,
+        )
+
+        # 3. Trigger run
+        resp = await client.post(
+            f"{orch_url}/sessions/{session_id}/runs",
+            json={
+                "task": message_text,
+                "files": files,
+                "skills": skills,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+            },
+            headers=headers,
+        )
+        if resp.status_code >= 400:
+            return JSONResponse(
+                status_code=resp.status_code if resp.status_code < 600 else 502,
+                content={"detail": "Failed to start run", "status": resp.status_code},
+            )
+        run = resp.json()
+        # run["id"] is the canonical field; fall back to run["run_id"] if present
+        run_id = run.get("id") or run.get("run_id")
+
+    return JSONResponse(
+        status_code=200,
+        content={"run_id": run_id, "message_id": message_id, "run": run},
+    )
+
+
+@router.get("/sessions/{session_id}/stream")
+async def stream(
+    session_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> StreamingResponse:
+    """Relay the session-scoped SSE stream from the orchestrator.
+
+    Connects to ``GET {orch}/sessions/{session_id}/stream`` and relays all
+    SSE lines verbatim: ``event:``, ``data:``, and blank-line frame separators.
+
+    Emits an ``event: error`` frame if the upstream connection fails.
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = request.app.state.settings.session_orchestrator_url
+
     async def event_generator():
-        async with httpx.AsyncClient(timeout=600) as client:
-            headers = foundation_headers(tenant_id, user_id, access_token)
-
-            # 1. Create user message in orchestrator (pass attachment_ids so the
-            #    orchestrator can embed attachment metadata on the message row).
-            resp = await client.post(
-                f"{orch_url}/sessions/{session_id}/messages",
-                json={"role": "USER", "content": message_text, "attachment_ids": attachment_ids},
-                headers=headers,
-            )
-            if resp.status_code >= 400:
-                payload = json.dumps(
-                    {"detail": "Failed to save message", "status": resp.status_code}
-                )
-                yield f"event: error\ndata: {payload}\n\n"
-                return
-
-            msg = resp.json()
-            yield f"event: message_created\ndata: {json.dumps(msg)}\n\n"
-
-            # 2. Resolve attachment files (failure-open)
-            files = await _resolve_attachment_files(
-                client=client,
-                orch_url=orch_url,
-                session_id=session_id,
-                attachment_ids=attachment_ids,
-                headers=headers,
-            )
-
-            # 3. Trigger run (pass files so worker downloads them)
-            resp = await client.post(
-                f"{orch_url}/sessions/{session_id}/runs",
-                json={
-                    "task": message_text,
-                    "files": files,
-                    "skills": skills,
-                    "model": model,
-                    "reasoning_effort": reasoning_effort,
-                },
-                headers=headers,
-            )
-            if resp.status_code >= 400:
-                payload = json.dumps(
-                    {"detail": "Failed to start run", "status": resp.status_code}
-                )
-                yield f"event: error\ndata: {payload}\n\n"
-                return
-
-            run = resp.json()
-            yield f"event: run_started\ndata: {json.dumps(run)}\n\n"
-
-            # 4. Relay orchestrator SSE messages verbatim.
-            async with client.stream(
-                "GET",
-                f"{orch_url}/sessions/{session_id}/messages/stream",
-                headers=headers,
-            ) as stream:
-                async for line in stream.aiter_lines():
+        headers = foundation_headers(tenant_id, user_id, access_token)
+        try:
+            async with (
+                httpx.AsyncClient(timeout=600) as client,
+                client.stream(
+                    "GET",
+                    f"{orch_url}/sessions/{session_id}/stream",
+                    headers=headers,
+                ) as upstream,
+            ):
+                async for line in upstream.aiter_lines():
                     if line.startswith("event:") or line.startswith("data:"):
                         yield f"{line}\n"
                     elif line == "":
                         yield "\n"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("stream relay error for session %s: %s", session_id, exc)
+            payload = json.dumps({"detail": "Stream connection failed", "error": str(exc)})
+            yield f"event: error\ndata: {payload}\n\n"
 
     return StreamingResponse(
         event_generator(),

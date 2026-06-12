@@ -869,3 +869,268 @@ async def stream_messages(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get(
+    "/sessions/{session_id}/stream",
+    dependencies=[Depends(require_permission("session.message.read", "session"))],
+)
+async def stream_session(
+    session_id: str,
+    request: Request,
+    tenant_id: str = TTenantId,
+) -> StreamingResponse:
+    """Session-scoped multiplexing SSE stream (Phase 1.2).
+
+    Unlike ``stream_messages`` which binds to one run and ends when that run
+    completes, this endpoint holds the HTTP connection open for the lifetime of
+    the session view and surfaces events from *whatever* run is currently active
+    — including runs that start later (resumed runs, scheduled runs).
+
+    Event-name contract
+    -------------------
+    Emitted now:
+      ``run_started``   — a new run has become active on this session.
+      ``token``         — incremental assistant text delta (from Redis stream).
+      ``tool``          — tool call / result (from Redis stream).
+      ``thinking``      — reasoning text (from Redis stream).
+      ``plan``          — structured plan steps update.
+      ``message``       — newly persisted message row.
+      ``run_complete``  — active run reached a terminal state.
+      ``done``          — stream deadline exhausted; client should close.
+      ``error``         — unexpected server error; detail is opaque.
+
+    Phase 2 additions (not yet implemented — reserved):
+      ``pending_confirmation`` / ``pending_question`` — run paused waiting for
+        human input; would be emitted when the Redis stream surfaces the
+        corresponding entry type from the worker.
+      ``run_paused`` / ``run_resumed`` — lifecycle signals around confirmation.
+
+    Behaviour
+    ---------
+    * Outer loop is bounded by ``_MAX_POLLS × _POLL_INTERVAL_SECONDS`` (same
+      5-minute wall-clock as ``stream_messages``).
+    * Each iteration: look for an active (RUNNING/PENDING) run not yet streamed
+      in this connection.  If found: emit ``run_started``, drive
+      ``_stream_tokens`` to exhaustion, reconcile the run to persist its
+      terminal state + assistant message, emit ``run_complete``.
+    * Newly persisted messages and plan updates are emitted every poll, same
+      as the existing endpoint.
+    * If no active run is found, sleep and loop again — the connection stays
+      open waiting for a future run.
+    * Buffer-then-yield rule: all events collected inside the
+      ``async for db in acquire_db_session(...)`` block are buffered in a
+      local list and yielded only *after* the block closes so that a client
+      disconnect (GeneratorExit / CancelledError) cannot roll back a
+      just-committed assistant message row.
+    """
+    scheduler_url: str = request.app.state.settings.agent_scheduler_url
+    knowledge_ingest_url: str = request.app.state.settings.knowledge_ingest_url
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        redis_url: str | None = request.app.state.settings.redis_url
+        deadline = asyncio.get_event_loop().time() + (
+            _MAX_POLLS * _POLL_INTERVAL_SECONDS
+        )
+        # Track run ids already streamed in this connection so we never
+        # re-stream the same run (e.g. if a reconcile poll sees it as still
+        # RUNNING before the final terminal write completes).
+        streamed_run_ids: set[str] = set()
+        last_seq = 0
+
+        try:
+            for _ in range(_MAX_POLLS):
+                if asyncio.get_event_loop().time() >= deadline:
+                    break
+
+                events: list[str] = []
+                active_run_to_stream: Run | None = None
+                session_user_id: str = "SYSTEM"
+                latest_plan_steps: list[Any] = []
+                latest_plan_run_id: str = ""
+
+                # ── DB poll ──────────────────────────────────────────────────
+                # Collect all events into ``events``; yield ONLY after the
+                # block exits so GeneratorExit cannot roll back committed rows.
+                async for db in acquire_db_session(tenant_id=tenant_id):
+                    svc = SessionService(db, tenant_id=tenant_id)
+                    runs = await svc.list_runs(session_id)
+
+                    # Identify the current active run (if any).
+                    active = next(
+                        (r for r in runs if r.status in ("RUNNING", "PENDING")),
+                        None,
+                    )
+
+                    if active is not None and active.id not in streamed_run_ids:
+                        # New active run we haven't streamed yet — snapshot the
+                        # session user_id now (inside the DB session) for use in
+                        # the scheduler reconcile call below.
+                        session_obj = await svc.get_session(session_id)
+                        session_user_id = session_obj.user_id
+                        active_run_to_stream = active
+                        # Emit run_started envelope before leaving the DB block
+                        # so the client knows which run is about to stream.
+                        events.append(
+                            _sse("run_started", {"run_id": active.id})
+                        )
+                        streamed_run_ids.add(active.id)
+
+                    # Reconcile any RUNNING/PENDING runs (even the one we're
+                    # about to stream — reconcile is idempotent and brings the
+                    # plan panel up to date).
+                    running_runs = [
+                        r for r in runs if r.status in ("RUNNING", "PENDING")
+                    ]
+                    if running_runs and session_user_id == "SYSTEM":
+                        # We didn't fetch session_obj above (no new active run);
+                        # fetch it now for reconcile.
+                        session_obj = await svc.get_session(session_id)
+                        session_user_id = session_obj.user_id
+
+                    for r in running_runs:
+                        _terminal, _plan = await _reconcile_run_completion(
+                            scheduler_url=scheduler_url,
+                            tenant_id=tenant_id,
+                            user_id=session_user_id,
+                            run=r,
+                            svc=svc,
+                            knowledge_ingest_url=knowledge_ingest_url,
+                            redis_url=redis_url,
+                        )
+                        if _plan:
+                            latest_plan_steps = _plan
+                            latest_plan_run_id = r.id
+
+                    if latest_plan_steps:
+                        events.append(
+                            _sse(
+                                "plan",
+                                {
+                                    "run_id": latest_plan_run_id,
+                                    "plan_steps": latest_plan_steps,
+                                },
+                            )
+                        )
+
+                    # Emit newly persisted messages since last_seq.
+                    items, _ = await svc.list_messages(
+                        session_id,
+                        cursor=str(last_seq) if last_seq else None,
+                        limit=50,
+                    )
+                    for msg in items:
+                        msg_json = MessageOut.model_validate(msg).model_dump_json()
+                        events.append(f"event: message\ndata: {msg_json}\n\n")
+                        last_seq = msg.sequence
+
+                # ── DB block closed / committed ──────────────────────────────
+                for ev in events:
+                    yield ev
+
+                # ── Token stream for a newly discovered active run ───────────
+                # Driven OUTSIDE the DB session so that streaming (which can
+                # last many seconds) does not hold an open DB connection.
+                if active_run_to_stream is not None:
+                    if redis_url:
+                        async for ev in _stream_tokens(
+                            redis_url=redis_url,
+                            run_id=active_run_to_stream.id,
+                            deadline=deadline,
+                            wait_for_worker=True,
+                        ):
+                            yield ev
+
+                    # After _stream_tokens returns (end marker or stall),
+                    # reconcile the run one final time to persist its terminal
+                    # state + assistant message, then emit run_complete.
+                    post_stream_events: list[str] = []
+                    async for db in acquire_db_session(tenant_id=tenant_id):
+                        svc = SessionService(db, tenant_id=tenant_id)
+                        runs = await svc.list_runs(session_id)
+                        run_obj = next(
+                            (r for r in runs if r.id == active_run_to_stream.id),
+                            None,
+                        )
+                        if run_obj is not None:
+                            _terminal, _plan = await _reconcile_run_completion(
+                                scheduler_url=scheduler_url,
+                                tenant_id=tenant_id,
+                                user_id=session_user_id,
+                                run=run_obj,
+                                svc=svc,
+                                knowledge_ingest_url=knowledge_ingest_url,
+                                redis_url=redis_url,
+                            )
+                            if _plan:
+                                post_stream_events.append(
+                                    _sse(
+                                        "plan",
+                                        {
+                                            "run_id": run_obj.id,
+                                            "plan_steps": _plan,
+                                        },
+                                    )
+                                )
+                            # Emit newly persisted messages produced by reconcile.
+                            new_items, _ = await svc.list_messages(
+                                session_id,
+                                cursor=str(last_seq) if last_seq else None,
+                                limit=50,
+                            )
+                            for msg in new_items:
+                                msg_json = (
+                                    MessageOut.model_validate(msg).model_dump_json()
+                                )
+                                post_stream_events.append(
+                                    f"event: message\ndata: {msg_json}\n\n"
+                                )
+                                last_seq = msg.sequence
+
+                            post_stream_events.append(
+                                _sse(
+                                    "run_complete",
+                                    {
+                                        "run_id": run_obj.id,
+                                        "status": run_obj.status,
+                                        "result_summary": run_obj.result_summary,
+                                    },
+                                )
+                            )
+
+                    # DB session closed; safe to yield.
+                    for ev in post_stream_events:
+                        yield ev
+
+                    # Continue the outer loop — do NOT end the stream; a future
+                    # run may start on this session (e.g. the user sends another
+                    # message).
+                    await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+                    continue
+
+                # No active run this poll — sleep and keep the connection alive.
+                await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+
+            yield _sse("done", {})
+
+        except asyncio.CancelledError:
+            # Client disconnected; re-raise to let the framework clean up.
+            raise
+        except Exception:
+            logger.exception(
+                "session SSE stream terminated unexpectedly",
+                extra={"session_id": session_id, "tenant_id": tenant_id},
+            )
+            yield (
+                f"event: error\ndata: "
+                f"{json.dumps({'detail': 'event stream terminated; see request id'})}\n\n"
+            )
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )

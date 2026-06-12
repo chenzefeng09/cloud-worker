@@ -43,6 +43,11 @@ from skill_store.errors import SkillPackageInvalidError
 MAX_MEMBERS = 2000           # max number of entries in the archive
 MAX_MEMBER_SIZE = 5 * 1024 * 1024      # 5 MiB — largest single decompressed member
 MAX_TOTAL_SIZE = 50 * 1024 * 1024      # 50 MiB — largest total decompressed size
+# Frontmatter description goes into every sandbox's system prompt verbatim as a
+# one-line skill index entry.  Bound it so a single user can't blow up the
+# context budget for everyone — Claude skill convention is "one sentence",
+# 200 chars (~150 tokens of Chinese) is generous.
+MAX_DESCRIPTION_LEN = 200
 
 # Name of the required metadata file (Claude skill convention).
 SKILL_MD_FILENAME = "SKILL.md"
@@ -240,5 +245,10 @@ def _parse_frontmatter(text: str) -> tuple[str, str]:
         raise SkillPackageInvalidError(
             "SKILL.md frontmatter 缺少 description",
         )
+    description_clean = description.strip()
+    if len(description_clean) > MAX_DESCRIPTION_LEN:
+        raise SkillPackageInvalidError(
+            f"SKILL.md frontmatter description 过长，最多 {MAX_DESCRIPTION_LEN} 字符（当前 {len(description_clean)}）",
+        )
 
-    return name.strip(), description.strip()
+    return name.strip(), description_clean

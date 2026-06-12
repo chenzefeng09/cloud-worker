@@ -131,6 +131,27 @@ web-dev: ## Start React dev server locally
 web-install: ## Install frontend dependencies
 	cd apps/web && npm install
 
+# ---- Sandbox images ----
+#
+# The Claude SDK worker image bundles the COMPILED worker, so the build is a
+# two-step process: (1) compile TypeScript -> dist/ with npm, then (2) docker
+# build copies dist/ + a production-only node_modules into the image.  Build
+# context is the repo root because the Dockerfile COPYs from worker-claude-sdk/.
+CLAUDE_SDK_IMAGE ?= ghcr.io/agent-platform/claude-sdk-sandbox:0.1
+
+.PHONY: build-claude-sdk-image
+build-claude-sdk-image: ## Build claude-sdk-sandbox image (compiles worker first)
+	cd worker-claude-sdk && npm ci && npm run build && cd - > /dev/null
+	docker build \
+	  -f sandbox-images/claude-sdk.Dockerfile \
+	  -t $(CLAUDE_SDK_IMAGE) \
+	  .
+	@echo "$(GREEN)Built $(CLAUDE_SDK_IMAGE)$(RESET)"
+
+.PHONY: push-claude-sdk-image
+push-claude-sdk-image: ## Push claude-sdk-sandbox image to ghcr.io
+	docker push $(CLAUDE_SDK_IMAGE)
+
 # ---- Conformance ----
 .PHONY: conformance
 conformance: ## Run conformance tests against running stack

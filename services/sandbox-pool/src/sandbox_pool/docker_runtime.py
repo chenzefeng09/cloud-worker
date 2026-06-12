@@ -90,8 +90,15 @@ class PoolDockerRuntime:
 
     # ------------------------------------------------------------------ spawn
 
-    def start_idle_container(self, template: str) -> str:
+    def start_idle_container(
+        self, template: str, *, memory_limit: str | None = None,
+    ) -> str:
         """Start a warm idle sandbox container and return its 12-char short id.
+
+        ``memory_limit`` (docker-style, e.g. ``"1g"`` / ``"4g"``) sizes the
+        warm container for its memory tier.  Under microVM runtimes warm RAM is
+        pre-allocated, so each tier must warm at its own size; when omitted we
+        fall back to the legacy single-bucket ``sandbox_memory_limit``.
 
         The container runs ``sleep infinity`` so it parks the warm image
         without consuming CPU.  The pool hands the *short id* out as
@@ -108,7 +115,7 @@ class PoolDockerRuntime:
                 image=self._settings.sandbox_image,
                 command=["sleep", "infinity"],
                 network=self._settings.docker_network,
-                mem_limit=self._settings.sandbox_memory_limit,
+                mem_limit=memory_limit or self._settings.sandbox_memory_limit,
                 cpu_shares=self._settings.sandbox_cpu_shares,
                 detach=True,
                 remove=False,

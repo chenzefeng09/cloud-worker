@@ -11,14 +11,17 @@ service can still operate behind a gateway that doesn't unwrap the JWT.
 
 from __future__ import annotations
 
+import logging
+
 import httpx
-from fastapi import APIRouter, Depends, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, Query, Request, Response, UploadFile
 from fastapi.responses import JSONResponse
 
 from agent_bff.api._http import foundation_headers
 from agent_bff.api.dependencies import require_auth
 
 router = APIRouter(tags=["Sessions"])
+logger = logging.getLogger(__name__)
 
 
 async def _orchestrator_url(request: Request) -> str:
@@ -236,6 +239,78 @@ async def list_messages(
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
         return _proxy_json(resp)
+
+
+# --------------------------------------------------------------------------- #
+# Attachment large-check (pre-upload gate)
+# --------------------------------------------------------------------------- #
+
+
+@router.get("/attachments/large-check")
+async def attachment_large_check(
+    request: Request,
+    size_bytes: int = Query(..., ge=0),
+    _auth: tuple = Depends(require_auth()),
+) -> JSONResponse:
+    """Pre-upload gate: can the current user upload an attachment of this size?
+
+    Large attachments (>= ``large_attachment_threshold_bytes``) trigger the
+    large-memory (4g) sandbox tier and require the lifecycle ``large-attachment``
+    entitlement.  The frontend calls this at file-selection time, BEFORE the
+    upload network call, so it can show a friendly "exceeds your quota" message
+    instead of letting the upload through and failing later.
+
+    Response shape::
+
+        {"allowed": bool, "is_large": bool, "reason": str | None}
+
+    * Small files (below threshold) are ALWAYS allowed without consulting
+      lifecycle — they never hit the large-memory tier.
+    * Large files consult lifecycle ``/large-attachment/resolve``.  ``reason``
+      is ``"large_attachment_not_permitted"`` when a large file is denied.
+
+    FAIL-OPEN: if the lifecycle call fails (unreachable / 5xx), we ALLOW and log
+    a warning.  Rationale: this is only a UX pre-check — the server-side upload
+    path and run creation (scheduler) are the real enforcement of the memory
+    tier — so a flaky dependency must not block users from uploading.
+    """
+    settings = request.app.state.settings
+    threshold = settings.large_attachment_threshold_bytes
+    is_large = size_bytes >= threshold
+
+    if not is_large:
+        return JSONResponse(
+            content={"allowed": True, "is_large": False, "reason": None},
+            status_code=200,
+        )
+
+    tenant_id, user_id, access_token = _auth
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{settings.foundation_lifecycle_url}/large-attachment/resolve",
+                params={"user_id": user_id},
+                headers=foundation_headers(tenant_id, user_id, access_token),
+            )
+        resp.raise_for_status()
+        allowed = bool(resp.json().get("allowed", False))
+    except Exception as exc:  # noqa: BLE001 — fail-open on any lifecycle failure
+        logger.warning(
+            "large-attachment resolve failed; failing open (allow): %s", exc
+        )
+        return JSONResponse(
+            content={"allowed": True, "is_large": True, "reason": None},
+            status_code=200,
+        )
+
+    return JSONResponse(
+        content={
+            "allowed": allowed,
+            "is_large": True,
+            "reason": None if allowed else "large_attachment_not_permitted",
+        },
+        status_code=200,
+    )
 
 
 # --------------------------------------------------------------------------- #

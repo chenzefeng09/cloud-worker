@@ -36,6 +36,23 @@ class SkillOut(BaseModel):
 
 class SkillInstallRequest(BaseModel):
     enabled_by_default: bool = True
+    # Optional explicit version to pin (must match an existing SkillVersion.version
+    # of this skill).  ``None`` = follow latest at resolve time.
+    version: str | None = Field(default=None, max_length=40)
+
+
+class ResolvedSkillOut(BaseModel):
+    """One entry in the scheduler ``/internal/skills/resolve`` response.
+
+    ``blob_url`` is a short-lived presigned HTTP URL; the scheduler downloads
+    by ``sha256`` (content-addressed cache key) and just uses the URL to fetch
+    the bytes once per (skill, version).
+    """
+
+    name: str
+    version: str
+    sha256: str
+    blob_url: str
 
 
 class InstalledSkillOut(BaseModel):

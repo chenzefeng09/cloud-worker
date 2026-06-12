@@ -1,0 +1,50 @@
+# Root .dockerignore — applies when the build context is the agent-platform
+# repo root (currently: sandbox-images/claude-sdk.Dockerfile).
+#
+# Goal: keep the context small so `docker build .` is fast, WITHOUT excluding
+# the files the Claude SDK image needs:
+#   * worker-claude-sdk/package.json + package-lock.json  (npm ci)
+#   * worker-claude-sdk/dist/                             (compiled worker)
+#
+# IMPORTANT: do NOT add a bare `dist/` rule here — that would drop
+# worker-claude-sdk/dist and break the COPY in claude-sdk.Dockerfile.  We only
+# exclude node_modules (npm ci rebuilds a clean production tree inside the
+# image) and unrelated heavy trees.
+
+# Version control / tooling caches
+.git/
+.github/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+**/__pycache__/
+**/*.py[cod]
+.playwright-mcp/
+
+# Node build inputs we don't want shipped into the context.
+# node_modules is reinstalled in-image via `npm ci --omit=dev`.
+**/node_modules/
+
+# Unrelated subtrees — none of these are COPYed by claude-sdk.Dockerfile.
+# (sandbox-images/ itself is NOT excluded so the Dockerfile + README stay
+# available; agentscope-ext/ is used by base.Dockerfile via --build-context,
+# not the primary context, so excluding it here is safe.)
+apps/
+services/
+libs/
+contracts/
+docs/
+spikes/
+tests/
+deploy/
+agentscope-ext/
+sandbox-images/wheels/
+
+# Env / secrets / local artefacts
+*.env
+!*.env.example
+*.log
+.DS_Store
+.venv/
+coverage/
+htmlcov/

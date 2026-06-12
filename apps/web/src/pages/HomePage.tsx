@@ -19,6 +19,7 @@ import {
   DEFAULT_EFFORT,
 } from '../lib/modelOptions';
 import { useDefaultModel } from '../hooks/useDefaultModel';
+import { useCanUploadAttachment } from '../hooks/useCanUploadAttachment';
 
 const PLACEHOLDERS = [
   '帮我安排明天的团队站会…',
@@ -45,6 +46,7 @@ export function HomePage() {
   const [submitting, setSubmitting] = useState(false);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
+  const { checkFile } = useCanUploadAttachment();
   const { modelId: defaultModelId, isLoading: defaultModelLoading } = useDefaultModel('llm');
   const [model, setModelRaw] = useState<string>(SYSTEM_FALLBACK_MODEL);
   const [effort, setEffort] = useState<string>(DEFAULT_EFFORT);
@@ -98,6 +100,13 @@ export function HomePage() {
         return;
       }
       for (const file of files) {
+        // Pre-upload gate: large attachments require the large-attachment
+        // entitlement; check before the upload network call.
+        const gate = await checkFile(file);
+        if (!gate.allowed) {
+          setSubmitError('该文件较大，需要管理员授予大附件权限后才能上传，请联系管理员。');
+          return;
+        }
         const att = await api.attachments.upload(session.id, file);
         setAttachments((prev) => [...prev, att]);
       }

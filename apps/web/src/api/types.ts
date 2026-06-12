@@ -600,6 +600,28 @@ export interface PoolTemplateInfo {
 export interface PoolSnapshot {
   total: number;
   by_template: Record<string, PoolTemplateInfo>;
+  // Tiered warm-pool breakdown keyed by memory tier (e.g. "small", "large").
+  // Each tier reports idle/total bucket counts independently.
+  by_memory_tier?: Record<string, PoolTemplateInfo>;
+}
+
+// ─── Large-attachment entitlement (→ foundation lifecycle) ───────────────────
+
+export interface LargeAttachmentTenantSetting {
+  id?: string | null;
+  tenant_id?: string;
+  large_attachment_enabled: boolean;
+  updated_at?: string | null;
+  updated_by?: string | null;
+}
+
+export interface LargeAttachmentUserAllow {
+  id?: string | null;
+  tenant_id?: string;
+  user_id: string;
+  allowed: boolean;
+  updated_at?: string | null;
+  updated_by?: string | null;
 }
 
 export interface SandboxItem {

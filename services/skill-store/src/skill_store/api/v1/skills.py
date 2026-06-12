@@ -19,6 +19,7 @@ from skill_store.blob.base import BlobStore, make_key
 from skill_store.schemas.common import ListPage
 from skill_store.schemas.skill import (
     InstalledSkillOut,
+    ResolvedSkillOut,
     SkillCreate,
     SkillInstallRequest,
     SkillOut,
@@ -83,7 +84,10 @@ async def install_skill(
     """Install a tenant skill into the calling user's toolbox (idempotent)."""
     svc = SkillService(db, blob=_no_blob(), tenant_id=tenant_id, user_id=user_id)
     enabled = body.enabled_by_default if body is not None else True
-    install = await svc.install_skill(skill_id, enabled_by_default=enabled)
+    pinned = body.version if body is not None else None
+    install = await svc.install_skill(
+        skill_id, enabled_by_default=enabled, version=pinned,
+    )
     skill = await svc.get_skill(skill_id)
     return InstalledSkillOut.model_validate(
         {
@@ -289,6 +293,47 @@ async def internal_list(
             version_dicts.append(vd)
         entry["versions"] = version_dicts
         items.append(entry)
+    return ListPage(items=items, total=len(items))
+
+
+@router.get(
+    "/internal/skills/resolve",
+    response_model=ListPage,
+    dependencies=[TInternalAuth],
+)
+async def internal_resolve(
+    tenant_id: str,
+    user_id: str,
+    request: Request,
+    names: str | None = None,
+    db: AsyncSession = Depends(internal_db_session),
+    blob: BlobStore = TBlobStore,
+) -> ListPage:
+    """Resolve (user, skill name) → concrete (version, sha256, presigned URL).
+
+    The scheduler calls this once per run to learn which skill blobs to
+    materialise into its content-addressed host cache before mounting them
+    into the sandbox.  The response is a ``ListPage`` of ``ResolvedSkillOut``
+    so it shares the wire shape with other ``/internal/*`` listings.
+
+    Skills the user hasn't installed are silently absent from the result —
+    callers know what they asked for.  Empty ``names`` → empty list.
+    """
+    name_list = [n.strip() for n in names.split(",") if n.strip()] if names else []
+    if not name_list:
+        return ListPage(items=[], total=0)
+
+    svc = SkillService(db, blob=blob, tenant_id=tenant_id, user_id=user_id)
+    settings = request.app.state.settings
+    resolved = await svc.resolve_for_runtime(
+        tenant_id, user_id, name_list, ttl_seconds=settings.presign_ttl_seconds,
+    )
+    items = [
+        ResolvedSkillOut(
+            name=r.name, version=r.version, sha256=r.sha256, blob_url=r.blob_url,
+        ).model_dump(mode="json")
+        for r in resolved
+    ]
     return ListPage(items=items, total=len(items))
 
 

@@ -41,7 +41,9 @@ from docker.types import Mount
 
 from agent_scheduler.config import SANDBOX_SERVICE_SCOPES, Settings
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
+from agent_scheduler.services.feature_flag import evaluate_flag
 from agent_scheduler.services.runtime import RUNTIME_REGISTRY
+from agent_scheduler.services.skill_cache import MountedSkill, SkillCache
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +93,18 @@ class DockerRuntime:
         except Exception:  # pragma: no cover — environment misconfiguration
             logger.exception("docker client unavailable; runtime will refuse spawn")
             self._client = None
+        # Lazy: built on first spawn so test fixtures that bypass __init__
+        # (see tests/conftest.py) don't try to construct an httpx.Client.
+        self._skill_cache: SkillCache | None = None
+
+    def _get_skill_cache(self) -> SkillCache:
+        if self._skill_cache is None:
+            self._skill_cache = SkillCache(
+                cache_base=self._settings.skills_cache_base,
+                skill_store_url=self._settings.skill_store_url,
+                service_scopes=self._settings.skill_store_service_scopes,
+            )
+        return self._skill_cache
 
     @property
     def client(self) -> docker.DockerClient:
@@ -114,6 +128,7 @@ class DockerRuntime:
         skills: list[str] | None = None,
         files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
+        memory_limit: str | None = None,
         history: list[dict[str, Any]] | None = None,
         llm_gateway_url: str | None = None,
         llm_virtual_key: str | None = None,
@@ -255,22 +270,85 @@ class DockerRuntime:
         if llm_virtual_key:
             env_vars["LLM_VIRTUAL_KEY"] = llm_virtual_key
 
+        # Stage-2 block B: materialise the run's skills into the
+        # content-addressed host cache and prepare read-only bind mounts
+        # at /home/skills/<name>.  Failure-open: any cache error is
+        # logged and yields an empty mount list — the sandbox simply
+        # sees no skills, never failing the spawn over a missing one.
+        mounted_skills: list[MountedSkill] = []
+        try:
+            mounted_skills = self._get_skill_cache().materialize(
+                list(skills or []),
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- failure-open
+            logger.warning(
+                "skill cache materialise raised; continuing without mounts",
+                extra={"run_id": run_id, "err": str(exc)},
+            )
+
+        mounts = [
+            Mount(
+                target="/workspace",
+                source=str(workspace_dir),
+                type="bind",
+            ),
+        ]
+        for ms in mounted_skills:
+            mounts.append(
+                Mount(
+                    target=f"/home/skills/{ms.name}",
+                    source=ms.host_path,
+                    type="bind",
+                    read_only=True,
+                )
+            )
+
+        # Phase 5: pick the worker image per-run via feature flag.  Failure-open
+        # (handled inside ``evaluate_flag``) means a down/slow flag service
+        # falls back to the AgentScope image, so the agentscope path here is
+        # byte-for-byte unchanged from before this feature landed.
+        use_claude_sdk = evaluate_flag(
+            "enable_claude_sdk_worker",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            flag_url=self._settings.feature_flag_url,
+            timeout_ms=self._settings.feature_flag_timeout_ms,
+        )
+        selected_image = (
+            self._settings.claude_sdk_image
+            if use_claude_sdk
+            else self._settings.agent_image
+        )
+        # ``command=None`` lets docker use the image ENTRYPOINT (the Claude SDK
+        # image's node entry).  AgentScope keeps its explicit argv unchanged.
+        selected_cmd = (
+            None
+            if use_claude_sdk
+            else ["python", "-m", "agentscope_ext.runtime_worker"]
+        )
+        logger.info(
+            "worker image selected",
+            extra={
+                "run_id": run_id,
+                "tenant_id": tenant_id,
+                "image": selected_image,
+                "claude_sdk": use_claude_sdk,
+            },
+        )
+
         try:
             container = self.client.containers.run(
-                image=self._settings.agent_image,
+                image=selected_image,
                 # AgentScope worker entrypoint — see agentscope-ext/README.md.
                 # Argv-only invocation; the task itself lives in workspace/task.json.
-                command=["python", "-m", "agentscope_ext.runtime_worker"],
+                # Claude SDK path uses command=None to run the image ENTRYPOINT.
+                command=selected_cmd,
                 environment=env_vars,
-                mounts=[
-                    Mount(
-                        target="/workspace",
-                        source=str(workspace_dir),
-                        type="bind",
-                    ),
-                ],
+                mounts=mounts,
                 network=self._settings.docker_network,
-                mem_limit=self._settings.sandbox_memory_limit,
+                mem_limit=memory_limit or self._settings.sandbox_memory_limit,
                 cpu_shares=self._settings.sandbox_cpu_shares,
                 detach=True,
                 labels={
@@ -282,7 +360,7 @@ class DockerRuntime:
             )
         except docker.errors.ImageNotFound as exc:
             raise SandboxSpawnError(
-                f"Sandbox image not found: {self._settings.agent_image}. "
+                f"Sandbox image not found: {selected_image}. "
                 f"Build it from sandbox-images/base.Dockerfile or pull from the registry."
             ) from exc
         except docker.errors.APIError as exc:

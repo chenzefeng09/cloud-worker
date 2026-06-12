@@ -1,0 +1,12 @@
+{
+  // Build-only config: compiles ONLY src/ with rootDir=src so emitted output is
+  // flat under dist/ (dist/main.js, not dist/src/main.js). Tests are excluded
+  // from the production build — vitest type-checks them via the base tsconfig.
+  // This keeps the image ENTRYPOINT `node /app/dist/main.js` correct.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src"
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist", "tests"]
+}

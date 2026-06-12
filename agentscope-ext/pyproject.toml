@@ -17,6 +17,7 @@ dependencies = [
     "agentscope>=2.0,<3.0",
     "httpx>=0.27",
     "pydantic>=2.7",
+    "pyyaml>=6.0.2,<7",
 ]
 
 [project.optional-dependencies]

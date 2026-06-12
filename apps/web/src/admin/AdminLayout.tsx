@@ -22,6 +22,8 @@ import { DlpPage } from './pages/DlpPage';
 import { CompliancePage } from './pages/CompliancePage';
 import { SecurityOpsPage } from './pages/SecurityOpsPage';
 import { LifecyclePage } from './pages/LifecyclePage';
+import { LargeAttachmentPage } from './pages/LargeAttachmentPage';
+import { PoolMonitorPage } from './pages/PoolMonitorPage';
 import { DataProtectionPage } from './pages/DataProtectionPage';
 import { SsoPage } from './pages/SsoPage';
 import { DialogProvider } from './components/dialogs';
@@ -76,6 +78,8 @@ const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
       { to: '/admin/mcp', label: 'MCP 服务器', glyph: '⊟' },
       { to: '/admin/knowledge', label: '知识库', glyph: '❖' },
       { to: '/admin/ops', label: '运行与沙箱', glyph: '◳' },
+      { to: '/admin/pool-monitor', label: '温池监控', glyph: '▦' },
+      { to: '/admin/large-attachment', label: '大附件能力', glyph: '⊠' },
       { to: '/admin/api-platform', label: 'API 平台', glyph: '⌘' },
     ],
   },
@@ -191,6 +195,8 @@ export function AdminLayout() {
             <Route path="mcp" element={<McpServersPage />} />
             <Route path="knowledge" element={<KnowledgeAdminPage />} />
             <Route path="ops" element={<OpsDashboardPage />} />
+            <Route path="pool-monitor" element={<PoolMonitorPage />} />
+            <Route path="large-attachment" element={<LargeAttachmentPage />} />
             <Route path="pam" element={<PamPage />} />
             <Route path="sso" element={<SsoPage />} />
             <Route path="api-platform" element={<ApiPlatformPage />} />

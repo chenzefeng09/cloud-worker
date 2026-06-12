@@ -67,6 +67,18 @@ class Settings(BaseSettings):
 
     session_orchestrator_url: str = "http://localhost:8006/api/session/v1"
 
+    # Large-attachment gating threshold (bytes).  A selected attachment at or
+    # above this size triggers the large-memory (4g) sandbox tier and is gated
+    # by the lifecycle ``large-attachment`` entitlement.  The frontend pre-check
+    # (GET /attachments/large-check) uses this to decide whether to consult the
+    # entitlement before uploading.
+    #
+    # KNOWN COUPLING: this default (50 MiB) is duplicated from the scheduler's
+    # ``sandbox_large_attachment_threshold_bytes`` (agent-scheduler config).
+    # Both must stay in sync; the scheduler remains the authoritative enforcer
+    # of the memory tier — this value only drives the UX pre-check.
+    large_attachment_threshold_bytes: int = 50 * 1024 * 1024
+
     # Library services
     mcp_registry_url: str = "http://localhost:8010/api/mcp/v1"
     skill_store_url: str = "http://localhost:8011/api/skills/v1"

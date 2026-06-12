@@ -113,6 +113,16 @@ class Settings(BaseSettings):
     # runtime invokes ``python -m agentscope_ext.runtime_worker`` as
     # the container/VM entrypoint.
     agent_image: str = "ghcr.io/agent-platform/agentscope-sandbox:0.1"
+    # Phase 5: alternate worker image for the new Claude SDK backend.  The
+    # runtime selects between ``agent_image`` (AgentScope, default) and this
+    # image per-run based on the ``enable_claude_sdk_worker`` feature flag,
+    # enabling grey-release / instant rollback without a redeploy.  The Claude
+    # SDK image runs via its own ENTRYPOINT (node), not the AgentScope CMD.
+    claude_sdk_image: str = "ghcr.io/agent-platform/claude-sdk-sandbox:0.1"
+    # Timeout (ms) for the synchronous feature-flag evaluate call on the spawn
+    # path.  Kept tight: the call is failure-open, so a slow flag service must
+    # not stall run scheduling.
+    feature_flag_timeout_ms: int = 200
     llm_api_key: str = ""
     llm_model: str = "claude-sonnet-4-20250514"
     # Optional LLM provider override for the in-sandbox worker.
@@ -128,7 +138,30 @@ class Settings(BaseSettings):
     workspace_base: str = "/var/agent-platform/workspaces"
     docker_network: str = "saas-foundation-dev_foundation"
 
+    # Stage-2 block B: content-addressed cache for materialised skill blobs.
+    # The scheduler resolves a run's skill names via skill-store, downloads
+    # each blob into ``{skills_cache_base}/{sha256}/`` once, and then bind-mounts
+    # that path read-only into the sandbox at ``/home/skills/<name>``.
+    #
+    # The path must be identical inside the scheduler container and on the
+    # docker daemon's host filesystem (sandboxes mount by absolute host path);
+    # compose enforces this by binding the dir with the same source and target.
+    skills_cache_base: str = "/var/agent-platform/skills_cache"
+    # Comma-separated X-Service-Scopes value the scheduler sends to skill-store
+    # when calling /internal/skills/resolve.  Only ``skill.read_internal`` is
+    # required for resolve; keep this as a separate knob so an operator can add
+    # scopes (e.g. read-only debugging) without rebuilding.
+    skill_store_service_scopes: str = "skill.read_internal"
+
     sandbox_memory_limit: str = "2g"
+    # Per-run sandbox memory tiers.  A run's sandbox memory limit is auto-chosen
+    # from the total size of that run's attachments: ``small`` by default,
+    # ``large`` once the summed attachment bytes meet/exceed the threshold.
+    # The orchestrator reports ``total_attachment_bytes`` per run; the scheduler
+    # owns the policy (threshold + concrete g-values) so it lives in one place.
+    sandbox_memory_limit_small: str = "1g"
+    sandbox_memory_limit_large: str = "4g"
+    sandbox_large_attachment_threshold_bytes: int = 50 * 1024 * 1024  # 50 MiB
     sandbox_cpu_shares: int = 1024
     sandbox_timeout: int = 600  # seconds; also caps minted token TTL
 

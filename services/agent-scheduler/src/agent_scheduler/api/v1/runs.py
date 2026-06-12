@@ -354,6 +354,11 @@ async def create_run(
         sampling_params_raw if isinstance(sampling_params_raw, dict) else {}
     )
 
+    # Per-run sandbox memory tier.  The orchestrator reports this run's total
+    # attachment bytes; the scheduler owns the policy and maps it to a concrete
+    # memory limit (small tier by default, large tier at/above the threshold).
+    total_attachment_bytes: int = int(body.get("total_attachment_bytes") or 0)
+
     # Optional per-message LLM selection (model + reasoning effort), nested in
     # agent_config by the orchestrator. Falls back to top-level for direct callers.
     agent_config: dict[str, Any] = body.get("agent_config") or {}
@@ -372,6 +377,25 @@ async def create_run(
     await quota_guard.check(tenant_id=tenant_id, dimension="agent_sessions", requested=1)
 
     _settings = request.app.state.settings
+
+    # Resolve the per-run sandbox memory tier from the reported attachment size.
+    memory_limit = (
+        _settings.sandbox_memory_limit_large
+        if total_attachment_bytes >= _settings.sandbox_large_attachment_threshold_bytes
+        else _settings.sandbox_memory_limit_small
+    )
+    # Warm-pool bucket key for this run.  Under the Cube/microVM runtime each
+    # warm sandbox pre-allocates its RAM, so the pool keeps separate "small"
+    # (1g) and "large" (4g) buckets and must be acquired from the matching one.
+    memory_tier = (
+        "large" if memory_limit == _settings.sandbox_memory_limit_large else "small"
+    )
+    # NOTE: the scheduler currently spawns sandboxes directly via
+    # ``runtime.spawn_run`` and does NOT yet acquire from services/sandbox-pool.
+    # When the warm-pool acquire path is wired in here, pass ``memory_tier``
+    # in the pool acquire request (POST /sandboxes/acquire) so a run is served
+    # only from its own memory bucket.  ``memory_tier`` is computed above and
+    # ready for that call.
 
     foundation_token = await _mint_sandbox_token(
         settings=_settings,
@@ -414,6 +438,7 @@ async def create_run(
             skills=skills,
             files=files,
             memory=memory,
+            memory_limit=memory_limit,
             history=history,
             llm_gateway_url=_settings.llm_gateway_url,
             llm_virtual_key=virtual_key,

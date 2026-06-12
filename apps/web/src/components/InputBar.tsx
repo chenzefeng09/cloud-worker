@@ -3,6 +3,7 @@ import type { Attachment, InstalledSkill } from '../api/types';
 import { Chip } from './shell/Chip';
 import { Dropdown } from './shell/Dropdown';
 import { MODEL_OPTIONS, EFFORT_OPTIONS } from '../lib/modelOptions';
+import { useCanUploadAttachment } from '../hooks/useCanUploadAttachment';
 
 interface Props {
   onSend: (text: string, attachmentIds?: string[], attachments?: Attachment[]) => void;
@@ -35,6 +36,7 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+  const { checkFile } = useCanUploadAttachment();
 
   // Close the "+" popover when clicking outside it.
   useEffect(() => {
@@ -124,6 +126,16 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
       const added: Attachment[] = [];
       try {
         for (const file of files) {
+          // Pre-upload gate: large attachments need the `large-attachment`
+          // entitlement. Check BEFORE the upload network call so the user gets
+          // a friendly message instead of a late server-side failure.
+          const gate = await checkFile(file);
+          if (!gate.allowed) {
+            setUploadError(
+              '该文件较大，需要管理员授予大附件权限后才能上传，请联系管理员。',
+            );
+            return [...attachments, ...added];
+          }
           const att = await onUpload(file);
           added.push(att);
           setAttachments((prev) => [...prev, att]);

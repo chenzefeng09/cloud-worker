@@ -282,6 +282,17 @@ def test_upload_rejects_malformed_yaml(
     _assert_invalid(resp, contains="frontmatter 格式错误")
 
 
+def test_upload_rejects_description_over_limit(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    long_desc = "x" * 201
+    fm = f"---\nname: too-long-desc\ndescription: {long_desc}\n---\nbody\n"
+    tarball = _make_tarball({"SKILL.md": fm.encode("utf-8")})
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+    _assert_invalid(resp, contains="description 过长")
+
+
 def test_upload_rejects_path_traversal(
     app_client: TestClient, tenant_headers: dict[str, str],
 ) -> None:
@@ -490,6 +501,98 @@ def test_internal_endpoint_rejects_query_tenant_mismatch(
         },
     )
     assert resp.status_code == 403
+
+
+def test_install_with_version_field(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers, visibility="private")
+    _upload(app_client, tenant_headers, skill["id"], tarball=_valid_skill_tarball())
+
+    resp = app_client.post(
+        f"/api/skills/v1/skills/{skill['id']}/install",
+        headers=tenant_headers,
+        json={"enabled_by_default": True, "version": "1.0.0"},
+    )
+    assert resp.status_code == 201, resp.text
+
+
+def test_install_with_unknown_version_404(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers, visibility="private")
+    resp = app_client.post(
+        f"/api/skills/v1/skills/{skill['id']}/install",
+        headers=tenant_headers,
+        json={"enabled_by_default": True, "version": "9.9.9"},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "SKILL.VERSION.NOT_FOUND"
+
+
+def test_internal_resolve_requires_scope(app_client: TestClient) -> None:
+    resp = app_client.get(
+        "/api/skills/v1/internal/skills/resolve",
+        params={
+            "tenant_id": "tnt_01J5TEST00000000000000TNT1",
+            "user_id": "usr_01J5TEST0000000000000USER1",
+            "names": "poet",
+        },
+    )
+    assert resp.status_code == 403
+
+
+def test_internal_resolve_empty_names(
+    app_client: TestClient, internal_headers: dict[str, str],
+) -> None:
+    resp = app_client.get(
+        "/api/skills/v1/internal/skills/resolve",
+        params={
+            "tenant_id": "tnt_01J5TEST00000000000000TNT1",
+            "user_id": "usr_01J5TEST0000000000000USER1",
+        },
+        headers=internal_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"items": [], "total": 0}
+
+
+def test_internal_resolve_returns_presigned(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+) -> None:
+    # Set up: create skill, upload v1.0.0, install pinning that version.
+    skill = _create_skill(app_client, tenant_headers, visibility="private")
+    _upload(app_client, tenant_headers, skill["id"], tarball=_valid_skill_tarball())
+    install_resp = app_client.post(
+        f"/api/skills/v1/skills/{skill['id']}/install",
+        headers=tenant_headers,
+        json={"enabled_by_default": True, "version": "1.0.0"},
+    )
+    assert install_resp.status_code == 201, install_resp.text
+
+    resp = app_client.get(
+        "/api/skills/v1/internal/skills/resolve",
+        params={
+            "tenant_id": "tnt_01J5TEST00000000000000TNT1",
+            "user_id": "usr_01J5TEST0000000000000USER1",
+            "names": "poet,ghost",
+        },
+        headers=internal_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # ``ghost`` was not installed -> not in the resolved list.
+    assert body["total"] == 1
+    item = body["items"][0]
+    assert item["name"] == "poet"
+    assert item["version"] == "1.0.0"
+    assert item["sha256"]
+    # InMemoryBlobStore presign returns ``memory://...?ttl=...``; in production
+    # this is a real HTTP presigned URL.
+    assert item["blob_url"].startswith("memory://tenant/")
+    assert "ttl=" in item["blob_url"]
 
 
 def test_internal_endpoint_returns_skills_with_versions(

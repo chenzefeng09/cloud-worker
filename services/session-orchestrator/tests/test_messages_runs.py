@@ -393,6 +393,124 @@ def test_create_run_injects_memory(
         assert "张三" in scheduler_body[-1]["memory"]
 
 
+def test_create_run_sums_attachment_bytes_for_memory_tier(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """create_run sums this run's attachment sizes and forwards them as
+    ``total_attachment_bytes`` so the scheduler can pick the sandbox memory tier.
+    Only the files referenced by THIS run are summed; unrelated attachments on
+    the session are ignored.
+    """
+    import httpx
+
+    session = Session(
+        id="ses_att", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+    )
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_att"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+
+    # Fake attachment rows the service would return for this session.
+    att_a = MagicMock(blob_key="blob-a", size_bytes=10 * 1024 * 1024)
+    att_b = MagicMock(blob_key="blob-b", size_bytes=20 * 1024 * 1024)
+    att_unused = MagicMock(blob_key="blob-z", size_bytes=99 * 1024 * 1024)
+
+    scheduler_body: list[dict] = []
+
+    class _MemResp:
+        status_code = 200
+        def json(self):
+            return {"hits": []}
+
+    class _SchResp:
+        status_code = 201
+        def json(self):
+            return {"id": "run_att", "sandbox_id": "abc123", "status": "RUNNING"}
+
+    class _FakeClient(AuthzAwareClient):
+        async def get(self, url, **kw): return _MemResp()
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if json:
+                scheduler_body.append(json)
+            return _SchResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()), \
+         patch(
+            "agent_session_orchestrator.services.session_service."
+            "SessionService.list_attachments",
+            new=AsyncMock(return_value=[att_a, att_b, att_unused]),
+         ):
+        app_client.post(
+            "/api/session/v1/sessions/ses_att/runs",
+            headers=auth_headers,
+            json={
+                "task": "summarise these",
+                "files": [{"key": "blob-a"}, {"key": "blob-b"}],
+            },
+        )
+
+    assert scheduler_body, "scheduler was not called"
+    # 10 MiB + 20 MiB = 30 MiB; the 99 MiB unrelated attachment is NOT counted.
+    assert scheduler_body[-1]["total_attachment_bytes"] == 30 * 1024 * 1024
+
+
+def test_create_run_no_files_reports_zero_attachment_bytes(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """With no attachments the orchestrator reports 0 bytes (→ small tier)."""
+    import httpx
+
+    session = Session(
+        id="ses_noatt", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+    )
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_noatt"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+
+    scheduler_body: list[dict] = []
+
+    class _MemResp:
+        status_code = 200
+        def json(self):
+            return {"hits": []}
+
+    class _SchResp:
+        status_code = 201
+        def json(self):
+            return {"id": "run_noatt", "sandbox_id": "abc123", "status": "RUNNING"}
+
+    class _FakeClient(AuthzAwareClient):
+        async def get(self, url, **kw): return _MemResp()
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if json:
+                scheduler_body.append(json)
+            return _SchResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        app_client.post(
+            "/api/session/v1/sessions/ses_noatt/runs",
+            headers=auth_headers,
+            json={"task": "no files here"},
+        )
+
+    assert scheduler_body, "scheduler was not called"
+    assert scheduler_body[-1]["total_attachment_bytes"] == 0
+
+
 # ---------------------------------------------------------------------------
 # Tests -- PART C: token-level SSE streaming via Redis Stream
 # ---------------------------------------------------------------------------

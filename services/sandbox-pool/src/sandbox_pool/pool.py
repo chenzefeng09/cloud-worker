@@ -55,7 +55,9 @@ from sandbox_pool.metrics import PoolMetrics, build_metrics
 class PoolRuntime(Protocol):
     """Minimal interface required by Pool — satisfied by PoolDockerRuntime and test mocks."""
 
-    def start_idle_container(self, template: str) -> str: ...
+    def start_idle_container(
+        self, template: str, *, memory_limit: str | None = None,
+    ) -> str: ...
 
     def stop_container(self, container_id: str) -> None: ...
 
@@ -64,26 +66,42 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class PoolEntry:
-    """One pre-warmed container (or one in-use container after acquire)."""
+    """One pre-warmed container (or one in-use container after acquire).
+
+    ``memory_tier`` is the bucket this warm sandbox belongs to ("small" or
+    "large").  Because microVM warm sandboxes pre-allocate their RAM, a
+    "large" (4g) warm VM cannot serve a "small" (1g) run and vice-versa, so
+    the bucket key is ``(template, memory_tier)`` and acquire matches on both.
+    """
 
     sandbox_id: str
     template: str
     state: str  # IDLE | ACQUIRED | RECYCLING
     tenant_id: str | None = None  # populated on acquire
+    memory_tier: str = "small"  # "small" | "large"; default for back-compat
 
 
 @dataclass
 class PoolState:
     entries: dict[str, PoolEntry] = field(default_factory=dict)
 
-    def idle_count(self, template: str) -> int:
+    def idle_count(self, template: str, memory_tier: str | None = None) -> int:
+        """Count IDLE entries for a template, optionally scoped to one tier.
+
+        ``memory_tier=None`` counts across all tiers (legacy single-bucket
+        behaviour); pass a tier to count that bucket only.
+        """
         return sum(
             1 for e in self.entries.values()
-            if e.template == template and e.state == "IDLE"
+            if e.template == template
+            and e.state == "IDLE"
+            and (memory_tier is None or e.memory_tier == memory_tier)
         )
 
-    def total_count(self) -> int:
-        return len(self.entries)
+    def total_count(self, memory_tier: str | None = None) -> int:
+        if memory_tier is None:
+            return len(self.entries)
+        return sum(1 for e in self.entries.values() if e.memory_tier == memory_tier)
 
 
 class Pool:
@@ -127,26 +145,48 @@ class Pool:
 
     # ------------------------------------------------------------------ inspect
     def snapshot(self) -> dict[str, object]:
-        """For ``/healthz`` + metrics.  Cheap, lock-free read."""
+        """For ``/healthz`` + metrics.  Cheap, lock-free read.
+
+        ``by_memory_tier`` is the bucket breakdown the admin console reads: a
+        flood of small idles must not mask zero large idles, so each tier's
+        ``idle``/``total`` is reported independently.  ``by_template`` is kept
+        for back-compat.
+        """
+        entries = self._state.entries.values()
         return {
             "total": self._state.total_count(),
             "by_template": {
                 tmpl: {
                     "idle": self._state.idle_count(tmpl),
-                    "total": sum(
-                        1 for e in self._state.entries.values() if e.template == tmpl
-                    ),
+                    "total": sum(1 for e in entries if e.template == tmpl),
                 }
                 for tmpl in self._settings.warmup_templates
+            },
+            "by_memory_tier": {
+                tier: {
+                    "idle": sum(
+                        1 for e in entries
+                        if e.memory_tier == tier and e.state == "IDLE"
+                    ),
+                    "total": sum(1 for e in entries if e.memory_tier == tier),
+                }
+                for tier in self._settings.memory_tiers
             },
         }
 
     # ------------------------------------------------------------------ acquire
-    async def acquire(self, *, tenant_id: str, template: str = "base") -> PoolEntry:
+    async def acquire(
+        self, *, tenant_id: str, template: str = "base", memory_tier: str = "small",
+    ) -> PoolEntry:
         """Hand out one sandbox to a caller.
 
-        Fast path: if a warm IDLE entry exists for the requested template,
-        claim it immediately (no new container is started).
+        Fast path: if a warm IDLE entry exists for the requested template AND
+        memory tier, claim it immediately (no new container is started).
+
+        The bucket key is ``(template, memory_tier)``: a run requesting "large"
+        is NEVER served a "small" warm sandbox (and vice-versa), because a
+        microVM pre-allocates its RAM and so a 4g warm VM can't act as a 1g one
+        (wastes RAM) nor a 1g VM as a 4g run (too little RAM).
 
         Slow path: poll for a warm entry up to ``acquire_timeout_seconds``.
         If no warm entry appears within the timeout, cold-spawn synchronously
@@ -161,12 +201,18 @@ class Pool:
         start = time.perf_counter()
         outcome = "failed"
         try:
+            tier_max = self._settings.tier_max_total(memory_tier)
+
             # --- fast path: warm entry available right now ---
             async with self._lock:
-                if self._state.total_count() >= self._settings.max_total:
+                if self._state.total_count(memory_tier) >= tier_max:
                     raise PoolExhaustedError()
                 for entry in self._state.entries.values():
-                    if entry.state == "IDLE" and entry.template == template:
+                    if (
+                        entry.state == "IDLE"
+                        and entry.template == template
+                        and entry.memory_tier == memory_tier
+                    ):
                         entry.state = "ACQUIRED"
                         entry.tenant_id = tenant_id
                         outcome = "warm"
@@ -175,6 +221,7 @@ class Pool:
                             extra={
                                 "sandbox_id": entry.sandbox_id,
                                 "tenant_id": tenant_id,
+                                "memory_tier": memory_tier,
                             },
                         )
                         return entry
@@ -186,10 +233,14 @@ class Pool:
             while time.perf_counter() < deadline:
                 await asyncio.sleep(_poll_interval)
                 async with self._lock:
-                    if self._state.total_count() >= self._settings.max_total:
+                    if self._state.total_count(memory_tier) >= tier_max:
                         raise PoolExhaustedError()
                     for entry in self._state.entries.values():
-                        if entry.state == "IDLE" and entry.template == template:
+                        if (
+                            entry.state == "IDLE"
+                            and entry.template == template
+                            and entry.memory_tier == memory_tier
+                        ):
                             entry.state = "ACQUIRED"
                             entry.tenant_id = tenant_id
                             outcome = "warm"
@@ -198,31 +249,36 @@ class Pool:
                                 extra={
                                     "sandbox_id": entry.sandbox_id,
                                     "tenant_id": tenant_id,
+                                    "memory_tier": memory_tier,
                                 },
                             )
                             return entry
 
             # --- cold spawn: no warm entry within timeout ---
             async with self._lock:
-                if self._state.total_count() >= self._settings.max_total:
+                if self._state.total_count(memory_tier) >= tier_max:
                     raise PoolExhaustedError()
-                entry = await asyncio.to_thread(self._spawn_one, template)
+                entry = await asyncio.to_thread(self._spawn_one, template, memory_tier)
                 entry.state = "ACQUIRED"
                 entry.tenant_id = tenant_id
                 outcome = "cold"
                 logger.info(
                     "acquire cold",
-                    extra={"sandbox_id": entry.sandbox_id, "tenant_id": tenant_id},
+                    extra={
+                        "sandbox_id": entry.sandbox_id,
+                        "tenant_id": tenant_id,
+                        "memory_tier": memory_tier,
+                    },
                 )
                 return entry
 
         finally:
             elapsed = time.perf_counter() - start
             self._metrics.acquire_total.labels(
-                outcome=outcome, template=template,
+                outcome=outcome, template=template, memory_tier=memory_tier,
             ).inc()
             self._metrics.acquire_latency.labels(
-                outcome=outcome, template=template,
+                outcome=outcome, template=template, memory_tier=memory_tier,
             ).observe(elapsed)
             self._refresh_gauges()
 
@@ -250,30 +306,47 @@ class Pool:
         spawned = 0
         async with self._lock:
             for template in self._settings.warmup_templates:
-                deficit = self._settings.idle_low_watermark - self._state.idle_count(template)
-                deficit = min(
-                    deficit,
-                    self._settings.max_total - self._state.total_count(),
-                )
-                for _ in range(max(deficit, 0)):
-                    await asyncio.to_thread(self._spawn_one, template)
-                    spawned += 1
+                for tier in self._settings.memory_tiers:
+                    deficit = (
+                        self._settings.tier_idle_low(tier)
+                        - self._state.idle_count(template, tier)
+                    )
+                    # Cap by this tier's own budget AND the global hard cap.
+                    deficit = min(
+                        deficit,
+                        self._settings.tier_max_total(tier)
+                        - self._state.total_count(tier),
+                        self._settings.max_total - self._state.total_count(),
+                    )
+                    for _ in range(max(deficit, 0)):
+                        await asyncio.to_thread(self._spawn_one, template, tier)
+                        spawned += 1
         self._refresh_gauges()
         return spawned
 
     async def reap_excess_tick(self) -> int:
-        """Trim idle containers above ``idle_high_watermark`` per template."""
+        """Trim idle containers above ``idle_high_watermark`` per (template, tier).
+
+        Reaping is per-tier: a flood of small idles must not cause large warm
+        VMs to be reaped (or mask that the large bucket is below its target).
+        """
         reaped = 0
         async with self._lock:
             for template in self._settings.warmup_templates:
-                excess = self._state.idle_count(template) - self._settings.idle_high_watermark
-                victims = [
-                    e for e in self._state.entries.values()
-                    if e.template == template and e.state == "IDLE"
-                ][:max(excess, 0)]
-                for v in victims:
-                    self._reap_one(v.sandbox_id)
-                    reaped += 1
+                for tier in self._settings.memory_tiers:
+                    excess = (
+                        self._state.idle_count(template, tier)
+                        - self._settings.tier_idle_high(tier)
+                    )
+                    victims = [
+                        e for e in self._state.entries.values()
+                        if e.template == template
+                        and e.memory_tier == tier
+                        and e.state == "IDLE"
+                    ][:max(excess, 0)]
+                    for v in victims:
+                        self._reap_one(v.sandbox_id)
+                        reaped += 1
         self._refresh_gauges()
         return reaped
 
@@ -281,25 +354,32 @@ class Pool:
     def _refresh_gauges(self) -> None:
         self._metrics.total.set(self._state.total_count())
         for tmpl in self._settings.warmup_templates:
-            self._metrics.idle.labels(template=tmpl).set(
-                self._state.idle_count(tmpl),
-            )
+            for tier in self._settings.memory_tiers:
+                self._metrics.idle.labels(template=tmpl, memory_tier=tier).set(
+                    self._state.idle_count(tmpl, tier),
+                )
 
-    def _spawn_one(self, template: str) -> PoolEntry:
+    def _spawn_one(self, template: str, memory_tier: str = "small") -> PoolEntry:
         """Start a real idle container and register it in the pool state.
 
         Called from warmup_tick (via asyncio.to_thread) and the cold-spawn
         path in acquire (also via asyncio.to_thread) so the blocking Docker
         API call doesn't stall the event loop.
 
+        The container is warmed at the tier's memory size (small→1g, large→4g)
+        so a warm sandbox can actually serve runs of that tier.
+
         Returns the PoolEntry (state=IDLE) so callers can immediately
         transition it to ACQUIRED if needed.
         """
-        container_id = self._runtime.start_idle_container(template)
+        container_id = self._runtime.start_idle_container(
+            template, memory_limit=self._settings.tier_memory_size(memory_tier),
+        )
         entry = PoolEntry(
             sandbox_id=container_id,
             template=template,
             state="IDLE",
+            memory_tier=memory_tier,
         )
         self._state.entries[entry.sandbox_id] = entry
         return entry

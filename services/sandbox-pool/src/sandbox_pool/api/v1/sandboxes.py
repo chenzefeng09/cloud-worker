@@ -14,6 +14,10 @@ router = APIRouter(tags=["Sandboxes"])
 
 class AcquireRequest(BaseModel):
     template: str = "base"
+    # Memory bucket to acquire from: "small" (1g) or "large" (4g).  A "large"
+    # run is never served a "small" warm sandbox.  Defaults to "small" so
+    # callers that don't set it behave as before.
+    memory_tier: str = "small"
 
 
 class AcquireResponse(BaseModel):
@@ -46,7 +50,11 @@ async def acquire(body: AcquireRequest, request: Request) -> AcquireResponse:
     tenant_id = _require_tenant()
     pool = _pool(request)
     try:
-        entry = await pool.acquire(tenant_id=tenant_id, template=body.template)
+        entry = await pool.acquire(
+            tenant_id=tenant_id,
+            template=body.template,
+            memory_tier=body.memory_tier,
+        )
     except PoolError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail) from exc
     # Skeleton: we don't track cold-vs-warm yet; return False.  B-M2

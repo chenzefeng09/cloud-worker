@@ -33,6 +33,9 @@ def _settings(**over: object) -> Settings:
         "otel_enabled": False,
         "sandbox_image": "test-image:latest",
         "docker_network": "test_net",
+        # Single "small" bucket with no per-tier keys → legacy watermark
+        # overrides flow through via fallback.
+        "memory_tier_watermarks": {"small": {}},
     }
     defaults.update(over)
     return Settings(**defaults)  # type: ignore[arg-type]
@@ -42,7 +45,7 @@ def _make_mock_runtime() -> MagicMock:
     runtime = MagicMock()
     _counter = itertools.count()
     runtime.start_idle_container.side_effect = (
-        lambda template: f"{next(_counter):012x}"
+        lambda template, memory_limit=None: f"{next(_counter):012x}"
     )
     return runtime
 
@@ -55,15 +58,23 @@ def _make_pool(**over: object) -> tuple[Pool, PoolMetrics]:
     return pool, metrics
 
 
-def _counter(metrics: PoolMetrics, outcome: str, template: str = "base") -> float:
-    return metrics.acquire_total.labels(outcome=outcome, template=template)._value.get()
+def _counter(
+    metrics: PoolMetrics, outcome: str, template: str = "base",
+    memory_tier: str = "small",
+) -> float:
+    return metrics.acquire_total.labels(
+        outcome=outcome, template=template, memory_tier=memory_tier,
+    )._value.get()
 
 
 def _histogram_count(
     metrics: PoolMetrics, outcome: str, template: str = "base",
+    memory_tier: str = "small",
 ) -> tuple[float, float]:
     """Total observation count for the latency histogram label combo."""
-    child = metrics.acquire_latency.labels(outcome=outcome, template=template)
+    child = metrics.acquire_latency.labels(
+        outcome=outcome, template=template, memory_tier=memory_tier,
+    )
     return child._sum.get(), sum(b.get() for b in child._buckets)
 
 
@@ -120,10 +131,10 @@ async def test_acquire_failed_increments_failed_counter() -> None:
 async def test_idle_and_total_gauges_track_pool_state() -> None:
     pool, metrics = _make_pool(idle_low_watermark=3, warmup_templates=["base"])
     await pool.warmup_tick()
-    assert metrics.idle.labels(template="base")._value.get() == 3.0
+    assert metrics.idle.labels(template="base", memory_tier="small")._value.get() == 3.0
     assert metrics.total._value.get() == 3.0
 
     await pool.acquire(tenant_id="tnt_a")  # one IDLE → ACQUIRED
-    assert metrics.idle.labels(template="base")._value.get() == 2.0
+    assert metrics.idle.labels(template="base", memory_tier="small")._value.get() == 2.0
     # total unchanged — warm acquire doesn't spawn.
     assert metrics.total._value.get() == 3.0

@@ -52,11 +52,42 @@ class Settings(BaseSettings):
     cube_client_key: str | None = None
     cube_ca_cert: str | None = None
 
-    # Pool sizing
+    # Pool sizing (legacy single-bucket fields).
+    #
+    # These remain as back-compat defaults: any code (or test) that does not
+    # use the per-tier config still reads these.  The warm loop, however, keys
+    # off ``memory_tier_watermarks`` below so each memory bucket warms/reaps
+    # independently.  When a tier is missing from ``memory_tier_watermarks``
+    # the pool falls back to these single-bucket values for that tier.
     idle_low_watermark: int = 5
     idle_high_watermark: int = 20
     max_total: int = 200
     acquire_timeout_seconds: int = 30
+
+    # Per-memory-tier watermarks.
+    #
+    # Under the Cube/microVM runtime each warm sandbox PRE-ALLOCATES its RAM,
+    # so a "large" (4g) warm VM cannot serve a "small" (1g) run and vice-versa.
+    # Each tier is therefore tracked, warmed and reaped as its own bucket.
+    #
+    # Shape: ``{tier: {"idle_low": int, "idle_high": int, "max_total": int}}``.
+    # We chose a nested dict (not flat ``idle_low_small`` / ``idle_low_large``
+    # fields) because:
+    #   * tiers are an open set — adding a future "xlarge" bucket is a config
+    #     change, not a code change (no new Settings fields);
+    #   * pydantic-settings already parses complex-typed env vars as JSON, so
+    #     ``SANDBOX_POOL_MEMORY_TIER_WATERMARKS='{"small":{...},"large":{...}}'``
+    #     overrides the whole map the same way ``WARMUP_TEMPLATES`` (a list) is
+    #     overridable — it matches the existing complex-settings convention.
+    memory_tier_watermarks: dict[str, dict[str, int]] = {
+        "small": {"idle_low": 2, "idle_high": 10, "max_total": 100},
+        "large": {"idle_low": 1, "idle_high": 5, "max_total": 50},
+    }
+
+    # Per-tier memory sizes the pool warms each bucket at (docker-style strings).
+    # "small" warms 1g VMs, "large" warms 4g VMs.  A warm sandbox spawned for a
+    # tier MUST be sized for that tier or it cannot serve that tier's runs.
+    memory_tier_sizes: dict[str, str] = {"small": "1g", "large": "4g"}
 
     # Image templates the pool pre-warms.  At dev time we only warm
     # "base"; production tiers add "office" / "matlab".
@@ -76,3 +107,29 @@ class Settings(BaseSettings):
 
     otel_enabled: bool = True
     otel_exporter_endpoint: str = "http://localhost:4317"
+
+    # ---------------------------------------------------------------- tiers
+    @property
+    def memory_tiers(self) -> list[str]:
+        """Tiers the pool tracks, derived from the per-tier watermark config.
+
+        Falls back to ``["small"]`` if nothing is configured so back-compat
+        callers (no tier passed) keep working against a single bucket.
+        """
+        return list(self.memory_tier_watermarks) or ["small"]
+
+    def tier_idle_low(self, tier: str) -> int:
+        cfg = self.memory_tier_watermarks.get(tier)
+        return cfg["idle_low"] if cfg and "idle_low" in cfg else self.idle_low_watermark
+
+    def tier_idle_high(self, tier: str) -> int:
+        cfg = self.memory_tier_watermarks.get(tier)
+        return cfg["idle_high"] if cfg and "idle_high" in cfg else self.idle_high_watermark
+
+    def tier_max_total(self, tier: str) -> int:
+        cfg = self.memory_tier_watermarks.get(tier)
+        return cfg["max_total"] if cfg and "max_total" in cfg else self.max_total
+
+    def tier_memory_size(self, tier: str) -> str:
+        """Docker-style memory string the pool warms this tier at."""
+        return self.memory_tier_sizes.get(tier, self.sandbox_memory_limit)

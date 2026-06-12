@@ -31,6 +31,11 @@ def _settings(**over: object) -> Settings:
         # Minimal docker-related settings (not used — runtime is mocked)
         "sandbox_image": "test-image:latest",
         "docker_network": "test_net",
+        # Single-bucket by default: one "small" tier with no per-tier keys, so
+        # the legacy idle_low_watermark/idle_high_watermark/max_total overrides
+        # flow through (via fallback) and legacy single-tier tests keep their
+        # expected counts.  Multi-tier tests override memory_tier_watermarks.
+        "memory_tier_watermarks": {"small": {}},
     }
     defaults.update(over)
     return Settings(**defaults)  # type: ignore[arg-type]
@@ -46,7 +51,7 @@ def _make_pool(**over: object) -> tuple[Pool, MagicMock]:
     runtime = MagicMock()
     _counter = itertools.count()
     runtime.start_idle_container.side_effect = (
-        lambda template: f"{next(_counter):012x}"
+        lambda template, memory_limit=None: f"{next(_counter):012x}"
     )
     pool = Pool(_settings(**over), runtime=runtime)
     return pool, runtime
@@ -63,8 +68,8 @@ async def test_acquire_cold_spawns_when_empty() -> None:
     assert entry.state == "ACQUIRED"
     assert entry.tenant_id == "tnt_a"
     assert entry.template == "base"
-    # Real spawn must have been called
-    runtime.start_idle_container.assert_called_once_with("base")
+    # Real spawn must have been called (small tier → 1g)
+    runtime.start_idle_container.assert_called_once_with("base", memory_limit="1g")
 
 
 @pytest.mark.asyncio
@@ -155,6 +160,7 @@ async def test_warmup_tick_spawns_real_containers() -> None:
     # All calls used the "base" template
     for call in runtime.start_idle_container.call_args_list:
         assert call.args[0] == "base"
+        assert call.kwargs["memory_limit"] == "1g"
 
 
 @pytest.mark.asyncio
@@ -208,5 +214,143 @@ async def test_acquire_cold_spawn_when_no_warm_and_no_timeout(monkeypatch) -> No
     pool, runtime = _make_pool(idle_low_watermark=0, acquire_timeout_seconds=0)
     entry = await pool.acquire(tenant_id="tnt_cold")
     assert entry.state == "ACQUIRED"
-    # Cold spawn happened
-    runtime.start_idle_container.assert_called_once_with("base")
+    # Cold spawn happened (small tier → 1g)
+    runtime.start_idle_container.assert_called_once_with("base", memory_limit="1g")
+
+
+# --------------------------------------------------------------------------- #
+# Per-memory-tier buckets (small=1g / large=4g)
+# --------------------------------------------------------------------------- #
+
+def _multi_tier(**over: object) -> dict[str, object]:
+    """Two-bucket watermark config used by the tier tests."""
+    base: dict[str, object] = {
+        "acquire_timeout_seconds": 0,
+        "max_total": 100,
+        "memory_tier_watermarks": {
+            "small": {"idle_low": 2, "idle_high": 4, "max_total": 50},
+            "large": {"idle_low": 1, "idle_high": 3, "max_total": 50},
+        },
+        "memory_tier_sizes": {"small": "1g", "large": "4g"},
+    }
+    base.update(over)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_large_acquire_does_not_serve_small_idle() -> None:
+    """A "large" request must NOT be handed a "small" warm sandbox."""
+    pool, runtime = _make_pool(**_multi_tier(
+        memory_tier_watermarks={
+            "small": {"idle_low": 3, "idle_high": 4, "max_total": 50},
+            "large": {"idle_low": 0, "idle_high": 3, "max_total": 50},
+        },
+    ))
+    # Warm only small idles (large idle_low=0 → none warmed).
+    await pool.warmup_tick()
+    snap = pool.snapshot()
+    assert snap["by_memory_tier"]["small"]["idle"] == 3
+    assert snap["by_memory_tier"]["large"]["idle"] == 0
+
+    runtime.start_idle_container.reset_mock()
+    # Acquiring large must cold-spawn (no large idle to reuse) and leave the
+    # small idles untouched.
+    entry = await pool.acquire(tenant_id="t1", memory_tier="large")
+    assert entry.memory_tier == "large"
+    runtime.start_idle_container.assert_called_once_with("base", memory_limit="4g")
+    # All 3 small idles still IDLE (none stolen for the large run).
+    assert pool.snapshot()["by_memory_tier"]["small"]["idle"] == 3
+
+
+@pytest.mark.asyncio
+async def test_small_acquire_does_not_serve_large_idle() -> None:
+    """A "small" request must NOT be handed a "large" warm sandbox."""
+    pool, runtime = _make_pool(**_multi_tier(
+        memory_tier_watermarks={
+            "small": {"idle_low": 0, "idle_high": 4, "max_total": 50},
+            "large": {"idle_low": 2, "idle_high": 3, "max_total": 50},
+        },
+    ))
+    await pool.warmup_tick()  # warms only large
+    assert pool.snapshot()["by_memory_tier"]["large"]["idle"] == 2
+
+    runtime.start_idle_container.reset_mock()
+    entry = await pool.acquire(tenant_id="t1", memory_tier="small")
+    assert entry.memory_tier == "small"
+    runtime.start_idle_container.assert_called_once_with("base", memory_limit="1g")
+    assert pool.snapshot()["by_memory_tier"]["large"]["idle"] == 2
+
+
+@pytest.mark.asyncio
+async def test_large_acquire_reuses_large_idle() -> None:
+    """A warm large idle is reused for a large acquire (no new spawn)."""
+    pool, runtime = _make_pool(**_multi_tier())
+    await pool.warmup_tick()
+    runtime.start_idle_container.reset_mock()
+
+    entry = await pool.acquire(tenant_id="t1", memory_tier="large")
+    assert entry.memory_tier == "large"
+    runtime.start_idle_container.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_warmup_brings_each_tier_to_its_own_idle_low() -> None:
+    """warmup_tick warms small→idle_low_small and large→idle_low_large."""
+    pool, runtime = _make_pool(**_multi_tier())
+    spawned = await pool.warmup_tick()
+    # small idle_low=2 + large idle_low=1 = 3 spawns.
+    assert spawned == 3
+
+    snap = pool.snapshot()
+    assert snap["by_memory_tier"]["small"]["idle"] == 2
+    assert snap["by_memory_tier"]["large"]["idle"] == 1
+
+    # Each tier warmed at its own memory size.
+    sizes = sorted(
+        c.kwargs["memory_limit"]
+        for c in runtime.start_idle_container.call_args_list
+    )
+    assert sizes == ["1g", "1g", "4g"]
+
+
+@pytest.mark.asyncio
+async def test_snapshot_reports_per_tier_breakdown() -> None:
+    pool, _runtime = _make_pool(**_multi_tier())
+    await pool.warmup_tick()
+    snap = pool.snapshot()
+    assert set(snap["by_memory_tier"]) == {"small", "large"}
+    assert snap["by_memory_tier"]["small"] == {"idle": 2, "total": 2}
+    assert snap["by_memory_tier"]["large"] == {"idle": 1, "total": 1}
+    assert snap["total"] == 3
+
+
+@pytest.mark.asyncio
+async def test_reaping_is_per_tier() -> None:
+    """Reaping trims each tier to its own idle_high, independently."""
+    pool, _runtime = _make_pool(**_multi_tier(
+        memory_tier_watermarks={
+            "small": {"idle_low": 6, "idle_high": 2, "max_total": 50},
+            "large": {"idle_low": 5, "idle_high": 1, "max_total": 50},
+        },
+    ))
+    await pool.warmup_tick()  # small=6 idle, large=5 idle
+    reaped = await pool.reap_excess_tick()
+    # small: 6 → 2 → reap 4; large: 5 → 1 → reap 4; total 8.
+    assert reaped == 8
+    snap = pool.snapshot()
+    assert snap["by_memory_tier"]["small"]["idle"] == 2
+    assert snap["by_memory_tier"]["large"]["idle"] == 1
+
+
+@pytest.mark.asyncio
+async def test_large_exhaustion_independent_of_small() -> None:
+    """A flood of small idles must not let large exceed its own max_total."""
+    pool, _runtime = _make_pool(**_multi_tier(
+        memory_tier_watermarks={
+            "small": {"idle_low": 0, "idle_high": 4, "max_total": 50},
+            "large": {"idle_low": 0, "idle_high": 3, "max_total": 1},
+        },
+    ))
+    await pool.acquire(tenant_id="t1", memory_tier="large")
+    with pytest.raises(PoolExhaustedError):
+        await pool.acquire(tenant_id="t2", memory_tier="large")

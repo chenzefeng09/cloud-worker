@@ -208,6 +208,27 @@ async def create_run(
     # Optional attachment files — [{"key": s3key, "filename": name, "mime": mime}, ...]
     files: list[dict[str, Any]] = body.get("files") or []
 
+    # Sum the byte size of this run's attachments so the scheduler can pick the
+    # sandbox memory tier.  The file dicts carry only the blob ``key`` (no size),
+    # so resolve sizes from the session's Attachment rows.  Failure-open: any
+    # error or no files → 0 bytes → scheduler falls back to the small tier.
+    total_attachment_bytes = 0
+    if files:
+        try:
+            attachments = await svc.list_attachments(session_id)
+            size_by_key = {
+                att.blob_key: int(att.size_bytes or 0) for att in attachments
+            }
+            total_attachment_bytes = sum(
+                size_by_key.get(f.get("key"), 0) for f in files
+            )
+        except Exception:  # noqa: BLE001 — never block a run on size lookup
+            logger.warning(
+                "failed to resolve attachment sizes; defaulting to small tier",
+                extra={"session_id": session_id, "run_id": run.id},
+            )
+            total_attachment_bytes = 0
+
     # Pre-fetch relevant memory from knowledge-ingest; failure-open.
     knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
     memory_snippets = await _fetch_memory(
@@ -236,6 +257,9 @@ async def create_run(
                         "reasoning_effort": body.get("reasoning_effort"),
                     },
                     "files": files,
+                    # Total attachment bytes for this run; the scheduler maps it
+                    # to a concrete sandbox memory limit (small vs large tier).
+                    "total_attachment_bytes": total_attachment_bytes,
                     "memory": memory_snippets,
                     # Per-message skill selection relayed from BFF; scheduler
                     # writes these into task.json["skills"] for the worker.

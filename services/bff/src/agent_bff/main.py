@@ -165,6 +165,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.include_router(admin_lifecycle_router, prefix=settings.api_prefix)
 
+    from agent_bff.api.v1.admin_large_attachment import (
+        router as admin_large_attachment_router,
+    )
+    app.include_router(admin_large_attachment_router, prefix=settings.api_prefix)
+
     from agent_bff.api.v1.admin_data_protection import (
         router as admin_data_protection_router,
     )

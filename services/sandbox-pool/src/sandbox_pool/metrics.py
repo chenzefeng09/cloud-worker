@@ -55,13 +55,13 @@ def build_metrics(registry: CollectorRegistry | None = None) -> PoolMetrics:
         acquire_total=Counter(
             "sandbox_pool_acquire_total",
             "Acquire attempts partitioned by outcome.",
-            labelnames=("outcome", "template"),
+            labelnames=("outcome", "template", "memory_tier"),
             registry=reg,
         ),
         idle=Gauge(
             "sandbox_pool_idle",
-            "Number of IDLE (warm) sandboxes per template.",
-            labelnames=("template",),
+            "Number of IDLE (warm) sandboxes per template and memory tier.",
+            labelnames=("template", "memory_tier"),
             registry=reg,
         ),
         total=Gauge(
@@ -72,7 +72,7 @@ def build_metrics(registry: CollectorRegistry | None = None) -> PoolMetrics:
         acquire_latency=Histogram(
             "sandbox_pool_acquire_latency_seconds",
             "Wall-clock time from acquire() entry to return, per outcome.",
-            labelnames=("outcome", "template"),
+            labelnames=("outcome", "template", "memory_tier"),
             buckets=_LATENCY_BUCKETS,
             registry=reg,
         ),

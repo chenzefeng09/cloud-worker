@@ -119,8 +119,15 @@ class PoolCubeRuntime:
 
     # --------------------------------------------------------------- spawn
 
-    def start_idle_container(self, template: str) -> str:
+    def start_idle_container(
+        self, template: str, *, memory_limit: str | None = None,
+    ) -> str:
         """Boot a warm idle microVM and return its sandbox_id.
+
+        ``memory_limit`` (docker-style, e.g. ``"1g"`` / ``"4g"``) sizes the
+        microVM for its memory tier.  Because a microVM pre-allocates its RAM,
+        each tier must warm at its own size; when omitted we fall back to the
+        legacy single-bucket ``sandbox_memory_limit``.
 
         The microVM runs the agentscope_ext runtime_worker command but with
         an empty task (AGENT_TASK_JSON is set to a quiescent payload).
@@ -154,7 +161,9 @@ class PoolCubeRuntime:
             # Worker entry point — matches docker_runtime and cube_runtime.
             "cmd": ["python", "-m", "agentscope_ext.runtime_worker"],
             "resources": {
-                "memory_mb": _parse_memory_mb(self._settings.sandbox_memory_limit),
+                "memory_mb": _parse_memory_mb(
+                    memory_limit or self._settings.sandbox_memory_limit,
+                ),
                 "cpu_shares": self._settings.sandbox_cpu_shares,
             },
         }

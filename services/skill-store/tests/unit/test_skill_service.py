@@ -260,6 +260,153 @@ async def test_list_versions_unknown_skill_raises(svc: SkillService) -> None:
 
 
 @pytest.mark.asyncio
+async def test_install_without_version_leaves_pinned_null(
+    session: AsyncSession,
+) -> None:
+    svc = SkillService(
+        session, blob=InMemoryBlobStore(), tenant_id=TEST_TENANT, user_id="usr_alice",
+    )
+    skill = await svc.create_skill(
+        name="poet", description=None, owner=None, visibility="private",
+    )
+    install = await svc.install_skill(skill.id)
+    assert install.pinned_version_id is None
+
+
+@pytest.mark.asyncio
+async def test_install_with_version_pins_correct_id(
+    session: AsyncSession,
+) -> None:
+    svc = SkillService(
+        session, blob=InMemoryBlobStore(), tenant_id=TEST_TENANT, user_id="usr_alice",
+    )
+    skill = await svc.create_skill(
+        name="poet", description=None, owner=None, visibility="private",
+    )
+    sv = await svc.upload_version(
+        skill.id, version="1.0.0", tarball=_tarball(),
+        manifest=None, expected_sha256=None, uploaded_by=None,
+    )
+    install = await svc.install_skill(skill.id, version="1.0.0")
+    assert install.pinned_version_id == sv.id
+
+
+@pytest.mark.asyncio
+async def test_install_with_unknown_version_raises(session: AsyncSession) -> None:
+    svc = SkillService(
+        session, blob=InMemoryBlobStore(), tenant_id=TEST_TENANT, user_id="usr_alice",
+    )
+    skill = await svc.create_skill(
+        name="poet", description=None, owner=None, visibility="private",
+    )
+    with pytest.raises(VersionNotFoundError):
+        await svc.install_skill(skill.id, version="9.9.9")
+
+
+@pytest.mark.asyncio
+async def test_install_reinstall_updates_pinned(session: AsyncSession) -> None:
+    svc = SkillService(
+        session, blob=InMemoryBlobStore(), tenant_id=TEST_TENANT, user_id="usr_alice",
+    )
+    skill = await svc.create_skill(
+        name="poet", description=None, owner=None, visibility="private",
+    )
+    await svc.upload_version(
+        skill.id, version="1.0.0", tarball=_tarball(),
+        manifest=None, expected_sha256=None, uploaded_by=None,
+    )
+    sv2 = await svc.upload_version(
+        skill.id, version="2.0.0", tarball=_tarball(description="v2 body"),
+        manifest=None, expected_sha256=None, uploaded_by=None,
+    )
+    # First install: follow latest.
+    inst = await svc.install_skill(skill.id)
+    assert inst.pinned_version_id is None
+    # Re-install pinning a version updates in place.
+    inst = await svc.install_skill(skill.id, version="2.0.0")
+    assert inst.pinned_version_id == sv2.id
+    # Re-install dropping the pin clears it.
+    inst = await svc.install_skill(skill.id, version=None)
+    assert inst.pinned_version_id is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_runtime_mixes_pinned_and_latest(
+    session: AsyncSession,
+) -> None:
+    svc = SkillService(
+        session, blob=InMemoryBlobStore(), tenant_id=TEST_TENANT, user_id="usr_alice",
+    )
+    # Skill "poet" — two versions, user pins 1.0.0.
+    poet = await svc.create_skill(
+        name="poet", description=None, owner=None, visibility="private",
+    )
+    await svc.upload_version(
+        poet.id, version="1.0.0", tarball=_tarball(),
+        manifest=None, expected_sha256=None, uploaded_by=None,
+    )
+    await svc.upload_version(
+        poet.id, version="2.0.0", tarball=_tarball(description="poet v2"),
+        manifest=None, expected_sha256=None, uploaded_by=None,
+    )
+    await svc.install_skill(poet.id, version="1.0.0")
+
+    # Skill "chef" — two versions, user follows latest.
+    chef = await svc.create_skill(
+        name="chef", description=None, owner=None, visibility="private",
+    )
+    await svc.upload_version(
+        chef.id, version="0.1.0", tarball=_tarball(name="chef", description="chef v0"),
+        manifest=None, expected_sha256=None, uploaded_by=None,
+    )
+    chef_latest = await svc.upload_version(
+        chef.id, version="0.2.0", tarball=_tarball(name="chef", description="chef v0.2"),
+        manifest=None, expected_sha256=None, uploaded_by=None,
+    )
+    await svc.install_skill(chef.id)
+
+    resolved = await svc.resolve_for_runtime(
+        TEST_TENANT, "usr_alice", ["poet", "chef", "ghost"], ttl_seconds=600,
+    )
+    by_name = {r.name: r for r in resolved}
+    # ``ghost`` has no install -- silently absent.
+    assert set(by_name) == {"poet", "chef"}
+    assert by_name["poet"].version == "1.0.0"
+    assert by_name["chef"].version == "0.2.0"
+    assert by_name["chef"].sha256 == chef_latest.sha256
+    # blob_url is a presigned URL from InMemoryBlobStore (carries ttl param).
+    assert by_name["poet"].blob_url.startswith("memory://tenant/")
+    assert "ttl=600" in by_name["poet"].blob_url
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_runtime_empty_names(session: AsyncSession) -> None:
+    svc = SkillService(
+        session, blob=InMemoryBlobStore(), tenant_id=TEST_TENANT, user_id="usr_alice",
+    )
+    assert await svc.resolve_for_runtime(
+        TEST_TENANT, "usr_alice", [], ttl_seconds=600,
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_resolve_for_runtime_skips_skills_without_versions(
+    session: AsyncSession,
+) -> None:
+    """Installed skill with no uploaded version yet -> silently skipped."""
+    svc = SkillService(
+        session, blob=InMemoryBlobStore(), tenant_id=TEST_TENANT, user_id="usr_alice",
+    )
+    skill = await svc.create_skill(
+        name="poet", description=None, owner=None, visibility="private",
+    )
+    await svc.install_skill(skill.id)
+    assert await svc.resolve_for_runtime(
+        TEST_TENANT, "usr_alice", ["poet"], ttl_seconds=600,
+    ) == []
+
+
+@pytest.mark.asyncio
 async def test_list_internal_filters_by_names(session: AsyncSession) -> None:
     svc = SkillService(session, blob=InMemoryBlobStore(), tenant_id=TEST_TENANT)
     await svc.create_skill(name="a", description=None, owner=None, visibility="private")

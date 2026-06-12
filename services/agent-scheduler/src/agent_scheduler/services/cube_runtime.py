@@ -34,7 +34,9 @@ import httpx
 
 from agent_scheduler.config import SANDBOX_SERVICE_SCOPES, Settings
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
+from agent_scheduler.services.feature_flag import evaluate_flag
 from agent_scheduler.services.runtime import RUNTIME_REGISTRY
+from agent_scheduler.services.skill_cache import MountedSkill, SkillCache
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +82,19 @@ class CubeSandboxRuntime:
             # decide at startup which one to build, but spawning without
             # a URL is a deployment error — fail clearly when called.
             self._client: httpx.Client | None = None
-            return
-        self._client = self._make_client(url)
+        else:
+            self._client = self._make_client(url)
+        # Lazy — keeps tests that bypass __init__ from constructing a client.
+        self._skill_cache: SkillCache | None = None
+
+    def _get_skill_cache(self) -> SkillCache:
+        if self._skill_cache is None:
+            self._skill_cache = SkillCache(
+                cache_base=self._settings.skills_cache_base,
+                skill_store_url=self._settings.skill_store_url,
+                service_scopes=self._settings.skill_store_service_scopes,
+            )
+        return self._skill_cache
 
     # --------------------------------------------------------------- transport
     def _make_client(self, base_url: str) -> httpx.Client:
@@ -152,6 +165,7 @@ class CubeSandboxRuntime:
         skills: list[str] | None = None,
         files: list[dict] | None = None,
         memory: str | None = None,
+        memory_limit: str | None = None,
         history: list[dict[str, Any]] | None = None,
         llm_gateway_url: str | None = None,
         llm_virtual_key: str | None = None,
@@ -186,11 +200,17 @@ class CubeSandboxRuntime:
             )
         sandbox_llm_api_key = "" if gateway_mode else self._settings.llm_api_key
 
-        # NOTE: CubeSandbox doesn't have docker-style bind mounts, so the
-        # task payload is piped through ``env.AGENT_TASK_JSON`` instead of
-        # the ``/workspace/task.json`` file the docker runtime uses.  The
-        # ``runtime_worker`` checks env first, then file.  See
+        # The task payload is piped through ``env.AGENT_TASK_JSON``
+        # instead of a workspace file because CubeSandbox sandboxes are
+        # microVMs without a shared workspace bind by default; the
+        # ``runtime_worker`` checks env first, then the file path used
+        # by the docker runtime.  See
         # ``agentscope_ext.runtime_worker.__main__`` for the contract.
+        #
+        # Skill blobs DO get bind-mounted from the scheduler host into
+        # the VM via ``metadata.host-mount`` (Cube convention; see
+        # CubeSandbox/examples/host-mount) — populated below from the
+        # skill_cache materialise step.
         import json
         task_json = {
             "task": task,
@@ -228,22 +248,86 @@ class CubeSandboxRuntime:
         if llm_virtual_key:
             env["LLM_VIRTUAL_KEY"] = llm_virtual_key
 
+        # Materialise skills onto the scheduler host and let CubeSandbox
+        # host-mount them into the VM at /home/skills/<name>.  Failure
+        # to materialise yields an empty list — sandbox spawn proceeds
+        # without that skill rather than failing the run.
+        mounted_skills: list[MountedSkill] = []
+        try:
+            mounted_skills = self._get_skill_cache().materialize(
+                list(skills or []),
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+        except Exception as exc:  # noqa: BLE001 -- failure-open
+            logger.warning(
+                "skill cache materialise raised; continuing without mounts",
+                extra={"run_id": run_id, "err": str(exc)},
+            )
+
+        metadata: dict[str, Any] = {
+            # CubeSandbox stores these as VM labels; they're how we
+            # later filter by tenant on list / find owner on cancel.
+            "agent-platform.run-id": run_id,
+            "agent-platform.session-id": session_id,
+            "agent-platform.tenant-id": tenant_id,
+        }
+        if mounted_skills:
+            metadata["host-mount"] = json.dumps([
+                {
+                    "hostPath": ms.host_path,
+                    "mountPath": f"/home/skills/{ms.name}",
+                    "readOnly": True,
+                }
+                for ms in mounted_skills
+            ])
+
+        # Phase 5: pick the worker image per-run via feature flag.  Failure-open
+        # (inside ``evaluate_flag``) falls back to the AgentScope template, so
+        # the agentscope path stays byte-for-byte unchanged.  Unlike docker we
+        # do NOT rely on an empty cmd for the Claude SDK image: CubeSandbox's
+        # behaviour with an empty cmd is unspecified, so we pass the equivalent
+        # of the image ENTRYPOINT explicitly.
+        use_claude_sdk = evaluate_flag(
+            "enable_claude_sdk_worker",
+            tenant_id=tenant_id,
+            user_id=user_id,
+            flag_url=self._settings.feature_flag_url,
+            timeout_ms=self._settings.feature_flag_timeout_ms,
+        )
+        selected_image = (
+            self._settings.claude_sdk_image
+            if use_claude_sdk
+            else self._settings.agent_image
+        )
+        selected_cmd = (
+            ["node", "/app/dist/main.js"]
+            if use_claude_sdk
+            else ["python", "-m", "agentscope_ext.runtime_worker"]
+        )
+        logger.info(
+            "worker image selected",
+            extra={
+                "run_id": run_id,
+                "tenant_id": tenant_id,
+                "image": selected_image,
+                "claude_sdk": use_claude_sdk,
+            },
+        )
+
         body: dict[str, Any] = {
             # E2B-compatible fields
-            "template_id": self._settings.agent_image,
-            "metadata": {
-                # CubeSandbox stores these as VM labels; they're how we
-                # later filter by tenant on list / find owner on cancel.
-                "agent-platform.run-id": run_id,
-                "agent-platform.session-id": session_id,
-                "agent-platform.tenant-id": tenant_id,
-            },
+            "template_id": selected_image,
+            "metadata": metadata,
             "env": env,
             # AgentScope worker entry — matches the docker runtime's CMD line.
-            "cmd": ["python", "-m", "agentscope_ext.runtime_worker"],
+            # Claude SDK path uses the image's node ENTRYPOINT explicitly.
+            "cmd": selected_cmd,
             "timeout_seconds": self._settings.sandbox_timeout,
             "resources": {
-                "memory_mb": _parse_memory_mb(self._settings.sandbox_memory_limit),
+                "memory_mb": _parse_memory_mb(
+                    memory_limit or self._settings.sandbox_memory_limit
+                ),
                 "cpu_shares": self._settings.sandbox_cpu_shares,
             },
         }

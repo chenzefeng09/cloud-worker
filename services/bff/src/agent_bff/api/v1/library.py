@@ -180,6 +180,28 @@ async def create_skill(
         return resp.json()
 
 
+@router.get("/library/skills/{skill_id}/versions")
+async def list_skill_versions(
+    skill_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> dict:
+    """List all published versions of a skill from skill-store.
+
+    Used by the SPA's "install to toolbox" modal to let the user lock a
+    specific version (or leave null → follow latest).
+    """
+    tenant_id, user_id, access_token = _auth
+    url = request.app.state.settings.skill_store_url
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{url}/skills/{skill_id}/versions",
+            headers=foundation_headers(tenant_id, user_id, access_token),
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+
 @router.post("/library/skills/{skill_id}/versions", status_code=201)
 async def create_skill_version(
     skill_id: str,

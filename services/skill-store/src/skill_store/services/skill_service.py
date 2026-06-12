@@ -13,6 +13,7 @@ The service composes DB writes with blob-store operations.  Order matters:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import select
@@ -38,6 +39,20 @@ from skill_store.services.skill_package import validate_and_parse
 _SHELF_VISIBILITIES = ("tenant", "public")
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class ResolvedSkill:
+    """A resolved (skill, version) pair the scheduler should materialise.
+
+    ``blob_url`` is a presigned HTTP URL the scheduler fetches once; ``sha256``
+    is the content-address used as the cache key.
+    """
+
+    name: str
+    version: str
+    sha256: str
+    blob_url: str
 
 
 class SkillService:
@@ -157,10 +172,24 @@ class SkillService:
 
     async def install_skill(
         self, skill_id: str, *, enabled_by_default: bool = True,
+        version: str | None = None,
     ) -> UserInstalledSkill:
-        """Install a skill into the user's toolbox (idempotent on re-install)."""
+        """Install a skill into the user's toolbox (idempotent on re-install).
+
+        ``version=None`` means "follow latest" (``pinned_version_id`` is left
+        NULL).  A non-None ``version`` must match an existing SkillVersion of
+        this skill; otherwise ``VersionNotFoundError`` is raised so the API
+        layer turns it into a 404.
+        """
         user_id = self._require_user()
         skill = await self.get_skill(skill_id)  # 404 if not in tenant
+
+        pinned_version_id: str | None = None
+        if version is not None:
+            # Resolve the requested version to its id; raises VersionNotFoundError
+            # if it doesn't exist for this skill.
+            sv = await self.get_version(skill.id, version)
+            pinned_version_id = sv.id
 
         existing = await self._db.execute(
             select(UserInstalledSkill).where(
@@ -172,6 +201,7 @@ class SkillService:
         row = existing.scalar_one_or_none()
         if row is not None:
             row.enabled_by_default = enabled_by_default
+            row.pinned_version_id = pinned_version_id
             await self._db.flush()
             return row
 
@@ -180,6 +210,7 @@ class SkillService:
             user_id=user_id,
             skill_id=skill.id,
             enabled_by_default=enabled_by_default,
+            pinned_version_id=pinned_version_id,
         )
         self._db.add(row)
         await self._db.flush()
@@ -295,6 +326,91 @@ class SkillService:
         self._blob.delete(key)
 
     # ----------------------------------------------------------- internal
+
+    async def resolve_for_runtime(
+        self,
+        tenant_id: str,
+        user_id: str,
+        names: list[str],
+        *,
+        ttl_seconds: int,
+    ) -> list[ResolvedSkill]:
+        """Materialise each requested skill name to a concrete blob to fetch.
+
+        For each install record matching (tenant_id, user_id, skill.name in
+        names):
+
+        * ``pinned_version_id`` non-NULL → use that exact SkillVersion.
+        * ``pinned_version_id`` NULL    → use the most recently uploaded
+          SkillVersion of the skill (by ``uploaded_at`` desc).
+
+        Skill names with no install record are silently omitted — the caller
+        knows which names it asked for and can decide what to do about misses.
+        """
+        if not names:
+            return []
+
+        stmt = (
+            select(Skill, UserInstalledSkill)
+            .join(UserInstalledSkill, UserInstalledSkill.skill_id == Skill.id)
+            .where(
+                UserInstalledSkill.tenant_id == tenant_id,
+                UserInstalledSkill.user_id == user_id,
+                Skill.name.in_(names),
+            )
+            .order_by(Skill.name.asc())
+        )
+        result = await self._db.execute(stmt)
+        installs = list(result.all())
+
+        resolved: list[ResolvedSkill] = []
+        for skill, install in installs:
+            sv: SkillVersion | None
+            if install.pinned_version_id is not None:
+                sv_stmt = select(SkillVersion).where(
+                    SkillVersion.id == install.pinned_version_id,
+                )
+                sv = (await self._db.execute(sv_stmt)).scalar_one_or_none()
+                # A SET NULL race (pinned row was deleted between query &
+                # fetch) would leave sv=None; fall back to latest.
+                if sv is None:
+                    sv = await self._latest_version(skill.id)
+            else:
+                sv = await self._latest_version(skill.id)
+
+            if sv is None:
+                # Skill has zero versions yet — nothing to materialise.
+                continue
+
+            key = make_key(tenant_id, sv.skill_id, sv.version)
+            try:
+                blob_url = self._blob.presign_get(key, ttl_seconds=ttl_seconds)
+            except Exception:  # noqa: BLE001 -- fail-open: scheduler will retry
+                logger.warning(
+                    "presign_get failed during resolve_for_runtime",
+                    extra={"skill_id": sv.skill_id, "version": sv.version, "key": key},
+                    exc_info=True,
+                )
+                blob_url = sv.blob_url
+
+            resolved.append(
+                ResolvedSkill(
+                    name=skill.name,
+                    version=sv.version,
+                    sha256=sv.sha256,
+                    blob_url=blob_url,
+                )
+            )
+        return resolved
+
+    async def _latest_version(self, skill_id: str) -> SkillVersion | None:
+        stmt = (
+            select(SkillVersion)
+            .where(SkillVersion.skill_id == skill_id)
+            .order_by(SkillVersion.uploaded_at.desc())
+            .limit(1)
+        )
+        return (await self._db.execute(stmt)).scalar_one_or_none()
 
     async def list_internal(
         self, tenant_id: str, names: list[str] | None = None,

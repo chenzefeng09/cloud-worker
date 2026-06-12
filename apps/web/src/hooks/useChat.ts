@@ -6,13 +6,12 @@ import type { Message, MessageAttachment } from '../api/types';
 /**
  * SSE event handler bound to a specific sessionId.
  *
- * Why we capture the sessionId at send-time
- * -----------------------------------------
- * The previous implementation read `activeSessionId` from the store *inside*
- * the handler.  If the user switched to a different session while an SSE
- * stream was still running, every subsequent agent message went into the
- * newly-active session.  We now snapshot the sessionId when `sendMessage` is
- * called and use that for every event the stream emits.
+ * Why we capture the sessionId at connection-time
+ * ------------------------------------------------
+ * Both the persistent stream effect and sendMessage capture the sessionId
+ * when the connection/call is made.  If the user switches sessions while a
+ * stream is still open, every subsequent event is routed to the original
+ * session — never to whatever is currently active.
  *
  * Ordered streaming pipeline
  * --------------------------
@@ -21,11 +20,21 @@ import type { Message, MessageAttachment } from '../api/types';
  * two buckets (text + tools).
  *
  * Event → store method mapping:
- *   token    → appendStreamingToken   (appends to open text segment, or opens new one)
- *   tool     → upsertStreamingTool    (seals open text; creates/updates tool block)
- *   thinking → appendStreamingThinking(seals open text; appends thinking block)
- *   message  → clearStreamingBlocks + addMessage  (replaces temp blocks with real DB rows)
- *   done     → setIsStreaming(false)
+ *   run_started  → setIsStreaming(true)   (event-driven; eliminates the race
+ *                                          window when POST returns but no
+ *                                          stream event has landed yet — the
+ *                                          optimistic setIsStreaming(true) in
+ *                                          sendMessage covers that gap instead)
+ *   token        → appendStreamingToken   (appends to open text segment, or opens new one)
+ *   tool         → upsertStreamingTool    (seals open text; creates/updates tool block)
+ *   thinking     → appendStreamingThinking(seals open text; appends thinking block)
+ *   message      → clearStreamingBlocks + addMessage  (replaces temp blocks with real DB rows)
+ *   run_complete → setIsStreaming(false)  (event-driven)
+ *   done         → onDone()  (stream cycling signal — NOT isStreaming, a `done`
+ *                              only means the 5-min server window closed; a new
+ *                              window will reconnect immediately, so isStreaming
+ *                              must not flip here)
+ *   error        → addMessage SYSTEM + onDone()
  */
 function handleSSEEvent(
   sessionId: string,
@@ -35,6 +44,11 @@ function handleSSEEvent(
 ): void {
   const store = useChatStore.getState();
   switch (eventType) {
+    case 'run_started':
+      // A new run started on this session — mark streaming live.
+      store.setIsStreaming(true);
+      break;
+
     case 'message_created':
       // Backend echo of the user message — may replace the optimistic entry.
       store.addMessage(sessionId, data as unknown as Message);
@@ -113,12 +127,18 @@ function handleSSEEvent(
       store.addMessage(sessionId, data as unknown as Message);
       break;
 
-    case 'run_started':
     case 'run_complete':
-      // Lifecycle events — nothing to render.
+      // Run finished — clear the streaming indicator.  The stream window may
+      // stay open a while longer; isStreaming is about run activity, not
+      // connection state.
+      store.setIsStreaming(false);
       break;
 
     case 'done':
+      // The server closes the SSE window after ~5 min and emits `done`.  This
+      // is NOT a run-completion signal; a run_complete will have preceded it if
+      // a run was active.  We call onDone so the reconnect loop can reopen the
+      // connection.  We deliberately do NOT flip isStreaming here.
       onDone();
       break;
 
@@ -135,13 +155,71 @@ function handleSSEEvent(
       });
       onDone();
       break;
+
+    default:
+      // Never silently drop unknown events — a previously-unhandled `message`
+      // event name silently broke the UI; warn loudly so it's never missed.
+      console.warn('[useChat] Unknown SSE event type:', eventType, data);
+      break;
+  }
+}
+
+/**
+ * Parse a raw SSE byte stream coming off a ReadableStreamDefaultReader, calling
+ * `onEvent(eventType, parsedData)` for each complete SSE event.
+ *
+ * Returns a Promise that resolves when the stream reaches EOF (reader.done).
+ * The promise rejects if the AbortSignal fires or the reader throws.
+ *
+ * Why a shared helper?
+ * --------------------
+ * Both the persistent stream effect (openSessionStream) and the old sendMessage
+ * used identical line-buffer logic.  Centralising it avoids a copy-paste drift
+ * bug where one path mis-handles partial UTF-8 chunks differently from the other.
+ */
+async function parseSSEStream(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  onEvent: (eventType: string, data: Record<string, unknown>) => void,
+): Promise<void> {
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    let eventType = '';
+    for (const line of lines) {
+      if (line.startsWith('event: ')) {
+        eventType = line.slice(7).trim();
+      } else if (line.startsWith('data: ') && eventType) {
+        try {
+          const data = JSON.parse(line.slice(6));
+          onEvent(eventType, data);
+        } catch {
+          // Non-JSON data line — skip silently (SSE spec allows non-data lines)
+        }
+        eventType = '';
+      }
+    }
   }
 }
 
 export function useChat() {
   const { activeSessionId, messages, setIsStreaming, isStreaming } = useChatStore();
+  // abortRef is used by cancel() to abort an in-flight POST (rare — the POST is
+  // now very short-lived, typically <500 ms, but we keep the ref so cancel()
+  // can still call abortRef.current?.abort() for consistency).
   const abortRef = useRef<AbortController | null>(null);
   const loadedRef = useRef<Set<string>>(new Set());
+  // streamAbortRef holds the AbortController for the persistent SSE connection.
+  // One ref, one controller per session — replaced atomically when the session
+  // changes so the cleanup of the old effect always has the right handle.
+  const streamAbortRef = useRef<AbortController | null>(null);
   // Prefill text to inject into InputBar after a rewind (cleared once consumed).
   const [prefillText, setPrefillText] = useState<string>('');
   // Rewind confirmation state — drives the app-level confirm modal.
@@ -149,8 +227,10 @@ export function useChat() {
   const [rewindBusy, setRewindBusy] = useState<boolean>(false);
   const [rewindError, setRewindError] = useState<string>('');
 
-  // Hydrate transcript from server when the active session changes (page
-  // refresh, deep-link, session switch).
+  // ── Hydrate transcript ──────────────────────────────────────────────────────
+  //
+  // Load existing message history from the server when the active session
+  // changes (page refresh, deep-link, session switch).
   useEffect(() => {
     if (!activeSessionId) return;
     if (loadedRef.current.has(activeSessionId)) return;
@@ -166,24 +246,148 @@ export function useChat() {
         }
       } catch (err) {
         if (!(err instanceof ApiError) || err.status !== 401) {
-           
+
           console.warn('load messages failed', err);
         }
       }
     })();
   }, [activeSessionId]);
 
+  // ── Persistent session SSE stream ───────────────────────────────────────────
+  //
+  // One long-lived connection per active session, opened on mount / session
+  // switch and kept alive via reconnect.  This decouples event reception from
+  // the send path: all token/tool/message/run_complete events arrive here
+  // regardless of which component triggered the run.
+  //
+  // Lifecycle:
+  //   1. Open GET /sessions/{id}/stream with credentials + AbortSignal.
+  //   2. Parse SSE via parseSSEStream → handleSSEEvent.
+  //   3. On clean EOF (server `done` event followed by stream close):
+  //      reconnect after 1 s backoff if the session is still active.
+  //   4. On immediate connect failure (network down, 401, etc.):
+  //      back off exponentially (1 s → 2 s → 4 s, capped at 8 s) to avoid
+  //      storm-reconnect loops that would saturate the server.
+  //   5. Cleanup (session change / unmount) aborts the in-flight fetch via
+  //      streamAbortRef, which causes the reader to throw AbortError → loop exits.
+  //
+  // Double-stream prevention: the effect runs exactly once per activeSessionId
+  // value (React's dependency array guarantees this).  The AbortController is
+  // replaced atomically; there is never more than one live controller per session.
+  useEffect(() => {
+    if (!activeSessionId) return;
+    const sid = activeSessionId;
+
+    // Create a fresh controller for this session.  The previous session's
+    // controller was already aborted by the prior cleanup.
+    const controller = new AbortController();
+    streamAbortRef.current = controller;
+
+    let cancelled = false; // flipped to true in cleanup to stop reconnect loops
+
+    async function connectLoop(): Promise<void> {
+      let backoffMs = 1000;
+
+      while (!cancelled) {
+        const connectStart = Date.now();
+        try {
+          const res = await fetch(`/api/bff/v1/sessions/${sid}/stream`, {
+            credentials: 'include',
+            signal: controller.signal,
+          });
+
+          if (!res.ok || !res.body) {
+            // Non-2xx (e.g. 401, 503) — back off before retrying.
+            console.warn(`[useChat] session stream ${res.status} for ${sid}; backing off ${backoffMs}ms`);
+            await delay(backoffMs, controller.signal);
+            backoffMs = Math.min(backoffMs * 2, 8000);
+            continue;
+          }
+
+          // Reset backoff on a successful connection.
+          backoffMs = 1000;
+
+          const reader = res.body.getReader();
+          let doneFired = false;
+
+          await parseSSEStream(reader, (eventType, data) => {
+            if (eventType === 'done') doneFired = true;
+            handleSSEEvent(sid, eventType, data, () => {
+              doneFired = true;
+            });
+          });
+
+          // Stream closed.  If the server sent `done` first this is a normal
+          // 5-min cycle; reconnect after a short pause.
+          if (!cancelled) {
+            if (doneFired) {
+              // Normal cycle end — reconnect quickly.
+              await delay(1000, controller.signal);
+            } else {
+              // Unexpected EOF (server restart, proxy cut) — back off.
+              console.warn(`[useChat] session stream closed unexpectedly for ${sid}; reconnecting in ${backoffMs}ms`);
+              await delay(backoffMs, controller.signal);
+              backoffMs = Math.min(backoffMs * 2, 8000);
+            }
+          }
+        } catch (e) {
+          if ((e as Error).name === 'AbortError') {
+            // Cleanup called — exit immediately.
+            break;
+          }
+          // Network / parse error.  If we failed very quickly (< 200 ms) it's
+          // likely a hard connectivity issue; back off more aggressively.
+          const elapsed = Date.now() - connectStart;
+          if (elapsed < 200) {
+            backoffMs = Math.min(backoffMs * 2, 8000);
+          }
+          if (!cancelled) {
+            console.warn(`[useChat] session stream error for ${sid}; reconnecting in ${backoffMs}ms`, e);
+            try {
+              await delay(backoffMs, controller.signal);
+            } catch {
+              break; // aborted during backoff delay
+            }
+          }
+        }
+      }
+    }
+
+    connectLoop();
+
+    return () => {
+      // Abort the in-flight fetch + any pending delay.  React double-invocation
+      // in StrictMode is fine: the second mount replaces streamAbortRef and
+      // opens a new connection, the first mount's abort fires cleanly.
+      cancelled = true;
+      controller.abort();
+    };
+  }, [activeSessionId]);
+
+  // ── sendMessage ─────────────────────────────────────────────────────────────
+  //
+  // Phase 1.3 contract: POST /chat → plain JSON {run_id, message_id, run}.
+  // The SSE stream (opened by the effect above) delivers all subsequent events.
+  //
+  // What sendMessage now does:
+  //   1. Guard against concurrent sends (isStreaming).
+  //   2. Add optimistic USER message.
+  //   3. POST /chat with the same body as before.
+  //   4. On success: call setIsStreaming(true) optimistically so the UI shows
+  //      the loading state immediately, before run_started arrives on the stream.
+  //      The stream's run_complete (not this function) turns it off.
+  //   5. On failure: add SYSTEM error message, return.
+  //
+  // The `res.body.getReader()` SSE loop that was here is GONE — the persistent
+  // stream effect handles all events.
   const sendMessage = useCallback(
     async (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => {
       if (!activeSessionId || isStreaming) return;
       const sessionId = activeSessionId;
 
-      setIsStreaming(true);
-
-      // Optimistic USER message.
-      const tempUserId = `temp_user_${Date.now()}`;
+      // Optimistic USER message — shown immediately so the UI feels responsive.
       useChatStore.getState().addMessage(sessionId, {
-        id: tempUserId,
+        id: `temp_user_${Date.now()}`,
         session_id: sessionId,
         role: 'USER',
         content: text,
@@ -193,14 +397,6 @@ export function useChat() {
         created_at: new Date().toISOString(),
         attachments: attachmentsMeta && attachmentsMeta.length > 0 ? attachmentsMeta : undefined,
       });
-
-      let isDone = false;
-      const markDone = () => {
-        if (!isDone) {
-          isDone = true;
-          setIsStreaming(false);
-        }
-      };
 
       try {
         abortRef.current = new AbortController();
@@ -226,67 +422,73 @@ export function useChat() {
           signal: abortRef.current.signal,
         });
 
-        if (!res.ok || !res.body) {
+        if (!res.ok) {
+          // Parse the JSON error body (backend now returns plain JSON on failure).
+          let detail = `请求失败 (${res.status})`;
+          try {
+            const errBody = await res.json();
+            if (errBody?.detail) detail = String(errBody.detail);
+          } catch {
+            // ignore parse error, keep default message
+          }
           useChatStore.getState().addMessage(sessionId, {
             id: `err_${Date.now()}`,
             session_id: sessionId,
             role: 'SYSTEM',
-            content: `请求失败 (${res.status})`,
+            content: detail,
             tool_calls: null,
             run_id: null,
             sequence: 0,
             created_at: new Date().toISOString(),
           });
-          markDone();
           return;
         }
 
-        const reader = res.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          let eventType = '';
-          for (const line of lines) {
-            if (line.startsWith('event: ')) {
-              eventType = line.slice(7).trim();
-            } else if (line.startsWith('data: ') && eventType) {
-              try {
-                const data = JSON.parse(line.slice(6));
-                handleSSEEvent(sessionId, eventType, data, markDone);
-              } catch {
-                // Non-JSON data line, skip
-              }
-              eventType = '';
-            }
-          }
-        }
+        // Success: parse {run_id, message_id, run}.
+        // We don't strictly need the payload right now — the persistent stream
+        // will deliver run_started/token/run_complete.  But setting isStreaming
+        // optimistically here closes the gap between POST return and the stream's
+        // first run_started event (typically <100 ms on a healthy connection, but
+        // avoids a brief flash of "not loading" in the UI).
+        //
+        // Reconciliation of the optimistic user message: addMessage already
+        // deduplicates by content (temp_user_* → real USER row) when the stream
+        // emits the message_created event, so no extra work needed here.
+        await res.json(); // consume body (run_id / message_id / run — unused for now)
+        setIsStreaming(true);
       } catch (e) {
         if ((e as Error).name !== 'AbortError') {
-           
+
           console.error('Chat error:', e);
         }
-      } finally {
-        markDone();
+        // Note: we do NOT call setIsStreaming(false) here because the persistent
+        // stream's run_complete is the authoritative signal.  If the POST aborted
+        // before the server processed it, no run was started, so isStreaming was
+        // never set to true and there's nothing to clear.
       }
     },
     [activeSessionId, isStreaming, setIsStreaming],
   );
 
+  // ── cancel ──────────────────────────────────────────────────────────────────
+  //
+  // Abort the in-flight POST (if it's still running — rare, since POST is now
+  // very short-lived) and ask the backend to cancel the active run.
+  //
+  // We do NOT abort the persistent stream connection here: the stream should
+  // stay open so we can see the run_complete event when the backend run
+  // terminates.  The stream's run_complete will flip isStreaming(false).
+  //
+  // We DO call setIsStreaming(false) immediately for responsive UI feedback,
+  // accepting the tiny risk that a run_complete arrives a moment later and
+  // redundantly calls it again (idempotent).
   const cancel = useCallback(() => {
     const sessionId = useChatStore.getState().activeSessionId;
-    abortRef.current?.abort();
+    abortRef.current?.abort(); // abort POST if still in flight
     setIsStreaming(false);
     if (sessionId) {
       api.sessions.cancel(sessionId).catch((err) => {
-         
+
         console.warn('backend cancel failed', err);
       });
     }
@@ -318,7 +520,6 @@ export function useChat() {
       setPrefillText(content);
       setPendingRewind(null);
     } catch (err) {
-      // eslint-disable-next-line no-console
       console.error('rewind failed', err);
       // Surface the failure inline; keep the modal open so the user notices.
       setRewindError(
@@ -343,4 +544,25 @@ export function useChat() {
     rewindBusy,
     rewindError,
   };
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+/**
+ * Promise-based delay that resolves after `ms` milliseconds but rejects
+ * immediately if the given AbortSignal fires.  Used by the reconnect loop to
+ * back off without holding the event loop and to exit cleanly on cleanup.
+ */
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    }, { once: true });
+  });
 }

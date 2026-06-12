@@ -69,6 +69,15 @@ class UserInstalledSkill(Base):
     installed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now(),
     )
+    # NULL = follow latest; non-NULL = pin a specific SkillVersion.id.  The FK
+    # uses ON DELETE SET NULL so deleting a version a user pinned silently falls
+    # back to "follow latest" rather than dropping their install row.
+    pinned_version_id: Mapped[str | None] = mapped_column(
+        String(40),
+        ForeignKey("skill_versions.id", ondelete="SET NULL"),
+        nullable=True,
+        default=None,
+    )
 
 
 class SkillVersion(Base):

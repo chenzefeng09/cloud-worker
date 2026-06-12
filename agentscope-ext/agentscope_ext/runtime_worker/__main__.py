@@ -638,12 +638,12 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
     )
 
     # ------------------------------------------------------------------
-    # Available skills (progressive disclosure).  We download + unpack the
-    # task's skill packages into /workspace/skills/<name>-<version>/ and tell
-    # the agent each skill's name/description + the absolute SKILL.md path so
-    # it can Read the full instructions on demand.  No user-uploaded code is
-    # ever imported or executed.  Failure-open: collect_skill_prompts swallows
-    # all per-skill errors and returns only the successfully-unpacked ones.
+    # Available skills (progressive disclosure).  The scheduler has already
+    # mounted each task-selected skill read-only at /home/skills/<name>/; we
+    # just advertise name + description + the SKILL.md path so the agent can
+    # Read the full instructions on demand.  No user-uploaded code is ever
+    # imported or executed.  Failure-open: collect_skill_prompts swallows
+    # all per-skill errors and returns only the successfully-mounted ones.
     # ------------------------------------------------------------------
     try:
         from agentscope_ext.skills_loader import collect_skill_prompts
@@ -654,15 +654,15 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
         skill_prompts = []
 
     if skill_prompts:
-        lines = [
-            "\n\n## 可用技能\n"
-            "你可以使用以下技能。每个技能的完整说明在对应的 SKILL.md 里，"
-            "需要时用 Read 工具读取该文件（及其同目录的 scripts/references）："
-        ]
+        # Compact one-line-per-skill format. The header is a single sentence
+        # to keep base overhead low; each entry shows name, description, and
+        # the absolute SKILL.md path so the agent can Read it on demand
+        # (the description is bounded to MAX_DESCRIPTION_LEN at upload time).
+        lines = ["\n\n## 可用技能（需要时用 Read 工具读取指令文件）"]
         for sp in skill_prompts:
             lines.append(
                 f"- {sp['name']}：{sp.get('description', '')}"
-                f"  指令文件：{sp['skill_md_abspath']}"
+                f"  → {sp['skill_md_abspath']}"
             )
         sys_prompt += "\n".join(lines)
 

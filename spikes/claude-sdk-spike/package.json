@@ -1,0 +1,24 @@
+{
+  "name": "claude-sdk-spike",
+  "version": "0.0.1",
+  "private": true,
+  "description": "1-day spike: TS Claude Agent SDK -> thin adapter -> existing llm-gateway -> DeepSeek, with a PreToolUse hook gating tool execution.",
+  "type": "module",
+  "scripts": {
+    "start:adapter": "tsx src/adapter.ts",
+    "start:runner": "tsx src/runner.ts",
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

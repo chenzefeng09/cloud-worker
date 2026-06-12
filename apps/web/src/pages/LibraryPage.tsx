@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import { PageHead } from '../components/shell/PageHead';
 import { Chip } from '../components/shell/Chip';
+import { Dropdown } from '../components/shell/Dropdown';
 import { api } from '../api/client';
 import { ApiError } from '../api/client';
-import type { KnowledgeDocument, McpServer, Skill } from '../api/types';
+import type { KnowledgeDocument, McpServer, Skill, SkillVersion } from '../api/types';
 import { formatRelativeTimeZh } from '../lib/format';
 import { sha256Hex } from '../lib/sha256';
+import { useInstalledSkills } from '../hooks/useInstalledSkills';
 
 // Skill tarball upload limits — kept in lockstep with the BFF (20 MiB) and the
 // skill-store backend, which also enforces the SKILL.md / gzip checks.
@@ -50,6 +52,16 @@ export function LibraryPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [installOpen, setInstallOpen] = useState(false);
+  // Skill the user is installing-to-toolbox via the InstallToToolbox modal.
+  const [toolboxTarget, setToolboxTarget] = useState<Skill | null>(null);
+
+  // The user's already-installed skills — drives the "已安装" grey state on
+  // each shelf row. refresh() is called after a successful install.
+  const installedSkills = useInstalledSkills();
+  const installedSkillIds = useMemo(
+    () => new Set(installedSkills.map((s) => s.id)),
+    [installedSkills],
+  );
 
   const fetchAll = useCallback(async () => {
     setLoading(true);
@@ -186,25 +198,43 @@ export function LibraryPage() {
                 <div className="font-mono italic text-dim text-[12px]">暂无技能</div>
               ) : (
                 <div className="flex flex-col gap-1.5">
-                  {skills.map((sk) => (
-                    <div
-                      key={sk.id}
-                      className="grid grid-cols-[1fr_80px_100px] gap-3 items-center px-3.5 py-2.5 border border-line bg-surface rounded-md hover:border-ink-2 transition-all"
-                    >
-                      <div>
-                        <div className="text-[13.5px] font-medium">{sk.name}</div>
-                        {sk.description && (
-                          <div className="font-mono text-[11px] text-dim truncate">{sk.description}</div>
+                  {skills.map((sk) => {
+                    const installed = installedSkillIds.has(sk.id);
+                    return (
+                      <div
+                        key={sk.id}
+                        className="grid grid-cols-[1fr_80px_100px_72px] gap-3 items-center px-3.5 py-2.5 border border-line bg-surface rounded-md hover:border-ink-2 transition-all"
+                      >
+                        <div>
+                          <div className="text-[13.5px] font-medium">{sk.name}</div>
+                          {sk.description && (
+                            <div className="font-mono text-[11px] text-dim truncate">{sk.description}</div>
+                          )}
+                        </div>
+                        <span className="font-mono text-[11px] text-ink-2">
+                          {sk.owner ?? '—'}
+                        </span>
+                        <span className="font-mono text-[11px] text-dim">
+                          {formatRelativeTimeZh(sk.created_at)}
+                        </span>
+                        {installed ? (
+                          <span
+                            className="font-mono text-[11px] text-dim text-center px-2 py-1 border border-dashed border-line rounded-md cursor-default select-none"
+                            title="该技能已在你的工具箱中"
+                          >
+                            已安装
+                          </span>
+                        ) : (
+                          <button
+                            className="cw-btn cw-btn-sm"
+                            onClick={() => setToolboxTarget(sk)}
+                          >
+                            安装
+                          </button>
                         )}
                       </div>
-                      <span className="font-mono text-[11px] text-ink-2">
-                        {sk.owner ?? '—'}
-                      </span>
-                      <span className="font-mono text-[11px] text-dim text-right">
-                        {formatRelativeTimeZh(sk.created_at)}
-                      </span>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </>
@@ -255,6 +285,17 @@ export function LibraryPage() {
           onInstalled={() => {
             setInstallOpen(false);
             void fetchAll();
+          }}
+        />
+      )}
+
+      {toolboxTarget && (
+        <InstallToToolboxModal
+          skill={toolboxTarget}
+          onClose={() => setToolboxTarget(null)}
+          onInstalled={() => {
+            setToolboxTarget(null);
+            installedSkills.refresh();
           }}
         />
       )}
@@ -555,6 +596,148 @@ function InstallModal({
             className="cw-btn cw-btn-accent cw-btn-sm"
             onClick={submit}
             disabled={submitting}
+          >
+            {submitting ? '安装中…' : '安装'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Install-to-toolbox modal — adds an existing shelf skill to the calling
+// user's personal toolbox. Lets the user lock a specific version, or leave
+// it on "follow latest" (the backend default → pinned_version_id = null).
+// ─────────────────────────────────────────────────────────────────────────────
+
+function InstallToToolboxModal({
+  skill,
+  onClose,
+  onInstalled,
+}: {
+  skill: Skill;
+  onClose: () => void;
+  onInstalled: () => void;
+}) {
+  const [versions, setVersions] = useState<SkillVersion[]>([]);
+  const [versionsLoading, setVersionsLoading] = useState(true);
+  // Empty string ⇒ "follow latest" (we omit the field in the request body).
+  const [pickedVersion, setPickedVersion] = useState<string>('');
+  const [enabledByDefault, setEnabledByDefault] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setVersionsLoading(true);
+    api.library.listSkillVersions(skill.id)
+      .then((vs) => {
+        if (cancelled) return;
+        setVersions(vs);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setErr(e instanceof ApiError ? e.message : '加载版本列表失败');
+      })
+      .finally(() => {
+        if (cancelled) return;
+        setVersionsLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [skill.id]);
+
+  // Dropdown options: "follow latest" first (id=''), then each concrete version.
+  const versionOptions = useMemo(
+    () => [
+      { id: '', label: '跟随 latest' },
+      ...versions.map((v) => ({ id: v.version, label: v.version })),
+    ],
+    [versions],
+  );
+
+  const submit = async () => {
+    setErr(null);
+    setSubmitting(true);
+    try {
+      await api.library.installSkill(
+        skill.id,
+        enabledByDefault,
+        pickedVersion || undefined,
+      );
+      onInstalled();
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '安装失败，请稍后重试。');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 px-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-[420px] border border-line bg-surface rounded-md shadow-lg"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between px-4 py-3 border-b border-line">
+          <div className="text-[13.5px] font-medium">安装技能</div>
+          <button
+            className="font-mono text-[12px] text-dim hover:text-ink transition-colors"
+            onClick={onClose}
+          >
+            ✕
+          </button>
+        </div>
+
+        <div className="flex flex-col gap-3 px-4 py-4">
+          <Field label="技能">
+            <div className={`${inputCls} bg-paper-2 text-ink-2 cursor-default`}>
+              {skill.name}
+            </div>
+          </Field>
+
+          <Field label="版本">
+            {versionsLoading ? (
+              <div className="font-mono text-[11px] text-dim">加载中…</div>
+            ) : (
+              <Dropdown
+                value={pickedVersion}
+                options={versionOptions}
+                onChange={setPickedVersion}
+                fullWidth
+              />
+            )}
+          </Field>
+
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={enabledByDefault}
+              onChange={(e) => setEnabledByDefault(e.target.checked)}
+            />
+            <span className={labelCls}>默认启用</span>
+          </label>
+
+          {err && (
+            <div className="px-2.5 py-1.5 border border-accent-line bg-accent-soft rounded-md text-[12px] text-accent">
+              {err}
+            </div>
+          )}
+        </div>
+
+        <div className="flex justify-end gap-2 px-4 py-3 border-t border-line">
+          <button className="cw-btn cw-btn-sm" onClick={onClose} disabled={submitting}>
+            取消
+          </button>
+          <button
+            className="cw-btn cw-btn-accent cw-btn-sm"
+            onClick={submit}
+            disabled={submitting || versionsLoading}
           >
             {submitting ? '安装中…' : '安装'}
           </button>

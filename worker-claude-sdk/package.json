@@ -1,0 +1,27 @@
+{
+  "name": "worker-claude-sdk",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Production Claude Agent SDK runtime worker: SDK -> in-process Anthropic⇄OpenAI adapter -> llm-gateway. Phase 1 base layer (task/result/redis_state/adapter).",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.1.77",
+    "@aws-sdk/client-s3": "^3.600.0",
+    "ioredis": "^5.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -63,6 +63,41 @@ docker build -t agentscope-sandbox-matlab:0.1 -f matlab.Dockerfile ..
 > trailing ``..``) so the Dockerfiles can ``COPY agentscope-ext/`` into
 > the image without a separate vendor step.
 
+## Claude SDK worker image (separate lineage)
+
+``claude-sdk.Dockerfile`` builds ``ghcr.io/agent-platform/claude-sdk-sandbox:0.1``
+— a **TypeScript/Node.js** worker, NOT part of the AgentScope/Python lineage
+above.  It runs the ``worker-claude-sdk/`` worker (Claude Agent SDK ⇄
+llm-gateway) on ``node:22-slim`` and honours the same runtime contract:
+reads ``/workspace/task.json`` or ``AGENT_TASK_JSON``, writes
+``/workspace/result.json`` + ``/workspace/events.jsonl``, skills under
+``/home/skills/``.  Same non-root ``agent`` user (uid/gid 1000) so the
+scheduler's bind-mounted ``/workspace`` files are writable.
+
+**Two-step build (compile, then containerise).**  The Dockerfile copies a
+*prebuilt* ``dist/`` — it does not run ``tsc``.  So ``worker-claude-sdk/dist/``
+must exist before ``docker build``.  Ordered command:
+
+```bash
+# from the repo root — build context is the repo ROOT (note trailing ".")
+cd worker-claude-sdk && npm ci && npm run build && cd ..
+docker build \
+  -f sandbox-images/claude-sdk.Dockerfile \
+  -t ghcr.io/agent-platform/claude-sdk-sandbox:0.1 \
+  .
+```
+
+Or just ``make build-claude-sdk-image`` (runs both steps) and
+``make push-claude-sdk-image`` from the repo root.
+
+> Prerequisite: ``worker-claude-sdk/dist/main.js`` is produced by
+> ``npm run build`` (``tsc``).  If you build before the worker code's
+> ``dist/`` exists, the ``COPY worker-claude-sdk/dist/`` step fails.
+
+> CI note: sandbox images are not built in ``.github/workflows`` today (those
+> are per-service lint/test only); images are built manually via the Makefile
+> targets above, matching the AgentScope image workflow.
+
 ## How the scheduler picks an image
 
 For the docker runtime, the image is set globally per deployment via

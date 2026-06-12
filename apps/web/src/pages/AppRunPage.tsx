@@ -6,6 +6,7 @@ import { Dropdown } from '../components/shell/Dropdown';
 import { api, ApiError } from '../api/client';
 import type { App, AppVersion, Attachment, InputField } from '../api/types';
 import { modelLabel, effortLabel } from '../lib/modelOptions';
+import { useCanUploadAttachment } from '../hooks/useCanUploadAttachment';
 
 /** Resolve the published version of an App (the one current_version_id points at). */
 function resolvePublishedVersion(app: App | null): AppVersion | null {
@@ -30,6 +31,7 @@ export function AppRunPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
 
+  const { checkFile } = useCanUploadAttachment();
   const [app, setApp] = useState<App | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -138,6 +140,16 @@ export function AppRunPage() {
       const single = !constraint?.multiple;
       const toUpload = single ? files.slice(0, 1) : files;
       for (const file of toUpload) {
+        // Pre-upload gate: large attachments require the large-attachment
+        // entitlement; check before the upload network call.
+        const gate = await checkFile(file);
+        if (!gate.allowed) {
+          setFieldErrors((prev) => ({
+            ...prev,
+            [field.key]: '该文件较大，需要管理员授予大附件权限后才能上传，请联系管理员。',
+          }));
+          return;
+        }
         const att = await api.attachments.upload(sid, file);
         setFileValues((prev) => {
           const existing = single ? [] : prev[field.key] ?? [];

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Local secrets — keep the example, ignore the real thing.
+.env
+
+# Runner output artifacts (regenerated each run); keep the dir, drop contents.
+out/*
+!out/.gitkeep

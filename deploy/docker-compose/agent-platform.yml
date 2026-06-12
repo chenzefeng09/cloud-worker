@@ -416,6 +416,13 @@ services:
       # if your compose project uses different service names / ports.
       SCHEDULER_MCP_REGISTRY_URL: ${MCP_REGISTRY_URL:-http://mcp-registry:8010/api/mcp/v1}
       SCHEDULER_SKILL_STORE_URL: ${SKILL_STORE_URL:-http://skill-store:8011/api/skills/v1}
+      # Stage-2 block B: content-addressed skill cache directory.
+      # MUST be a host-bind with identical inside/outside paths because the
+      # scheduler tells docker-socket-proxy to bind-mount per-sha subdirs
+      # by absolute host path into the sandbox at /home/skills/<name>.
+      SCHEDULER_SKILLS_CACHE_BASE: ${AGENT_SKILLS_CACHE_BASE:-/tmp/agent-platform/skills_cache}
+      # Service scopes the scheduler sends to skill-store /internal/skills/resolve.
+      SCHEDULER_SKILL_STORE_SERVICE_SCOPES: ${SCHEDULER_SKILL_STORE_SERVICE_SCOPES:-skill.read_internal}
       # Activate B-M3 extensions + web_fetch inside every sandbox container.
       # Order matters: mcp_tenant_injector first, skills_loader second,
       # web_fetch third, llm_gateway_enforcer last.
@@ -463,6 +470,11 @@ services:
       # tells docker-socket-proxy to bind-mount per-run subdirs by absolute
       # path, and that path must resolve on the daemon side too.
       - ${AGENT_WORKSPACE_BASE:-/tmp/agent-workspaces}:${AGENT_WORKSPACE_BASE:-/tmp/agent-workspaces}
+      # Stage-2 block B: host-bind keeps the skills cache path identical
+      # inside the scheduler and on the docker daemon's host filesystem,
+      # so the per-sha sub-dir the scheduler asks docker-socket-proxy to
+      # bind-mount into the sandbox resolves on both sides.
+      - ${AGENT_SKILLS_CACHE_BASE:-/tmp/agent-platform/skills_cache}:${AGENT_SKILLS_CACHE_BASE:-/tmp/agent-platform/skills_cache}
     networks: [foundation, agent_internal]
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8007/api/scheduler/v1/healthz').read()\""]
