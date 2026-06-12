@@ -3,6 +3,7 @@ import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import { useChatStore } from '../../stores/chatStore';
 import { useConfirm, useToast } from '../components/dialogs';
+import { Dialog } from '../components/Dialog';
 import { CustomSelect } from '../components/CustomSelect';
 import type { LegalHold, RecycleBinItem } from '../../api/types';
 
@@ -211,8 +212,8 @@ export function LifecyclePage() {
           </div>
 
           {sdOpen && (
-            <form onSubmit={handleSoftDelete} className="border border-line rounded-md p-3 bg-surface flex flex-col gap-2 max-w-2xl">
-              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">手工软删除（演示）</div>
+            <Dialog title="手工软删除" onClose={() => setSdOpen(false)} dismissable={!sdBusy} className="w-full max-w-2xl">
+            <form onSubmit={handleSoftDelete} className="flex flex-col gap-2">
               <div className="text-[11px] text-dim">资源类型 ID 须为已注册类型（如 <code className="font-mono">rt_…</code>），否则下游返回「资源类型未注册」。</div>
               <div className="grid grid-cols-3 gap-2">
                 <div className="flex flex-col gap-1">
@@ -233,6 +234,7 @@ export function LifecyclePage() {
                 <button type="button" onClick={() => setSdOpen(false)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink">取消</button>
               </div>
             </form>
+            </Dialog>
           )}
 
           {!loading && !todo && items.length === 0 && <div className="font-mono text-[12px] text-dim italic">回收站为空</div>}
@@ -278,7 +280,8 @@ export function LifecyclePage() {
           </div>
 
           {lhOpen && (
-            <form onSubmit={handleCreateHold} className="border border-line rounded-md p-3 bg-surface flex flex-col gap-2 max-w-2xl">
+            <Dialog title="新建法务保留" onClose={() => setLhOpen(false)} dismissable={!lhBusy} className="w-full max-w-2xl">
+            <form onSubmit={handleCreateHold} className="flex flex-col gap-2">
               {lhError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{lhError}</div>}
               <div className="grid grid-cols-2 gap-2">
                 <div className="flex flex-col gap-1">
@@ -303,6 +306,7 @@ export function LifecyclePage() {
                 <button type="button" onClick={() => setLhOpen(false)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink">取消</button>
               </div>
             </form>
+            </Dialog>
           )}
 
           {!loading && !todo && holds.length === 0 && <div className="font-mono text-[12px] text-dim italic">暂无法务保留</div>}

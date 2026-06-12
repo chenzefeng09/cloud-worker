@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import { useToast } from '../components/dialogs';
+import { Dialog } from '../components/Dialog';
 import { CustomSelect } from '../components/CustomSelect';
 import type {
   RiskAcceptRequest,
@@ -482,44 +483,46 @@ function IncidentsTab({ tenantId }: { tenantId: string | null }) {
       </div>
 
       {creating && (
-        <form onSubmit={handleCreate} className="border border-line rounded-md p-3 bg-surface flex flex-col gap-2 max-w-2xl">
-          <div className="grid grid-cols-2 gap-2">
-            <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">级别</label>
-              <CustomSelect
-                options={SEVERITIES.map((s) => ({ value: s, label: s }))}
-                value={severity}
-                onChange={(v) => setSeverity(v)}
-              />
+        <Dialog title="新建安全事件" onClose={() => setCreating(false)} dismissable={!busy} className="w-full max-w-2xl">
+          <form onSubmit={handleCreate} className="flex flex-col gap-2">
+            <div className="grid grid-cols-2 gap-2">
+              <div className="flex flex-col gap-1">
+                <label className="text-[11px] text-dim font-mono">级别</label>
+                <CustomSelect
+                  options={SEVERITIES.map((s) => ({ value: s, label: s }))}
+                  value={severity}
+                  onChange={(v) => setSeverity(v)}
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-[11px] text-dim font-mono">类别</label>
+                <CustomSelect
+                  options={INCIDENT_CATEGORIES.map((c) => ({ value: c, label: c }))}
+                  value={category}
+                  onChange={(v) => setCategory(v)}
+                />
+              </div>
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">类别</label>
-              <CustomSelect
-                options={INCIDENT_CATEGORIES.map((c) => ({ value: c, label: c }))}
-                value={category}
-                onChange={(v) => setCategory(v)}
-              />
+              <label className="text-[11px] text-dim font-mono">标题</label>
+              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="生产数据库异常访问" />
             </div>
-          </div>
-          <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">标题</label>
-            <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="生产数据库异常访问" />
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">事件指挥 (IC, 可选)</label>
-              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={ic} onChange={(e) => setIc(e.target.value)} />
+            <div className="grid grid-cols-2 gap-2">
+              <div className="flex flex-col gap-1">
+                <label className="text-[11px] text-dim font-mono">事件指挥 (IC, 可选)</label>
+                <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={ic} onChange={(e) => setIc(e.target.value)} />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-[11px] text-dim font-mono">受影响租户 (逗号分隔)</label>
+                <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={affected} onChange={(e) => setAffected(e.target.value)} />
+              </div>
             </div>
-            <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">受影响租户 (逗号分隔)</label>
-              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={affected} onChange={(e) => setAffected(e.target.value)} />
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setCreating(false)} disabled={busy} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50">取消</button>
+              <button type="submit" disabled={busy || !title.trim()} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{busy ? '创建中…' : '创建'}</button>
             </div>
-          </div>
-          <div className="flex gap-2">
-            <button type="submit" disabled={busy || !title.trim()} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{busy ? '创建中…' : '创建'}</button>
-            <button type="button" onClick={() => setCreating(false)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink">取消</button>
-          </div>
-        </form>
+          </form>
+        </Dialog>
       )}
 
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
@@ -723,20 +726,22 @@ function SbomTab({ tenantId }: { tenantId: string | null }) {
       </div>
 
       {creating && (
-        <form onSubmit={handleCreate} className="border border-line rounded-md p-3 bg-surface flex flex-col gap-2 max-w-xl">
-          <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">镜像引用</label>
-            <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={imageRef} onChange={(e) => setImageRef(e.target.value)} placeholder="registry.acme.co/app:1.2.3" />
-          </div>
-          <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">通知对象 (逗号分隔)</label>
-            <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={notify} onChange={(e) => setNotify(e.target.value)} placeholder="secops@acme.co" />
-          </div>
-          <div className="flex gap-2">
-            <button type="submit" disabled={busy || !imageRef.trim()} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{busy ? '注册中…' : '注册'}</button>
-            <button type="button" onClick={() => setCreating(false)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink">取消</button>
-          </div>
-        </form>
+        <Dialog title="注册镜像" onClose={() => setCreating(false)} dismissable={!busy} className="w-full max-w-xl">
+          <form onSubmit={handleCreate} className="flex flex-col gap-2">
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">镜像引用</label>
+              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={imageRef} onChange={(e) => setImageRef(e.target.value)} placeholder="registry.acme.co/app:1.2.3" />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">通知对象 (逗号分隔)</label>
+              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={notify} onChange={(e) => setNotify(e.target.value)} placeholder="secops@acme.co" />
+            </div>
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setCreating(false)} disabled={busy} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50">取消</button>
+              <button type="submit" disabled={busy || !imageRef.trim()} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{busy ? '注册中…' : '注册'}</button>
+            </div>
+          </form>
+        </Dialog>
       )}
 
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
@@ -835,34 +840,36 @@ function DrillsTab({ tenantId }: { tenantId: string | null }) {
       </div>
 
       {creating && (
-        <form onSubmit={handleCreate} className="border border-line rounded-md p-3 bg-surface flex flex-col gap-2 max-w-2xl">
-          <div className="grid grid-cols-2 gap-2">
-            <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">类型</label>
-              <CustomSelect
-                options={DRILL_KINDS.map((k) => ({ value: k, label: k }))}
-                value={kind}
-                onChange={(v) => setKind(v)}
-              />
+        <Dialog title="安排演练" onClose={() => setCreating(false)} dismissable={!busy} className="w-full max-w-2xl">
+          <form onSubmit={handleCreate} className="flex flex-col gap-2">
+            <div className="grid grid-cols-2 gap-2">
+              <div className="flex flex-col gap-1">
+                <label className="text-[11px] text-dim font-mono">类型</label>
+                <CustomSelect
+                  options={DRILL_KINDS.map((k) => ({ value: k, label: k }))}
+                  value={kind}
+                  onChange={(v) => setKind(v)}
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-[11px] text-dim font-mono">计划时间 (ISO)</label>
+                <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={scheduledAt} onChange={(e) => setScheduledAt(e.target.value)} placeholder="2026-07-01T10:00:00Z" />
+              </div>
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">计划时间 (ISO)</label>
-              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={scheduledAt} onChange={(e) => setScheduledAt(e.target.value)} placeholder="2026-07-01T10:00:00Z" />
+              <label className="text-[11px] text-dim font-mono">参与者 (逗号分隔)</label>
+              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={participants} onChange={(e) => setParticipants(e.target.value)} placeholder="alice, bob" />
             </div>
-          </div>
-          <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">参与者 (逗号分隔)</label>
-            <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={participants} onChange={(e) => setParticipants(e.target.value)} placeholder="alice, bob" />
-          </div>
-          <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">场景 Runbook (可选)</label>
-            <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={runbook} onChange={(e) => setRunbook(e.target.value)} />
-          </div>
-          <div className="flex gap-2">
-            <button type="submit" disabled={busy} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{busy ? '提交中…' : '安排'}</button>
-            <button type="button" onClick={() => setCreating(false)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink">取消</button>
-          </div>
-        </form>
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">场景 Runbook (可选)</label>
+              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={runbook} onChange={(e) => setRunbook(e.target.value)} />
+            </div>
+            <div className="flex justify-end gap-2">
+              <button type="button" onClick={() => setCreating(false)} disabled={busy} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50">取消</button>
+              <button type="submit" disabled={busy} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{busy ? '提交中…' : '安排'}</button>
+            </div>
+          </form>
+        </Dialog>
       )}
 
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}

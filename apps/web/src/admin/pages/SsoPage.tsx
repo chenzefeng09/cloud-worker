@@ -545,6 +545,7 @@ function RoutingRulesPanel({
   const [loading, setLoading] = useState(false);
   const [todo, setTodo] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
 
   // Add-rule form state
   const [priority, setPriority] = useState('100');
@@ -607,12 +608,25 @@ function RoutingRulesPanel({
       setMatchValue('');
       setTargetTenantId('');
       setDefaultRole('');
+      setCreating(false);
       load();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '添加失败');
     } finally {
       setBusy(false);
     }
+  };
+
+  // Reset the add-rule form to defaults when the dialog is dismissed.
+  const closeCreate = () => {
+    setCreating(false);
+    setError(null);
+    setPriority('100');
+    setMatchType('EMAIL_DOMAIN');
+    setMatchAttribute('email');
+    setMatchValue('');
+    setTargetTenantId('');
+    setDefaultRole('');
   };
 
   const handleToggleEnabled = async (r: SsoRoutingRule) => {
@@ -643,11 +657,21 @@ function RoutingRulesPanel({
 
   return (
     <div className="flex flex-col gap-3 bg-paper-2 border border-line-2 rounded-md p-4">
-      <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-        「{provider.name}」路由规则
+      <div className="flex items-center justify-between">
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
+          「{provider.name}」路由规则
+        </div>
+        {!todo && (
+          <button
+            onClick={() => setCreating(true)}
+            className="px-2 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2"
+          >
+            + 添加规则
+          </button>
+        )}
       </div>
 
-      {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
+      {error && !creating && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
       {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
       {todo && (
         <div className="border border-line rounded-md p-3 text-[12px] text-dim italic">
@@ -706,10 +730,16 @@ function RoutingRulesPanel({
         </div>
       )}
 
-      {/* Add rule form */}
-      {!todo && (
-        <form onSubmit={handleAdd} className="flex flex-col gap-2 border-t border-line-2 pt-3">
-          <div className="text-[10.5px] font-mono text-dim uppercase tracking-[0.1em]">添加规则</div>
+      {/* Add rule dialog */}
+      {creating && (
+        <Dialog
+          title="添加路由规则"
+          onClose={closeCreate}
+          dismissable={!busy}
+          className="w-full max-w-[560px]"
+        >
+        <form onSubmit={handleAdd} className="flex flex-col gap-3">
+          {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
           <div className="grid grid-cols-2 gap-2">
             <div className="flex flex-col gap-1">
               <label className="text-[11px] text-dim font-mono">优先级</label>
@@ -767,16 +797,25 @@ function RoutingRulesPanel({
               />
             </div>
           </div>
-          <div className="flex justify-end">
+          <div className="flex items-center justify-end gap-2 pt-1">
+            <button
+              type="button"
+              onClick={closeCreate}
+              disabled={busy}
+              className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
+            >
+              取消
+            </button>
             <button
               type="submit"
               disabled={busy}
-              className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50"
+              className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
             >
               {busy ? '添加中…' : '添加规则'}
             </button>
           </div>
         </form>
+        </Dialog>
       )}
     </div>
   );

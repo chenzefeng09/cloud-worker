@@ -36,6 +36,7 @@ from foundation_sdk import (
 from foundation_sdk.fastapi import get_tenant_id, get_user_id
 
 from agent_bff.api._http import foundation_headers
+from agent_bff.api._jwt import clearance_from_token
 from agent_bff.api.dependencies import require_auth
 from agent_bff.api.middleware import get_access_token
 from agent_bff.errors import AuthenticationError, BFFError, ProxyError
@@ -124,8 +125,17 @@ def _session_cookie_response(request: Request, *, session: dict, email: str) -> 
         logger.error("identity returned 201 with missing fields")
         raise AuthenticationError("Identity response malformed")
 
+    # clearance lives in the access_token (Keycloak `clearance` claim), not the
+    # identity SessionRead payload — decode it out and bake it into the cookie
+    # so downstream requests don't have to re-parse the JWT every time.
+    clearance = clearance_from_token(access_token)
     cookie_value = _signer(request).sign(
-        {"user_id": user_id, "tenant_id": tenant_id, "access_token": access_token},
+        {
+            "user_id": user_id,
+            "tenant_id": tenant_id,
+            "access_token": access_token,
+            "clearance": clearance,
+        },
     )
     response = JSONResponse(
         content={
@@ -422,8 +432,14 @@ async def sso_callback(request: Request) -> Response:
 
     # Mint the identical signed cookie the password / SSO_TOKEN paths produce,
     # but attach it to the redirect so the browser lands authenticated on /home.
+    clearance = clearance_from_token(access_token)
     cookie_value = _signer(request).sign(
-        {"user_id": user_id, "tenant_id": tenant_id, "access_token": access_token},
+        {
+            "user_id": user_id,
+            "tenant_id": tenant_id,
+            "access_token": access_token,
+            "clearance": clearance,
+        },
     )
     response = RedirectResponse(
         f"{origin}/home",

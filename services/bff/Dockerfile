@@ -23,7 +23,8 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
     "sqlalchemy[asyncio]>=2.0.36,<3" \
     "asyncpg>=0.30.0,<1" \
     "aiosqlite>=0.20.0,<1" \
-    "alembic>=1.14.0,<2"
+    "alembic>=1.14.0,<2" \
+    "python-jose[cryptography]>=3.3.0,<4"
 
 COPY src/ ./src/
 COPY alembic/ ./alembic/

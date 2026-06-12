@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import { useConfirm } from '../components/dialogs';
+import { Dialog } from '../components/Dialog';
 import { CustomSelect } from '../components/CustomSelect';
 import type {
   AdminRole,
@@ -291,36 +292,32 @@ function EditRolePermissions({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[8vh] bg-black/30" onClick={onClose}>
-      <div
-        className="bg-paper border border-line rounded-lg shadow-xl w-[480px] flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="px-5 pt-5 pb-3 border-b border-line">
-          <h2 className="text-[15px] font-display text-ink tracking-[-0.02em]">编辑权限 · {role.name}</h2>
-          <p className="text-[11px] text-dim mt-0.5">调整该角色的权限集合</p>
-        </div>
-        <div className="px-5 py-4 flex flex-col gap-3">
-          {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
-          <PermissionPicker permissions={permissions} selected={selected} onToggle={toggle} />
-        </div>
-        <div className="px-5 py-3 border-t border-line flex items-center justify-end gap-2">
-          <button
-            onClick={onClose}
-            className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink"
-          >
-            取消
-          </button>
-          <button
-            onClick={handleSave}
-            disabled={loading}
-            className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
-          >
-            {loading ? '保存中…' : '保存'}
-          </button>
-        </div>
+    <Dialog
+      title={`编辑权限 · ${role.name}`}
+      onClose={onClose}
+      dismissable={!loading}
+      className="w-full max-w-lg"
+    >
+      <p className="text-[11px] text-dim -mt-1">调整该角色的权限集合</p>
+      {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
+      <PermissionPicker permissions={permissions} selected={selected} onToggle={toggle} />
+      <div className="flex items-center justify-end gap-2 pt-1">
+        <button
+          onClick={onClose}
+          disabled={loading}
+          className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
+        >
+          取消
+        </button>
+        <button
+          onClick={handleSave}
+          disabled={loading}
+          className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
+        >
+          {loading ? '保存中…' : '保存'}
+        </button>
       </div>
-    </div>
+    </Dialog>
   );
 }
 

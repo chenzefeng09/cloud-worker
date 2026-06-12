@@ -106,3 +106,34 @@ async def close_db() -> None:
     if _engine is not None:
         await _engine.dispose()
         _engine = None
+
+
+async def privileged_scalars(settings: Settings, sql: str, params: dict | None = None) -> list:
+    """Run a read-only query on the migrator (BYPASSRLS) connection.
+
+    Background jobs (e.g. the session-retention sweep) have no request and
+    therefore no single ``app.tenant_id`` to bind, so they cannot use
+    :func:`get_session`: the RLS policies installed by ``0001_init`` would
+    filter every row out.  The ``app_migrator`` role retains BYPASSRLS for
+    exactly this kind of operational, cross-tenant read (see the migration
+    docstring).
+
+    This helper opens a short-lived engine on ``db_dsn_migrator``, runs the
+    query, and disposes immediately — it is **not** pooled because the sweep
+    runs at most once a day.  Use it only for cross-tenant *reads*; the
+    actual writes (soft-deletes) go through the normal tenant-bound
+    ``app_user`` path so RLS still guards every mutation.
+
+    Returns the first column of every row (``Result.scalars().all()``).
+    """
+    dsn = settings.db_dsn_migrator
+    sep = "&" if "?" in dsn else "?"
+    if "prepared_statement_cache_size" not in dsn:
+        dsn = f"{dsn}{sep}prepared_statement_cache_size=0"
+    engine = create_async_engine(dsn, connect_args={"statement_cache_size": 0})
+    try:
+        async with engine.connect() as conn:
+            result = await conn.execute(text(sql), params or {})
+            return list(result.scalars().all())
+    finally:
+        await engine.dispose()

@@ -31,6 +31,7 @@ def foundation_headers(
     *,
     scopes: Iterable[str] | None = None,
     super_admin: bool = False,
+    clearance: str | None = None,
 ) -> dict[str, str]:
     """Build the header set BFF forwards to every foundation call.
 
@@ -49,10 +50,18 @@ def foundation_headers(
     behind ``require_super_admin_bff`` that touch scope-gated foundation
     surfaces (lifecycle storage admin today).  Passing an explicit ``scopes``
     argument always wins over the super_admin default.
+
+    ``clearance``: when a non-empty string is passed, attach it as the
+    ``X-User-Clearance`` header.  Used by the orchestrator DLP-download proxy
+    so the downstream DLP guard can enforce the caller's clearance level.
+    Omitted/empty → header is not sent (backward compatible for all other
+    foundation proxies).
     """
     headers = {"X-Tenant-Id": tenant_id, "X-User-Id": user_id}
     if access_token:
         headers["Authorization"] = f"Bearer {access_token}"
+    if clearance:
+        headers["X-User-Clearance"] = clearance
 
     if scopes is not None:
         scope_list = [s for s in scopes if s]

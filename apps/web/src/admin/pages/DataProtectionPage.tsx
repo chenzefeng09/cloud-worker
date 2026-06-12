@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import { useConfirm, useToast } from '../components/dialogs';
+import { Dialog } from '../components/Dialog';
 import { CustomSelect } from '../components/CustomSelect';
 import type {
   ConsentRecord,
@@ -47,6 +48,7 @@ export function DataProtectionPage() {
   const [error, setError] = useState<string | null>(null);
 
   // Cross-border check.
+  const [cbOpen, setCbOpen] = useState(false);
   const [cbCountry, setCbCountry] = useState('');
   const [cbCategories, setCbCategories] = useState('');
   const [cbResult, setCbResult] = useState<CrossBorderResult | null>(null);
@@ -54,6 +56,7 @@ export function DataProtectionPage() {
   const [cbError, setCbError] = useState<string | null>(null);
 
   // Destruction.
+  const [destOpen, setDestOpen] = useState(false);
   const [destResIds, setDestResIds] = useState('');
   const [destMethod, setDestMethod] = useState('crypto_shred');
   const [destBusy, setDestBusy] = useState(false);
@@ -125,6 +128,7 @@ export function DataProtectionPage() {
         tid,
       );
       setCbResult(res);
+      setCbOpen(false);
     } catch (err) {
       setCbError(err instanceof ApiError ? err.message : '检查失败');
     } finally {
@@ -146,7 +150,7 @@ export function DataProtectionPage() {
       );
       setDestCreated(res);
       toast.success('已创建销毁请求');
-      setDestResIds('');
+      setDestResIds(''); setDestOpen(false);
     } catch (err) {
       setDestError(err instanceof ApiError ? err.message : '创建失败');
     } finally {
@@ -283,8 +287,13 @@ export function DataProtectionPage() {
 
           {/* Cross-border check */}
           <section className="flex flex-col gap-2">
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">跨境传输检查</div>
-            <form onSubmit={handleCrossBorder} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 max-w-2xl">
+            <div className="flex items-center justify-between">
+              <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">跨境传输检查</div>
+              {!cbOpen && <button onClick={() => setCbOpen(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ 跨境传输登记</button>}
+            </div>
+            {cbOpen && (
+              <Dialog title="跨境传输登记" onClose={() => setCbOpen(false)} dismissable={!cbBusy} className="w-full max-w-2xl">
+              <form onSubmit={handleCrossBorder} className="flex flex-col gap-2">
               {cbError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{cbError}</div>}
               <div className="grid grid-cols-2 gap-2">
                 <div className="flex flex-col gap-1">
@@ -296,30 +305,36 @@ export function DataProtectionPage() {
                   <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={cbCategories} onChange={(e) => setCbCategories(e.target.value)} placeholder="pii, financial" />
                 </div>
               </div>
-              <div>
+              <div className="flex gap-2">
                 <button type="submit" disabled={cbBusy} className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50">{cbBusy ? '检查中…' : '检查'}</button>
+                <button type="button" onClick={() => setCbOpen(false)} className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink">取消</button>
               </div>
-              {cbResult && (
-                <div className="border-t border-line-2 pt-2 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[12px]">
-                  <span className="font-mono text-dim">是否允许</span>
-                  <span className="font-mono text-ink-2">{cbResult.allowed === undefined ? '—' : cbResult.allowed ? '是' : '否'}</span>
-                  <span className="font-mono text-dim">决策</span>
-                  <span className={`font-mono ${decisionClass(cbResult.decision)}`}>{cbResult.decision ?? '—'}</span>
-                  <span className="font-mono text-dim">风险</span>
-                  <span className="font-mono text-ink-2">{cbResult.risks?.join('; ') || '—'}</span>
-                  <span className="font-mono text-dim">所需措施</span>
-                  <span className="font-mono text-ink-2">{cbResult.required_actions?.join('; ') || '—'}</span>
-                </div>
-              )}
-            </form>
+              </form>
+              </Dialog>
+            )}
+            {cbResult && (
+              <div className="border border-line rounded-md p-4 bg-surface grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[12px] max-w-2xl">
+                <span className="font-mono text-dim">是否允许</span>
+                <span className="font-mono text-ink-2">{cbResult.allowed === undefined ? '—' : cbResult.allowed ? '是' : '否'}</span>
+                <span className="font-mono text-dim">决策</span>
+                <span className={`font-mono ${decisionClass(cbResult.decision)}`}>{cbResult.decision ?? '—'}</span>
+                <span className="font-mono text-dim">风险</span>
+                <span className="font-mono text-ink-2">{cbResult.risks?.join('; ') || '—'}</span>
+                <span className="font-mono text-dim">所需措施</span>
+                <span className="font-mono text-ink-2">{cbResult.required_actions?.join('; ') || '—'}</span>
+              </div>
+            )}
           </section>
 
           {/* Destruction */}
           <section className="flex flex-col gap-2">
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">数据销毁</div>
-            <div className="flex flex-col md:flex-row gap-3">
-              <form onSubmit={handleCreateDestruction} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 flex-1">
-                <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">新建销毁请求</div>
+            <div className="flex items-center justify-between">
+              <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">数据销毁</div>
+              {!destOpen && <button onClick={() => setDestOpen(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ 新建销毁请求</button>}
+            </div>
+            {destOpen && (
+              <Dialog title="新建销毁请求" onClose={() => setDestOpen(false)} dismissable={!destBusy} className="w-full max-w-md">
+              <form onSubmit={handleCreateDestruction} className="flex flex-col gap-2">
                 {destError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{destError}</div>}
                 <div className="flex flex-col gap-1">
                   <label className="text-[11px] text-dim font-mono">资源 ID (逗号分隔)</label>
@@ -329,19 +344,22 @@ export function DataProtectionPage() {
                   <label className="text-[11px] text-dim font-mono">销毁方法</label>
                   <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={destMethod} onChange={(e) => setDestMethod(e.target.value)} />
                 </div>
-                <div>
+                <div className="flex gap-2">
                   <button type="submit" disabled={destBusy} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{destBusy ? '提交中…' : '创建'}</button>
+                  <button type="button" onClick={() => setDestOpen(false)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink">取消</button>
                 </div>
-                {destCreated && (
-                  <div className="border-t border-line-2 pt-2 flex flex-col gap-1 text-[12px]">
-                    <div className="font-mono text-ink-2">已创建：{destCreated.id} · 状态 {destCreated.status ?? '—'}</div>
-                    {isPending(destCreated) && (
-                      <button onClick={() => handleApproveDestruction(destCreated.id)} className="self-start text-[11px] font-mono text-red-600 border border-red-200 rounded-sm px-2 py-0.5 hover:bg-red-50">审批</button>
-                    )}
-                  </div>
-                )}
               </form>
-
+              </Dialog>
+            )}
+            {destCreated && (
+              <div className="border border-line rounded-md p-3 bg-surface flex flex-col gap-1 text-[12px] max-w-2xl">
+                <div className="font-mono text-ink-2">已创建：{destCreated.id} · 状态 {destCreated.status ?? '—'}</div>
+                {isPending(destCreated) && (
+                  <button onClick={() => handleApproveDestruction(destCreated.id)} className="self-start text-[11px] font-mono text-red-600 border border-red-200 rounded-sm px-2 py-0.5 hover:bg-red-50">审批</button>
+                )}
+              </div>
+            )}
+            <div className="flex flex-col md:flex-row gap-3">
               <form onSubmit={handleQueryDestruction} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 flex-1">
                 <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">按 ID 查询销毁状态</div>
                 {destQueryError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{destQueryError}</div>}
@@ -379,7 +397,8 @@ export function DataProtectionPage() {
             </div>
 
             {cOpen && (
-              <form onSubmit={handleCreateConsent} className="border border-line rounded-md p-3 bg-surface flex flex-col gap-2 max-w-2xl">
+              <Dialog title="记录同意" onClose={() => setCOpen(false)} dismissable={!cBusy} className="w-full max-w-2xl">
+              <form onSubmit={handleCreateConsent} className="flex flex-col gap-2">
                 {cError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{cError}</div>}
                 <div className="grid grid-cols-3 gap-2">
                   <div className="flex flex-col gap-1">
@@ -409,6 +428,7 @@ export function DataProtectionPage() {
                   <button type="button" onClick={() => setCOpen(false)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink">取消</button>
                 </div>
               </form>
+              </Dialog>
             )}
 
             <div className="flex items-end gap-2">

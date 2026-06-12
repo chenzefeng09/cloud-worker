@@ -624,6 +624,18 @@ export interface LargeAttachmentUserAllow {
   updated_by?: string | null;
 }
 
+export type LargeAttachmentSubjectType = 'USER' | 'TEAM' | 'ORG_UNIT';
+
+export interface LargeAttachmentSubjectAllow {
+  id?: string | null;
+  tenant_id?: string;
+  subject_type: LargeAttachmentSubjectType;
+  subject_id: string;
+  allowed: boolean;
+  updated_at?: string | null;
+  updated_by?: string | null;
+}
+
 export interface SandboxItem {
   // The scheduler returns `container_id`; keep `id` optional for other sources.
   container_id?: string;
@@ -1304,6 +1316,51 @@ export interface DlpClassification {
   tags?: string[] | null;
   downgradable?: boolean;
   [key: string]: unknown;
+}
+
+// Governance read-models (→ foundation-dlp /core/events|classifications|stats).
+
+export interface DlpEvent {
+  id: string;
+  check_type: string;
+  decision: string;
+  user_id?: string | null;
+  resource_type?: string | null;
+  resource_id?: string | null;
+  reason_code?: string | null;
+  occurred_at: string;
+  detail?: Record<string, unknown> | null;
+  request_id?: string | null;
+  [key: string]: unknown;
+}
+
+export interface DlpEventList {
+  items: DlpEvent[];
+  next_before: string | null;
+}
+
+export interface DlpClassificationRow {
+  resource_type: string;
+  resource_id: string;
+  sensitivity: string;
+  tags?: string[] | null;
+  reason?: string | null;
+  tagged_by?: string | null;
+  tagged_at: string;
+  downgradable?: boolean;
+  [key: string]: unknown;
+}
+
+export interface DlpClassificationList {
+  items: DlpClassificationRow[];
+  next_before: string | null;
+}
+
+export interface DlpStats {
+  by_decision: Record<string, number>;
+  by_check_type: Record<string, number>;
+  by_sensitivity: Record<string, number>;
+  total_events: number;
 }
 
 // ─── Compliance center (→ foundation-compliance) ──────────────────────────────

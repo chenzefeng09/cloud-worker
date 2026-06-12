@@ -9,6 +9,7 @@ import { OutputFileCards } from './OutputFileCards';
 import { InputBar } from './InputBar';
 import { PlanBlock } from './PlanBlock';
 import { RewindConfirmModal } from './RewindConfirmModal';
+import { DataNoticeModal } from './DataNoticeModal';
 import { api } from '../api/client';
 import type { Attachment, MessageAttachment } from '../api/types';
 import { groupSteps } from '../lib/groupSteps';
@@ -268,6 +269,10 @@ function FixtureMessageInner({
 
 // ── ChatWindow ────────────────────────────────────────────────────────────────
 
+// localStorage key recording that the user has acknowledged the first-use data
+// notice. Versioned so the notice can be re-shown if the policy text changes.
+const DATA_NOTICE_ACK_KEY = 'data-notice-ack-v1';
+
 export function ChatWindow({
   sessionId,
   friendly,
@@ -312,6 +317,27 @@ export function ChatWindow({
 
   // Live plan steps for this session — rendered at the bottom of the transcript.
   const planSteps = useChatStore((s) => s.planSteps[sessionId]);
+
+  // First-use data-usage notice: show once per device, then remember the
+  // acknowledgement in localStorage so it never appears again.
+  const [showDataNotice, setShowDataNotice] = useState(false);
+  useEffect(() => {
+    try {
+      if (!localStorage.getItem(DATA_NOTICE_ACK_KEY)) {
+        setShowDataNotice(true);
+      }
+    } catch {
+      // localStorage unavailable (e.g. privacy mode) — skip the notice.
+    }
+  }, []);
+  const ackDataNotice = () => {
+    try {
+      localStorage.setItem(DATA_NOTICE_ACK_KEY, '1');
+    } catch {
+      // Ignore storage failures; just close the modal.
+    }
+    setShowDataNotice(false);
+  };
 
   // Seed this session's enabled skills from the user's install defaults, once
   // the installed list loads — only if the user hasn't chosen yet this session.
@@ -490,6 +516,7 @@ export function ChatWindow({
         onModelChange={showThinkingUi ? (m) => setSessionModel(sessionId, m) : undefined}
         onEffortChange={showThinkingUi ? (e) => setSessionEffort(sessionId, e) : undefined}
       />
+      {showDataNotice && <DataNoticeModal onAck={ackDataNotice} />}
       {pendingRewind && (
         <RewindConfirmModal
           message={pendingRewind}

@@ -22,6 +22,8 @@ import logging
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agent_session_orchestrator.config import Settings
+from agent_session_orchestrator.domain.db import get_session, privileged_scalars
 from agent_session_orchestrator.domain.models import Attachment, Message, Run, Session
 from agent_session_orchestrator.errors import RunNotFoundError, SessionNotFoundError
 
@@ -32,14 +34,85 @@ def _now() -> dt.datetime:
     return dt.datetime.now(tz=dt.UTC)
 
 
+async def purge_expired_sessions(settings: Settings, retention_days: int) -> int:
+    """Soft-delete every session older than ``retention_days`` (all tenants).
+
+    Designed for the background retention sweep — there is no request and
+    therefore no single tenant context.  RLS is FORCEd on ``app_user``
+    (see ``0001_init``), so the cross-tenant *scan* runs on the migrator
+    (BYPASSRLS) connection via :func:`privileged_scalars`.  The actual
+    soft-deletes then go through the normal tenant-bound ``app_user`` path
+    (:class:`SessionService.delete_session`) so every mutation is still RLS
+    guarded and reuses the cascade-friendly delete logic.
+
+    Conservative by design: each session is deleted in its own transaction;
+    a failure on one session is logged and the loop continues.
+
+    Returns the number of sessions successfully soft-deleted.
+    """
+    cutoff = _now() - dt.timedelta(days=retention_days)
+
+    # Cross-tenant read of expired, not-yet-deleted sessions.  We pull
+    # (tenant_id, id) so we can re-bind RLS correctly for each delete.  The
+    # scalar helper returns one column, so encode the pair as "tenant_id\x1fid"
+    # — tenant_id and session id are opaque slugs without control chars.
+    rows = await privileged_scalars(
+        settings,
+        "SELECT tenant_id || '\x1f' || id"
+        " FROM session_orchestrator.session"
+        " WHERE deleted_at IS NULL AND created_at < :cutoff"
+        " ORDER BY tenant_id",
+        {"cutoff": cutoff},
+    )
+
+    scanned = len(rows)
+    purged = 0
+    for row in rows:
+        tenant_id, _, session_id = str(row).partition("\x1f")
+        if not tenant_id or not session_id:
+            logger.warning("retention sweep: malformed scan row %r — skipping", row)
+            continue
+        try:
+            async for db in get_session(
+                tenant_id=tenant_id, user_id="SYSTEM", actor="SYSTEM"
+            ):
+                service = SessionService(db, tenant_id=tenant_id)
+                await service.delete_session(session_id)
+            purged += 1
+        except Exception:  # noqa: BLE001 — one bad session must not abort the sweep
+            logger.exception(
+                "retention sweep: failed to purge session",
+                extra={"tenant_id": tenant_id, "session_id": session_id},
+            )
+
+    logger.info(
+        "retention sweep: scanned %d expired session(s), purged %d",
+        scanned,
+        purged,
+    )
+    return purged
+
+
 class SessionService:
     def __init__(self, db: AsyncSession, *, tenant_id: str) -> None:
         self._db = db
         self._tenant_id = tenant_id
 
     async def list_sessions(
-        self, *, cursor: str | None = None, limit: int = 50
+        self, *, user_id: str | None = None, cursor: str | None = None, limit: int = 50
     ) -> tuple[list[Session], str | None]:
+        """List sessions for the current tenant.
+
+        ``user_id`` narrows the result to a single owner.  This is the IDOR
+        guard for the normal chat path: a regular member must only ever see
+        their own sessions.  Tenant RLS already scopes to ``tenant_id``; the
+        ``user_id`` predicate is a strictly tighter filter on top of that
+        (never broadens scope, never crosses tenants).
+
+        ``user_id=None`` lists *every* session in the tenant — reserved for the
+        admin replay path, which gates on a tenant_admin permission upstream
+        (BFF) and never crosses the tenant boundary.
+        """
         stmt = (
             select(Session)
             .where(
@@ -49,6 +122,8 @@ class SessionService:
             .order_by(Session.updated_at.desc())
             .limit(limit + 1)
         )
+        if user_id is not None:
+            stmt = stmt.where(Session.user_id == user_id)
         if cursor:
             stmt = stmt.where(Session.updated_at < cursor)
 

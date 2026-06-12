@@ -57,8 +57,12 @@ function handleSSEEvent(
     case 'token': {
       const runId = data.run_id as string | undefined;
       const delta = data.delta as string | undefined;
+      // Redis stream entry id ("<ms>-<seq>"); enables idempotent replay so a
+      // reconnect/StrictMode-remount that re-streams from "0-0" can't double or
+      // scramble the streamed text. Optional — older backends omit it.
+      const offset = data.offset as string | undefined;
       if (runId && delta !== undefined) {
-        store.appendStreamingToken(sessionId, runId, delta);
+        store.appendStreamingToken(sessionId, runId, delta, offset);
       }
       break;
     }
@@ -68,6 +72,7 @@ function handleSSEEvent(
       const kind = data.kind as 'call' | 'result' | undefined;
       const toolCallId = data.tool_call_id as string | undefined;
       const toolName = data.name as string | undefined;
+      const offset = data.offset as string | undefined;
       if (runId && kind && toolCallId && toolName) {
         store.upsertStreamingTool(sessionId, runId, {
           kind,
@@ -76,7 +81,7 @@ function handleSSEEvent(
           args: kind === 'call' ? (data.args as string | undefined) : undefined,
           result: kind === 'result' ? (data.result as string | undefined) : undefined,
           state: kind === 'result' ? (data.state as string | undefined) : undefined,
-        });
+        }, offset);
       }
       break;
     }
@@ -84,8 +89,9 @@ function handleSSEEvent(
     case 'thinking': {
       const runId = data.run_id as string | undefined;
       const text = data.text as string | undefined;
+      const offset = data.offset as string | undefined;
       if (runId && text) {
-        store.appendStreamingThinking(sessionId, runId, text);
+        store.appendStreamingThinking(sessionId, runId, text, offset);
       }
       break;
     }
@@ -209,6 +215,146 @@ async function parseSSEStream(
   }
 }
 
+// ── Singleton persistent-stream manager ───────────────────────────────────────
+//
+// Why a module-level singleton instead of a per-hook effect
+// ---------------------------------------------------------
+// `useChat()` is consumed by more than one mounted component at a time (e.g.
+// AgentPage calls it for `sendMessage` AND renders ChatWindow which calls it for
+// the transcript).  If the SSE connect-loop lived in a hook-local effect, EACH
+// consumer would open its own GET /sessions/{id}/stream.  Two live streams both
+// replay the same run's Redis token entries from `0-0`, so every `token` /
+// `thinking` event is applied twice → the assistant text renders doubled and
+// chopped ("你好你好", interleaved THOUGHT blocks).  React 18 StrictMode's
+// double-mount made this even easier to hit.
+//
+// The fix: exactly ONE connection per sessionId for the whole app, ref-counted
+// across all subscribers.  The first subscriber opens it; the last to leave
+// tears it down.  Switching the active session is handled by each subscriber
+// re-subscribing to the new id (and releasing the old one).
+interface StreamHandle {
+  controller: AbortController;
+  cancelled: boolean;
+  refCount: number;
+  /** Pending teardown timer (see the delayed-abort note in unsubscribe). */
+  teardownTimer: ReturnType<typeof setTimeout> | null;
+}
+
+const activeStreams = new Map<string, StreamHandle>();
+
+// How long to wait after the last subscriber leaves before tearing the
+// connection down.  React 18 StrictMode (and ordinary remounts) unmount then
+// immediately re-mount an effect, driving refCount 1→0→1 within the same tick.
+// A synchronous abort would kill the live SSE connection and force a full
+// reconnect+replay on every mount flicker; the small grace window lets the
+// re-subscribe cancel the teardown so the connection survives untouched.  The
+// offset-based idempotency is the real correctness guarantee — this is purely a
+// churn-avoidance optimisation.
+const STREAM_TEARDOWN_GRACE_MS = 50;
+
+/**
+ * Open (or join) the singleton SSE stream for `sid`; returns an unsubscribe fn.
+ * Exported for tests — production code reaches it via the useChat effect.
+ */
+export function subscribeSessionStream(sid: string): () => void {
+  let handle = activeStreams.get(sid);
+  if (handle) {
+    // A connection for this session already exists — just join it.  If a
+    // teardown was scheduled (last subscriber just left), cancel it: the
+    // connection is still alive and this new subscriber reclaims it.
+    if (handle.teardownTimer !== null) {
+      clearTimeout(handle.teardownTimer);
+      handle.teardownTimer = null;
+    }
+    handle.refCount += 1;
+  } else {
+    const controller = new AbortController();
+    handle = { controller, cancelled: false, refCount: 1, teardownTimer: null };
+    activeStreams.set(sid, handle);
+    runConnectLoop(sid, handle);
+  }
+
+  return () => {
+    const h = activeStreams.get(sid);
+    if (!h) return;
+    h.refCount -= 1;
+    if (h.refCount <= 0 && h.teardownTimer === null) {
+      // Last subscriber left — schedule (don't immediately execute) teardown so
+      // a StrictMode/remount re-subscribe in the same tick can keep the
+      // connection alive (see STREAM_TEARDOWN_GRACE_MS).
+      h.teardownTimer = setTimeout(() => {
+        // Re-check under the timer: a subscriber may have rejoined.
+        if (h.refCount <= 0) {
+          h.cancelled = true;
+          h.controller.abort();
+          activeStreams.delete(sid);
+        } else {
+          h.teardownTimer = null;
+        }
+      }, STREAM_TEARDOWN_GRACE_MS);
+    }
+  };
+}
+
+/** The reconnecting fetch loop for one session's SSE stream. */
+async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> {
+  const { controller } = handle;
+  let backoffMs = 1000;
+
+  while (!handle.cancelled) {
+    const connectStart = Date.now();
+    try {
+      const res = await fetch(`/api/bff/v1/sessions/${sid}/stream`, {
+        credentials: 'include',
+        signal: controller.signal,
+      });
+
+      if (!res.ok || !res.body) {
+        console.warn(`[useChat] session stream ${res.status} for ${sid}; backing off ${backoffMs}ms`);
+        await delay(backoffMs, controller.signal);
+        backoffMs = Math.min(backoffMs * 2, 8000);
+        continue;
+      }
+
+      backoffMs = 1000;
+
+      const reader = res.body.getReader();
+      let doneFired = false;
+
+      await parseSSEStream(reader, (eventType, data) => {
+        if (eventType === 'done') doneFired = true;
+        handleSSEEvent(sid, eventType, data, () => {
+          doneFired = true;
+        });
+      });
+
+      if (!handle.cancelled) {
+        if (doneFired) {
+          await delay(1000, controller.signal);
+        } else {
+          console.warn(`[useChat] session stream closed unexpectedly for ${sid}; reconnecting in ${backoffMs}ms`);
+          await delay(backoffMs, controller.signal);
+          backoffMs = Math.min(backoffMs * 2, 8000);
+        }
+      }
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') break;
+      const elapsed = Date.now() - connectStart;
+      if (elapsed < 200) {
+        backoffMs = Math.min(backoffMs * 2, 8000);
+      }
+      if (!handle.cancelled) {
+        console.warn(`[useChat] session stream error for ${sid}; reconnecting in ${backoffMs}ms`, e);
+        try {
+          await delay(backoffMs, controller.signal);
+        } catch {
+          break; // aborted during backoff delay
+        }
+      }
+    }
+  }
+}
+
 export function useChat() {
   const { activeSessionId, messages, setIsStreaming, isStreaming } = useChatStore();
   // abortRef is used by cancel() to abort an in-flight POST (rare — the POST is
@@ -216,10 +362,6 @@ export function useChat() {
   // can still call abortRef.current?.abort() for consistency).
   const abortRef = useRef<AbortController | null>(null);
   const loadedRef = useRef<Set<string>>(new Set());
-  // streamAbortRef holds the AbortController for the persistent SSE connection.
-  // One ref, one controller per session — replaced atomically when the session
-  // changes so the cleanup of the old effect always has the right handle.
-  const streamAbortRef = useRef<AbortController | null>(null);
   // Prefill text to inject into InputBar after a rewind (cleared once consumed).
   const [prefillText, setPrefillText] = useState<string>('');
   // Rewind confirmation state — drives the app-level confirm modal.
@@ -271,97 +413,17 @@ export function useChat() {
   //   5. Cleanup (session change / unmount) aborts the in-flight fetch via
   //      streamAbortRef, which causes the reader to throw AbortError → loop exits.
   //
-  // Double-stream prevention: the effect runs exactly once per activeSessionId
-  // value (React's dependency array guarantees this).  The AbortController is
-  // replaced atomically; there is never more than one live controller per session.
+  // Double-stream prevention: the actual SSE connection lives in a module-level
+  // ref-counted singleton (subscribeSessionStream).  Every mounted useChat()
+  // consumer for the same session shares ONE connection, so token/thinking
+  // events are never applied twice — which is what produced the doubled,
+  // chopped streaming text.  React StrictMode's double-mount is handled by the
+  // ref count too: the synchronous subscribe→unsubscribe→subscribe cycle leaves
+  // the connection up with refCount 1.
   useEffect(() => {
     if (!activeSessionId) return;
-    const sid = activeSessionId;
-
-    // Create a fresh controller for this session.  The previous session's
-    // controller was already aborted by the prior cleanup.
-    const controller = new AbortController();
-    streamAbortRef.current = controller;
-
-    let cancelled = false; // flipped to true in cleanup to stop reconnect loops
-
-    async function connectLoop(): Promise<void> {
-      let backoffMs = 1000;
-
-      while (!cancelled) {
-        const connectStart = Date.now();
-        try {
-          const res = await fetch(`/api/bff/v1/sessions/${sid}/stream`, {
-            credentials: 'include',
-            signal: controller.signal,
-          });
-
-          if (!res.ok || !res.body) {
-            // Non-2xx (e.g. 401, 503) — back off before retrying.
-            console.warn(`[useChat] session stream ${res.status} for ${sid}; backing off ${backoffMs}ms`);
-            await delay(backoffMs, controller.signal);
-            backoffMs = Math.min(backoffMs * 2, 8000);
-            continue;
-          }
-
-          // Reset backoff on a successful connection.
-          backoffMs = 1000;
-
-          const reader = res.body.getReader();
-          let doneFired = false;
-
-          await parseSSEStream(reader, (eventType, data) => {
-            if (eventType === 'done') doneFired = true;
-            handleSSEEvent(sid, eventType, data, () => {
-              doneFired = true;
-            });
-          });
-
-          // Stream closed.  If the server sent `done` first this is a normal
-          // 5-min cycle; reconnect after a short pause.
-          if (!cancelled) {
-            if (doneFired) {
-              // Normal cycle end — reconnect quickly.
-              await delay(1000, controller.signal);
-            } else {
-              // Unexpected EOF (server restart, proxy cut) — back off.
-              console.warn(`[useChat] session stream closed unexpectedly for ${sid}; reconnecting in ${backoffMs}ms`);
-              await delay(backoffMs, controller.signal);
-              backoffMs = Math.min(backoffMs * 2, 8000);
-            }
-          }
-        } catch (e) {
-          if ((e as Error).name === 'AbortError') {
-            // Cleanup called — exit immediately.
-            break;
-          }
-          // Network / parse error.  If we failed very quickly (< 200 ms) it's
-          // likely a hard connectivity issue; back off more aggressively.
-          const elapsed = Date.now() - connectStart;
-          if (elapsed < 200) {
-            backoffMs = Math.min(backoffMs * 2, 8000);
-          }
-          if (!cancelled) {
-            console.warn(`[useChat] session stream error for ${sid}; reconnecting in ${backoffMs}ms`, e);
-            try {
-              await delay(backoffMs, controller.signal);
-            } catch {
-              break; // aborted during backoff delay
-            }
-          }
-        }
-      }
-    }
-
-    connectLoop();
-
-    return () => {
-      // Abort the in-flight fetch + any pending delay.  React double-invocation
-      // in StrictMode is fine: the second mount replaces streamAbortRef and
-      // opens a new connection, the first mount's abort fires cleanly.
-      cancelled = true;
-      controller.abort();
-    };
+    const unsubscribe = subscribeSessionStream(activeSessionId);
+    return unsubscribe;
   }, [activeSessionId]);
 
   // ── sendMessage ─────────────────────────────────────────────────────────────
@@ -564,5 +626,15 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
       clearTimeout(timer);
       reject(new DOMException('Aborted', 'AbortError'));
     }, { once: true });
+  });
+}
+
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    for (const [, handle] of activeStreams) {
+      handle.cancelled = true;
+      handle.controller.abort();
+    }
+    activeStreams.clear();
   });
 }

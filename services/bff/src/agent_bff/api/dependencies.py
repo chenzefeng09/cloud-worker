@@ -7,7 +7,12 @@ from typing import Any
 
 from fastapi import Depends
 
-from agent_bff.api.middleware import get_access_token, get_tenant_id, get_user_id
+from agent_bff.api.middleware import (
+    get_access_token,
+    get_clearance,
+    get_tenant_id,
+    get_user_id,
+)
 from agent_bff.errors import AuthenticationError
 
 
@@ -22,6 +27,11 @@ async def current_user() -> str:
 async def current_access_token() -> str:
     """Bearer token to forward to downstream foundation services."""
     return get_access_token()
+
+
+async def current_clearance() -> str:
+    """User clearance (``L1``-``L5``) for this request, or ``""`` if unknown."""
+    return get_clearance()
 
 
 def require_auth() -> Callable[..., Coroutine[Any, Any, tuple[str, str, str]]]:
@@ -47,3 +57,8 @@ def require_auth() -> Callable[..., Coroutine[Any, Any, tuple[str, str, str]]]:
 TTenantId = Depends(current_tenant)
 TUserId = Depends(current_user)
 TAccessToken = Depends(current_access_token)
+# Independent clearance dependency.  ``require_auth`` deliberately stays a
+# 3-tuple — it has 40+ unpacking sites across the BFF — so routes that need the
+# user's clearance opt in with this separate ``Depends`` instead of widening
+# every call site.  Only the orchestrator DLP-download proxy uses it today.
+TClearance = Depends(current_clearance)

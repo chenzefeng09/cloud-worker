@@ -12,6 +12,9 @@ Upstream paths (foundation-dlp; the core router is mounted under ``/core``):
     GET  /core/classification:get   (query: resource_type, resource_id)
     POST /core/check:read
     POST /core/check:download
+    GET  /core/events               (query: check_type?, decision?, limit, before?)
+    GET  /core/classifications      (query: sensitivity?, resource_type?, limit, before?)
+    GET  /core/stats                (query: since?)
 """
 
 from __future__ import annotations
@@ -101,6 +104,66 @@ async def get_classification(
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.get(
                 f"{settings.foundation_dlp_url}/core/classification:get",
+                params=_forward_params(request),
+                headers=_headers(request, _auth),
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise _connect_502(exc) from exc
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.get("/admin/dlp/events")
+async def list_events(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Scan/decision history (forwards check_type/decision/limit/before)."""
+    settings = request.app.state.settings
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{settings.foundation_dlp_url}/core/events",
+                params=_forward_params(request),
+                headers=_headers(request, _auth),
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise _connect_502(exc) from exc
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.get("/admin/dlp/classifications")
+async def list_classifications(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Tagged-resource ledger (forwards sensitivity/resource_type/limit/before)."""
+    settings = request.app.state.settings
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{settings.foundation_dlp_url}/core/classifications",
+                params=_forward_params(request),
+                headers=_headers(request, _auth),
+            )
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise _connect_502(exc) from exc
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+@router.get("/admin/dlp/stats")
+async def dlp_stats(
+    request: Request,
+    _auth: tuple = Depends(require_super_admin_bff),
+) -> dict:
+    """Governance overview counters (forwards optional ``since``)."""
+    settings = request.app.state.settings
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            resp = await client.get(
+                f"{settings.foundation_dlp_url}/core/stats",
                 params=_forward_params(request),
                 headers=_headers(request, _auth),
             )

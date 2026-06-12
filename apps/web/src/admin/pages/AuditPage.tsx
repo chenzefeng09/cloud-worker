@@ -15,7 +15,9 @@ function ActionMultiSelect({
   onChange: (next: string[]) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
   const ref = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -24,6 +26,14 @@ function ActionMultiSelect({
     };
     document.addEventListener('mousedown', onClickOutside);
     return () => document.removeEventListener('mousedown', onClickOutside);
+  }, [open]);
+
+  // Reset and focus the search box each time the popover opens.
+  useEffect(() => {
+    if (open) {
+      setQuery('');
+      searchRef.current?.focus();
+    }
   }, [open]);
 
   const toggle = (value: string) => {
@@ -35,6 +45,14 @@ function ActionMultiSelect({
   };
 
   const selectedOptions = AUDIT_ACTIONS.filter((a) => selected.includes(a.value));
+
+  // Match against 中文 label and the wire value (case-insensitive).
+  const q = query.trim().toLowerCase();
+  const matches = (a: (typeof AUDIT_ACTIONS)[number]) =>
+    q === '' || a.label.toLowerCase().includes(q) || a.value.toLowerCase().includes(q);
+  const visibleGroups = AUDIT_ACTION_GROUPS.filter((group) =>
+    AUDIT_ACTIONS.some((a) => a.group === group && matches(a)),
+  );
 
   return (
     <div className="relative" ref={ref}>
@@ -65,7 +83,17 @@ function ActionMultiSelect({
       </button>
 
       {open && (
-        <div className="absolute z-30 mt-1 w-full max-h-72 overflow-auto border border-line rounded-sm bg-surface shadow-lg p-1">
+        <div className="absolute z-30 mt-1 w-full max-h-80 overflow-auto border border-line rounded-sm bg-surface shadow-lg p-1">
+          <div className="sticky top-0 z-10 bg-surface pb-1">
+            <input
+              ref={searchRef}
+              type="text"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="搜索操作名称或标识…"
+              className="w-full border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper focus:outline-none focus:border-accent"
+            />
+          </div>
           {selected.length > 0 && (
             <button
               type="button"
@@ -75,12 +103,15 @@ function ActionMultiSelect({
               清除已选 ({selected.length})
             </button>
           )}
-          {AUDIT_ACTION_GROUPS.map((group) => (
+          {visibleGroups.length === 0 && (
+            <div className="px-2 py-3 text-[11.5px] text-dim italic">无匹配操作</div>
+          )}
+          {visibleGroups.map((group) => (
             <div key={group} className="mt-1">
               <div className="px-2 py-1 font-mono text-[9.5px] uppercase tracking-[0.1em] text-dim">
                 {group}
               </div>
-              {AUDIT_ACTIONS.filter((a) => a.group === group).map((a) => {
+              {AUDIT_ACTIONS.filter((a) => a.group === group && matches(a)).map((a) => {
                 const checked = selected.includes(a.value);
                 return (
                   <label
@@ -108,12 +139,36 @@ function ActionMultiSelect({
   );
 }
 
+// Format a Date into the local `YYYY-MM-DDTHH:mm` string a datetime-local input wants.
+function toLocalInput(d: Date): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// [from, to] window ending now and reaching back the given number of days.
+function rangeForDays(days: number): [string, string] {
+  const now = new Date();
+  const start = new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+  return [toLocalInput(start), toLocalInput(now)];
+}
+
+const QUICK_RANGES: { label: string; days: number }[] = [
+  { label: '近 24 小时', days: 1 },
+  { label: '近 7 天', days: 7 },
+  { label: '近 30 天', days: 30 },
+  { label: '近 90 天', days: 90 },
+];
+
 export function AuditPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading } = useAdminStore();
   const [tenantId, setTenantId] = useState('');
   const [actions, setActions] = useState<string[]>([]);
-  const [from, setFrom] = useState('');
-  const [to, setTo] = useState('');
+  // Default the window to the past 7 days so the form is query-ready on open.
+  const [defaultFrom, defaultTo] = rangeForDays(7);
+  const [from, setFrom] = useState(defaultFrom);
+  const [to, setTo] = useState(defaultTo);
+  // Which quick-range button is active; null once the user edits a field manually.
+  const [activeRange, setActiveRange] = useState<number | null>(7);
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -132,8 +187,8 @@ export function AuditPage() {
   const currentFilter = (): Record<string, unknown> => {
     const filter: Record<string, unknown> = {};
     if (actions.length) filter.event_types = actions;
-    if (from) filter.from = from;
-    if (to) filter.to = to;
+    if (from) filter.occurred_from = from;
+    if (to) filter.occurred_to = to;
     return filter;
   };
 
@@ -215,8 +270,8 @@ export function AuditPage() {
     try {
       const body: Record<string, unknown> = { limit: 50, tenant_id: tenantId };
       if (actions.length) body.event_types = actions;
-      if (from) body.from = from;
-      if (to) body.to = to;
+      if (from) body.occurred_from = from;
+      if (to) body.occurred_to = to;
       const data = await api.admin.audit.query(body);
       setEvents(data.items);
     } catch (err) {
@@ -245,9 +300,10 @@ export function AuditPage() {
           <div className="flex flex-col gap-1">
             <label className="text-[11px] font-mono text-dim">租户</label>
             <CustomSelect
-              options={[{ value: '', label: '全部' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+              options={tenants.map((t) => ({ value: t.id, label: t.name }))}
               value={tenantId}
               onChange={(v) => setTenantId(v)}
+              placeholder={tenantsLoading ? '加载中…' : '请选择租户'}
               disabled={tenantsLoading}
             />
           </div>
@@ -261,7 +317,10 @@ export function AuditPage() {
               type="datetime-local"
               className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
               value={from}
-              onChange={(e) => setFrom(e.target.value)}
+              onChange={(e) => {
+                setFrom(e.target.value);
+                setActiveRange(null);
+              }}
             />
           </div>
           <div className="flex flex-col gap-1">
@@ -270,9 +329,48 @@ export function AuditPage() {
               type="datetime-local"
               className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
               value={to}
-              onChange={(e) => setTo(e.target.value)}
+              onChange={(e) => {
+                setTo(e.target.value);
+                setActiveRange(null);
+              }}
             />
           </div>
+        </div>
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <span className="text-[11px] font-mono text-dim mr-0.5">快捷周期</span>
+          {QUICK_RANGES.map((r) => (
+            <button
+              key={r.days}
+              type="button"
+              onClick={() => {
+                const [nextFrom, nextTo] = rangeForDays(r.days);
+                setFrom(nextFrom);
+                setTo(nextTo);
+                setActiveRange(r.days);
+              }}
+              className={[
+                'px-2 py-0.5 text-[11px] font-mono rounded-sm border transition-colors',
+                activeRange === r.days
+                  ? 'border-accent bg-accent-soft text-accent'
+                  : 'border-line bg-paper text-ink-2 hover:bg-paper-2',
+              ].join(' ')}
+            >
+              {r.label}
+            </button>
+          ))}
+          {(from || to) && (
+            <button
+              type="button"
+              onClick={() => {
+                setFrom('');
+                setTo('');
+                setActiveRange(null);
+              }}
+              className="px-2 py-0.5 text-[11px] font-mono rounded-sm border border-line bg-paper text-dim hover:text-ink hover:bg-paper-2"
+            >
+              清除时间
+            </button>
+          )}
         </div>
         <div className="flex items-center gap-2">
           <button

@@ -3,6 +3,7 @@ import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import type { FeatureFlag, FeatureFlagUpdate, KillSwitchRequest } from '../../api/types';
 import { useConfirm, usePrompt } from '../components/dialogs';
+import { Dialog } from '../components/Dialog';
 import { CustomSelect } from '../components/CustomSelect';
 
 // ─── Chinese description mapping (future i18n: move to locale file) ─────────
@@ -50,7 +51,8 @@ function CreateFlagForm({
 
   const set = (patch: Partial<typeof form>) => setForm((f) => ({ ...f, ...patch }));
 
-  const handleSubmit = async () => {
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
     if (!form.key.trim()) { setError('Key 不能为空'); return; }
     setBusy(true);
     setError(null);
@@ -76,78 +78,77 @@ function CreateFlagForm({
   };
 
   return (
-    <div className="border border-line rounded-md p-4 bg-paper-2 space-y-3">
-      <div className="text-[13px] font-display text-ink">新增 Feature Flag</div>
+    <Dialog title="新增 Feature Flag" onClose={onCancel} dismissable={!busy} className="w-full max-w-lg">
+      <form onSubmit={handleSubmit} className="space-y-3">
+        {error && (
+          <div className="text-[12px] text-accent">{error}</div>
+        )}
 
-      {error && (
-        <div className="text-[12px] text-accent">{error}</div>
-      )}
+        <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 items-center text-[12px]">
+          <label className="font-mono text-dim">Key *</label>
+          <input
+            className="border border-line rounded-sm px-2 py-1 font-mono text-[12px] bg-paper focus:outline-none focus:border-ink-3"
+            placeholder="e.g. billing.new_feature"
+            value={form.key}
+            onChange={(e) => set({ key: e.target.value })}
+          />
 
-      <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 items-center text-[12px]">
-        <label className="font-mono text-dim">Key *</label>
-        <input
-          className="border border-line rounded-sm px-2 py-1 font-mono text-[12px] bg-paper focus:outline-none focus:border-ink-3"
-          placeholder="e.g. billing.new_feature"
-          value={form.key}
-          onChange={(e) => set({ key: e.target.value })}
-        />
+          <label className="font-mono text-dim">Name</label>
+          <input
+            className="border border-line rounded-sm px-2 py-1 font-mono text-[12px] bg-paper focus:outline-none focus:border-ink-3"
+            placeholder="可选的显示名"
+            value={form.name}
+            onChange={(e) => set({ name: e.target.value })}
+          />
 
-        <label className="font-mono text-dim">Name</label>
-        <input
-          className="border border-line rounded-sm px-2 py-1 font-mono text-[12px] bg-paper focus:outline-none focus:border-ink-3"
-          placeholder="可选的显示名"
-          value={form.name}
-          onChange={(e) => set({ name: e.target.value })}
-        />
+          <label className="font-mono text-dim">描述</label>
+          <input
+            className="border border-line rounded-sm px-2 py-1 font-mono text-[12px] bg-paper focus:outline-none focus:border-ink-3"
+            placeholder="可选"
+            value={form.description}
+            onChange={(e) => set({ description: e.target.value })}
+          />
 
-        <label className="font-mono text-dim">描述</label>
-        <input
-          className="border border-line rounded-sm px-2 py-1 font-mono text-[12px] bg-paper focus:outline-none focus:border-ink-3"
-          placeholder="可选"
-          value={form.description}
-          onChange={(e) => set({ description: e.target.value })}
-        />
-
-        <span />
-        <div className="flex items-center gap-4 text-[11px] font-mono text-ink-2">
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
-            启用
-          </label>
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <input type="checkbox" checked={form.default_value} onChange={(e) => set({ default_value: e.target.checked })} />
-            默认值 开
-          </label>
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <input type="checkbox" checked={form.fail_open} onChange={(e) => set({ fail_open: e.target.checked })} />
-            fail-open
-          </label>
-          <label className="flex items-center gap-1.5 cursor-pointer">
-            <input type="checkbox" checked={form.user_overridable} onChange={(e) => set({ user_overridable: e.target.checked })} />
-            允许用户覆盖
-          </label>
+          <span />
+          <div className="flex items-center gap-4 text-[11px] font-mono text-ink-2">
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" checked={form.enabled} onChange={(e) => set({ enabled: e.target.checked })} />
+              启用
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" checked={form.default_value} onChange={(e) => set({ default_value: e.target.checked })} />
+              默认值 开
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" checked={form.fail_open} onChange={(e) => set({ fail_open: e.target.checked })} />
+              fail-open
+            </label>
+            <label className="flex items-center gap-1.5 cursor-pointer">
+              <input type="checkbox" checked={form.user_overridable} onChange={(e) => set({ user_overridable: e.target.checked })} />
+              允许用户覆盖
+            </label>
+          </div>
         </div>
-      </div>
 
-      <div className="flex items-center gap-2 pt-1">
-        <button
-          type="button"
-          disabled={busy}
-          onClick={handleSubmit}
-          className="px-3 py-1.5 text-[11px] font-mono rounded-sm border border-green-200 text-green-700 hover:bg-green-50 disabled:opacity-50"
-        >
-          创建
-        </button>
-        <button
-          type="button"
-          disabled={busy}
-          onClick={onCancel}
-          className="px-3 py-1.5 text-[11px] font-mono rounded-sm border border-line text-dim hover:bg-paper-2 disabled:opacity-50"
-        >
-          取消
-        </button>
-      </div>
-    </div>
+        <div className="flex items-center justify-end gap-2 pt-1">
+          <button
+            type="button"
+            disabled={busy}
+            onClick={onCancel}
+            className="px-3 py-1.5 text-[11px] font-mono rounded-sm border border-line text-dim hover:bg-paper-2 disabled:opacity-50"
+          >
+            取消
+          </button>
+          <button
+            type="submit"
+            disabled={busy}
+            className="px-3 py-1.5 text-[11px] font-mono rounded-sm border border-green-200 text-green-700 hover:bg-green-50 disabled:opacity-50"
+          >
+            创建
+          </button>
+        </div>
+      </form>
+    </Dialog>
   );
 }
 
@@ -276,10 +277,10 @@ export function FeatureFlagsPage() {
         {selectedTenantId && !isTodoEndpoint && (
           <button
             type="button"
-            onClick={() => setShowCreate((v) => !v)}
+            onClick={() => setShowCreate(true)}
             className="px-3 py-1.5 text-[11px] font-mono rounded-sm border border-line text-ink-2 hover:bg-paper-2"
           >
-            {showCreate ? '取消新增' : '+ 新增'}
+            + 新增
           </button>
         )}
       </div>
@@ -328,7 +329,7 @@ export function FeatureFlagsPage() {
             </div>
           )}
 
-          {!loading && !isTodoEndpoint && flags.length === 0 && !showCreate && (
+          {!loading && !isTodoEndpoint && flags.length === 0 && (
             <div className="font-mono text-[12px] text-dim italic">暂无 Feature Flag</div>
           )}
 

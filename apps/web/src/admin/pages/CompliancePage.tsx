@@ -2,15 +2,68 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import { usePrompt, useToast } from '../components/dialogs';
-import { CustomSelect } from '../components/CustomSelect';
+import { Dialog } from '../components/Dialog';
+import { CustomSelect, GroupedSelect, ComboBox, MultiChipSelect } from '../components/CustomSelect';
 import type { ComplianceReport, DsarRecord, RopaRecord } from '../../api/types';
 
 const isTodo = (err: unknown) =>
   err instanceof ApiError && (err.status === 404 || err.status === 501 || err.status === 502);
 
+// 处理个人数据的法律依据：GDPR 第 6 条 6 项；PIPL（《个人信息保护法》）第 13 条各项。
+// 注意 PIPL 无 GDPR 的 legitimate_interests（正当利益）。
+const LEGAL_BASIS_GROUPS = [
+  {
+    label: 'PIPL 第 13 条',
+    options: [
+      { value: 'PIPL_CONSENT', label: 'PIPL_CONSENT — 知情同意' },
+      { value: 'PIPL_SEPARATE_CONSENT', label: 'PIPL_SEPARATE_CONSENT — 单独同意' },
+      { value: 'PIPL_CONTRACT', label: 'PIPL_CONTRACT — 订立/履行合同所必需' },
+      { value: 'PIPL_HR_MANAGEMENT', label: 'PIPL_HR_MANAGEMENT — 人力资源管理所必需' },
+      { value: 'PIPL_LEGAL_DUTY', label: 'PIPL_LEGAL_DUTY — 法定职责/义务所必需' },
+      { value: 'PIPL_PUBLIC_HEALTH', label: 'PIPL_PUBLIC_HEALTH — 应对突发公共卫生事件' },
+      { value: 'PIPL_PUBLIC_INTEREST', label: 'PIPL_PUBLIC_INTEREST — 公共利益新闻报道/舆论监督' },
+      { value: 'PIPL_PUBLIC_DATA', label: 'PIPL_PUBLIC_DATA — 合理处理已公开信息' },
+    ],
+  },
+  {
+    label: 'GDPR 第 6 条',
+    options: [
+      { value: 'CONSENT', label: 'CONSENT — 同意' },
+      { value: 'CONTRACT', label: 'CONTRACT — 合同所必需' },
+      { value: 'LEGAL_OBLIGATION', label: 'LEGAL_OBLIGATION — 法定义务' },
+      { value: 'VITAL_INTEREST', label: 'VITAL_INTEREST — 重大利益' },
+      { value: 'PUBLIC_TASK', label: 'PUBLIC_TASK — 公共利益/公务' },
+      { value: 'LEGITIMATE_INTEREST', label: 'LEGITIMATE_INTEREST — 正当利益' },
+    ],
+  },
+];
+
 function csv(v: string): string[] {
   return v.split(',').map((x) => x.trim()).filter(Boolean);
 }
+
+// 报告类型：后端不校验枚举（透传给上游 foundation-compliance），这里给常见预设但仍允许自定义。
+const REPORT_TYPE_OPTIONS = [
+  { value: 'annual', label: 'annual — 年度报告' },
+  { value: 'quarterly', label: 'quarterly — 季度报告' },
+  { value: 'pipl_annual', label: 'pipl_annual — PIPL 年度报告' },
+  { value: 'dpia', label: 'dpia — 数据保护影响评估' },
+];
+
+// 合规模式：固定取值，与列表中存储的小写值一致。
+const COMPLIANCE_MODE_OPTIONS = ['gdpr', 'pipl'];
+
+// 数据类别：后端不校验枚举（透传），给常见预设但仍允许自定义。ROPA（单数）与 DPIA（多值）共用。
+const DATA_CATEGORY_OPTIONS = [
+  { value: 'pii', label: 'pii — 个人身份信息' },
+  { value: 'contact', label: 'contact — 联系方式' },
+  { value: 'location', label: 'location — 位置信息' },
+  { value: 'financial', label: 'financial — 财务信息' },
+  { value: 'health', label: 'health — 健康信息' },
+  { value: 'biometric', label: 'biometric — 生物识别信息' },
+  { value: 'behavioral', label: 'behavioral — 行为/使用数据' },
+];
+const DATA_CATEGORY_VALUES = DATA_CATEGORY_OPTIONS.map((o) => o.value);
 
 export function CompliancePage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading, selectedTenantId, setSelectedTenantId } =
@@ -31,7 +84,7 @@ export function CompliancePage() {
   const [rService, setRService] = useState('');
   const [rDataCategory, setRDataCategory] = useState('');
   const [rPurpose, setRPurpose] = useState('');
-  const [rLegalBasis, setRLegalBasis] = useState('consent');
+  const [rLegalBasis, setRLegalBasis] = useState('PIPL_CONSENT');
   const [rSubjects, setRSubjects] = useState('');
   const [rRecipients, setRRecipients] = useState('');
   const [rBusy, setRBusy] = useState(false);
@@ -39,10 +92,11 @@ export function CompliancePage() {
   // Report form.
   const [repOpen, setRepOpen] = useState(false);
   const [repType, setRepType] = useState('');
-  const [repModes, setRepModes] = useState('');
+  const [repModes, setRepModes] = useState<string[]>([]);
   const [repBusy, setRepBusy] = useState(false);
 
   // DSAR.
+  const [dsarOpen, setDsarOpen] = useState(false);
   const [dsarUser, setDsarUser] = useState('');
   const [dsarType, setDsarType] = useState('access');
   const [dsarDetails, setDsarDetails] = useState('');
@@ -53,9 +107,10 @@ export function CompliancePage() {
   const [dsarQueryResult, setDsarQueryResult] = useState<DsarRecord | null>(null);
 
   // DPIA.
+  const [dpiaOpen, setDpiaOpen] = useState(false);
   const [dpiaProject, setDpiaProject] = useState('');
   const [dpiaDesc, setDpiaDesc] = useState('');
-  const [dpiaCategories, setDpiaCategories] = useState('');
+  const [dpiaCategories, setDpiaCategories] = useState<string[]>([]);
   const [dpiaBusy, setDpiaBusy] = useState(false);
   const [dpiaError, setDpiaError] = useState<string | null>(null);
 
@@ -116,11 +171,11 @@ export function CompliancePage() {
     setError(null);
     try {
       await api.admin.compliance.reports.generate(
-        { report_type: repType.trim(), compliance_modes: csv(repModes) },
+        { report_type: repType.trim(), compliance_modes: repModes },
         tid,
       );
       toast.success('已生成合规报告');
-      setRepType(''); setRepModes(''); setRepOpen(false);
+      setRepType(''); setRepModes([]); setRepOpen(false);
       refresh();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '生成失败');
@@ -142,6 +197,7 @@ export function CompliancePage() {
       );
       setDsarResult(res);
       toast.success('已创建 DSAR');
+      setDsarOpen(false);
     } catch (err) {
       setDsarError(err instanceof ApiError ? err.message : '创建失败');
     } finally {
@@ -172,7 +228,7 @@ export function CompliancePage() {
         {
           project_name: dpiaProject.trim(),
           description: dpiaDesc.trim(),
-          data_categories: csv(dpiaCategories),
+          data_categories: dpiaCategories,
           risks: [],
           mitigations: [],
         },
@@ -194,7 +250,7 @@ export function CompliancePage() {
         );
         toast.success('DPIA 已完成');
       }
-      setDpiaProject(''); setDpiaDesc(''); setDpiaCategories('');
+      setDpiaProject(''); setDpiaDesc(''); setDpiaCategories([]); setDpiaOpen(false);
     } catch (err) {
       setDpiaError(err instanceof ApiError ? err.message : '创建失败');
     } finally {
@@ -231,7 +287,8 @@ export function CompliancePage() {
           {!ropaOpen && <button onClick={() => setRopaOpen(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ 新建</button>}
         </div>
         {ropaOpen && (
-          <form onSubmit={handleCreateRopa} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 max-w-2xl">
+          <Dialog title="新建 ROPA" onClose={() => setRopaOpen(false)} dismissable={!rBusy} className="w-full max-w-2xl">
+          <form onSubmit={handleCreateRopa} className="flex flex-col gap-2">
             <div className="grid grid-cols-2 gap-2">
               <div className="flex flex-col gap-1">
                 <label className="text-[11px] text-dim font-mono">服务</label>
@@ -239,7 +296,7 @@ export function CompliancePage() {
               </div>
               <div className="flex flex-col gap-1">
                 <label className="text-[11px] text-dim font-mono">数据类别</label>
-                <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent" value={rDataCategory} onChange={(e) => setRDataCategory(e.target.value)} placeholder="contact" />
+                <ComboBox options={DATA_CATEGORY_OPTIONS} value={rDataCategory} onChange={setRDataCategory} placeholder="选择或输入…" />
               </div>
             </div>
             <div className="flex flex-col gap-1">
@@ -249,7 +306,7 @@ export function CompliancePage() {
             <div className="grid grid-cols-3 gap-2">
               <div className="flex flex-col gap-1">
                 <label className="text-[11px] text-dim font-mono">法律依据</label>
-                <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent" value={rLegalBasis} onChange={(e) => setRLegalBasis(e.target.value)} placeholder="consent" />
+                <GroupedSelect groups={LEGAL_BASIS_GROUPS} value={rLegalBasis} onChange={setRLegalBasis} />
               </div>
               <div className="flex flex-col gap-1">
                 <label className="text-[11px] text-dim font-mono">数据主体 (逗号)</label>
@@ -265,6 +322,7 @@ export function CompliancePage() {
               <button type="button" onClick={() => setRopaOpen(false)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink">取消</button>
             </div>
           </form>
+          </Dialog>
         )}
         {!loading && !todo && ropa.length === 0 && <div className="font-mono text-[12px] text-dim italic">暂无 ROPA 记录</div>}
         {ropa.length > 0 && (
@@ -298,15 +356,16 @@ export function CompliancePage() {
           {!repOpen && <button onClick={() => setRepOpen(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ 生成报告</button>}
         </div>
         {repOpen && (
-          <form onSubmit={handleGenerateReport} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 max-w-xl">
+          <Dialog title="生成合规报告" onClose={() => setRepOpen(false)} dismissable={!repBusy} className="w-full max-w-xl">
+          <form onSubmit={handleGenerateReport} className="flex flex-col gap-2">
             <div className="grid grid-cols-2 gap-2">
               <div className="flex flex-col gap-1">
                 <label className="text-[11px] text-dim font-mono">报告类型</label>
-                <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent" value={repType} onChange={(e) => setRepType(e.target.value)} placeholder="annual" />
+                <ComboBox options={REPORT_TYPE_OPTIONS} value={repType} onChange={setRepType} placeholder="选择或输入…" />
               </div>
               <div className="flex flex-col gap-1">
-                <label className="text-[11px] text-dim font-mono">合规模式 (逗号)</label>
-                <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={repModes} onChange={(e) => setRepModes(e.target.value)} placeholder="GDPR, PIPL" />
+                <label className="text-[11px] text-dim font-mono">合规模式</label>
+                <MultiChipSelect options={COMPLIANCE_MODE_OPTIONS} value={repModes} onChange={setRepModes} placeholder="选择合规模式…" />
               </div>
             </div>
             <div className="flex gap-2">
@@ -314,6 +373,7 @@ export function CompliancePage() {
               <button type="button" onClick={() => setRepOpen(false)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink">取消</button>
             </div>
           </form>
+          </Dialog>
         )}
         {!loading && !todo && reports.length === 0 && <div className="font-mono text-[12px] text-dim italic">暂无合规报告</div>}
         {reports.length > 0 && (
@@ -340,10 +400,13 @@ export function CompliancePage() {
 
       {/* DSAR */}
       <section className="flex flex-col gap-2">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">DSAR（数据主体请求）</div>
-        <div className="flex flex-col md:flex-row gap-3">
-          <form onSubmit={handleCreateDsar} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 flex-1">
-            <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">新建 DSAR</div>
+        <div className="flex items-center justify-between">
+          <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">DSAR（数据主体请求）</div>
+          {!dsarOpen && <button onClick={() => setDsarOpen(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ 新建 DSAR</button>}
+        </div>
+        {dsarOpen && (
+          <Dialog title="新建 DSAR" onClose={() => setDsarOpen(false)} dismissable={!dsarBusy} className="w-full max-w-md">
+          <form onSubmit={handleCreateDsar} className="flex flex-col gap-2">
             {dsarError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{dsarError}</div>}
             <div className="flex flex-col gap-1">
               <label className="text-[11px] text-dim font-mono">用户 ID</label>
@@ -366,15 +429,19 @@ export function CompliancePage() {
               <label className="text-[11px] text-dim font-mono">详情</label>
               <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent" value={dsarDetails} onChange={(e) => setDsarDetails(e.target.value)} />
             </div>
-            <div>
+            <div className="flex gap-2">
               <button type="submit" disabled={dsarBusy} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{dsarBusy ? '提交中…' : '创建'}</button>
+              <button type="button" onClick={() => setDsarOpen(false)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink">取消</button>
             </div>
-            {dsarResult && (
-              <div className="border-t border-line-2 pt-2 text-[12px] text-ink-2 font-mono">
-                已创建 DSAR：{dsarResult.id} · 状态 {dsarResult.status ?? '—'}
-              </div>
-            )}
           </form>
+          </Dialog>
+        )}
+        {dsarResult && (
+          <div className="border border-line rounded-md p-3 bg-surface text-[12px] text-ink-2 font-mono">
+            已创建 DSAR：{dsarResult.id} · 状态 {dsarResult.status ?? '—'}
+          </div>
+        )}
+        <div className="flex flex-col md:flex-row gap-3">
           <form onSubmit={handleQueryDsar} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 flex-1">
             <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">按 ID 查询</div>
             <div className="flex flex-col gap-1">
@@ -400,27 +467,35 @@ export function CompliancePage() {
 
       {/* DPIA */}
       <section className="flex flex-col gap-2">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">DPIA（数据保护影响评估）</div>
-        <form onSubmit={handleCreateDpia} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 max-w-2xl">
-          {dpiaError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{dpiaError}</div>}
+        <div className="flex items-center justify-between">
+          <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">DPIA（数据保护影响评估）</div>
+          {!dpiaOpen && <button onClick={() => setDpiaOpen(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ 新建 DPIA</button>}
+        </div>
+        {dpiaOpen && (
+          <Dialog title="新建 DPIA" onClose={() => setDpiaOpen(false)} dismissable={!dpiaBusy} className="w-full max-w-2xl">
+          <form onSubmit={handleCreateDpia} className="flex flex-col gap-2">
+            {dpiaError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{dpiaError}</div>}
           <div className="grid grid-cols-2 gap-2">
             <div className="flex flex-col gap-1">
               <label className="text-[11px] text-dim font-mono">项目名称</label>
               <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent" value={dpiaProject} onChange={(e) => setDpiaProject(e.target.value)} />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">数据类别 (逗号)</label>
-              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={dpiaCategories} onChange={(e) => setDpiaCategories(e.target.value)} placeholder="pii, location" />
+              <label className="text-[11px] text-dim font-mono">数据类别</label>
+              <MultiChipSelect options={DATA_CATEGORY_VALUES} value={dpiaCategories} onChange={setDpiaCategories} placeholder="选择数据类别…" />
             </div>
           </div>
           <div className="flex flex-col gap-1">
             <label className="text-[11px] text-dim font-mono">描述</label>
             <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent" value={dpiaDesc} onChange={(e) => setDpiaDesc(e.target.value)} />
           </div>
-          <div>
+          <div className="flex gap-2">
             <button type="submit" disabled={dpiaBusy} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{dpiaBusy ? '创建中…' : '创建 DPIA'}</button>
+            <button type="button" onClick={() => setDpiaOpen(false)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink">取消</button>
           </div>
         </form>
+          </Dialog>
+        )}
       </section>
     </div>
   );

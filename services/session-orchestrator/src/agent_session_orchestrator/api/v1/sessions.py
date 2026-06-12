@@ -15,13 +15,24 @@ router = APIRouter(tags=["Sessions"])
 @router.get("/sessions", response_model=CursorPage,
             dependencies=[Depends(require_permission("session.read", "session"))])
 async def list_sessions(
+    request: Request,
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
+    user_id: str = TUserId,
     cursor: str | None = None,
     limit: int = 50,
 ) -> CursorPage:
+    # IDOR guard: a normal caller may only list *their own* sessions.  The
+    # admin replay path (BFF, gated on a tenant_admin permission) forwards
+    # ``X-Actor: ADMIN`` — the same bypass signal ``require_permission`` honours
+    # — and is allowed to list every session in the tenant.  We never widen
+    # past the tenant boundary in either case.
+    is_admin = request.headers.get("X-Actor") == "ADMIN"
+    owner_filter = None if is_admin else user_id
     svc = SessionService(db, tenant_id=tenant_id)
-    items, next_cursor = await svc.list_sessions(cursor=cursor, limit=limit)
+    items, next_cursor = await svc.list_sessions(
+        user_id=owner_filter, cursor=cursor, limit=limit
+    )
     return CursorPage(
         items=[SessionOut.model_validate(s).model_dump(mode="json") for s in items],
         next_cursor=next_cursor,

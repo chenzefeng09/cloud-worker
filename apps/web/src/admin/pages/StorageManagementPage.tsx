@@ -15,6 +15,7 @@ import type {
   PromQueryRangeResponse,
 } from '../../api/types';
 import { useConfirm, useToast } from '../components/dialogs';
+import { Dialog } from '../components/Dialog';
 import { CustomSelect } from '../components/CustomSelect';
 
 // Foundation lifecycle ships four well-known bucket purposes.  Listed here
@@ -481,25 +482,20 @@ export function StorageManagementPage() {
 
       {/* Edit modal */}
       {edit.open && edit.item && (
-        <div
-          className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center"
-          onClick={closeEdit}
+        <Dialog
+          title="调整配额"
+          onClose={closeEdit}
+          dismissable={!edit.busy}
+          className="w-full max-w-[420px]"
         >
-          <form
-            onClick={(e) => e.stopPropagation()}
-            onSubmit={submitEdit}
-            className="bg-surface border border-line rounded-md p-4 w-[420px] flex flex-col gap-3"
-          >
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-              调整配额
-            </div>
-            <div className="text-[12px] text-ink">
-              {edit.item.tenant_id} · {edit.item.bucket_purpose}
-            </div>
-            <div className="text-[11px] text-dim">
-              当前已用：{formatBytes(edit.item.used_bytes)} ／ 上限{' '}
-              {formatBytes(edit.item.limit_bytes)}
-            </div>
+          <div className="text-[12px] text-ink">
+            {edit.item.tenant_id} · {edit.item.bucket_purpose}
+          </div>
+          <div className="text-[11px] text-dim">
+            当前已用：{formatBytes(edit.item.used_bytes)} ／ 上限{' '}
+            {formatBytes(edit.item.limit_bytes)}
+          </div>
+          <form onSubmit={submitEdit} className="flex flex-col gap-3">
             {edit.error && (
               <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">
                 {edit.error}
@@ -531,7 +527,8 @@ export function StorageManagementPage() {
               <button
                 type="button"
                 onClick={closeEdit}
-                className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink"
+                disabled={edit.busy}
+                className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
               >
                 取消
               </button>
@@ -544,7 +541,7 @@ export function StorageManagementPage() {
               </button>
             </div>
           </form>
-        </div>
+        </Dialog>
       )}
     </div>
   );

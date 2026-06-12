@@ -745,41 +745,49 @@ function TeamsPanel({
           团队
           {selectedOuName && <span className="text-dim ml-1.5 normal-case tracking-normal">— {selectedOuName}</span>}
         </h2>
-        {!creating && (
-          <button
-            onClick={() => setCreating(true)}
-            className="px-2 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2"
-          >
-            + 新建团队
-          </button>
-        )}
+        <button
+          onClick={() => setCreating(true)}
+          className="px-2 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2"
+        >
+          + 新建团队
+        </button>
       </div>
 
       {creating && (
-        <form onSubmit={handleCreate} className="flex items-center gap-2">
-          <input
-            autoFocus
-            className="flex-1 border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
-            placeholder="团队名称"
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            required
-          />
-          <button
-            type="submit"
-            disabled={busy || !name.trim()}
-            className="px-2.5 py-1.5 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50"
-          >
-            {busy ? '创建中…' : '创建'}
-          </button>
-          <button
-            type="button"
-            onClick={() => { setCreating(false); setName(''); }}
-            className="px-2.5 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink"
-          >
-            取消
-          </button>
-        </form>
+        <Dialog
+          title="新建团队"
+          onClose={() => { setCreating(false); setName(''); }}
+          dismissable={!busy}
+          className="w-full max-w-[440px]"
+        >
+          <form onSubmit={handleCreate} className="flex flex-col gap-3">
+            <input
+              autoFocus
+              className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
+              placeholder="团队名称"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              required
+            />
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() => { setCreating(false); setName(''); }}
+                disabled={busy}
+                className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                disabled={busy || !name.trim()}
+                className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
+              >
+                {busy ? '创建中…' : '创建'}
+              </button>
+            </div>
+          </form>
+        </Dialog>
       )}
 
       {/* Team list */}

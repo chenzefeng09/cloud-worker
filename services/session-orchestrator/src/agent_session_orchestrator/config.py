@@ -45,6 +45,20 @@ class Settings(BaseSettings):
     foundation_billing_url: str = "http://billing:8007/api/billing/v1"
     feature_flag_url: str = "http://feature-flag:8012/api/feature-flag/v1"
 
+    # Foundation DLP — data-flow controls on the attachment path:
+    #   • download check:download (fail-open on DLP error — see dlp_guard.py)
+    #   • upload   scan + classification:tag (fail-open)
+    # Env var: SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL
+    foundation_dlp_url: str = "http://foundation-dlp:8013/api/dlp/v1"
+
+    # Session-retention sweep — background job that soft-deletes sessions older
+    # than ``session_retention_days``.  Env vars carry the ``SESSION_ORCHESTRATOR_``
+    # prefix declared in ``model_config`` above, i.e.
+    #   SESSION_ORCHESTRATOR_SESSION_RETENTION_DAYS
+    #   SESSION_ORCHESTRATOR_SESSION_RETENTION_SWEEP_INTERVAL_SECONDS
+    session_retention_days: int = 30
+    session_retention_sweep_interval_seconds: int = 86400
+
     # Redis — used to read agent run hot-state (plan/step/cursor) written by the
     # runtime_worker inside the sandbox.  Key schema: agent:run:{run_id}:state.
     # Failure-open: if unset or unreachable, the /state endpoint returns DB status

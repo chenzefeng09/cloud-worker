@@ -22,7 +22,11 @@ from collections.abc import AsyncIterator
 from fastapi import Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent_session_orchestrator.api.middleware import get_tenant_id, get_user_id
+from agent_session_orchestrator.api.middleware import (
+    get_clearance,
+    get_tenant_id,
+    get_user_id,
+)
 from agent_session_orchestrator.domain.db import get_session
 
 
@@ -52,6 +56,19 @@ async def current_user() -> str:
     return get_user_id() or "SYSTEM"
 
 
+async def current_clearance() -> str:
+    """Resolve the caller's data clearance from the contextvar.
+
+    The clearance rides in on the ``X-User-Clearance`` header (injected by the
+    BFF on the download path) and is read into a contextvar by
+    :class:`RequestContextMiddleware`.  When the header is absent the
+    contextvar is an empty string, so we fall back to ``"L2"`` — a
+    conservative non-privileged default that keeps DLP ``check:download``
+    enforcing rather than silently elevating to a higher tier.
+    """
+    return get_clearance() or "L2"
+
+
 async def db_session(
     tenant_id: str = Depends(current_tenant),
     user_id: str = Depends(current_user),
@@ -68,3 +85,4 @@ async def db_session(
 TDbSession = Depends(db_session)
 TTenantId = Depends(current_tenant)
 TUserId = Depends(current_user)
+TClearance = Depends(current_clearance)

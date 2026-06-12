@@ -181,12 +181,23 @@ async def _stream_tokens(
                     entry = _coerce_redis_entry(raw_entry)
                     entry_type = entry.get("type")
 
+                    # The Redis stream entry id (e.g. "1718-0") is a globally
+                    # monotonic offset within this run's stream.  We attach it to
+                    # every emitted event so the frontend can apply tokens
+                    # idempotently: any new SSE connection replays from "0-0", so
+                    # without an offset the client re-appends already-seen tokens
+                    # (StrictMode remount / reconnect → scrambled, partly-lost
+                    # streamed text).  With ``offset`` the client drops any event
+                    # whose offset it has already applied for this run.
                     if entry_type == "end":
                         return
                     if entry_type == "delta":
                         text = entry.get("text") or ""
                         if text:
-                            yield _sse("token", {"run_id": run_id, "delta": text})
+                            yield _sse(
+                                "token",
+                                {"run_id": run_id, "delta": text, "offset": last_id},
+                            )
                     elif entry_type == "tool_call":
                         yield _sse(
                             "tool",
@@ -196,6 +207,7 @@ async def _stream_tokens(
                                 "tool_call_id": entry.get("tool_call_id") or "",
                                 "name": entry.get("name") or "tool",
                                 "args": entry.get("args") or "",
+                                "offset": last_id,
                             },
                         )
                     elif entry_type == "tool_result":
@@ -208,12 +220,16 @@ async def _stream_tokens(
                                 "name": entry.get("name") or "tool",
                                 "result": _sanitize_tool_text(entry.get("result")),
                                 "state": entry.get("state") or "",
+                                "offset": last_id,
                             },
                         )
                     elif entry_type == "thinking":
                         text = entry.get("text") or ""
                         if text:
-                            yield _sse("thinking", {"run_id": run_id, "text": text})
+                            yield _sse(
+                                "thinking",
+                                {"run_id": run_id, "text": text, "offset": last_id},
+                            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Redis token stream read failed: %s", exc)
         return
@@ -563,6 +579,17 @@ async def _persist_artifacts(
             mime = art.get("mime", "application/octet-stream")
             if not s3_key:
                 continue
+            # ── DLP scan (mount point 3): intentionally degraded ────────────
+            # The scheduler hands us only the artifact's s3_key here, not its
+            # bytes. Scanning would require an extra S3 GET per artifact on the
+            # reconcile/completion path — heavy IO we deliberately avoid so as
+            # not to slow down or destabilise run reconciliation. We therefore
+            # only record the artifact metadata and skip content scan/tagging.
+            #
+            # TODO(dlp-artifacts): scan output artifacts for sensitivity. Best
+            # done out-of-band (async worker / event consumer keyed off the
+            # attachment id + s3_key) so the reconcile path stays lightweight,
+            # then call dlp_guard.scan_and_tag on the fetched text. fail-open.
             await svc.create_attachment(
                 run.session_id,
                 user_id="SYSTEM",

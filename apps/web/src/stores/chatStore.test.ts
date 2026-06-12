@@ -28,6 +28,7 @@ const RESET_STATE = {
   sessions: [],
   activeSessionId: null,
   messages: {},
+  streamOffsets: {},
   isStreaming: false,
   isLoggedIn: false,
   userProfile: null,
@@ -182,6 +183,112 @@ describe('chatStore', () => {
     expect(msgs).toHaveLength(2);
   });
 
+  // ─── Ordered insertion by sequence (timeline ordering) ──────────────────────
+
+  it('addMessage inserts a real lower-sequence message before a higher one', () => {
+    // Race: assistant (seq=3) lands first, then the real user row (seq=1).
+    const assistant: Message = {
+      id: 'msg_asst',
+      session_id: 'ses_1',
+      role: 'ASSISTANT',
+      content: 'an answer',
+      tool_calls: null,
+      run_id: 'run_1',
+      sequence: 3,
+      created_at: '2026-01-01T00:00:03Z',
+    };
+    const user: Message = {
+      id: 'msg_user',
+      session_id: 'ses_1',
+      role: 'USER',
+      content: 'a question',
+      tool_calls: null,
+      run_id: null,
+      sequence: 1,
+      created_at: '2026-01-01T00:00:01Z',
+    };
+    useChatStore.getState().addMessage('ses_1', assistant);
+    useChatStore.getState().addMessage('ses_1', user);
+
+    const msgs = useChatStore.getState().messages['ses_1'];
+    expect(msgs).toHaveLength(2);
+    // USER must render above the ASSISTANT despite arriving second.
+    expect(msgs[0].id).toBe('msg_user');
+    expect(msgs[1].id).toBe('msg_asst');
+  });
+
+  it('addMessage inserts a real message ahead of sequence===0 streaming blocks', () => {
+    // A streaming assistant block (sequence===0) is already present when the
+    // real user row (sequence=1) arrives — the user row must jump ahead of it.
+    useChatStore.getState().appendStreamingToken('ses_1', 'run_1', 'streaming...');
+    const user: Message = {
+      id: 'msg_user',
+      session_id: 'ses_1',
+      role: 'USER',
+      content: 'hello',
+      tool_calls: null,
+      run_id: null,
+      sequence: 1,
+      created_at: '2026-01-01T00:00:01Z',
+    };
+    useChatStore.getState().addMessage('ses_1', user);
+
+    const msgs = useChatStore.getState().messages['ses_1'];
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0].id).toBe('msg_user');
+    expect(msgs[1].id).toBe('stream_run_1_0');
+  });
+
+  it('addMessage keeps real messages in strict sequence order', () => {
+    const mk = (seq: number, id: string): Message => ({
+      id,
+      session_id: 'ses_1',
+      role: 'ASSISTANT',
+      content: id,
+      tool_calls: null,
+      run_id: null,
+      sequence: seq,
+      created_at: '2026-01-01T00:00:00Z',
+    });
+    // Arrive out of order: 2, 1, 3.
+    useChatStore.getState().addMessage('ses_1', mk(2, 'b'));
+    useChatStore.getState().addMessage('ses_1', mk(1, 'a'));
+    useChatStore.getState().addMessage('ses_1', mk(3, 'c'));
+
+    const msgs = useChatStore.getState().messages['ses_1'];
+    expect(msgs.map((m) => m.id)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('addMessage replaces temp_user_ even when content whitespace differs', () => {
+    const tempMsg: Message = {
+      id: 'temp_user_42',
+      session_id: 'ses_1',
+      role: 'USER',
+      content: '你好 ', // trailing space (raw composer input)
+      tool_calls: null,
+      run_id: null,
+      sequence: 0,
+      created_at: '2026-01-01T00:00:00Z',
+    };
+    useChatStore.getState().addMessage('ses_1', tempMsg);
+
+    const realMsg: Message = {
+      id: 'msg_real_strip',
+      session_id: 'ses_1',
+      role: 'USER',
+      content: '你好', // backend .strip()ed
+      tool_calls: null,
+      run_id: null,
+      sequence: 1,
+      created_at: '2026-01-01T00:00:01Z',
+    };
+    useChatStore.getState().addMessage('ses_1', realMsg);
+
+    const msgs = useChatStore.getState().messages['ses_1'];
+    expect(msgs).toHaveLength(1); // replaced, not duplicated
+    expect(msgs[0].id).toBe('msg_real_strip');
+  });
+
   // ─── appendStreamingToken ────────────────────────────────────────────────────
 
   it('appendStreamingToken creates an open text block on first token', () => {
@@ -299,6 +406,99 @@ describe('chatStore', () => {
     expect(msgs[1].blockKind).toBe('thinking');
     expect(msgs[1].id).toBe('thinking_run_1_0');
     expect(msgs[1].content).toBe('I should plan this');
+  });
+
+  // ─── Idempotent streaming by Redis offset (replay / reconnect safety) ────────
+  //
+  // A fresh SSE connection always replays the run from "0-0", so without
+  // dedup a reconnect/StrictMode-remount re-appends already-seen deltas onto
+  // whatever text block is currently open — scrambling and partly losing the
+  // streamed reply.  Each event carries the Redis entry id as ``offset``; the
+  // store applies it only when strictly newer than the last applied for the run.
+
+  it('appendStreamingToken drops a replayed (already-applied) offset', () => {
+    const st = () => useChatStore.getState();
+    st().appendStreamingToken('ses_1', 'run_1', 'A', '1-0');
+    st().appendStreamingToken('ses_1', 'run_1', 'B', '2-0');
+    // Replay the same two deltas from the start (new connection).
+    st().appendStreamingToken('ses_1', 'run_1', 'A', '1-0');
+    st().appendStreamingToken('ses_1', 'run_1', 'B', '2-0');
+    const msgs = st().messages['ses_1'];
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].content).toBe('AB'); // not "ABAB"
+  });
+
+  it('appendStreamingToken applies a strictly-newer offset after replay', () => {
+    const st = () => useChatStore.getState();
+    st().appendStreamingToken('ses_1', 'run_1', 'A', '1-0');
+    st().appendStreamingToken('ses_1', 'run_1', 'A', '1-0'); // replayed → dropped
+    st().appendStreamingToken('ses_1', 'run_1', 'B', '2-0'); // new → applied
+    expect(st().messages['ses_1'][0].content).toBe('AB');
+  });
+
+  it('offset comparison is numeric, not lexical (10-0 > 9-0)', () => {
+    const st = () => useChatStore.getState();
+    st().appendStreamingToken('ses_1', 'run_1', 'x', '9-0');
+    // "10-0" is lexically < "9-0" but numerically greater — must be applied.
+    st().appendStreamingToken('ses_1', 'run_1', 'y', '10-0');
+    expect(st().messages['ses_1'][0].content).toBe('xy');
+  });
+
+  it('replayed thinking event is not duplicated and does not re-split text', () => {
+    const st = () => useChatStore.getState();
+    // Live: text, thinking (seals text), more text.
+    st().appendStreamingToken('ses_1', 'run_1', 'before', '1-0');
+    st().appendStreamingThinking('ses_1', 'run_1', 'plan', '2-0');
+    st().appendStreamingToken('ses_1', 'run_1', 'after', '3-0');
+    // Reconnect: replay from the start.
+    st().appendStreamingToken('ses_1', 'run_1', 'before', '1-0');
+    st().appendStreamingThinking('ses_1', 'run_1', 'plan', '2-0');
+    st().appendStreamingToken('ses_1', 'run_1', 'after', '3-0');
+
+    const msgs = st().messages['ses_1'];
+    const text = msgs.filter((m) => m.blockKind === 'text').map((m) => m.content);
+    const thinking = msgs.filter((m) => m.blockKind === 'thinking');
+    expect(thinking).toHaveLength(1); // not duplicated
+    expect(text.join('')).toBe('beforeafter'); // not scrambled/duplicated
+  });
+
+  it('offset dedup is per-run (a different run is unaffected)', () => {
+    const st = () => useChatStore.getState();
+    st().appendStreamingToken('ses_1', 'run_a', 'A', '5-0');
+    // run_b at offset "1-0" is lower than run_a's "5-0" but belongs to a
+    // different run, so it must still be applied.
+    st().appendStreamingToken('ses_1', 'run_b', 'B', '1-0');
+    const contents = st().messages['ses_1'].map((m) => m.content);
+    expect(contents).toContain('A');
+    expect(contents).toContain('B');
+  });
+
+  it('replayed tool call/result is idempotent (one tool block, merged result)', () => {
+    const st = () => useChatStore.getState();
+    st().upsertStreamingTool('ses_1', 'run_1', {
+      kind: 'call', tool_call_id: 'tc1', name: 'Read', args: '{}',
+    }, '1-0');
+    st().upsertStreamingTool('ses_1', 'run_1', {
+      kind: 'result', tool_call_id: 'tc1', name: 'Read', result: 'ok', state: 'success',
+    }, '2-0');
+    // Replay both.
+    st().upsertStreamingTool('ses_1', 'run_1', {
+      kind: 'call', tool_call_id: 'tc1', name: 'Read', args: '{}',
+    }, '1-0');
+    st().upsertStreamingTool('ses_1', 'run_1', {
+      kind: 'result', tool_call_id: 'tc1', name: 'Read', result: 'ok', state: 'success',
+    }, '2-0');
+
+    const tools = st().messages['ses_1'].filter((m) => m.blockKind === 'tool');
+    expect(tools).toHaveLength(1);
+    expect(tools[0].tool_calls?.[0].result).toBe('ok');
+  });
+
+  it('offset-less calls are always applied (legacy/test path)', () => {
+    const st = () => useChatStore.getState();
+    st().appendStreamingToken('ses_1', 'run_1', 'A');
+    st().appendStreamingToken('ses_1', 'run_1', 'B');
+    expect(st().messages['ses_1'][0].content).toBe('AB');
   });
 
   // ─── clearStreamingBlocks ────────────────────────────────────────────────────

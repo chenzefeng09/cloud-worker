@@ -619,8 +619,10 @@ def test_stream_tokens_yields_delta_events_and_stops_on_end() -> None:
 
     assert len(events) == 2, f"Expected 2 delta events, got {len(events)}: {events}"
     parsed = [json.loads(e.split("data: ")[1].strip()) for e in events]
-    assert parsed[0] == {"run_id": "run_test_1", "delta": "Hello"}
-    assert parsed[1] == {"run_id": "run_test_1", "delta": " world"}
+    # Each event carries the Redis entry id as ``offset`` for idempotent
+    # frontend replay (a reconnect re-streams from "0-0").
+    assert parsed[0] == {"run_id": "run_test_1", "delta": "Hello", "offset": "1-0"}
+    assert parsed[1] == {"run_id": "run_test_1", "delta": " world", "offset": "2-0"}
     for ev in events:
         assert ev.startswith("event: token\n"), f"Wrong event name: {ev!r}"
 
@@ -676,7 +678,7 @@ def test_stream_tokens_waits_through_worker_coldstart() -> None:
 
     assert len(events) == 1, f"Expected the post-coldstart delta, got: {events}"
     parsed = json.loads(events[0].split("data: ")[1].strip())
-    assert parsed == {"run_id": "run_cold", "delta": "spring"}
+    assert parsed == {"run_id": "run_cold", "delta": "spring", "offset": "1-0"}
     assert events[0].startswith("event: token\n")
 
 
@@ -1333,18 +1335,23 @@ def test_stream_tokens_yields_tool_and_thinking_events() -> None:
     assert call_event["name"] == "Read"
     assert call_event["args"] == '{"file_path": "/tmp/foo"}'
     assert call_event["run_id"] == "run_tool_test"
+    # Every streamed event carries its Redis entry id as ``offset`` so the
+    # frontend can apply tool/thinking events idempotently across replay.
+    assert call_event["offset"] == "2-0"
 
     assert result_event["tool_call_id"] == "tc_1"
     assert result_event["name"] == "Read"
     assert result_event["result"] == "file content"
     assert result_event["state"] == "success"
     assert result_event["run_id"] == "run_tool_test"
+    assert result_event["offset"] == "3-0"
 
     # 1 thinking
     assert event_names.count("thinking") == 1
     thinking_event = next(p[1] for p in parsed if p[0] == "thinking")
     assert thinking_event["text"] == "I see a file"
     assert thinking_event["run_id"] == "run_tool_test"
+    assert thinking_event["offset"] == "4-0"
 
     # "SHOULD NOT APPEAR" delta never yielded
     assert all(p[1].get("delta") != "SHOULD NOT APPEAR" for p in parsed if p[0] == "token")

@@ -249,8 +249,10 @@ function SessionSearch({
  * Reuses the exact same rendering chain as the live chat:
  *   groupSteps() → MessageBubble / StepGroup → chatStepRenderers (ThinkingBlock, ToolRow)
  *
- * No new API or BFF endpoints needed: the existing api.sessions.list,
- * api.runs.list, and api.messages.list are all proxied and sufficient.
+ * Session listing uses the admin-only api.admin.sessions.list() (whole-tenant,
+ * tenant_admin-gated in the BFF); runs and messages reuse the existing
+ * api.runs.list / api.messages.list proxies (scoped per session_id, which the
+ * orchestrator already tenant-checks).
  *
  * TODO (time-axis): add a step-by-step playback slider that reveals messages
  * one-by-one so operators can "scrub" through the run timeline.  The data is
@@ -266,7 +268,10 @@ export function SessionReplayPage() {
   const loadSessions = useCallback(async () => {
     setSessionsLoading(true);
     try {
-      const page = await api.sessions.list();
+      // Admin-only: lists the WHOLE tenant's sessions (gated server-side by a
+      // tenant_admin authz check).  The chat page uses api.sessions.list(),
+      // which is owner-scoped and only returns the caller's own sessions.
+      const page = await api.admin.sessions.list();
       setSessions(Array.isArray(page?.items) ? page.items : []);
     } catch {
       // failure-open

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useToast } from '../components/dialogs';
+import { Dialog } from '../components/Dialog';
 import { CustomSelect } from '../components/CustomSelect';
 
 const TIER_LABELS: Record<string, string> = {
@@ -130,8 +131,8 @@ function CreatePlanForm({ onCreated, onCancel }: { onCreated: () => void; onCanc
   };
 
   return (
-    <form onSubmit={handleSubmit} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-3">
-      <div className="text-[13px] font-display text-ink">新建套餐</div>
+    <Dialog title="新建套餐" onClose={onCancel} dismissable={!busy} className="w-full max-w-2xl">
+      <form onSubmit={handleSubmit} className="flex flex-col gap-3">
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <label className="flex flex-col gap-1">
@@ -184,7 +185,15 @@ function CreatePlanForm({ onCreated, onCancel }: { onCreated: () => void; onCanc
           ))}
         </div>
       </div>
-      <div className="flex items-center gap-2 pt-1">
+      <div className="flex items-center justify-end gap-2 pt-1">
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={busy}
+          className="px-3 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
+        >
+          取消
+        </button>
         <button
           type="submit"
           disabled={busy || !name.trim()}
@@ -192,15 +201,9 @@ function CreatePlanForm({ onCreated, onCancel }: { onCreated: () => void; onCanc
         >
           {busy ? '创建中…' : '创建套餐'}
         </button>
-        <button
-          type="button"
-          onClick={onCancel}
-          className="px-3 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink"
-        >
-          取消
-        </button>
       </div>
-    </form>
+      </form>
+    </Dialog>
   );
 }
 
@@ -245,10 +248,10 @@ export function PlanCataloguePage() {
         </div>
         {!todo && (
           <button
-            onClick={() => setShowCreate((v) => !v)}
+            onClick={() => setShowCreate(true)}
             className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2"
           >
-            {showCreate ? '收起' : '+ 新建套餐'}
+            + 新建套餐
           </button>
         )}
       </div>

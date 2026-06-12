@@ -19,8 +19,11 @@ import type {
   ComplianceReport,
   CreatePlatformApiKeyRequest,
   DlpClassification,
+  DlpClassificationList,
+  DlpEventList,
   DlpScanRequest,
   DlpScanResult,
+  DlpStats,
   DlpTagRequest,
   DpiaRecord,
   DsarRecord,
@@ -77,6 +80,8 @@ import type {
   OpsRun,
   LargeAttachmentTenantSetting,
   LargeAttachmentUserAllow,
+  LargeAttachmentSubjectAllow,
+  LargeAttachmentSubjectType,
   OrgUnit,
   PatchMcpServerRequest,
   PatchTenantRequest,
@@ -492,6 +497,17 @@ export const api = {
   },
 
   admin: {
+    // Session replay (tenant-admin only): lists EVERY session in the caller's
+    // tenant. Distinct from `api.sessions.list()`, which is now owner-scoped
+    // (a member only sees their own). Gated server-side by a tenant_admin
+    // authz check in the BFF.
+    sessions: {
+      list: (cursor?: string) =>
+        request<CursorPage<Session>>(
+          'GET',
+          `/admin/sessions?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`,
+        ),
+    },
     tenants: {
       list: () =>
         request<{ items: Tenant[] }>('GET', '/admin/tenants'),
@@ -858,6 +874,21 @@ export const api = {
           'GET',
           `/admin/dlp/classification:get${qs({ resource_type: resourceType, resource_id: resourceId, tenant_id: tenantId })}`,
         ),
+      listEvents: (
+        params: { check_type?: string; decision?: string; limit?: number; before?: string },
+        tenantId?: string,
+      ) =>
+        request<DlpEventList>('GET', `/admin/dlp/events${qs({ ...params, tenant_id: tenantId })}`),
+      listClassifications: (
+        params: { sensitivity?: string; resource_type?: string; limit?: number; before?: string },
+        tenantId?: string,
+      ) =>
+        request<DlpClassificationList>(
+          'GET',
+          `/admin/dlp/classifications${qs({ ...params, tenant_id: tenantId })}`,
+        ),
+      stats: (params: { since?: string }, tenantId?: string) =>
+        request<DlpStats>('GET', `/admin/dlp/stats${qs({ ...params, tenant_id: tenantId })}`),
     },
     // Compliance center (→ foundation-compliance): ROPA / reports / DSAR / DPIA.
     compliance: {
@@ -1075,6 +1106,22 @@ export const api = {
         request<{ deleted: boolean; user_id: string }>(
           'DELETE',
           `/admin/large-attachment/user-allows/${encodeURIComponent(userId)}${qs({ tenant_id: tenantId })}`,
+        ),
+      subjectAllows: (tenantId?: string) =>
+        request<{ items: LargeAttachmentSubjectAllow[] } | LargeAttachmentSubjectAllow[]>(
+          'GET',
+          `/admin/large-attachment/subject-allows${qs({ tenant_id: tenantId })}`,
+        ).then((r) => (Array.isArray(r) ? r : r.items ?? [])),
+      setSubjectAllow: (subjectType: LargeAttachmentSubjectType, subjectId: string, allowed: boolean, tenantId?: string) =>
+        request<LargeAttachmentSubjectAllow>(
+          'PUT',
+          `/admin/large-attachment/subject-allows${qs({ tenant_id: tenantId })}`,
+          { subject_type: subjectType, subject_id: subjectId, allowed },
+        ),
+      removeSubjectAllow: (subjectType: LargeAttachmentSubjectType, subjectId: string, tenantId?: string) =>
+        request<{ deleted: boolean; subject_type: LargeAttachmentSubjectType; subject_id: string }>(
+          'DELETE',
+          `/admin/large-attachment/subject-allows/${encodeURIComponent(subjectType)}/${encodeURIComponent(subjectId)}${qs({ tenant_id: tenantId })}`,
         ),
     },
     // Data protection (→ foundation-data-protection): masking / residency /

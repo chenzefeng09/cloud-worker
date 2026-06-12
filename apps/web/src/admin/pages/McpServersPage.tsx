@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useConfirm } from '../components/dialogs';
+import { Dialog } from '../components/Dialog';
 import { CustomSelect, MultiChipSelect } from '../components/CustomSelect';
 import type {
   McpServer,
@@ -48,13 +49,8 @@ function RegisterMcpModal({ onClose, onRegistered }: { onClose: () => void; onRe
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
-      <form
-        onSubmit={submit}
-        onClick={(e) => e.stopPropagation()}
-        className="border border-line rounded-md p-5 bg-surface flex flex-col gap-3 w-full max-w-md"
-      >
-        <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-dim">注册 MCP 服务器</div>
+    <Dialog title="注册 MCP 服务器" onClose={onClose} dismissable={!loading} className="w-full max-w-md">
+      <form onSubmit={submit} className="flex flex-col gap-3">
         {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
 
         <div className="flex flex-col gap-1">
@@ -120,13 +116,14 @@ function RegisterMcpModal({ onClose, onRegistered }: { onClose: () => void; onRe
           <button
             type="button"
             onClick={onClose}
-            className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink"
+            disabled={loading}
+            className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
           >
             取消
           </button>
         </div>
       </form>
-    </div>
+    </Dialog>
   );
 }
 

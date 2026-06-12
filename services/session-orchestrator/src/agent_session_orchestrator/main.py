@@ -1,5 +1,8 @@
 """FastAPI main app factory."""
 
+import asyncio
+import contextlib
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -9,6 +12,12 @@ from foundation_sdk.fastapi import install_request_context, register_problem_det
 from agent_session_orchestrator.config import Settings
 from agent_session_orchestrator.domain.db import close_db, init_db
 from agent_session_orchestrator.observability import init_observability
+
+logger = logging.getLogger(__name__)
+
+# Short delay before the first sweep so a fleet of pods restarting together
+# doesn't all hammer the DB at boot.
+_RETENTION_SWEEP_STARTUP_DELAY_SECONDS = 60
 
 
 def _make_blob_store(settings: Settings):  # type: ignore[no-untyped-def]
@@ -31,13 +40,46 @@ def _make_blob_store(settings: Settings):  # type: ignore[no-untyped-def]
         return None
 
 
+async def _retention_sweep_loop(settings: Settings) -> None:
+    """Periodically soft-delete sessions past the retention window.
+
+    Sleeps a short startup delay first (avoid boot-time stampede), then loops
+    forever on ``session_retention_sweep_interval_seconds`` (default 24h).
+    Any error is logged and the loop keeps running so a single bad sweep does
+    not silently kill retention enforcement.
+    """
+    # Imported lazily to keep app import light and avoid import cycles.
+    from agent_session_orchestrator.services.session_service import (
+        purge_expired_sessions,
+    )
+
+    await asyncio.sleep(_RETENTION_SWEEP_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            await purge_expired_sessions(settings, settings.session_retention_days)
+        except Exception:  # pragma: no cover — keep the loop alive
+            logger.exception("retention sweep tick failed")
+        await asyncio.sleep(settings.session_retention_sweep_interval_seconds)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = app.state.settings
     init_observability(service_name="session-orchestrator")
     await init_db(settings)
-    yield
-    await close_db()
+
+    sweep_task = asyncio.create_task(
+        _retention_sweep_loop(settings), name="session-retention-sweep"
+    )
+    try:
+        yield
+    finally:
+        sweep_task.cancel()
+        # Cancelled tasks raise CancelledError on await — expected; suppress
+        # so shutdown completes cleanly.
+        with contextlib.suppress(asyncio.CancelledError):
+            await sweep_task
+        await close_db()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

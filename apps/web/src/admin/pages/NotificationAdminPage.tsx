@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import { useToast } from '../components/dialogs';
-import { CustomSelect } from '../components/CustomSelect';
+import { CustomSelect, ComboBox } from '../components/CustomSelect';
 import type { NotificationSendRequest, NotificationTemplate } from '../../api/types';
 
 const isTodo = (err: unknown) =>
@@ -53,6 +53,34 @@ export function NotificationAdminPage() {
   }, [selectedTenantId]);
 
   useEffect(() => { load(); }, [load]);
+
+  // Distinct, non-empty event types drawn from loaded templates.
+  const eventTypeOptions = useMemo(() => {
+    const seen = new Set<string>();
+    const out: { value: string; label: string }[] = [];
+    for (const t of templates) {
+      const et = t.event_type?.trim();
+      if (et && !seen.has(et)) {
+        seen.add(et);
+        out.push({ value: et, label: et });
+      }
+    }
+    return out;
+  }, [templates]);
+
+  // Template options, filtered by the selected event type when one is set.
+  const templateOptions = useMemo(() => {
+    const seen = new Set<string>();
+    const out: { value: string; label: string }[] = [];
+    for (const t of templates) {
+      if (eventType && t.event_type !== eventType) continue;
+      const val = t.key ?? t.id;
+      if (!val || seen.has(val)) continue;
+      seen.add(val);
+      out.push({ value: val, label: val });
+    }
+    return out;
+  }, [templates, eventType]);
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -165,10 +193,10 @@ export function NotificationAdminPage() {
           <div className="grid grid-cols-2 gap-3">
             <div className="flex flex-col gap-1">
               <label className="text-[11px] text-dim font-mono">事件类型 (event_type)</label>
-              <input
-                className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
+              <ComboBox
+                options={eventTypeOptions}
                 value={eventType}
-                onChange={(e) => setEventType(e.target.value)}
+                onChange={setEventType}
                 placeholder="user.welcome"
               />
             </div>
@@ -198,10 +226,10 @@ export function NotificationAdminPage() {
           <div className="grid grid-cols-2 gap-3">
             <div className="flex flex-col gap-1">
               <label className="text-[11px] text-dim font-mono">模板 (可选)</label>
-              <input
-                className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
+              <ComboBox
+                options={templateOptions}
                 value={template}
-                onChange={(e) => setTemplate(e.target.value)}
+                onChange={setTemplate}
                 placeholder="welcome_v2"
               />
             </div>

@@ -8,6 +8,13 @@ FROM agent-platform-dev-session-orchestrator:latest
 USER root
 COPY --from=feature_flag_client . /tmp/ff-client
 RUN pip install --no-cache-dir "/tmp/ff-client[fastapi]" && rm -rf /tmp/ff-client
+# Refresh foundation_sdk from the in-repo source too. The base image installs
+# it once; when the shared SDK changes (e.g. a new contextvar/getter), a plain
+# overlay would keep the stale wheel and fail to import. Reinstall from the
+# mounted source with --no-deps (deps already present in the base) so this stays
+# a local, network-free step — no PyPI round-trip.
+COPY --from=foundation_sdk . /tmp/sdk
+RUN pip install --no-cache-dir --no-deps --force-reinstall "/tmp/sdk[fastapi]" && rm -rf /tmp/sdk
 COPY src /app/src
 # Refresh migrations + alembic.ini too: the migrate sidecar runs
 # ``alembic upgrade head`` from this same image, and the base image may carry

@@ -206,6 +206,7 @@ services:
       dockerfile: Dockerfile.overlay
       additional_contexts:
         feature_flag_client: ../../libs/feature-flag-client
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
     image: agent-platform-dev-session-orchestrator
     container_name: agent-session-orchestrator-migrate
     restart: "no"
@@ -228,6 +229,7 @@ services:
       dockerfile: Dockerfile.overlay
       additional_contexts:
         feature_flag_client: ../../libs/feature-flag-client
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
     container_name: agent-session-orchestrator
     restart: unless-stopped
     environment:

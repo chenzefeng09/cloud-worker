@@ -12,20 +12,95 @@ service can still operate behind a gateway that doesn't unwrap the JWT.
 from __future__ import annotations
 
 import logging
+import uuid
+from datetime import UTC, datetime
 
 import httpx
-from fastapi import APIRouter, Depends, Query, Request, Response, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import JSONResponse
 
 from agent_bff.api._http import foundation_headers
-from agent_bff.api.dependencies import require_auth
+from agent_bff.api.dependencies import TClearance, require_auth
 
 router = APIRouter(tags=["Sessions"])
 logger = logging.getLogger(__name__)
 
+# Tight timeout for the authz /check call backing the tenant-admin guard —
+# fail-closed (403) on timeout, same posture as require_super_admin_bff.
+_AUTHZ_TIMEOUT = 2.0
+
+# Audit event types emitted when an admin views session replay data.
+_AUDIT_EVENT_SESSION_LIST = "admin.session.list.viewed"
+
+# Short timeout so audit (a side-channel) never holds up the user-facing
+# response.  foundation-audit ingest is fire-and-forget from the BFF's view.
+_AUDIT_TIMEOUT = 5
+
 
 async def _orchestrator_url(request: Request) -> str:
     return request.app.state.settings.session_orchestrator_url
+
+
+def _new_event_id() -> str:
+    """Generate an ``evt_<26 upper-alnum>`` id.
+
+    foundation-audit's ``AuditEvent.event_id`` is constrained to the pattern
+    ``^evt_[0-9A-Z]{26}$``.  We reuse the same uuid-hex scheme the BFF domain
+    models use (``new_id``) — 26 hex chars uppercased satisfies ``[0-9A-Z]``
+    without pulling in a ULID dependency.
+    """
+    return f"evt_{uuid.uuid4().hex[:26].upper()}"
+
+
+async def _emit_session_view_audit(
+    settings,
+    tenant_id: str,
+    user_id: str,
+    access_token: str,
+    event_type: str,
+    resource_id: str | None,
+) -> None:
+    """Write a best-effort audit event for an admin session-view action.
+
+    This is a SIDE-CHANNEL: any failure (bad config, audit down, non-2xx,
+    timeout) is swallowed with a warning log and never propagates to the
+    caller.  The session-view endpoints must return their data regardless of
+    whether the audit record landed.
+
+    Posts the canonical ``AuditEvent`` shape to foundation-audit's ingest
+    endpoint ``POST {foundation_audit_url}/events`` using the same
+    ``foundation_headers`` convention every other BFF→foundation call uses
+    (``X-Tenant-Id`` / ``X-User-Id`` + bearer); the audit service builds its
+    tenant context from those headers.
+    """
+    try:
+        body = {
+            "event_id": _new_event_id(),
+            "occurred_at": datetime.now(UTC).isoformat(),
+            "tenant_id": tenant_id,
+            "service": "agent-bff",
+            "event_type": event_type,
+            "outcome": "SUCCESS",
+            "actor_kind": "ADMIN",
+            "actor_user_id": user_id,
+            "resource_type": "session",
+            "resource_id": resource_id,
+            "payload": {"via": "admin_session_view"},
+        }
+        async with httpx.AsyncClient(timeout=_AUDIT_TIMEOUT) as client:
+            resp = await client.post(
+                f"{settings.foundation_audit_url}/events",
+                json=body,
+                headers=foundation_headers(tenant_id, user_id, access_token),
+            )
+        if resp.status_code >= 400:
+            logger.warning(
+                "session-view audit rejected (%s): %s",
+                resp.status_code,
+                event_type,
+            )
+    except Exception as exc:  # noqa: BLE001 — audit is best-effort, never blocks
+        logger.warning("session-view audit emit failed (%s): %s", event_type, exc)
 
 
 def _proxy_json(resp: httpx.Response) -> JSONResponse:
@@ -37,6 +112,115 @@ def _proxy_json(resp: httpx.Response) -> JSONResponse:
     if not resp.content:
         return JSONResponse(content=None, status_code=resp.status_code)
     return JSONResponse(content=resp.json(), status_code=resp.status_code)
+
+
+async def require_tenant_admin_bff(
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> tuple[str, str, str]:
+    """BFF-side fail-closed guard for the admin session-replay surface.
+
+    Modelled on ``admin.require_super_admin_bff`` — same authz ``/check`` call
+    structure, fail-closed on every error path (unreachable / non-200 /
+    unparseable / ``allowed != True`` → 403).
+
+    Distinguishing tenant_admin from a normal member is the subtle part.  Both
+    roles hold ``session.read`` / ``session.message.read`` (see
+    saas-foundation bootstrap_tenant_roles), so checking those would let *any*
+    member through.  We instead check ``session.delete``: the ``member`` role's
+    permission list is an *explicit* set that does NOT include it, whereas
+    ``tenant_admin`` holds the ``session.*`` wildcard which matches it.  The
+    action is registered in the authz permission catalogue (migration 0002), so
+    ``/check`` returns a real allow/deny rather than PERMISSION_UNKNOWN.  This
+    gates "list the whole tenant's sessions" on a tenant-admin-only capability
+    without inventing a new permission in the sibling repo.
+    """
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+    authz_url: str = settings.authz_url
+
+    try:
+        async with httpx.AsyncClient(timeout=_AUTHZ_TIMEOUT) as client:
+            resp = await client.post(
+                f"{authz_url}/check",
+                json={
+                    "user_id": user_id,
+                    "action": "session.delete",
+                    "resource_type": "session",
+                },
+                headers={"X-Tenant-Id": tenant_id},
+            )
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError) as exc:
+        logger.warning(
+            "bff.require_tenant_admin.authz_unreachable", extra={"exc": str(exc)}
+        )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="ADMIN: authz service unreachable",
+        ) from exc
+
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"ADMIN: authz returned HTTP {resp.status_code}",
+        )
+
+    try:
+        body = resp.json()
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="ADMIN: authz response unparseable",
+        ) from None
+
+    if body.get("allowed") is not True:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="ADMIN: permission denied (tenant_admin required)",
+        )
+
+    return tenant_id, user_id, access_token
+
+
+@router.get("/admin/sessions")
+async def admin_list_sessions(
+    request: Request,
+    cursor: str | None = None,
+    limit: int = 50,
+    _auth: tuple = Depends(require_tenant_admin_bff),
+) -> JSONResponse:
+    """List EVERY session in the caller's tenant (admin replay).
+
+    Separate from ``GET /sessions`` — which is now owner-scoped — so a normal
+    member can never reach the whole-tenant listing.  Gated by
+    ``require_tenant_admin_bff``.  Forwards ``X-Actor: ADMIN`` so the
+    orchestrator skips its per-user owner filter and returns all sessions in
+    the tenant (still tenant-bound; never cross-tenant).  Emits the same
+    ``admin.session.list.viewed`` audit event as the legacy view path.
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = await _orchestrator_url(request)
+    params: dict[str, int | str] = {"limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+
+    headers = foundation_headers(tenant_id, user_id, access_token)
+    headers["X-Actor"] = "ADMIN"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{orch_url}/sessions",
+            params=params,
+            headers=headers,
+        )
+    await _emit_session_view_audit(
+        request.app.state.settings,
+        tenant_id,
+        user_id,
+        access_token,
+        _AUDIT_EVENT_SESSION_LIST,
+        None,
+    )
+    return _proxy_json(resp)
 
 
 @router.get("/sessions")
@@ -58,7 +242,10 @@ async def list_sessions(
             params=params,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-        return _proxy_json(resp)
+    # No audit here: this is the owner-scoped path (a user listing *their own*
+    # sessions), not a privileged action.  The tenant-wide replay surface
+    # ``GET /admin/sessions`` is what emits ``admin.session.list.viewed``.
+    return _proxy_json(resp)
 
 
 @router.post("/sessions", status_code=201)
@@ -238,7 +425,13 @@ async def list_messages(
             params=params,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-        return _proxy_json(resp)
+    # No audit here: this transcript endpoint is shared by the chat page (a user
+    # reading *their own* conversation), so it is not inherently a privileged
+    # action.  Audit for admin replay lives on the tenant-wide ``/admin/*``
+    # surface.  KNOWN GAP: admin replay reuses this endpoint to read a peer's
+    # messages and therefore is not yet audited at message granularity — needs a
+    # dedicated admin messages endpoint to close (out of scope here).
+    return _proxy_json(resp)
 
 
 # --------------------------------------------------------------------------- #
@@ -378,14 +571,22 @@ async def get_file_content(
     file_id: str,
     request: Request,
     _auth: tuple = Depends(require_auth()),
+    clearance: str = TClearance,
 ) -> Response:
-    """Proxy file content download from session-orchestrator."""
+    """Proxy file content download from session-orchestrator.
+
+    Forwards the caller's clearance as ``X-User-Clearance`` so the
+    orchestrator's DLP guard (``check: download``) can enforce the level — this
+    is the only BFF proxy that reaches the DLP-gated download path.
+    """
     tenant_id, user_id, access_token = _auth
     orch_url = await _orchestrator_url(request)
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(
             f"{orch_url}/sessions/{session_id}/files/{file_id}/content",
-            headers=foundation_headers(tenant_id, user_id, access_token),
+            headers=foundation_headers(
+                tenant_id, user_id, access_token, clearance=clearance
+            ),
         )
     content_type = resp.headers.get("content-type", "application/octet-stream")
     content_disp = resp.headers.get("content-disposition", "")

@@ -2,8 +2,9 @@
  * useChat tests — SSE events route to the correct session and build ordered
  * blocks in the store.
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { useChatStore } from '../stores/chatStore';
+import { subscribeSessionStream } from './useChat';
 import type { Message, ToolCallEntry } from '../api/types';
 
 // Recreate the handleSSEEvent routing logic inline so we can test it without
@@ -263,5 +264,126 @@ describe('SSE → store routing', () => {
     const msgs = useChatStore.getState().messages['ses_A'];
     expect(msgs).toHaveLength(1);
     expect(msgs[0].id).toBe('real_user_1');
+  });
+
+  // ─── Regression: a single (non-doubled) token stream stays clean ──────────
+  //
+  // Before the singleton-stream fix two useChat() consumers each opened their
+  // own SSE connection, so every token/thinking event was applied twice and
+  // interleaved → "你好你好" + chopped THOUGHT/text blocks.  With one stream the
+  // ordered pipeline produces a single clean text block (one thinking event
+  // seals it into the expected thinking → text shape — no duplication).
+  it('single token+thinking stream is not duplicated or chopped', () => {
+    dispatchSSE('ses_A', 'thinking', { run_id: 'run_z', text: '让我想想' });
+    for (const d of ['我是', '你的', '企业', '级', 'AI', '助理']) {
+      dispatchSSE('ses_A', 'token', { run_id: 'run_z', delta: d });
+    }
+    const msgs = useChatStore.getState().messages['ses_A'];
+    const textBlocks = msgs.filter((m) => m.blockKind === 'text');
+    const thinkingBlocks = msgs.filter((m) => m.blockKind === 'thinking');
+    // Exactly one thinking block and one text block — nothing doubled/chopped.
+    expect(thinkingBlocks).toHaveLength(1);
+    expect(textBlocks).toHaveLength(1);
+    expect(thinkingBlocks[0].content).toBe('让我想想');
+    expect(textBlocks[0].content).toBe('我是你的企业级AI助理');
+  });
+
+  // ─── Regression: a real USER row never lands below an assistant stream ────
+  //
+  // The addMessage sequence-ordered insertion must keep a persisted USER row
+  // (sequence>0) ahead of the in-progress streaming assistant block (which
+  // carries sequence===0), while still leaving the streamed text intact.
+  it('persisted user row inserts ahead of an in-progress assistant stream', () => {
+    // Assistant tokens streaming for run_q (sequence===0 placeholder).
+    dispatchSSE('ses_A', 'token', { run_id: 'run_q', delta: 'partial answer' });
+    // A real persisted USER row for the same turn arrives (sequence 1).
+    dispatchSSE('ses_A', 'message', {
+      id: 'user_row_1',
+      session_id: 'ses_A',
+      role: 'USER',
+      content: 'my question',
+      tool_calls: null,
+      run_id: null,
+      sequence: 1,
+      created_at: '2026-01-01',
+    });
+    const msgs = useChatStore.getState().messages['ses_A'];
+    const userIdx = msgs.findIndex((m) => m.id === 'user_row_1');
+    const streamIdx = msgs.findIndex((m) => m.blockKind === 'text' && m.streaming);
+    expect(userIdx).toBeGreaterThanOrEqual(0);
+    expect(streamIdx).toBeGreaterThanOrEqual(0);
+    // USER must come before the streaming assistant block.
+    expect(userIdx).toBeLessThan(streamIdx);
+    // ...and the streamed text is not wiped.
+    expect(msgs[streamIdx].content).toBe('partial answer');
+  });
+});
+
+// ─── Singleton SSE-stream manager: one connection per session ────────────────
+describe('subscribeSessionStream — single connection per session', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const aborts: AbortSignal[] = [];
+
+  beforeEach(() => {
+    // Teardown is now scheduled on a setTimeout (grace window for StrictMode
+    // remounts), so drive time deterministically with fake timers.
+    vi.useFakeTimers();
+    aborts.length = 0;
+    // Never-resolving fetch so the connect loop stays parked on the first await,
+    // letting us assert how many connections were opened.
+    fetchMock = vi.fn((_url: string, init: { signal: AbortSignal }) => {
+      aborts.push(init.signal);
+      return new Promise(() => {}); // pending forever
+    });
+    vi.stubGlobal('fetch', fetchMock);
+  });
+
+  afterEach(() => {
+    vi.runOnlyPendingTimers();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('two subscribers to the same session open exactly one fetch', () => {
+    const unsub1 = subscribeSessionStream('ses_one');
+    const unsub2 = subscribeSessionStream('ses_one');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(aborts[0].aborted).toBe(false);
+    unsub1();
+    // Still one subscriber left — connection stays open.
+    expect(aborts[0].aborted).toBe(false);
+    unsub2();
+    // Last subscriber gone — teardown is scheduled but not yet fired.
+    expect(aborts[0].aborted).toBe(false);
+    vi.advanceTimersByTime(100); // past the grace window
+    expect(aborts[0].aborted).toBe(true);
+  });
+
+  it('StrictMode remount (unsubscribe→resubscribe in same tick) keeps one live connection', () => {
+    const unsub1 = subscribeSessionStream('ses_sm');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // StrictMode: cleanup runs, then the effect re-runs synchronously.
+    unsub1(); // refCount 1→0, teardown scheduled
+    const unsub2 = subscribeSessionStream('ses_sm'); // refCount 0→1, cancels teardown
+    // No new fetch — the original connection was reclaimed.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(100);
+    // Connection survived the flicker: never aborted, no reconnect.
+    expect(aborts[0].aborted).toBe(false);
+    // Real teardown when the surviving subscriber actually leaves.
+    unsub2();
+    vi.advanceTimersByTime(100);
+    expect(aborts[0].aborted).toBe(true);
+  });
+
+  it('different sessions get independent connections', () => {
+    const unsubA = subscribeSessionStream('ses_a');
+    const unsubB = subscribeSessionStream('ses_b');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    unsubA();
+    unsubB();
+    vi.advanceTimersByTime(100);
+    expect(aborts[0].aborted).toBe(true);
+    expect(aborts[1].aborted).toBe(true);
   });
 });

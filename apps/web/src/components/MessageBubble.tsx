@@ -6,6 +6,7 @@ import rehypeHighlight from 'rehype-highlight';
 import { ToolRow, ThinkingBlock, markdownComponents } from './chatStepRenderers';
 import { useCopied, CopyIcon } from './CopyButton';
 import { formatRelativeTimeZh, formatAbsoluteTimeZh } from '../lib/format';
+import { sanitizeStreamingMarkdown } from '../lib/sanitizeStreamingMarkdown';
 import { useFeatureFlag } from '../hooks/useFeatureFlags';
 
 interface MessageBubbleProps {
@@ -277,6 +278,7 @@ export function MessageBubble({ message, friendly, onPreviewFile, onRewind, show
   return (
     <AssistantTextBlock
       content={message.content}
+      streaming={message.streaming}
       showCopy={showRoundCopy}
       copyText={roundCopyText}
       createdAt={message.created_at}
@@ -288,16 +290,19 @@ export function MessageBubble({ message, friendly, onPreviewFile, onRewind, show
 
 function AssistantTextBlock({
   content,
+  streaming,
   showCopy,
   copyText,
   createdAt,
 }: {
   content: string;
+  streaming?: boolean;
   showCopy?: boolean;
   copyText?: string;
   createdAt?: string;
 }) {
   const { copied, copy } = useCopied();
+  const displayContent = streaming ? sanitizeStreamingMarkdown(content) : content;
 
   return (
     // `group` lets child elements respond to hover of this container.
@@ -308,7 +313,7 @@ function AssistantTextBlock({
           rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
           components={markdownComponents}
         >
-          {content}
+          {displayContent}
         </ReactMarkdown>
       </div>
 

@@ -29,7 +29,17 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, Upload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
-from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, TUserId
+from agent_session_orchestrator.api.dependencies import (
+    TClearance,
+    TDbSession,
+    TTenantId,
+    TUserId,
+)
+from agent_session_orchestrator.api.dlp_guard import (
+    DlpDownloadDeniedError,
+    check_download,
+    scan_and_tag,
+)
 from agent_session_orchestrator.services.session_service import SessionService
 
 router = APIRouter(tags=["Attachments"])
@@ -101,6 +111,21 @@ async def upload_attachment(
     att.blob_key = blob_key
     await db.flush()
 
+    # ── DLP scan (mount point 2): fail-open ─────────────────────────────────
+    # Only text content is scanned — binary blobs (images, archives, etc.)
+    # are skipped to avoid garbage hits and decode cost. A hit does NOT reject
+    # the upload; scan_and_tag auto-classifies the attachment instead. Any DLP
+    # error is logged and swallowed inside scan_and_tag.
+    text_content = _maybe_text(data)
+    if text_content is not None:
+        await scan_and_tag(
+            dlp_url=request.app.state.settings.foundation_dlp_url,
+            tenant_id=tenant_id,
+            content=text_content,
+            resource_id=att.id,
+            resource_type="attachment",
+        )
+
     return {
         "id": att.id,
         "session_id": session_id,
@@ -154,6 +179,8 @@ async def get_file_content(
     request: Request,
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
+    user_id: str = TUserId,
+    clearance: str = TClearance,
 ) -> Response:
     """Download or preview the raw bytes for a session file.
 
@@ -166,6 +193,29 @@ async def get_file_content(
         att = await svc.get_attachment(session_id, file_id)
     except Exception:
         raise HTTPException(status_code=404, detail="file not found") from None
+
+    # ── DLP check:download (mount point 1) ──────────────────────────────────
+    # fail-OPEN on DLP error (network/timeout/non-200 → WARN, download
+    # proceeds; see dlp_guard.check_download), but an explicit allowed=false
+    # from DLP raises DlpDownloadDeniedError → 403. The Attachment model has no
+    # dedicated resource-type column, so resource_type is the constant
+    # "attachment"; resource_id is the attachment id.
+    #
+    # ``clearance`` is the caller's real data clearance, resolved from the
+    # ``X-User-Clearance`` header (injected by the BFF) via the
+    # ``current_clearance`` dependency; it falls back to "L2" when absent.
+    try:
+        await check_download(
+            dlp_url=request.app.state.settings.foundation_dlp_url,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            resource_id=att.id,
+            resource_type="attachment",
+            user_clearance=clearance,
+            destination="laptop",
+        )
+    except DlpDownloadDeniedError as exc:
+        raise HTTPException(status_code=403, detail=f"DLP: {exc.reason}") from exc
 
     try:
         import asyncio
@@ -182,6 +232,31 @@ async def get_file_content(
             "Content-Length": str(len(data)),
         },
     )
+
+
+# Cap how much of a text upload we hand to DLP scan to bound payload size /
+# latency on large files. DLP only needs a representative sample for pattern
+# matching; whole-file scanning of multi-MB uploads is not worth the cost.
+_DLP_SCAN_MAX_BYTES = 256 * 1024
+
+
+def _maybe_text(data: bytes) -> str | None:
+    """Return ``data`` decoded as UTF-8 text if it looks textual, else ``None``.
+
+    Used to gate DLP scanning so binary blobs (images, archives, PDFs) are
+    skipped — they would only produce decode errors and noise. Truncates to
+    ``_DLP_SCAN_MAX_BYTES`` before decoding to bound the scan payload.
+    """
+    if not data:
+        return None
+    sample = data[:_DLP_SCAN_MAX_BYTES]
+    # A NUL byte is a strong signal of binary content.
+    if b"\x00" in sample:
+        return None
+    try:
+        return sample.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def _content_disposition(filename: str, disposition: str = "inline") -> str:

@@ -25,6 +25,13 @@ interface ChatState {
    * Shape matches the frontend ``PlanStep`` type: ``{n, t, d, live}``.
    */
   planSteps: Record<string, PlanStep[]>;
+  /**
+   * Highest Redis-stream offset applied per run, keyed sessionId → runId →
+   * offset (e.g. "1718-0").  Drives idempotent streaming: a token/tool/thinking
+   * event whose offset is ≤ the recorded value is a replay and is dropped.  An
+   * internal bookkeeping map — never rendered, never persisted.
+   */
+  streamOffsets: Record<string, Record<string, string>>;
   isStreaming: boolean;
   isLoggedIn: boolean;
   userProfile: UserProfile | null;
@@ -78,8 +85,21 @@ interface ChatState {
    * If the last block for this run is not an open text segment, a new one is
    * created (sealed segments have `streaming: false`).
    * Block id: `stream_<runId>_<seq>` where seq is the count of text segments.
+   *
+   * Idempotency: when `offset` (the Redis stream entry id, e.g. "1718-0") is
+   * given, the delta is applied only if its offset is strictly greater than the
+   * highest offset already applied for this run.  This makes replay (a fresh SSE
+   * connection always replays from "0-0") and StrictMode reconnect harmless: a
+   * re-delivered token is dropped instead of being mis-appended to the wrong
+   * (later) text block.  Calls without an offset are always applied (legacy /
+   * tests).
    */
-  appendStreamingToken: (sessionId: string, runId: string, delta: string) => void;
+  appendStreamingToken: (
+    sessionId: string,
+    runId: string,
+    delta: string,
+    offset?: string,
+  ) => void;
 
   /**
    * Handle a tool event (kind="call" | "result").
@@ -89,13 +109,27 @@ interface ChatState {
    * - result: find the existing tool block by tool_call_id and merge
    *   result/state into it.
    */
-  upsertStreamingTool: (sessionId: string, runId: string, update: ToolCallUpdate) => void;
+  upsertStreamingTool: (
+    sessionId: string,
+    runId: string,
+    update: ToolCallUpdate,
+    offset?: string,
+  ) => void;
 
   /**
    * Handle a thinking event.  Seals the current open text block, then appends
    * a thinking block `thinking_<runId>_<seq>`.
+   *
+   * Idempotency: see `appendStreamingToken` — when `offset` is given, a thinking
+   * event already applied (offset ≤ highest seen for the run) is dropped so
+   * replay does not duplicate the thinking block.
    */
-  appendStreamingThinking: (sessionId: string, runId: string, text: string) => void;
+  appendStreamingThinking: (
+    sessionId: string,
+    runId: string,
+    text: string,
+    offset?: string,
+  ) => void;
 
   /**
    * Remove temporary blocks whose `streamRunId` matches `runId`.  Called when
@@ -163,6 +197,58 @@ function getMessages(s: { messages: Record<string, Message[]> }, sessionId: stri
 }
 
 /**
+ * Compare two Redis-stream entry ids ("<ms>-<seq>").  Returns a negative number
+ * when `a < b`, 0 when equal, positive when `a > b`.  Both components are
+ * numeric, so lexical string comparison is WRONG ("10-0" < "9-0" lexically);
+ * we parse and compare each part numerically.
+ */
+function compareOffsets(a: string, b: string): number {
+  const [aMs, aSeq] = a.split('-');
+  const [bMs, bSeq] = b.split('-');
+  const ms = Number(aMs) - Number(bMs);
+  if (ms !== 0) return ms;
+  return Number(aSeq || 0) - Number(bSeq || 0);
+}
+
+/**
+ * Decide whether a streaming event carrying `offset` for `runId` is a replay
+ * that must be dropped.  Returns `true` when the event is a duplicate (offset ≤
+ * the highest already applied for this run).  Calls without an offset are never
+ * treated as replays (always applied) — preserves legacy/test behaviour.
+ */
+function isReplayOffset(
+  s: { streamOffsets: Record<string, Record<string, string>> },
+  sessionId: string,
+  runId: string,
+  offset: string | undefined,
+): boolean {
+  if (offset === undefined) return false;
+  const last = s.streamOffsets[sessionId]?.[runId];
+  return last !== undefined && compareOffsets(offset, last) <= 0;
+}
+
+/**
+ * Return an updated `streamOffsets` map recording `offset` as the latest seen
+ * for `runId` (only advances; never moves backwards).  When `offset` is
+ * undefined the map is returned unchanged.
+ */
+function recordOffset(
+  prev: Record<string, Record<string, string>>,
+  sessionId: string,
+  runId: string,
+  offset: string | undefined,
+): Record<string, Record<string, string>> {
+  if (offset === undefined) return prev;
+  const forSession = prev[sessionId] || {};
+  const last = forSession[runId];
+  if (last !== undefined && compareOffsets(offset, last) <= 0) return prev;
+  return {
+    ...prev,
+    [sessionId]: { ...forSession, [runId]: offset },
+  };
+}
+
+/**
  * Seal the currently-open text block for a run, if there is one.
  * "Open" means: last block whose id starts with `stream_<runId>_` AND has
  * `streaming: true`.  Sealing sets `streaming: false` so that the next token
@@ -196,6 +282,7 @@ export const useChatStore = create<ChatState>((set) => ({
   activeSessionId: null,
   messages: {},
   planSteps: {},
+  streamOffsets: {},
   isStreaming: false,
   isLoggedIn: false,
   userProfile: null,
@@ -225,13 +312,18 @@ export const useChatStore = create<ChatState>((set) => ({
       if (message.id && existing.some((m) => m.id === message.id)) return s;
 
       // 2. Optimistic USER message replacement.
+      //    Compare content trimmed — the backend `.strip()`s user content, so
+      //    a temp placeholder built from raw input may carry trailing/leading
+      //    whitespace the persisted row does not.
       if (
         message.role === 'USER' &&
         message.id &&
         !message.id.startsWith('temp_user_')
       ) {
         const tempIdx = existing.findIndex(
-          (m) => m.id.startsWith('temp_user_') && m.content === message.content,
+          (m) =>
+            m.id.startsWith('temp_user_') &&
+            m.content.trim() === message.content.trim(),
         );
         if (tempIdx !== -1) {
           const updated = [...existing];
@@ -240,6 +332,33 @@ export const useChatStore = create<ChatState>((set) => ({
         }
       }
 
+      // 3. Ordered insertion for real (persisted) messages.
+      //    Streaming/optimistic placeholders carry sequence===0 and are anchored
+      //    at the current tail (they're "in progress"); a real message with
+      //    sequence>0 must land at its sequence-ordered position so that a USER
+      //    row arriving after an assistant streaming block doesn't get appended
+      //    below it. The array invariant is [real rows sorted by sequence...,
+      //    sequence===0 placeholders...]; we insert before the first element
+      //    that is either a real row with a greater sequence OR a placeholder
+      //    (sequence===0) — so the real row slots into sequence order and ahead
+      //    of any trailing streaming blocks. Real rows preserve strict sequence
+      //    order, which keeps same-run messages contiguous for groupSteps.
+      if (message.sequence > 0) {
+        const insertIdx = existing.findIndex(
+          (m) => m.sequence === 0 || m.sequence > message.sequence,
+        );
+        if (insertIdx !== -1) {
+          const updated = [
+            ...existing.slice(0, insertIdx),
+            message,
+            ...existing.slice(insertIdx),
+          ];
+          return { messages: { ...s.messages, [sessionId]: updated } };
+        }
+      }
+
+      // 4. Fallback: placeholder/streaming block (sequence===0) or a real
+      //    message that belongs at the tail → append.
       return {
         messages: { ...s.messages, [sessionId]: [...existing, message] },
       };
@@ -256,9 +375,16 @@ export const useChatStore = create<ChatState>((set) => ({
 
   // ── Ordered streaming pipeline ────────────────────────────────────────────
 
-  appendStreamingToken: (sessionId, runId, delta) =>
+  appendStreamingToken: (sessionId, runId, delta, offset) =>
     set((s) => {
+      // Idempotency guard: drop a token we've already applied for this run.
+      // Without this, a reconnect/StrictMode-remount replays the run from
+      // "0-0" and re-appends earlier deltas onto whatever text block is
+      // currently open — scrambling and partly losing the streamed text.
+      if (isReplayOffset(s, sessionId, runId, offset)) return s;
+
       const existing = getMessages(s, sessionId);
+      const streamOffsets = recordOffset(s.streamOffsets, sessionId, runId, offset);
 
       // Look for the most-recent block for this run that is an open text block.
       for (let i = existing.length - 1; i >= 0; i--) {
@@ -267,7 +393,7 @@ export const useChatStore = create<ChatState>((set) => ({
           // Append delta to this block.
           const updated = [...existing];
           updated[i] = { ...m, content: m.content + delta };
-          return { messages: { ...s.messages, [sessionId]: updated } };
+          return { messages: { ...s.messages, [sessionId]: updated }, streamOffsets };
         }
         // Stop scanning once we pass all blocks for this run (hit an older run or user msg).
         if (m.streamRunId && m.streamRunId !== runId) break;
@@ -290,11 +416,17 @@ export const useChatStore = create<ChatState>((set) => ({
       };
       return {
         messages: { ...s.messages, [sessionId]: [...existing, placeholder] },
+        streamOffsets,
       };
     }),
 
-  upsertStreamingTool: (sessionId, runId, update) =>
+  upsertStreamingTool: (sessionId, runId, update, offset) =>
     set((s) => {
+      // Idempotency guard: a replayed tool_call/tool_result is dropped so a
+      // reconnect doesn't re-seal text blocks or re-merge results.
+      if (isReplayOffset(s, sessionId, runId, offset)) return s;
+      const streamOffsets = recordOffset(s.streamOffsets, sessionId, runId, offset);
+
       let existing = getMessages(s, sessionId);
 
       if (update.kind === 'call') {
@@ -338,16 +470,17 @@ export const useChatStore = create<ChatState>((set) => ({
           };
           return {
             messages: { ...s.messages, [sessionId]: [...existing, toolBlock] },
+            streamOffsets,
           };
         }
         // Already exists (shouldn't happen for kind=call, but safe fallback).
-        return { messages: { ...s.messages, [sessionId]: existing } };
+        return { messages: { ...s.messages, [sessionId]: existing }, streamOffsets };
       }
 
       // kind === 'result': merge into existing tool block.
       const toolBlockId = `tool_${runId}_${update.tool_call_id}`;
       const idx = existing.findIndex((m) => m.id === toolBlockId);
-      if (idx === -1) return s;
+      if (idx === -1) return { ...s, streamOffsets };
 
       const updated = [...existing];
       const prev = updated[idx];
@@ -357,11 +490,17 @@ export const useChatStore = create<ChatState>((set) => ({
           : tc,
       );
       updated[idx] = { ...prev, tool_calls: calls, streaming: false };
-      return { messages: { ...s.messages, [sessionId]: updated } };
+      return { messages: { ...s.messages, [sessionId]: updated }, streamOffsets };
     }),
 
-  appendStreamingThinking: (sessionId, runId, text) =>
+  appendStreamingThinking: (sessionId, runId, text, offset) =>
     set((s) => {
+      // Idempotency guard: a replayed thinking event would (a) duplicate the
+      // thinking block and (b) seal the open text block again, splitting the
+      // streamed reply.  Drop it.
+      if (isReplayOffset(s, sessionId, runId, offset)) return s;
+      const streamOffsets = recordOffset(s.streamOffsets, sessionId, runId, offset);
+
       let existing = getMessages(s, sessionId);
 
       // Seal any open text block.
@@ -386,6 +525,7 @@ export const useChatStore = create<ChatState>((set) => ({
       };
       return {
         messages: { ...s.messages, [sessionId]: [...existing, thinkingBlock] },
+        streamOffsets,
       };
     }),
 
@@ -462,6 +602,7 @@ export const useChatStore = create<ChatState>((set) => ({
       sessions: [],
       messages: {},
       planSteps: {},
+      streamOffsets: {},
       activeSessionId: null,
       bootstrapped: true,
       selectedSkills: {},

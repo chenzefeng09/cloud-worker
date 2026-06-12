@@ -3,6 +3,7 @@ import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import type { AdminUser, InviteUserRequest } from '../../api/types';
 import { useConfirm, useToast } from '../components/dialogs';
+import { Dialog } from '../components/Dialog';
 import { CustomSelect } from '../components/CustomSelect';
 
 /**
@@ -68,63 +69,55 @@ function InviteUserDialog({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center pt-[12vh] bg-black/30" onClick={onClose}>
-      <form
-        onSubmit={handleSubmit}
-        className="bg-paper border border-line rounded-lg shadow-xl w-[440px] flex flex-col"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="px-5 pt-5 pb-3 border-b border-line">
-          <h2 className="text-[15px] font-display text-ink tracking-[-0.02em]">邀请用户</h2>
-          <p className="text-[11px] text-dim mt-0.5">
-            {tenantId ? '邀请将加入当前筛选的租户' : '邀请将加入你所属的租户'}
-          </p>
-        </div>
+    <Dialog title="邀请用户" onClose={onClose} dismissable={!loading} className="w-full max-w-[440px]">
+      <p className="text-[11px] text-dim -mt-1">
+        {tenantId ? '邀请将加入当前筛选的租户' : '邀请将加入你所属的租户'}
+      </p>
 
-        <div className="px-5 py-4 flex flex-col gap-3">
-          {error && (
-            <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>
-          )}
-          <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">邮箱</label>
-            <input
-              className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="user@acme.co"
-              required
-            />
-          </div>
-          <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">显示名 (可选)</label>
-            <input
-              className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              placeholder="张三"
-            />
-          </div>
-          <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">角色 (逗号分隔, 可选)</label>
-            <input
-              className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
-              value={roles}
-              onChange={(e) => setRoles(e.target.value)}
-              placeholder="member, viewer"
-            />
-          </div>
-          <label className="flex items-center gap-2 cursor-pointer mt-1">
-            <input type="checkbox" checked={sendEmail} onChange={(e) => setSendEmail(e.target.checked)} />
-            <span className="text-[12px] text-ink-2">发送邀请邮件</span>
-          </label>
+      <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+        {error && (
+          <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>
+        )}
+        <div className="flex flex-col gap-1">
+          <label className="text-[11px] text-dim font-mono">邮箱</label>
+          <input
+            className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            placeholder="user@acme.co"
+            required
+          />
         </div>
+        <div className="flex flex-col gap-1">
+          <label className="text-[11px] text-dim font-mono">显示名 (可选)</label>
+          <input
+            className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+            placeholder="张三"
+          />
+        </div>
+        <div className="flex flex-col gap-1">
+          <label className="text-[11px] text-dim font-mono">角色 (逗号分隔, 可选)</label>
+          <input
+            className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
+            value={roles}
+            onChange={(e) => setRoles(e.target.value)}
+            placeholder="member, viewer"
+          />
+        </div>
+        <label className="flex items-center gap-2 cursor-pointer mt-1">
+          <input type="checkbox" checked={sendEmail} onChange={(e) => setSendEmail(e.target.checked)} />
+          <span className="text-[12px] text-ink-2">发送邀请邮件</span>
+        </label>
 
-        <div className="px-5 py-3 border-t border-line flex items-center justify-end gap-2">
+        <div className="flex items-center justify-end gap-2 pt-1">
           <button
             type="button"
             onClick={onClose}
-            className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink"
+            disabled={loading}
+            className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
           >
             取消
           </button>
@@ -137,7 +130,7 @@ function InviteUserDialog({
           </button>
         </div>
       </form>
-    </div>
+    </Dialog>
   );
 }
 

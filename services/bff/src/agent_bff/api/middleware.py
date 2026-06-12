@@ -35,17 +35,29 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "SessionMiddleware",
     "get_access_token",
+    "get_clearance",
     "get_request_id",
     "get_tenant_id",
     "get_user_id",
 ]
 
 _access_token_var: ContextVar[str] = ContextVar("agent_bff.access_token", default="")
+_clearance_var: ContextVar[str] = ContextVar("agent_bff.clearance", default="")
 
 
 def get_access_token() -> str:
     """Bearer token to forward to foundation services this request."""
     return _access_token_var.get()
+
+
+def get_clearance() -> str:
+    """User clearance (``L1``-``L5``) for this request, or ``""`` if unknown.
+
+    Sourced from the signed session cookie payload (set at login from the
+    access token's ``clearance`` claim); forwarded to session-orchestrator as
+    ``X-User-Clearance`` on DLP-gated download proxies.
+    """
+    return _clearance_var.get()
 
 
 class SessionMiddleware(BaseHTTPMiddleware):
@@ -80,5 +92,6 @@ class SessionMiddleware(BaseHTTPMiddleware):
                     user_id=str(payload.get("user_id", "")),
                 )
                 _access_token_var.set(str(payload.get("access_token", "")))
+                _clearance_var.set(str(payload.get("clearance", "")))
 
         return await call_next(request)
