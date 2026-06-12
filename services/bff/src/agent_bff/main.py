@@ -175,6 +175,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.include_router(admin_data_protection_router, prefix=settings.api_prefix)
 
+    from agent_bff.api.v1.admin_metrics import (
+        router as admin_metrics_router,
+    )
+    app.include_router(admin_metrics_router, prefix=settings.api_prefix)
+
     from agent_bff.api.v1.billing import router as billing_router
     app.include_router(billing_router, prefix=settings.api_prefix)
 
