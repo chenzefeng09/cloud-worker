@@ -14,7 +14,7 @@ import secrets
 
 import pytest
 
-from agent_scheduler.config import Settings
+from agent_scheduler.config import SANDBOX_TOKEN_SCOPES, Settings
 
 _PLACEHOLDER = "dev-tool-broker-lease-secret-change-me"
 
@@ -67,3 +67,30 @@ def test_dev_broker_mode_allows_placeholder_secret() -> None:
         tool_broker_lease_secret=_PLACEHOLDER,
     )
     assert settings.env == "dev"
+
+
+# --- Security fix B7: least-privilege sandbox token scopes ------------------
+
+
+def test_sandbox_token_scopes_excludes_broker_unreachable_caps() -> None:
+    """``notification.send`` was a dead capability and must stay removed.
+
+    Nothing in the sandbox/worker path consumes it, there is no tool-broker
+    route proxying to a notification service, and it is absent from
+    ``egress_policy.BROKER_LEASE_SCOPES`` — carrying it only widened the
+    token's blast radius if leaked.
+    """
+    assert "notification.send" not in SANDBOX_TOKEN_SCOPES
+
+
+def test_sandbox_token_scopes_keeps_required_caps() -> None:
+    """The capabilities the sandbox genuinely uses must remain.
+
+    * ``llm-gateway.invoke`` — gates the model-call façade (broker + direct).
+    * ``audit.write`` — the ``event_audit_sink`` worker extension POSTs agent
+      events directly to the foundation audit service in ``foundation`` egress
+      mode, where the scope is genuinely enforced; dropping it would break
+      audit forwarding there.
+    """
+    assert "llm-gateway.invoke" in SANDBOX_TOKEN_SCOPES
+    assert "audit.write" in SANDBOX_TOKEN_SCOPES

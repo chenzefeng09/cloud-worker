@@ -47,12 +47,25 @@ def _lease_secret_is_weak(secret: str) -> bool:
     )
 
 # Smallest scope set that lets the in-sandbox AgentScope worker do useful
-# work: call the LLM gateway, write audit events for tool calls, and
-# dispatch notifications.  Expanding this list is a code change, on purpose.
+# work.  Expanding this list is a code change, on purpose.
+#
+# Security fix B7 (least privilege) — ``notification.send`` was removed: it was
+# a dead capability in the sandbox token.  Nothing in the sandbox/worker path
+# consumes it (no ``notification``/``notify`` caller in agentscope_ext), there
+# is no tool-broker route that proxies to a notification service, and it is not
+# in ``egress_policy.BROKER_LEASE_SCOPES``.  Carrying it only widened the
+# token's blast radius if leaked, for zero functional benefit.
+#
+# ``audit.write`` is deliberately KEPT: the ``event_audit_sink`` worker
+# extension (default-enabled via ``runtime_extensions``) POSTs each agent event
+# directly to ``{FOUNDATION_API_URL}/audit/v1/events`` carrying this minted
+# token.  That direct call is air-gapped (and silently fails open) in ``broker``
+# egress mode, but in ``foundation`` egress mode the sandbox shares the
+# foundation network and the audit service genuinely enforces ``audit.write``.
+# Dropping it would break audit forwarding in foundation mode, so it stays.
 SANDBOX_TOKEN_SCOPES: tuple[str, ...] = (
     "audit.write",
     "llm-gateway.invoke",
-    "notification.send",
 )
 
 # Comma-separated X-Service-Scopes value the scheduler injects into the sandbox

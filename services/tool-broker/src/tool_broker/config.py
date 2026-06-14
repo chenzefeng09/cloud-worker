@@ -60,6 +60,14 @@ class Settings(BaseSettings):
     skill_store_url: str = "http://skill-store:8011/api/skills/v1"
     web_fetch_gateway_url: str = "http://web-fetch-gateway:8013/api/web-fetch/v1"
 
+    # --- B2: per-route upstream path allowlist -----------------------------
+    # Each passthrough proxy route forwards the sandbox-chosen ``{path}`` to an
+    # upstream service.  Without a constraint that is an open passthrough into
+    # the upstream's entire GET/POST surface.  The toggle below lets dev/tests
+    # opt out, but production keeps it on (the default) so a sandbox can reach
+    # ONLY the specific upstream paths the worker's extensions actually call.
+    enforce_upstream_allowlist: bool = True
+
     # --- /state façade (Redis) ---------------------------------------------
     # The broker's OWN trusted connection to foundation Redis.  This is never
     # exposed to the sandbox; sandboxes reach Redis only through the narrow

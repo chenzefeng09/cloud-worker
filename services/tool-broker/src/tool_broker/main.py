@@ -80,6 +80,128 @@ _HOP_BY_HOP_RESPONSE_HEADERS = frozenset(
 
 _ALLOWED_METHODS = frozenset({"GET", "POST", "HEAD"})
 
+
+# ---------------------------------------------------------------------------
+# B2: per-route upstream path allowlist
+# ---------------------------------------------------------------------------
+#
+# Each passthrough proxy route forwards a sandbox-chosen ``{path}`` to its
+# upstream service.  Left unconstrained, ``{path}`` is an open door into the
+# upstream's whole GET/POST surface.  We pin each route to the SMALL set of
+# upstream paths the worker's in-sandbox extensions actually call, derived by
+# reading those extensions (file:line cited per entry).  The path is normalised
+# (leading/trailing slashes stripped, query already dropped, ``..`` traversal
+# rejected) and compared case-sensitively.  ``exact`` entries must match the
+# whole normalised path; ``prefixes`` entries match the path or any deeper
+# child (``entry`` or ``entry/...``).
+#
+# Correctness (never break a legit worker call) beats tightness: where the live
+# call set cannot be confirmed (skills — see below) we use a narrow ``/internal``
+# prefix rather than an over-tight exact rule.
+
+
+class _UpstreamAllowlist:
+    """An allowlist of permitted upstream paths for one proxy route.
+
+    ``exact`` paths must equal the normalised request path; ``prefixes`` match
+    the path itself or any deeper segment (``p`` or ``p/<rest>``).  All entries
+    are stored without leading/trailing slashes and compared case-sensitively.
+    """
+
+    def __init__(
+        self,
+        *,
+        exact: frozenset[str] = frozenset(),
+        prefixes: tuple[str, ...] = (),
+    ) -> None:
+        self.exact = frozenset(p.strip("/") for p in exact)
+        self.prefixes = tuple(p.strip("/") for p in prefixes)
+
+    def allows(self, normalized_path: str) -> bool:
+        """Return ``True`` when ``normalized_path`` is permitted by this route."""
+        if normalized_path in self.exact:
+            return True
+        return any(
+            normalized_path == prefix or normalized_path.startswith(prefix + "/")
+            for prefix in self.prefixes
+        )
+
+
+# The route key is the required scope (already threaded through ``_proxy``),
+# which uniquely identifies each passthrough route.
+_UPSTREAM_ALLOWLISTS: dict[str, _UpstreamAllowlist] = {
+    # llm-gateway: the OpenAI SDK in llm_gateway_enforcer.model._build_openai_
+    # gateway_model only ever POSTs chat completions — the SDK appends
+    # ``/chat/completions`` to ``LLM_GATEWAY_URL`` (model.py docstring lines
+    # 5-8 and 122-124).  The enforcer never calls ``/models`` or any other
+    # endpoint, so the tightest correct rule is the single exact path.
+    "llm-gateway.invoke": _UpstreamAllowlist(
+        exact=frozenset({"chat/completions"}),
+    ),
+    # mcp-registry: mcp_tenant_injector.injector.fetch_mcp_servers issues a
+    # single GET to ``{base}/internal/mcp-servers`` (injector.py:56).  Exact.
+    "mcp.read_internal": _UpstreamAllowlist(
+        exact=frozenset({"internal/mcp-servers"}),
+    ),
+    # skill-store: the in-sandbox skills_loader no longer resolves over the
+    # network (skills are bind-mounted read-only — skills_loader/__init__.py
+    # module docstring; egress_policy.py:141-143 keeps SKILL_STORE_URL only
+    # for legacy sandbox-side loaders).  So there is NO confirmed live call on
+    # this route today.  The legacy loader hit skill-store's internal endpoints
+    # (skill_store/api/v1/skills.py:260 ``/internal/skills`` and :299
+    # ``/internal/skills/resolve``).  We therefore allow the ``internal/skills``
+    # PREFIX — meaningfully narrower than the open passthrough, and it keeps any
+    # legacy loader working — rather than guessing a too-tight exact rule.
+    "skill.read_internal": _UpstreamAllowlist(
+        prefixes=("internal/skills",),
+    ),
+    # web-fetch-gateway: web_fetch.tool.WebFetchTool._fetch_text POSTs a single
+    # ``/fetch`` endpoint (tool.py:200-203; web_fetch/__init__.py docstring
+    # line 15).  Exact.
+    "web_fetch.invoke": _UpstreamAllowlist(
+        exact=frozenset({"fetch"}),
+    ),
+}
+
+
+def _normalize_upstream_path(path: str) -> str:
+    """Normalise a proxy ``{path}`` for allowlist comparison.
+
+    Strips leading/trailing slashes (the query string is already excluded by
+    FastAPI's ``{path:path}`` capture) and rejects path traversal: any segment
+    equal to ``.`` or ``..`` raises 403 so a sandbox cannot climb out of the
+    intended upstream surface.
+    """
+    candidate = (path or "").strip("/")
+    segments = candidate.split("/") if candidate else []
+    if any(segment in ("", ".", "..") for segment in segments):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="tool-broker: upstream path not allowed",
+        )
+    return candidate
+
+
+def _enforce_upstream_allowlist(
+    settings: Settings, *, required_scope: str, path: str
+) -> None:
+    """Reject ``path`` unless it is on ``required_scope``'s route allowlist.
+
+    No-op when ``enforce_upstream_allowlist`` is disabled (dev/tests).  Raises
+    403 ``tool-broker: upstream path not allowed`` for an unknown route or a
+    path outside the route's allowlist.
+    """
+    if not settings.enforce_upstream_allowlist:
+        return
+    normalized = _normalize_upstream_path(path)
+    allowlist = _UPSTREAM_ALLOWLISTS.get(required_scope)
+    if allowlist is None or not allowlist.allows(normalized):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="tool-broker: upstream path not allowed",
+        )
+
+
 router = APIRouter(tags=["Tool Broker"])
 
 
@@ -95,6 +217,22 @@ def _target_url(base_url: str, path: str, query: str) -> str:
 
 
 def _require_auth(request: Request, settings: Settings) -> str:
+    # TODO(security, B7): the Bearer token here is a real JWT minted by the
+    # identity service (audience "foundation", tenant-bound), but the broker
+    # only does a prefix/presence check below — it does NOT verify the
+    # signature.  Full verification was deferred because the broker has no
+    # access to the identity service's signing key: there is no JWKS URL or
+    # public-key config field (see config.Settings), no JWT library in
+    # pyproject.toml (fastapi/httpx/redis/boto3 only), and no foundation_sdk
+    # available to it; the JWKS lives in the separate saas-foundation repo.
+    # Bolting on PyJWT + cross-repo key fetching would add a fragile new
+    # dependency for marginal gain — the HMAC per-run lease (_require_lease,
+    # signed by the scheduler's tool_broker_lease_secret) is already the real
+    # per-run authority enforced on every façade.  To implement later: add a
+    # ``identity_jwks_url`` / ``identity_public_key`` config field, and when it
+    # is set verify the token's signature + ``aud == "foundation"`` + ``exp`` +
+    # that the token's tenant claim matches ``X-Tenant-Id`` here; when it is
+    # unset, keep the current prefix-only behaviour so dev/tests don't break.
     if not settings.require_auth:
         return request.headers.get("X-Tenant-Id", "")
 
@@ -301,6 +439,10 @@ async def _proxy(
             status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
             detail=f"method {request.method!r} is not allowed through tool-broker",
         )
+
+    # B2: constrain the open ``{path}`` passthrough to the route's allowlist of
+    # known upstream paths before we build or forward the upstream request.
+    _enforce_upstream_allowlist(settings, required_scope=required_scope, path=path)
 
     query = urlencode(list(request.query_params.multi_items()))
     target = _target_url(upstream_base_url, path, query)
@@ -676,12 +818,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     if settings is None:
         settings = Settings()
 
+    # L1: the broker is reached only by untrusted sandboxes, so it must not
+    # advertise its control-plane API.  Disabling the schema + docs endpoints
+    # (``openapi_url=None`` also disables ``/docs`` and ``/redoc``, but we set
+    # all three explicitly for clarity) stops a sandbox enumerating the whole
+    # surface via ``/openapi.json``.  ``/healthz`` is a normal route and is
+    # unaffected — only the schema endpoints go away.
     app = FastAPI(
         title="Tool Broker",
         version="0.1.0a1",
         description="Controlled sandbox façade for foundation tool services.",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
     app.state.settings = settings
+
+    @app.middleware("http")
+    async def _strip_server_header(request: Request, call_next):
+        """L3: drop the ``Server`` header so the broker doesn't leak uvicorn.
+
+        Works regardless of how the app is launched (uvicorn programmatically,
+        gunicorn, a different ASGI server), so it is more robust than relying on
+        ``server_header=False`` at the uvicorn call site.
+        """
+        response = await call_next(request)
+        # Starlette's ``MutableHeaders`` supports ``__delitem__``/``__contains__``
+        # but not ``pop``; delete the (case-insensitive) header only if present.
+        if "server" in response.headers:
+            del response.headers["server"]
+        return response
+
     app.include_router(router, prefix=settings.api_prefix)
     return app
 

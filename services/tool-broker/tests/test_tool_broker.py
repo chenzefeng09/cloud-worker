@@ -561,7 +561,7 @@ def test_sandbox_identity_headers_are_dropped_and_lease_wins(monkeypatch) -> Non
     client = _client(require_auth=True)
 
     resp = client.post(
-        "/api/tool-broker/v1/mcp/v1/servers",
+        "/api/tool-broker/v1/mcp/v1/internal/mcp-servers",
         headers={
             "Authorization": "Bearer sandbox-token",
             "X-Tenant-Id": "tnt_123",
@@ -626,7 +626,7 @@ def test_mcp_proxy_injects_trusted_service_scope_dropping_spoof(monkeypatch) -> 
     client = _client(require_auth=True)
 
     resp = client.post(
-        "/api/tool-broker/v1/mcp/v1/servers",
+        "/api/tool-broker/v1/mcp/v1/internal/mcp-servers",
         headers={
             "Authorization": "Bearer sandbox-token",
             "X-Tenant-Id": "tnt_123",
@@ -649,7 +649,7 @@ def test_skills_proxy_injects_trusted_service_scope_dropping_spoof(monkeypatch) 
     client = _client(require_auth=True)
 
     resp = client.get(
-        "/api/tool-broker/v1/skills/v1/skills/my-skill",
+        "/api/tool-broker/v1/skills/v1/internal/skills/resolve",
         headers={
             "Authorization": "Bearer sandbox-token",
             "X-Tenant-Id": "tnt_123",
@@ -749,3 +749,199 @@ def test_config_allows_placeholder_lease_secret_in_dev() -> None:
     # Dev tolerates the shipped placeholder so the local stack just works.
     settings = Settings(env="dev", lease_secret="dev-tool-broker-lease-secret-change-me")
     assert settings.env == "dev"
+
+
+# ---------------------------------------------------------------------------
+# B2: per-route upstream path allowlist
+# ---------------------------------------------------------------------------
+#
+# Each passthrough route must forward ONLY the small set of upstream paths the
+# worker's extensions actually call (derived by reading those extensions), and
+# 403 ``tool-broker: upstream path not allowed`` for anything else.  The
+# allowed-path cases prove a legit call still reaches the (fake) upstream; the
+# disallowed cases prove the broker refuses before any upstream request.
+
+
+def _proxy_client(monkeypatch) -> TestClient:
+    """Patch ``httpx.AsyncClient`` with the recording fake and return a client."""
+    _FakeAsyncClient.calls = []
+    monkeypatch.setattr("tool_broker.main.httpx.AsyncClient", _FakeAsyncClient)
+    return _client(require_auth=True)
+
+
+def test_b2_llm_gateway_allows_chat_completions(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    resp = client.post(
+        "/api/tool-broker/v1/llm-gateway/v1/chat/completions",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-Tool-Broker-Lease": _lease(["llm-gateway.invoke"]),
+        },
+        json={"model": "m", "messages": []},
+    )
+    assert resp.status_code == 200
+    assert len(_FakeAsyncClient.calls) == 1
+
+
+def test_b2_llm_gateway_blocks_unlisted_path(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    # The enforcer never calls ``/models`` — only ``/chat/completions``.
+    resp = client.get(
+        "/api/tool-broker/v1/llm-gateway/v1/models",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-Tool-Broker-Lease": _lease(["llm-gateway.invoke"]),
+        },
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "tool-broker: upstream path not allowed"
+    assert _FakeAsyncClient.calls == []
+
+
+def test_b2_mcp_allows_internal_mcp_servers(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    resp = client.get(
+        "/api/tool-broker/v1/mcp/v1/internal/mcp-servers?tenant_id=tnt_123",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-Tool-Broker-Lease": _lease(["mcp.read_internal"]),
+        },
+    )
+    assert resp.status_code == 200
+    assert _FakeAsyncClient.calls[0]["url"] == (
+        "http://mcp-registry:8010/api/mcp/v1/internal/mcp-servers?tenant_id=tnt_123"
+    )
+
+
+def test_b2_mcp_blocks_unlisted_path(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    # ``servers`` (no ``internal/`` prefix) is the broad admin surface — blocked.
+    resp = client.post(
+        "/api/tool-broker/v1/mcp/v1/servers",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-Tool-Broker-Lease": _lease(["mcp.read_internal"]),
+        },
+        json={},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "tool-broker: upstream path not allowed"
+    assert _FakeAsyncClient.calls == []
+
+
+def test_b2_skills_allows_internal_skills_prefix(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    resp = client.get(
+        "/api/tool-broker/v1/skills/v1/internal/skills/resolve?name=foo",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-Tool-Broker-Lease": _lease(["skill.read_internal"]),
+        },
+    )
+    assert resp.status_code == 200
+    assert _FakeAsyncClient.calls[0]["url"] == (
+        "http://skill-store:8011/api/skills/v1/internal/skills/resolve?name=foo"
+    )
+
+
+def test_b2_skills_blocks_non_internal_path(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    # The user-facing ``/skills/{id}`` browse surface is outside the
+    # ``internal/skills`` prefix — blocked.
+    resp = client.get(
+        "/api/tool-broker/v1/skills/v1/skills/my-skill",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-Tool-Broker-Lease": _lease(["skill.read_internal"]),
+        },
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "tool-broker: upstream path not allowed"
+    assert _FakeAsyncClient.calls == []
+
+
+def test_b2_web_fetch_allows_fetch(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    resp = client.post(
+        "/api/tool-broker/v1/web-fetch/api/web-fetch/v1/fetch",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-Tool-Broker-Lease": _lease(["web_fetch.invoke"]),
+        },
+        json={"url": "https://example.com"},
+    )
+    assert resp.status_code == 200
+    assert _FakeAsyncClient.calls[0]["url"] == (
+        "http://web-fetch-gateway:8013/api/web-fetch/v1/fetch"
+    )
+
+
+def test_b2_web_fetch_blocks_unlisted_path(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    resp = client.get(
+        "/api/tool-broker/v1/web-fetch/api/web-fetch/v1/admin/config",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-Tool-Broker-Lease": _lease(["web_fetch.invoke"]),
+        },
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "tool-broker: upstream path not allowed"
+    assert _FakeAsyncClient.calls == []
+
+
+def test_b2_rejects_path_traversal(monkeypatch) -> None:
+    client = _proxy_client(monkeypatch)
+    # A ``..`` segment must be rejected even though it would normalise toward an
+    # allowed path — defence against climbing out of the upstream surface.
+    resp = client.post(
+        "/api/tool-broker/v1/mcp/v1/internal/../servers",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-Tool-Broker-Lease": _lease(["mcp.read_internal"]),
+        },
+        json={},
+    )
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "tool-broker: upstream path not allowed"
+    assert _FakeAsyncClient.calls == []
+
+
+# ---------------------------------------------------------------------------
+# L1: OpenAPI / docs schema endpoints disabled; healthz still reachable
+# ---------------------------------------------------------------------------
+
+
+def test_l1_schema_endpoints_disabled_but_healthz_live() -> None:
+    client = _client(require_auth=True)
+
+    for schema_path in ("/openapi.json", "/docs", "/redoc"):
+        resp = client.get(schema_path)
+        assert resp.status_code == 404, schema_path
+
+    # healthz lives under the api_prefix and stays unauthenticated.
+    health = client.get("/api/tool-broker/v1/healthz")
+    assert health.status_code == 200
+    assert health.json() == {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# L3: the broker must not advertise its server (uvicorn) in responses
+# ---------------------------------------------------------------------------
+
+
+def test_l3_server_header_is_stripped() -> None:
+    client = _client(require_auth=True)
+    resp = client.get("/api/tool-broker/v1/healthz")
+    assert resp.status_code == 200
+    # The Server header is popped by the middleware regardless of launcher.
+    assert "server" not in {k.lower() for k in resp.headers}
