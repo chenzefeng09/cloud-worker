@@ -63,6 +63,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         SessionMiddleware,
         cookie_name=settings.cookie_name,
         signer=signer,
+        service_token=settings.service_token,
     )
     # Shared request-id + tenant header propagation; the cookie middleware
     # above overrides the tenant/user contextvars with the cookie-derived
@@ -118,6 +119,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from agent_bff.api.v1.admin_billing import router as admin_billing_router
     app.include_router(admin_billing_router, prefix=settings.api_prefix)
+
+    # LLM model management — tenant-scoped lanes (model.read / model.admin);
+    # provider writes + probe stay super_admin in admin_router above.
+    from agent_bff.api.v1.admin_model import router as admin_model_router
+    app.include_router(admin_model_router, prefix=settings.api_prefix)
 
     from agent_bff.api.v1.admin_audit import router as admin_audit_router
     app.include_router(admin_audit_router, prefix=settings.api_prefix)
@@ -191,6 +197,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from agent_bff.api.v1.api_keys import router as api_keys_router
     app.include_router(api_keys_router, prefix=settings.api_prefix)
+
+    from agent_bff.api.v1.schedules import router as schedules_router
+    app.include_router(schedules_router, prefix=settings.api_prefix)
 
     return app
 

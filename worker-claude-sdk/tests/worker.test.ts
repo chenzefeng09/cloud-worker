@@ -11,7 +11,7 @@
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Env, Task } from "../src/task.js";
 import { RedisStateClient } from "../src/redis_state.js";
@@ -46,6 +46,7 @@ function baseEnv(over: Partial<Env> = {}): Env {
     MCP_REGISTRY_URL: "",
     SKILL_STORE_URL: "",
     WEB_FETCH_GATEWAY_URL: "",
+    TOOL_BROKER_LEASE: "",
     OTEL_EXPORTER_OTLP_ENDPOINT: "",
     ...over,
   };
@@ -258,6 +259,43 @@ describe("worker", () => {
   it("loadMcpServers returns {} when registry is unconfigured (failure-open)", async () => {
     const out = await worker.loadMcpServers(baseEnv());
     expect(out).toEqual({});
+  });
+
+  it("loadMcpServers forwards broker auth headers", async () => {
+    const realFetch = global.fetch;
+    let capturedHeaders: Record<string, string> = {};
+    global.fetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const headers = init?.headers as Record<string, string>;
+      capturedHeaders = Object.fromEntries(
+        Object.entries(headers).map(([k, v]) => [k.toLowerCase(), v]),
+      );
+      return new Response(JSON.stringify({ servers: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+
+    try {
+      const out = await worker.loadMcpServers(
+        baseEnv({
+          FOUNDATION_API_TOKEN: "tok-broker",
+          FOUNDATION_TENANT_ID: "tnt-broker",
+          FOUNDATION_USER_ID: "usr-broker",
+          FOUNDATION_SERVICE_SCOPES: "mcp.read_internal",
+          MCP_REGISTRY_URL: "http://tool-broker:8024/api/tool-broker/v1/mcp/v1",
+          TOOL_BROKER_LEASE: "v1.payload.signature",
+        }),
+      );
+
+      expect(out).toEqual({});
+      expect(capturedHeaders.authorization).toBe("Bearer tok-broker");
+      expect(capturedHeaders["x-tenant-id"]).toBe("tnt-broker");
+      expect(capturedHeaders["x-user-id"]).toBe("usr-broker");
+      expect(capturedHeaders["x-service-scopes"]).toBe("mcp.read_internal");
+      expect(capturedHeaders["x-tool-broker-lease"]).toBe("v1.payload.signature");
+    } finally {
+      global.fetch = realFetch;
+    }
   });
 
   it("buildResumeContext returns '' when no checkpoint / terminal checkpoint", async () => {

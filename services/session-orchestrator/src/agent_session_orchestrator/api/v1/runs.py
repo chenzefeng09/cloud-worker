@@ -76,6 +76,7 @@ def _serialize_run(r: Run) -> dict[str, Any]:
         "output_tokens": r.output_tokens,
         "total_tokens": r.total_tokens,
         "app_snapshot": r.app_snapshot,
+        "source": r.source,
     }
 
 
@@ -198,8 +199,18 @@ async def create_run(
     sampling_params = body.get("sampling_params") or {}
     app_snapshot = body.get("app_snapshot")
 
-    # Persist the snapshot atomically with the run row (same transaction).
-    run = await svc.create_run(session_id, task, app_snapshot=app_snapshot)
+    # Run origin — "user" (default) for interactive runs, "schedule" for
+    # cron-runner-triggered runs.
+    _VALID_SOURCES = {"user", "schedule"}
+    source: str = body.get("source") or "user"
+    if source not in _VALID_SOURCES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid source {source!r}; must be one of {sorted(_VALID_SOURCES)}",
+        )
+
+    # Persist the snapshot and source atomically with the run row (same transaction).
+    run = await svc.create_run(session_id, task, app_snapshot=app_snapshot, source=source)
 
     # Relay to agent-scheduler.
     scheduler_url = await _get_scheduler_url(request)
@@ -272,6 +283,10 @@ async def create_run(
                     # ``sampling_params`` is applied per-run by the gateway model.
                     "sys_prompt": sys_prompt,
                     "sampling_params": sampling_params,
+                    # HITL gating: normal session runs always enable human-in-the-loop
+                    # so the worker can pause for confirmation / free-text questions.
+                    # Scheduled/batch runs will override to False (future).
+                    "hitl": True,
                 },
                 headers=headers,
             )
@@ -315,6 +330,7 @@ async def create_run(
         "sandbox_id": run.sandbox_id,
         "status": run.status,
         "task_description": run.task_description,
+        "source": run.source,
         "created_at": run.created_at.isoformat(),
     }
 
@@ -480,6 +496,369 @@ async def get_run_state(
         "status": run.status,
         "cursor": "",
     }
+
+
+@router.get(
+    "/sessions/{session_id}/pending",
+    dependencies=[Depends(require_permission("run.read", "run"))],
+)
+async def get_session_pending(
+    session_id: str,
+    request: Request,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+) -> dict[str, Any]:
+    """Return all currently-paused HITL interactions across the session's runs.
+
+    The frontend calls this on mount / reconnect so it can rehydrate the
+    ConfirmCard / QuestionCard for a run that paused while the page was closed
+    (or paused on an earlier run in the session).  Without it, the live SSE
+    ``pending_confirmation`` / ``pending_question`` event is the only signal and
+    a page refresh leaves the run PAUSED forever with no way to approve/reject.
+
+    Authority is Redis, not the DB row: the worker writes
+    ``agent:run:{run_id}:paused`` before scheduler reconciliation flips the DB
+    row to PAUSED, so a RUNNING/PENDING run may still have a live pause blob
+    (same reasoning as ``respond_run``).  We therefore list every run in the
+    session and GET its paused key directly rather than filtering on DB status.
+
+    Best-effort / failure-open: never 404 or 500 from this mount-time pull.
+    If Redis is unavailable or unconfigured we return ``{"items": []}``.  The
+    ``agent_state`` field of the paused blob is deliberately NOT leaked (huge).
+    """
+    import json
+
+    # Validate ownership/tenant scope (raises 404 only if the session itself is
+    # not visible to this tenant — list_runs is tenant-scoped regardless).
+    svc = SessionService(db, tenant_id=tenant_id)
+    runs = await svc.list_runs(session_id)
+
+    items: list[dict[str, Any]] = []
+    redis_url: str | None = request.app.state.settings.redis_url
+    if not redis_url or not runs:
+        return {"items": items}
+
+    try:
+        import redis.asyncio as aioredis  # type: ignore[import-not-found]
+
+        client = aioredis.Redis.from_url(
+            redis_url,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+            decode_responses=True,
+        )
+        try:
+            for run in runs:
+                raw = await client.get(f"agent:run:{run.id}:paused")
+                if not raw:
+                    continue
+                blob = json.loads(raw)
+                items.append(
+                    {
+                        "run_id": run.id,
+                        "kind": blob.get("kind"),
+                        "tool_calls": [
+                            {
+                                "id": tc.get("id"),
+                                "name": tc.get("name"),
+                                "args": tc.get("args"),
+                            }
+                            for tc in (blob.get("tool_calls") or [])
+                        ],
+                        "question": blob.get("question"),
+                        "paused_at": blob.get("paused_at"),
+                    }
+                )
+        finally:
+            await client.aclose()
+    except Exception as exc:  # noqa: BLE001 — never break the mount path
+        logger.warning(
+            "pending read failed for session %s: %s", session_id, exc
+        )
+        return {"items": []}
+
+    return {"items": items}
+
+
+@router.post(
+    "/sessions/{session_id}/runs/{run_id}/respond",
+    dependencies=[Depends(require_permission("run.create", "run"))],
+)
+async def respond_run(
+    session_id: str,
+    run_id: str,
+    body: dict[str, Any],
+    request: Request,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+    user_id: str = TUserId,
+) -> dict[str, Any]:
+    """Respond to a HITL pause: resume a paused run with a confirmation or answer.
+
+    Body:
+      ``kind``        — "confirm" | "answer"
+      ``tool_call_id``— the tool call id from the pending_confirmation / pending_question event
+      ``confirmed``   — bool | null  (used when kind="confirm")
+      ``answer``      — str | null   (used when kind="answer")
+
+    Flow:
+    1. Load run and validate the submitted response body.
+    2. Read + validate ``agent:run:{run_id}:paused`` from Redis (404/410 if missing — pause expired).
+       The Redis paused blob is the authoritative pause signal: the live SSE
+       stream can deliver ``pending_confirmation`` before scheduler reconciliation
+       has flipped the DB row to PAUSED, so RUNNING/PENDING with a paused blob is
+       accepted as an in-flight pause.
+    3. Re-dispatch to the scheduler with a ``resume`` payload containing the agent_state
+       from the paused Redis key plus the user decision.
+    4. Update the same run row: status="RUNNING", sandbox_id=<new container>, clear errors.
+    5. DELETE the paused Redis key (consumed).
+    6. Return {run_id, status: "RUNNING"}.
+
+    Uses the same ``run.create`` permission as create_run (write-level action on runs).
+    """
+    import json as _json
+
+    svc = SessionService(db, tenant_id=tenant_id)
+    run = await svc.get_run(session_id, run_id)
+
+    # Step 1: Validate the body fields before touching Redis state.
+    kind = body.get("kind")
+    if kind not in ("confirm", "answer"):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="body.kind must be 'confirm' or 'answer'",
+        )
+    tool_call_id = body.get("tool_call_id")
+    if not tool_call_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="body.tool_call_id is required",
+        )
+
+    confirmed: bool | None = body.get("confirmed")
+    answer: str | None = body.get("answer")
+
+    # Step 2: Read the paused state from Redis.
+    redis_url: str | None = request.app.state.settings.redis_url
+    if not redis_url:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Redis is not configured; cannot resume paused run",
+        )
+
+    paused_key = f"agent:run:{run_id}:paused"
+    resume_lock_key = f"agent:run:{run_id}:resume_lock"
+    paused_data: dict[str, Any] | None = None
+    redis_client: Any | None = None
+    resume_lock_acquired = False
+    try:
+        import redis.asyncio as aioredis  # type: ignore[import-not-found]
+
+        redis_client = aioredis.Redis.from_url(
+            redis_url,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+            decode_responses=True,
+        )
+        raw = await redis_client.get(paused_key)
+        if raw:
+            paused_data = _json.loads(raw)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("respond: Redis read failed for run %s: %s", run_id, exc)
+        if redis_client is not None:
+            try:
+                await redis_client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Redis read failed; cannot resume paused run",
+        ) from exc
+
+    if paused_data is None:
+        if redis_client is not None:
+            try:
+                await redis_client.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "Paused state not found for run (may have expired — TTL 7d); "
+                "cannot resume"
+            ),
+        )
+
+    # Validate the response targets the actual paused interaction.  The frontend
+    # should never send a mismatch, but this keeps stale/replayed cards from
+    # resuming the wrong tool call.
+    expected_pause_kind = "question" if kind == "answer" else "confirm"
+    paused_kind = paused_data.get("kind")
+    if paused_kind and paused_kind != expected_pause_kind:
+        if redis_client is not None:
+            await redis_client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"response kind {kind!r} does not match paused interaction "
+                f"{paused_kind!r}"
+            ),
+        )
+    paused_tool_calls = paused_data.get("tool_calls") or []
+    if isinstance(paused_tool_calls, list) and paused_tool_calls:
+        paused_ids = {
+            str(tc.get("id"))
+            for tc in paused_tool_calls
+            if isinstance(tc, dict) and tc.get("id") is not None
+        }
+        if paused_ids and str(tool_call_id) not in paused_ids:
+            if redis_client is not None:
+                await redis_client.aclose()
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="body.tool_call_id does not match paused interaction",
+            )
+
+    # Guard terminal states, but accept RUNNING/PENDING when Redis already has
+    # the paused blob.  That is the normal HITL race: the worker wrote the pause
+    # state and SSE rendered the card before scheduler reconciliation updated DB.
+    if run.status not in ("PAUSED", "RUNNING", "PENDING"):
+        if redis_client is not None:
+            await redis_client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"run is not PAUSED (current status: {run.status}); cannot respond",
+        )
+    if run.status != "PAUSED":
+        logger.info(
+            "respond: accepting Redis-authoritative pause before DB status PAUSED",
+            extra={"run_id": run_id, "db_status": run.status},
+        )
+
+    # Only one resume dispatch may consume a paused blob.  Without this lock,
+    # two fast POSTs can both read the same Redis key and spawn duplicate
+    # resumed sandboxes before the success path deletes the key.
+    try:
+        resume_lock_acquired = bool(
+            await redis_client.set(resume_lock_key, "1", ex=120, nx=True)
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("respond: Redis resume lock failed for run %s: %s", run_id, exc)
+        if redis_client is not None:
+            await redis_client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Redis lock failed; cannot resume paused run",
+        ) from exc
+
+    if not resume_lock_acquired:
+        if redis_client is not None:
+            await redis_client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="run resume is already in progress",
+        )
+
+    # agent_state is the worker's full in-memory state snapshot; replaying it
+    # replaces the need to re-send conversation history.
+    agent_state: dict[str, Any] = paused_data.get("agent_state") or {}
+
+    # Step 3: Re-dispatch to the scheduler.
+    # Reuse the same env/skill assembly as create_run (scheduler builds the
+    # sandbox from the task payload, not from the original run_id).  For a
+    # resume the history is replaced by agent_state; we pass history=[] to
+    # signal the worker to restore from agent_state instead.
+    scheduler_url = await _get_scheduler_url(request)
+    headers = {"X-Tenant-Id": tenant_id, "X-User-Id": user_id}
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                f"{scheduler_url}/runs",
+                json={
+                    "session_id": session_id,
+                    "run_id": run_id,
+                    "task": run.task_description,
+                    "agent_config": {},
+                    "files": [],
+                    "total_attachment_bytes": 0,
+                    "memory": "",
+                    # agent_state from the paused key replaces history for resume.
+                    "history": [],
+                    "sys_prompt": None,
+                    "sampling_params": {},
+                    # HITL gating: resumed runs retain HITL so the worker can
+                    # pause again if needed.
+                    "hitl": True,
+                    # Resume payload: tells the worker to restore agent_state
+                    # and deliver the user decision as the tool response.
+                    "resume": {
+                        "kind": kind,
+                        "tool_call_id": tool_call_id,
+                        "confirmed": confirmed,
+                        "answer": answer,
+                        "agent_state": agent_state,
+                    },
+                },
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        if resume_lock_acquired and redis_client is not None:
+            try:
+                await redis_client.delete(resume_lock_key)
+            except Exception:  # noqa: BLE001
+                pass
+        if redis_client is not None:
+            await redis_client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="agent-scheduler unreachable",
+        ) from exc
+
+    if resp.status_code >= 400:
+        logger.warning(
+            "scheduler rejected resume",
+            extra={"status": resp.status_code, "run_id": run_id},
+        )
+        if resume_lock_acquired and redis_client is not None:
+            try:
+                await redis_client.delete(resume_lock_key)
+            except Exception:  # noqa: BLE001
+                pass
+        if redis_client is not None:
+            await redis_client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"scheduler rejected resume (HTTP {resp.status_code})",
+        )
+
+    scheduler_run = resp.json()
+
+    # Step 4: Update the same run row — reuse, do NOT create a new Run.
+    sandbox_id_full = str(scheduler_run.get("sandbox_id") or "")
+    run.sandbox_id = sandbox_id_full[:12] if sandbox_id_full else None
+    run.status = "RUNNING"
+    run.error_message = None
+    run.started_at = _now()
+    await db.flush()
+
+    # Step 5: Delete the paused Redis key (it has been consumed) and release the
+    # short resume lock.
+    try:
+        if redis_client is not None:
+            await redis_client.delete(paused_key)
+            if resume_lock_acquired:
+                await redis_client.delete(resume_lock_key)
+            await redis_client.aclose()
+    except Exception as exc:  # noqa: BLE001 — failure-open; run is already RUNNING
+        logger.warning(
+            "respond: failed to delete paused Redis key / resume lock for run %s: %s",
+            run_id,
+            exc,
+        )
+
+    # Step 6: Return.
+    return {"run_id": run_id, "status": "RUNNING"}
 
 
 async def _do_cancel_run(

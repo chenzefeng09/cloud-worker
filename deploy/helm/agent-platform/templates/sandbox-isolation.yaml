@@ -1,0 +1,102 @@
+{{/* =============================================================================
+     Sandbox network isolation — the k8s analogue of compose's `internal: true`
+     `sandbox_broker` network.
+
+     -------------------------------------------------------------------------
+     HONEST FINDING (do NOT turn this into security theater):
+     -------------------------------------------------------------------------
+     In this platform a *sandbox* is NOT a Kubernetes Pod, in either runtime:
+
+       * agentScheduler.config.runtime=docker  → the sandbox is a sibling
+         container spawned through docker-socket-proxy. It is a Docker
+         container on the node, with no Pod object, no Pod label, and no
+         standing in the k8s network model. In dev/compose its isolation comes
+         from joining the `internal: true` `sandbox_broker` Docker network.
+
+       * agentScheduler.config.runtime=cube    → the sandbox is a CubeSandbox /
+         E2B microVM created by the controller via `POST /sandboxes`. It is a
+         microVM behind the controller, again with no Pod object.
+
+     A k8s `NetworkPolicy` selects Pods by label. Since sandboxes are not Pods,
+     a NetworkPolicy here would select NOTHING and silently enforce NOTHING.
+     We refuse to ship that. (The `sandbox-pool` Deployment IS a Pod, but it is
+     only the warm-pool *manager* — isolating it does not isolate the sandboxes
+     it provisions.)
+
+     -------------------------------------------------------------------------
+     What actually enforces sandbox isolation in prod:
+     -------------------------------------------------------------------------
+       (a) IN THIS REPO — broker egress URL rewriting. With
+           SCHEDULER_SANDBOX_EGRESS_MODE=broker, the scheduler's
+           `egress_policy.service_env` rewrites every capability URL the worker
+           receives (LLM / MCP / skills / web-fetch / state / S3) to the
+           tool-broker façade, and blanks the direct Redis URL + MinIO keys.
+           The worker therefore has NO configured path to infra — only the
+           broker, gated by a signed per-run lease.
+
+       (b) OUT OF THIS REPO — CubeSandbox controller-side network policy. To
+           *physically* stop a microVM from opening a raw socket to an infra
+           IP, the CubeSandbox controller must apply a per-VM egress policy
+           (default-deny, allow only the tool-broker Service + DNS), keyed off
+           the metadata labels the scheduler stamps on every spawn:
+               agent-platform.egress-mode      = broker
+               agent-platform.network-policy   = sandbox-broker-only
+               agent-platform.tool-broker-url  = <in-cluster tool-broker URL>
+           (see services/agent-scheduler/.../cube_runtime.py spawn body).
+           That controller config ships with the W6 operator material that
+           also provides `agentScheduler.cubeControllerUrl`
+           (see deploy/operator/ and docs/design/b-m2-sandbox-runtime-v1.md).
+           It is NOT a Helm object in this chart.
+
+     -------------------------------------------------------------------------
+     The optional block below is a FUTURE hook only:
+     -------------------------------------------------------------------------
+     If someone later adds an in-cluster runtime where each sandbox really is a
+     Pod carrying a fixed label, set agentScheduler.sandboxNetworkPolicy.enabled
+     =true and that Pod label in podSelectorLabel. Only THEN does a real
+     NetworkPolicy (default-deny egress, allow only tool-broker + DNS) apply.
+     Until such a runtime exists this stays disabled by default.
+     ============================================================================= */}}
+
+{{- if and .Values.agentScheduler.sandboxNetworkPolicy .Values.agentScheduler.sandboxNetworkPolicy.enabled }}
+{{- $port := .Values.toolBroker.port | default 8024 }}
+---
+# !! Only meaningful if sandboxes are Pods carrying the label below. Under the
+# !! current docker/cube runtimes they are NOT Pods, so this selects nothing.
+# !! See the header of this file before enabling.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "agent-platform.fullname" (dict "svcName" "sandbox" "root" .) }}
+  labels: {{- include "agent-platform.labels" (dict "svcName" "sandbox" "root" .) | nindent 4 }}
+  annotations:
+    agent-platform.example.com/note: >-
+      Effective ONLY for a hypothetical in-cluster pod-sandbox runtime.
+      docker-socket / cube sandboxes are not pods; isolation for those is
+      enforced by broker URL rewriting + CubeSandbox controller-side policy.
+spec:
+  podSelector:
+    matchLabels: {{- toYaml .Values.agentScheduler.sandboxNetworkPolicy.podSelectorLabel | nindent 6 }}
+  policyTypes: [Egress]
+  egress:
+    # DNS only
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # tool-broker façade ONLY — nothing else (no DB / Redis / MinIO / foundation)
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: tool-broker
+              app.kubernetes.io/part-of: agent-platform
+      ports:
+        - port: {{ $port }}
+          protocol: TCP
+{{- end }}

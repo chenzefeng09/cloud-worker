@@ -234,6 +234,235 @@ def test_cancel_session_run_cancels_active_run(
     mock_db.add.assert_called()
 
 
+def test_respond_accepts_redis_pause_before_db_status_paused(
+    app_client: TestClient,
+    mock_db: AsyncMock,
+    auth_headers,
+) -> None:
+    """A user can approve as soon as pending_confirmation is streamed.
+
+    The worker writes Redis paused state before scheduler reconciliation flips
+    the DB row to PAUSED.  The respond endpoint must treat the Redis paused blob
+    as authoritative; otherwise the first click returns 409 and the user has to
+    approve the same tool call twice.
+    """
+    import httpx
+
+    run = _run_row(status="RUNNING")
+    mock_db.execute.return_value = make_scalar_result(run)
+    app_client.app.state.settings.redis_url = "redis://localhost:6379/0"
+
+    paused_blob = {
+        "kind": "confirm",
+        "reply_id": "reply_1",
+        "tool_calls": [{"id": "tc_weather", "name": "WebFetch", "args": "{}"}],
+        "question": None,
+        "agent_state": {"messages": []},
+        "paused_at": "2026-01-01T00:00:00+00:00",
+    }
+    redis_ops: list[tuple[str, str]] = []
+
+    class _FakeRedis:
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def get(self, key):
+            redis_ops.append(("get", key))
+            return json.dumps(paused_blob)
+
+        async def set(self, key, value, ex=None, nx=False):
+            redis_ops.append(("set", key))
+            return True
+
+        async def delete(self, key):
+            redis_ops.append(("delete", key))
+            return 1
+
+        async def aclose(self):
+            redis_ops.append(("close", ""))
+
+    scheduler_payloads: list[dict] = []
+
+    class _FakeSchedulerResp:
+        status_code = 200
+
+        def json(self):
+            return {"sandbox_id": "newcontainerabcdef123456"}
+
+    class _FakeClient(AuthzAwareClient):
+        async def post(self, url, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            scheduler_payloads.append(kw.get("json") or {})
+            return _FakeSchedulerResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        with _patch_redis_asyncio(_FakeRedis):
+            resp = app_client.post(
+                "/api/session/v1/sessions/ses_1/runs/run_1/respond",
+                headers=auth_headers,
+                json={
+                    "kind": "confirm",
+                    "tool_call_id": "tc_weather",
+                    "confirmed": True,
+                    "answer": None,
+                },
+            )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"run_id": "run_1", "status": "RUNNING"}
+    assert scheduler_payloads, "resume was not dispatched to scheduler"
+    resume = scheduler_payloads[0]["resume"]
+    assert resume["tool_call_id"] == "tc_weather"
+    assert resume["confirmed"] is True
+    assert ("delete", "agent:run:run_1:paused") in redis_ops
+    assert ("delete", "agent:run:run_1:resume_lock") in redis_ops
+    mock_db.flush.assert_called()
+
+
+def test_respond_rejects_second_resume_while_lock_is_held(
+    app_client: TestClient,
+    mock_db: AsyncMock,
+    auth_headers,
+) -> None:
+    """Resume dispatch is guarded so duplicate POSTs do not spawn two sandboxes."""
+    run = _run_row(status="PAUSED")
+    mock_db.execute.return_value = make_scalar_result(run)
+    app_client.app.state.settings.redis_url = "redis://localhost:6379/0"
+
+    paused_blob = {
+        "kind": "confirm",
+        "tool_calls": [{"id": "tc_1", "name": "WebFetch", "args": "{}"}],
+        "agent_state": {},
+    }
+
+    class _FakeRedis:
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def get(self, key):
+            return json.dumps(paused_blob)
+
+        async def set(self, key, value, ex=None, nx=False):
+            return False
+
+        async def aclose(self):
+            return None
+
+    with _patch_redis_asyncio(_FakeRedis):
+        resp = app_client.post(
+            "/api/session/v1/sessions/ses_1/runs/run_1/respond",
+            headers=auth_headers,
+            json={"kind": "confirm", "tool_call_id": "tc_1", "confirmed": True},
+        )
+
+    assert resp.status_code == 409
+    assert "already in progress" in resp.json()["detail"]
+
+
+def test_session_pending_returns_paused_items(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """GET /sessions/{id}/pending returns the paused HITL blob shape per run.
+
+    The worker writes ``agent:run:{run_id}:paused`` before the DB row flips to
+    PAUSED, so the endpoint lists the session's runs and reads each run's paused
+    key from Redis.  ``agent_state`` must NOT leak into the response.
+    """
+    runs = [_run_row(status="RUNNING")]  # run_1
+    mock_db.execute.return_value = make_scalar_result(runs)
+    app_client.app.state.settings.redis_url = "redis://localhost:6379/0"
+
+    paused_blob = {
+        "kind": "confirm",
+        "reply_id": "reply_1",
+        "tool_calls": [{"id": "tc_bash", "name": "Bash", "args": "{\"cmd\":\"ls\"}"}],
+        "question": None,
+        "agent_state": {"messages": ["HUGE"]},
+        "paused_at": "2026-01-01T00:00:00+00:00",
+    }
+    redis_ops: list[tuple[str, str]] = []
+
+    class _FakeRedis:
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def get(self, key):
+            redis_ops.append(("get", key))
+            if key == "agent:run:run_1:paused":
+                return json.dumps(paused_blob)
+            return None
+
+        async def aclose(self):
+            redis_ops.append(("close", ""))
+
+    with _patch_redis_asyncio(_FakeRedis):
+        resp = app_client.get(
+            "/api/session/v1/sessions/ses_1/pending", headers=auth_headers,
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["items"]) == 1
+    item = body["items"][0]
+    assert item["run_id"] == "run_1"
+    assert item["kind"] == "confirm"
+    assert item["tool_calls"] == [
+        {"id": "tc_bash", "name": "Bash", "args": "{\"cmd\":\"ls\"}"}
+    ]
+    assert item["question"] is None
+    assert item["paused_at"] == "2026-01-01T00:00:00+00:00"
+    # agent_state must never be leaked.
+    assert "agent_state" not in item
+    assert ("get", "agent:run:run_1:paused") in redis_ops
+
+
+def test_session_pending_empty_when_no_paused_key(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """No paused Redis key for any run → empty items (still 200)."""
+    runs = [_run_row(status="COMPLETED")]
+    mock_db.execute.return_value = make_scalar_result(runs)
+    app_client.app.state.settings.redis_url = "redis://localhost:6379/0"
+
+    class _FakeRedis:
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def get(self, key):
+            return None
+
+        async def aclose(self):
+            return None
+
+    with _patch_redis_asyncio(_FakeRedis):
+        resp = app_client.get(
+            "/api/session/v1/sessions/ses_1/pending", headers=auth_headers,
+        )
+
+    assert resp.status_code == 200
+    assert resp.json() == {"items": []}
+
+
+def test_session_pending_failopen_when_redis_unconfigured(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """Redis not configured → fail-open empty items, never 500."""
+    runs = [_run_row(status="RUNNING")]
+    mock_db.execute.return_value = make_scalar_result(runs)
+    app_client.app.state.settings.redis_url = None
+
+    resp = app_client.get(
+        "/api/session/v1/sessions/ses_1/pending", headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"items": []}
+
+
 def test_update_session_mutates_via_service(
     app_client: TestClient, mock_db: AsyncMock, auth_headers,
 ) -> None:
@@ -617,14 +846,21 @@ def test_stream_tokens_yields_delta_events_and_stops_on_end() -> None:
 
     events = asyncio.get_event_loop().run_until_complete(_run())
 
-    assert len(events) == 2, f"Expected 2 delta events, got {len(events)}: {events}"
-    parsed = [json.loads(e.split("data: ")[1].strip()) for e in events]
+    parsed = [
+        (event_name, json.loads(data))
+        for event_name, data in _parse_sse_events("".join(events))
+    ]
+    token_payloads = [payload for event_name, payload in parsed if event_name == "token"]
     # Each event carries the Redis entry id as ``offset`` for idempotent
     # frontend replay (a reconnect re-streams from "0-0").
-    assert parsed[0] == {"run_id": "run_test_1", "delta": "Hello", "offset": "1-0"}
-    assert parsed[1] == {"run_id": "run_test_1", "delta": " world", "offset": "2-0"}
-    for ev in events:
-        assert ev.startswith("event: token\n"), f"Wrong event name: {ev!r}"
+    assert token_payloads == [
+        {"run_id": "run_test_1", "delta": "Hello", "offset": "1-0"},
+        {"run_id": "run_test_1", "delta": " world", "offset": "2-0"},
+    ]
+    assert parsed[-1] == (
+        "run_stream_end",
+        {"run_id": "run_test_1", "paused": False},
+    )
 
 
 def test_stream_tokens_waits_through_worker_coldstart() -> None:
@@ -676,10 +912,18 @@ def test_stream_tokens_waits_through_worker_coldstart() -> None:
 
     events = asyncio.get_event_loop().run_until_complete(_run())
 
-    assert len(events) == 1, f"Expected the post-coldstart delta, got: {events}"
-    parsed = json.loads(events[0].split("data: ")[1].strip())
-    assert parsed == {"run_id": "run_cold", "delta": "spring", "offset": "1-0"}
-    assert events[0].startswith("event: token\n")
+    parsed = [
+        (event_name, json.loads(data))
+        for event_name, data in _parse_sse_events("".join(events))
+    ]
+    assert parsed[0] == (
+        "token",
+        {"run_id": "run_cold", "delta": "spring", "offset": "1-0"},
+    )
+    assert parsed[-1] == (
+        "run_stream_end",
+        {"run_id": "run_cold", "paused": False},
+    )
 
 
 def test_stream_tokens_replay_bails_out_fast_when_empty() -> None:
@@ -716,7 +960,13 @@ def test_stream_tokens_replay_bails_out_fast_when_empty() -> None:
         return events, _EmptyRedis.call_count
 
     events, call_count = asyncio.get_event_loop().run_until_complete(_run())
-    assert events == []
+    parsed = [
+        (event_name, json.loads(data))
+        for event_name, data in _parse_sse_events("".join(events))
+    ]
+    assert parsed == [
+        ("run_stream_end", {"run_id": "run_replay", "paused": False}),
+    ]
     # Old fast-exit preserved: returns after the 2nd idle read, not 30s of polls.
     assert call_count <= 3, f"Replay should bail fast, did {call_count} xreads"
 
@@ -751,80 +1001,27 @@ def test_stream_tokens_failure_open_on_redis_error() -> None:
     assert events == [], f"Expected no events when Redis errors, got: {events}"
 
 
-def _make_fake_db_session(mock_db: AsyncMock):
-    """Return an async context-manager generator that yields ``mock_db``.
+def test_stream_tokens_active_run_idle_does_not_break_until_inactive() -> None:
+    """Regression for the mid-run streaming stall.
 
-    ``stream_messages`` calls ``acquire_db_session`` (the real ``get_session``
-    factory from ``domain.db``) inside its generator rather than using the
-    FastAPI dependency injection.  We need to patch that import alias so that
-    the per-poll DB sessions come from our mock instead of trying to connect
-    to a real Postgres instance.
+    With ``wait_for_worker=True`` and an ``is_run_active`` predicate that reports
+    the run is still RUNNING, a LONG idle gap after the first token batch (the
+    model thinking between tool batches) must NOT break the tail — the old
+    ``saw_entry and idle_reads >= 5`` guard wrongly ended the stream here.
+
+    Once ``is_run_active`` flips to False on a status recheck, the tail breaks
+    and emits ``run_stream_end``.  The ``end`` marker arriving first would also
+    end it (authoritative normal exit), but here we exercise the crashed/abandoned
+    case where ``end`` never comes and only the status recheck saves us.
     """
-    from collections.abc import AsyncIterator
-
-    async def _fake_session(**kw) -> AsyncIterator[AsyncMock]:
-        yield mock_db
-
-    return _fake_session
-
-
-def test_stream_messages_emits_tokens_then_message_and_done(
-    app_client, mock_db: AsyncMock, auth_headers,
-) -> None:
-    """stream_messages: token events precede event: message and event: done.
-
-    DB execute call order:
-
-    Phase-1 (resolve active run, one fake DB session):
-      [0] list_runs                          → [run_running]
-
-    Phase-2 poll iteration (one fake DB session):
-      [1] list_runs (reconcile guard)        → [run_running]  → RUNNING → enter reconcile
-      [2]   get_session (creator lookup)     → ses
-          httpx GET scheduler → COMPLETED
-          _read_ordered_blocks_from_redis → [] (no xrange on fake)
-          → fallback path (result_summary → single assistant message)
-      [3]   idempotency: list_messages get_session → ses
-      [4]   idempotency: list_messages query  → [] (no msgs yet)
-      [5]   create_message(asst): get_session → ses
-      [6]   create_message(asst): max(sequence) → seq_result (0)
-          db.add(msg) + flush + refresh
-      [7] list_messages for new msgs: get_session → ses
-      [8] list_messages for new msgs: query   → [msg_assistant]
-      [9] list_runs (terminal check)          → [run_completed]
-    """
-    import datetime as dt
-    import unittest.mock as mock
-
-    from agent_session_orchestrator.domain.models import Message, Run, Session
-
-    run = Run(
-        id="run_tok", tenant_id=TEST_TENANT, session_id="ses_tok",
-        task_description="stream me", status="RUNNING", sandbox_id="sandbox1",
-        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-    )
-    run_completed = Run(
-        id="run_tok", tenant_id=TEST_TENANT, session_id="ses_tok",
-        task_description="stream me", status="COMPLETED", sandbox_id="sandbox1",
-        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        finished_at=dt.datetime(2026, 1, 1, 0, 0, 1, tzinfo=dt.UTC),
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        result_summary="done",
-    )
-    msg_assistant = Message(
-        id="msg_tok_1", tenant_id=TEST_TENANT, session_id="ses_tok",
-        role="assistant", content="done", sequence=1,
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-    )
-    ses = Session(
-        id="ses_tok", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+    from agent_session_orchestrator.api.v1.messages import (
+        _RUN_STATUS_RECHECK_READS,
+        _stream_tokens,
     )
 
-    # Redis stub that yields two deltas then an end sentinel via xread (Phase 1).
-    # xrange is intentionally absent so _read_ordered_blocks_from_redis fails-open
-    # with [] and the fallback (result_summary → single assistant message) fires.
-    class _FakeRedis:
+    fake_first_batch = [("1-0", {"type": "delta", "text": "thinking..."})]
+
+    class _StallRedis:
         _call_count = 0
 
         @classmethod
@@ -833,224 +1030,84 @@ def test_stream_messages_emits_tokens_then_message_and_done(
 
         async def xread(self, streams, block=0, count=None):
             key = list(streams.keys())[0]
-            if self.__class__._call_count == 0:
+            # First read delivers a token, every subsequent read is empty
+            # (worker silent while the model decides the next tool batch).
+            if self._call_count == 0:
                 self.__class__._call_count += 1
-                return [(key, [
-                    ("1-0", {"type": "delta", "text": "Hello"}),
-                    ("2-0", {"type": "delta", "text": " world"}),
-                ])]
+                return [(key, fake_first_batch)]
             self.__class__._call_count += 1
-            return [(key, [("3-0", {"type": "end", "text": ""})])]
+            return []
 
         async def aclose(self): pass
 
-    seq_result = MagicMock()
-    seq_result.scalar_one_or_none = MagicMock(return_value=0)
+    # is_run_active stays True well past the OLD 5-idle-read break, then flips
+    # False after several rechecks — proving idle alone no longer ends the tail.
+    active_state = {"checks": 0}
 
-    mock_db.execute.side_effect = [
-        make_scalar_result([run]),           # [0]  Phase-1: list_runs
-        make_scalar_result([run]),           # [1]  Phase-2: list_runs (reconcile)
-        make_scalar_result(ses),             # [2]  reconcile: get_session (creator)
-        # httpx → COMPLETED; _read_ordered_blocks_from_redis → [] (no xrange)
-        # → fallback: single assistant from result_summary
-        make_scalar_result(ses),             # [3]  idempotency: list_messages get_session
-        make_scalar_result([]),              # [4]  idempotency: list_messages query (no msgs)
-        make_scalar_result(ses),             # [5]  create_message(asst): get_session
-        seq_result,                          # [6]  create_message(asst): max(sequence)
-        make_scalar_result(ses),             # [7]  list_messages for new msgs: get_session
-        make_scalar_result([msg_assistant]), # [8]  list_messages for new msgs: query
-        make_scalar_result([run_completed]), # [9]  list_runs terminal check
-    ]
+    async def _is_run_active() -> bool:
+        active_state["checks"] += 1
+        # Remain RUNNING for the first 3 rechecks (>> the old 5-idle break),
+        # then report the run left the active state.
+        return active_state["checks"] < 4
 
-    async def _refresh(obj: Message) -> None:
-        obj.id = "msg_tok_1"
-        obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
-
-    mock_db.refresh.side_effect = _refresh
-
-    class _FakeSchResp:
-        status_code = 200
-        def json(self):
-            return {
-                "status": "COMPLETED",
-                "result_summary": "done",
-                "result_error": None,
-                "artifacts": [],
-                "usage": {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30},
-            }
-
-    class _FakeHttpxClient(AuthzAwareClient):
-        async def get(self, url, **kw):
-            if "/check" in url and "authz" in url:
-                return self._authz_allowed_resp()
-            return _FakeSchResp()
-
-    import httpx as _httpx
-    import agent_session_orchestrator.api.v1.messages as _messages_mod
-    _FakeRedis._call_count = 0  # reset class-level counter
-    with _patch_redis_asyncio(_FakeRedis):
-        with mock.patch.object(_httpx, "AsyncClient", return_value=_FakeHttpxClient()):
-            with mock.patch.object(
-                _messages_mod, "acquire_db_session", new=_make_fake_db_session(mock_db)
+    async def _run():
+        with _patch_redis_asyncio(_StallRedis):
+            _StallRedis._call_count = 0
+            active_state["checks"] = 0
+            deadline = asyncio.get_event_loop().time() + 30.0
+            events = []
+            async for ev in _stream_tokens(
+                redis_url="redis://localhost:6379",
+                run_id="run_stall",
+                deadline=deadline,
+                wait_for_worker=True,
+                is_run_active=_is_run_active,
             ):
-                app_client.app.state.settings.redis_url = "redis://localhost:6379"
-                try:
-                    resp = app_client.get(
-                        "/api/session/v1/sessions/ses_tok/messages/stream",
-                        headers=auth_headers,
-                    )
-                finally:
-                    app_client.app.state.settings.redis_url = None
+                events.append(ev)
+        return events, _StallRedis._call_count, active_state["checks"]
 
-    assert resp.status_code == 200
-    body = resp.text
-    events = _parse_sse_events(body)
-    event_names = [e[0] for e in events]
+    events, call_count, checks = asyncio.get_event_loop().run_until_complete(_run())
 
-    # token events must appear before message/done
-    assert "token" in event_names, f"No token events found in: {event_names}"
-    token_indices = [i for i, n in enumerate(event_names) if n == "token"]
-    non_token_indices = [i for i, n in enumerate(event_names) if n != "token"]
-    if non_token_indices:
-        assert max(token_indices) < min(non_token_indices), (
-            "token events must come before message/done events"
-        )
-
-    # Verify delta content
-    token_datas = [json.loads(d) for name, d in events if name == "token"]
-    assert any(td["delta"] == "Hello" for td in token_datas)
-    assert any(td["delta"] == " world" for td in token_datas)
-
-    # done must always be emitted
-    assert "done" in event_names, f"Missing done event in: {event_names}"
-
-
-def test_stream_messages_falls_back_when_redis_unavailable(
-    app_client, mock_db: AsyncMock, auth_headers,
-) -> None:
-    """stream_messages degrades gracefully to message-poll when Redis is off.
-
-    With redis_url=None the token-streaming phase is entirely skipped.
-    The run is already COMPLETED so reconcile is a no-op and the existing
-    assistant message is returned directly.
-
-    DB execute call order (Phase-2 only, one fake DB session):
-      [0] list_runs (reconcile guard)       → [run_completed]  → terminal, skip reconcile
-      [1] list_messages: get_session         → ses
-      [2] list_messages: query               → [msg]
-      [3] list_runs (terminal check)         → [run_completed]
-    """
-    import datetime as dt
-    import unittest.mock as mock
-
-    from agent_session_orchestrator.domain.models import Message, Run, Session
-
-    run_completed = Run(
-        id="run_nored", tenant_id=TEST_TENANT, session_id="ses_nored",
-        task_description="no redis", status="COMPLETED", sandbox_id="sb2",
-        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        finished_at=dt.datetime(2026, 1, 1, 0, 0, 1, tzinfo=dt.UTC),
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        result_summary="fallback result",
+    parsed = [
+        (event_name, json.loads(data))
+        for event_name, data in _parse_sse_events("".join(events))
+    ]
+    # The single token was yielded...
+    assert parsed[0] == (
+        "token",
+        {"run_id": "run_stall", "delta": "thinking...", "offset": "1-0"},
     )
-    msg = Message(
-        id="msg_nored", tenant_id=TEST_TENANT, session_id="ses_nored",
-        role="assistant", content="fallback result", sequence=1,
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    # ...and the stream only ended after is_run_active reported inactive,
+    # NOT after the old 5-idle-read break.  4 rechecks at one per
+    # _RUN_STATUS_RECHECK_READS idle reads ⇒ ~20 idle reads tailing through
+    # silence the old guard would have cut at 5.
+    assert checks == 4
+    assert call_count > 5 + _RUN_STATUS_RECHECK_READS, (
+        "Active tail broke too early on idle; should have kept tailing "
+        f"past the old 5-idle guard (did {call_count} xreads)"
     )
-    ses = Session(
-        id="ses_nored", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+    assert parsed[-1] == (
+        "run_stream_end",
+        {"run_id": "run_stall", "paused": False},
     )
 
-    # redis_url is None → Phase-1 entirely skipped (no list_runs call)
-    # Phase-2 poll (one fake DB session):
-    mock_db.execute.side_effect = [
-        make_scalar_result([run_completed]),  # [0] list_runs (reconcile, COMPLETED → skip)
-        make_scalar_result(ses),              # [1] list_messages: get_session
-        make_scalar_result([msg]),            # [2] list_messages: query
-        make_scalar_result([run_completed]),  # [3] list_runs terminal check
+
+def test_stream_tokens_active_run_stops_on_end_marker_despite_idle() -> None:
+    """With wait_for_worker=True, the ``end`` marker is the authoritative normal
+    exit even across idle gaps — and is reached without ever consulting
+    is_run_active (the model finished cleanly)."""
+    from agent_session_orchestrator.api.v1.messages import _stream_tokens
+
+    batches = [
+        [("1-0", {"type": "delta", "text": "a"})],
+        [],  # idle gap (model thinking) — old guard would start counting here
+        [],
+        [("2-0", {"type": "delta", "text": "b"})],
+        [("3-0", {"type": "end", "text": ""})],
     ]
 
-    async def _refresh(obj): pass
-    mock_db.refresh.side_effect = _refresh
-
-    class _FakeHttpxClient(AuthzAwareClient):
-        async def get(self, url, **kw):
-            if "/check" in url and "authz" in url:
-                return self._authz_allowed_resp()
-            return self._authz_allowed_resp()
-
-    import httpx as _httpx
-    import agent_session_orchestrator.api.v1.messages as _messages_mod
-    with mock.patch.object(_httpx, "AsyncClient", return_value=_FakeHttpxClient()):
-        with mock.patch.object(
-            _messages_mod, "acquire_db_session", new=_make_fake_db_session(mock_db)
-        ):
-            app_client.app.state.settings.redis_url = None
-            resp = app_client.get(
-                "/api/session/v1/sessions/ses_nored/messages/stream",
-                headers=auth_headers,
-            )
-
-    assert resp.status_code == 200
-    events = _parse_sse_events(resp.text)
-    event_names = [e[0] for e in events]
-
-    assert "token" not in event_names, "Should have no token events when Redis is off"
-    assert "done" in event_names, f"Missing done event: {event_names}"
-
-
-# ---------------------------------------------------------------------------
-# Tests -- PART D: fast-run race condition (run COMPLETED before SSE connect)
-# ---------------------------------------------------------------------------
-
-
-def test_stream_messages_fast_run_replays_tokens_when_no_assistant_msg(
-    app_client, mock_db: AsyncMock, auth_headers,
-) -> None:
-    """Phase 1 tails token stream for a COMPLETED run with no assistant message yet.
-
-    This covers the race condition where a short task finishes in < 1 s so by
-    the time the SSE connection is established the run is already COMPLETED,
-    but the assistant message has not yet been written to the DB.  The token
-    stream (TTL ~1800 s) still holds all deltas and can be replayed.
-
-    DB execute call order:
-
-    Phase-1 (resolve run + check for assistant message):
-      [0] list_runs                          → [run_completed]
-      [1] list_messages: get_session         → ses
-      [2] list_messages: query               → [] (no assistant message yet)
-
-    Phase-2 poll iteration:
-      [3] list_runs (reconcile guard)        → [run_completed] → terminal, skip reconcile
-      [4] list_messages: get_session         → ses
-      [5] list_messages: query               → [msg_assistant]
-      [6] list_runs (terminal check)         → [run_completed]
-    """
-    import unittest.mock as mock
-
-    run_completed = Run(
-        id="run_fast", tenant_id=TEST_TENANT, session_id="ses_fast",
-        task_description="fast task", status="COMPLETED", sandbox_id="sbfast",
-        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        finished_at=dt.datetime(2026, 1, 1, 0, 0, 0, 100000, tzinfo=dt.UTC),
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        result_summary="fast done",
-    )
-    msg_assistant = Message(
-        id="msg_fast_1", tenant_id=TEST_TENANT, session_id="ses_fast",
-        role="assistant", content="fast done", sequence=1,
-        run_id="run_fast",
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-    )
-    ses = Session(
-        id="ses_fast", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
-    )
-
-    # Redis stub: two deltas then end
-    class _FakeRedis:
-        _call_count = 0
+    class _EndRedis:
+        _i = 0
 
         @classmethod
         def from_url(cls, *a, **kw):
@@ -1058,182 +1115,58 @@ def test_stream_messages_fast_run_replays_tokens_when_no_assistant_msg(
 
         async def xread(self, streams, block=0, count=None):
             key = list(streams.keys())[0]
-            if self.__class__._call_count == 0:
-                self.__class__._call_count += 1
-                return [(key, [
-                    ("1-0", {"type": "delta", "text": "fast"}),
-                    ("2-0", {"type": "delta", "text": " done"}),
-                ])]
-            self.__class__._call_count += 1
-            return [(key, [("3-0", {"type": "end", "text": ""})])]
+            i = self.__class__._i
+            self.__class__._i += 1
+            if i < len(batches):
+                b = batches[i]
+                return [(key, b)] if b else []
+            return []
 
         async def aclose(self): pass
 
-    mock_db.execute.side_effect = [
-        make_scalar_result([run_completed]),  # [0] Phase-1: list_runs
-        make_scalar_result(ses),              # [1] Phase-1: list_messages get_session
-        make_scalar_result([]),               # [2] Phase-1: list_messages query (no msg yet)
-        make_scalar_result([run_completed]),  # [3] Phase-2: list_runs (reconcile, COMPLETED)
-        make_scalar_result(ses),              # [4] Phase-2: list_messages get_session
-        make_scalar_result([msg_assistant]),  # [5] Phase-2: list_messages query
-        make_scalar_result([run_completed]),  # [6] Phase-2: list_runs terminal check
-    ]
+    recheck_called = {"n": 0}
 
-    async def _refresh(obj): pass
-    mock_db.refresh.side_effect = _refresh
+    async def _is_run_active() -> bool:
+        recheck_called["n"] += 1
+        return True
 
-    class _FakeHttpxClient(AuthzAwareClient):
-        async def get(self, url, **kw):
-            if "/check" in url and "authz" in url:
-                return self._authz_allowed_resp()
-            return self._authz_allowed_resp()
-
-    import httpx as _httpx
-    import agent_session_orchestrator.api.v1.messages as _messages_mod
-    _FakeRedis._call_count = 0
-    with _patch_redis_asyncio(_FakeRedis):
-        with mock.patch.object(_httpx, "AsyncClient", return_value=_FakeHttpxClient()):
-            with mock.patch.object(
-                _messages_mod, "acquire_db_session", new=_make_fake_db_session(mock_db)
+    async def _run():
+        with _patch_redis_asyncio(_EndRedis):
+            _EndRedis._i = 0
+            recheck_called["n"] = 0
+            deadline = asyncio.get_event_loop().time() + 30.0
+            events = []
+            async for ev in _stream_tokens(
+                redis_url="redis://localhost:6379",
+                run_id="run_end",
+                deadline=deadline,
+                wait_for_worker=True,
+                is_run_active=_is_run_active,
             ):
-                app_client.app.state.settings.redis_url = "redis://localhost:6379"
-                try:
-                    resp = app_client.get(
-                        "/api/session/v1/sessions/ses_fast/messages/stream",
-                        headers=auth_headers,
-                    )
-                finally:
-                    app_client.app.state.settings.redis_url = None
+                events.append(ev)
+        return events, recheck_called["n"]
 
-    assert resp.status_code == 200
-    events = _parse_sse_events(resp.text)
-    event_names = [e[0] for e in events]
-
-    # Phase 1 must have yielded token events (fast-run replay)
-    assert "token" in event_names, f"Expected token events for fast-run replay, got: {event_names}"
-    token_datas = [json.loads(d) for name, d in events if name == "token"]
-    assert any(td["delta"] == "fast" for td in token_datas)
-    assert any(td["delta"] == " done" for td in token_datas)
-
-    # Phase 2 must still emit message + done
-    assert "message" in event_names, f"Missing message event: {event_names}"
-    assert "done" in event_names, f"Missing done event: {event_names}"
-
-    # Token events must precede message/done events
-    token_indices = [i for i, n in enumerate(event_names) if n == "token"]
-    non_token_indices = [i for i, n in enumerate(event_names) if n != "token"]
-    if non_token_indices:
-        assert max(token_indices) < min(non_token_indices), (
-            "token events must come before message/done events"
-        )
-
-
-def test_stream_messages_historical_session_skips_token_replay(
-    app_client, mock_db: AsyncMock, auth_headers,
-) -> None:
-    """Phase 1 is skipped when the run is COMPLETED and its assistant message exists.
-
-    This covers the re-open / reconnect case: the user returns to a session
-    that already has a completed run with a persisted assistant message.  We
-    must NOT replay the token stream (would flood the UI with stale content).
-
-    DB execute call order:
-
-    Phase-1 (resolve run + check for assistant message):
-      [0] list_runs                          → [run_completed]
-      [1] list_messages: get_session         → ses
-      [2] list_messages: query               → [msg_assistant]  ← already exists!
-
-    Phase-2 poll iteration (Phase 1 was skipped):
-      [3] list_runs (reconcile guard)        → [run_completed]
-      [4] list_messages: get_session         → ses
-      [5] list_messages: query               → [msg_assistant]
-      [6] list_runs (terminal check)         → [run_completed]
-    """
-    import unittest.mock as mock
-
-    run_completed = Run(
-        id="run_hist", tenant_id=TEST_TENANT, session_id="ses_hist",
-        task_description="old task", status="COMPLETED", sandbox_id="sbhist",
-        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        finished_at=dt.datetime(2026, 1, 1, 0, 1, 0, tzinfo=dt.UTC),
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        result_summary="old result",
-    )
-    msg_assistant = Message(
-        id="msg_hist_1", tenant_id=TEST_TENANT, session_id="ses_hist",
-        role="assistant", content="old result", sequence=1,
-        run_id="run_hist",
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-    )
-    ses = Session(
-        id="ses_hist", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
-    )
-
-    # Redis stub that would yield tokens if tailed — must NOT be called in Phase 1
-    class _FakeRedis:
-        _tail_called = False
-
-        @classmethod
-        def from_url(cls, *a, **kw):
-            return cls()
-
-        async def xread(self, streams, block=0, count=None):
-            self.__class__._tail_called = True
-            key = list(streams.keys())[0]
-            return [(key, [("1-0", {"type": "delta", "text": "SHOULD NOT APPEAR"})])]
-
-        async def aclose(self): pass
-
-    mock_db.execute.side_effect = [
-        make_scalar_result([run_completed]),  # [0] Phase-1: list_runs
-        make_scalar_result(ses),              # [1] Phase-1: list_messages get_session
-        make_scalar_result([msg_assistant]),  # [2] Phase-1: list_messages (msg exists!)
-        make_scalar_result([run_completed]),  # [3] Phase-2: list_runs (reconcile)
-        make_scalar_result(ses),              # [4] Phase-2: list_messages get_session
-        make_scalar_result([msg_assistant]),  # [5] Phase-2: list_messages query
-        make_scalar_result([run_completed]),  # [6] Phase-2: list_runs terminal check
+    events, rechecks = asyncio.get_event_loop().run_until_complete(_run())
+    parsed = [
+        (event_name, json.loads(data))
+        for event_name, data in _parse_sse_events("".join(events))
     ]
-
-    async def _refresh(obj): pass
-    mock_db.refresh.side_effect = _refresh
-
-    class _FakeHttpxClient(AuthzAwareClient):
-        async def get(self, url, **kw):
-            if "/check" in url and "authz" in url:
-                return self._authz_allowed_resp()
-            return self._authz_allowed_resp()
-
-    import httpx as _httpx
-    import agent_session_orchestrator.api.v1.messages as _messages_mod
-    _FakeRedis._tail_called = False
-    with _patch_redis_asyncio(_FakeRedis):
-        with mock.patch.object(_httpx, "AsyncClient", return_value=_FakeHttpxClient()):
-            with mock.patch.object(
-                _messages_mod, "acquire_db_session", new=_make_fake_db_session(mock_db)
-            ):
-                app_client.app.state.settings.redis_url = "redis://localhost:6379"
-                try:
-                    resp = app_client.get(
-                        "/api/session/v1/sessions/ses_hist/messages/stream",
-                        headers=auth_headers,
-                    )
-                finally:
-                    app_client.app.state.settings.redis_url = None
-
-    assert resp.status_code == 200
-    events = _parse_sse_events(resp.text)
-    event_names = [e[0] for e in events]
-
-    # No token events — Phase 1 was correctly skipped
-    assert "token" not in event_names, (
-        f"Should NOT have token events for historical session, got: {event_names}"
+    deltas = [p for name, p in parsed if name == "token"]
+    assert [d["delta"] for d in deltas] == ["a", "b"]
+    assert parsed[-1] == (
+        "run_stream_end",
+        {"run_id": "run_end", "paused": False},
     )
-    assert not _FakeRedis._tail_called, "Redis xread should not have been called for historical session"
+    # The 2-read idle gap (< _RUN_STATUS_RECHECK_READS) never triggered a recheck.
+    assert rechecks == 0
 
-    # Phase 2 still delivers the message and done
-    assert "message" in event_names, f"Missing message event: {event_names}"
-    assert "done" in event_names, f"Missing done event: {event_names}"
+
+# ---------------------------------------------------------------------------
+# Tests -- PART D-removed: stream_messages tests deleted.
+# The /messages/stream endpoint was removed; /sessions/{id}/stream is the
+# only SSE stream. Reconcile behaviour is tested directly below (Part F).
+# ---------------------------------------------------------------------------
+
 
 
 # ---------------------------------------------------------------------------
@@ -1395,8 +1328,14 @@ def test_stream_tokens_skips_unknown_type() -> None:
         return events
 
     events = asyncio.get_event_loop().run_until_complete(_run())
-    assert len(events) == 1
-    assert events[0].startswith("event: token\n")
+    parsed = [
+        (event_name, json.loads(data))
+        for event_name, data in _parse_sse_events("".join(events))
+    ]
+    assert [event_name for event_name, _payload in parsed] == [
+        "token",
+        "run_stream_end",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1404,9 +1343,7 @@ def test_stream_tokens_skips_unknown_type() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_reconcile_persists_tool_message_before_assistant(
-    app_client, mock_db: AsyncMock, auth_headers,
-) -> None:
+def test_reconcile_persists_tool_message_before_assistant() -> None:
     """reconcile writes interleaved messages in Redis stream order.
 
     Stream: delta("thinking...") → tool_call(Read/tc_abc) → tool_result → end.
@@ -1414,8 +1351,13 @@ def test_reconcile_persists_tool_message_before_assistant(
     Expected DB writes (in order): assistant(text) then tool — matching stream order.
     The TOOL message's tool_calls field is a list with {id, name, input, result, state},
     where input is a parsed object (not a raw string).
+
+    Calls _reconcile_run_completion directly (no endpoint dependency).
     """
+    import asyncio
     import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
 
     run = Run(
         id="run_tc", tenant_id=TEST_TENANT, session_id="ses_tc",
@@ -1423,9 +1365,8 @@ def test_reconcile_persists_tool_message_before_assistant(
         started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
         created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
     )
-    ses = Session(id="ses_tc", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
 
-    # Redis stub with tool_call + tool_result entries (plus some deltas/end)
+    # Redis stub with tool_call + tool_result entries
     tool_stream = [
         ("1-0", {"type": "delta", "text": "thinking..."}),
         ("2-0", {
@@ -1457,84 +1398,14 @@ def test_reconcile_persists_tool_message_before_assistant(
 
         async def aclose(self): pass
 
-    seq_result_0 = MagicMock()
-    seq_result_0.scalar_one_or_none = MagicMock(return_value=0)
-    seq_result_1 = MagicMock()
-    seq_result_1.scalar_one_or_none = MagicMock(return_value=1)
-
     created_messages: list[dict] = []
 
-    async def _refresh(obj):
-        if isinstance(obj, Message):
-            n = len(created_messages)
-            obj.id = f"msg_tc_{n}"
-            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
-            created_messages.append({"role": obj.role, "tool_calls": obj.tool_calls})
+    async def _fake_create_message(session_id, role, content, tool_calls, run_id):
+        created_messages.append({"role": role, "content": content, "tool_calls": tool_calls})
 
-    mock_db.refresh.side_effect = _refresh
-
-    # DB call sequence for stream_messages (one Phase-2 poll iteration).
-    #
-    # The Redis stream is: delta("thinking...") → tool_call(tc_abc) →
-    # tool_result(tc_abc) → end.
-    # _read_ordered_blocks_from_redis produces:
-    #   [text("thinking..."), tool(tc_abc/Read)]
-    # Reconcile writes them in block order: text first, then tool.
-    #
-    # Phase-1: list_runs → [run_running]
-    # Phase-2:
-    #   list_runs (reconcile guard) → [run_running]
-    #   get_session (creator) → ses  [httpx → COMPLETED]
-    #   idempotency: list_messages get_session → ses
-    #   idempotency: list_messages query → [] (no msgs)
-    #   _read_ordered_blocks_from_redis → [text block, tool block]
-    #   create_message(asst/text): get_session → ses
-    #   create_message(asst/text): max(sequence) → 0
-    #   create_message(TOOL): get_session → ses
-    #   create_message(TOOL): max(sequence) → 1
-    #   list_messages (new msgs): get_session → ses
-    #   list_messages (new msgs): query → [text_msg, tool_msg]
-    #   list_runs terminal check → [run_completed]
-    run_completed = Run(
-        id="run_tc", tenant_id=TEST_TENANT, session_id="ses_tc",
-        task_description="use tools", status="COMPLETED", sandbox_id="sb_tc",
-        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        finished_at=dt.datetime(2026, 1, 1, 0, 0, 1, tzinfo=dt.UTC),
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        result_summary="done with tools",
-    )
-    text_msg = Message(
-        id="msg_tc_0", tenant_id=TEST_TENANT, session_id="ses_tc",
-        role="assistant", content="thinking...",
-        sequence=1, run_id="run_tc",
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-    )
-    tool_msg = Message(
-        id="msg_tc_1", tenant_id=TEST_TENANT, session_id="ses_tc",
-        role="tool", content="Read",
-        tool_calls=[{"id": "tc_abc", "name": "Read",
-                     "input": {"file_path": "/app/main.py"},
-                     "result": "import sys", "state": "success"}],
-        sequence=2, run_id="run_tc",
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-    )
-
-    mock_db.execute.side_effect = [
-        make_scalar_result([run]),           # [0]  Phase-1: list_runs
-        make_scalar_result([run]),           # [1]  Phase-2: list_runs (reconcile guard)
-        make_scalar_result(ses),             # [2]  reconcile: get_session (creator)
-        # httpx → COMPLETED; redis_url is set
-        make_scalar_result(ses),             # [3]  idempotency: list_messages get_session
-        make_scalar_result([]),              # [4]  idempotency: list_messages query → empty
-        # _read_ordered_blocks_from_redis → [text, tool]
-        make_scalar_result(ses),             # [5]  create_message(asst/text): get_session
-        seq_result_0,                        # [6]  create_message(asst/text): max(sequence) → 0
-        make_scalar_result(ses),             # [7]  create_message(TOOL): get_session
-        seq_result_1,                        # [8]  create_message(TOOL): max(sequence) → 1
-        make_scalar_result(ses),             # [9]  list_messages (new): get_session
-        make_scalar_result([text_msg, tool_msg]),  # [10] list_messages (new): query
-        make_scalar_result([run_completed]), # [11] list_runs terminal check
-    ]
+    svc = MagicMock()
+    svc.list_messages = AsyncMock(return_value=([], None))
+    svc.create_message = AsyncMock(side_effect=_fake_create_message)
 
     class _FakeSchResp:
         status_code = 200
@@ -1547,86 +1418,73 @@ def test_reconcile_persists_tool_message_before_assistant(
                 "usage": {},
             }
 
-    class _FakeHttpxClient(AuthzAwareClient):
-        async def get(self, url, **kw):
-            if "/check" in url and "authz" in url:
-                return self._authz_allowed_resp()
-            return _FakeSchResp()
-
     import httpx as _httpx
-    import agent_session_orchestrator.api.v1.messages as _messages_mod
 
-    with _patch_redis_asyncio(_FakeRedisWithXrange):
-        with mock.patch.object(_httpx, "AsyncClient", return_value=_FakeHttpxClient()):
-            with mock.patch.object(
-                _messages_mod, "acquire_db_session", new=_make_fake_db_session(mock_db)
-            ):
-                app_client.app.state.settings.redis_url = "redis://localhost:6379"
-                try:
-                    resp = app_client.get(
-                        "/api/session/v1/sessions/ses_tc/messages/stream",
-                        headers=auth_headers,
-                    )
-                finally:
-                    app_client.app.state.settings.redis_url = None
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw): return _FakeSchResp()
 
-    assert resp.status_code == 200
+    with (
+        _patch_redis_asyncio(_FakeRedisWithXrange),
+        mock.patch.object(_httpx, "AsyncClient", return_value=_FakeClient()),
+    ):
+        terminal, _ = asyncio.get_event_loop().run_until_complete(
+            _reconcile_run_completion(
+                scheduler_url="http://scheduler:8080",
+                tenant_id=TEST_TENANT,
+                user_id="u1",
+                run=run,
+                svc=svc,
+                knowledge_ingest_url="",
+                redis_url="redis://localhost:6379",
+            )
+        )
+
+    assert terminal is True, "reconcile must return True (terminal) for COMPLETED run"
 
     # Stream: delta("thinking...") → tool_call → tool_result → end
-    # Blocks: [text("thinking..."), tool(Read)] → 2 db.add calls in that order
-    assert mock_db.add.call_count == 2, (
-        f"Expected 2 db.add calls (text + TOOL), got {mock_db.add.call_count}"
+    # Blocks: [text("thinking..."), tool(Read)] → 2 create_message calls in that order
+    assert svc.create_message.call_count == 2, (
+        f"Expected 2 create_message calls (text + TOOL), got {svc.create_message.call_count}"
     )
 
-    # First add call: assistant text block ("thinking...")
-    first_add_obj = mock_db.add.call_args_list[0][0][0]
-    assert first_add_obj.role == "assistant", (
-        f"First message should be role=assistant (text block), got {first_add_obj.role}"
+    # First call: assistant text block ("thinking...")
+    first_call = created_messages[0]
+    assert first_call["role"] == "assistant", (
+        f"First message should be role=assistant (text block), got {first_call['role']}"
     )
-    assert first_add_obj.content == "thinking...", first_add_obj.content
+    assert first_call["content"] == "thinking...", first_call["content"]
 
-    # Second add call: TOOL block (Read)
-    second_add_obj = mock_db.add.call_args_list[1][0][0]
-    assert second_add_obj.role == "tool", (
-        f"Second message should be role=tool, got {second_add_obj.role}"
+    # Second call: TOOL block (Read)
+    second_call = created_messages[1]
+    assert second_call["role"] == "tool", (
+        f"Second message should be role=tool, got {second_call['role']}"
     )
-    assert isinstance(second_add_obj.tool_calls, list), "tool_calls must be a list"
-    assert len(second_add_obj.tool_calls) == 1
-    tc = second_add_obj.tool_calls[0]
+    assert isinstance(second_call["tool_calls"], list), "tool_calls must be a list"
+    assert len(second_call["tool_calls"]) == 1
+    tc = second_call["tool_calls"][0]
     assert tc["id"] == "tc_abc"
     assert tc["name"] == "Read"
     assert tc["input"] == {"file_path": "/app/main.py"}, tc["input"]
     assert tc["result"] == "import sys"
     assert tc["state"] == "success"
 
-    # Sequence is guaranteed by serial create_message calls probing max(sequence).
-    # seq_result_0=0 → text gets seq 1, seq_result_1=1 → tool gets seq 2.
 
+def test_reconcile_no_tool_message_when_no_tool_calls() -> None:
+    """When Redis has no tool_call entries, no TOOL message is created.
 
-def test_reconcile_no_tool_message_when_no_tool_calls(
-    app_client, mock_db: AsyncMock, auth_headers,
-) -> None:
-    """When Redis has no tool_call entries, no TOOL message is created."""
+    Calls _reconcile_run_completion directly (no endpoint dependency).
+    """
+    import asyncio
     import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
 
     run = Run(
         id="run_notc", tenant_id=TEST_TENANT, session_id="ses_notc",
         task_description="no tools used", status="RUNNING", sandbox_id="sb_notc",
         started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-    )
-    run_completed = Run(
-        id="run_notc", tenant_id=TEST_TENANT, session_id="ses_notc",
-        task_description="no tools used", status="COMPLETED", sandbox_id="sb_notc",
-        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        finished_at=dt.datetime(2026, 1, 1, 0, 0, 1, tzinfo=dt.UTC),
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        result_summary="plain answer",
-    )
-    ses = Session(id="ses_notc", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
-    asst_msg = Message(
-        id="msg_notc_0", tenant_id=TEST_TENANT, session_id="ses_notc",
-        role="assistant", content="plain answer", sequence=1, run_id="run_notc",
         created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
     )
 
@@ -1647,30 +1505,14 @@ def test_reconcile_no_tool_message_when_no_tool_calls(
 
         async def aclose(self): pass
 
-    seq_result_0 = MagicMock()
-    seq_result_0.scalar_one_or_none = MagicMock(return_value=0)
+    created_messages: list[dict] = []
 
-    async def _refresh(obj):
-        if isinstance(obj, Message):
-            obj.id = "msg_notc_0"
-            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+    async def _fake_create_message(session_id, role, content, tool_calls, run_id):
+        created_messages.append({"role": role, "content": content, "tool_calls": tool_calls})
 
-    mock_db.refresh.side_effect = _refresh
-
-    mock_db.execute.side_effect = [
-        make_scalar_result([run]),           # [0]  Phase-1: list_runs
-        make_scalar_result([run]),           # [1]  Phase-2: list_runs (reconcile)
-        make_scalar_result(ses),             # [2]  reconcile: get_session (creator)
-        # httpx → COMPLETED
-        # _read_ordered_blocks_from_redis → [text("plain")] (no tool blocks)
-        make_scalar_result(ses),             # [3]  idempotency: list_messages get_session
-        make_scalar_result([]),              # [4]  idempotency: list_messages query → empty
-        make_scalar_result(ses),             # [5]  create_message(asst/text): get_session
-        seq_result_0,                        # [6]  create_message(asst/text): max(sequence)
-        make_scalar_result(ses),             # [7]  list_messages (new): get_session
-        make_scalar_result([asst_msg]),      # [8]  list_messages (new): query
-        make_scalar_result([run_completed]), # [9]  list_runs terminal check
-    ]
+    svc = MagicMock()
+    svc.list_messages = AsyncMock(return_value=([], None))
+    svc.create_message = AsyncMock(side_effect=_fake_create_message)
 
     class _FakeSchResp:
         status_code = 200
@@ -1683,45 +1525,49 @@ def test_reconcile_no_tool_message_when_no_tool_calls(
                 "usage": {},
             }
 
-    class _FakeHttpxClient(AuthzAwareClient):
-        async def get(self, url, **kw):
-            if "/check" in url and "authz" in url:
-                return self._authz_allowed_resp()
-            return _FakeSchResp()
-
     import httpx as _httpx
-    import agent_session_orchestrator.api.v1.messages as _messages_mod
 
-    with _patch_redis_asyncio(_FakeRedisNoTools):
-        with mock.patch.object(_httpx, "AsyncClient", return_value=_FakeHttpxClient()):
-            with mock.patch.object(
-                _messages_mod, "acquire_db_session", new=_make_fake_db_session(mock_db)
-            ):
-                app_client.app.state.settings.redis_url = "redis://localhost:6379"
-                try:
-                    resp = app_client.get(
-                        "/api/session/v1/sessions/ses_notc/messages/stream",
-                        headers=auth_headers,
-                    )
-                finally:
-                    app_client.app.state.settings.redis_url = None
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw): return _FakeSchResp()
 
-    assert resp.status_code == 200
+    with (
+        _patch_redis_asyncio(_FakeRedisNoTools),
+        mock.patch.object(_httpx, "AsyncClient", return_value=_FakeClient()),
+    ):
+        terminal, _ = asyncio.get_event_loop().run_until_complete(
+            _reconcile_run_completion(
+                scheduler_url="http://scheduler:8080",
+                tenant_id=TEST_TENANT,
+                user_id="u1",
+                run=run,
+                svc=svc,
+                knowledge_ingest_url="",
+                redis_url="redis://localhost:6379",
+            )
+        )
 
-    # Only one db.add call — the text block as assistant message; no TOOL message
-    assert mock_db.add.call_count == 1, (
-        f"Expected 1 db.add call (text block → asst), got {mock_db.add.call_count}"
+    assert terminal is True, "reconcile must return True (terminal) for COMPLETED run"
+
+    # Only one create_message call — the text block as assistant; no TOOL message
+    assert svc.create_message.call_count == 1, (
+        f"Expected 1 create_message call (text block → asst), got {svc.create_message.call_count}"
     )
-    only_add = mock_db.add.call_args_list[0][0][0]
-    assert only_add.role == "assistant"
-    assert only_add.content == "plain"
+    only_call = created_messages[0]
+    assert only_call["role"] == "assistant"
+    assert only_call["content"] == "plain"
 
 
-def test_reconcile_tool_message_idempotent(
-    app_client, mock_db: AsyncMock, auth_headers,
-) -> None:
-    """reconcile does not create a second TOOL message if one already exists for this run."""
+def test_reconcile_tool_message_idempotent() -> None:
+    """reconcile does not create messages if assistant/tool rows already exist for this run.
+
+    Calls _reconcile_run_completion directly (no endpoint dependency).
+    """
+    import asyncio
     import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
 
     run = Run(
         id="run_idem", tenant_id=TEST_TENANT, session_id="ses_idem",
@@ -1729,17 +1575,8 @@ def test_reconcile_tool_message_idempotent(
         started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
         created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
     )
-    run_completed = Run(
-        id="run_idem", tenant_id=TEST_TENANT, session_id="ses_idem",
-        task_description="already done", status="COMPLETED", sandbox_id="sb_idem",
-        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        finished_at=dt.datetime(2026, 1, 1, 0, 0, 1, tzinfo=dt.UTC),
-        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-        result_summary="already done result",
-    )
-    ses = Session(id="ses_idem", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
 
-    # Pre-existing TOOL message for this run
+    # Pre-existing TOOL + assistant messages for this run
     existing_tool_msg = Message(
         id="msg_idem_0", tenant_id=TEST_TENANT, session_id="ses_idem",
         role="tool", content="调用了 1 个工具",
@@ -1760,7 +1597,6 @@ def test_reconcile_tool_message_idempotent(
             return cls()
 
         async def xrange(self, key, min="-", max="+"):
-            # Tool calls exist in Redis too
             return [
                 ("1-0", {
                     "type": "tool_call",
@@ -1775,24 +1611,10 @@ def test_reconcile_tool_message_idempotent(
 
         async def aclose(self): pass
 
-    async def _refresh(obj): pass
-    mock_db.refresh.side_effect = _refresh
-
-    # New idempotency: a single list_messages call checks for any assistant or tool
-    # message for this run_id.  Finds existing_tool_msg → already_persisted=True →
-    # skip all creation.
-    mock_db.execute.side_effect = [
-        make_scalar_result([run]),                      # [0]  Phase-1: list_runs
-        make_scalar_result([run]),                      # [1]  Phase-2: list_runs (reconcile)
-        make_scalar_result(ses),                        # [2]  reconcile: get_session (creator)
-        # httpx → COMPLETED
-        make_scalar_result(ses),                        # [3]  idempotency: list_messages get_session
-        make_scalar_result([existing_tool_msg, existing_asst_msg]),  # [4] idempotency query → already_persisted=True
-        # → skip all block creation
-        make_scalar_result(ses),                        # [5]  list_messages (new): get_session
-        make_scalar_result([]),                         # [6]  list_messages (new): query → nothing new
-        make_scalar_result([run_completed]),            # [7]  list_runs terminal check
-    ]
+    # list_messages returns existing rows → already_persisted=True → no create_message calls
+    svc = MagicMock()
+    svc.list_messages = AsyncMock(return_value=([existing_tool_msg, existing_asst_msg], None))
+    svc.create_message = AsyncMock()
 
     class _FakeSchResp:
         status_code = 200
@@ -1805,35 +1627,33 @@ def test_reconcile_tool_message_idempotent(
                 "usage": {},
             }
 
-    class _FakeHttpxClient(AuthzAwareClient):
-        async def get(self, url, **kw):
-            if "/check" in url and "authz" in url:
-                return self._authz_allowed_resp()
-            return _FakeSchResp()
-
     import httpx as _httpx
-    import agent_session_orchestrator.api.v1.messages as _messages_mod
 
-    with _patch_redis_asyncio(_FakeRedisXrange):
-        with mock.patch.object(_httpx, "AsyncClient", return_value=_FakeHttpxClient()):
-            with mock.patch.object(
-                _messages_mod, "acquire_db_session", new=_make_fake_db_session(mock_db)
-            ):
-                app_client.app.state.settings.redis_url = "redis://localhost:6379"
-                try:
-                    resp = app_client.get(
-                        "/api/session/v1/sessions/ses_idem/messages/stream",
-                        headers=auth_headers,
-                    )
-                finally:
-                    app_client.app.state.settings.redis_url = None
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw): return _FakeSchResp()
 
-    assert resp.status_code == 200
+    with (
+        _patch_redis_asyncio(_FakeRedisXrange),
+        mock.patch.object(_httpx, "AsyncClient", return_value=_FakeClient()),
+    ):
+        terminal, _ = asyncio.get_event_loop().run_until_complete(
+            _reconcile_run_completion(
+                scheduler_url="http://scheduler:8080",
+                tenant_id=TEST_TENANT,
+                user_id="u1",
+                run=run,
+                svc=svc,
+                knowledge_ingest_url="",
+                redis_url="redis://localhost:6379",
+            )
+        )
 
-    # No db.add calls — any assistant/tool message for this run already exists
-    assert mock_db.add.call_count == 0, (
-        f"Expected 0 db.add calls (idempotent), got {mock_db.add.call_count}"
-    )
+    assert terminal is True, "reconcile must return True (terminal) for COMPLETED run"
+
+    # No create_message calls — already_persisted=True skips all creation
+    svc.create_message.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -1888,7 +1708,8 @@ def test_read_ordered_blocks_full_interleaved() -> None:
 
     blocks = asyncio.get_event_loop().run_until_complete(_run())
 
-    # Expected order: text("Hello world"), tool(tc1/Read), text("after tool"), thinking
+    # Expected order: text("Hello world"), tool(tc1/Read), thinking, text("after tool").
+    # Thinking is a side-channel and does not split the surrounding assistant text.
     assert len(blocks) == 4, f"Expected 4 blocks, got {len(blocks)}: {blocks}"
 
     assert blocks[0] == {"kind": "text", "text": "Hello world"}, blocks[0]
@@ -1901,9 +1722,9 @@ def test_read_ordered_blocks_full_interleaved() -> None:
     assert b1["result"] == "file content"
     assert b1["state"] == "success"
 
-    assert blocks[2] == {"kind": "text", "text": "after tool"}, blocks[2]
+    assert blocks[2] == {"kind": "thinking", "text": "I reflect"}, blocks[2]
 
-    assert blocks[3] == {"kind": "thinking", "text": "I reflect"}, blocks[3]
+    assert blocks[3] == {"kind": "text", "text": "after tool"}, blocks[3]
 
 
 def test_read_ordered_blocks_empty_on_redis_error() -> None:
@@ -2042,3 +1863,262 @@ def test_read_ordered_blocks_sanitizes_nul_tool_result() -> None:
     assert blocks[0]["kind"] == "tool"
     assert blocks[0]["result"] == "ab"
     assert "\x00" not in blocks[0]["result"]
+
+
+# ---------------------------------------------------------------------------
+# Tests -- PART H: HITL pause/resume
+# ---------------------------------------------------------------------------
+
+
+def test_stream_tokens_yields_pending_confirmation_event() -> None:
+    """_stream_tokens yields event: pending_confirmation for HITL confirm entries."""
+    from agent_session_orchestrator.api.v1.messages import _stream_tokens
+
+    class _FakeRedis:
+        _call_count = 0
+
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def xread(self, streams, block=0, count=None):
+            key = list(streams.keys())[0]
+            n = self.__class__._call_count
+            self.__class__._call_count += 1
+            if n == 0:
+                return [(key, [
+                    ("1-0", {"type": "delta", "text": "I will call a tool"}),
+                    ("2-0", {
+                        "type": "pending_confirmation",
+                        "tool_call_id": "tc_hitl_1",
+                        "name": "Bash",
+                        "args": '{"command": "rm -rf /"}',
+                    }),
+                ])]
+            # No end marker — worker paused; stream should return after stalling.
+            return []
+
+        async def aclose(self): pass
+
+    async def _run():
+        with _patch_redis_asyncio(_FakeRedis):
+            _FakeRedis._call_count = 0
+            deadline = asyncio.get_event_loop().time() + 10.0
+            events = []
+            async for ev in _stream_tokens(
+                redis_url="redis://localhost:6379",
+                run_id="run_hitl_confirm",
+                deadline=deadline,
+            ):
+                events.append(ev)
+        return events
+
+    events = asyncio.get_event_loop().run_until_complete(_run())
+
+    parsed = []
+    for ev in events:
+        lines = ev.strip().splitlines()
+        event_name = next(l.split(":", 1)[1].strip() for l in lines if l.startswith("event:"))
+        data_str = next(l.split(":", 1)[1].strip() for l in lines if l.startswith("data:"))
+        parsed.append((event_name, json.loads(data_str)))
+
+    event_names = [p[0] for p in parsed]
+
+    # Must include token for the delta and pending_confirmation for the HITL entry.
+    assert "token" in event_names, f"Expected token event, got: {event_names}"
+    assert "pending_confirmation" in event_names, (
+        f"Expected pending_confirmation event, got: {event_names}"
+    )
+
+    confirm_events = [p[1] for p in parsed if p[0] == "pending_confirmation"]
+    assert len(confirm_events) == 1
+    ce = confirm_events[0]
+    assert ce["run_id"] == "run_hitl_confirm"
+    assert ce["tool_call_id"] == "tc_hitl_1"
+    assert ce["name"] == "Bash"
+    assert ce["args"] == '{"command": "rm -rf /"}'
+
+
+def test_stream_tokens_yields_pending_question_event() -> None:
+    """_stream_tokens yields event: pending_question for HITL question entries."""
+    from agent_session_orchestrator.api.v1.messages import _stream_tokens
+
+    class _FakeRedis:
+        _call_count = 0
+
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def xread(self, streams, block=0, count=None):
+            key = list(streams.keys())[0]
+            n = self.__class__._call_count
+            self.__class__._call_count += 1
+            if n == 0:
+                return [(key, [
+                    ("1-0", {
+                        "type": "pending_question",
+                        "tool_call_id": "tc_hitl_q",
+                        "question": "Which environment should I deploy to?",
+                    }),
+                ])]
+            return []
+
+        async def aclose(self): pass
+
+    async def _run():
+        with _patch_redis_asyncio(_FakeRedis):
+            _FakeRedis._call_count = 0
+            deadline = asyncio.get_event_loop().time() + 10.0
+            events = []
+            async for ev in _stream_tokens(
+                redis_url="redis://localhost:6379",
+                run_id="run_hitl_q",
+                deadline=deadline,
+            ):
+                events.append(ev)
+        return events
+
+    events = asyncio.get_event_loop().run_until_complete(_run())
+
+    parsed = []
+    for ev in events:
+        lines = ev.strip().splitlines()
+        event_name = next(l.split(":", 1)[1].strip() for l in lines if l.startswith("event:"))
+        data_str = next(l.split(":", 1)[1].strip() for l in lines if l.startswith("data:"))
+        parsed.append((event_name, json.loads(data_str)))
+
+    event_names = [p[0] for p in parsed]
+    assert "pending_question" in event_names, (
+        f"Expected pending_question event, got: {event_names}"
+    )
+
+    q_events = [p[1] for p in parsed if p[0] == "pending_question"]
+    assert len(q_events) == 1
+    qe = q_events[0]
+    assert qe["run_id"] == "run_hitl_q"
+    assert qe["tool_call_id"] == "tc_hitl_q"
+    assert qe["question"] == "Which environment should I deploy to?"
+
+
+def test_reconcile_sets_paused_status_when_worker_pauses(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """_reconcile_run_completion sets run.status=PAUSED and returns non-terminal
+    when the scheduler returns COMPLETED but result_status=paused.
+
+    Verifies contract: reconcile must NOT write an assistant message on pause,
+    and must return (False, []) so the SSE loop emits run_paused not run_complete.
+    """
+    import asyncio
+    import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
+
+    run = Run(
+        id="run_pause_test", tenant_id=TEST_TENANT, session_id="ses_pause",
+        task_description="do something", status="RUNNING", sandbox_id="sb_pause",
+        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    ses = Session(id="ses_pause", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
+    svc = MagicMock()
+    svc.list_messages = AsyncMock(return_value=([], None))
+    svc.create_message = AsyncMock()
+
+    class _FakePausedSchResp:
+        status_code = 200
+        def json(self):
+            return {
+                "status": "COMPLETED",
+                # Worker exited 0 but wrote status=paused in result.json;
+                # scheduler surfaces it as result_status.
+                "result_status": "paused",
+                "result_summary": None,
+                "result_error": None,
+                "artifacts": [],
+                "usage": {},
+                "plan_steps": [],
+            }
+
+    import httpx as _httpx
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw): return _FakePausedSchResp()
+
+    with mock.patch.object(_httpx, "AsyncClient", return_value=_FakeClient()):
+        terminal, plan_steps = asyncio.get_event_loop().run_until_complete(
+            _reconcile_run_completion(
+                scheduler_url="http://scheduler:8080",
+                tenant_id=TEST_TENANT,
+                user_id="u1",
+                run=run,
+                svc=svc,
+                knowledge_ingest_url="",
+                redis_url=None,
+            )
+        )
+
+    # Reconcile must return non-terminal (PAUSED is not terminal).
+    assert terminal is False, (
+        "reconcile must return False (non-terminal) for a paused run"
+    )
+    # Run status must be set to PAUSED.
+    assert run.status == "PAUSED", (
+        f"Expected run.status=PAUSED, got {run.status}"
+    )
+    # No assistant message must be written.
+    svc.create_message.assert_not_called()
+
+
+def test_create_run_includes_hitl_flag(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """create_run must pass hitl=True in the scheduler payload for normal sessions."""
+    import httpx
+
+    session = Session(
+        id="ses_hitl_flag", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+    )
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_hitl_flag"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+
+    scheduler_body: list[dict] = []
+
+    class _MemResp:
+        status_code = 200
+        def json(self): return {"hits": []}
+
+    class _SchResp:
+        status_code = 201
+        def json(self): return {"id": "run_hitl_flag", "sandbox_id": "abc123", "status": "RUNNING"}
+
+    class _FakeClient(AuthzAwareClient):
+        async def get(self, url, **kw): return _MemResp()
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if json:
+                scheduler_body.append(json)
+            return _SchResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        app_client.post(
+            "/api/session/v1/sessions/ses_hitl_flag/runs",
+            headers=auth_headers,
+            json={"task": "do something"},
+        )
+
+    assert scheduler_body, "scheduler was not called"
+    body = scheduler_body[-1]
+    assert body.get("hitl") is True, (
+        f"Expected hitl=True in scheduler payload, got: {body.get('hitl')}"
+    )

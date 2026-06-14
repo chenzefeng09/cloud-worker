@@ -4,6 +4,8 @@ import { useAdminStore } from '../../stores/adminStore';
 import { CustomSelect } from '../components/CustomSelect';
 import type { AuditEvent, AuditChainVerifyResult } from '../../api/types';
 import { AUDIT_ACTIONS, AUDIT_ACTION_GROUPS } from '../auditActions';
+import { useTranslation } from '../../i18n';
+import { formatDateTime } from '../../i18n/dates';
 
 // ─── Action multi-select popover ───────────────────────────────────────────────
 
@@ -14,6 +16,7 @@ function ActionMultiSelect({
   selected: string[];
   onChange: (next: string[]) => void;
 }) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const ref = useRef<HTMLDivElement>(null);
@@ -46,12 +49,12 @@ function ActionMultiSelect({
 
   const selectedOptions = AUDIT_ACTIONS.filter((a) => selected.includes(a.value));
 
-  // Match against 中文 label and the wire value (case-insensitive).
+  // Match against translated label and the wire value (case-insensitive).
   const q = query.trim().toLowerCase();
   const matches = (a: (typeof AUDIT_ACTIONS)[number]) =>
-    q === '' || a.label.toLowerCase().includes(q) || a.value.toLowerCase().includes(q);
-  const visibleGroups = AUDIT_ACTION_GROUPS.filter((group) =>
-    AUDIT_ACTIONS.some((a) => a.group === group && matches(a)),
+    q === '' || t(a.labelKey).toLowerCase().includes(q) || a.value.toLowerCase().includes(q);
+  const visibleGroups = AUDIT_ACTION_GROUPS.filter((groupKey) =>
+    AUDIT_ACTIONS.some((a) => a.groupKey === groupKey && matches(a)),
   );
 
   return (
@@ -71,7 +74,7 @@ function ActionMultiSelect({
                   key={o.value}
                   className="inline-flex items-center bg-paper-2 border border-line rounded-sm px-1.5 py-0.5 text-[11px] text-ink-2"
                 >
-                  {o.label}
+                  {t(o.labelKey)}
                 </span>
               ))}
             </span>
@@ -106,12 +109,12 @@ function ActionMultiSelect({
           {visibleGroups.length === 0 && (
             <div className="px-2 py-3 text-[11.5px] text-dim italic">无匹配操作</div>
           )}
-          {visibleGroups.map((group) => (
-            <div key={group} className="mt-1">
+          {visibleGroups.map((groupKey) => (
+            <div key={groupKey} className="mt-1">
               <div className="px-2 py-1 font-mono text-[9.5px] uppercase tracking-[0.1em] text-dim">
-                {group}
+                {t(groupKey)}
               </div>
-              {AUDIT_ACTIONS.filter((a) => a.group === group && matches(a)).map((a) => {
+              {AUDIT_ACTIONS.filter((a) => a.groupKey === groupKey && matches(a)).map((a) => {
                 const checked = selected.includes(a.value);
                 return (
                   <label
@@ -125,7 +128,7 @@ function ActionMultiSelect({
                       className="mt-0.5 accent-accent"
                     />
                     <span className="flex flex-col leading-tight">
-                      <span className="text-[12px] text-ink">{a.label}</span>
+                      <span className="text-[12px] text-ink">{t(a.labelKey)}</span>
                       <span className="font-mono text-[10px] text-dim">{a.value}</span>
                     </span>
                   </label>
@@ -160,6 +163,7 @@ const QUICK_RANGES: { label: string; days: number }[] = [
 ];
 
 export function AuditPage() {
+  const { lang } = useTranslation();
   const { tenants, tenantsLoading, setTenants, setTenantsLoading } = useAdminStore();
   const [tenantId, setTenantId] = useState('');
   const [actions, setActions] = useState<string[]>([]);
@@ -511,7 +515,7 @@ export function AuditPage() {
                 {events.map((ev) => (
                   <tr key={ev.event_id} className="border-b border-line-2 hover:bg-paper-2 transition-colors">
                     <td className="px-3 py-2 font-mono text-[11px] text-dim whitespace-nowrap">
-                      {ev.occurred_at ? new Date(ev.occurred_at).toLocaleString('zh-CN') : '—'}
+                      {ev.occurred_at ? formatDateTime(new Date(ev.occurred_at), lang) : '—'}
                     </td>
                     <td className="px-3 py-2 font-mono text-[12px] text-ink">{ev.event_type}</td>
                     <td className="px-3 py-2 font-mono text-[11px] text-ink-2">

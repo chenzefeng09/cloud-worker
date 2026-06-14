@@ -72,6 +72,7 @@ def _base_env() -> dict:
         "FOUNDATION_API_TOKEN": "tok-sandbox-jwt",
         "FOUNDATION_TENANT_ID": "tnt-abc",
         "FOUNDATION_USER_ID": "usr-123",
+        "TOOL_BROKER_LEASE": "v1.payload.signature",
         "LLM_MODEL": "gpt-4o-mini",
         "LLM_PROVIDER": "openai",
     }
@@ -302,6 +303,8 @@ def test_gateway_model_injects_auth_headers(monkeypatch):
                 model_name="gpt-4o-mini",
                 formatter=fake_formatter,
                 tenant_id="tnt_01J5DEVXX00000000000000001",
+                user_id="usr_01J5DEVXX00000000000000001",
+                broker_lease="v1.payload.signature",
             )
 
         import asyncio
@@ -321,6 +324,8 @@ def test_gateway_model_injects_auth_headers(monkeypatch):
         # The gateway's TenantContextMiddleware requires X-Tenant-Id or it
         # returns 401 "Tenant context missing" — assert the enforcer forwards it.
         assert captured_headers.get("X-Tenant-Id") == "tnt_01J5DEVXX00000000000000001"
+        assert captured_headers.get("X-User-Id") == "usr_01J5DEVXX00000000000000001"
+        assert captured_headers.get("X-Tool-Broker-Lease") == "v1.payload.signature"
 
     except ImportError:
         pytest.skip("agentscope not installed — skipping header-injection integration test")
@@ -337,7 +342,9 @@ def test_snapshot_env_includes_gateway_keys(monkeypatch):
 
     monkeypatch.setenv("LLM_GATEWAY_URL", "http://gw:8011/api/llm-gateway/v1")
     monkeypatch.setenv("LLM_VIRTUAL_KEY", "vk-abc")
+    monkeypatch.setenv("TOOL_BROKER_LEASE", "v1.payload.signature")
 
     snap = hooks_mod.snapshot_env()
     assert snap.get("LLM_GATEWAY_URL") == "http://gw:8011/api/llm-gateway/v1"
     assert snap.get("LLM_VIRTUAL_KEY") == "vk-abc"
+    assert snap.get("TOOL_BROKER_LEASE") == "v1.payload.signature"

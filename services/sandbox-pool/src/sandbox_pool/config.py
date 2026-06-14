@@ -100,7 +100,13 @@ class Settings(BaseSettings):
     # Sandbox image to run as idle containers.
     sandbox_image: str = "ghcr.io/agent-platform/agentscope-sandbox:0.1"
     # Docker network the pool-managed containers join (must match compose network).
-    docker_network: str = "saas-foundation-dev_foundation"
+    # Prewarmed sandboxes must NOT sit on the flat foundation network: like
+    # scheduler-spawned sandboxes in broker egress mode, they join the internal
+    # sandbox_broker network and reach platform capabilities via tool-broker
+    # façades only. Name is the compose-project-prefixed network
+    # (project ``agent-platform-dev`` + network key ``sandbox_broker``) and must
+    # match the scheduler's ``sandbox_broker_network`` default.
+    docker_network: str = "agent-platform-dev_sandbox_broker"
     # Resource limits for idle sandbox containers (mirrors scheduler defaults).
     sandbox_memory_limit: str = "2g"
     sandbox_cpu_shares: int = 1024

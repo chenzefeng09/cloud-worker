@@ -121,6 +121,7 @@ def _env(*, include_service_scopes: bool = True):
         "MCP_REGISTRY_URL": "https://mcp-registry.local/api/mcp/v1",
         "FOUNDATION_API_URL": "https://foundation.local",
         "FOUNDATION_API_TOKEN": "tok-xyz",
+        "TOOL_BROKER_LEASE": "v1.payload.signature",
     }
     if include_service_scopes:
         # Scheduler injects this so the extension can set X-Service-Scopes.
@@ -214,6 +215,7 @@ def test_fetch_sends_x_service_scopes_header(fresh):
     )
     assert "mcp.read_internal" in captured_headers["x-service-scopes"]
     assert captured_headers.get("x-tenant-id") == "tnt-abc"
+    assert captured_headers.get("x-tool-broker-lease") == "v1.payload.signature"
 
     injector.set_client(None)
 

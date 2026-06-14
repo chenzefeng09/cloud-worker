@@ -22,6 +22,39 @@ export function formatRelativeTimeZh(value: string | Date | null | undefined): s
 }
 
 /**
+ * Bucket a timestamp into a coarse recency group used to section the sidebar
+ * session list (ChatGPT/Claude style): 今天 / 昨天 / 过去 7 天 / 过去 30 天 / 更早.
+ * Buckets are calendar-day based (local time) so "昨天" means the previous
+ * calendar day, not "24–48h ago".
+ */
+export type RecencyBucket = '今天' | '昨天' | '过去 7 天' | '过去 30 天' | '更早';
+
+export function recencyBucketZh(value: string | Date | null | undefined): RecencyBucket {
+  if (!value) return '更早';
+  const d = typeof value === 'string' ? new Date(value) : value;
+  if (Number.isNaN(d.getTime())) return '更早';
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  const dayMs = 86_400_000;
+  const diffDays = Math.floor((startOfToday.getTime() - d.getTime()) / dayMs);
+  if (diffDays < 0) return '今天'; // future/clock-skew → treat as today
+  if (diffDays === 0) return '今天';
+  if (diffDays === 1) return '昨天';
+  if (diffDays < 7) return '过去 7 天';
+  if (diffDays < 30) return '过去 30 天';
+  return '更早';
+}
+
+/** Fixed display order for recency buckets. */
+export const RECENCY_BUCKET_ORDER: RecencyBucket[] = [
+  '今天',
+  '昨天',
+  '过去 7 天',
+  '过去 30 天',
+  '更早',
+];
+
+/**
  * Format an ISO timestamp as an absolute local date-time string
  * (e.g. "2026-06-07 21:13:27"), used in hover tooltips.
  */
@@ -40,7 +73,10 @@ export function formatAbsoluteTimeZh(value: string | Date | null | undefined): s
 export function sessionStatusZh(status: string | null | undefined): string {
   switch (status) {
     case 'ACTIVE':
-      return '运行中';
+      // Session-level "open / can continue", NOT "a run is executing".
+      // Deliberately distinct from the task-level live → "运行中" so a settled
+      // session with no active run doesn't read as if it's burning compute.
+      return '进行中';
     case 'PAUSED':
       return '已暂停';
     case 'COMPLETED':

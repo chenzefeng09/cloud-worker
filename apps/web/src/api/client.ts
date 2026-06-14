@@ -1,5 +1,7 @@
 import type {
   ActiveSession,
+  RespondBody,
+  PendingInteractionsResponse,
   AddTeamMemberRequest,
   AdminRole,
   AdminSkill,
@@ -154,6 +156,9 @@ import type {
   OrphanReportListResponse,
   PromQueryRangeResponse,
   BucketPurpose,
+  CronJob,
+  CronJobCreate,
+  CronJobUpdate,
 } from './types';
 
 const BFF_BASE = '/api/bff/v1';
@@ -304,6 +309,28 @@ export const api = {
       request<void>('DELETE', `/sessions/${id}`),
     cancel: (sessionId: string) =>
       request<Record<string, unknown>>('POST', `/sessions/${sessionId}/cancel`),
+    /**
+     * Forward a HITL response (confirm approve/reject, or a question answer)
+     * to the orchestrator via the BFF proxy.
+     *
+     * Returns `{ run_id, status: "RUNNING" }` on success.
+     * Throws ApiError with status 409 if the run is not paused.
+     * Throws ApiError with status 404 if the pause has expired.
+     */
+    respond: (sessionId: string, runId: string, body: RespondBody) =>
+      request<{ run_id: string; status: string }>(
+        'POST',
+        `/sessions/${sessionId}/runs/${runId}/respond`,
+        body,
+      ),
+    /**
+     * Pull all currently-paused HITL interactions for the session.
+     * Called on mount / reconnect to rehydrate ConfirmCard / QuestionCard
+     * for a run that paused while the page was closed.  Best-effort: the
+     * backend always returns 200 with a (possibly empty) `items` array.
+     */
+    pending: (sessionId: string) =>
+      request<PendingInteractionsResponse>('GET', `/sessions/${sessionId}/pending`),
   },
 
   messages: {
@@ -1185,6 +1212,14 @@ export const api = {
         'GET',
         '/pam/elevations/mine',
       ).then((r) => (Array.isArray(r) ? r : r.items ?? [])),
+  },
+
+  schedules: {
+    list: () => request<CronJob[]>('GET', '/schedules'),
+    create: (body: CronJobCreate) => request<CronJob>('POST', '/schedules', body),
+    update: (id: string, body: CronJobUpdate) =>
+      request<CronJob>('PATCH', `/schedules/${id}`, body),
+    remove: (id: string) => request<void>('DELETE', `/schedules/${id}`),
   },
 
   chat: {

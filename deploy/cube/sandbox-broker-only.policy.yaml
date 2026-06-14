@@ -1,0 +1,125 @@
+# =============================================================================
+# sandbox-broker-only — CubeSandbox (CubeVS) per-microVM egress policy values
+# =============================================================================
+#
+# This is the PROD analogue of the dev compose `internal: true` `sandbox_broker`
+# network: a sandbox may reach the tool-broker façade (and DNS) and NOTHING
+# else — not Redis, not MinIO, not Keycloak, not mcp-registry, not the internet,
+# not the cloud metadata IP (169.254.169.254), not other RFC-1918 hosts.
+#
+# -----------------------------------------------------------------------------
+# WHAT CONSUMES THIS  (read before editing — the mechanism is NOT a CRD)
+# -----------------------------------------------------------------------------
+# CubeSandbox has a FIRST-CLASS per-sandbox egress primitive: CubeVS, its
+# eBPF kernel-level virtual switch. It is NOT configured by a Kubernetes CRD,
+# a CubeProxy policy file, or a sandbox metadata label. It is configured per
+# sandbox AT CREATE TIME through the E2B sandbox-create call, which Cubelet
+# translates into a CubeVS `MVMOptions` struct
+# (`AddTAPDevice(ifindex, ip, id, version, options)`):
+#
+#   E2B create kwarg                 -> CubeVS MVMOptions field   -> effect
+#   ---------------------------------------------------------------------------
+#   allow_internet_access=False      -> AllowInternetAccess=false -> drop all
+#                                                                     public-IP
+#                                                                     egress
+#   network={"allow_out": [CIDR...]} -> AllowOut (CIDR list)       -> forward
+#                                                                     only these
+#   network={"deny_out":  [CIDR...]} -> DenyOut  (CIDR list)       -> drop these
+#
+# CubeVS evaluation order (from docs/architecture/network.md):
+#   1. dest == sandbox gateway (169.254.68.5)  -> ALLOW (internal, always)
+#   2. dest matches AllowOut                    -> ALLOW
+#   3. dest matches DenyOut                     -> DROP
+#   4. default                                  -> ALLOW
+# Plus a hardwired guard CubeVS always enforces regardless of options:
+#   10.0.0.0/8, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16
+#   are DROPPED. (This already covers the cloud-metadata IP 169.254.169.254
+#   and most internal subnets — but see the WARNING below: if your tool-broker
+#   ClusterIP sits inside one of these guarded ranges, allowlist mode alone is
+#   NOT enough and you need the host-firewall fallback in nftables/.)
+#
+# Because CubeVS keys on DESTINATION CIDR (not on a sandbox label), the
+# scheduler's `agent-platform.network-policy=sandbox-broker-only` label cannot
+# be consumed by CubeVS directly. This file is the canonical place an operator
+# resolves that named policy into the concrete CIDR allowlist + the E2B
+# create-shape Cubelet expects. Point your CubeMaster / Cubelet admission shim
+# (the integration glue you run in front of CubeProxy) at this file so that any
+# sandbox stamped `agent-platform.network-policy: sandbox-broker-only` is
+# created with the `e2bCreateOverlay` below.
+#
+# Everything here is PARAMETERISED — fill in the two CIDRs for YOUR cluster.
+# Defaults assume the helm chart's in-cluster `ap-tool-broker:8024` and a
+# typical CoreDNS ClusterIP. They are NOT auto-discovered; you must set them.
+# -----------------------------------------------------------------------------
+
+apiVersion: agent-platform.example.com/v1   # advisory schema — consumed by YOUR
+kind: SandboxEgressPolicy                    # CubeMaster/Cubelet glue, not by k8s
+metadata:
+  # Matches the label the scheduler stamps:
+  #   metadata "agent-platform.network-policy" = "sandbox-broker-only"
+  # (services/agent-scheduler/.../services/cube_runtime.py, broker egress mode)
+  name: sandbox-broker-only
+
+# The named-label -> policy binding. Your admission glue selects this policy
+# when a sandbox carries the matching metadata label.
+selector:
+  matchMetadata:
+    agent-platform.egress-mode: broker
+    agent-platform.network-policy: sandbox-broker-only
+
+# ---- Reachability set (the single source of truth for the allowlist) --------
+# Edit these two for your cluster. Use a /32 for a stable ClusterIP, or the
+# Service CIDR if your tool-broker / DNS IPs are not pinned.
+reachability:
+  # tool-broker façade — the ONLY infra peer a sandbox may reach.
+  # Resolve `ap-tool-broker` (helm: ClusterIP Service, port 8024) to its
+  # ClusterIP and put that /32 here. Parameterise via your values overlay.
+  toolBroker:
+    cidr: "10.96.0.24/32"          # <-- REPLACE: `kubectl -n agent-platform get svc ap-tool-broker -o jsonpath='{.spec.clusterIP}'`
+    port: 8024                      # toolBroker.port (helm default 8024)
+  # Cluster DNS — required so the sandbox can resolve `ap-tool-broker`.
+  # Without this, allowlist mode breaks name resolution.
+  clusterDns:
+    cidr: "10.96.0.10/32"          # <-- REPLACE: `kubectl -n kube-system get svc kube-dns -o jsonpath='{.spec.clusterIP}'`
+    ports: [53]                     # UDP + TCP 53
+
+# ---- The literal overlay Cubelet/CubeVS consumes via the E2B create call -----
+# Your CubeMaster/Cubelet glue MUST apply exactly this when the selector matches.
+# allow_internet_access=False gives default-deny; allow_out is the ALLOWLIST.
+# (CubeVS rule 4 "default: allow" only applies to NON-public dests once internet
+#  is off; with AllowInternetAccess=false every public-IP dest is dropped and the
+#  guarded RFC-1918/link-local ranges are dropped, so allow_out is the whole
+#  permitted set. This is "allow tool-broker + DNS, deny all else".)
+e2bCreateOverlay:
+  allow_internet_access: false
+  network:
+    allow_out:
+      - "10.96.0.24/32"            # tool-broker  (keep in sync with reachability.toolBroker.cidr)
+      - "10.96.0.10/32"            # cluster DNS  (keep in sync with reachability.clusterDns.cidr)
+    # deny_out is redundant when allow_internet_access=false + allow_out is set,
+    # but we list the metadata/RFC-1918 ranges explicitly as defence-in-depth in
+    # case a backend is configured with AllowInternetAccess=true. CubeVS already
+    # hard-denies these, so this is belt-and-suspenders.
+    deny_out:
+      - "169.254.169.254/32"       # cloud instance metadata
+      - "169.254.0.0/16"           # link-local (covers metadata + IMDS)
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "192.168.0.0/16"
+
+# -----------------------------------------------------------------------------
+# WARNING — tool-broker inside a guarded range.
+# CubeVS HARD-denies 10/8, 172.16/12, 192.168/16, 127/8, 169.254/16 no matter
+# what AllowOut says. Kubernetes Service ClusterIPs commonly live in 10.96.0.0/12
+# (inside 10/8). If your `ap-tool-broker` ClusterIP is inside a guarded range,
+# CubeVS's hardwired guard will DROP it even though it is in allow_out, and the
+# sandbox will be fully air-gapped. Two supported escapes:
+#   (1) Expose the tool-broker on an IP OUTSIDE the guarded ranges to the
+#       sandbox netns (e.g. a dedicated non-RFC-1918 egress IP / LB VIP), and
+#       put that /32 in allow_out; OR
+#   (2) Use the host-firewall fallback in `nftables/` instead of CubeVS — an
+#       nft ruleset on the sandbox host has no such hardwired guard and will
+#       honour an explicit ACCEPT to the broker's RFC-1918 ClusterIP.
+# Pick per your CubeVS build; the README's "Tuning / adapt to your backend"
+# section walks through both.
+# -----------------------------------------------------------------------------

@@ -30,6 +30,16 @@ export interface GatewayAdapterOptions {
   gatewayUrl?: string;
   /** Model name to rewrite every inbound Claude model to. */
   targetModel: string;
+  /** Foundation bearer token injected into llm-gateway requests. */
+  foundationToken?: string;
+  /** Tenant context injected into llm-gateway requests. */
+  tenantId?: string;
+  /** User context forwarded for broker/upstream audit attribution. */
+  userId?: string;
+  /** Tenant virtual key injected into llm-gateway requests. */
+  virtualKey?: string;
+  /** Signed tool-broker lease when the gateway URL is a broker façade. */
+  brokerLease?: string;
   /** Bind port. 0 (default) picks a random free port. */
   port?: number;
 }
@@ -246,6 +256,11 @@ function sendJson(res: http.ServerResponse, status: number, payload: unknown): v
 export class GatewayAdapter {
   private readonly gatewayUrl: string;
   private readonly targetModel: string;
+  private readonly foundationToken?: string;
+  private readonly tenantId?: string;
+  private readonly userId?: string;
+  private readonly virtualKey?: string;
+  private readonly brokerLease?: string;
   private readonly requestedPort: number;
   private server: http.Server | null = null;
   private boundPort = 0;
@@ -253,6 +268,11 @@ export class GatewayAdapter {
   constructor(opts: GatewayAdapterOptions) {
     this.gatewayUrl = (opts.gatewayUrl ?? DEFAULT_GATEWAY_URL).replace(/\/+$/, "");
     this.targetModel = opts.targetModel;
+    this.foundationToken = opts.foundationToken;
+    this.tenantId = opts.tenantId;
+    this.userId = opts.userId;
+    this.virtualKey = opts.virtualKey;
+    this.brokerLease = opts.brokerLease;
     this.requestedPort = opts.port ?? 0;
   }
 
@@ -331,10 +351,13 @@ export class GatewayAdapter {
       return;
     }
 
-    // Gateway identity from the trusted process env (NOT from the SDK bearer).
-    const foundationToken = process.env.FOUNDATION_API_TOKEN ?? "";
-    const tenantId = process.env.FOUNDATION_TENANT_ID ?? "";
-    const virtualKey = process.env.LLM_VIRTUAL_KEY ?? "";
+    // Gateway identity from the trusted adapter snapshot (NOT from the SDK bearer).
+    const foundationToken =
+      this.foundationToken ?? process.env.FOUNDATION_API_TOKEN ?? "";
+    const tenantId = this.tenantId ?? process.env.FOUNDATION_TENANT_ID ?? "";
+    const userId = this.userId ?? process.env.FOUNDATION_USER_ID ?? "";
+    const virtualKey = this.virtualKey ?? process.env.LLM_VIRTUAL_KEY ?? "";
+    const brokerLease = this.brokerLease ?? process.env.TOOL_BROKER_LEASE ?? "";
 
     let inbound: Json;
     try {
@@ -359,7 +382,9 @@ export class GatewayAdapter {
           // The three headers the gateway hard-requires, sourced from env.
           authorization: `Bearer ${foundationToken}`,
           "x-tenant-id": tenantId,
+          "x-user-id": userId,
           "x-llm-virtual-key": virtualKey,
+          ...(brokerLease ? { "x-tool-broker-lease": brokerLease } : {}),
         },
         body: JSON.stringify(openaiBody),
       });

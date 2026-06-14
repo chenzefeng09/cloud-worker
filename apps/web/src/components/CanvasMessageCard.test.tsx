@@ -1,0 +1,256 @@
+import { useState } from 'react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { CanvasMessageCard } from './CanvasMessageCard';
+import {
+  applyCanvasReplacement,
+  type CanvasDocumentDraft,
+  type CanvasEditRequest,
+  type CanvasEditSuggestion,
+} from '../lib/canvasObjects';
+
+function makeDraft(content: string): CanvasDocumentDraft {
+  return {
+    id: 'canvas_test',
+    kind: 'article',
+    title: '测试文章',
+    content,
+    updatedAt: '2026-06-14T00:00:00.000Z',
+  };
+}
+
+function rect(): DOMRect {
+  return {
+    x: 120,
+    y: 120,
+    left: 120,
+    top: 120,
+    right: 180,
+    bottom: 140,
+    width: 60,
+    height: 20,
+    toJSON: () => ({}),
+  };
+}
+
+function findTextNode(root: Node, text: string): Text | null {
+  for (const child of Array.from(root.childNodes)) {
+    if (child.nodeType === Node.TEXT_NODE && child.textContent?.includes(text)) {
+      return child as Text;
+    }
+    const nested = findTextNode(child, text);
+    if (nested) return nested;
+  }
+  return null;
+}
+
+function selectText(root: HTMLElement, text: string): void {
+  const textNode = findTextNode(root, text);
+  if (!textNode || !textNode.textContent) throw new Error(`Text not found: ${text}`);
+  const start = textNode.textContent.indexOf(text);
+  const range = document.createRange();
+  range.setStart(textNode, start);
+  range.setEnd(textNode, start + text.length);
+
+  const selection = window.getSelection();
+  if (!selection) throw new Error('Selection API unavailable');
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
+describe('CanvasMessageCard', () => {
+  beforeEach(() => {
+    Object.defineProperty(Range.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value: vi.fn(rect),
+    });
+    Object.defineProperty(window, 'requestAnimationFrame', {
+      configurable: true,
+      value: (callback: FrameRequestCallback) => window.setTimeout(callback, 0),
+    });
+  });
+
+  it('renders markdown as editable rich text', async () => {
+    const draft = makeDraft('# 一级标题\n\n这是一段正文。');
+    render(
+      <CanvasMessageCard
+        sessionId="ses_test"
+        draft={draft}
+        onDraftChange={vi.fn()}
+        onRequestEdit={vi.fn()}
+      />,
+    );
+
+    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    await waitFor(() => expect(editor.querySelector('h1')).toHaveTextContent('一级标题'));
+    expect(editor).toHaveTextContent('这是一段正文。');
+  });
+
+  it('pastes markdown blocks as rich text instead of visible markdown source', async () => {
+    const changes: CanvasDocumentDraft[] = [];
+
+    function ControlledCard() {
+      const [draft, setDraft] = useState(makeDraft(''));
+      return (
+        <CanvasMessageCard
+          sessionId="ses_test"
+          draft={draft}
+          onDraftChange={(next) => {
+            changes.push(next);
+            setDraft(next);
+          }}
+          onRequestEdit={vi.fn()}
+        />
+      );
+    }
+
+    render(<ControlledCard />);
+    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+
+    fireEvent.paste(editor, {
+      clipboardData: {
+        getData: (type: string) =>
+          type === 'text/plain' ? '# 粘贴标题\n\n- 第一项\n- 第二项' : '',
+      },
+    });
+
+    await waitFor(() => expect(editor.querySelector('h1')).toHaveTextContent('粘贴标题'));
+    expect(editor).not.toHaveTextContent('# 粘贴标题');
+    expect(editor.querySelectorAll('li')).toHaveLength(2);
+    expect(changes[changes.length - 1]?.content).toBe('# 粘贴标题\n\n- 第一项\n- 第二项');
+  });
+
+  it('creates a selection edit request from the floating toolbar', async () => {
+    const user = userEvent.setup();
+    const draft = makeDraft('第一段文字。\n\n这一句需要修改，保持其他内容不变。');
+    const onRequestEdit = vi.fn<(_: CanvasEditRequest, prompt: string) => Promise<void>>().mockResolvedValue();
+
+    render(
+      <CanvasMessageCard
+        sessionId="ses_test"
+        draft={draft}
+        onDraftChange={vi.fn()}
+        onRequestEdit={onRequestEdit}
+      />,
+    );
+
+    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    await waitFor(() => expect(editor).toHaveTextContent('这一句需要修改'));
+
+    selectText(editor, '这一句需要修改');
+    fireEvent.mouseUp(editor);
+
+    await user.click(await screen.findByText('要求更改'));
+    await user.type(screen.getByPlaceholderText('修改一下'), '改得更口语');
+    await user.click(screen.getByTitle('发送修改要求'));
+
+    await waitFor(() => expect(onRequestEdit).toHaveBeenCalledTimes(1));
+    const [request, prompt] = onRequestEdit.mock.calls[0];
+    expect(request.scope).toBe('selection');
+    expect(request.selection?.text).toBe('这一句需要修改');
+    expect(request.instruction).toBe('改得更口语');
+    expect(prompt).toContain('<canvas-replacement>');
+  });
+
+  it('shows an AI suggestion before applying it', async () => {
+    const user = userEvent.setup();
+    const draft = makeDraft('第一段文字。\n\n这一句需要修改，保持其他内容不变。');
+    const request: CanvasEditRequest = {
+      documentId: draft.id,
+      kind: draft.kind,
+      title: draft.title,
+      scope: 'selection',
+      instruction: '改得更口语',
+      content: draft.content,
+      selection: {
+        text: '这一句需要修改',
+        start: draft.content.indexOf('这一句需要修改'),
+        end: draft.content.indexOf('这一句需要修改') + '这一句需要修改'.length,
+      },
+    };
+    const onAcceptSuggestion = vi.fn();
+    const onRejectSuggestion = vi.fn();
+
+    render(
+      <CanvasMessageCard
+        sessionId="ses_test"
+        draft={draft}
+        suggestion={{
+          request,
+          replacement: '这句话可以说得更自然一点',
+          receivedAt: '2026-06-14T00:01:00.000Z',
+        }}
+        onDraftChange={vi.fn()}
+        onRequestEdit={vi.fn()}
+        onAcceptSuggestion={onAcceptSuggestion}
+        onRejectSuggestion={onRejectSuggestion}
+      />,
+    );
+
+    expect(screen.getByLabelText('选区修改建议')).toHaveTextContent('改得更口语');
+    expect(screen.getByText('第一段文字。')).toBeInTheDocument();
+    expect(screen.getByText(/保持其他内容不变/)).toBeInTheDocument();
+    expect(screen.getByText('这一句需要修改')).toHaveClass('canvas-inline-suggestion-old');
+    expect(screen.getByText('这句话可以说得更自然一点')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '接受' }));
+    await user.click(screen.getByRole('button', { name: '撤销' }));
+
+    expect(onAcceptSuggestion).toHaveBeenCalledTimes(1);
+    expect(onRejectSuggestion).toHaveBeenCalledTimes(1);
+  });
+
+  it('records accepted AI suggestions in the local undo stack', async () => {
+    const user = userEvent.setup();
+    const initialDraft = makeDraft('第一段文字。\n\n这一句需要修改，保持其他内容不变。');
+    const request: CanvasEditRequest = {
+      documentId: initialDraft.id,
+      kind: initialDraft.kind,
+      title: initialDraft.title,
+      scope: 'selection',
+      instruction: '改得更口语',
+      content: initialDraft.content,
+      selection: {
+        text: '这一句需要修改',
+        start: initialDraft.content.indexOf('这一句需要修改'),
+        end: initialDraft.content.indexOf('这一句需要修改') + '这一句需要修改'.length,
+      },
+    };
+
+    function ControlledCard() {
+      const [draft, setDraft] = useState(initialDraft);
+      const [suggestion, setSuggestion] = useState<CanvasEditSuggestion | null>({
+        request,
+        replacement: '这句话可以说得更自然一点',
+        receivedAt: '2026-06-14T00:01:00.000Z',
+      });
+
+      return (
+        <CanvasMessageCard
+          sessionId="ses_test"
+          draft={draft}
+          suggestion={suggestion}
+          onDraftChange={setDraft}
+          onRequestEdit={vi.fn()}
+          onAcceptSuggestion={() => {
+            setDraft((current) => applyCanvasReplacement(current, request, '这句话可以说得更自然一点'));
+            setSuggestion(null);
+          }}
+          onRejectSuggestion={() => setSuggestion(null)}
+        />
+      );
+    }
+
+    render(<ControlledCard />);
+
+    await user.click(screen.getByRole('button', { name: '接受' }));
+    await waitFor(() => expect(screen.getByRole('textbox', { name: '页内画布正文' })).toHaveTextContent('这句话可以说得更自然一点'));
+    expect(screen.queryByText('这一句需要修改')).not.toBeInTheDocument();
+
+    await user.click(screen.getByTitle('撤销'));
+
+    await waitFor(() => expect(screen.getByRole('textbox', { name: '页内画布正文' })).toHaveTextContent('这一句需要修改'));
+    expect(screen.queryByText('这句话可以说得更自然一点')).not.toBeInTheDocument();
+  });
+});

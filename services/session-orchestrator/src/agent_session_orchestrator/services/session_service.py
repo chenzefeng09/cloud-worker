@@ -294,6 +294,7 @@ class SessionService:
         task: str,
         *,
         app_snapshot: dict | None = None,
+        source: str = "user",
     ) -> Run:
         await self.get_session(session_id)
         run = Run(
@@ -302,6 +303,7 @@ class SessionService:
             task_description=task,
             status="PENDING",
             app_snapshot=app_snapshot,
+            source=source,
         )
         self._db.add(run)
         await self._db.flush()

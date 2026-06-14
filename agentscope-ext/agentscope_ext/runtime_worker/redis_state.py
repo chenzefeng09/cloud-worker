@@ -27,25 +27,48 @@ Key schema
     "plan":          str,   # last observed ThinkEvent thought text (or "")
     "cursor":        str,   # last event_type seen (for resume context)
     "last_event_seq":int,   # same as step, kept for compat
-    "status":        str,   # "RUNNING" | "COMPLETED" | "FAILED"
+    "status":        str,   # "RUNNING" | "COMPLETED" | "FAILED" | "PAUSED"
     "updated_step":  int    # echo of step (monotonic wall-clock substitute)
   }
 
 Terminal states ("COMPLETED", "FAILED") keep the key for
 ``STATE_TTL_SECONDS`` so the scheduler can read the outcome even after
-the container exits.
+the container exits.  "PAUSED" state keeps the key for ``PAUSED_TTL_SECONDS``
+(7 days) to allow the orchestrator to resume via a new sandbox container.
 
 Token streaming
 ---------------
 ``agent:run:{run_id}:tokens`` → Redis Stream
 
 Each entry has two fields:
-  ``type``  ``delta`` | ``end``
+  ``type``  ``delta`` | ``end`` | ``tool_call`` | ``tool_result`` |
+            ``thinking`` | ``pending_confirmation`` | ``pending_question``
   ``text``  the delta string (empty for ``end`` entries)
 
 The stream is capped at 10 000 entries (``MAXLEN ~ 10000``) and expires
 after ``STATE_TTL_SECONDS`` seconds (same TTL as the state key).
-Consumers should read until they see a ``type=end`` entry.
+Consumers should read until they see a ``type=end`` entry.  On pause,
+no ``type=end`` entry is pushed (the reply is not finished); instead,
+``pending_confirmation`` / ``pending_question`` entries announce the
+pending tool calls and the orchestrator drives the resume handshake.
+
+Pause blob
+----------
+``agent:run:{run_id}:paused`` → plain SET (JSON, TTL 7 days):
+
+  {
+    "kind":        "confirm" | "question",
+    "reply_id":    str,
+    "tool_calls":  [{"id": str, "name": str, "args": str}, ...],
+    "question":    str | null,
+    "agent_state": <AgentState.model_dump(mode="json")>,
+    "paused_at":   ISO-8601 timestamp
+  }
+
+Written by :meth:`RunStateClient.write_paused`.  The orchestrator reads
+this when it receives a task resume request and passes ``agent_state``
+back in ``task["resume"]["agent_state"]`` so the worker can restore
+``AgentState.model_validate(...)`` in a fresh sandbox.
 """
 
 from __future__ import annotations
@@ -57,10 +80,143 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+
+class _BrokerTransport:
+    """HTTP-backed drop-in for the subset of the redis-py client we use.
+
+    In *broker egress mode* the sandbox has no direct network route to
+    foundation Redis; instead it reaches the narrow ``/state/v1`` façade on the
+    tool-broker.  This transport implements the exact methods that
+    :class:`RunStateClient` calls on ``self._client`` — ``get``, ``set(ex=)``,
+    ``xadd(maxlen=, approximate=)`` and ``expire`` — translating each into a
+    broker HTTP call, so the rest of the class is oblivious to the transport.
+
+    Failure-open: every method swallows HTTP errors after a WARNING so the run
+    never crashes because state could not be persisted (same contract as the
+    direct Redis path).
+
+    Keys are reconstructed from the run_id rather than parsed from the full
+    Redis key string the caller passes, so the broker can re-enforce its
+    per-run lease boundary.  Both the local key and the lease-bound run_id are
+    derived from the same ``run_id``, so they always agree.
+    """
+
+    # Maps the canonical Redis key suffix to the façade ``kind`` value.
+    _SET_KINDS = ("state", "paused")
+
+    def __init__(
+        self,
+        *,
+        run_id: str,
+        broker_url: str,
+        tenant_id: str,
+        user_id: str,
+        token: str,
+        lease: str,
+        timeout: float = 10.0,
+    ) -> None:
+        self._run_id = run_id
+        self._base = broker_url.rstrip("/")
+        self._timeout = timeout
+        self._headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Tenant-Id": tenant_id,
+            "X-User-Id": user_id,
+            "X-Tool-Broker-Lease": lease,
+        }
+
+    def _kind_for_key(self, key: str) -> str | None:
+        for kind in self._SET_KINDS:
+            if key.endswith(f":{kind}"):
+                return kind
+        return None
+
+    def get(self, key: str) -> str | None:
+        kind = self._kind_for_key(key)
+        if kind is None:
+            return None
+        try:
+            import httpx
+
+            resp = httpx.get(
+                f"{self._base}/state/v1/get",
+                params={"run_id": self._run_id, "kind": kind},
+                headers=self._headers,
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+            return resp.json().get("value")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("broker state get failed for run %s: %s", self._run_id, exc)
+            return None
+
+    def set(self, key: str, value: str, ex: int | None = None) -> None:
+        kind = self._kind_for_key(key)
+        if kind is None:
+            return
+        try:
+            import httpx
+
+            resp = httpx.post(
+                f"{self._base}/state/v1/set",
+                json={
+                    "run_id": self._run_id,
+                    "kind": kind,
+                    "value": value,
+                    "ttl": int(ex or 0),
+                },
+                headers=self._headers,
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("broker state set failed for run %s: %s", self._run_id, exc)
+
+    def xadd(
+        self,
+        key: str,
+        fields: dict[str, str],
+        *,
+        maxlen: int | None = None,
+        approximate: bool = True,
+    ) -> None:
+        del key, approximate  # key is reconstructed broker-side from run_id
+        try:
+            import httpx
+
+            resp = httpx.post(
+                f"{self._base}/state/v1/xadd",
+                json={
+                    "run_id": self._run_id,
+                    "fields": {str(k): str(v) for k, v in fields.items()},
+                    "maxlen": int(maxlen or 10_000),
+                    # The worker calls expire(STATE_TTL_SECONDS) immediately
+                    # after the first xadd; we fold the TTL into every xadd so
+                    # the stream key always carries a TTL in a single
+                    # round-trip (the broker EXPIRE is idempotent and cheap).
+                    "expire": STATE_TTL_SECONDS,
+                },
+                headers=self._headers,
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("broker state xadd failed for run %s: %s", self._run_id, exc)
+
+    def expire(self, key: str, ttl: int) -> None:
+        # No-op: the TTL is folded into every ``xadd`` above so the stream key
+        # always has a TTL set without a second broker round-trip.
+        del key, ttl
+
 # How long (seconds) to keep a state key in Redis after terminal state.
 # 30 minutes is long enough for the scheduler to poll final status; Redis
 # ``allkeys-lru`` evicts this automatically if memory gets tight.
 STATE_TTL_SECONDS = 1800
+
+# Paused runs must survive long enough for a human to confirm/reject (up to
+# 7 days).  The orchestrator is responsible for cleaning up the paused key
+# once the resume container completes.
+PAUSED_TTL_SECONDS = 7 * 24 * 3600
 
 # Key prefix — must stay stable across deploys (scheduler reads same key).
 _KEY_PREFIX = "agent:run"
@@ -72,6 +228,10 @@ def _make_key(run_id: str) -> str:
 
 def _make_token_stream_key(run_id: str) -> str:
     return f"{_KEY_PREFIX}:{run_id}:tokens"
+
+
+def _make_paused_key(run_id: str) -> str:
+    return f"{_KEY_PREFIX}:{run_id}:paused"
 
 
 # Maximum number of entries to retain in the token stream.
@@ -97,16 +257,30 @@ class RunStateClient:
         self._run_id = run_id
         self._key = _make_key(run_id)
         self._token_stream_key = _make_token_stream_key(run_id)
+        self._paused_key = _make_paused_key(run_id)
         self._client: Any | None = None
         self._step = 0
         # Tracks whether we have already set EXPIRE on the token stream key.
         self._token_stream_expire_set: bool = False
 
-        if not redis_url:
-            logger.debug("REDIS_URL unset; hot-state disabled for run %s", run_id)
-            return
         if not run_id:
             logger.warning("RUN_ID unset; hot-state disabled (cannot build Redis key)")
+            return
+
+        if not redis_url:
+            # Broker egress mode: no direct Redis route, but the tool-broker
+            # /state/v1 façade is reachable.  Build an HTTP-backed transport
+            # that exposes the same get/set/xadd/expire surface this class
+            # calls on ``self._client``.  Outside broker mode (no TOOL_BROKER_URL)
+            # the client stays a silent no-op exactly as before.
+            self._client = _maybe_broker_transport(run_id)
+            if self._client is None:
+                logger.debug("REDIS_URL unset; hot-state disabled for run %s", run_id)
+            else:
+                logger.info(
+                    "Hot-state via tool-broker for run %s (broker egress mode)",
+                    run_id,
+                )
             return
 
         try:
@@ -363,6 +537,161 @@ class RunStateClient:
                 exc,
             )
 
+    def push_pending_confirmation(
+        self,
+        tool_call_id: str,
+        name: str,
+        args: str,
+    ) -> None:
+        """Append a ``type=pending_confirmation`` entry to the token stream.
+
+        Emitted once per pending MCP tool call when the run pauses for HITL
+        confirmation.  The orchestrator SSE bridge surfaces this to the
+        frontend so the user can approve or reject the tool call.
+
+        Contract::
+
+            type=pending_confirmation
+            tool_call_id=<id>
+            name=<tool name, e.g. "mcp__github__search_code">
+            args=<complete JSON args string>
+
+        Failure-open: any Redis error is logged as WARNING and swallowed.
+        """
+        if self._client is None:
+            return
+        try:
+            self._client.xadd(
+                self._token_stream_key,
+                {
+                    "type": "pending_confirmation",
+                    "tool_call_id": tool_call_id,
+                    "name": name,
+                    "args": args,
+                },
+                maxlen=_TOKEN_STREAM_MAXLEN,
+                approximate=True,
+            )
+            if not self._token_stream_expire_set:
+                self._client.expire(self._token_stream_key, STATE_TTL_SECONDS)
+                self._token_stream_expire_set = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis pending_confirmation push failed for run %s: %s",
+                self._run_id,
+                exc,
+            )
+
+    def push_pending_question(
+        self,
+        tool_call_id: str,
+        question: str,
+    ) -> None:
+        """Append a ``type=pending_question`` entry to the token stream.
+
+        Emitted when the agent calls ``ask_user`` (external tool) and
+        the run pauses awaiting a human answer.
+
+        Contract::
+
+            type=pending_question
+            tool_call_id=<id>
+            question=<question text>
+
+        Failure-open: any Redis error is logged as WARNING and swallowed.
+        """
+        if self._client is None:
+            return
+        try:
+            self._client.xadd(
+                self._token_stream_key,
+                {
+                    "type": "pending_question",
+                    "tool_call_id": tool_call_id,
+                    "question": question,
+                },
+                maxlen=_TOKEN_STREAM_MAXLEN,
+                approximate=True,
+            )
+            if not self._token_stream_expire_set:
+                self._client.expire(self._token_stream_key, STATE_TTL_SECONDS)
+                self._token_stream_expire_set = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis pending_question push failed for run %s: %s",
+                self._run_id,
+                exc,
+            )
+
+    def write_paused(self, blob: dict) -> None:
+        """Write the HITL pause blob to ``agent:run:{run_id}:paused``.
+
+        ``blob`` must be a JSON-serialisable dict with at minimum:
+
+          {
+            "kind":        "confirm" | "question",
+            "reply_id":    str,
+            "tool_calls":  [{"id": str, "name": str, "args": str}, ...],
+            "question":    str | null,
+            "agent_state": <AgentState.model_dump(mode="json")>,
+            "paused_at":   ISO-8601 str
+          }
+
+        TTL is ``PAUSED_TTL_SECONDS`` (7 days) — long enough for a human
+        to respond.  Also updates the hot-state key status to "PAUSED".
+
+        Failure-open: errors are logged as WARNING and swallowed.
+        """
+        if self._client is None:
+            return
+        try:
+            self._client.set(
+                self._paused_key,
+                json.dumps(blob, ensure_ascii=False),
+                ex=PAUSED_TTL_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis paused-blob write failed for run %s: %s",
+                self._run_id,
+                exc,
+            )
+
+    def mark_paused(self) -> None:
+        """Set status=PAUSED in the hot-state key.
+
+        Does NOT set a short TTL — paused runs must survive the 7-day
+        confirmation window.  Uses ``PAUSED_TTL_SECONDS`` instead of
+        ``STATE_TTL_SECONDS``.
+
+        Failure-open: errors are logged as WARNING and swallowed.
+        """
+        if self._client is None:
+            return
+        try:
+            raw = self._client.get(self._key)
+            if raw:
+                state = json.loads(raw)
+            else:
+                state = {
+                    "run_id": self._run_id,
+                    "step": self._step,
+                    "plan": "",
+                    "cursor": "",
+                    "last_event_seq": self._step,
+                    "updated_step": self._step,
+                }
+            state["status"] = "PAUSED"
+            self._client.set(
+                self._key, json.dumps(state), ex=PAUSED_TTL_SECONDS
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis paused-state write failed for run %s: %s",
+                self._run_id,
+                exc,
+            )
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -389,11 +718,37 @@ class RunStateClient:
             logger.warning("Redis terminal write failed for run %s: %s", self._run_id, exc)
 
 
+def _maybe_broker_transport(run_id: str) -> _BrokerTransport | None:
+    """Build a broker-backed transport when in broker egress mode, else None.
+
+    Broker mode is detected by ``TOOL_BROKER_URL`` being set while the direct
+    ``REDIS_URL`` is blank (the scheduler blanks ``REDIS_URL`` and injects
+    ``TOOL_BROKER_URL`` + ``TOOL_BROKER_LEASE`` for broker-mode sandboxes).
+    The lease, tenant, user and bearer token are read from the same env vars
+    the worker already receives.  Returns None (no-op state) if the lease is
+    missing — the run continues without hot-state rather than crashing.
+    """
+    broker_url = os.environ.get("TOOL_BROKER_URL", "").strip()
+    lease = os.environ.get("TOOL_BROKER_LEASE", "").strip()
+    if not broker_url or not lease:
+        return None
+    return _BrokerTransport(
+        run_id=run_id,
+        broker_url=broker_url,
+        tenant_id=os.environ.get("FOUNDATION_TENANT_ID", ""),
+        user_id=os.environ.get("FOUNDATION_USER_ID", ""),
+        token=os.environ.get("FOUNDATION_API_TOKEN", ""),
+        lease=lease,
+    )
+
+
 def from_env() -> RunStateClient:
     """Build a :class:`RunStateClient` from the current process environment.
 
     Reads ``RUN_ID`` and ``REDIS_URL`` env vars.  Returns a no-op client
-    when either is unset — callers need not check.
+    when either is unset — callers need not check.  In broker egress mode
+    (``REDIS_URL`` blank, ``TOOL_BROKER_URL`` set) the client routes hot-state
+    operations through the tool-broker ``/state/v1`` façade instead.
     """
     run_id = os.environ.get("RUN_ID", "")
     redis_url = os.environ.get("REDIS_URL", "")

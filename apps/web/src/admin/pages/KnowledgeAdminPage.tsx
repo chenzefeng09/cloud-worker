@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
+import { useChatStore } from '../../stores/chatStore';
+import { isPlatformAdmin } from '../../lib/permissions';
+import { formatDateTimeAuto } from '../../i18n/dates';
 import { useConfirm, useToast } from '../components/dialogs';
 import { Dialog } from '../components/Dialog';
 import { CustomSelect } from '../components/CustomSelect';
@@ -17,11 +20,13 @@ const STATUS_COLOR: Record<DocumentStatus, string> = {
 
 function DocDetailPanel({
   doc,
-  tenantId,
+  apiTenantId,
   onClose,
 }: {
   doc: KnowledgeDocument;
-  tenantId: string;
+  /** tenant_id to send to the BFF: undefined → caller's own tenant (no
+   *  ?tenant_id= override); a concrete id → cross-tenant (platform-admin only). */
+  apiTenantId: string | undefined;
   onClose: () => void;
 }) {
   const [detail, setDetail] = useState<KnowledgeDocument | null>(null);
@@ -33,12 +38,12 @@ function DocDetailPanel({
     setLoading(true);
     setError(null);
     api.admin.knowledge.documents
-      .get(doc.id, tenantId)
+      .get(doc.id, apiTenantId)
       .then((data) => { if (!cancelled) setDetail(data); })
       .catch((err) => { if (!cancelled) setError(err instanceof ApiError ? err.message : '加载失败'); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [doc.id, tenantId]);
+  }, [doc.id, apiTenantId]);
 
   const d = detail ?? doc;
 
@@ -60,7 +65,7 @@ function DocDetailPanel({
         <span className="font-mono text-dim">来源</span>
         <span className="font-mono text-ink-2 break-all">{d.source_uri || '—'}</span>
         <span className="font-mono text-dim">上传时间</span>
-        <span className="font-mono text-ink-2">{new Date(d.uploaded_at).toLocaleString('zh-CN')}</span>
+        <span className="font-mono text-ink-2">{formatDateTimeAuto(new Date(d.uploaded_at))}</span>
       </div>
     </Dialog>
   );
@@ -70,13 +75,14 @@ function DocDetailPanel({
 
 function DocRow({
   doc,
-  tenantId,
+  apiTenantId,
   onSelect,
   selected,
   onDeleted,
 }: {
   doc: KnowledgeDocument;
-  tenantId: string;
+  /** tenant_id to send to the BFF (see DocDetailPanel). */
+  apiTenantId: string | undefined;
   onSelect: (d: KnowledgeDocument) => void;
   selected: boolean;
   onDeleted: () => void;
@@ -93,7 +99,7 @@ function DocRow({
     setReingesting(true);
     setMsg(null);
     try {
-      const res: IngestResult = await api.admin.knowledge.documents.reingest(doc.id, tenantId);
+      const res: IngestResult = await api.admin.knowledge.documents.reingest(doc.id, apiTenantId);
       setMsg(`已触发：${res.status}，生成 ${res.chunks_created} 个 chunk`);
     } catch (err) {
       setMsg(err instanceof ApiError ? `失败：${err.message}` : '重新摄取失败');
@@ -115,7 +121,7 @@ function DocRow({
       return;
     setDeleting(true);
     try {
-      await api.admin.knowledge.documents.delete(doc.id, tenantId);
+      await api.admin.knowledge.documents.delete(doc.id, apiTenantId);
       toast.success('已删除文档');
       onDeleted();
     } catch (err) {
@@ -135,7 +141,7 @@ function DocRow({
       <td className={`px-3 py-2 font-mono text-[11px] ${STATUS_COLOR[doc.status]}`}>{doc.status}</td>
       <td className="px-3 py-2 font-mono text-[12px] text-ink-2">{doc.chunk_count}</td>
       <td className="px-3 py-2 font-mono text-[11px] text-dim">
-        {new Date(doc.uploaded_at).toLocaleString('zh-CN')}
+        {formatDateTimeAuto(new Date(doc.uploaded_at))}
       </td>
       <td className="px-3 py-2">
         <div className="flex items-center gap-2">
@@ -165,6 +171,24 @@ function DocRow({
 export function KnowledgeAdminPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading, selectedTenantId, setSelectedTenantId } =
     useAdminStore();
+  const userProfile = useChatStore((s) => s.userProfile);
+  // Platform admins may pick any tenant; tenant admins are locked to their own
+  // tenant. The adminStore is shared and may hold a stale cross-tenant id from a
+  // prior platform-admin session, so we never trust selectedTenantId for a
+  // tenant_admin — they always resolve to their own tenant_id.
+  const canSwitchTenant = isPlatformAdmin(userProfile?.permissions);
+  const ownTenantId = userProfile?.tenant_id ?? null;
+  const ownTenantName = tenants.find((t) => t.id === ownTenantId)?.name ?? ownTenantId ?? '当前租户';
+
+  // The tenant whose documents we view: platform-admins follow the selector;
+  // tenant-admins are pinned to their own tenant.
+  const effectiveTenantId = canSwitchTenant ? selectedTenantId : ownTenantId;
+  // What we actually send to the BFF as ?tenant_id=: only platform-admins acting
+  // cross-tenant send an override. A tenant_admin (or a platform-admin who hasn't
+  // picked a tenant) sends undefined → BFF uses the caller's own tenant and the
+  // cross-tenant gate stays in the same-tenant lane.
+  const apiTenantId = canSwitchTenant ? (selectedTenantId ?? undefined) : undefined;
+
   const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -183,15 +207,22 @@ export function KnowledgeAdminPage() {
       .finally(() => setTenantsLoading(false));
   }, [tenants.length, setTenants, setTenantsLoading]);
 
+  // Tenant admins must never carry a cross-tenant selection in the shared store.
   useEffect(() => {
-    if (!selectedTenantId) return;
+    if (!canSwitchTenant && selectedTenantId !== null) {
+      setSelectedTenantId(null);
+    }
+  }, [canSwitchTenant, selectedTenantId, setSelectedTenantId]);
+
+  useEffect(() => {
+    if (!effectiveTenantId) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
     setIsTodoEndpoint(false);
     setSelected(null);
     api.admin.knowledge.documents
-      .list(selectedTenantId)
+      .list(apiTenantId)
       .then((data) => { if (!cancelled) setDocs(data); })
       .catch((err) => {
         if (cancelled) return;
@@ -203,7 +234,7 @@ export function KnowledgeAdminPage() {
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [selectedTenantId, reloadKey]);
+  }, [effectiveTenantId, apiTenantId, reloadKey]);
 
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
@@ -212,15 +243,25 @@ export function KnowledgeAdminPage() {
         <p className="text-[12px] text-dim mt-0.5">租户知识库文档治理（→ knowledge-ingest）</p>
       </div>
 
+      {/* Tenant selector — only platform admins may switch; tenant admins are
+          locked to their own tenant (shown read-only). */}
       <div className="flex items-center gap-3">
-        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
-        <CustomSelect
-          options={[{ value: '', label: '— 请选择 —' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
-          value={selectedTenantId ?? ''}
-          onChange={(v) => { setSelectedTenantId(v || null); setDocs([]); setSelected(null); }}
-          disabled={tenantsLoading}
-          className="min-w-[200px]"
-        />
+        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">
+          {canSwitchTenant ? '选择租户' : '当前租户'}
+        </label>
+        {canSwitchTenant ? (
+          <CustomSelect
+            options={[{ value: '', label: '— 请选择 —' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+            value={selectedTenantId ?? ''}
+            onChange={(v) => { setSelectedTenantId(v || null); setDocs([]); setSelected(null); }}
+            disabled={tenantsLoading}
+            className="min-w-[200px]"
+          />
+        ) : (
+          <span className="min-w-[200px] text-[13px] text-ink font-mono px-3 py-1.5 rounded-sm border border-line bg-surface">
+            {ownTenantName}
+          </span>
+        )}
       </div>
 
       {error && (
@@ -235,17 +276,17 @@ export function KnowledgeAdminPage() {
         </div>
       )}
 
-      {!selectedTenantId && !loading && (
+      {canSwitchTenant && !effectiveTenantId && !loading && (
         <div className="font-mono text-[12px] text-dim italic">请先选择一个租户</div>
       )}
 
       {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
 
-      {selectedTenantId && !loading && !isTodoEndpoint && docs.length === 0 && !error && (
+      {effectiveTenantId && !loading && !isTodoEndpoint && docs.length === 0 && !error && (
         <div className="font-mono text-[12px] text-dim italic">该租户暂无文档</div>
       )}
 
-      {selectedTenantId && !isTodoEndpoint && docs.length > 0 && (
+      {effectiveTenantId && !isTodoEndpoint && docs.length > 0 && (
         <div className="border border-line rounded-md overflow-hidden">
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
@@ -262,7 +303,7 @@ export function KnowledgeAdminPage() {
                 <DocRow
                   key={d.id}
                   doc={d}
-                  tenantId={selectedTenantId}
+                  apiTenantId={apiTenantId}
                   onSelect={setSelected}
                   selected={selected?.id === d.id}
                   onDeleted={() => { setSelected(null); setReloadKey((k) => k + 1); }}
@@ -273,8 +314,8 @@ export function KnowledgeAdminPage() {
         </div>
       )}
 
-      {selected && selectedTenantId && (
-        <DocDetailPanel doc={selected} tenantId={selectedTenantId} onClose={() => setSelected(null)} />
+      {selected && effectiveTenantId && (
+        <DocDetailPanel doc={selected} apiTenantId={apiTenantId} onClose={() => setSelected(null)} />
       )}
     </div>
   );

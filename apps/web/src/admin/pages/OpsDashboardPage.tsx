@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api/client';
+import { useChatStore } from '../../stores/chatStore';
+import { isPlatformAdmin } from '../../lib/permissions';
 import { useConfirm } from '../components/dialogs';
+import { formatDateTimeAuto } from '../../i18n/dates';
 import { CustomSelect } from '../components/CustomSelect';
 import type {
   DailyTokenUsage,
@@ -294,9 +297,20 @@ function groupBy<T>(items: T[], keyFn: (item: T) => string): Record<string, T[]>
 type PoolTab = 'sandbox' | 'runs';
 
 export function OpsDashboardPage() {
+  // Platform admins may filter/act across tenants (sending ?tenant_id=); tenant
+  // admins are locked to their own tenant — the BFF scopes everything to the
+  // caller's tenant, so we never send a tenant_id override for them (a foreign
+  // one would 403 at the BFF cross-tenant gate anyway).
+  const userProfile = useChatStore((s) => s.userProfile);
+  const canSwitchTenant = isPlatformAdmin(userProfile?.permissions);
+
   // ── Filter state ───────────────────────────────────────────────────────────
   const [tenantId, setTenantId] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
+
+  // The tenant_id sent to the BFF: only a platform admin acting cross-tenant
+  // sends an override; a tenant_admin always sends undefined (own tenant).
+  const apiTenantId = canSwitchTenant ? (tenantId || undefined) : undefined;
 
   // ── Sub-tab state ─────────────────────────────────────────────────────────
   const [poolTab, setPoolTab] = useState<PoolTab>('sandbox');
@@ -343,7 +357,7 @@ export function OpsDashboardPage() {
     setUsageError(null);
     setUsageTodo(false);
     api.admin.ops
-      .usageDaily({ days: 14, tenant_id: tenantId || undefined })
+      .usageDaily({ days: 14, tenant_id: apiTenantId })
       .then((data) => { if (!cancelled) setUsageDays(data.days); })
       .catch((err) => {
         if (cancelled) return;
@@ -352,7 +366,7 @@ export function OpsDashboardPage() {
       })
       .finally(() => { if (!cancelled) setUsageLoading(false); });
     return () => { cancelled = true; };
-  }, [tenantId]);
+  }, [apiTenantId]);
 
   // ── Sandbox data ───────────────────────────────────────────────────────────
   const [pool, setPool] = useState<PoolSnapshot | null>(null);
@@ -433,7 +447,7 @@ export function OpsDashboardPage() {
     setRunsTodo(false);
     api.admin.ops
       .runs({
-        tenant_id: tenantId || undefined,
+        tenant_id: apiTenantId,
         status: (statusFilter as RunStatus) || undefined,
       })
       .then((data) => { if (!cancelled) setRuns(data); })
@@ -444,7 +458,7 @@ export function OpsDashboardPage() {
       })
       .finally(() => { if (!cancelled) setRunsLoading(false); });
     return () => { cancelled = true; };
-  }, [tenantId, statusFilter]);
+  }, [apiTenantId, statusFilter]);
 
   const filteredRuns = useMemo(() => {
     if (!runsSearch) return runs;
@@ -501,15 +515,18 @@ export function OpsDashboardPage() {
         <p className="text-[12px] text-dim mt-0.5">Token 用量、沙箱池与运行监控</p>
       </div>
 
-      {/* Filter bar */}
+      {/* Filter bar — the tenant filter is platform-admin only; tenant admins
+          are scoped to their own tenant by the BFF and see no tenant picker. */}
       <div className="flex items-center gap-3 flex-wrap">
-        <CustomSelect
-          options={tenantOptions}
-          value={tenantId}
-          onChange={setTenantId}
-          placeholder="全部租户"
-          className="w-48"
-        />
+        {canSwitchTenant && (
+          <CustomSelect
+            options={tenantOptions}
+            value={tenantId}
+            onChange={setTenantId}
+            placeholder="全部租户"
+            className="w-48"
+          />
+        )}
         <CustomSelect
           options={STATUS_OPTIONS}
           value={statusFilter}
@@ -695,7 +712,7 @@ export function OpsDashboardPage() {
                           {r.total_tokens != null ? r.total_tokens.toLocaleString() : '—'}
                         </td>
                         <td className="px-3 py-2 font-mono text-[11px] text-dim">
-                          {new Date(r.created_at).toLocaleString('zh-CN')}
+                          {formatDateTimeAuto(new Date(r.created_at))}
                         </td>
                       </tr>
                     ))}

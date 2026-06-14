@@ -2,8 +2,18 @@
 # Source-only overlay: reuses the existing session-orchestrator image's
 # already-installed Python deps and only swaps the in-repo source files.
 # Skips poetry install so a flaky PyPI doesn't block the rebuild.
+#
+# FROM ``:base``, NOT ``:latest`` — compose builds this file INTO ``:latest``,
+# so a ``FROM :latest`` is self-referential and compounds layers on every
+# rebuild (it reached 733 layers by 2026-06 and broke ALL derived builds with
+# "mount options is too long").  ``:base`` is a flattened snapshot (1 layer);
+# every rebuild is now base + a constant handful of overlay layers.
+# To refresh ``:base`` itself (e.g. dependency changes): rebuild the full
+# Dockerfile, or flatten a known-good container:
+#   docker export <container> | docker import --change 'ENV ...' ... - \
+#     agent-platform-dev-session-orchestrator:base
 
-FROM agent-platform-dev-session-orchestrator:latest
+FROM agent-platform-dev-session-orchestrator:base
 
 USER root
 COPY --from=feature_flag_client . /tmp/ff-client

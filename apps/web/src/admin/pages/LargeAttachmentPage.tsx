@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
+import { useChatStore } from '../../stores/chatStore';
+import { isPlatformAdmin } from '../../lib/permissions';
+import { formatDateTimeAuto } from '../../i18n/dates';
 import { useConfirm, useToast } from '../components/dialogs';
 import { CustomSelect, SearchableSelect } from '../components/CustomSelect';
 import type {
@@ -18,7 +21,7 @@ const isTodo = (err: unknown) =>
 function fmt(iso?: string | null): string {
   if (!iso) return '—';
   const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN');
+  return Number.isNaN(d.getTime()) ? iso : formatDateTimeAuto(d);
 }
 
 const SUBJECT_TYPE_LABELS: Record<LargeAttachmentSubjectType, string> = {
@@ -36,9 +39,28 @@ export function LargeAttachmentPage() {
     selectedTenantId,
     setSelectedTenantId,
   } = useAdminStore();
+  const userProfile = useChatStore((s) => s.userProfile);
   const toast = useToast();
   const confirm = useConfirm();
-  const tid = selectedTenantId ?? undefined;
+
+  // Platform admins may pick any tenant; tenant admins are locked to their own
+  // tenant. The shared adminStore may hold a stale cross-tenant id from a prior
+  // platform-admin session, so we never trust selectedTenantId for a tenant_admin.
+  const canSwitchTenant = isPlatformAdmin(userProfile?.permissions);
+  const ownTenantId = userProfile?.tenant_id ?? null;
+  const ownTenantName = tenants.find((t) => t.id === ownTenantId)?.name ?? ownTenantId ?? '当前租户';
+
+  // Which tenant we manage: platform-admins follow the selector; tenant-admins
+  // are pinned to their own tenant (so the page loads immediately).
+  const effectiveTenantId = canSwitchTenant ? selectedTenantId : ownTenantId;
+  // What we actually send to the BFF: only a platform-admin acting cross-tenant
+  // sends an override. A tenant_admin sends undefined → BFF uses the caller's
+  // own tenant and the cross-tenant gate stays in the same-tenant lane.
+  const apiTenantId = canSwitchTenant ? (selectedTenantId ?? undefined) : undefined;
+  // ``tid`` gates "is a tenant chosen / data loadable"; ``apiTid`` is the value
+  // forwarded to the API client.
+  const tid = effectiveTenantId ?? undefined;
+  const apiTid = apiTenantId;
 
   const [setting, setSetting] = useState<LargeAttachmentTenantSetting | null>(null);
   const [allows, setAllows] = useState<LargeAttachmentSubjectAllow[]>([]);
@@ -82,8 +104,8 @@ export function LargeAttachmentPage() {
     setError(null);
     setTodo(false);
     Promise.all([
-      api.admin.largeAttachment.tenantSetting(tid),
-      api.admin.largeAttachment.subjectAllows(tid),
+      api.admin.largeAttachment.tenantSetting(apiTid),
+      api.admin.largeAttachment.subjectAllows(apiTid),
     ])
       .then(([s, a]) => {
         setSetting(s);
@@ -94,11 +116,18 @@ export function LargeAttachmentPage() {
         else setError(err instanceof ApiError ? err.message : '加载失败');
       })
       .finally(() => setLoading(false));
-  }, [tid]);
+  }, [tid, apiTid]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  // Tenant admins must never carry a cross-tenant selection in the shared store.
+  useEffect(() => {
+    if (!canSwitchTenant && selectedTenantId !== null) {
+      setSelectedTenantId(null);
+    }
+  }, [canSwitchTenant, selectedTenantId, setSelectedTenantId]);
 
   // Load the tenant's rosters for the searchable pickers. Best-effort:
   // failures just leave pickers empty (the toggle/whitelist still work).
@@ -111,19 +140,19 @@ export function LargeAttachmentPage() {
     }
     let cancelled = false;
     api.admin.users
-      .list(tid)
+      .list(apiTid)
       .then((data) => { if (!cancelled) setUsers(data.items); })
       .catch(() => { if (!cancelled) setUsers([]); });
     api.admin.org.teams
-      .list(tid)
+      .list(apiTid)
       .then((data) => { if (!cancelled) setTeams(data); })
       .catch(() => { if (!cancelled) setTeams([]); });
     api.admin.org.orgUnits
-      .list(tid)
+      .list(apiTid)
       .then((data) => { if (!cancelled) setOrgUnits(data); })
       .catch(() => { if (!cancelled) setOrgUnits([]); });
     return () => { cancelled = true; };
-  }, [tid]);
+  }, [tid, apiTid]);
 
   // Picker options per subject type — exclude already-listed subjects.
   const takenUsers = useMemo(
@@ -188,7 +217,7 @@ export function LargeAttachmentPage() {
     const next = !enabled;
     setToggleBusy(true);
     try {
-      const updated = await api.admin.largeAttachment.setTenantSetting(next, tid);
+      const updated = await api.admin.largeAttachment.setTenantSetting(next, apiTid);
       setSetting(updated);
       toast.success(next ? '已开启租户大附件能力' : '已关闭租户大附件能力');
     } catch (err) {
@@ -204,7 +233,7 @@ export function LargeAttachmentPage() {
     setAddBusy(true);
     setAddError(null);
     try {
-      await api.admin.largeAttachment.setSubjectAllow(newSubjectType, newSubjectId.trim(), true, tid);
+      await api.admin.largeAttachment.setSubjectAllow(newSubjectType, newSubjectId.trim(), true, apiTid);
       toast.success('已加入准入白名单');
       setNewSubjectId('');
       load();
@@ -218,7 +247,7 @@ export function LargeAttachmentPage() {
   const handleToggleAllow = async (row: LargeAttachmentSubjectAllow) => {
     if (!tid) return;
     try {
-      await api.admin.largeAttachment.setSubjectAllow(row.subject_type, row.subject_id, !row.allowed, tid);
+      await api.admin.largeAttachment.setSubjectAllow(row.subject_type, row.subject_id, !row.allowed, apiTid);
       toast.success('已更新');
       load();
     } catch (err) {
@@ -239,7 +268,7 @@ export function LargeAttachmentPage() {
     )
       return;
     try {
-      await api.admin.largeAttachment.removeSubjectAllow(row.subject_type, row.subject_id, tid);
+      await api.admin.largeAttachment.removeSubjectAllow(row.subject_type, row.subject_id, apiTid);
       toast.success('已移除');
       load();
     } catch (err) {
@@ -305,22 +334,32 @@ export function LargeAttachmentPage() {
       )}
 
       {/* ─── 租户选择 ─────────────────────────────────────────── */}
+      {/* Platform admins may switch tenants; tenant admins are locked to their
+          own tenant (shown read-only). */}
       <div className="flex items-center gap-3">
-        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
-        <CustomSelect
-          options={[{ value: '', label: '— 请选择 —' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
-          value={selectedTenantId ?? ''}
-          onChange={(v) => {
-            setSelectedTenantId(v || null);
-            setSetting(null);
-            setAllows([]);
-          }}
-          disabled={tenantsLoading}
-          className="min-w-[200px]"
-        />
+        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">
+          {canSwitchTenant ? '选择租户' : '当前租户'}
+        </label>
+        {canSwitchTenant ? (
+          <CustomSelect
+            options={[{ value: '', label: '— 请选择 —' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+            value={selectedTenantId ?? ''}
+            onChange={(v) => {
+              setSelectedTenantId(v || null);
+              setSetting(null);
+              setAllows([]);
+            }}
+            disabled={tenantsLoading}
+            className="min-w-[200px]"
+          />
+        ) : (
+          <span className="min-w-[200px] text-[13px] text-ink font-mono px-3 py-1.5 rounded-sm border border-line bg-surface">
+            {ownTenantName}
+          </span>
+        )}
       </div>
 
-      {!tid && (
+      {canSwitchTenant && !tid && (
         <div className="font-mono text-[12px] text-dim italic">选择一个租户以管理其大附件能力</div>
       )}
 

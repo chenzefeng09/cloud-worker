@@ -8,6 +8,10 @@ adapter ourselves.
 
 See `docs/design/b-m2-sandbox-runtime-v1.md §5` for the full design.
 
+> Looking for the sandbox **egress-isolation** asset (default-deny egress, allow
+> only tool-broker + DNS for CubeSandbox microVMs)? That lives in
+> `deploy/cube/`, not here — this directory is autoscaling only.
+
 ## Files
 
 | File                                       | Purpose                                                              |

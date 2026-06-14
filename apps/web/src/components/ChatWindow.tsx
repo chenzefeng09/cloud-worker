@@ -1,8 +1,8 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type WheelEvent } from 'react';
 import { useChat } from '../hooks/useChat';
 import { useOutputAttachments } from '../hooks/useOutputAttachments';
 import { useInstalledSkills } from '../hooks/useInstalledSkills';
-import { useChatStore } from '../stores/chatStore';
+import { useChatStore, hasPendingInteraction } from '../stores/chatStore';
 import { MessageBubble, WorkingOnItPill } from './MessageBubble';
 import { StepGroup } from './StepGroup';
 import { OutputFileCards } from './OutputFileCards';
@@ -10,6 +10,9 @@ import { InputBar } from './InputBar';
 import { PlanBlock } from './PlanBlock';
 import { RewindConfirmModal } from './RewindConfirmModal';
 import { DataNoticeModal } from './DataNoticeModal';
+import { ConfirmCard } from './hitl/ConfirmCard';
+import { QuestionCard } from './hitl/QuestionCard';
+import { CanvasMessageCard } from './CanvasMessageCard';
 import { api } from '../api/client';
 import type { Attachment, MessageAttachment } from '../api/types';
 import { groupSteps } from '../lib/groupSteps';
@@ -21,6 +24,22 @@ import {
   AGENT_TRANSCRIPT_FIXTURE,
 } from '../lib/designFixtures';
 import type { TranscriptMessage } from '../lib/designFixtures';
+import type { PendingInteraction } from '../api/types';
+import type {
+  CanvasDocumentDraft,
+  CanvasEditRequest,
+  CanvasEditSuggestion,
+  CanvasOpenSeed,
+} from '../lib/canvasObjects';
+import { getCanvasVisibleMessages, hasVisibleCanvasAnchor } from '../lib/canvasAnchoring';
+import {
+  isUserScrollingAwayFromBottom,
+  resolveTranscriptScrollState,
+} from '../lib/chatScroll';
+
+// Stable empty list for the pending-interactions selector — a fresh `[]` per
+// getSnapshot call would re-render forever (Zustand caches by reference).
+const EMPTY_INTERACTIONS: PendingInteraction[] = [];
 
 // ── Design-only fixture renderer ──────────────────────────────────────────────
 // Renders AGENT_TRANSCRIPT_FIXTURE when there are no real messages yet.
@@ -35,8 +54,6 @@ function FixtureMessage({
 }) {
   return <FixtureMessageInner m={m} friendly={friendly} />;
 }
-
-import { useState } from 'react';
 
 function FixtureMessageInner({
   m,
@@ -277,10 +294,34 @@ export function ChatWindow({
   sessionId,
   friendly,
   onPreviewFile,
+  onOpenCanvas,
+  onSendMessage,
+  inlineCanvasDraft,
+  inlineCanvasPending,
+  inlineCanvasSuggestion,
+  inlineCanvasAnchorMessageId,
+  hiddenMessageIds,
+  onInlineCanvasDraftChange,
+  onInlineCanvasRequestEdit,
+  onInlineCanvasOpenPanel,
+  onInlineCanvasAcceptSuggestion,
+  onInlineCanvasRejectSuggestion,
 }: {
   sessionId: string;
   friendly?: boolean;
   onPreviewFile?: (att: { id: string; filename: string; mime?: string }) => void;
+  onOpenCanvas?: (seed: CanvasOpenSeed) => void;
+  onSendMessage?: (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => void | Promise<void>;
+  inlineCanvasDraft?: CanvasDocumentDraft | null;
+  inlineCanvasPending?: boolean;
+  inlineCanvasSuggestion?: CanvasEditSuggestion | null;
+  inlineCanvasAnchorMessageId?: string | null;
+  hiddenMessageIds?: string[];
+  onInlineCanvasDraftChange?: (draft: CanvasDocumentDraft) => void;
+  onInlineCanvasRequestEdit?: (request: CanvasEditRequest, prompt: string) => void | Promise<void>;
+  onInlineCanvasOpenPanel?: () => void;
+  onInlineCanvasAcceptSuggestion?: () => void;
+  onInlineCanvasRejectSuggestion?: () => void;
 }) {
   const {
     messages,
@@ -297,9 +338,14 @@ export function ChatWindow({
     rewindError,
   } = useChat();
   const { byRunId, refresh: refreshOutputs } = useOutputAttachments(sessionId);
+  const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const shouldStickToBottomRef = useRef(true);
+  const userDetachedFromBottomRef = useRef(false);
+  const previousScrollTopRef = useRef(0);
   // Track previous isStreaming value so we can detect the true→false edge.
   const prevStreamingRef = useRef(isStreaming);
+  const [isAwayFromBottom, setIsAwayFromBottom] = useState(false);
 
   // Per-session skill toggles, surfaced in the InputBar "+" popover.
   const skills = useInstalledSkills();
@@ -318,9 +364,36 @@ export function ChatWindow({
   // Live plan steps for this session — rendered at the bottom of the transcript.
   const planSteps = useChatStore((s) => s.planSteps[sessionId]);
 
+  // HITL — pending interactions (confirm / question cards).
+  // `?? EMPTY_INTERACTIONS` (module-level constant) instead of `|| []`: a fresh
+  // array per call makes getSnapshot unstable → infinite re-render loop.
+  const pendingInteractions = useChatStore(
+    (s) => s.pendingInteractions[sessionId] ?? EMPTY_INTERACTIONS,
+  );
+  // Derived: true when at least one pending interaction exists.
+  // Used to disable the composer while HITL cards are shown — prevents the user
+  // from forking a paused run with a new message before resolving it.
+  const hasPending = useChatStore((s) => hasPendingInteraction(s, sessionId));
+
   // First-use data-usage notice: show once per device, then remember the
   // acknowledgement in localStorage so it never appears again.
   const [showDataNotice, setShowDataNotice] = useState(false);
+  const canRenderInlineCanvas = Boolean(
+    inlineCanvasDraft && onInlineCanvasDraftChange && onInlineCanvasRequestEdit,
+  );
+  const visibleMessages = useMemo(
+    () =>
+      getCanvasVisibleMessages(
+        messages,
+        hiddenMessageIds,
+        canRenderInlineCanvas,
+        inlineCanvasAnchorMessageId,
+      ),
+    [canRenderInlineCanvas, hiddenMessageIds, inlineCanvasAnchorMessageId, messages],
+  );
+  const anchoredInlineCanvasVisible = Boolean(
+    hasVisibleCanvasAnchor(visibleMessages, canRenderInlineCanvas, inlineCanvasAnchorMessageId),
+  );
   useEffect(() => {
     try {
       if (!localStorage.getItem(DATA_NOTICE_ACK_KEY)) {
@@ -346,9 +419,41 @@ export function ChatWindow({
     seedSkills(sessionId, skills.filter((s) => s.enabled_by_default).map((s) => s.name));
   }, [sessionId, skills, seedSkills]);
 
+  const updateScrollStickiness = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const next = resolveTranscriptScrollState({
+      scrollTop: el.scrollTop,
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+      previousScrollTop: previousScrollTopRef.current,
+      wasSticking: shouldStickToBottomRef.current,
+      wasDetached: userDetachedFromBottomRef.current,
+    });
+    previousScrollTopRef.current = next.nextPreviousScrollTop;
+    shouldStickToBottomRef.current = next.shouldStickToBottom;
+    userDetachedFromBottomRef.current = next.isAwayFromBottom;
+    setIsAwayFromBottom((current) =>
+      current === next.isAwayFromBottom ? current : next.isAwayFromBottom,
+    );
+  }, []);
+
+  const scrollToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    shouldStickToBottomRef.current = true;
+    userDetachedFromBottomRef.current = false;
+    setIsAwayFromBottom(false);
+    requestAnimationFrame(() => {
+      bottomRef.current?.scrollIntoView({ behavior, block: 'end' });
+    });
+  }, []);
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, isStreaming]);
+    if (!shouldStickToBottomRef.current) {
+      setIsAwayFromBottom(true);
+      return;
+    }
+    scrollToBottom(isStreaming ? 'auto' : 'smooth');
+  }, [messages, isStreaming, scrollToBottom]);
 
   // Refresh output attachments when streaming transitions true → false
   // (i.e. a run just completed). This surfaces newly written files quickly.
@@ -370,22 +475,60 @@ export function ChatWindow({
       mime: a.mime,
       size: a.size_bytes,
     }));
+    shouldStickToBottomRef.current = true;
+    scrollToBottom('smooth');
+    if (onSendMessage) {
+      onSendMessage(text, attachmentIds, attMeta);
+      return;
+    }
     sendMessage(text, attachmentIds, attMeta);
   };
+
+  const handleTranscriptWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
+    if (!isUserScrollingAwayFromBottom(event.deltaY)) return;
+    userDetachedFromBottomRef.current = true;
+    shouldStickToBottomRef.current = false;
+    setIsAwayFromBottom(true);
+  }, []);
 
   // Show fixture fallback only when no real messages exist, not streaming,
   // and the design-fixture flag is on. DESIGN FIXTURE — remove the fixture
   // block when backend provides real data.
   const showFixture =
-    SHOW_DESIGN_FIXTURES && messages.length === 0 && !isStreaming;
+    SHOW_DESIGN_FIXTURES && visibleMessages.length === 0 && !isStreaming && !inlineCanvasDraft;
+
+  const renderInlineCanvasCard = () => {
+    if (!canRenderInlineCanvas || !inlineCanvasDraft || !onInlineCanvasDraftChange || !onInlineCanvasRequestEdit) {
+      return null;
+    }
+    return (
+      <CanvasMessageCard
+        sessionId={sessionId}
+        draft={inlineCanvasDraft}
+        pending={inlineCanvasPending}
+        aiDisabled={isStreaming}
+        onDraftChange={onInlineCanvasDraftChange}
+        onRequestEdit={onInlineCanvasRequestEdit}
+        onOpenPanel={onInlineCanvasOpenPanel}
+        suggestion={inlineCanvasSuggestion}
+        onAcceptSuggestion={onInlineCanvasAcceptSuggestion}
+        onRejectSuggestion={onInlineCanvasRejectSuggestion}
+      />
+    );
+  };
 
   return (
-    <div className="flex-1 flex flex-col min-h-0">
-      <div className="cw-scroll flex-1 px-8 py-5 flex flex-col gap-[8px]">
+    <div className="flex-1 flex flex-col min-h-0 relative">
+      <div
+        ref={scrollRef}
+        onScroll={updateScrollStickiness}
+        onWheel={handleTranscriptWheel}
+        className="cw-scroll flex-1 px-8 py-5 flex flex-col gap-[8px]"
+      >
         <div style={{ maxWidth: 780, margin: '0 auto', width: '100%', display: 'flex', flexDirection: 'column', gap: 8 }}>
           {/* ── Real messages ── */}
           {(() => {
-            const units = groupSteps(messages, isStreaming);
+            const units = groupSteps(visibleMessages, isStreaming);
 
             // Pre-compute: for each run_id that has output files, find the
             // index of the LAST assistant message unit with that run_id.
@@ -430,6 +573,11 @@ export function ChatWindow({
               if (u.kind === 'message') {
                 const role = (u.message.role || '').toUpperCase();
                 const runId = u.message.run_id;
+                const isInlineCanvasAnchor =
+                  canRenderInlineCanvas && inlineCanvasAnchorMessageId === u.message.id;
+                if (isInlineCanvasAnchor) {
+                  return <div key={`canvas_${u.message.id}`}>{renderInlineCanvasCard()}</div>;
+                }
                 // Show output file cards only under the last assistant message
                 // for a given run_id (prevents duplicate cards if a run has
                 // multiple assistant text blocks).
@@ -449,6 +597,7 @@ export function ChatWindow({
                       message={u.message}
                       friendly={friendly}
                       onPreviewFile={onPreviewFile}
+                      onOpenCanvas={onOpenCanvas}
                       onRewind={rewindTo}
                       showRoundCopy={showRoundCopy}
                       roundCopyText={roundKey != null ? roundCopyText.get(roundKey) : undefined}
@@ -482,7 +631,7 @@ export function ChatWindow({
             ))}
 
           {/* ── Empty state (fixtures off, no messages) ── */}
-          {!showFixture && messages.length === 0 && !isStreaming && (
+          {!showFixture && visibleMessages.length === 0 && !isStreaming && !inlineCanvasDraft && (
             <div className="flex-1 flex items-center justify-center py-16">
               <span className="font-mono italic text-dim text-[12px]">
                 开始与 AI Agent 对话
@@ -490,18 +639,55 @@ export function ChatWindow({
             </div>
           )}
 
+          {canRenderInlineCanvas && !anchoredInlineCanvasVisible && renderInlineCanvasCard()}
+
           {/* ── Current plan steps (live from agent TaskCreate/TaskUpdate) ── */}
           {planSteps && planSteps.length > 0 && <PlanBlock steps={planSteps} />}
 
           {/* ── Live "Working on it…" pill — shown while streaming, regardless of mode ── */}
           {isStreaming && <WorkingOnItPill />}
 
+          {/* ── HITL cards — confirm / question ──────────────────────────────
+              Pinned at the bottom of the message list when the agent pauses.
+              The composer is DISABLED while cards are present (hasPending) to
+              prevent the user from forking the paused run with a new message.
+
+              Survives refresh/reconnect: useChat hydrates these on mount via
+              GET /sessions/{sid}/pending (api.sessions.pending) so a run that
+              paused while the page was closed still shows its card. */}
+          {pendingInteractions.map((interaction) =>
+            interaction.kind === 'confirm' ? (
+              <ConfirmCard
+                key={interaction.toolCallId}
+                sessionId={sessionId}
+                interaction={interaction}
+              />
+            ) : (
+              <QuestionCard
+                key={interaction.toolCallId}
+                sessionId={sessionId}
+                interaction={interaction}
+              />
+            ),
+          )}
+
           <div ref={bottomRef} />
         </div>
       </div>
+      {isAwayFromBottom && (
+        <button
+          type="button"
+          className="chat-scroll-to-bottom"
+          onClick={() => scrollToBottom('smooth')}
+          aria-label="滚动到最新消息"
+          title="滚动到最新消息"
+        >
+          ↓
+        </button>
+      )}
       <InputBar
         onSend={handleSend}
-        disabled={isStreaming}
+        disabled={isStreaming || hasPending}
         isStreaming={isStreaming}
         onStop={cancel}
         onUpload={handleUpload}

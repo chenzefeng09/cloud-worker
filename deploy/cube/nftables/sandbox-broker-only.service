@@ -1,0 +1,39 @@
+# =============================================================================
+# sandbox-broker-only.service — persist the sandbox egress firewall across boots
+# =============================================================================
+#
+# Install on each CubeSandbox sandbox node so the host-firewall fallback is
+# re-applied on boot (before Cubelet starts spawning microVMs / TAP devices).
+#
+#   1. Copy this repo's nftables/ dir to the node, e.g. /opt/agent-platform/cube/nftables
+#   2. Provide the resolved ClusterIPs once, e.g. in an env file:
+#        /etc/agent-platform/sandbox-egress.env
+#          TOOL_BROKER_ADDR=10.96.0.24
+#          TOOL_BROKER_PORT=8024
+#          CLUSTER_DNS_ADDR=10.96.0.10
+#   3. cp sandbox-broker-only.service /etc/systemd/system/
+#      systemctl daemon-reload
+#      systemctl enable --now sandbox-broker-only.service
+#
+# Ordering: runs after the network is up and BEFORE cubelet, so no microVM ever
+# boots without the egress restriction in place. Adjust `Before=` to your
+# actual Cubelet unit name.
+# -----------------------------------------------------------------------------
+[Unit]
+Description=Agent-platform sandbox egress firewall (tool-broker + DNS only)
+Documentation=https://github.com/TencentCloud/CubeSandbox/blob/master/docs/architecture/network.md
+After=network-online.target nftables.service
+Wants=network-online.target
+Before=cubelet.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=/etc/agent-platform/sandbox-egress.env
+# Adjust the path to wherever you copied this repo's nftables/ dir on the node.
+ExecStart=/opt/agent-platform/cube/nftables/install.sh
+# On stop, drop the table so the node returns to its prior egress posture.
+ExecStop=/usr/sbin/nft delete table inet sandbox_egress
+
+[Install]
+WantedBy=multi-user.target

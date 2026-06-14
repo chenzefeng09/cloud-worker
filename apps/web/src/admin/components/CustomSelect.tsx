@@ -57,11 +57,16 @@ const triggerCls = (disabled: boolean) =>
       : 'hover:border-ink-2 focus:outline-none focus:border-accent'
   }`;
 
+// `min-w-full` keeps the panel at least as wide as the trigger; `w-max` lets it
+// grow to fit long option labels (e.g. `usr_…` ids). The `max-w-[min(28rem,90vw)]`
+// cap stops a very long label from widening the panel past the viewport — an
+// unbounded absolute child would extend the page's scroll width and shift the
+// whole layout left. Long labels then wrap inside the panel (see `itemCls`).
 const dropdownCls =
-  'absolute z-50 mt-1 min-w-full w-max border border-line rounded-md bg-surface shadow-lg max-h-[240px] overflow-auto';
+  'absolute z-50 mt-1 min-w-full w-max max-w-[min(28rem,90vw)] border border-line rounded-md bg-surface shadow-lg max-h-[240px] overflow-auto';
 
 const itemCls = (active: boolean) =>
-  `w-full text-left px-3 py-1.5 text-[12px] transition-colors ${
+  `w-full text-left px-3 py-1.5 text-[12px] break-words transition-colors ${
     active ? 'bg-accent-soft text-ink font-medium' : 'text-ink hover:bg-paper-2'
   }`;
 

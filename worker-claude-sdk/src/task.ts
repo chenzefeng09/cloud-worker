@@ -169,6 +169,7 @@ export interface Env {
   MCP_REGISTRY_URL: string;
   SKILL_STORE_URL: string;
   WEB_FETCH_GATEWAY_URL: string;
+  TOOL_BROKER_LEASE: string;
   // Observability.
   OTEL_EXPORTER_OTLP_ENDPOINT: string;
 }
@@ -198,6 +199,7 @@ export function readEnv(): Env {
     MCP_REGISTRY_URL: get("MCP_REGISTRY_URL"),
     SKILL_STORE_URL: get("SKILL_STORE_URL"),
     WEB_FETCH_GATEWAY_URL: get("WEB_FETCH_GATEWAY_URL"),
+    TOOL_BROKER_LEASE: get("TOOL_BROKER_LEASE"),
     OTEL_EXPORTER_OTLP_ENDPOINT: get("OTEL_EXPORTER_OTLP_ENDPOINT"),
   };
 }

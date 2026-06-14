@@ -659,3 +659,184 @@ def test_worker_detects_checkpoint_and_injects_memory(monkeypatch, tmp_path):
     assert len(captured_system_prompt) == 1
     prompt = captured_system_prompt[0]
     assert "断点恢复" in prompt or "step 7" in prompt or "7" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Broker egress mode — RunStateClient routes through the tool-broker façade
+# ---------------------------------------------------------------------------
+
+
+class _FakeHTTPResponse:
+    def __init__(self, *, json_body=None, status_code=200) -> None:
+        self._json = json_body or {}
+        self.status_code = status_code
+
+    def json(self):
+        return self._json
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class _FakeHTTPX:
+    """Records broker HTTP calls; returns canned responses keyed by path."""
+
+    def __init__(self) -> None:
+        self.posts: list[dict] = []
+        self.gets: list[dict] = []
+        self.get_value = None
+
+    def post(self, url, *, json=None, headers=None, timeout=None):
+        self.posts.append({"url": url, "json": json, "headers": headers})
+        return _FakeHTTPResponse(json_body={"ok": True})
+
+    def get(self, url, *, params=None, headers=None, timeout=None):
+        self.gets.append({"url": url, "params": params, "headers": headers})
+        return _FakeHTTPResponse(json_body={"value": self.get_value})
+
+
+@pytest.fixture
+def broker_env(monkeypatch):
+    """Configure broker egress mode env vars (REDIS_URL blank, broker set)."""
+    monkeypatch.setenv("RUN_ID", "run_brk")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.setenv("TOOL_BROKER_URL", "http://tool-broker:8024/api/tool-broker/v1")
+    monkeypatch.setenv("TOOL_BROKER_LEASE", "v1.body.sig")
+    monkeypatch.setenv("FOUNDATION_TENANT_ID", "tnt_brk")
+    monkeypatch.setenv("FOUNDATION_USER_ID", "usr_brk")
+    monkeypatch.setenv("FOUNDATION_API_TOKEN", "tok_brk")
+
+
+def _install_fake_httpx(monkeypatch) -> _FakeHTTPX:
+    fake = _FakeHTTPX()
+    httpx_mod = types.ModuleType("httpx")
+    httpx_mod.get = fake.get
+    httpx_mod.post = fake.post
+    monkeypatch.setitem(sys.modules, "httpx", httpx_mod)
+    return fake
+
+
+def test_broker_mode_built_when_redis_url_blank_and_broker_set(broker_env, monkeypatch):
+    """from_env builds a broker transport when REDIS_URL is blank + broker set."""
+    _install_fake_httpx(monkeypatch)
+    import importlib
+    from agentscope_ext.runtime_worker import redis_state as rs
+    importlib.reload(rs)
+
+    client = rs.from_env()
+    assert client._client is not None  # noqa: SLF001
+    assert type(client._client).__name__ == "_BrokerTransport"  # noqa: SLF001
+
+
+def test_broker_mode_disabled_without_lease(monkeypatch):
+    """No lease → no broker transport, silent no-op (not a crash)."""
+    monkeypatch.setenv("RUN_ID", "run_brk")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.setenv("TOOL_BROKER_URL", "http://tool-broker:8024/api/tool-broker/v1")
+    monkeypatch.delenv("TOOL_BROKER_LEASE", raising=False)
+    import importlib
+    from agentscope_ext.runtime_worker import redis_state as rs
+    importlib.reload(rs)
+
+    client = rs.from_env()
+    assert client._client is None  # noqa: SLF001
+    client.write_step()  # must not raise
+
+
+def test_broker_write_step_posts_to_state_set(broker_env, monkeypatch):
+    fake = _install_fake_httpx(monkeypatch)
+    import importlib
+    from agentscope_ext.runtime_worker import redis_state as rs
+    importlib.reload(rs)
+
+    client = rs.from_env()
+    client.write_step(plan="p", cursor="c")
+
+    assert len(fake.posts) == 1
+    post = fake.posts[0]
+    assert post["url"].endswith("/state/v1/set")
+    assert post["json"]["run_id"] == "run_brk"
+    assert post["json"]["kind"] == "state"
+    assert post["json"]["ttl"] == rs.STATE_TTL_SECONDS
+    body = json.loads(post["json"]["value"])
+    assert body["plan"] == "p"
+    assert body["cursor"] == "c"
+    assert body["status"] == "RUNNING"
+    # Lease + tenant headers are forwarded.
+    assert post["headers"]["X-Tool-Broker-Lease"] == "v1.body.sig"
+    assert post["headers"]["X-Tenant-Id"] == "tnt_brk"
+    assert post["headers"]["Authorization"] == "Bearer tok_brk"
+
+
+def test_broker_push_token_posts_to_xadd_with_expire(broker_env, monkeypatch):
+    fake = _install_fake_httpx(monkeypatch)
+    import importlib
+    from agentscope_ext.runtime_worker import redis_state as rs
+    importlib.reload(rs)
+
+    client = rs.from_env()
+    client.push_token("hello")
+    client.push_token_end()
+
+    xadds = [p for p in fake.posts if p["url"].endswith("/state/v1/xadd")]
+    assert len(xadds) == 2
+    assert xadds[0]["json"]["fields"] == {"type": "delta", "text": "hello"}
+    assert xadds[0]["json"]["maxlen"] == rs._TOKEN_STREAM_MAXLEN
+    assert xadds[0]["json"]["expire"] == rs.STATE_TTL_SECONDS
+    assert xadds[1]["json"]["fields"] == {"type": "end", "text": ""}
+
+
+def test_broker_read_checkpoint_gets_from_state(broker_env, monkeypatch):
+    fake = _install_fake_httpx(monkeypatch)
+    fake.get_value = json.dumps({"run_id": "run_brk", "step": 4, "status": "RUNNING"})
+    import importlib
+    from agentscope_ext.runtime_worker import redis_state as rs
+    importlib.reload(rs)
+
+    client = rs.from_env()
+    checkpoint = client.read_checkpoint()
+
+    assert checkpoint == {"run_id": "run_brk", "step": 4, "status": "RUNNING"}
+    assert len(fake.gets) == 1
+    assert fake.gets[0]["url"].endswith("/state/v1/get")
+    assert fake.gets[0]["params"] == {"run_id": "run_brk", "kind": "state"}
+
+
+def test_broker_write_paused_posts_paused_kind(broker_env, monkeypatch):
+    fake = _install_fake_httpx(monkeypatch)
+    import importlib
+    from agentscope_ext.runtime_worker import redis_state as rs
+    importlib.reload(rs)
+
+    client = rs.from_env()
+    client.write_paused({"kind": "confirm", "reply_id": "r1"})
+
+    paused = [p for p in fake.posts if p["json"].get("kind") == "paused"]
+    assert len(paused) == 1
+    assert paused[0]["json"]["ttl"] == rs.PAUSED_TTL_SECONDS
+    assert paused[0]["url"].endswith("/state/v1/set")
+
+
+def test_broker_transport_failure_open(broker_env, monkeypatch):
+    """A broker HTTP error must be swallowed (failure-open), not raised."""
+    import importlib
+
+    def _boom_post(*_a, **_k):
+        raise RuntimeError("connection refused")
+
+    def _boom_get(*_a, **_k):
+        raise RuntimeError("connection refused")
+
+    httpx_mod = types.ModuleType("httpx")
+    httpx_mod.post = _boom_post
+    httpx_mod.get = _boom_get
+    monkeypatch.setitem(sys.modules, "httpx", httpx_mod)
+
+    from agentscope_ext.runtime_worker import redis_state as rs
+    importlib.reload(rs)
+
+    client = rs.from_env()
+    client.write_step()  # must not raise
+    client.push_token("x")  # must not raise
+    assert client.read_checkpoint() is None  # must not raise

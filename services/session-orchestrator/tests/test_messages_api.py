@@ -1,4 +1,4 @@
-"""Tests for api/v1/messages.py — list_messages, create_message, stream_messages,
+"""Tests for api/v1/messages.py — list_messages, create_message,
 _write_memory, _reconcile_run_completion, _persist_artifacts."""
 
 from __future__ import annotations
@@ -339,49 +339,3 @@ def test_create_message_endpoint_returns_201(
     assert resp.status_code in (201, 500)
     mock_db.add.assert_called_once()
 
-
-# ---------------------------------------------------------------------------
-# stream_messages endpoint (SSE)
-# ---------------------------------------------------------------------------
-
-
-def test_stream_messages_returns_sse_response(
-    app_client: TestClient, mock_db: AsyncMock, auth_headers: dict,
-) -> None:
-    """GET /messages/stream returns a streaming response (text/event-stream).
-
-    The SSE generator contains a 300-poll loop with asyncio.sleep(); we patch
-    both acquire_db_session and asyncio.sleep to make the test instant and
-    force terminal state on the first poll so the generator exits quickly.
-    """
-    import asyncio as _asyncio
-
-    ses = _ses()
-    run_completed = _run(status="COMPLETED", sandbox_id=None)
-    # Provide a completed run so the generator sees terminal state and exits.
-    mock_db.execute.return_value = make_scalar_result([run_completed])
-
-    # The stream generator uses acquire_db_session (not the dependency override).
-    # Patch it to yield mock_db so it doesn't try to connect to real Postgres.
-    async def _fake_session(**kw: object):  # type: ignore[override]
-        # Also mock get_session and list_messages inside the loop
-        mock_db.execute.return_value = make_scalar_result(ses)
-        yield mock_db
-
-    async def _noop_sleep(_: float) -> None:
-        pass
-
-    with (
-        patch(
-            "agent_session_orchestrator.api.v1.messages.acquire_db_session",
-            side_effect=_fake_session,
-        ),
-        patch.object(_asyncio, "sleep", side_effect=_noop_sleep),
-        app_client.stream(
-            "GET",
-            "/api/session/v1/sessions/ses_m/messages/stream",
-            headers=auth_headers,
-        ) as resp,
-    ):
-        assert resp.status_code == 200
-        assert "text/event-stream" in resp.headers.get("content-type", "")

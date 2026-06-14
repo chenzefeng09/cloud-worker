@@ -275,8 +275,13 @@ export async function loadMcpServers(
     const resp = await fetch(url, {
       method: "GET",
       headers: {
+        authorization: `Bearer ${env.FOUNDATION_API_TOKEN}`,
         "x-tenant-id": env.FOUNDATION_TENANT_ID,
+        "x-user-id": env.FOUNDATION_USER_ID,
         "x-service-scopes": env.FOUNDATION_SERVICE_SCOPES,
+        ...(env.TOOL_BROKER_LEASE
+          ? { "x-tool-broker-lease": env.TOOL_BROKER_LEASE }
+          : {}),
       },
     });
     if (!resp.ok) {

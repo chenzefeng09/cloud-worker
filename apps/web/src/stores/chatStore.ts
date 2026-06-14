@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Message, Session, ToolCallEntry, UserProfile } from '../api/types';
+import type { Message, PendingInteraction, Session, ToolCallEntry, UserProfile } from '../api/types';
 import type { PlanStep } from '../lib/designFixtures';
 
 /** Payload for a single tool event from the SSE stream. */
@@ -32,6 +32,17 @@ interface ChatState {
    * internal bookkeeping map — never rendered, never persisted.
    */
   streamOffsets: Record<string, Record<string, string>>;
+  /**
+   * Runs whose streaming channel has been CLOSED because their durable DB
+   * message rows have already arrived (sessionId → set of runIds).  Once a run
+   * is here, any further appendStreamingToken/appendStreamingThinking/
+   * upsertStreamingTool for it is DROPPED — a consumer-side idempotency backstop
+   * against the server replaying the Redis token stream of an already-hydrated
+   * run (which would rebuild a duplicate, side-by-side set of streaming blocks).
+   * Reset by `run_started` (reopenRunStream) so a re-run / new leg streams
+   * normally.  Internal bookkeeping — never rendered, never persisted.
+   */
+  closedStreamRuns: Record<string, Set<string>>;
   isStreaming: boolean;
   isLoggedIn: boolean;
   userProfile: UserProfile | null;
@@ -49,6 +60,44 @@ interface ChatState {
   selectedModel: Record<string, string>;
   /** Per-session reasoning effort ('' = off). Read at send time. */
   selectedEffort: Record<string, string>;
+
+  // ── HITL — human-in-the-loop ─────────────────────────────────────────────
+  //
+  // Pending interactions (tool confirmations, agent questions) are held here
+  // and rendered as inline cards at the bottom of the message list while a run
+  // is paused.
+  //
+  // REFRESH-DURING-PAUSE GAP (TODO P2-followup):
+  // ---------------------------------------------------
+  // Pending interactions are populated from the live SSE stream when events
+  // `pending_confirmation` / `pending_question` arrive.  A PAUSED run is NOT
+  // selected by the orchestrator's stream selector (status PAUSED is excluded),
+  // so after a page refresh while the agent is paused the orchestrator does NOT
+  // replay the run's Redis stream — meaning the pending_confirmation events do
+  // NOT re-arrive and the confirm/question cards are LOST on refresh.
+  //
+  // PROPER FIX REQUIRES a backend change: the orchestrator must expose a
+  // GET /sessions/{sid}/runs/{run_id}/pending endpoint that returns the
+  // current paused interactions from Redis, or the stream selector must
+  // include PAUSED runs' pending entries in the initial replay.
+  //
+  // Until that endpoint exists, this v1 implementation renders pendings from
+  // the live stream only. On refresh with a PAUSED run the user will see an
+  // empty card area and must be told to check for a context update or
+  // re-submit. A follow-up story is needed: "Expose pending HITL interactions
+  // on paused-run hydration endpoint."
+  //
+  // Deduplication: interactions are keyed by toolCallId; a reconnect that
+  // re-delivers pending_confirmation for the same toolCallId will not
+  // duplicate the card because addPendingInteraction dedupes by toolCallId.
+  pendingInteractions: Record<string, PendingInteraction[]>;
+  /**
+   * HITL interactions that have already been submitted locally or completed by
+   * a tool result.  Keyed per session by `${runId}:${toolCallId}` so a replayed
+   * pending_confirmation / pending_question from the beginning of Redis stream
+   * cannot resurrect an already-consumed approval card.
+   */
+  acknowledgedPendingInteractions: Record<string, Set<string>>;
 
   setSessions: (sessions: Session[]) => void;
   addSession: (session: Session) => void;
@@ -72,7 +121,7 @@ interface ChatState {
   //
   //   token  → append to the "open" text segment for this run (create if none).
   //   tool   → seal the current text segment, create/update a tool block.
-  //   thinking → seal the current text segment, create a thinking block.
+  //   thinking → create a side-channel thinking block without splitting text.
   //
   // When the real DB messages arrive (event: message) we call
   // clearStreamingBlocks to swap temp blocks for real rows.  Clearing is
@@ -117,8 +166,10 @@ interface ChatState {
   ) => void;
 
   /**
-   * Handle a thinking event.  Seals the current open text block, then appends
-   * a thinking block `thinking_<runId>_<seq>`.
+   * Handle a thinking event. Thinking is a side-channel, not a hard boundary in
+   * assistant text: when an open text block already exists for the run, insert
+   * the thinking block before it and keep the text block open so later tokens
+   * continue the same visible answer.
    *
    * Idempotency: see `appendStreamingToken` — when `offset` is given, a thinking
    * event already applied (offset ≤ highest seen for the run) is dropped so
@@ -142,6 +193,36 @@ interface ChatState {
     runId: string,
     kind?: 'text' | 'tool' | 'thinking',
   ) => void;
+
+  /**
+   * Reset the stream-offset watermark for `runId` so that a replay from offset
+   * "0-0" (which the server always re-streams on reconnect) passes the
+   * idempotency guard and tokens are applied again rather than dropped.
+   *
+   * Must be called alongside `clearStreamingBlocks` on every `run_started`
+   * event to implement C3 replay idempotency: the first `run_started` sets up
+   * a clean slate; a reconnect mid-run re-emits `run_started`, clears whatever
+   * partial blocks were built, resets offsets, then the replayed token/tool/
+   * thinking stream rebuilds the blocks from scratch — no duplicates, no gaps.
+   */
+  clearRunStreamOffsets: (sessionId: string, runId: string) => void;
+
+  /**
+   * Mark `runId`'s streaming channel as terminally CLOSED.  Called from the
+   * `message` handler once a durable assistant/thinking/tool row for the run has
+   * been hydrated: from then on the three streaming entry points drop further
+   * token/thinking/tool events for this run, so a server (or other connection)
+   * that keeps replaying the run's Redis stream can't rebuild a duplicate set of
+   * streaming blocks alongside the durable rows.
+   */
+  closeRunStream: (sessionId: string, runId: string) => void;
+
+  /**
+   * Re-open `runId`'s streaming channel (clears the closed flag).  Called from
+   * `run_started` so a resumed run or a fresh leg with the same id can stream
+   * again normally.
+   */
+  reopenRunStream: (sessionId: string, runId: string) => void;
 
   // ── Legacy compat (kept for tests that import them directly) ──────────────
 
@@ -172,6 +253,51 @@ interface ChatState {
 
   setPlanSteps: (sessionId: string, steps: PlanStep[]) => void;
   setIsStreaming: (streaming: boolean) => void;
+
+  // ── HITL mutators ─────────────────────────────────────────────────────────
+
+  /**
+   * Add (or ignore-if-duplicate) a pending interaction for a session.
+   * Deduplication is by toolCallId, and acknowledged interactions are ignored
+   * so replay after approve/answer cannot resurrect a consumed card.
+   */
+  addPendingInteraction: (sessionId: string, p: PendingInteraction) => void;
+
+  /**
+   * Mark a pending interaction as consumed/submitted.  Used before optimistic
+   * removal and when a tool_result arrives, because both mean an older replayed
+   * pending event must be ignored.
+   */
+  markPendingInteractionAcknowledged: (
+    sessionId: string,
+    runId: string,
+    toolCallId: string,
+  ) => void;
+
+  /**
+   * Undo the acknowledgement after a failed submit so the same card can be
+   * re-added and retried.
+   */
+  unmarkPendingInteractionAcknowledged: (
+    sessionId: string,
+    runId: string,
+    toolCallId: string,
+  ) => void;
+
+  /**
+   * Remove a single pending interaction by its toolCallId (call after the user
+   * submits a response — optimistic removal before the API call completes).
+   */
+  removePendingInteraction: (sessionId: string, toolCallId: string) => void;
+
+  /**
+   * Clear all pending interactions for a session, or only those belonging to
+   * a specific runId when `runId` is given.
+   *
+   * Called on `run_started` (clear visible cards; replay may re-deliver any
+   * unacknowledged pendings) and on `run_complete`.
+   */
+  clearPendingInteractions: (sessionId: string, runId?: string) => void;
   login: (profile: UserProfile) => void;
   logout: () => void;
   setBootstrapped: (value: boolean) => void;
@@ -228,6 +354,34 @@ function isReplayOffset(
 }
 
 /**
+ * True when `runId`'s streaming channel has been closed (its durable rows have
+ * already hydrated).  Used by the three streaming entry points to early-return
+ * so a replayed token/tool/thinking event can't rebuild a duplicate block.
+ */
+function isRunStreamClosed(
+  s: { closedStreamRuns: Record<string, Set<string>> },
+  sessionId: string,
+  runId: string,
+): boolean {
+  return s.closedStreamRuns[sessionId]?.has(runId) === true;
+}
+
+function pendingInteractionKey(runId: string, toolCallId: string): string {
+  return `${runId}:${toolCallId}`;
+}
+
+function isPendingInteractionAcknowledged(
+  s: { acknowledgedPendingInteractions: Record<string, Set<string>> },
+  sessionId: string,
+  runId: string,
+  toolCallId: string,
+): boolean {
+  return s.acknowledgedPendingInteractions[sessionId]?.has(
+    pendingInteractionKey(runId, toolCallId),
+  ) === true;
+}
+
+/**
  * Return an updated `streamOffsets` map recording `offset` as the latest seen
  * for `runId` (only advances; never moves backwards).  When `offset` is
  * undefined the map is returned unchanged.
@@ -277,12 +431,27 @@ function countTextBlocks(msgs: Message[], runId: string): number {
 
 // ── Store ─────────────────────────────────────────────────────────────────────
 
+/**
+ * Derived selector: true when the given session has at least one pending HITL
+ * interaction. Used by ChatWindow to disable the composer while cards are
+ * displayed (prevents forking the paused run with a new message).
+ */
+export function hasPendingInteraction(
+  state: ChatState,
+  sessionId: string | null,
+): boolean {
+  if (!sessionId) return false;
+  const pending = state.pendingInteractions[sessionId];
+  return Array.isArray(pending) && pending.length > 0;
+}
+
 export const useChatStore = create<ChatState>((set) => ({
   sessions: [],
   activeSessionId: null,
   messages: {},
   planSteps: {},
   streamOffsets: {},
+  closedStreamRuns: {},
   isStreaming: false,
   isLoggedIn: false,
   userProfile: null,
@@ -290,6 +459,8 @@ export const useChatStore = create<ChatState>((set) => ({
   selectedSkills: {},
   selectedModel: {},
   selectedEffort: {},
+  pendingInteractions: {},
+  acknowledgedPendingInteractions: {},
 
   setSessions: (sessions) => set({ sessions }),
   addSession: (session) => set((s) => ({ sessions: [session, ...s.sessions] })),
@@ -377,6 +548,9 @@ export const useChatStore = create<ChatState>((set) => ({
 
   appendStreamingToken: (sessionId, runId, delta, offset) =>
     set((s) => {
+      // Channel-closed guard: the run's durable rows already hydrated — drop any
+      // (replayed) token so we don't rebuild a duplicate streaming block.
+      if (isRunStreamClosed(s, sessionId, runId)) return s;
       // Idempotency guard: drop a token we've already applied for this run.
       // Without this, a reconnect/StrictMode-remount replays the run from
       // "0-0" and re-appends earlier deltas onto whatever text block is
@@ -422,6 +596,9 @@ export const useChatStore = create<ChatState>((set) => ({
 
   upsertStreamingTool: (sessionId, runId, update, offset) =>
     set((s) => {
+      // Channel-closed guard: durable rows already hydrated — drop replayed tool
+      // events so they can't rebuild a duplicate tool block.
+      if (isRunStreamClosed(s, sessionId, runId)) return s;
       // Idempotency guard: a replayed tool_call/tool_result is dropped so a
       // reconnect doesn't re-seal text blocks or re-merge results.
       if (isReplayOffset(s, sessionId, runId, offset)) return s;
@@ -495,16 +672,15 @@ export const useChatStore = create<ChatState>((set) => ({
 
   appendStreamingThinking: (sessionId, runId, text, offset) =>
     set((s) => {
-      // Idempotency guard: a replayed thinking event would (a) duplicate the
-      // thinking block and (b) seal the open text block again, splitting the
-      // streamed reply.  Drop it.
+      // Channel-closed guard: durable rows already hydrated — drop replayed
+      // thinking events so they can't rebuild a duplicate thinking block.
+      if (isRunStreamClosed(s, sessionId, runId)) return s;
+      // Idempotency guard: a replayed thinking event would duplicate the
+      // thinking block and can reshuffle the visible run layout. Drop it.
       if (isReplayOffset(s, sessionId, runId, offset)) return s;
       const streamOffsets = recordOffset(s.streamOffsets, sessionId, runId, offset);
 
-      let existing = getMessages(s, sessionId);
-
-      // Seal any open text block.
-      existing = sealOpenTextBlock(existing, runId);
+      const existing = getMessages(s, sessionId);
 
       const seq = existing.filter(
         (m) => m.streamRunId === runId && m.blockKind === 'thinking',
@@ -523,8 +699,18 @@ export const useChatStore = create<ChatState>((set) => ({
         blockKind: 'thinking',
         streamRunId: runId,
       };
+      const openTextIdx = existing.findIndex(
+        (m) => m.streamRunId === runId && m.blockKind === 'text' && m.streaming,
+      );
+      const nextMessages = openTextIdx === -1
+        ? [...existing, thinkingBlock]
+        : [
+            ...existing.slice(0, openTextIdx),
+            thinkingBlock,
+            ...existing.slice(openTextIdx),
+          ];
       return {
-        messages: { ...s.messages, [sessionId]: [...existing, thinkingBlock] },
+        messages: { ...s.messages, [sessionId]: nextMessages },
         streamOffsets,
       };
     }),
@@ -539,6 +725,41 @@ export const useChatStore = create<ChatState>((set) => ({
       });
       if (filtered.length === existing.length) return s;
       return { messages: { ...s.messages, [sessionId]: filtered } };
+    }),
+
+  clearRunStreamOffsets: (sessionId, runId) =>
+    set((s) => {
+      const forSession = s.streamOffsets[sessionId];
+      if (!forSession || forSession[runId] === undefined) return s;
+      const { [runId]: _dropped, ...rest } = forSession;
+      return {
+        streamOffsets: {
+          ...s.streamOffsets,
+          [sessionId]: rest,
+        },
+      };
+    }),
+
+  closeRunStream: (sessionId, runId) =>
+    set((s) => {
+      const forSession = s.closedStreamRuns[sessionId];
+      if (forSession?.has(runId)) return s; // already closed
+      const next = new Set(forSession ?? []);
+      next.add(runId);
+      return {
+        closedStreamRuns: { ...s.closedStreamRuns, [sessionId]: next },
+      };
+    }),
+
+  reopenRunStream: (sessionId, runId) =>
+    set((s) => {
+      const forSession = s.closedStreamRuns[sessionId];
+      if (!forSession || !forSession.has(runId)) return s; // not closed
+      const next = new Set(forSession);
+      next.delete(runId);
+      return {
+        closedStreamRuns: { ...s.closedStreamRuns, [sessionId]: next },
+      };
     }),
 
   // ── Legacy compat ─────────────────────────────────────────────────────────
@@ -594,6 +815,82 @@ export const useChatStore = create<ChatState>((set) => ({
   setPlanSteps: (sessionId, steps) =>
     set((s) => ({ planSteps: { ...s.planSteps, [sessionId]: steps } })),
   setIsStreaming: (isStreaming) => set({ isStreaming }),
+
+  // ── HITL mutators ─────────────────────────────────────────────────────────
+
+  addPendingInteraction: (sessionId, p) =>
+    set((s) => {
+      const current = s.pendingInteractions[sessionId] || [];
+      if (isPendingInteractionAcknowledged(s, sessionId, p.runId, p.toolCallId)) {
+        return s;
+      }
+      // Deduplicate by toolCallId — idempotent on replay.
+      if (current.some((x) => x.toolCallId === p.toolCallId)) return s;
+      return {
+        pendingInteractions: {
+          ...s.pendingInteractions,
+          [sessionId]: [...current, p],
+        },
+      };
+    }),
+
+  markPendingInteractionAcknowledged: (sessionId, runId, toolCallId) =>
+    set((s) => {
+      const current = s.acknowledgedPendingInteractions[sessionId];
+      const key = pendingInteractionKey(runId, toolCallId);
+      if (current?.has(key)) return s;
+      const next = new Set(current ?? []);
+      next.add(key);
+      return {
+        acknowledgedPendingInteractions: {
+          ...s.acknowledgedPendingInteractions,
+          [sessionId]: next,
+        },
+      };
+    }),
+
+  unmarkPendingInteractionAcknowledged: (sessionId, runId, toolCallId) =>
+    set((s) => {
+      const current = s.acknowledgedPendingInteractions[sessionId];
+      const key = pendingInteractionKey(runId, toolCallId);
+      if (!current?.has(key)) return s;
+      const next = new Set(current);
+      next.delete(key);
+      return {
+        acknowledgedPendingInteractions: {
+          ...s.acknowledgedPendingInteractions,
+          [sessionId]: next,
+        },
+      };
+    }),
+
+  removePendingInteraction: (sessionId, toolCallId) =>
+    set((s) => {
+      const current = s.pendingInteractions[sessionId] || [];
+      const filtered = current.filter((x) => x.toolCallId !== toolCallId);
+      if (filtered.length === current.length) return s;
+      return {
+        pendingInteractions: {
+          ...s.pendingInteractions,
+          [sessionId]: filtered,
+        },
+      };
+    }),
+
+  clearPendingInteractions: (sessionId, runId) =>
+    set((s) => {
+      const current = s.pendingInteractions[sessionId] || [];
+      const filtered = runId
+        ? current.filter((x) => x.runId !== runId)
+        : [];
+      if (filtered.length === current.length) return s;
+      return {
+        pendingInteractions: {
+          ...s.pendingInteractions,
+          [sessionId]: filtered,
+        },
+      };
+    }),
   login: (profile) => set({ isLoggedIn: true, userProfile: profile, bootstrapped: true }),
   logout: () =>
     set({
@@ -603,11 +900,14 @@ export const useChatStore = create<ChatState>((set) => ({
       messages: {},
       planSteps: {},
       streamOffsets: {},
+      closedStreamRuns: {},
       activeSessionId: null,
       bootstrapped: true,
       selectedSkills: {},
       selectedModel: {},
       selectedEffort: {},
+      pendingInteractions: {},
+      acknowledgedPendingInteractions: {},
     }),
   setBootstrapped: (value) => set({ bootstrapped: value }),
   toggleSkill: (sessionId, name) =>

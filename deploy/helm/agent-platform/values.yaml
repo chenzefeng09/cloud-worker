@@ -205,6 +205,15 @@ agentScheduler:
     sandboxCpuShares: "1024"
     sandboxTimeout: "600"
     runtimeExtensions: "mcp_tenant_injector,skills_loader,web_fetch,event_audit_sink,llm_gateway_enforcer"
+    # ----- Sandbox egress mode -----------------------------------------------
+    # broker (默认): 沙箱仅经 tool-broker 触达 infra（每 run 签名 lease）。
+    # foundation: 旧/兼容模式，沙箱直连 foundation 服务网段。
+    # none: 仅本地文件系统工具。
+    # 注意 k8s 隔离真相见 D3（NOTES.txt / templates/sandbox-isolation.yaml 注释）：
+    # 沙箱不是 pod，URL 重写在此层强制，物理网络隔离需 Cube 控制器侧策略。
+    sandboxEgressMode: broker
+    # tool-broker 集群内端点（留空则用 http://ap-tool-broker:<port>/api/tool-broker/v1）
+    toolBrokerUrl: ""
     # Keycloak OIDC bootstrap（scheduler 自举 service-account token）
     keycloakRealm: foundation
     keycloakClientId: foundation-identity-service
@@ -220,6 +229,25 @@ agentScheduler:
   # cube-controller URL（runtime=cube 时填写）
   cubeControllerUrl: ""
   existingSecret: ""   # BFF_SCHEDULER_SERVICE_TOKEN / KEYCLOAK_CLIENT_SECRET 等
+  # ---- Sandbox isolation (D3) ---------------------------------------------
+  # 关键事实：本平台的沙箱在 k8s 中【不是 pod】。
+  #   - runtime=docker: 由 docker-socket-proxy 启动的【兄弟容器】，不在 k8s pod 模型内。
+  #   - runtime=cube:   由 CubeSandbox/E2B 控制器启动的【microVM】，不在 k8s pod 模型内。
+  # 因此 pod NetworkPolicy 选不到沙箱、形同虚设——默认【不渲染】，避免安全剧场。
+  #
+  # 生产环境沙箱隔离实际由两层强制（见 templates/sandbox-isolation.yaml 注释）：
+  #   (a) broker egress 的 URL 重写（scheduler service_env，本仓强制）；
+  #   (b) CubeSandbox 控制器侧的 per-VM 网络策略（本仓【之外】，W6 operator 物料）。
+  #
+  # 仅当未来引入“沙箱即 pod 并带固定 label”的 in-cluster runtime 时，才把下面
+  # 开关打开以渲染一条 default-deny egress + 仅放行 tool-broker/DNS 的 NetworkPolicy。
+  sandboxNetworkPolicy:
+    # 默认 false：当前 docker/cube 两种 runtime 下沙箱都不是 pod，渲染了也无效。
+    enabled: false
+    # 该 NetworkPolicy 选中的 pod label（仅在 in-cluster pod runtime 下有意义）。
+    # 未来 pod 化沙箱必须打上此 label 才会被策略选中。
+    podSelectorLabel:
+      agent-platform.example.com/component: sandbox
   env: []
 
 # ---------------------------------------------------------------------------
@@ -408,6 +436,55 @@ webFetchGateway:
     restrictContentTypes: "true"
     requireAuth: "true"
     requiredScope: web_fetch.invoke
+  env: []
+
+# ---------------------------------------------------------------------------
+# Tool Broker — sandbox egress façade（broker egress 模式的唯一对外出口）
+#
+# broker 模式下沙箱只能经 tool-broker 访问 LLM-gateway / MCP / skill-store /
+# web-fetch，并通过 /state（Redis 代理）+ /s3（对象存储只读代理）触达热状态与
+# 产物。真实 infra 凭据只存在于 broker 这一侧，沙箱本身不持有任何 infra 密钥。
+#
+# 凭据复用（single source of truth，勿新建第二套 secret）：
+#   - Redis     ← global.foundation.redis.existingSecret（key: url 或 password）
+#   - S3/MinIO  ← global.foundation.s3.existingSecret（access_key_id / secret_access_key）
+#   - LEASE_SECRET（与 scheduler 共享的 HMAC 密钥）← toolBroker.existingSecret
+#                  （默认 ap-tool-broker-secrets；scheduler 引用同一 secret）
+# ---------------------------------------------------------------------------
+toolBroker:
+  enabled: true
+  image:
+    repository: agent-platform/tool-broker
+    tag: ""   # 占位；CI 注入
+  replicaCount: 1
+  port: 8024
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+  autoscaling:
+    enabled: false
+    minReplicas: 1
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+  podDisruptionBudget:
+    enabled: false
+    minAvailable: 1
+  topologySpreadConstraints: []
+  networkPolicy:
+    enabled: false
+  config:
+    apiPrefix: /api/tool-broker/v1
+    requireAuth: "true"
+    requireLease: "true"
+    # 上游 façade 目标（留空则用下方默认的集群内 service DNS）
+    llmGatewayUrl: ""        # 默认 global.foundation.llmGatewayUrl
+    mcpRegistryUrl: ""       # 默认 http://ap-mcp-registry:8010/api/mcp/v1
+    skillStoreUrl: ""        # 默认 http://ap-skill-store:8011/api/skills/v1
+    webFetchGatewayUrl: ""   # 默认 http://ap-web-fetch-gateway:8013/api/web-fetch/v1
+    # HMAC lease 密钥占位；生产用 existingSecret 注入真实值后此项忽略。
+    # 与 scheduler 共享，二者 MUST 同值（见 secrets.yaml / agent-scheduler.yaml）。
+    leaseSecret: ""
+  existingSecret: ""   # 若设置，从此 Secret 注入 TOOL_BROKER_LEASE_SECRET（且 scheduler 复用）
   env: []
 
 # =============================================================================

@@ -1,80 +1,101 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { api, ApiError } from '../api/client';
-import type { Message, MessageAttachment } from '../api/types';
+import type { Message, MessageAttachment, PendingInteractionItem } from '../api/types';
 
-/**
- * SSE event handler bound to a specific sessionId.
- *
- * Why we capture the sessionId at connection-time
- * ------------------------------------------------
- * Both the persistent stream effect and sendMessage capture the sessionId
- * when the connection/call is made.  If the user switches sessions while a
- * stream is still open, every subsequent event is routed to the original
- * session — never to whatever is currently active.
- *
- * Ordered streaming pipeline
- * --------------------------
- * SSE events arrive in chronological order from the Redis stream.  We build
- * an ordered block list in the store rather than collapsing everything into
- * two buckets (text + tools).
- *
- * Event → store method mapping:
- *   run_started  → setIsStreaming(true)   (event-driven; eliminates the race
- *                                          window when POST returns but no
- *                                          stream event has landed yet — the
- *                                          optimistic setIsStreaming(true) in
- *                                          sendMessage covers that gap instead)
- *   token        → appendStreamingToken   (appends to open text segment, or opens new one)
- *   tool         → upsertStreamingTool    (seals open text; creates/updates tool block)
- *   thinking     → appendStreamingThinking(seals open text; appends thinking block)
- *   message      → clearStreamingBlocks + addMessage  (replaces temp blocks with real DB rows)
- *   run_complete → setIsStreaming(false)  (event-driven)
- *   done         → onDone()  (stream cycling signal — NOT isStreaming, a `done`
- *                              only means the 5-min server window closed; a new
- *                              window will reconnect immediately, so isStreaming
- *                              must not flip here)
- *   error        → addMessage SYSTEM + onDone()
- */
-function handleSSEEvent(
-  sessionId: string,
-  eventType: string,
-  data: Record<string, unknown>,
-  onDone: () => void,
-): void {
-  const store = useChatStore.getState();
-  switch (eventType) {
-    case 'run_started':
-      // A new run started on this session — mark streaming live.
-      store.setIsStreaming(true);
-      break;
+// ── SSE event handler registry ────────────────────────────────────────────────
+//
+// This map is THE platform SSE event contract and the SINGLE adaptation point.
+//
+// The backend worker may swap frameworks (AgentScope today, possibly Claude
+// Agent SDK or another framework later) and the orchestrator normalises worker
+// events into this contract before they reach the client.  If event names
+// change, ONLY this map and its comment need updating — nothing else in the
+// frontend changes.
+//
+// Event → store method mapping:
+//   run_started    → clearStreamingBlocks (C3 replay idempotency) +
+//                    clearRunStreamOffsets + setIsStreaming(true)
+//   token          → appendStreamingToken (idempotent via offset watermark)
+//   tool           → upsertStreamingTool  (idempotent via offset watermark)
+//   thinking       → appendStreamingThinking (idempotent via offset watermark)
+//   message        → clearStreamingBlocks (kind-aware) + addMessage
+//   message_created→ addMessage  (backend echo of the user message)
+//   agent_message  → addMessage  (legacy event name — treated same as message)
+//   plan           → setPlanSteps
+//   run_complete   → setIsStreaming(false)
+//   done           → onDone()  (5-min server window closed; NOT isStreaming)
+//   error          → addMessage SYSTEM + onDone()
+//   <unknown>      → console.warn (never silently dropped — a silent `message`
+//                    drop has bitten this codebase before)
+//
+// Handler signature:
+//   ctx  — { sessionId: string; onDone: () => void }
+//   data — parsed JSON payload for the event
 
-    case 'message_created':
-      // Backend echo of the user message — may replace the optimistic entry.
-      store.addMessage(sessionId, data as unknown as Message);
-      break;
+interface SSEContext {
+  sessionId: string;
+  onDone: () => void;
+}
 
-    case 'token': {
-      const runId = data.run_id as string | undefined;
-      const delta = data.delta as string | undefined;
-      // Redis stream entry id ("<ms>-<seq>"); enables idempotent replay so a
-      // reconnect/StrictMode-remount that re-streams from "0-0" can't double or
-      // scramble the streamed text. Optional — older backends omit it.
-      const offset = data.offset as string | undefined;
-      if (runId && delta !== undefined) {
-        store.appendStreamingToken(sessionId, runId, delta, offset);
-      }
-      break;
+type SSEHandler = (ctx: SSEContext, data: Record<string, unknown>) => void;
+
+const SSE_HANDLERS: Record<string, SSEHandler> = {
+  run_started(ctx, data) {
+    // C3 — replay idempotency:
+    // On every run_started (including a reconnect mid-run), wipe the transient
+    // streaming blocks for this run and reset its offset watermark so that the
+    // server's token/tool/thinking replay from "0-0" applies cleanly rather
+    // than being filtered by stale offsets or double-appended.
+    //
+    // Correctness comes from consumer-side idempotency, not from the guarantee
+    // that events arrive exactly once — the server ALWAYS re-streams from the
+    // beginning of the run's Redis stream on every (re)connect.
+    const store = useChatStore.getState();
+    const runId = data.run_id as string | undefined;
+    if (runId) {
+      store.clearStreamingBlocks(ctx.sessionId, runId); // clear all kinds
+      store.clearRunStreamOffsets(ctx.sessionId, runId); // reset offset watermark
+      store.reopenRunStream(ctx.sessionId, runId); // re-open channel for this leg
+      // Clear visible pendings for this run.  On a RESUMED leg the stream is
+      // replayed from the beginning; addPendingInteraction rebuilds only
+      // unacknowledged cards and suppresses approvals already submitted.
+      store.clearPendingInteractions(ctx.sessionId, runId);
     }
+    // Mark streaming live.  The optimistic setIsStreaming(true) in sendMessage
+    // covers the gap between POST return and the first run_started arriving.
+    store.setIsStreaming(true);
+  },
 
-    case 'tool': {
-      const runId = data.run_id as string | undefined;
-      const kind = data.kind as 'call' | 'result' | undefined;
-      const toolCallId = data.tool_call_id as string | undefined;
-      const toolName = data.name as string | undefined;
-      const offset = data.offset as string | undefined;
-      if (runId && kind && toolCallId && toolName) {
-        store.upsertStreamingTool(sessionId, runId, {
+  message_created(_ctx, data) {
+    // Backend echo of the user message — may replace the optimistic entry.
+    const store = useChatStore.getState();
+    store.addMessage(_ctx.sessionId, data as unknown as Message);
+  },
+
+  token(ctx, data) {
+    const store = useChatStore.getState();
+    const runId = data.run_id as string | undefined;
+    const delta = data.delta as string | undefined;
+    // Redis stream entry id ("<ms>-<seq>"); enables idempotent replay so a
+    // reconnect/StrictMode-remount that re-streams from "0-0" can't double or
+    // scramble the streamed text.  Optional — older backends omit it.
+    const offset = data.offset as string | undefined;
+    if (runId && delta !== undefined) {
+      store.appendStreamingToken(ctx.sessionId, runId, delta, offset);
+    }
+  },
+
+  tool(ctx, data) {
+    const store = useChatStore.getState();
+    const runId = data.run_id as string | undefined;
+    const kind = data.kind as 'call' | 'result' | undefined;
+    const toolCallId = data.tool_call_id as string | undefined;
+    const toolName = data.name as string | undefined;
+    const offset = data.offset as string | undefined;
+    if (runId && kind && toolCallId) {
+      if (toolName) {
+        store.upsertStreamingTool(ctx.sessionId, runId, {
           kind,
           tool_call_id: toolCallId,
           name: toolName,
@@ -83,90 +104,221 @@ function handleSSEEvent(
           state: kind === 'result' ? (data.state as string | undefined) : undefined,
         }, offset);
       }
-      break;
-    }
-
-    case 'thinking': {
-      const runId = data.run_id as string | undefined;
-      const text = data.text as string | undefined;
-      const offset = data.offset as string | undefined;
-      if (runId && text) {
-        store.appendStreamingThinking(sessionId, runId, text, offset);
+      if (kind === 'result') {
+        // HITL self-heal: a tool_result for this tool_call_id means the
+        // interaction has been consumed (confirm approved / answered).  On a
+        // replay-only reconnect the pending_confirmation event re-delivers the
+        // card; acknowledge + remove it the moment the replayed tool_result
+        // lands so older pending events cannot resurrect a consumed card.
+        store.markPendingInteractionAcknowledged(ctx.sessionId, runId, toolCallId);
+        store.removePendingInteraction(ctx.sessionId, toolCallId);
       }
-      break;
     }
+  },
 
-    case 'plan': {
-      // Real-time plan steps from the worker's TaskCreate/TaskUpdate calls.
-      // Shape: { run_id: string, plan_steps: PlanStep[] }
-      const steps = data.plan_steps;
-      if (Array.isArray(steps) && steps.length > 0) {
-        store.setPlanSteps(sessionId, steps as import('../lib/designFixtures').PlanStep[]);
-      }
-      break;
+  thinking(ctx, data) {
+    const store = useChatStore.getState();
+    const runId = data.run_id as string | undefined;
+    const text = data.text as string | undefined;
+    const offset = data.offset as string | undefined;
+    if (runId && text) {
+      store.appendStreamingThinking(ctx.sessionId, runId, text, offset);
     }
+  },
 
-    case 'message': {
-      // A complete message row from the server.  The orchestrator stores roles
-      // lowercase ("assistant"/"user"/"system"/"tool"); compare case-insensitively.
-      const msg = data as unknown as Message;
-      const roleUpper = (msg.role || '').toUpperCase();
-      if ((roleUpper === 'ASSISTANT' || roleUpper === 'TOOL' || roleUpper === 'THINKING') && msg.run_id) {
-        // Swap the transient streaming block for the durable DB row — but only
-        // the block of the SAME kind this row replaces.  Durable rows arrive
-        // THINKING-first, then ASSISTANT text; a non-kind-aware clear would wipe
-        // the live-streamed text when the THINKING row lands, and if the text's
-        // own durable row is delayed (or the stream closes first) the run would
-        // show a lone THOUGHT block with no answer.  addMessage deduplicates.
-        const kindForRole =
-          roleUpper === 'THINKING' ? 'thinking' : roleUpper === 'TOOL' ? 'tool' : 'text';
-        store.clearStreamingBlocks(sessionId, msg.run_id, kindForRole);
-        store.addMessage(sessionId, msg);
-      } else {
-        store.addMessage(sessionId, msg);
-      }
-      break;
+  plan(ctx, data) {
+    // Real-time plan steps from the worker's TaskCreate/TaskUpdate calls.
+    // Shape: { run_id: string, plan_steps: PlanStep[] }
+    const steps = data.plan_steps;
+    if (Array.isArray(steps) && steps.length > 0) {
+      useChatStore.getState().setPlanSteps(
+        ctx.sessionId,
+        steps as import('../lib/designFixtures').PlanStep[],
+      );
     }
+  },
 
-    case 'agent_message':
-      // Legacy event name — treat same as `message`.
-      store.addMessage(sessionId, data as unknown as Message);
-      break;
+  message(ctx, data) {
+    // A complete message row from the server.  The orchestrator stores roles
+    // lowercase ("assistant"/"user"/"system"/"tool"); compare case-insensitively.
+    const store = useChatStore.getState();
+    const msg = data as unknown as Message;
+    const roleUpper = (msg.role || '').toUpperCase();
+    if ((roleUpper === 'ASSISTANT' || roleUpper === 'TOOL' || roleUpper === 'THINKING') && msg.run_id) {
+      // Swap the transient streaming block for the durable DB row — but only
+      // the block of the SAME kind this row replaces.  Durable rows arrive
+      // THINKING-first, then ASSISTANT text; a non-kind-aware clear would wipe
+      // the live-streamed text when the THINKING row lands, and if the text's
+      // own durable row is delayed (or the stream closes first) the run would
+      // show a lone THOUGHT block with no answer.  addMessage deduplicates.
+      const kindForRole =
+        roleUpper === 'THINKING' ? 'thinking' : roleUpper === 'TOOL' ? 'tool' : 'text';
+      store.clearStreamingBlocks(ctx.sessionId, msg.run_id, kindForRole);
+      store.addMessage(ctx.sessionId, msg);
+      // A durable row for this run has landed → the run reached terminal and was
+      // hydrated.  Close its streaming channel and drop its offset watermark so
+      // any further (replayed) token/tool/thinking events are discarded instead
+      // of rebuilding a duplicate set of side-by-side streaming blocks.  A future
+      // `run_started` (resume / new leg) reopens the channel.
+      store.closeRunStream(ctx.sessionId, msg.run_id);
+      store.clearRunStreamOffsets(ctx.sessionId, msg.run_id);
+    } else {
+      store.addMessage(ctx.sessionId, msg);
+    }
+  },
 
-    case 'run_complete':
-      // Run finished — clear the streaming indicator.  The stream window may
-      // stay open a while longer; isStreaming is about run activity, not
-      // connection state.
-      store.setIsStreaming(false);
-      break;
+  agent_message(ctx, data) {
+    // Legacy event name — treat same as `message`.
+    useChatStore.getState().addMessage(ctx.sessionId, data as unknown as Message);
+  },
 
-    case 'done':
-      // The server closes the SSE window after ~5 min and emits `done`.  This
-      // is NOT a run-completion signal; a run_complete will have preceded it if
-      // a run was active.  We call onDone so the reconnect loop can reopen the
-      // connection.  We deliberately do NOT flip isStreaming here.
-      onDone();
-      break;
+  // ── HITL event handlers ──────────────────────────────────────────────────
+  //
+  // Backend SSE contract (ALL IMPLEMENTED — consumed here):
+  //   pending_confirmation {run_id, tool_call_id, name, args}
+  //     → addPendingInteraction(kind:'confirm')
+  //   pending_question {run_id, tool_call_id, question}
+  //     → addPendingInteraction(kind:'question')
+  //   run_paused {run_id}
+  //     → setIsStreaming(false)  (worker exited; pending cards remain)
+  //
+  // Note: `run_resumed` is NOT emitted by the backend.  The resumed leg fires
+  // a new `run_started` (same run_id), which triggers the normal
+  // clearStreamingBlocks + clearRunStreamOffsets + setIsStreaming(true) path.
+  // No separate `run_resumed` handler is needed.
 
-    case 'error':
-      store.addMessage(sessionId, {
-        id: `err_${Date.now()}`,
-        session_id: sessionId,
-        role: 'SYSTEM',
-        content: `Error: ${(data as Record<string, unknown>).detail || 'Unknown error'}`,
-        tool_calls: null,
-        run_id: null,
-        sequence: 0,
-        created_at: new Date().toISOString(),
+  pending_confirmation(ctx, data) {
+    const store = useChatStore.getState();
+    const runId = data.run_id as string | undefined;
+    const toolCallId = data.tool_call_id as string | undefined;
+    const name = data.name as string | undefined;
+    const args = data.args as string | undefined;
+    if (runId && toolCallId) {
+      store.addPendingInteraction(ctx.sessionId, {
+        runId,
+        toolCallId,
+        kind: 'confirm',
+        name,
+        args,
       });
-      onDone();
-      break;
+    }
+  },
 
-    default:
-      // Never silently drop unknown events — a previously-unhandled `message`
-      // event name silently broke the UI; warn loudly so it's never missed.
-      console.warn('[useChat] Unknown SSE event type:', eventType, data);
-      break;
+  pending_question(ctx, data) {
+    const store = useChatStore.getState();
+    const runId = data.run_id as string | undefined;
+    const toolCallId = data.tool_call_id as string | undefined;
+    const question = data.question as string | undefined;
+    if (runId && toolCallId) {
+      store.addPendingInteraction(ctx.sessionId, {
+        runId,
+        toolCallId,
+        kind: 'question',
+        question,
+      });
+    }
+  },
+
+  run_paused(_ctx) {
+    // Worker exited to save resources while paused.  The run is NOT complete —
+    // it will be respawned when the user responds.  We flip isStreaming(false)
+    // so the "Working on it…" pill disappears, but the pending cards (set by
+    // pending_confirmation / pending_question) remain visible and the composer
+    // stays DISABLED via the hasPendingInteraction selector in ChatWindow.
+    useChatStore.getState().setIsStreaming(false);
+  },
+
+  run_complete(_ctx, data) {
+    // Run finished — clear the streaming indicator AND any remaining pending
+    // interactions (a resumed-run that completes without further confirmation
+    // should clear the cards automatically).
+    const store = useChatStore.getState();
+    const runId = data.run_id as string | undefined;
+    store.setIsStreaming(false);
+    if (runId) {
+      store.clearPendingInteractions(_ctx.sessionId, runId);
+    } else {
+      store.clearPendingInteractions(_ctx.sessionId);
+    }
+  },
+
+  run_stream_end(ctx, data) {
+    // The orchestrator emits this when a run's Redis token *tail* for THIS
+    // connection ends — on normal completion AND on replay-only reconnects
+    // (where no run_started/run_complete pair is re-delivered).  Payload:
+    // { run_id, paused }.
+    //
+    // IMPORTANT: run_stream_end means "this connection's token tail ended",
+    // NOT "the run completed".  An active run goes quiet between tool batches
+    // while the model decides the next step; the tail can legitimately end and
+    // be re-opened on a later poll.  We therefore do NOT flip isStreaming to
+    // false here — `run_complete` (and the durable-message path) are the
+    // authoritative completers.  On a terminal replay reconnect the outer
+    // orchestrator loop still emits run_complete (the completion_primed
+    // synthetic run_complete and the post-stream run_complete), so the
+    // "Working on it…" pill is cleared by that path — not by this handler.
+    const store = useChatStore.getState();
+    const runId = data.run_id as string | undefined;
+    const paused = data.paused === true;
+    if (!paused) {
+      // Stream tail ended without a pending interaction → clear any pending
+      // cards resurrected by a replay-only reconnect for this run.  (We do
+      // NOT touch isStreaming — see comment above.)
+      if (runId) store.clearPendingInteractions(ctx.sessionId, runId);
+    }
+    // When paused === true the pending_confirmation event (relayed in the same
+    // stream) is the source of truth — leave the card and let the user act.
+  },
+
+  done(_ctx, _data) {
+    // The server closes the SSE window after ~5 min and emits `done`.  This
+    // is NOT a run-completion signal; a run_complete will have preceded it if
+    // a run was active.  We call onDone so the reconnect loop can reopen the
+    // connection.  We deliberately do NOT flip isStreaming here.
+    _ctx.onDone();
+  },
+
+  error(ctx, data) {
+    useChatStore.getState().addMessage(ctx.sessionId, {
+      id: `err_${Date.now()}`,
+      session_id: ctx.sessionId,
+      role: 'SYSTEM',
+      content: `Error: ${(data as Record<string, unknown>).detail || 'Unknown error'}`,
+      tool_calls: null,
+      run_id: null,
+      sequence: 0,
+      created_at: new Date().toISOString(),
+    });
+    ctx.onDone();
+  },
+};
+
+/**
+ * Dispatch a single SSE event through the handler registry.
+ *
+ * Exported for use in tests — allows tests to drive the full SSE_HANDLERS
+ * adapter map rather than maintaining a parallel reimplementation.
+ *
+ * Why we capture the sessionId at connection-time
+ * ------------------------------------------------
+ * Both the persistent stream effect and sendMessage capture the sessionId
+ * when the connection/call is made.  If the user switches sessions while a
+ * stream is still open, every subsequent event is routed to the original
+ * session — never to whatever is currently active.
+ */
+export function handleSSEEvent(
+  sessionId: string,
+  eventType: string,
+  data: Record<string, unknown>,
+  onDone: () => void,
+): void {
+  const handler = SSE_HANDLERS[eventType];
+  if (handler) {
+    handler({ sessionId, onDone }, data);
+  } else {
+    // Never silently drop unknown events — a previously-unhandled `message`
+    // event name silently broke the UI; warn loudly so it's never missed.
+    console.warn('[useChat] Unknown SSE event type:', eventType, data);
   }
 }
 
@@ -183,12 +335,51 @@ function handleSSEEvent(
  * used identical line-buffer logic.  Centralising it avoids a copy-paste drift
  * bug where one path mis-handles partial UTF-8 chunks differently from the other.
  */
-async function parseSSEStream(
+export async function parseSSEStream(
   reader: ReadableStreamDefaultReader<Uint8Array>,
   onEvent: (eventType: string, data: Record<string, unknown>) => void,
 ): Promise<void> {
   const decoder = new TextDecoder();
   let buffer = '';
+  let eventType = '';
+  let dataLines: string[] = [];
+
+  const dispatchEvent = () => {
+    if (dataLines.length === 0) {
+      eventType = '';
+      return;
+    }
+    const rawData = dataLines.join('\n');
+    const type = eventType || 'message';
+    try {
+      const data = JSON.parse(rawData);
+      onEvent(type, data);
+    } catch {
+      // Non-JSON data — skip silently (SSE allows arbitrary data frames).
+    }
+    eventType = '';
+    dataLines = [];
+  };
+
+  const processLine = (rawLine: string) => {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (line === '') {
+      dispatchEvent();
+      return;
+    }
+    if (line.startsWith(':')) return; // SSE comment / heartbeat.
+
+    const colon = line.indexOf(':');
+    const field = colon === -1 ? line : line.slice(0, colon);
+    let value = colon === -1 ? '' : line.slice(colon + 1);
+    if (value.startsWith(' ')) value = value.slice(1);
+
+    if (field === 'event') {
+      eventType = value;
+    } else if (field === 'data') {
+      dataLines.push(value);
+    }
+  };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -198,21 +389,16 @@ async function parseSSEStream(
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
 
-    let eventType = '';
     for (const line of lines) {
-      if (line.startsWith('event: ')) {
-        eventType = line.slice(7).trim();
-      } else if (line.startsWith('data: ') && eventType) {
-        try {
-          const data = JSON.parse(line.slice(6));
-          onEvent(eventType, data);
-        } catch {
-          // Non-JSON data line — skip silently (SSE spec allows non-data lines)
-        }
-        eventType = '';
-      }
+      processLine(line);
     }
   }
+
+  buffer += decoder.decode();
+  if (buffer) {
+    processLine(buffer);
+  }
+  dispatchEvent();
 }
 
 // ── Singleton persistent-stream manager ───────────────────────────────────────
@@ -255,6 +441,13 @@ const STREAM_TEARDOWN_GRACE_MS = 50;
 /**
  * Open (or join) the singleton SSE stream for `sid`; returns an unsubscribe fn.
  * Exported for tests — production code reaches it via the useChat effect.
+ *
+ * C2 — single subscription (HARD requirement):
+ * Only ONE stream is ever open per session.  A ref-counted handle tracks all
+ * subscribers; opening for a session that already has a live stream increments
+ * the ref count without opening a new fetch.  Cleanup decrements and schedules
+ * teardown (with grace delay for StrictMode remounts).  This prevents the token-
+ * doubling that a double-open causes when the server replays from "0-0".
  */
 export function subscribeSessionStream(sid: string): () => void {
   let handle = activeStreams.get(sid);
@@ -355,6 +548,45 @@ async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> 
   }
 }
 
+/**
+ * Apply a batch of paused HITL interactions (from GET /sessions/{id}/pending)
+ * to the chat store on mount.  Mirrors the SSE `pending_confirmation` /
+ * `pending_question` handlers above so the rehydrated cards are identical to
+ * the live-streamed ones.  `addPendingInteraction` dedups by toolCallId and
+ * respects acknowledged interactions, so this is safe to run alongside SSE
+ * replay (no duplicate or resurrected cards).
+ *
+ * Exported so it can be unit-tested directly against the store, matching the
+ * store-driven style of the other tests in this file.
+ */
+export function applyPendingInteractions(
+  sessionId: string,
+  items: PendingInteractionItem[],
+): void {
+  const store = useChatStore.getState();
+  for (const it of items) {
+    if (it.kind === 'question') {
+      const tc = it.tool_calls[0];
+      store.addPendingInteraction(sessionId, {
+        runId: it.run_id,
+        toolCallId: tc?.id ?? it.run_id,
+        kind: 'question',
+        question: it.question ?? undefined,
+      });
+    } else {
+      for (const tc of it.tool_calls) {
+        store.addPendingInteraction(sessionId, {
+          runId: it.run_id,
+          toolCallId: tc.id,
+          kind: 'confirm',
+          name: tc.name,
+          args: tc.args,
+        });
+      }
+    }
+  }
+}
+
 export function useChat() {
   const { activeSessionId, messages, setIsStreaming, isStreaming } = useChatStore();
   // abortRef is used by cancel() to abort an in-flight POST (rare — the POST is
@@ -392,6 +624,19 @@ export function useChat() {
           console.warn('load messages failed', err);
         }
       }
+
+      // Rehydrate any HITL pause that happened while the page was closed (or on
+      // an earlier run in this session).  The live SSE pending_confirmation /
+      // pending_question event is missed on refresh/reconnect, so without this
+      // the run sits PAUSED with no card.  applyPendingInteractions mirrors the
+      // SSE handlers and is dedup-safe, so it can run alongside stream replay.
+      // Wrapped in its own try/catch so a failure never breaks message hydration.
+      try {
+        const pending = await api.sessions.pending(sid);
+        applyPendingInteractions(sid, pending.items);
+      } catch (err) {
+        console.warn('load pending interactions failed', err);
+      }
     })();
   }, [activeSessionId]);
 
@@ -404,7 +649,7 @@ export function useChat() {
   //
   // Lifecycle:
   //   1. Open GET /sessions/{id}/stream with credentials + AbortSignal.
-  //   2. Parse SSE via parseSSEStream → handleSSEEvent.
+  //   2. Parse SSE via parseSSEStream → handleSSEEvent → SSE_HANDLERS.
   //   3. On clean EOF (server `done` event followed by stream close):
   //      reconnect after 1 s backoff if the session is still active.
   //   4. On immediate connect failure (network down, 401, etc.):
@@ -413,7 +658,7 @@ export function useChat() {
   //   5. Cleanup (session change / unmount) aborts the in-flight fetch via
   //      streamAbortRef, which causes the reader to throw AbortError → loop exits.
   //
-  // Double-stream prevention: the actual SSE connection lives in a module-level
+  // C2 — single subscription: the actual SSE connection lives in a module-level
   // ref-counted singleton (subscribeSessionStream).  Every mounted useChat()
   // consumer for the same session shares ONE connection, so token/thinking
   // events are never applied twice — which is what produced the doubled,
@@ -440,8 +685,8 @@ export function useChat() {
   //      The stream's run_complete (not this function) turns it off.
   //   5. On failure: add SYSTEM error message, return.
   //
-  // The `res.body.getReader()` SSE loop that was here is GONE — the persistent
-  // stream effect handles all events.
+  // The `res.body.getReader()` SSE loop that was previously here is GONE — the
+  // persistent stream effect handles all events.
   const sendMessage = useCallback(
     async (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => {
       if (!activeSessionId || isStreaming) return;

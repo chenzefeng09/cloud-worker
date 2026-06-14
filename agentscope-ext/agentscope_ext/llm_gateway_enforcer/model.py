@@ -104,6 +104,8 @@ def _build_openai_gateway_model(
     model_name: str,
     formatter: Any,
     tenant_id: str = "",
+    user_id: str = "",
+    broker_lease: str = "",
     reasoning_effort: str | None = None,
     sampling_params: Mapping[str, Any] | None = None,
 ) -> Any:
@@ -150,6 +152,10 @@ def _build_openai_gateway_model(
     # gateway at all.
     if tenant_id:
         extra_headers["X-Tenant-Id"] = tenant_id
+    if user_id:
+        extra_headers["X-User-Id"] = user_id
+    if broker_lease:
+        extra_headers["X-Tool-Broker-Lease"] = broker_lease
 
     class _GatewayOpenAIChatModel(OpenAIChatModel):
         """OpenAIChatModel subclass that injects gateway auth headers."""
@@ -306,6 +312,8 @@ def make_gateway_model(*, task: dict, env: Mapping[str, str]) -> Any:
     virtual_key = env.get("LLM_VIRTUAL_KEY", "").strip()
     bearer_token = env.get("FOUNDATION_API_TOKEN", "").strip()
     tenant_id = env.get("FOUNDATION_TENANT_ID", "").strip()
+    user_id = env.get("FOUNDATION_USER_ID", "").strip()
+    broker_lease = env.get("TOOL_BROKER_LEASE", "").strip()
 
     # Build formatter (OpenAI-compatible; gateway speaks OpenAI wire format).
     try:
@@ -331,6 +339,8 @@ def make_gateway_model(*, task: dict, env: Mapping[str, str]) -> Any:
         model_name=model_name,
         formatter=formatter,
         tenant_id=tenant_id,
+        user_id=user_id,
+        broker_lease=broker_lease,
         reasoning_effort=reasoning_effort,
         sampling_params=sampling_params,
     )

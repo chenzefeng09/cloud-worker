@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { PageHead } from '../components/shell/PageHead';
+import { useTranslation } from '../i18n';
+import { formatDate } from '../i18n/dates';
 import { useWorkspace } from '../lib/workspaceContext';
 import { useSessions } from '../hooks/useSessions';
 import { api } from '../api/client';
@@ -34,6 +36,7 @@ const SUGGESTIONS = ['帮我规划明天', '概括这份 PDF', '回复供应商�
 const DEFAULT_APP_GLYPH = '▤';
 
 export function HomePage() {
+  const { lang } = useTranslation();
   const { ws } = useWorkspace();
   const { sessions, createSession } = useSessions();
   const { apps, loading: appsLoading } = useApps('published');
@@ -166,7 +169,7 @@ export function HomePage() {
     navigate(`/tasks/${s.id}`);
   };
 
-  const dateLabel = new Date().toLocaleDateString('zh-CN', {
+  const dateLabel = formatDate(new Date(), lang, {
     weekday: 'long',
     month: 'long',
     day: 'numeric',
@@ -178,10 +181,6 @@ export function HomePage() {
         crumbs={[{ label: '首页' }]}
         actions={
           <>
-            <Chip>
-              <span className="w-1.5 h-1.5 rounded-full bg-accent animate-blip" />
-              1 个工作节点运行中
-            </Chip>
             <button className="cw-btn cw-btn-ghost cw-btn-sm">⌘K 启动</button>
           </>
         }
@@ -450,12 +449,6 @@ export function HomePage() {
             <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim">
               最近 · 进行中
             </span>
-            <a
-              onClick={() => navigate('/tasks')}
-              className="cursor-pointer font-mono text-[11px] text-ink-2 hover:text-ink"
-            >
-              查看全部任务 →
-            </a>
           </div>
           <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-2.5">
             {sessions.slice(0, 4).map((s) => (

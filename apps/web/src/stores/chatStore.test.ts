@@ -28,12 +28,18 @@ const RESET_STATE = {
   sessions: [],
   activeSessionId: null,
   messages: {},
+  planSteps: {},
   streamOffsets: {},
+  closedStreamRuns: {},
   isStreaming: false,
   isLoggedIn: false,
   userProfile: null,
   bootstrapped: false,
   selectedSkills: {},
+  selectedModel: {},
+  selectedEffort: {},
+  pendingInteractions: {},
+  acknowledgedPendingInteractions: {},
 };
 
 describe('chatStore', () => {
@@ -395,17 +401,19 @@ describe('chatStore', () => {
 
   // ─── appendStreamingThinking ─────────────────────────────────────────────────
 
-  it('appendStreamingThinking seals text block and adds thinking block', () => {
+  it('appendStreamingThinking keeps the answer text open and places thinking before it', () => {
     useChatStore.getState().appendStreamingToken('ses_1', 'run_1', 'text before');
     useChatStore.getState().appendStreamingThinking('ses_1', 'run_1', 'I should plan this');
+    useChatStore.getState().appendStreamingToken('ses_1', 'run_1', ' text after');
 
     const msgs = useChatStore.getState().messages['ses_1'];
     expect(msgs).toHaveLength(2);
-    expect(msgs[0].blockKind).toBe('text');
-    expect(msgs[0].streaming).toBe(false); // sealed
-    expect(msgs[1].blockKind).toBe('thinking');
-    expect(msgs[1].id).toBe('thinking_run_1_0');
-    expect(msgs[1].content).toBe('I should plan this');
+    expect(msgs[0].blockKind).toBe('thinking');
+    expect(msgs[0].id).toBe('thinking_run_1_0');
+    expect(msgs[0].content).toBe('I should plan this');
+    expect(msgs[1].blockKind).toBe('text');
+    expect(msgs[1].streaming).toBe(true);
+    expect(msgs[1].content).toBe('text before text after');
   });
 
   // ─── Idempotent streaming by Redis offset (replay / reconnect safety) ────────
@@ -446,7 +454,8 @@ describe('chatStore', () => {
 
   it('replayed thinking event is not duplicated and does not re-split text', () => {
     const st = () => useChatStore.getState();
-    // Live: text, thinking (seals text), more text.
+    // Live: text starts, thinking arrives, then more text. Thinking must not
+    // split the visible answer into "before" / "after" blocks.
     st().appendStreamingToken('ses_1', 'run_1', 'before', '1-0');
     st().appendStreamingThinking('ses_1', 'run_1', 'plan', '2-0');
     st().appendStreamingToken('ses_1', 'run_1', 'after', '3-0');
@@ -459,7 +468,7 @@ describe('chatStore', () => {
     const text = msgs.filter((m) => m.blockKind === 'text').map((m) => m.content);
     const thinking = msgs.filter((m) => m.blockKind === 'thinking');
     expect(thinking).toHaveLength(1); // not duplicated
-    expect(text.join('')).toBe('beforeafter'); // not scrambled/duplicated
+    expect(text).toEqual(['beforeafter']); // not split/scrambled/duplicated
   });
 
   it('offset dedup is per-run (a different run is unaffected)', () => {
@@ -623,5 +632,112 @@ describe('chatStore', () => {
     useChatStore.getState().addMessage('ses_1', MESSAGE);
     useChatStore.getState().removeToolingPlaceholder('ses_1', 'run_ghost');
     expect(useChatStore.getState().messages['ses_1']).toHaveLength(1);
+  });
+
+  // ─── HITL — pendingInteractions ────────────────────────────────────────────────
+
+  it('addPendingInteraction appends a new pending interaction', () => {
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_1',
+      toolCallId: 'tc_01',
+      kind: 'confirm',
+      name: 'Read',
+      args: '{"file_path": "/foo.ts"}',
+    });
+    const pendings = useChatStore.getState().pendingInteractions['ses_1'];
+    expect(pendings).toHaveLength(1);
+    expect(pendings[0].toolCallId).toBe('tc_01');
+    expect(pendings[0].kind).toBe('confirm');
+  });
+
+  it('addPendingInteraction deduplicates by toolCallId', () => {
+    const p = { runId: 'run_1', toolCallId: 'tc_01', kind: 'confirm' as const };
+    useChatStore.getState().addPendingInteraction('ses_1', p);
+    useChatStore.getState().addPendingInteraction('ses_1', p); // duplicate
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toHaveLength(1);
+  });
+
+  it('addPendingInteraction ignores already acknowledged interactions', () => {
+    const p = { runId: 'run_1', toolCallId: 'tc_01', kind: 'confirm' as const };
+    useChatStore.getState().markPendingInteractionAcknowledged('ses_1', 'run_1', 'tc_01');
+    useChatStore.getState().addPendingInteraction('ses_1', p);
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toBeUndefined();
+  });
+
+  it('unmarkPendingInteractionAcknowledged allows a failed submit to be retried', () => {
+    const p = { runId: 'run_1', toolCallId: 'tc_01', kind: 'confirm' as const };
+    useChatStore.getState().markPendingInteractionAcknowledged('ses_1', 'run_1', 'tc_01');
+    useChatStore.getState().addPendingInteraction('ses_1', p);
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toBeUndefined();
+
+    useChatStore.getState().unmarkPendingInteractionAcknowledged('ses_1', 'run_1', 'tc_01');
+    useChatStore.getState().addPendingInteraction('ses_1', p);
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toHaveLength(1);
+  });
+
+  it('addPendingInteraction isolates per session', () => {
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_1', toolCallId: 'tc_01', kind: 'confirm',
+    });
+    useChatStore.getState().addPendingInteraction('ses_2', {
+      runId: 'run_2', toolCallId: 'tc_02', kind: 'question',
+    });
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toHaveLength(1);
+    expect(useChatStore.getState().pendingInteractions['ses_2']).toHaveLength(1);
+  });
+
+  it('removePendingInteraction removes by toolCallId', () => {
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_1', toolCallId: 'tc_01', kind: 'confirm',
+    });
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_1', toolCallId: 'tc_02', kind: 'question',
+    });
+    useChatStore.getState().removePendingInteraction('ses_1', 'tc_01');
+    const pendings = useChatStore.getState().pendingInteractions['ses_1'];
+    expect(pendings).toHaveLength(1);
+    expect(pendings[0].toolCallId).toBe('tc_02');
+  });
+
+  it('removePendingInteraction is a no-op if toolCallId not found', () => {
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_1', toolCallId: 'tc_01', kind: 'confirm',
+    });
+    useChatStore.getState().removePendingInteraction('ses_1', 'tc_ghost');
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toHaveLength(1);
+  });
+
+  it('clearPendingInteractions clears all for a session', () => {
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_1', toolCallId: 'tc_01', kind: 'confirm',
+    });
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_1', toolCallId: 'tc_02', kind: 'question',
+    });
+    useChatStore.getState().clearPendingInteractions('ses_1');
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toHaveLength(0);
+  });
+
+  it('clearPendingInteractions with runId only removes that run\'s pendings', () => {
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_1', toolCallId: 'tc_01', kind: 'confirm',
+    });
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_2', toolCallId: 'tc_02', kind: 'question',
+    });
+    useChatStore.getState().clearPendingInteractions('ses_1', 'run_1');
+    const pendings = useChatStore.getState().pendingInteractions['ses_1'];
+    expect(pendings).toHaveLength(1);
+    expect(pendings[0].runId).toBe('run_2');
+  });
+
+  it('logout clears pendingInteractions', () => {
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_1', toolCallId: 'tc_01', kind: 'confirm',
+    });
+    useChatStore.getState().markPendingInteractionAcknowledged('ses_1', 'run_1', 'tc_01');
+    useChatStore.getState().logout();
+    expect(useChatStore.getState().pendingInteractions).toEqual({});
+    expect(useChatStore.getState().acknowledgedPendingInteractions).toEqual({});
   });
 });

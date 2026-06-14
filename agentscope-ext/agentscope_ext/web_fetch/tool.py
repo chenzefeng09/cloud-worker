@@ -151,6 +151,7 @@ class WebFetchTool(_ToolBase):
         tenant_id: str = "",
         user_id: str = "",
         service_scopes: str = "",
+        broker_lease: str = "",
     ) -> None:
         # Strip any trailing slash so we can safely append the path.
         self._gateway_url = gateway_url.rstrip("/")
@@ -158,6 +159,7 @@ class WebFetchTool(_ToolBase):
         self._tenant_id = tenant_id
         self._user_id = user_id
         self._service_scopes = service_scopes
+        self._broker_lease = broker_lease
 
     async def check_permissions(
         self,
@@ -209,6 +211,8 @@ class WebFetchTool(_ToolBase):
             headers["X-User-Id"] = self._user_id
         if self._service_scopes:
             headers["X-Service-Scopes"] = self._service_scopes
+        if self._broker_lease:
+            headers["X-Tool-Broker-Lease"] = self._broker_lease
 
         try:
             resp = httpx.post(endpoint, json=payload, headers=headers, timeout=30.0)

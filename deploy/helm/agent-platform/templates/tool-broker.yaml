@@ -1,0 +1,207 @@
+{{/* =============================================================================
+     Tool Broker — Deployment + Service + ServiceAccount + HPA + PDB + NP
+
+     The tool-broker is the SINGLE egress façade a sandbox is allowed to reach
+     in broker egress mode (SCHEDULER_SANDBOX_EGRESS_MODE=broker). It fronts
+     LLM-gateway / MCP-registry / skill-store / web-fetch and proxies Redis
+     (/state/v1) + S3 reads (/s3/v1/object), holding the REAL infra creds so
+     sandboxes carry none.
+
+     Credential single-source-of-truth (do NOT invent new secrets):
+       - REDIS_URL / REDIS_PASSWORD  ← global.foundation.redis.existingSecret
+       - S3_ACCESS_KEY_ID / SECRET   ← global.foundation.s3.existingSecret
+       - LEASE_SECRET (HMAC, shared with the scheduler) ← toolBroker.existingSecret
+         (defaults to ap-tool-broker-secrets; the scheduler reads the SAME
+          secret for SCHEDULER_TOOL_BROKER_LEASE_SECRET, see agent-scheduler.yaml)
+
+     Rendered only when toolBroker.enabled=true (default true).
+     ============================================================================= */}}
+
+{{- if .Values.toolBroker.enabled }}
+{{- $svcName := "tool-broker" }}
+{{- $port := .Values.toolBroker.port | default 8024 }}
+{{- $leaseSecret := .Values.toolBroker.existingSecret | default "ap-tool-broker-secrets" }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" .) }}
+  labels: {{- include "agent-platform.labels" (dict "svcName" $svcName "root" .) | nindent 4 }}
+spec:
+  {{- if not .Values.toolBroker.autoscaling.enabled }}
+  replicas: {{ .Values.toolBroker.replicaCount | default 1 }}
+  {{- end }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 25%
+      maxUnavailable: 0
+  selector:
+    matchLabels: {{- include "agent-platform.selectorLabels" (dict "svcName" $svcName "root" .) | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "agent-platform.selectorLabels" (dict "svcName" $svcName "root" .) | nindent 8 }}
+        app.kubernetes.io/part-of: agent-platform
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ $port | quote }}
+        prometheus.io/path: /metrics
+        checksum/config: {{ .Values | toYaml | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" .) }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.global.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.toolBroker.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- range . }}
+        - maxSkew: {{ .maxSkew }}
+          topologyKey: {{ .topologyKey }}
+          whenUnsatisfiable: {{ .whenUnsatisfiable }}
+          labelSelector:
+            matchLabels: {{- include "agent-platform.selectorLabels" (dict "svcName" $svcName "root" $) | nindent 14 }}
+        {{- end }}
+      {{- end }}
+      containers:
+        - name: tool-broker
+          image: {{ include "agent-platform.image" (dict "img" .Values.toolBroker.image "root" .) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy | default "IfNotPresent" }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ $port }}
+              protocol: TCP
+          env:
+            {{- include "agent-platform.commonEnv" (dict "svcName" $svcName "root" .) | nindent 12 }}
+            # ---- Tool-broker service config (TOOL_BROKER_* env_prefix) -------
+            - name: TOOL_BROKER_ENV
+              value: {{ .Values.global.profile | default "small" | quote }}
+            - name: TOOL_BROKER_HTTP_PORT
+              value: {{ $port | quote }}
+            - name: TOOL_BROKER_API_PREFIX
+              value: {{ .Values.toolBroker.config.apiPrefix | default "/api/tool-broker/v1" | quote }}
+            - name: TOOL_BROKER_REQUIRE_AUTH
+              value: {{ .Values.toolBroker.config.requireAuth | default "true" | quote }}
+            - name: TOOL_BROKER_REQUIRE_LEASE
+              value: {{ .Values.toolBroker.config.requireLease | default "true" | quote }}
+            # Upstream façade targets — in-cluster service DNS.
+            - name: TOOL_BROKER_LLM_GATEWAY_URL
+              value: {{ .Values.toolBroker.config.llmGatewayUrl | default .Values.global.foundation.llmGatewayUrl | quote }}
+            - name: TOOL_BROKER_MCP_REGISTRY_URL
+              value: {{ .Values.toolBroker.config.mcpRegistryUrl | default (printf "http://ap-mcp-registry:%d/api/mcp/v1" (int .Values.mcpRegistry.port)) | quote }}
+            - name: TOOL_BROKER_SKILL_STORE_URL
+              value: {{ .Values.toolBroker.config.skillStoreUrl | default (printf "http://ap-skill-store:%d/api/skills/v1" (int .Values.skillStore.port)) | quote }}
+            - name: TOOL_BROKER_WEB_FETCH_GATEWAY_URL
+              value: {{ .Values.toolBroker.config.webFetchGatewayUrl | default (printf "http://ap-web-fetch-gateway:%d/api/web-fetch/v1" (int .Values.webFetchGateway.port)) | quote }}
+            # ---- /state façade: the broker's OWN trusted Redis connection ----
+            # Reuse the platform Redis secret (same ref every service uses).
+            # The broker consumes a SINGLE TOOL_BROKER_REDIS_URL (redis.from_url),
+            # so the password MUST be embedded in that URL. Two supported shapes:
+            #
+            #   * redis.url set  → the foundation redis secret carries a full
+            #     `url` key (redis://:<pwd>@host:port/db). We source it directly.
+            #     This is the recommended prod shape (single source of truth).
+            #
+            #   * redis.url empty → we build a password-LESS URL from host/port.
+            #     The broker has no separate password field (config.py:
+            #     redis_url only, extra="ignore"), so a split host/port +
+            #     password cannot be assembled here. If your foundation Redis
+            #     requires auth, set global.foundation.redis.url=true so the
+            #     `url` key (with embedded password) is used instead.
+            {{- if .Values.global.foundation.redis.url }}
+            - name: TOOL_BROKER_REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.foundation.redis.existingSecret }}
+                  key: url
+            {{- else }}
+            - name: TOOL_BROKER_REDIS_URL
+              value: {{ printf "redis://%s:%v/0" .Values.global.foundation.redis.host (.Values.global.foundation.redis.port | int) | quote }}
+            {{- end }}
+            # ---- /s3 façade: the broker's OWN trusted object-store creds ------
+            # Reuse the platform S3 secret (same ref every service uses).
+            - name: TOOL_BROKER_S3_ENDPOINT_URL
+              value: {{ .Values.global.foundation.s3.endpoint | quote }}
+            - name: TOOL_BROKER_S3_REGION
+              value: {{ .Values.global.foundation.s3.region | quote }}
+            - name: TOOL_BROKER_S3_BUCKET
+              value: {{ .Values.global.foundation.s3.bucket | quote }}
+            - name: TOOL_BROKER_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.foundation.s3.existingSecret }}
+                  key: access_key_id
+            - name: TOOL_BROKER_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.foundation.s3.existingSecret }}
+                  key: secret_access_key
+            # ---- HMAC lease secret (shared with scheduler) -------------------
+            - name: TOOL_BROKER_LEASE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $leaseSecret }}
+                  key: TOOL_BROKER_LEASE_SECRET
+            {{- with .Values.toolBroker.env }}
+              {{- toYaml . | nindent 12 }}
+            {{- end }}
+          livenessProbe:
+            httpGet:
+              path: /api/tool-broker/v1/healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/tool-broker/v1/healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            failureThreshold: 3
+          resources: {{- toYaml (.Values.toolBroker.resources | default (dict "requests" (dict "cpu" "100m" "memory" "256Mi") "limits" (dict "cpu" "500m" "memory" "512Mi"))) | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /app/.cache
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" .) }}
+  labels: {{- include "agent-platform.labels" (dict "svcName" $svcName "root" .) | nindent 4 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "agent-platform.fullname" (dict "svcName" $svcName "root" .) }}
+  labels: {{- include "agent-platform.labels" (dict "svcName" $svcName "root" .) | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector: {{- include "agent-platform.selectorLabels" (dict "svcName" $svcName "root" .) | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ $port }}
+      targetPort: http
+      protocol: TCP
+{{ include "agent-platform.hpa" (dict "svcName" $svcName "svc" .Values.toolBroker "root" .) }}
+{{ include "agent-platform.pdb" (dict "svcName" $svcName "svc" .Values.toolBroker "root" .) }}
+{{ include "agent-platform.networkPolicy" (dict "svcName" $svcName "svc" .Values.toolBroker "root" . "port" $port) }}
+{{- end }}

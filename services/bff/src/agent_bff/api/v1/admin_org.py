@@ -27,9 +27,30 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from agent_bff.api._http import foundation_headers
-from agent_bff.api.v1.admin import _raise_for_upstream, require_super_admin_bff
+from agent_bff.api.v1.admin import _raise_for_upstream
+from agent_bff.api.v1.admin_authz import require_tenant_rbac_bff
 
 router = APIRouter(tags=["Platform Admin"])
+
+# ── Authorization model ───────────────────────────────────────────────────────
+#
+# foundation-org performs NO per-user authorization of its own (it only verifies
+# an actor header is present).  The BFF guard ``require_tenant_rbac_bff`` is
+# therefore the AUTHORITATIVE enforcement point for the org surface:
+#
+#   • Read endpoints  → ``org.read``   (view org units / teams / members)
+#   • Write endpoints → ``org.manage`` (create / update / delete / move)
+#
+# The guard's cross-tenant lane preserves super_admin reach: a request carrying
+# ``?tenant_id=`` for a *foreign* tenant requires ``platform.admin`` (super_admin
+# only), so a tenant_admin operating on someone else's tenant is 403'd before
+# any upstream call.  A same-tenant request is authorized against the action
+# above.  ``_headers()`` still applies the ``?tenant_id=`` override — safe
+# because the guard has already rejected foreign-tenant access for non-super
+# callers.  tenant_admin holds both ``org.read`` and ``org.manage`` (see authz
+# migration 0006); member holds neither, so member → 403.
+_READ = "org.read"
+_MANAGE = "org.manage"
 
 _SERVICE = "org"
 _TIMEOUT = 15
@@ -61,7 +82,7 @@ def _connect_502(exc: httpx.HTTPError) -> HTTPException:
 @router.get("/admin/org/org-units")
 async def list_org_units(
     request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_tenant_rbac_bff(_READ)),
 ) -> dict:
     settings = request.app.state.settings
     try:
@@ -79,7 +100,7 @@ async def list_org_units(
 @router.post("/admin/org/org-units", status_code=201)
 async def create_org_unit(
     request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_tenant_rbac_bff(_MANAGE)),
 ) -> dict:
     settings = request.app.state.settings
     body = await _body(request)
@@ -99,7 +120,7 @@ async def create_org_unit(
 async def get_org_unit(
     ou_id: str,
     request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_tenant_rbac_bff(_READ)),
 ) -> dict:
     settings = request.app.state.settings
     try:
@@ -118,7 +139,7 @@ async def get_org_unit(
 async def update_org_unit(
     ou_id: str,
     request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_tenant_rbac_bff(_MANAGE)),
 ) -> dict:
     settings = request.app.state.settings
     body = await _body(request)
@@ -138,7 +159,7 @@ async def update_org_unit(
 async def delete_org_unit(
     ou_id: str,
     request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_tenant_rbac_bff(_MANAGE)),
 ) -> dict:
     """Delete an org unit, archiving it first.
 
@@ -173,7 +194,7 @@ async def delete_org_unit(
 async def move_org_unit(
     ou_id: str,
     request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_tenant_rbac_bff(_MANAGE)),
 ) -> dict:
     settings = request.app.state.settings
     body = await _body(request)
@@ -194,7 +215,7 @@ async def move_org_unit(
 @router.get("/admin/org/teams")
 async def list_teams(
     request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_tenant_rbac_bff(_READ)),
 ) -> dict:
     settings = request.app.state.settings
     try:
@@ -212,7 +233,7 @@ async def list_teams(
 @router.post("/admin/org/teams", status_code=201)
 async def create_team(
     request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_tenant_rbac_bff(_MANAGE)),
 ) -> dict:
     settings = request.app.state.settings
     body = await _body(request)
@@ -232,7 +253,7 @@ async def create_team(
 async def delete_team(
     team_id: str,
     request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_tenant_rbac_bff(_MANAGE)),
 ) -> dict:
     """Delete a team.
 
@@ -258,7 +279,7 @@ async def delete_team(
 async def list_team_members(
     team_id: str,
     request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_tenant_rbac_bff(_READ)),
 ) -> list | dict:
     """Upstream returns a *bare array* of TeamMember (not {items})."""
     settings = request.app.state.settings
@@ -278,7 +299,7 @@ async def list_team_members(
 async def add_team_member(
     team_id: str,
     request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_tenant_rbac_bff(_MANAGE)),
 ) -> dict:
     settings = request.app.state.settings
     body = await _body(request)
@@ -299,7 +320,7 @@ async def remove_team_member(
     team_id: str,
     user_id: str,
     request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_tenant_rbac_bff(_MANAGE)),
 ) -> dict:
     settings = request.app.state.settings
     try:

@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
+import { useChatStore } from '../../stores/chatStore';
+import { isPlatformAdmin } from '../../lib/permissions';
 import { useConfirm } from '../components/dialogs';
 import { CustomSelect } from '../components/CustomSelect';
 import { DefaultModelsDialog } from '../components/DefaultModelsDialog';
@@ -943,6 +945,15 @@ function ProviderCard({ provider, expanded, onToggleExpand, onToggleEnabled, onD
 // ─── Page ─────────────────────────────────────────────────────────────────────
 
 export function ModelManagementPage() {
+  // Scope split: the platform super_admin manages the shared LLM provider
+  // directory (接入点目录) AND the per-tenant default-model preferences; a
+  // tenant_admin (model.read / model.admin) only chooses their own tenant's
+  // default models and never sees the provider-management surface.  This mirrors
+  // the org/quota delegation pattern — visibility tracks the BFF guard tier
+  // (provider writes → super_admin; tenant-defaults → tenant_admin).
+  const userProfile = useChatStore((s) => s.userProfile);
+  const canManageProviders = isPlatformAdmin(userProfile?.permissions);
+
   const [providers, setProviders] = useState<ModelProvider[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -951,7 +962,9 @@ export function ModelManagementPage() {
   const [editingProvider, setEditingProvider] = useState<ModelProvider | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [toggling, setToggling] = useState<string | null>(null);
-  const [showDefaults, setShowDefaults] = useState(false);
+  // For tenant admins the whole page IS the default-model picker, so open it by
+  // default; platform admins toggle it from the provider-management header.
+  const [showDefaults, setShowDefaults] = useState(!canManageProviders);
   const confirm = useConfirm();
 
   const loadProviders = useCallback(async () => {
@@ -967,8 +980,15 @@ export function ModelManagementPage() {
   }, []);
 
   useEffect(() => {
+    // Provider list management is platform-admin only.  A tenant_admin neither
+    // renders nor needs the provider cards here (the default-model dialog loads
+    // its own provider catalogue via the model.read lane), so skip the fetch.
+    if (!canManageProviders) {
+      setLoading(false);
+      return;
+    }
     loadProviders();
-  }, [loadProviders]);
+  }, [loadProviders, canManageProviders]);
 
   const handleToggleEnabled = async (provider: ModelProvider) => {
     // Disabling a Provider takes its models offline platform-wide, so confirm
@@ -1040,7 +1060,9 @@ export function ModelManagementPage() {
         <div>
           <h1 className="text-[22px] font-display text-ink tracking-[-0.02em]">模型管理</h1>
           <p className="text-[12px] text-dim mt-0.5">
-            管理 LLM、嵌入和重排序模型的 Provider 接入配置
+            {canManageProviders
+              ? '管理 LLM、嵌入和重排序模型的 Provider 接入配置'
+              : '配置本租户的默认模型偏好'}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -1051,7 +1073,8 @@ export function ModelManagementPage() {
           >
             默认模型设置
           </button>
-          {providers.length > 0 && (
+          {/* Adding a Provider mutates the shared platform directory → super_admin only. */}
+          {canManageProviders && providers.length > 0 && (
             <button
               type="button"
               onClick={() => setShowAdd(true)}
@@ -1063,93 +1086,120 @@ export function ModelManagementPage() {
         </div>
       </div>
 
-      {/* Model type summary */}
-      <div className="flex gap-3">
-        {MODEL_TYPES.map((mt) => (
-          <div
-            key={mt.value}
-            className="flex-1 border border-line rounded-lg px-5 py-4 bg-paper shadow-sm"
-          >
-            <div className="flex items-center gap-1.5">
-              <ModelTypeBadge type={mt.value} />
-            </div>
-            <div className="mt-1.5 text-[20px] font-display text-ink tracking-[-0.02em]">
-              {typeCounts[mt.value]}
-            </div>
-            <div className="text-[10.5px] text-dim font-mono">{mt.desc}</div>
+      {/* Provider directory management — platform super_admin only.  A
+          tenant_admin sees just the default-model picker below. */}
+      {canManageProviders ? (
+        <>
+          {/* Model type summary */}
+          <div className="flex gap-3">
+            {MODEL_TYPES.map((mt) => (
+              <div
+                key={mt.value}
+                className="flex-1 border border-line rounded-lg px-5 py-4 bg-paper shadow-sm"
+              >
+                <div className="flex items-center gap-1.5">
+                  <ModelTypeBadge type={mt.value} />
+                </div>
+                <div className="mt-1.5 text-[20px] font-display text-ink tracking-[-0.02em]">
+                  {typeCounts[mt.value]}
+                </div>
+                <div className="text-[10.5px] text-dim font-mono">{mt.desc}</div>
+              </div>
+            ))}
           </div>
-        ))}
-      </div>
 
-      {/* Error */}
-      {error && (
-        <div className="border border-red-200 rounded-md px-4 py-3 bg-red-50 text-[13px] text-red-700">
-          {error}
-        </div>
-      )}
+          {/* Error */}
+          {error && (
+            <div className="border border-red-200 rounded-md px-4 py-3 bg-red-50 text-[13px] text-red-700">
+              {error}
+            </div>
+          )}
 
-      {/* Loading */}
-      {loading && (
-        <div className="text-[13px] text-dim py-8 text-center">加载中…</div>
-      )}
+          {/* Loading */}
+          {loading && (
+            <div className="text-[13px] text-dim py-8 text-center">加载中…</div>
+          )}
 
-      {/* Empty state */}
-      {!loading && providers.length === 0 && (
-        <div className="border border-line border-dashed rounded-md px-6 py-10 text-center">
-          <div className="text-[14px] text-dim">尚未配置任何模型 Provider</div>
-          <p className="text-[12px] text-dim mt-1">
-            添加 Provider 以接入 LLM、嵌入模型、重排序模型等
+          {/* Empty state */}
+          {!loading && providers.length === 0 && (
+            <div className="border border-line border-dashed rounded-md px-6 py-10 text-center">
+              <div className="text-[14px] text-dim">尚未配置任何模型 Provider</div>
+              <p className="text-[12px] text-dim mt-1">
+                添加 Provider 以接入 LLM、嵌入模型、重排序模型等
+              </p>
+              <button
+                type="button"
+                onClick={() => setShowAdd(true)}
+                className="mt-3 px-3 py-1.5 bg-ink text-paper text-[12px] font-mono rounded-sm hover:opacity-90"
+              >
+                + 添加 Provider
+              </button>
+            </div>
+          )}
+
+          {/* Provider list */}
+          {!loading && providers.length > 0 && (
+            <div className="flex flex-col gap-2">
+              {providers.map((p) => (
+                <ProviderCard
+                  key={p.id}
+                  provider={p}
+                  expanded={expandedId === p.id}
+                  onToggleExpand={() => setExpandedId(expandedId === p.id ? null : p.id)}
+                  onToggleEnabled={() => handleToggleEnabled(p)}
+                  onDelete={() => handleDelete(p)}
+                  onEdit={() => setEditingProvider(p)}
+                />
+              ))}
+            </div>
+          )}
+        </>
+      ) : (
+        /* Tenant-admin landing: explain the scoped surface + a clear entry to
+           the default-model picker (which is also auto-opened on mount). */
+        <div className="border border-line rounded-lg px-6 py-8 bg-paper shadow-sm flex flex-col items-start gap-3">
+          <div className="text-[14px] text-ink font-semibold">默认模型偏好</div>
+          <p className="text-[12px] text-dim leading-relaxed max-w-[640px]">
+            为本租户下的所有用户配置默认模型。当用户未自行设置偏好时，将使用此处配置的默认模型。
+            模型接入点（Provider）目录由平台管理员统一维护。
           </p>
           <button
             type="button"
-            onClick={() => setShowAdd(true)}
-            className="mt-3 px-3 py-1.5 bg-ink text-paper text-[12px] font-mono rounded-sm hover:opacity-90"
+            onClick={() => setShowDefaults(true)}
+            className="px-4 py-2 bg-ink text-paper text-[13px] font-mono rounded-md shadow hover:bg-ink-2 transition-colors"
           >
-            + 添加 Provider
+            配置默认模型
           </button>
         </div>
       )}
 
-      {/* Provider list */}
-      {!loading && providers.length > 0 && (
-        <div className="flex flex-col gap-2">
-          {providers.map((p) => (
-            <ProviderCard
-              key={p.id}
-              provider={p}
-              expanded={expandedId === p.id}
-              onToggleExpand={() => setExpandedId(expandedId === p.id ? null : p.id)}
-              onToggleEnabled={() => handleToggleEnabled(p)}
-              onDelete={() => handleDelete(p)}
-              onEdit={() => setEditingProvider(p)}
-            />
-          ))}
-        </div>
-      )}
-
-      {/* Disabled overlay indicators */}
-      {(deleting || toggling) && (
+      {/* Disabled overlay indicators (provider mutations → super_admin only) */}
+      {canManageProviders && (deleting || toggling) && (
         <div className="fixed bottom-4 right-4 bg-ink text-paper px-3 py-2 rounded-md text-[12px] font-mono shadow-lg">
           {deleting ? '删除中…' : '更新中…'}
         </div>
       )}
 
-            {/* Add provider dialog */}
-      <AddProviderDialog
-        open={showAdd}
-        onClose={() => setShowAdd(false)}
-        onAdded={loadProviders}
-      />
+      {/* Provider add/edit dialogs — platform super_admin only. */}
+      {canManageProviders && (
+        <>
+          <AddProviderDialog
+            open={showAdd}
+            onClose={() => setShowAdd(false)}
+            onAdded={loadProviders}
+          />
+          <EditProviderDialog
+            open={!!editingProvider}
+            provider={editingProvider}
+            onClose={() => setEditingProvider(null)}
+            onUpdated={loadProviders}
+          />
+        </>
+      )}
 
-      {/* Edit provider dialog */}
-      <EditProviderDialog
-        open={!!editingProvider}
-        provider={editingProvider}
-        onClose={() => setEditingProvider(null)}
-        onUpdated={loadProviders}
-      />
-
-      {/* Default models dialog */}
+      {/* Default models dialog — visible to both platform admins (tenant scope
+          they select with the tenant switcher upstream) and tenant_admins (own
+          tenant, locked). */}
       {showDefaults && <DefaultModelsDialog onClose={() => setShowDefaults(false)} />}
     </div>
     </div>

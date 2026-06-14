@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
+import { formatDateTimeAuto } from '../../i18n/dates';
 import { useChatStore } from '../../stores/chatStore';
 import { useConfirm, useToast } from '../components/dialogs';
 import { Dialog } from '../components/Dialog';
@@ -13,7 +14,7 @@ const isTodo = (err: unknown) =>
 function fmt(iso?: string | null): string {
   if (!iso) return '—';
   const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN');
+  return Number.isNaN(d.getTime()) ? iso : formatDateTimeAuto(d);
 }
 
 export function LifecyclePage() {

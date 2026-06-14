@@ -29,6 +29,10 @@ Services deployed:
 {{- if .Values.webFetchGateway.enabled }}
   - Web Fetch Gateway:          ap-web-fetch-gateway:{{ .Values.webFetchGateway.port | default 8013 }}
 {{- end }}
+{{- if .Values.toolBroker.enabled }}
+  - Tool Broker (egress façade): ap-tool-broker:{{ .Values.toolBroker.port | default 8024 }}
+    Sandbox egress mode:        {{ .Values.agentScheduler.config.sandboxEgressMode | default "broker" }}
+{{- end }}
 {{- if .Values.web.enabled }}
   - Web UI:                     ap-web:{{ .Values.web.port | default 80 }}
 {{- end }}
@@ -63,4 +67,35 @@ IMPORTANT — before the platform starts correctly:
 3. docker-socket-proxy sidecar requires /var/run/docker.sock on every
    scheduler node. Ensure the node has Docker daemon running.
    Production: consider switching to cube runtime (agentScheduler.config.runtime=cube).
+{{- end }}
+
+{{- if eq (.Values.agentScheduler.config.sandboxEgressMode | default "broker") "broker" }}
+
+SANDBOX NETWORK ISOLATION (broker egress mode) — read this:
+  Sandboxes in this platform are NOT Kubernetes Pods. Under both runtimes:
+    - runtime=docker: sandbox is a docker-socket-proxy-spawned sibling container
+    - runtime=cube:   sandbox is a CubeSandbox/E2B microVM
+  A Pod NetworkPolicy would select nothing, so this chart does NOT ship one for
+  sandboxes (see templates/sandbox-isolation.yaml — disabled by default).
+
+  In prod, sandbox isolation is enforced by:
+    (a) THIS CHART — broker egress URL rewriting: the scheduler hands the worker
+        only tool-broker façade URLs (LLM/MCP/skills/web-fetch/state/S3) plus a
+        signed per-run lease; no direct Redis URL / MinIO keys reach the sandbox.
+    (b) OUT OF THIS CHART — CubeSandbox controller-side per-VM network policy
+        (default-deny egress, allow only ap-tool-broker + DNS), keyed off the
+        agent-platform.egress-mode / .network-policy metadata labels the
+        scheduler stamps on each spawn. The concrete asset (CubeVS allow_out
+        overlay + host nftables fallback) lives in deploy/cube/; it is applied
+        at the CubeSandbox controller, NOT as a Helm object in this chart.
+  => If you need to PHYSICALLY block a microVM from reaching infra, you MUST
+     configure (b) at the CubeSandbox controller. (a) alone removes the
+     configured path but does not stop a raw socket attempt.
+
+4. tool-broker holds the REAL infra creds (Redis password + MinIO keys + LLM
+   lease secret). Ensure these Secrets exist (reused, not duplicated):
+   - {{ .Values.global.foundation.redis.existingSecret }} (key: url OR password)
+   - {{ .Values.global.foundation.s3.existingSecret }} (keys: access_key_id, secret_access_key)
+   - {{ .Values.toolBroker.existingSecret | default "ap-tool-broker-secrets" }} (key: TOOL_BROKER_LEASE_SECRET)
+     — the SAME secret the scheduler reads for SCHEDULER_TOOL_BROKER_LEASE_SECRET.
 {{- end }}

@@ -27,7 +27,6 @@ Security design:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 
 import httpx
@@ -360,107 +359,6 @@ async def query_audit_events(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Billing — proxy quota info for a tenant to the admin panel
-# ─────────────────────────────────────────────────────────────────────────────
-
-@router.get("/admin/billing/quota")
-async def get_tenant_billing_quota(
-    request: Request,
-    tenant_id: str,
-    _auth: tuple = Depends(require_super_admin_bff),
-) -> dict:
-    """Return the current plan + usage for a tenant.
-
-    Composes two foundation-billing calls:
-      * GET /plans          — full plan catalogue (to resolve plan details)
-      * GET /subscriptions/current — the tenant's active subscription + usage
-
-    Query parameter:
-        tenant_id   str   required — the target tenant whose quota to inspect
-
-    Response (QuotaInfo shape expected by the frontend):
-        {
-          "tenant_id": "<tid>",
-          "plan": { "id": str, "name": str, "tier": str, "limits": {str: int} } | null,
-          "usage": { str: int }
-        }
-
-    Composition:
-      1. GET /subscriptions/current  → resolve the active subscription's
-         plan_id / status (no plan/usage embedded).
-      2. GET /plans                  → find the matching plan and map its
-         `quotas` field → `limits`.
-      3. GET /quota/usage            → the tenant's current usage map.
-
-    When the tenant has no active subscription the response is
-    ``{tenant_id, plan: None, usage}`` so the frontend can render an empty
-    state instead of crashing.
-    """
-    admin_tenant_id, user_id, access_token = _auth
-    settings = request.app.state.settings
-
-    target_headers = foundation_headers(tenant_id, user_id, access_token)
-
-    async with httpx.AsyncClient(timeout=15) as client:
-        results = await asyncio.gather(
-            client.get(
-                f"{settings.foundation_billing_url}/subscriptions/current",
-                headers=target_headers,
-            ),
-            client.get(
-                f"{settings.foundation_billing_url}/plans",
-                headers=target_headers,
-            ),
-            client.get(
-                f"{settings.foundation_billing_url}/quota/usage",
-                headers=target_headers,
-            ),
-            return_exceptions=True,
-        )
-
-    # A connection-level failure on any leg must surface as a readable 502
-    # rather than a bare 500 from the unhandled exception.
-    for r in results:
-        if isinstance(r, httpx.HTTPError):
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=f"billing upstream unreachable: {r}",
-            )
-        if isinstance(r, BaseException):
-            raise r
-
-    sub_resp, plans_resp, usage_resp = results
-
-    _raise_for_upstream(sub_resp)
-    _raise_for_upstream(plans_resp)
-    _raise_for_upstream(usage_resp)
-
-    sub = sub_resp.json()
-    usage: dict = usage_resp.json().get("usage") or {}
-
-    # No active subscription → empty plan, but still return usage + valid shape.
-    plan_id = sub.get("plan_id")
-    if sub.get("status") != "ACTIVE" or not plan_id:
-        return {"tenant_id": tenant_id, "plan": None, "usage": usage}
-
-    # Resolve plan details from the catalogue; billing exposes quotas as
-    # `quotas`, the frontend reads `limits`.
-    plans_list = plans_resp.json().get("items") or []
-    matched = next((p for p in plans_list if p.get("id") == plan_id), None)
-    if matched is None:
-        return {"tenant_id": tenant_id, "plan": None, "usage": usage}
-
-    plan_obj = {
-        "id": matched.get("id"),
-        "name": matched.get("name"),
-        "tier": matched.get("tier"),
-        "limits": matched.get("quotas") or {},
-    }
-
-    return {"tenant_id": tenant_id, "plan": plan_obj, "usage": usage}
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # LLM Model Management — proxy to llm-gateway
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -483,21 +381,11 @@ async def probe_llm_endpoint(
     return resp.json()
 
 
-@router.get("/admin/llm/providers")
-async def list_llm_providers(
-    request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
-) -> dict:
-    """List all registered LLM providers."""
-    tenant_id, user_id, access_token = _auth
-    settings = request.app.state.settings
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            f"{settings.foundation_llm_gateway_url}/providers",
-            headers=admin_headers(tenant_id, user_id, access_token),
-        )
-    _raise_for_upstream(resp)
-    return resp.json()
+# NOTE: ``GET /admin/llm/providers`` is intentionally NOT here.  The provider
+# *read* lane is delegated to tenant administrators (``model.read``) so they can
+# enumerate the model catalogue needed to choose their tenant defaults; it lives
+# in ``admin_model.py`` alongside the tenant-defaults endpoints.  Provider
+# mutations (POST/PATCH/DELETE) below stay super_admin-only (platform.admin).
 
 
 @router.post("/admin/llm/providers", status_code=201)
@@ -557,64 +445,14 @@ async def delete_llm_provider(
     return {"status": "deleted"}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LLM Tenant Defaults — proxy to llm-gateway /tenant-defaults
-# ─────────────────────────────────────────────────────────────────────────────
-
-@router.get("/admin/llm/tenant-defaults")
-async def get_tenant_defaults(
-    request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
-) -> dict:
-    """Return the tenant-level LLM defaults."""
-    tenant_id, user_id, access_token = _auth
-    settings = request.app.state.settings
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            f"{settings.foundation_llm_gateway_url}/tenant-defaults",
-            headers=admin_headers(tenant_id, user_id, access_token),
-        )
-    _raise_for_upstream(resp)
-    return resp.json()
-
-
-@router.put("/admin/llm/tenant-defaults")
-async def update_tenant_defaults(
-    request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
-) -> dict:
-    """Update the tenant-level LLM defaults."""
-    tenant_id, user_id, access_token = _auth
-    settings = request.app.state.settings
-    model = await _parse_model(request, TenantDefaultsRequest)
-    body = model.model_dump()
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.put(
-            f"{settings.foundation_llm_gateway_url}/tenant-defaults",
-            json=body,
-            headers=admin_headers(tenant_id, user_id, access_token),
-        )
-    _raise_for_upstream(resp)
-    return resp.json()
-
-
-@router.get("/admin/llm/tenant-defaults/resolve")
-async def resolve_tenant_defaults(
-    request: Request,
-    _auth: tuple = Depends(require_super_admin_bff),
-) -> dict:
-    """Resolve the effective tenant-level LLM defaults for a given purpose."""
-    tenant_id, user_id, access_token = _auth
-    settings = request.app.state.settings
-    params = dict(request.query_params)
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            f"{settings.foundation_llm_gateway_url}/tenant-defaults/resolve",
-            params=params,
-            headers=admin_headers(tenant_id, user_id, access_token),
-        )
-    _raise_for_upstream(resp)
-    return resp.json()
+# NOTE: the LLM *tenant-defaults* endpoints (GET / PUT / resolve) and the
+# provider *read* lane (GET /providers) live in ``admin_model.py``.  They are
+# tenant-scoped surfaces delegated to tenant administrators (model.read /
+# model.admin) and therefore guarded by ``require_tenant_rbac_bff`` rather than
+# ``require_super_admin_bff``.  Keeping them out of this module avoids a circular
+# import: ``admin_authz`` (which defines ``require_tenant_rbac_bff``) imports
+# from ``admin``, so ``admin`` must not import from ``admin_authz``.  See
+# ``admin_model.py``.
 
 
 # ─────────────────────────────────────────────────────────────────────────────

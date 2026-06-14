@@ -64,6 +64,7 @@ def install() -> None:
                 tenant_id=tenant_id,
                 user_id=env.get("FOUNDATION_USER_ID", ""),
                 service_scopes=env.get("FOUNDATION_SERVICE_SCOPES", ""),
+                broker_lease=env.get("TOOL_BROKER_LEASE", ""),
             )
             toolkit.tool_groups[0].tools.append(tool)
             _LOG.info(

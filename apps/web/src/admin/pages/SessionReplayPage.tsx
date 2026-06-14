@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../../api/client';
 import type { Message, Run, Session } from '../../api/types';
+import { formatDateTimeAuto } from '../../i18n/dates';
 import { groupSteps } from '../../lib/groupSteps';
 import { MessageBubble } from '../../components/MessageBubble';
 import { StepGroup } from '../../components/StepGroup';
@@ -16,7 +17,7 @@ function fmtTokens(n: number | null | undefined): string {
 
 function fmtDate(iso: string | null | undefined): string {
   if (!iso) return '—';
-  return new Date(iso).toLocaleString('zh-CN');
+  return formatDateTimeAuto(new Date(iso));
 }
 
 function runStatusZh(status: string | null | undefined): string {

@@ -100,10 +100,25 @@ class FakePlatform:
     override individual routes.  Every forwarded call is recorded in
     ``requests`` as (method, url, headers) so cross-tenant header assertions
     are possible.
+
+    Authz ``/check`` resolution
+    ───────────────────────────
+    By default every ``/check`` is answered with ``authz_allowed`` (the legacy
+    super_admin-style stub).  When ``allowed_actions`` is supplied instead, a
+    ``/check`` is allowed iff the requested ``action`` is in that set — this
+    models a specific role (e.g. a ``member`` who lacks ``*.create``).  Each
+    check's requested action is appended to ``checked_actions``.
     """
 
-    def __init__(self, *, authz_allowed: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        authz_allowed: bool = True,
+        allowed_actions: set[str] | None = None,
+    ) -> None:
         self.authz_allowed = authz_allowed
+        self.allowed_actions = allowed_actions
+        self.checked_actions: list[str] = []
         self.requests: list[tuple[str, str, dict[str, str]]] = []
         # method, url-substring → (status, body)
         self.routes: dict[tuple[str, str], tuple[int, Any]] = {
@@ -132,9 +147,13 @@ class FakePlatform:
 
         # authz /check — the BFF guard.
         if "/check" in url:
-            return httpx.Response(
-                200, json={"allowed": self.authz_allowed},
-            )
+            action = (kwargs.get("json") or {}).get("action", "")
+            self.checked_actions.append(action)
+            if self.allowed_actions is not None:
+                allowed = action in self.allowed_actions
+            else:
+                allowed = self.authz_allowed
+            return httpx.Response(200, json={"allowed": allowed})
 
         # Match against the path *after* the service base url so the base's
         # own "/skills/" / "/documents" segments don't trip the matcher.
@@ -180,6 +199,46 @@ def fake_allowed(monkeypatch: pytest.MonkeyPatch) -> FakePlatform:
 @pytest.fixture
 def fake_denied(monkeypatch: pytest.MonkeyPatch) -> FakePlatform:
     return _install(monkeypatch, FakePlatform(authz_allowed=False))
+
+
+# The ``member`` system role's grants for these three services are read-only:
+# skill.read / document.read / document.search / mcp_server.read.  Crucially it
+# holds no ``*.create`` for skills/mcp/knowledge — which is the BFF gate action.
+_MEMBER_ACTIONS = {
+    "skill.read",
+    "document.read",
+    "document.search",
+    "mcp_server.read",
+    "run.read",
+    "run.create",
+    "run.cancel",
+    "app.read",
+}
+
+# tenant_admin holds the wildcards covering every module action, but NOT
+# ``platform.admin`` — so it passes same-tenant module gates but is barred from
+# cross-tenant operations.  ``sandbox.read`` is the ops-module gate action
+# (held by tenant_admin via ``sandbox.*``, not by member).
+_TENANT_ADMIN_ACTIONS = {
+    "skill.create",
+    "mcp_server.create",
+    "document.create",
+    "sandbox.read",
+}
+
+
+@pytest.fixture
+def fake_member(monkeypatch: pytest.MonkeyPatch) -> FakePlatform:
+    """A plain member: holds read tokens but no ``*.create`` for the 3 modules."""
+    return _install(monkeypatch, FakePlatform(allowed_actions=_MEMBER_ACTIONS))
+
+
+@pytest.fixture
+def fake_tenant_admin(monkeypatch: pytest.MonkeyPatch) -> FakePlatform:
+    """A tenant_admin: holds module ``*.create`` but not ``platform.admin``."""
+    return _install(
+        monkeypatch, FakePlatform(allowed_actions=_TENANT_ADMIN_ACTIONS),
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -416,3 +475,152 @@ def test_upstream_unreachable_is_502(
     monkeypatch.setattr(httpx, "AsyncClient", _Broken)
     resp = client.get("/api/bff/v1/admin/skills", cookies=authed_cookie)
     assert resp.status_code == 502
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tenant delegation — skills / mcp / knowledge are gated on the module's
+# ``*.create`` action (held by tenant_admin, not member).
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Each tenant-delegated endpoint paired with the module-create action the BFF
+# guard authorizes for it.
+DELEGATED_ENDPOINTS = [
+    ("/admin/skills", "GET", None, "skill.create"),
+    ("/admin/skills/skl_1", "GET", None, "skill.create"),
+    ("/admin/skills/skl_1/versions", "GET", None, "skill.create"),
+    ("/admin/skills/skl_1", "DELETE", None, "skill.create"),
+    ("/admin/mcp/servers", "GET", None, "mcp_server.create"),
+    ("/admin/mcp/servers", "POST", {"name": "s", "transport": "stdio"}, "mcp_server.create"),
+    ("/admin/mcp/servers/mcp_1", "GET", None, "mcp_server.create"),
+    ("/admin/mcp/servers/mcp_1", "PATCH", {"enabled": False}, "mcp_server.create"),
+    ("/admin/mcp/servers/mcp_1", "DELETE", None, "mcp_server.create"),
+    ("/admin/knowledge/documents", "GET", None, "document.create"),
+    ("/admin/knowledge/documents/doc_1", "GET", None, "document.create"),
+    ("/admin/knowledge/documents/doc_1/reingest", "POST", None, "document.create"),
+    ("/admin/knowledge/documents/doc_1", "DELETE", None, "document.create"),
+]
+
+# Ops runs / sandboxes / usage are now delegated to tenant admins, gated on
+# ``sandbox.read`` and forwarding WITHOUT X-Actor:ADMIN (scheduler re-authorizes
+# the real caller).  The sandbox-pool snapshot stays platform-super-admin only.
+DELEGATED_OPS_ENDPOINTS = [
+    ("/admin/ops/runs", "GET", None, "sandbox.read"),
+    ("/admin/ops/runs/run_1/cancel", "POST", None, "sandbox.read"),
+    ("/admin/ops/sandboxes", "GET", None, "sandbox.read"),
+    ("/admin/ops/sandboxes/sb_1/stop", "POST", None, "sandbox.read"),
+    ("/admin/ops/usage/daily", "GET", None, "sandbox.read"),
+]
+
+# The sandbox-pool snapshot is platform-level infra: still super_admin-only and
+# still asserts X-Actor:ADMIN downstream.
+POOL_ENDPOINTS = [
+    ("/admin/ops/pool", "GET", None),
+]
+
+
+# Skills/MCP/Knowledge + ops runs/sandboxes/usage are all tenant-delegated:
+# gated on a module action held by tenant_admin (not member) and forwarded
+# without X-Actor:ADMIN.
+ALL_DELEGATED_ENDPOINTS = DELEGATED_ENDPOINTS + DELEGATED_OPS_ENDPOINTS
+
+
+@pytest.mark.parametrize("path,method,json,action", ALL_DELEGATED_ENDPOINTS)
+def test_tenant_admin_allowed_on_delegated_modules(
+    client, authed_cookie, fake_tenant_admin, path, method, json, action,
+) -> None:
+    """tenant_admin (holds the module gate action, no platform.admin) is allowed."""
+    resp = _call(client, path, method, json, cookies=authed_cookie)
+    assert resp.status_code in (200, 201), f"{method} {path} → {resp.status_code}"
+    # The BFF authorized the module's gate action (same-tenant lane).
+    assert action in fake_tenant_admin.checked_actions
+
+
+@pytest.mark.parametrize("path,method,json,action", ALL_DELEGATED_ENDPOINTS)
+def test_member_denied_on_delegated_modules(
+    client, authed_cookie, fake_member, path, method, json, action,
+) -> None:
+    """A plain member (read-only grants, no module gate action) is 403'd at the BFF.
+
+    For ops this is the key downscope assertion: member holds ``run.*`` but NOT
+    ``sandbox.read``, so it cannot reach runs/sandboxes/usage.
+    """
+    resp = _call(client, path, method, json, cookies=authed_cookie)
+    assert resp.status_code == 403, f"{method} {path} → {resp.status_code}"
+
+
+@pytest.mark.parametrize("path,method,json,action", ALL_DELEGATED_ENDPOINTS)
+def test_delegated_modules_do_not_forward_admin_actor(
+    client, authed_cookie, fake_tenant_admin, path, method, json, action,
+) -> None:
+    """Delegated modules must forward WITHOUT X-Actor:ADMIN so the upstream
+    service re-authorizes the real caller per action (no bypass)."""
+    resp = _call(client, path, method, json, cookies=authed_cookie)
+    assert resp.status_code in (200, 201)
+    # Inspect every forwarded (non-/check) call's headers.
+    forwarded = [
+        h for (_, u, h) in fake_tenant_admin.requests if "/check" not in u
+    ]
+    assert forwarded, "no upstream call recorded"
+    for hdrs in forwarded:
+        assert "X-Actor" not in hdrs, f"{method} {path} leaked X-Actor: {hdrs}"
+
+
+@pytest.mark.parametrize("path,method,json", POOL_ENDPOINTS)
+def test_pool_endpoint_still_requires_super_admin(
+    client, authed_cookie, fake_member, path, method, json,
+) -> None:
+    """The sandbox-pool snapshot is unchanged: a non-platform-admin (member,
+    even with run.*) is 403'd — it lacks platform.admin."""
+    resp = _call(client, path, method, json, cookies=authed_cookie)
+    assert resp.status_code == 403, f"{method} {path} → {resp.status_code}"
+
+
+@pytest.mark.parametrize("path,method,json", POOL_ENDPOINTS)
+def test_pool_endpoint_still_forwards_admin_actor(
+    client, authed_cookie, fake_allowed, path, method, json,
+) -> None:
+    """The sandbox-pool snapshot still asserts X-Actor:ADMIN downstream."""
+    resp = _call(client, path, method, json, cookies=authed_cookie)
+    assert resp.status_code in (200, 201, 204)
+    forwarded = [h for (_, u, h) in fake_allowed.requests if "/check" not in u]
+    assert forwarded, "no upstream call recorded"
+    assert all(h.get("X-Actor") == "ADMIN" for h in forwarded)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cross-tenant gate — a tenant_admin passing a foreign ?tenant_id= is 403'd;
+# a super_admin (platform.admin) sails through.
+# ──────────────────────────────────────────────────────────────────────────────
+
+def test_tenant_admin_cross_tenant_forbidden(
+    client, authed_cookie, fake_tenant_admin,
+) -> None:
+    """tenant_admin (no platform.admin) targeting a foreign tenant → 403."""
+    foreign = "tnt_OTHER0000000000000000000001"
+    resp = client.get(
+        f"/api/bff/v1/admin/skills?tenant_id={foreign}", cookies=authed_cookie,
+    )
+    assert resp.status_code == 403
+    # The cross-tenant lane checked platform.admin (and the member/admin set
+    # does not grant it), so no skill-store call should have been forwarded.
+    assert not any(
+        f"{SKILL_URL}/skills" in u for (_, u, _) in fake_tenant_admin.requests
+    )
+
+
+def test_super_admin_cross_tenant_allowed_no_admin_actor(
+    client, authed_cookie, fake_allowed,
+) -> None:
+    """super_admin (platform.admin via authz_allowed) may target any tenant; the
+    forwarded X-Tenant-Id is the override and still no X-Actor:ADMIN is sent."""
+    target = "tnt_OTHER0000000000000000000001"
+    resp = client.get(
+        f"/api/bff/v1/admin/knowledge/documents?tenant_id={target}",
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    doc_reqs = [
+        h for (_, u, h) in fake_allowed.requests if f"{KNOW_URL}/documents" in u
+    ]
+    assert doc_reqs and doc_reqs[0].get("X-Tenant-Id") == target
+    assert "X-Actor" not in doc_reqs[0]

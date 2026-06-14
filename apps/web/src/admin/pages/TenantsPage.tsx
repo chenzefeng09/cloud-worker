@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
+import { formatDateAuto } from '../../i18n/dates';
 import { Dialog } from '../components/Dialog';
 import { useToast } from '../components/dialogs';
 import { CustomSelect } from '../components/CustomSelect';
@@ -155,7 +156,7 @@ function EditTenantRow({ tenant, onPatched }: { tenant: Tenant; onPatched: (t: T
         <td className="px-3 py-2 font-mono text-[11px] text-ink-2">{tenant.tier ?? '—'}</td>
         <td className={`px-3 py-2 font-mono text-[11px] ${(tenant.status && STATUS_COLOR[tenant.status]) ?? 'text-dim'}`}>{tenant.status ?? '—'}</td>
         <td className="px-3 py-2 font-mono text-[11px] text-dim">
-          {tenant.created_at ? new Date(tenant.created_at).toLocaleDateString('zh-CN') : '—'}
+          {tenant.created_at ? formatDateAuto(new Date(tenant.created_at)) : '—'}
         </td>
         <td className="px-3 py-2">
           <button
@@ -188,7 +189,7 @@ function EditTenantRow({ tenant, onPatched }: { tenant: Tenant; onPatched: (t: T
         />
       </td>
       <td className="px-3 py-2 font-mono text-[11px] text-dim">
-        {tenant.created_at ? new Date(tenant.created_at).toLocaleDateString('zh-CN') : '—'}
+        {tenant.created_at ? formatDateAuto(new Date(tenant.created_at)) : '—'}
       </td>
       <td className="px-3 py-2 flex items-center gap-2">
         {error && <span className="text-[11px] text-accent">{error}</span>}

@@ -1,59 +1,84 @@
 /**
  * useChat tests — SSE events route to the correct session and build ordered
  * blocks in the store.
+ *
+ * Tests drive the real SSE_HANDLERS adapter map via the exported handleSSEEvent,
+ * rather than maintaining a parallel re-implementation of the routing logic.
+ * This means a change to a handler is automatically tested here.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { useChatStore } from '../stores/chatStore';
-import { subscribeSessionStream } from './useChat';
-import type { Message, ToolCallEntry } from '../api/types';
+import { handleSSEEvent, parseSSEStream, subscribeSessionStream, applyPendingInteractions } from './useChat';
+import type { ToolCallEntry, PendingInteractionItem } from '../api/types';
 
-// Recreate the handleSSEEvent routing logic inline so we can test it without
-// a React / RTL environment.
-function dispatchSSE(sessionId: string, event: string, data: Record<string, unknown>) {
-  const store = useChatStore.getState();
-
-  if (event === 'message_created' || event === 'agent_message') {
-    store.addMessage(sessionId, data as unknown as Message);
-  } else if (event === 'token') {
-    const runId = data.run_id as string | undefined;
-    const delta = data.delta as string | undefined;
-    if (runId && delta !== undefined) {
-      store.appendStreamingToken(sessionId, runId, delta);
-    }
-  } else if (event === 'tool') {
-    const runId = data.run_id as string | undefined;
-    const kind = data.kind as 'call' | 'result' | undefined;
-    const toolCallId = data.tool_call_id as string | undefined;
-    const toolName = data.name as string | undefined;
-    if (runId && kind && toolCallId && toolName) {
-      store.upsertStreamingTool(sessionId, runId, {
-        kind,
-        tool_call_id: toolCallId,
-        name: toolName,
-        args: kind === 'call' ? (data.args as string | undefined) : undefined,
-        result: kind === 'result' ? (data.result as string | undefined) : undefined,
-        state: kind === 'result' ? (data.state as string | undefined) : undefined,
-      });
-    }
-  } else if (event === 'thinking') {
-    const runId = data.run_id as string | undefined;
-    const text = data.text as string | undefined;
-    if (runId && text) {
-      store.appendStreamingThinking(sessionId, runId, text);
-    }
-  } else if (event === 'message') {
-    const msg = data as unknown as Message;
-    const roleUpper = (msg.role || '').toUpperCase();
-    if ((roleUpper === 'ASSISTANT' || roleUpper === 'TOOL' || roleUpper === 'THINKING') && msg.run_id) {
-      const kindForRole =
-        roleUpper === 'THINKING' ? 'thinking' : roleUpper === 'TOOL' ? 'tool' : 'text';
-      store.clearStreamingBlocks(sessionId, msg.run_id, kindForRole);
-      store.addMessage(sessionId, msg);
-    } else {
-      store.addMessage(sessionId, msg);
-    }
-  }
+/**
+ * Thin wrapper so tests don't need to pass a no-op `onDone` everywhere.
+ * Matches the shape of `handleSSEEvent(sessionId, event, data, onDone)`.
+ */
+function dispatchSSE(
+  sessionId: string,
+  event: string,
+  data: Record<string, unknown>,
+  onDone: () => void = () => {},
+) {
+  handleSSEEvent(sessionId, event, data, onDone);
 }
+
+function readerFromChunks(chunks: string[]): ReadableStreamDefaultReader<Uint8Array> {
+  const encoder = new TextEncoder();
+  return new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(encoder.encode(chunk));
+      }
+      controller.close();
+    },
+  }).getReader();
+}
+
+describe('parseSSEStream', () => {
+  it('preserves event type when event and data arrive in different chunks', async () => {
+    const events: Array<[string, Record<string, unknown>]> = [];
+    await parseSSEStream(
+      readerFromChunks([
+        'event: token\n',
+        'data: {"run_id":"run_1","delta":"A","offset":"1-0"}\n\n',
+      ]),
+      (event, data) => events.push([event, data]),
+    );
+
+    expect(events).toEqual([
+      ['token', { run_id: 'run_1', delta: 'A', offset: '1-0' }],
+    ]);
+  });
+
+  it('parses multi-line data frames and data fields without a space', async () => {
+    const events: Array<[string, Record<string, unknown>]> = [];
+    await parseSSEStream(
+      readerFromChunks([
+        'event: token\n',
+        'data: {"run_id":"run_1",\n',
+        'data:"delta":"A",\n',
+        'data: "offset":"10-0"}\n\n',
+      ]),
+      (event, data) => events.push([event, data]),
+    );
+
+    expect(events).toEqual([
+      ['token', { run_id: 'run_1', delta: 'A', offset: '10-0' }],
+    ]);
+  });
+
+  it('flushes a final frame even when EOF arrives without a blank line', async () => {
+    const events: Array<[string, Record<string, unknown>]> = [];
+    await parseSSEStream(
+      readerFromChunks(['event: done\ndata: {}']),
+      (event, data) => events.push([event, data]),
+    );
+
+    expect(events).toEqual([['done', {}]]);
+  });
+});
 
 describe('SSE → store routing', () => {
   beforeEach(() => {
@@ -61,10 +86,14 @@ describe('SSE → store routing', () => {
       sessions: [],
       activeSessionId: 'ses_B',
       messages: {},
+      streamOffsets: {},
+      closedStreamRuns: {},
       isStreaming: false,
       isLoggedIn: true,
       userProfile: null,
       bootstrapped: true,
+      pendingInteractions: {},
+      acknowledgedPendingInteractions: {},
     });
   });
 
@@ -138,19 +167,18 @@ describe('SSE → store routing', () => {
 
   // ─── Thinking pipeline ────────────────────────────────────────────────────
 
-  it('thinking event creates a thinking block and seals preceding text', () => {
+  it('thinking event does not split an already-started text answer', () => {
     dispatchSSE('ses_A', 'token', { run_id: 'run_3', delta: 'intro' });
     dispatchSSE('ses_A', 'thinking', { run_id: 'run_3', text: 'plan the next step' });
     dispatchSSE('ses_A', 'token', { run_id: 'run_3', delta: 'result' });
 
     const msgs = useChatStore.getState().messages['ses_A'];
-    expect(msgs).toHaveLength(3);
-    expect(msgs[0].blockKind).toBe('text');
-    expect(msgs[0].streaming).toBe(false);
-    expect(msgs[1].blockKind).toBe('thinking');
-    expect(msgs[1].content).toBe('plan the next step');
-    expect(msgs[2].blockKind).toBe('text');
-    expect(msgs[2].content).toBe('result');
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0].blockKind).toBe('thinking');
+    expect(msgs[0].content).toBe('plan the next step');
+    expect(msgs[1].blockKind).toBe('text');
+    expect(msgs[1].streaming).toBe(true);
+    expect(msgs[1].content).toBe('introresult');
   });
 
   // ─── message event: clear temp blocks + add real row ─────────────────────
@@ -196,6 +224,75 @@ describe('SSE → store routing', () => {
     expect(after.some((m) => m.blockKind === 'text' && m.content === 'the answer')).toBe(true);
     expect(after.some((m) => m.id === 'think_row')).toBe(true);
     expect(after.some((m) => m.id === 'thinking_run_t_0')).toBe(false);
+  });
+
+  it('durable assistant message closes the run stream: a later token is dropped (no side-by-side rebuild)', () => {
+    // Durable assistant row arrives (run reached terminal, hydrated).
+    dispatchSSE('ses_A', 'message', {
+      id: 'final_msg',
+      session_id: 'ses_A',
+      role: 'assistant',
+      content: 'the answer',
+      tool_calls: null,
+      run_id: 'run_dup',
+      sequence: 1,
+      created_at: '2026-01-01',
+    });
+    // Server replays the Redis token stream for the SAME run afterwards.
+    dispatchSSE('ses_A', 'token', { run_id: 'run_dup', delta: 'the answer', offset: '1-0' });
+
+    const msgs = useChatStore.getState().messages['ses_A'];
+    // Only the durable row survives — no replayed streaming text block rebuilt.
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].id).toBe('final_msg');
+    expect(msgs.some((m) => m.blockKind === 'text' && m.streaming)).toBe(false);
+    // run_started reopens the channel so a re-run / new leg can stream again.
+    dispatchSSE('ses_A', 'run_started', { run_id: 'run_dup' });
+    dispatchSSE('ses_A', 'token', { run_id: 'run_dup', delta: 'rerun', offset: '1-0' });
+    const after = useChatStore.getState().messages['ses_A'];
+    expect(after.some((m) => m.blockKind === 'text' && m.content === 'rerun')).toBe(true);
+  });
+
+  it('after a full turn hydrates (thinking + tool + 2 text rows), streaming block count for the run is 0', () => {
+    const runId = 'run_full';
+    // Live stream builds blocks: thinking, tool, then two text segments.
+    dispatchSSE('ses_A', 'thinking', { run_id: runId, text: 'thinking', offset: '1-0' });
+    dispatchSSE('ses_A', 'tool', {
+      run_id: runId, kind: 'call', tool_call_id: 'tc_1', name: 'WebFetch', args: '{}', offset: '2-0',
+    });
+    dispatchSSE('ses_A', 'token', { run_id: runId, delta: 'part one', offset: '3-0' });
+    dispatchSSE('ses_A', 'thinking', { run_id: runId, text: 'more', offset: '4-0' });
+    dispatchSSE('ses_A', 'token', { run_id: runId, delta: 'part two', offset: '5-0' });
+
+    // All durable rows arrive (orchestrator order: thinking, tool, assistant…).
+    const durable = [
+      { id: 'd_think_0', role: 'thinking', content: 'thinking', tool_calls: null },
+      {
+        id: 'd_tool_0', role: 'tool', content: '',
+        tool_calls: [{ id: 'tc_1', name: 'WebFetch', input: {}, result: 'ok', state: 'success' }],
+      },
+      { id: 'd_think_1', role: 'thinking', content: 'more', tool_calls: null },
+      { id: 'd_text_0', role: 'assistant', content: 'part one', tool_calls: null },
+      { id: 'd_text_1', role: 'assistant', content: 'part two', tool_calls: null },
+    ];
+    durable.forEach((row, i) =>
+      dispatchSSE('ses_A', 'message', {
+        ...row, session_id: 'ses_A', run_id: runId, sequence: i + 1, created_at: '2026-01-01',
+      }),
+    );
+
+    const msgs = useChatStore.getState().messages['ses_A'];
+    const streamingForRun = msgs.filter((m) => m.streamRunId === runId);
+    // No transient streaming blocks left for this run — only durable rows remain.
+    expect(streamingForRun).toHaveLength(0);
+    expect(msgs.filter((m) => m.run_id === runId && !m.streamRunId)).toHaveLength(5);
+
+    // A subsequent replayed token/tool/thinking is discarded, not re-rendered.
+    dispatchSSE('ses_A', 'token', { run_id: runId, delta: 'part one', offset: '3-0' });
+    dispatchSSE('ses_A', 'thinking', { run_id: runId, text: 'thinking', offset: '1-0' });
+    expect(
+      useChatStore.getState().messages['ses_A'].filter((m) => m.streamRunId === runId),
+    ).toHaveLength(0);
   });
 
   it('message event with TOOL role clears temp tool blocks', () => {
@@ -271,8 +368,7 @@ describe('SSE → store routing', () => {
   // Before the singleton-stream fix two useChat() consumers each opened their
   // own SSE connection, so every token/thinking event was applied twice and
   // interleaved → "你好你好" + chopped THOUGHT/text blocks.  With one stream the
-  // ordered pipeline produces a single clean text block (one thinking event
-  // seals it into the expected thinking → text shape — no duplication).
+  // ordered pipeline produces one thinking block and one clean text block.
   it('single token+thinking stream is not duplicated or chopped', () => {
     dispatchSSE('ses_A', 'thinking', { run_id: 'run_z', text: '让我想想' });
     for (const d of ['我是', '你的', '企业', '级', 'AI', '助理']) {
@@ -316,6 +412,116 @@ describe('SSE → store routing', () => {
     expect(userIdx).toBeLessThan(streamIdx);
     // ...and the streamed text is not wiped.
     expect(msgs[streamIdx].content).toBe('partial answer');
+  });
+
+  // ─── run_started: event-driven isStreaming + C3 replay idempotency ─────────
+  //
+  // C3: on every run_started (including a reconnect mid-run), the handler
+  // clears transient streaming blocks AND resets offset watermarks so the
+  // server's token replay from "0-0" is applied cleanly, not dropped.
+  it('run_started sets isStreaming to true', () => {
+    dispatchSSE('ses_A', 'run_started', { run_id: 'run_new' });
+    expect(useChatStore.getState().isStreaming).toBe(true);
+  });
+
+  it('run_started clears existing streaming blocks for the run (C3 reconnect)', () => {
+    // Simulate partial tokens before a reconnect.
+    const st = () => useChatStore.getState();
+    st().appendStreamingToken('ses_A', 'run_r', 'partial', '1-0');
+    expect(st().messages['ses_A']).toHaveLength(1);
+
+    // Reconnect: server re-emits run_started.
+    dispatchSSE('ses_A', 'run_started', { run_id: 'run_r' });
+
+    // Streaming blocks must be wiped so the replay rebuilds them.
+    expect(st().messages['ses_A'].filter((m) => m.streamRunId === 'run_r')).toHaveLength(0);
+  });
+
+  it('run_started resets offset watermark so replayed tokens apply cleanly (C3)', () => {
+    const st = () => useChatStore.getState();
+    // First connection: apply some tokens with offsets.
+    st().appendStreamingToken('ses_A', 'run_r2', 'A', '1-0');
+    st().appendStreamingToken('ses_A', 'run_r2', 'B', '2-0');
+
+    // Reconnect: run_started fires, wiping blocks and resetting offsets.
+    dispatchSSE('ses_A', 'run_started', { run_id: 'run_r2' });
+
+    // The offset watermark should now be gone for this run, so replayed
+    // tokens from "1-0" are accepted again (not filtered as already-seen).
+    const afterReset = st().streamOffsets['ses_A'];
+    expect(afterReset?.['run_r2']).toBeUndefined();
+
+    // Replay the same offsets — they must apply now (build new blocks).
+    st().appendStreamingToken('ses_A', 'run_r2', 'A', '1-0');
+    st().appendStreamingToken('ses_A', 'run_r2', 'B', '2-0');
+    const msgs = st().messages['ses_A'];
+    const textBlock = msgs.find((m) => m.blockKind === 'text' && m.streamRunId === 'run_r2');
+    expect(textBlock).toBeDefined();
+    expect(textBlock?.content).toBe('AB');
+  });
+
+  it('run_started does not affect streaming blocks of OTHER runs', () => {
+    const st = () => useChatStore.getState();
+    st().appendStreamingToken('ses_A', 'run_other', 'keep me', '1-0');
+    dispatchSSE('ses_A', 'run_started', { run_id: 'run_new_one' });
+    // run_other blocks must survive — only run_new_one is cleared.
+    const msgs = st().messages['ses_A'];
+    expect(msgs.some((m) => m.streamRunId === 'run_other')).toBe(true);
+  });
+
+  it('run_complete sets isStreaming to false', () => {
+    useChatStore.setState({ isStreaming: true });
+    dispatchSSE('ses_A', 'run_complete', {});
+    expect(useChatStore.getState().isStreaming).toBe(false);
+  });
+
+  it('run_stream_end{paused:false} does NOT flip isStreaming (only the tail ended, not the run)', () => {
+    // Regression for the mid-run streaming stall: run_stream_end means "this
+    // connection's token tail ended", NOT "the run completed".  An active run
+    // goes quiet between tool batches; the tail can end and re-open later, so
+    // run_stream_end must leave isStreaming alone.  run_complete remains the
+    // authoritative completer.
+    useChatStore.setState({ isStreaming: true });
+    dispatchSSE('ses_A', 'run_stream_end', { run_id: 'run_1', paused: false });
+    expect(useChatStore.getState().isStreaming).toBe(true);
+
+    // run_complete is still what clears it.
+    dispatchSSE('ses_A', 'run_complete', { run_id: 'run_1' });
+    expect(useChatStore.getState().isStreaming).toBe(false);
+  });
+
+  it('run_stream_end{paused:false} still clears resurrected pending cards for the run', () => {
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_1', toolCallId: 'tc_01', kind: 'confirm',
+    });
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_2', toolCallId: 'tc_02', kind: 'question',
+    });
+    dispatchSSE('ses_1', 'run_stream_end', { run_id: 'run_1', paused: false });
+    const pendings = useChatStore.getState().pendingInteractions['ses_1'];
+    // Only run_1's card cleared; run_2 survives.  (isStreaming is untouched.)
+    expect(pendings).toHaveLength(1);
+    expect(pendings[0].runId).toBe('run_2');
+  });
+
+  it('done calls onDone without flipping isStreaming', () => {
+    useChatStore.setState({ isStreaming: true });
+    let doneCalled = false;
+    dispatchSSE('ses_A', 'done', {}, () => { doneCalled = true; });
+    expect(doneCalled).toBe(true);
+    // isStreaming must NOT be flipped by done — a run may still be active.
+    expect(useChatStore.getState().isStreaming).toBe(true);
+  });
+
+  it('unknown event type warns and does not crash', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    dispatchSSE('ses_A', 'totally_unknown_event', { foo: 'bar' });
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[useChat] Unknown SSE event type:'),
+      'totally_unknown_event',
+      expect.anything(),
+    );
+    warnSpy.mockRestore();
   });
 });
 
@@ -385,5 +591,210 @@ describe('subscribeSessionStream — single connection per session', () => {
     vi.advanceTimersByTime(100);
     expect(aborts[0].aborted).toBe(true);
     expect(aborts[1].aborted).toBe(true);
+  });
+});
+
+// ─── HITL SSE handlers ────────────────────────────────────────────────────────
+
+describe('HITL SSE event handlers', () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      sessions: [],
+      activeSessionId: 'ses_1',
+      messages: {},
+      streamOffsets: {},
+      closedStreamRuns: {},
+      isStreaming: false,
+      isLoggedIn: true,
+      userProfile: null,
+      bootstrapped: true,
+      pendingInteractions: {},
+      acknowledgedPendingInteractions: {},
+    });
+  });
+
+  it('pending_confirmation adds a confirm interaction', () => {
+    dispatchSSE('ses_1', 'pending_confirmation', {
+      run_id: 'run_1',
+      tool_call_id: 'tc_01',
+      name: 'Read',
+      args: '{"file_path": "/foo.ts"}',
+    });
+    const pendings = useChatStore.getState().pendingInteractions['ses_1'];
+    expect(pendings).toHaveLength(1);
+    expect(pendings[0].kind).toBe('confirm');
+    expect(pendings[0].toolCallId).toBe('tc_01');
+    expect(pendings[0].name).toBe('Read');
+  });
+
+  it('pending_question adds a question interaction', () => {
+    dispatchSSE('ses_1', 'pending_question', {
+      run_id: 'run_1',
+      tool_call_id: 'tc_02',
+      question: 'Should I proceed?',
+    });
+    const pendings = useChatStore.getState().pendingInteractions['ses_1'];
+    expect(pendings).toHaveLength(1);
+    expect(pendings[0].kind).toBe('question');
+    expect(pendings[0].question).toBe('Should I proceed?');
+  });
+
+  it('pending_confirmation is idempotent (replay safe)', () => {
+    const data = { run_id: 'run_1', tool_call_id: 'tc_01', name: 'Read', args: '{}' };
+    dispatchSSE('ses_1', 'pending_confirmation', data);
+    dispatchSSE('ses_1', 'pending_confirmation', data); // replay
+    const pendings = useChatStore.getState().pendingInteractions['ses_1'];
+    expect(pendings).toHaveLength(1); // deduplicated
+  });
+
+  it('pending_confirmation does not resurrect an acknowledged approval after replay', () => {
+    const data = {
+      run_id: 'run_1',
+      tool_call_id: 'tc_01',
+      name: 'WebFetch',
+      args: '{"url":"https://wttr.in/Beijing?lang=zh"}',
+    };
+    dispatchSSE('ses_1', 'pending_confirmation', data);
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toHaveLength(1);
+
+    useChatStore.getState().markPendingInteractionAcknowledged('ses_1', 'run_1', 'tc_01');
+    useChatStore.getState().removePendingInteraction('ses_1', 'tc_01');
+    dispatchSSE('ses_1', 'run_started', { run_id: 'run_1' });
+    dispatchSSE('ses_1', 'pending_confirmation', data);
+
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toHaveLength(0);
+  });
+
+  it('tool result consumes the pending interaction before older pending events replay', () => {
+    const pending = {
+      run_id: 'run_1',
+      tool_call_id: 'tc_01',
+      name: 'WebFetch',
+      args: '{"url":"https://wttr.in/Beijing?lang=zh"}',
+    };
+    dispatchSSE('ses_1', 'pending_confirmation', pending);
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toHaveLength(1);
+
+    dispatchSSE('ses_1', 'tool', {
+      run_id: 'run_1',
+      kind: 'result',
+      tool_call_id: 'tc_01',
+      name: 'WebFetch',
+      result: 'ok',
+      state: 'success',
+      offset: '2-0',
+    });
+    dispatchSSE('ses_1', 'pending_confirmation', pending);
+
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toHaveLength(0);
+  });
+
+  it('run_paused sets isStreaming to false', () => {
+    useChatStore.setState({ isStreaming: true });
+    dispatchSSE('ses_1', 'run_paused', { run_id: 'run_1' });
+    expect(useChatStore.getState().isStreaming).toBe(false);
+  });
+
+  it('run_complete clears pending interactions for the completed run', () => {
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_1', toolCallId: 'tc_01', kind: 'confirm',
+    });
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_2', toolCallId: 'tc_02', kind: 'question',
+    });
+    dispatchSSE('ses_1', 'run_complete', { run_id: 'run_1' });
+    const pendings = useChatStore.getState().pendingInteractions['ses_1'];
+    // Only run_1's interaction cleared; run_2 survives
+    expect(pendings).toHaveLength(1);
+    expect(pendings[0].runId).toBe('run_2');
+  });
+
+  it('run_started clears pending interactions for the run (resume replay rebuilds them)', () => {
+    useChatStore.getState().addPendingInteraction('ses_1', {
+      runId: 'run_1', toolCallId: 'tc_01', kind: 'confirm',
+    });
+    dispatchSSE('ses_1', 'run_started', { run_id: 'run_1' });
+    // Cleared so the replayed stream can rebuild from scratch (deduplication handles re-delivery).
+    const pendings = useChatStore.getState().pendingInteractions['ses_1'];
+    expect(pendings).toHaveLength(0);
+  });
+
+  it('pending_confirmation routes to the correct session (not the active one)', () => {
+    dispatchSSE('ses_OTHER', 'pending_confirmation', {
+      run_id: 'run_1', tool_call_id: 'tc_01', name: 'Read', args: '{}',
+    });
+    expect(useChatStore.getState().pendingInteractions['ses_OTHER']).toHaveLength(1);
+    // Active session (ses_1) must be untouched.
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toBeUndefined();
+  });
+});
+
+describe('applyPendingInteractions (mount rehydration)', () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      pendingInteractions: {},
+      acknowledgedPendingInteractions: {},
+    });
+  });
+
+  it('rehydrates a confirm item into a pending confirm card', () => {
+    const items: PendingInteractionItem[] = [
+      {
+        run_id: 'run_1',
+        kind: 'confirm',
+        tool_calls: [{ id: 'tc_bash', name: 'Bash', args: '{"cmd":"ls"}' }],
+        question: null,
+        paused_at: '2026-01-01T00:00:00+00:00',
+      },
+    ];
+    applyPendingInteractions('ses_1', items);
+
+    const pendings = useChatStore.getState().pendingInteractions['ses_1'];
+    expect(pendings).toHaveLength(1);
+    expect(pendings[0].kind).toBe('confirm');
+    expect(pendings[0].runId).toBe('run_1');
+    expect(pendings[0].toolCallId).toBe('tc_bash');
+    expect(pendings[0].name).toBe('Bash');
+    expect(pendings[0].args).toBe('{"cmd":"ls"}');
+  });
+
+  it('rehydrates a question item into a pending question card', () => {
+    const items: PendingInteractionItem[] = [
+      {
+        run_id: 'run_2',
+        kind: 'question',
+        tool_calls: [{ id: 'tc_q' }],
+        question: 'Which file?',
+        paused_at: null,
+      },
+    ];
+    applyPendingInteractions('ses_1', items);
+
+    const pendings = useChatStore.getState().pendingInteractions['ses_1'];
+    expect(pendings).toHaveLength(1);
+    expect(pendings[0].kind).toBe('question');
+    expect(pendings[0].toolCallId).toBe('tc_q');
+    expect(pendings[0].question).toBe('Which file?');
+  });
+
+  it('is dedup-safe alongside an SSE pending_confirmation for the same tool call', () => {
+    // SSE delivers the card first…
+    handleSSEEvent('ses_1', 'pending_confirmation', {
+      run_id: 'run_1', tool_call_id: 'tc_bash', name: 'Bash', args: '{}',
+    }, () => {});
+    // …then mount rehydration runs with the same tool call.
+    applyPendingInteractions('ses_1', [
+      { run_id: 'run_1', kind: 'confirm', tool_calls: [{ id: 'tc_bash', name: 'Bash', args: '{}' }] },
+    ]);
+    // No duplicate card.
+    expect(useChatStore.getState().pendingInteractions['ses_1']).toHaveLength(1);
+  });
+
+  it('does not resurrect an acknowledged interaction', () => {
+    useChatStore.getState().markPendingInteractionAcknowledged('ses_1', 'run_1', 'tc_bash');
+    applyPendingInteractions('ses_1', [
+      { run_id: 'run_1', kind: 'confirm', tool_calls: [{ id: 'tc_bash', name: 'Bash', args: '{}' }] },
+    ]);
+    expect(useChatStore.getState().pendingInteractions['ses_1'] ?? []).toHaveLength(0);
   });
 });
