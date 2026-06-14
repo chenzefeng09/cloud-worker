@@ -10,6 +10,8 @@ Covers:
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,7 +19,24 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_scheduler.api.v1.runs import _fetch_tenant_virtual_key
+from agent_scheduler.api.v1.runs import (
+    _fetch_tenant_virtual_key,
+    _mint_run_virtual_key,
+    _revoke_run_virtual_keys,
+)
+
+# Mirrors conftest._TENANT — the tenant header the gateway injects.
+_TENANT = "tnt_01J5TEST00000000000000TNT1"
+
+
+def _read_run_secrets(
+    workspace_base: str, *, tenant_id: str, session_id: str, run_id: str
+) -> dict[str, str]:
+    """Secrets are delivered via /workspace/.secrets.json (0600), not env."""
+    path = (
+        Path(workspace_base) / tenant_id / session_id / run_id / ".secrets.json"
+    )
+    return json.loads(path.read_text(encoding="utf-8"))
 from agent_scheduler.config import Settings
 
 
@@ -39,6 +58,9 @@ class _MockHTTPX:
         return None
 
     async def get(self, url: str, **kw: Any) -> httpx.Response:
+        return httpx.Response(self._status_code, json=self._body)
+
+    async def post(self, url: str, **kw: Any) -> httpx.Response:
         return httpx.Response(self._status_code, json=self._body)
 
 
@@ -153,6 +175,138 @@ async def test_fetch_virtual_key_returns_none_when_url_empty():
 
 
 # ---------------------------------------------------------------------------
+# _mint_run_virtual_key unit tests (short-lived, run-scoped keys)
+# ---------------------------------------------------------------------------
+
+
+def _gw_settings() -> Settings:
+    return Settings(
+        env="test",
+        scheduler_service_token="tok",
+        otel_enabled=False,
+        llm_gateway_url="http://llm-gateway:8011/api/llm-gateway/v1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_mint_run_key_returns_ephemeral_virtual_key(monkeypatch):
+    """A successful mint returns the gateway's ephemeral virtual_key."""
+    captured: dict[str, Any] = {}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def post(self, url, **kw):
+            captured["url"] = url
+            captured["json"] = kw.get("json")
+            return httpx.Response(
+                201,
+                json={
+                    "virtual_key": "sk-foundation-eph-XYZ",
+                    "run_id": "run_MINT1",
+                    "ephemeral": True,
+                    "expires_at": "2026-06-15T00:10:00+00:00",
+                },
+            )
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client())
+
+    result = await _mint_run_virtual_key(
+        settings=_gw_settings(),
+        tenant_id="tnt_test",
+        run_id="run_MINT1",
+        bearer="tok",
+    )
+    assert result == "sk-foundation-eph-XYZ"
+    assert captured["url"].endswith("/tenant-keys/ephemeral")
+    assert captured["json"]["run_id"] == "run_MINT1"
+    # TTL is derived from sandbox_timeout (+grace) and clamped to a sane window.
+    assert captured["json"]["ttl_seconds"] >= 60
+
+
+@pytest.mark.asyncio
+async def test_mint_run_key_returns_none_on_404_older_gateway(monkeypatch):
+    """Older gateway without the ephemeral endpoint (404) → None → caller falls back."""
+    mock_client = _MockHTTPX(404, {"detail": "not found"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: mock_client)
+
+    result = await _mint_run_virtual_key(
+        settings=_gw_settings(),
+        tenant_id="tnt_test",
+        run_id="run_OLD",
+        bearer="tok",
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_mint_run_key_returns_none_when_unreachable(monkeypatch):
+    """Network error during mint → None (caller falls back to the tenant key)."""
+
+    class _Unreachable:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def post(self, *a, **kw):
+            raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Unreachable())
+
+    result = await _mint_run_virtual_key(
+        settings=_gw_settings(),
+        tenant_id="tnt_test",
+        run_id="run_DOWN",
+        bearer="tok",
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_mint_run_key_returns_none_when_url_empty():
+    """Empty gateway URL short-circuits to None."""
+    settings = Settings(
+        env="test", scheduler_service_token="tok",
+        otel_enabled=False, llm_gateway_url="",
+    )
+    result = await _mint_run_virtual_key(
+        settings=settings, tenant_id="tnt", run_id="run_X", bearer="tok",
+    )
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_revoke_run_keys_swallows_errors(monkeypatch):
+    """Revoke is best-effort: a gateway failure must not raise (TTL still applies)."""
+
+    class _Unreachable:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def post(self, *a, **kw):
+            raise httpx.ConnectError("down")
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Unreachable())
+
+    # Must not raise.
+    await _revoke_run_virtual_keys(
+        settings=_gw_settings(),
+        tenant_id="tnt_test",
+        run_id="run_REVOKE",
+        bearer="tok",
+    )
+
+
+# ---------------------------------------------------------------------------
 # create_run end-to-end: gateway URL always present, virtual key conditional
 # ---------------------------------------------------------------------------
 
@@ -263,10 +417,159 @@ def test_create_run_injects_virtual_key_when_gateway_has_one(
 
     assert resp.status_code == 201, resp.text
     env = mock_docker_client.containers.run.call_args.kwargs["environment"]
-    assert env.get("LLM_VIRTUAL_KEY") == "vk-tenant-injected"
-    assert env.get("LLM_API_KEY") == ""
+    # The virtual key + (blanked) provider key are secrets → delivered via
+    # /workspace/.secrets.json, never the container env.
+    assert "LLM_VIRTUAL_KEY" not in env
+    assert "LLM_API_KEY" not in env
+    secrets = _read_run_secrets(
+        settings.workspace_base,
+        tenant_id=_TENANT,
+        session_id="ses_01J5SES0000000000000GW011",
+        run_id="run_01J5RUN0000000000000GW011",
+    )
+    assert secrets["LLM_VIRTUAL_KEY"] == "vk-tenant-injected"
+    assert secrets["LLM_API_KEY"] == ""
+    # Non-secret gateway routing stays in env.
     assert "LLM_GATEWAY_URL" in env
     assert "llm_gateway_enforcer" in env.get("RUNTIME_EXTENSIONS", "")
+
+
+def _make_minting_gateway_client(
+    *, mint_status: int, mint_body: Any, tenant_keys: Any,
+):
+    """Gateway stub that distinguishes ephemeral mint from the tenant-key list.
+
+    ``POST /tenant-keys/ephemeral`` → (mint_status, mint_body).
+    ``GET  /tenant-keys``           → (200, tenant_keys)  [fallback path].
+    Identity/authz/quota POSTs are stubbed as usual.
+    """
+
+    class _FakeClient:
+        def __init__(self, *args, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, url: str, **kw):
+            return httpx.Response(200, json=tenant_keys)
+
+        async def post(self, url: str, **kw):
+            if url.endswith("/tenant-keys/ephemeral"):
+                return httpx.Response(mint_status, json=mint_body)
+            if "service-account-token" in url:
+                return httpx.Response(201, json={"access_token": "minted-jwt"})
+            if "/authz/" in url or "/check" in url:
+                return httpx.Response(200, json={"allowed": True})
+            if "/quota/" in url:
+                return httpx.Response(
+                    200,
+                    json={"allowed": True, "dimension": "agent_sessions", "remaining": 100},
+                )
+            return httpx.Response(200, json={})
+
+    return _FakeClient
+
+
+def test_create_run_prefers_minted_ephemeral_key(
+    settings: Settings,
+    runtime,
+    mock_docker_client: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_headers: dict,
+) -> None:
+    """When the gateway mints an ephemeral key, the sandbox gets THAT key,
+    never the long-lived tenant key."""
+    from agent_scheduler.main import create_app
+    from agent_scheduler.api.dependencies import get_runtime
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        _make_minting_gateway_client(
+            mint_status=201,
+            mint_body={"virtual_key": "sk-foundation-eph-RUN", "ephemeral": True},
+            # A long-lived tenant key is available too; it must NOT be chosen.
+            tenant_keys=[{"key": "vk-tenant-LONGLIVED", "enabled": True}],
+        ),
+    )
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-eph")
+
+    app = create_app(settings)
+    app.state.settings = settings
+    app.dependency_overrides[get_runtime] = lambda: runtime
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post(
+            "/api/scheduler/v1/runs",
+            headers=auth_headers,
+            json={
+                "session_id": "ses_01J5SES0000000000000EPH01",
+                "run_id": "run_01J5RUN0000000000000EPH01",
+                "task": "ephemeral key preferred",
+            },
+        )
+
+    assert resp.status_code == 201, resp.text
+    secrets = _read_run_secrets(
+        settings.workspace_base,
+        tenant_id=_TENANT,
+        session_id="ses_01J5SES0000000000000EPH01",
+        run_id="run_01J5RUN0000000000000EPH01",
+    )
+    # The short-lived ephemeral key is injected; the long-lived tenant key is not.
+    assert secrets["LLM_VIRTUAL_KEY"] == "sk-foundation-eph-RUN"
+
+
+def test_create_run_falls_back_to_tenant_key_when_mint_unavailable(
+    settings: Settings,
+    runtime,
+    mock_docker_client: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_headers: dict,
+) -> None:
+    """Older gateway (mint 404) → fall back to the long-lived tenant key so
+    runs don't break."""
+    from agent_scheduler.main import create_app
+    from agent_scheduler.api.dependencies import get_runtime
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        _make_minting_gateway_client(
+            mint_status=404,
+            mint_body={"detail": "not found"},
+            tenant_keys=[{"key": "vk-tenant-FALLBACK", "enabled": True}],
+        ),
+    )
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-fallback")
+
+    app = create_app(settings)
+    app.state.settings = settings
+    app.dependency_overrides[get_runtime] = lambda: runtime
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post(
+            "/api/scheduler/v1/runs",
+            headers=auth_headers,
+            json={
+                "session_id": "ses_01J5SES0000000000000FBK01",
+                "run_id": "run_01J5RUN0000000000000FBK01",
+                "task": "fallback to tenant key",
+            },
+        )
+
+    assert resp.status_code == 201, resp.text
+    secrets = _read_run_secrets(
+        settings.workspace_base,
+        tenant_id=_TENANT,
+        session_id="ses_01J5SES0000000000000FBK01",
+        run_id="run_01J5RUN0000000000000FBK01",
+    )
+    assert secrets["LLM_VIRTUAL_KEY"] == "vk-tenant-FALLBACK"
 
 
 def test_create_run_rejects_when_gateway_down(

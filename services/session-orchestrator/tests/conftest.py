@@ -21,9 +21,35 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from agent_session_orchestrator.config import Settings
-from agent_session_orchestrator.main import create_app
-from tests._helpers import TEST_TENANT, TEST_USER
+# ── foundation_sdk compatibility shim (test env only) ───────────────────────
+# The real container image builds ``foundation_sdk`` fresh at image-build time,
+# so it always exposes ``get_clearance`` (the per-user DLP clearance helper that
+# api/middleware.py + api/dependencies.py import). A locally-installed SDK can
+# lag that build and lack the symbol, breaking test collection with
+# ``ImportError: cannot import name 'get_clearance'``. Inject it before any app
+# module imports it. No-op when the installed SDK already has it.
+from foundation_sdk import fastapi as _fsdk_fastapi  # noqa: E402
+
+if not hasattr(_fsdk_fastapi, "get_clearance"):
+    from contextvars import ContextVar as _ContextVar
+
+    _clearance_var: _ContextVar[str] = _ContextVar("foundation.clearance", default="")
+
+    def _get_clearance() -> str:
+        return _clearance_var.get()
+
+    _fsdk_fastapi.get_clearance = _get_clearance  # type: ignore[attr-defined]
+    try:
+        from foundation_sdk import _fastapi as _fsdk_internal
+
+        if not hasattr(_fsdk_internal, "get_clearance"):
+            _fsdk_internal.get_clearance = _get_clearance  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — internal module is best-effort
+        pass
+
+from agent_session_orchestrator.config import Settings  # noqa: E402
+from agent_session_orchestrator.main import create_app  # noqa: E402
+from tests._helpers import TEST_TENANT, TEST_USER  # noqa: E402
 
 
 def pytest_configure(config: pytest.Config) -> None:

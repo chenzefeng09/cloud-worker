@@ -2,26 +2,27 @@
 
 SSE stream
 ----------
-``GET /sessions/{id}/messages/stream`` is a polling SSE stream that wakes
-once per second to surface new messages and run state changes.  Two
-discipline points the earlier implementation got wrong:
+``GET /sessions/{id}/stream`` is the session-scoped multiplexing SSE stream
+that holds the connection open for the full lifetime of the session view and
+surfaces events from whatever run is currently active (including future runs
+started after the connection is opened).
 
-1. **Each poll opens its own DB session.**  The FastAPI dependency that
-   injected ``db: AsyncSession`` was bound to the *outer* request and held
-   one transaction (with one ``SET LOCAL``) for the entire 5-minute
-   lifetime of the generator.  That violated the transaction model
-   established by ``domain.db.get_session`` (``async with session.begin()``)
-   and would have leaked DB connections under load.  We now acquire a
-   fresh short-lived session per poll via the same ``get_session`` factory.
+Design notes:
 
-2. **Errors never leak ``str(exc)``.**  An unhandled exception in the
-   generator surfaces only a generic ``"event stream terminated"`` line;
-   the real exception is logged by the FastAPI exception handler with the
-   request id so ops can correlate.
+1. **Each poll opens its own DB session.**  We acquire a fresh short-lived
+   session per poll via the ``get_session`` factory (``async with
+   session.begin()``), rather than holding a single transaction for the
+   entire 5-minute stream lifetime.  This prevents connection leaks under load.
 
-LISTEN/NOTIFY or Redis pub/sub is the long-term replacement (tracked in
-B-M2 backlog) — once the publisher side exists this endpoint can drop the
-polling loop entirely.
+2. **Errors never leak ``str(exc)``.**  Unhandled exceptions surface only a
+   generic ``"event stream terminated"`` line; the real exception is logged
+   with the request id for ops correlation.
+
+3. **Buffer-then-yield discipline.**  All events collected inside an
+   ``async for db in acquire_db_session(...)`` block are buffered in a local
+   list and yielded only *after* the block closes.  This prevents a client
+   disconnect (``GeneratorExit`` / ``CancelledError``) from rolling back a
+   just-committed assistant message row.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import suppress
 from typing import Any
 
@@ -41,6 +42,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
 from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId
+from agent_session_orchestrator.api.dlp_guard import scan_and_tag
 from agent_session_orchestrator.domain.db import get_session as acquire_db_session
 from agent_session_orchestrator.domain.models import Run
 from agent_session_orchestrator.schemas.common import CursorPage
@@ -60,6 +62,13 @@ _MAX_TOOL_TEXT_CHARS = 8000
 # the live token stream — only the all-at-once DB-polled reply.  Far larger than a
 # real cold start; it only guards against a worker that never emits anything.
 _WORKER_COLDSTART_GRACE_SECONDS = 90.0
+# Active-run idle handling.  Once tokens have started flowing, silence is the
+# model thinking between tool batches — NOT a finished stream.  We only give up
+# tailing an active run when a status recheck confirms it left RUNNING/PENDING,
+# or after a generous hard cap that guards a crashed worker which dies without
+# ever writing its `end` marker.
+_ACTIVE_IDLE_HARDCAP_READS = 600  # ~10 min of pure silence ⇒ assume crashed worker
+_RUN_STATUS_RECHECK_READS = 5  # recheck run status every ~5s of idle
 
 
 def _run_token_stream_key(run_id: str) -> str:
@@ -111,20 +120,33 @@ async def _stream_tokens(
     run_id: str,
     deadline: float,
     wait_for_worker: bool = False,
+    is_run_active: Callable[[], Awaitable[bool]] | None = None,
 ) -> AsyncGenerator[str, None]:
     """Tail a run token stream from Redis and yield frontend SSE events.
 
     Failure-open: Redis is a hot-path convenience. If it is unavailable, the
     caller falls back to DB message polling and final run reconciliation.
 
-    ``wait_for_worker`` controls the no-token-yet early-exit:
+    ``wait_for_worker`` controls both the no-token-yet early-exit and the
+    after-tokens idle handling:
 
     * ``False`` (default, replay of an already-terminal run): the stream is
-      fully written, so bail out fast after a couple of idle reads.
+      fully written, so bail out fast — after a couple of idle reads before any
+      token, and after ~5 idle reads once tokens have started.
     * ``True`` (run is still RUNNING/PENDING): the worker container may still be
       cold-starting, so keep waiting for the first token up to
       ``_WORKER_COLDSTART_GRACE_SECONDS`` (or ``deadline``).  Without this the
-      live token stream is lost to the cold-start race.
+      live token stream is lost to the cold-start race.  AFTER tokens start, a
+      short idle gap is the model thinking between tool batches, NOT a finished
+      stream — the worker writes an authoritative ``end`` marker as the last
+      entry of a normal completion.  We therefore do NOT bail on a brief idle:
+      only when ``is_run_active`` (re-checked every ~5 idle reads) reports the
+      run left RUNNING/PENDING, or after ``_ACTIVE_IDLE_HARDCAP_READS`` of pure
+      silence (crashed-worker safety net that never wrote ``end``).
+
+    ``is_run_active`` is an optional async predicate returning ``True`` while the
+    run is still RUNNING/PENDING.  When ``None`` (e.g. terminal replay calls) the
+    active-run recheck path is simply not used.
     """
     try:
         import redis.asyncio as aioredis  # type: ignore[import-not-found]
@@ -142,31 +164,47 @@ async def _stream_tokens(
     stream_key = _run_token_stream_key(run_id)
     last_id = "0-0"
     saw_entry = False
+    saw_pending = False
     idle_reads = 0
+    stream_ended = False
     started_at = asyncio.get_event_loop().time()
     try:
         while asyncio.get_event_loop().time() < deadline:
             batches = await client.xread({stream_key: last_id}, block=1000, count=100)
             if not batches:
                 idle_reads += 1
-                # Once tokens have started flowing, a short run of idle reads
-                # means the worker has stalled or finished without an `end`
-                # marker — end the stream so the SSE connection doesn't hang.
-                if saw_entry and idle_reads >= 5:
-                    return
-                if not saw_entry:
+                if saw_entry:
                     if wait_for_worker:
-                        # Active run: the worker may still be cold-starting.
-                        # Keep waiting for the first token up to the grace cap.
+                        # Active run: silence is the model thinking between tool
+                        # batches, NOT a finished stream. The `end` marker is the
+                        # authoritative normal exit (handled above). Only give up if
+                        # the run actually left the active state, or after a generous
+                        # hard cap guarding a crashed worker that never writes `end`.
+                        if idle_reads >= _ACTIVE_IDLE_HARDCAP_READS:
+                            break
+                        if (
+                            is_run_active is not None
+                            and idle_reads % _RUN_STATUS_RECHECK_READS == 0
+                        ):
+                            still_active = True
+                            try:
+                                still_active = await is_run_active()
+                            except Exception:  # noqa: BLE001 — failure-open: keep tailing
+                                still_active = True
+                            if not still_active:
+                                break
+                    elif idle_reads >= 5:
+                        # Replay of an already-terminal run: short idle ⇒ stream done.
+                        break
+                else:
+                    if wait_for_worker:
                         if (
                             asyncio.get_event_loop().time() - started_at
                             >= _WORKER_COLDSTART_GRACE_SECONDS
                         ):
-                            return
+                            break
                     elif idle_reads >= 2:
-                        # Replay of a terminal run: the stream is already fully
-                        # written, so nothing-yet means nothing-coming.
-                        return
+                        break
                 continue
 
             for _key, entries in batches:
@@ -190,7 +228,8 @@ async def _stream_tokens(
                     # streamed text).  With ``offset`` the client drops any event
                     # whose offset it has already applied for this run.
                     if entry_type == "end":
-                        return
+                        stream_ended = True
+                        break
                     if entry_type == "delta":
                         text = entry.get("text") or ""
                         if text:
@@ -230,6 +269,42 @@ async def _stream_tokens(
                                 "thinking",
                                 {"run_id": run_id, "text": text, "offset": last_id},
                             )
+                    elif entry_type == "pending_confirmation":
+                        # HITL: worker paused waiting for user to confirm a tool call.
+                        # Relay verbatim so the frontend can render the confirmation card.
+                        saw_pending = True
+                        yield _sse(
+                            "pending_confirmation",
+                            {
+                                "run_id": run_id,
+                                "tool_call_id": entry.get("tool_call_id") or "",
+                                "name": entry.get("name") or "",
+                                "args": entry.get("args") or "",
+                            },
+                        )
+                    elif entry_type == "pending_question":
+                        # HITL: worker paused waiting for a free-text answer.
+                        saw_pending = True
+                        yield _sse(
+                            "pending_question",
+                            {
+                                "run_id": run_id,
+                                "tool_call_id": entry.get("tool_call_id") or "",
+                                "question": entry.get("question") or "",
+                            },
+                        )
+                if stream_ended:
+                    # `end` entry consumed in the inner loop — stop the outer
+                    # batch loop too so we reach the run_stream_end emit below.
+                    break
+            if stream_ended:
+                break
+        # Normal end-of-stream (end marker, stall, cold-start grace, or
+        # replay-idle).  Emit an authoritative terminal signal carrying whether
+        # the run paused for HITL input — this lets the caller decide
+        # paused-vs-complete without waiting on scheduler lag, and gives
+        # replay-only connections a clean stream terminator.
+        yield _sse("run_stream_end", {"run_id": run_id, "paused": saw_pending})
     except Exception as exc:  # noqa: BLE001
         logger.warning("Redis token stream read failed: %s", exc)
         return
@@ -279,12 +354,10 @@ async def _read_ordered_blocks_from_redis(
                 text_parts.append(str(entry.get("text") or ""))
                 continue
             if entry_type == "thinking":
-                # Do NOT flush_text() here. Thinking is interleaved reasoning
-                # that does not break the surrounding assistant text — and it is
-                # not persisted as a message row below. Flushing on thinking
-                # split one continuous reply (e.g. "你好" + "！我是…") into two
-                # adjacent assistant rows with nothing between them. Only a tool
-                # call must flush, because its block is ordered between text.
+                # Thinking is a side-channel, not a hard boundary in assistant
+                # text. Keep accumulating surrounding delta entries so
+                # "你好" + thinking + "！我是…" persists as one assistant row
+                # below the thinking block instead of two split text rows.
                 text = str(entry.get("text") or "")
                 if text:
                     blocks.append({"kind": "thinking", "text": text})
@@ -396,6 +469,50 @@ async def _write_memory(
         logger.debug("memory write failed (failure-open): %s", exc)
 
 
+async def _dlp_scan_transcript(
+    *,
+    dlp_url: str,
+    tenant_id: str,
+    content: str,
+    resource_id: str,
+) -> None:
+    """Route a persisted assistant message through the fail-open DLP scanner.
+
+    Output-side counterpart to the attachment-upload scan
+    (``api/v1/attachments.py``): the agent's reply text is scanned and, on a
+    hit, classification-tagged via the resource id; it is **never blocked**.
+
+    Fully fail-open and best-effort:
+
+    * No ``dlp_url`` configured → skip silently (mirrors how the memory-write
+      and other side-effects gate on their target URL being set).
+    * Any DLP error is already logged and swallowed inside ``scan_and_tag``;
+      we additionally guard here so a bug in the call site can never break run
+      finalization or the streamed reply.
+
+    The DLP contract has no dedicated transcript resource type (its
+    ``resource_type`` is a free string used for tagging/grouping), so we pass
+    ``resource_type="transcript"`` with the persisted message id as the
+    ``resource_id``. This is the closest natural fit — the scanned text is the
+    transcript message — and requires no change to the DLP service.
+    """
+    if not dlp_url or not content:
+        return
+    try:
+        await scan_and_tag(
+            dlp_url=dlp_url,
+            tenant_id=tenant_id,
+            content=content,
+            resource_id=resource_id,
+            resource_type="transcript",
+        )
+    except Exception as exc:  # noqa: BLE001 — DLP must never break finalization
+        logger.warning(
+            "DLP transcript scan failed (fail-open, ignoring)",
+            extra={"resource_id": resource_id, "err": str(exc)},
+        )
+
+
 async def _reconcile_run_completion(
     *,
     scheduler_url: str,
@@ -405,13 +522,15 @@ async def _reconcile_run_completion(
     svc: SessionService,
     knowledge_ingest_url: str = "",
     redis_url: str | None = None,
+    dlp_url: str = "",
 ) -> tuple[bool, list[Any]]:
     """Poll the scheduler for a RUNNING run; persist result on terminal exit.
 
     Returns ``(terminal_reached, plan_steps)`` where:
-    * ``terminal_reached`` is True when the run reached a terminal state and
-      the DB has been updated (so the SSE loop can emit run_complete on the
-      same iteration).
+    * ``terminal_reached`` is True when the run reached a terminal state
+      (COMPLETED / FAILED / CANCELLED) *and* the DB has been updated.
+      PAUSED is NOT terminal — returns False so the SSE loop does not emit
+      run_complete; the stream_session path handles run_paused separately.
     * ``plan_steps`` is the list of structured plan steps read from
       result.json (available both while RUNNING and after completion).
 
@@ -444,6 +563,32 @@ async def _reconcile_run_completion(
     plan_steps: list[Any] = payload.get("plan_steps") or []
 
     sched_status = payload.get("status")
+
+    # ── HITL PAUSED detection ──────────────────────────────────────────────
+    # The scheduler reports COMPLETED when the container exits 0, but the
+    # worker writes result.json with ``"status": "paused"`` when it paused for
+    # human-in-the-loop input.  We must inspect the worker result payload to
+    # distinguish a real completion from a pause.
+    #
+    # Scheduler shape on paused exit (container exited 0, scheduler sees
+    # COMPLETED but result.json carries status=paused):
+    #   payload.get("result_status") == "paused"
+    # OR the scheduler may surface it under a top-level "worker_status" key.
+    # We check both paths; if either indicates "paused" we treat as PAUSED.
+    worker_status = (
+        payload.get("result_status")
+        or payload.get("worker_status")
+        or ""
+    )
+    if sched_status in ("COMPLETED", "FAILED") and (worker_status == "paused"):
+        # Worker paused — set PAUSED, do NOT write assistant message, NOT terminal.
+        run.status = "PAUSED"
+        logger.info(
+            "run paused (HITL): set status=PAUSED",
+            extra={"run_id": run.id},
+        )
+        return False, plan_steps
+
     if sched_status not in ("COMPLETED", "FAILED"):
         # Run is still in progress; surface plan_steps to the SSE caller.
         return False, plan_steps
@@ -495,7 +640,7 @@ async def _reconcile_run_completion(
                 elif block.get("kind") == "text":
                     text = str(block.get("text") or "")
                     if text:
-                        await svc.create_message(
+                        msg = await svc.create_message(
                             session_id=run.session_id,
                             role="assistant",
                             content=text,
@@ -503,6 +648,21 @@ async def _reconcile_run_completion(
                             run_id=run.id,
                         )
                         persisted_from_stream = True
+                        # ── DLP scan (output side): fail-open ───────────────
+                        # Scan the assistant's natural-language reply as it is
+                        # persisted on its way out to the user, mirroring the
+                        # attachment upload path. A hit tags the message, it is
+                        # never blocked; any DLP error is swallowed inside
+                        # scan_and_tag. Off the hot path: this runs once per
+                        # completed text block at run finalization, not per
+                        # streamed token.
+                        if dlp_url:
+                            await _dlp_scan_transcript(
+                                dlp_url=dlp_url,
+                                tenant_id=tenant_id,
+                                content=text,
+                                resource_id=msg.id,
+                            )
                 elif block.get("kind") == "tool":
                     tool_call = {
                         "id": _sanitize_tool_text(block.get("tool_call_id") or ""),
@@ -524,13 +684,23 @@ async def _reconcile_run_completion(
     # already produced ordered text/tool blocks, avoid appending a duplicate
     # summary row for the same run.
     if summary and not persisted_from_stream and not already_persisted_for_run:
-        await svc.create_message(
+        msg = await svc.create_message(
             session_id=run.session_id,
             role="assistant",
             content=summary,
             tool_calls=None,
             run_id=run.id,
         )
+        # ── DLP scan (output side): fail-open ───────────────────────────────
+        # Same posture as the streamed-text branch above: scan the assistant
+        # summary on persist. Tag-only, never block; errors swallowed.
+        if dlp_url:
+            await _dlp_scan_transcript(
+                dlp_url=dlp_url,
+                tenant_id=tenant_id,
+                content=summary,
+                resource_id=msg.id,
+            )
 
     # Persist artifact metadata as output attachments (kind=output).
     # Failure-open: any error is logged; run completion is not affected.
@@ -628,6 +798,7 @@ async def list_messages(
         scheduler_url = request.app.state.settings.agent_scheduler_url
         knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
         redis_url = request.app.state.settings.redis_url
+        dlp_url = request.app.state.settings.foundation_dlp_url
         # Fetch the session's real user_id so the scheduler poll header
         # carries the originating user rather than the "SYSTEM" sentinel
         # (which the scheduler's authz guard rejects with 403).
@@ -641,6 +812,7 @@ async def list_messages(
                 svc=svc,
                 knowledge_ingest_url=knowledge_ingest_url,
                 redis_url=redis_url,
+                dlp_url=dlp_url,
             )
             # Note: plan_steps from list_messages are discarded — this path is
             # a page-refresh reconcile; SSE is the real-time channel for plans.
@@ -693,209 +865,6 @@ async def delete_messages_from_sequence(
     svc = SessionService(db, tenant_id=tenant_id)
     deleted_count = await svc.delete_messages_from_sequence(session_id, from_sequence)
     return {"deleted_count": deleted_count}
-
-
-@router.get("/sessions/{session_id}/messages/stream",
-            dependencies=[Depends(require_permission("session.message.read", "session"))])
-async def stream_messages(
-    session_id: str,
-    request: Request,
-    tenant_id: str = TTenantId,
-) -> StreamingResponse:
-    """Poll-based SSE — surfaces new messages and run completion."""
-    scheduler_url = request.app.state.settings.agent_scheduler_url
-    knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
-
-    async def event_generator() -> AsyncGenerator[str, None]:
-        last_seq = 0
-        redis_url = request.app.state.settings.redis_url
-        if redis_url:
-            stream_run_id: str | None = None
-            # True when stream_run_id is an active (RUNNING/PENDING) run whose
-            # worker may still be cold-starting; False for terminal replay.
-            stream_run_active = False
-            async for db in acquire_db_session(tenant_id=tenant_id):
-                svc = SessionService(db, tenant_id=tenant_id)
-                runs = await svc.list_runs(session_id)
-                active = next(
-                    (r for r in runs if r.status in ("RUNNING", "PENDING")),
-                    None,
-                )
-                if active is not None:
-                    stream_run_id = active.id
-                    stream_run_active = True
-                else:
-                    terminal = next(
-                        (
-                            r for r in runs
-                            if r.status in ("COMPLETED", "FAILED", "CANCELLED")
-                        ),
-                        None,
-                    )
-                    if terminal is not None:
-                        existing, _ = await svc.list_messages(session_id, limit=200)
-                        already_persisted = any(
-                            m.run_id == terminal.id
-                            and (m.role or "").lower() in {"assistant", "tool"}
-                            for m in existing
-                        )
-                        if not already_persisted:
-                            stream_run_id = terminal.id
-
-            if stream_run_id is not None:
-                deadline = asyncio.get_event_loop().time() + (
-                    _MAX_POLLS * _POLL_INTERVAL_SECONDS
-                )
-                async for ev in _stream_tokens(
-                    redis_url=redis_url,
-                    run_id=stream_run_id,
-                    deadline=deadline,
-                    wait_for_worker=stream_run_active,
-                ):
-                    yield ev
-
-        # Runs already terminal when this stream opened. A NEW message's run is
-        # not among these, so we must not let a pre-existing completed run from
-        # session history fire run_complete/done and end the stream before the
-        # current run finishes — that was causing replies to only appear on
-        # manual refresh.
-        preexisting_terminal: set[str] = set()
-        primed = False
-        try:
-            for _ in range(_MAX_POLLS):
-                # Per-poll DB session: collect events into a local buffer,
-                # let the surrounding ``async with session.begin()`` commit
-                # cleanly, and ONLY THEN yield to the SSE client.  Yielding
-                # inside the ``async for db`` would let a client disconnect
-                # raise GeneratorExit mid-transaction -- starlette/anyio
-                # would invoke ``aclose()`` on the generator, the ``async
-                # with`` would see an exception, and SQLAlchemy would
-                # ``ROLLBACK`` the just-written assistant message.
-                events: list[str] = []
-                terminal_seen = False
-                async for db in acquire_db_session(tenant_id=tenant_id):
-                    svc = SessionService(db, tenant_id=tenant_id)
-
-                    # Before reading state, reconcile RUNNING runs against
-                    # the scheduler so terminal exits get persisted (status,
-                    # result_summary) and an assistant message lands in the
-                    # messages table for the UI.
-                    runs = await svc.list_runs(session_id)
-                    # Collect plan_steps from any running run this poll.
-                    latest_plan_steps: list[Any] = []
-                    latest_run_id: str = ""
-                    running_runs = [
-                        r for r in runs if r.status in ("RUNNING", "PENDING")
-                    ]
-                    session_obj = (
-                        await svc.get_session(session_id)
-                        if running_runs
-                        else None
-                    )
-                    for r in running_runs:
-                        if session_obj is not None:
-                            _terminal, _plan = await _reconcile_run_completion(
-                                scheduler_url=scheduler_url,
-                                tenant_id=tenant_id,
-                                user_id=session_obj.user_id,
-                                run=r,
-                                svc=svc,
-                                knowledge_ingest_url=knowledge_ingest_url,
-                                redis_url=redis_url,
-                            )
-                            if _plan:
-                                latest_plan_steps = _plan
-                                latest_run_id = r.id
-
-                    # Emit a plan SSE event whenever plan_steps are available,
-                    # even while the run is still RUNNING.  This lets the
-                    # frontend PLAN panel update in real time.
-                    if latest_plan_steps:
-                        plan_payload = json.dumps({
-                            "run_id": latest_run_id,
-                            "plan_steps": latest_plan_steps,
-                        })
-                        events.append(f"event: plan\ndata: {plan_payload}\n\n")
-
-                    items, _ = await svc.list_messages(
-                        session_id, cursor=str(last_seq) if last_seq else None, limit=50
-                    )
-                    for msg in items:
-                        # model_dump_json combines validate + JSON encode in
-                        # one pass; the previous model_dump(mode="json") +
-                        # json.dumps doubled the serialisation cost.
-                        msg_json = MessageOut.model_validate(msg).model_dump_json()
-                        events.append(f"event: message\ndata: {msg_json}\n\n")
-                        last_seq = msg.sequence
-
-                    # Run-completion bookkeeping (re-read after reconcile).
-                    runs = await svc.list_runs(session_id)
-                    terminal_statuses = ("COMPLETED", "FAILED", "CANCELLED")
-                    active_exists = any(r.status in ("RUNNING", "PENDING") for r in runs)
-                    # On the first poll, snapshot runs that were ALREADY terminal
-                    # (session history) so they don't end the stream — we only
-                    # care about a run completing while this stream is open.
-                    if not primed and active_exists:
-                        preexisting_terminal = {
-                            r.id for r in runs if r.status in terminal_statuses
-                        }
-                        primed = True
-                    terminal = next(
-                        (
-                            r
-                            for r in runs
-                            if r.status in terminal_statuses
-                            and r.id not in preexisting_terminal
-                        ),
-                        None,
-                    )
-                    if terminal is not None:
-                        run_payload = json.dumps(
-                            {
-                                "run_id": terminal.id,
-                                "status": terminal.status,
-                                "result_summary": terminal.result_summary,
-                            },
-                        )
-                        events.append(f"event: run_complete\ndata: {run_payload}\n\n")
-                        events.append("event: done\ndata: {}\n\n")
-                        terminal_seen = True
-
-                # DB session has now closed + committed (or rolled back on
-                # an exception); safe to flush the buffered events to the
-                # client.
-                for ev in events:
-                    yield ev
-                if terminal_seen:
-                    return
-
-                await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-
-            yield "event: done\ndata: {}\n\n"
-        except asyncio.CancelledError:
-            # Client disconnected; nothing to do — the surrounding
-            # ``async for`` already closed the last DB session.
-            raise
-        except Exception:
-            logger.exception(
-                "messages SSE stream terminated unexpectedly",
-                extra={"session_id": session_id, "tenant_id": tenant_id},
-            )
-            # Do NOT echo str(exc); a 500-class error may include SQL text
-            # or path info that the client must not see.
-            yield (
-                f"event: error\ndata: "
-                f"{json.dumps({'detail': 'event stream terminated; see request id'})}\n\n"
-            )
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
 
 
 @router.get(
@@ -953,6 +922,7 @@ async def stream_session(
     """
     scheduler_url: str = request.app.state.settings.agent_scheduler_url
     knowledge_ingest_url: str = request.app.state.settings.knowledge_ingest_url
+    dlp_url: str = request.app.state.settings.foundation_dlp_url
 
     async def event_generator() -> AsyncGenerator[str, None]:
         redis_url: str | None = request.app.state.settings.redis_url
@@ -964,6 +934,65 @@ async def stream_session(
         # RUNNING before the final terminal write completes).
         streamed_run_ids: set[str] = set()
         last_seq = 0
+        # First-poll completion reconciliation.  A client that (re)connects
+        # AFTER its run already reached a terminal state would otherwise never
+        # receive a run_complete on this connection — the active-run selector
+        # finds nothing, the idle branch just polls, and the frontend's
+        # isStreaming stays stuck "true" (Working on it… pill never clears,
+        # though the run + sandbox are long gone).  On the first poll we emit a
+        # synthetic run_complete for the session's most-recent terminal run so
+        # the client's state machine always converges.  Idempotent: the client
+        # treats a duplicate run_complete as a no-op.
+        completion_primed = False
+
+        # ── HITL PAUSED-run replay state machine ────────────────────────────
+        #
+        # Problem: when a client reconnects (page refresh) while a run is
+        # already status=PAUSED, the active-run selector skips it (PAUSED ∉
+        # {RUNNING, PENDING}), so pending_confirmation / pending_question
+        # entries sitting in the Redis token stream never reach the new
+        # connection and the frontend cannot render the confirm card.
+        #
+        # Solution: a separate ``replayed_paused_run_ids`` set tracks runs
+        # that have been replayed through the PAUSED path in this connection.
+        #
+        # Per-connection state transitions per run_id R:
+        #
+        #  ┌──────────────────────────────────────────────────────────────┐
+        #  │ streamed_run_ids   replayed_paused_run_ids   meaning          │
+        #  ├──────────────────────────────────────────────────────────────┤
+        #  │ ∉  ∉                                          unseen          │
+        #  │ ∈  ∉                                          actively        │
+        #  │                                               streaming       │
+        #  │ ∉  ∈                                          replay done,    │
+        #  │                                               waiting for     │
+        #  │                                               resume          │
+        #  │ ∈  ∈  (transient, only during active replay)                 │
+        #  └──────────────────────────────────────────────────────────────┘
+        #
+        # Flow:
+        #  A. PAUSED run found, id ∉ streamed_run_ids, id ∉ replayed set
+        #     → add to streamed_run_ids (suppress looping), replay via
+        #       _stream_tokens(wait_for_worker=False), emit run_paused,
+        #       discard from streamed_run_ids, add to replayed set.
+        #     Net: id ∉ streamed_run_ids, id ∈ replayed_paused_run_ids.
+        #     A reconnect creates a fresh generator → fresh sets → replays again.
+        #
+        #  B. User responds → run transitions to RUNNING
+        #     → active path picks it up (id ∉ streamed_run_ids now),
+        #       removes it from replayed_paused_run_ids so a second pause
+        #       of the same run can replay again.
+        #
+        #  C. Resumed run pauses AGAIN
+        #     → active path streams to the new pause marker, emits run_paused,
+        #       discards from streamed_run_ids (standard pause path).
+        #       id is no longer in replayed set (cleared in step B), so a
+        #       subsequent reconnect will replay via path A again correctly.
+        #
+        # Guard: a PAUSED run with id already in replayed_paused_run_ids is
+        # skipped — preventing an infinite replay loop within one connection
+        # if the run somehow stays PAUSED across many polls.
+        replayed_paused_run_ids: set[str] = set()
 
         try:
             for _ in range(_MAX_POLLS):
@@ -972,6 +1001,15 @@ async def stream_session(
 
                 events: list[str] = []
                 active_run_to_stream: Run | None = None
+                # Set True when the run we're about to stream reached a terminal
+                # state during this poll's reconcile AND its durable message rows
+                # were already emitted below.  In that case we MUST NOT replay the
+                # Redis token stream (which always reads from "0-0" and would
+                # rebuild a duplicate set of streaming blocks alongside the durable
+                # rows) — we only need the post-stream reconcile to emit
+                # run_complete.
+                active_run_durably_completed: bool = False
+                paused_run_to_replay: Run | None = None
                 session_user_id: str = "SYSTEM"
                 latest_plan_steps: list[Any] = []
                 latest_plan_run_id: str = ""
@@ -982,6 +1020,36 @@ async def stream_session(
                 async for db in acquire_db_session(tenant_id=tenant_id):
                     svc = SessionService(db, tenant_id=tenant_id)
                     runs = await svc.list_runs(session_id)
+
+                    # First poll only: if there is no active/paused run but the
+                    # session has a terminal run, synthesize a run_complete so a
+                    # client that connected after completion clears isStreaming.
+                    if not completion_primed:
+                        completion_primed = True
+                        has_live = any(
+                            r.status in ("RUNNING", "PENDING", "PAUSED")
+                            for r in runs
+                        )
+                        if not has_live:
+                            terminal = next(
+                                (
+                                    r
+                                    for r in runs
+                                    if r.status in ("COMPLETED", "FAILED", "CANCELLED")
+                                ),
+                                None,
+                            )
+                            if terminal is not None:
+                                events.append(
+                                    _sse(
+                                        "run_complete",
+                                        {
+                                            "run_id": terminal.id,
+                                            "status": terminal.status,
+                                            "result_summary": terminal.result_summary,
+                                        },
+                                    )
+                                )
 
                     # Identify the current active run (if any).
                     active = next(
@@ -1002,6 +1070,32 @@ async def stream_session(
                             _sse("run_started", {"run_id": active.id})
                         )
                         streamed_run_ids.add(active.id)
+                        # This run entered via the active path (resumed) — clear
+                        # it from the replayed-paused set so a second pause can
+                        # replay again on a future reconnect (state-machine step B).
+                        replayed_paused_run_ids.discard(active.id)
+
+                    elif active is None:
+                        # No active run: check for a PAUSED run to replay.
+                        # Only replay once per connection (guard against loops).
+                        paused = next(
+                            (
+                                r
+                                for r in runs
+                                if r.status == "PAUSED"
+                                and r.id not in streamed_run_ids
+                                and r.id not in replayed_paused_run_ids
+                            ),
+                            None,
+                        )
+                        if paused is not None:
+                            paused_run_to_replay = paused
+                            # Temporarily mark as "being streamed" to prevent
+                            # a concurrent poll iteration from also picking it up.
+                            streamed_run_ids.add(paused.id)
+                            events.append(
+                                _sse("run_started", {"run_id": paused.id})
+                            )
 
                     # Reconcile any RUNNING/PENDING runs (even the one we're
                     # about to stream — reconcile is idempotent and brings the
@@ -1024,10 +1118,20 @@ async def stream_session(
                             svc=svc,
                             knowledge_ingest_url=knowledge_ingest_url,
                             redis_url=redis_url,
+                            dlp_url=dlp_url,
                         )
                         if _plan:
                             latest_plan_steps = _plan
                             latest_plan_run_id = r.id
+                        # If the run we're about to stream just reached a terminal
+                        # state, remember it: once its durable message rows are
+                        # emitted below we can skip the (duplicate) token replay.
+                        if (
+                            _terminal
+                            and active_run_to_stream is not None
+                            and r.id == active_run_to_stream.id
+                        ):
+                            active_run_durably_completed = True
 
                     if latest_plan_steps:
                         events.append(
@@ -1046,10 +1150,29 @@ async def stream_session(
                         cursor=str(last_seq) if last_seq else None,
                         limit=50,
                     )
+                    # Track durable rows for *this* run specifically, not any
+                    # row in the poll — an unrelated run persisting a message in
+                    # the same poll must not satisfy the skip-replay guard below.
+                    emitted_durable_for_active_run = False
+                    active_run_id = (
+                        active_run_to_stream.id
+                        if active_run_to_stream is not None
+                        else None
+                    )
                     for msg in items:
                         msg_json = MessageOut.model_validate(msg).model_dump_json()
                         events.append(f"event: message\ndata: {msg_json}\n\n")
                         last_seq = msg.sequence
+                        if active_run_id is not None and msg.run_id == active_run_id:
+                            emitted_durable_for_active_run = True
+
+                    # Only skip the token replay when durable rows for the
+                    # just-completed active run were actually delivered this poll.
+                    # If reconcile flagged terminal but no message rows landed
+                    # for this run (e.g. an empty/edge result), fall through to
+                    # the normal stream path so the client still gets its content.
+                    if active_run_durably_completed and not emitted_durable_for_active_run:
+                        active_run_durably_completed = False
 
                 # ── DB block closed / committed ──────────────────────────────
                 for ev in events:
@@ -1059,19 +1182,75 @@ async def stream_session(
                 # Driven OUTSIDE the DB session so that streaming (which can
                 # last many seconds) does not hold an open DB connection.
                 if active_run_to_stream is not None:
-                    if redis_url:
+                    # Authoritative pause signal from the token stream itself.
+                    # The post-stream reconcile below often still sees the run as
+                    # RUNNING (scheduler lag) right after the worker writes a
+                    # pending_confirmation and pauses; trusting only run.status
+                    # would emit run_complete and leave the run stuck in
+                    # streamed_run_ids, so the PAUSED-replay path never fires on
+                    # the live connection.  run_stream_end{paused:true} closes
+                    # that gap.
+                    stream_signaled_pause = False
+
+                    # Idle-recheck predicate for the active tail: a quiet gap
+                    # between tool batches must NOT be mistaken for a finished
+                    # stream.  ``_stream_tokens`` calls this every few idle reads
+                    # to confirm the run is still RUNNING/PENDING before giving
+                    # up.  It opens its OWN short-lived DB session (the buffer-
+                    # then-yield discipline forbids holding a DB session across
+                    # the stream) and never yields, so it is safe to run here.
+                    # Bind the loop variable's value via a default arg so the
+                    # closure captures THIS iteration's run id (not a later
+                    # reassignment) — the predicate is only ever invoked during
+                    # this iteration's _stream_tokens call, but the explicit bind
+                    # keeps it correct and lint-clean.
+                    async def _is_run_active(
+                        _run_id: str = active_run_to_stream.id,
+                    ) -> bool:
+                        async for db in acquire_db_session(tenant_id=tenant_id):
+                            svc = SessionService(db, tenant_id=tenant_id)
+                            runs = await svc.list_runs(session_id)
+                            run = next(
+                                (r for r in runs if r.id == _run_id), None
+                            )
+                            return run is not None and run.status in (
+                                "RUNNING",
+                                "PENDING",
+                            )
+                        return False
+
+                    if redis_url and not active_run_durably_completed:
                         async for ev in _stream_tokens(
                             redis_url=redis_url,
                             run_id=active_run_to_stream.id,
                             deadline=deadline,
                             wait_for_worker=True,
+                            is_run_active=_is_run_active,
                         ):
+                            if ev.startswith("event: run_stream_end") and (
+                                '"paused": true' in ev or '"paused":true' in ev
+                            ):
+                                stream_signaled_pause = True
                             yield ev
 
-                    # After _stream_tokens returns (end marker or stall),
+                    # After _stream_tokens returns (end marker, pause, or stall),
                     # reconcile the run one final time to persist its terminal
-                    # state + assistant message, then emit run_complete.
+                    # state + assistant message (or PAUSED state), then emit the
+                    # appropriate lifecycle event.
+                    #
+                    # HITL PAUSED: if reconcile sets run.status="PAUSED" the run
+                    # is non-terminal.  Emit ``run_paused`` instead of
+                    # ``run_complete``, and REMOVE the run_id from
+                    # ``streamed_run_ids`` so when the run is resumed (same
+                    # run_id, status back to RUNNING) the outer loop re-enters
+                    # _stream_tokens for the continuation tokens.
                     post_stream_events: list[str] = []
+                    post_stream_run_paused = False
+                    # Set when the tail returned early (hard cap / transient)
+                    # but reconcile shows the run is STILL RUNNING/PENDING.  In
+                    # that case we emit NO lifecycle event and re-tail next poll.
+                    post_stream_run_still_active = False
+                    post_stream_run_id = active_run_to_stream.id
                     async for db in acquire_db_session(tenant_id=tenant_id):
                         svc = SessionService(db, tenant_id=tenant_id)
                         runs = await svc.list_runs(session_id)
@@ -1088,6 +1267,7 @@ async def stream_session(
                                 svc=svc,
                                 knowledge_ingest_url=knowledge_ingest_url,
                                 redis_url=redis_url,
+                                dlp_url=dlp_url,
                             )
                             if _plan:
                                 post_stream_events.append(
@@ -1114,24 +1294,87 @@ async def stream_session(
                                 )
                                 last_seq = msg.sequence
 
-                            post_stream_events.append(
-                                _sse(
-                                    "run_complete",
-                                    {
-                                        "run_id": run_obj.id,
-                                        "status": run_obj.status,
-                                        "result_summary": run_obj.result_summary,
-                                    },
+                            if run_obj.status == "PAUSED" or stream_signaled_pause:
+                                # HITL pause: do NOT emit run_complete; instead
+                                # signal the frontend that the run needs input.
+                                # ``stream_signaled_pause`` makes the pause
+                                # authoritative even when the scheduler has not
+                                # yet surfaced status=PAUSED (lag), so the run is
+                                # correctly discarded from streamed_run_ids and
+                                # the PAUSED-replay path can fire on resume.
+                                post_stream_run_paused = True
+                                post_stream_events.append(
+                                    _sse("run_paused", {"run_id": run_obj.id})
                                 )
-                            )
+                            elif run_obj.status in (
+                                "COMPLETED",
+                                "FAILED",
+                                "CANCELLED",
+                            ):
+                                post_stream_events.append(
+                                    _sse(
+                                        "run_complete",
+                                        {
+                                            "run_id": run_obj.id,
+                                            "status": run_obj.status,
+                                            "result_summary": run_obj.result_summary,
+                                        },
+                                    )
+                                )
+                            else:
+                                # Still RUNNING/PENDING: the tail returned early
+                                # (crashed-worker hard cap or a transient blip),
+                                # NOT because the run finished.  Emit nothing
+                                # lifecycle-wise — falsely completing here would
+                                # strand the worker's remaining output.  Discard
+                                # the run_id below so the next poll re-enters the
+                                # active path and re-tails the stream.
+                                post_stream_run_still_active = True
 
                     # DB session closed; safe to yield.
                     for ev in post_stream_events:
                         yield ev
 
+                    # Remove from streamed_run_ids so the same run_id can be
+                    # re-entered on the next poll's active path:
+                    #   • PAUSED  → re-entered when resumed (status back to RUNNING)
+                    #   • still RUNNING/PENDING (early tail return) → re-tailed so
+                    #     the worker's remaining output is not stranded.
+                    if post_stream_run_paused or post_stream_run_still_active:
+                        streamed_run_ids.discard(post_stream_run_id)
+
                     # Continue the outer loop — do NOT end the stream; a future
                     # run may start on this session (e.g. the user sends another
                     # message).
+                    await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+                    continue
+
+                # ── PAUSED-run replay (reconnect after HITL pause) ───────────
+                # Driven OUTSIDE the DB session (same discipline as the active
+                # path above).  The run is already fully written to Redis — no
+                # reconcile needed, no run_complete emitted.
+                if paused_run_to_replay is not None:
+                    if redis_url:
+                        async for ev in _stream_tokens(
+                            redis_url=redis_url,
+                            run_id=paused_run_to_replay.id,
+                            deadline=deadline,
+                            wait_for_worker=False,  # stream is fully written
+                        ):
+                            yield ev
+
+                    # Emit run_paused so the frontend renders the confirm card.
+                    yield _sse("run_paused", {"run_id": paused_run_to_replay.id})
+
+                    # State-machine cleanup (see comment block near top of
+                    # event_generator):
+                    #   • discard from streamed_run_ids  → resume (RUNNING) can
+                    #     re-enter the active path normally
+                    #   • add to replayed_paused_run_ids → guard against re-
+                    #     replaying on every poll while the run stays PAUSED
+                    streamed_run_ids.discard(paused_run_to_replay.id)
+                    replayed_paused_run_ids.add(paused_run_to_replay.id)
+
                     await asyncio.sleep(_POLL_INTERVAL_SECONDS)
                     continue
 
