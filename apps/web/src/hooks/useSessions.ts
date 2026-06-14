@@ -6,6 +6,8 @@ export function useSessions() {
   const { sessions, setSessions, addSession, setActiveSession, activeSessionId } = useChatStore();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
 
   const fetchSessions = useCallback(async () => {
     setLoading(true);
@@ -15,13 +17,39 @@ export function useSessions() {
       // The BFF can hand back a 200 whose body is actually a downstream error
       // object (no `items`). Guard so a malformed page never poisons the store
       // with `undefined` — that used to crash <Sidebar> on `sessions.length`.
-      setSessions(Array.isArray(page?.items) ? page.items : []);
+      if (Array.isArray(page?.items)) {
+        setSessions(page.items);
+        setCursor(page.next_cursor ?? null);
+      } else {
+        setSessions([]);
+        setCursor(null);
+      }
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setLoading(false);
     }
   }, [setSessions]);
+
+  const loadMore = useCallback(async () => {
+    if (!cursor || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const page = await api.sessions.list(cursor);
+      const items = Array.isArray(page?.items) ? page.items : [];
+      // Append, de-duplicating by id (the store may already hold
+      // optimistic/prepended sessions). `setSessions` only accepts a plain
+      // array, so compute the next array from the `sessions` closure value —
+      // matching the existing `deleteSession` pattern below.
+      const seen = new Set(sessions.map((s) => s.id));
+      setSessions([...sessions, ...items.filter((s) => !seen.has(s.id))]);
+      setCursor(page.next_cursor ?? null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [cursor, loadingMore, sessions, setSessions]);
 
   const createSession = useCallback(async (title?: string) => {
     try {
@@ -44,5 +72,17 @@ export function useSessions() {
     }
   }, [sessions, activeSessionId, setSessions, setActiveSession]);
 
-  return { sessions, activeSessionId, loading, error, fetchSessions, createSession, deleteSession, setActiveSession };
+  return {
+    sessions,
+    activeSessionId,
+    loading,
+    error,
+    fetchSessions,
+    createSession,
+    deleteSession,
+    setActiveSession,
+    loadMore,
+    loadingMore,
+    hasMore: cursor !== null,
+  };
 }

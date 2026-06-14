@@ -140,6 +140,98 @@ async def chat(
     )
 
 
+@router.post("/sessions/{session_id}/runs/{run_id}/respond")
+async def respond(
+    session_id: str,
+    run_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> JSONResponse:
+    """Forward a human-in-the-loop response to the orchestrator.
+
+    Body fields:
+    * ``kind``        — required, "confirm" or "answer"
+    * ``tool_call_id``— required, non-empty string
+    * ``confirmed``   — bool or null (for kind=confirm)
+    * ``answer``      — str or null (for kind=answer)
+
+    Returns the orchestrator response verbatim on success.
+    On upstream 409 (run not paused) or 404 (pause expired), the status code
+    and body are relayed as-is so the frontend can handle them explicitly.
+    On upstream errors ≥ 400 the body is relayed with the same status code.
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = request.app.state.settings.session_orchestrator_url
+    body = await request.json()
+
+    # Minimal validation: kind must be "confirm" or "answer", tool_call_id non-empty.
+    # Deeper semantic validation is delegated to the orchestrator.
+    kind = body.get("kind")
+    tool_call_id = body.get("tool_call_id")
+    if kind not in ("confirm", "answer"):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "kind must be 'confirm' or 'answer'"},
+        )
+    if not tool_call_id or not isinstance(tool_call_id, str):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "tool_call_id must be a non-empty string"},
+        )
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        headers = foundation_headers(tenant_id, user_id, access_token)
+        resp = await client.post(
+            f"{orch_url}/sessions/{session_id}/runs/{run_id}/respond",
+            json=body,
+            headers=headers,
+        )
+
+    try:
+        resp_body = resp.json()
+    except Exception:  # noqa: BLE001
+        resp_body = {"detail": "Upstream returned non-JSON response", "status": resp.status_code}
+
+    return JSONResponse(
+        status_code=resp.status_code if resp.status_code < 600 else 502,
+        content=resp_body,
+    )
+
+
+@router.get("/sessions/{session_id}/pending")
+async def pending(
+    session_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> JSONResponse:
+    """Relay the session's currently-paused HITL interactions from the orchestrator.
+
+    The frontend calls this on mount / reconnect to rehydrate ConfirmCard /
+    QuestionCard for a run that paused while the page was closed.  The
+    orchestrator endpoint is best-effort (always 200 with an ``items`` array),
+    so this proxy just relays whatever it returns verbatim.
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = request.app.state.settings.session_orchestrator_url
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        headers = foundation_headers(tenant_id, user_id, access_token)
+        resp = await client.get(
+            f"{orch_url}/sessions/{session_id}/pending",
+            headers=headers,
+        )
+
+    try:
+        resp_body = resp.json()
+    except Exception:  # noqa: BLE001
+        resp_body = {"items": []}
+
+    return JSONResponse(
+        status_code=resp.status_code if resp.status_code < 600 else 502,
+        content=resp_body,
+    )
+
+
 @router.get("/sessions/{session_id}/stream")
 async def stream(
     session_id: str,

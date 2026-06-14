@@ -67,6 +67,7 @@ class TestWebFetchTool:
             tenant_id="tnt-web",
             user_id="usr-web",
             service_scopes="mcp.read_internal,skill.read_internal,web_fetch.invoke",
+            broker_lease="v1.payload.signature",
         )
 
     # ------------------------------------------------------------------
@@ -99,6 +100,7 @@ class TestWebFetchTool:
                 "X-Service-Scopes": (
                     "mcp.read_internal,skill.read_internal,web_fetch.invoke"
                 ),
+                "X-Tool-Broker-Lease": "v1.payload.signature",
             },
             timeout=30.0,
         )

@@ -72,6 +72,32 @@ vi.mock('../api/client', () => ({
       preferences: () => mockNotifPreferences(),
       updatePreferences: () => Promise.resolve({ items: [] }),
     },
+    modelPreferences: {
+      resolve: (purpose: string) =>
+        Promise.resolve({
+          purpose,
+          model_id: 'gpt-4o',
+          provider_id: 'prov_test',
+          source: 'system',
+        }),
+      list: () => Promise.resolve([]),
+      listModels: () => Promise.resolve([]),
+      upsert: () =>
+        Promise.resolve({ purpose: 'llm', model_id: 'gpt-4o', provider_id: 'prov_test' }),
+      delete: () => Promise.resolve(),
+    },
+    featureFlags: {
+      list: () => Promise.resolve([]),
+    },
+    userFlagOverrides: {
+      list: () => Promise.resolve([]),
+      put: () => Promise.resolve({}),
+      delete: () => Promise.resolve(),
+    },
+    pam: {
+      myElevations: () => Promise.resolve([]),
+      requestElevation: () => Promise.resolve({}),
+    },
   },
   ApiError: class ApiError extends Error {
     status: number;

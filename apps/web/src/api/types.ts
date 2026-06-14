@@ -85,6 +85,10 @@ export interface UserProfile {
   display_name: string;
   tenant_id: string;
   roles: string[];
+  /** Effective permission tokens for the current tenant (from /auth/me, merged
+   *  by the BFF via authz /my-permissions). Optional for backward-compat when
+   *  authz is unreachable — the BFF attaches `[]` in that case. */
+  permissions?: string[];
 }
 
 export interface SSEEvent {
@@ -747,12 +751,19 @@ export interface ResolvedDefault {
 export type RoleScope = 'TENANT' | 'ORG_UNIT' | 'TEAM' | 'RESOURCE';
 export type BindingSubjectType = 'USER' | 'TEAM' | 'ORG_UNIT';
 
-/** A role: a named bundle of permission strings, scoped to a level. */
+/** A role: a named bundle of permission strings. */
 export interface AdminRole {
   id: string;
   tenant_id?: string;
+  /** Technical name — lowercase identifier matching ^[a-z][a-z0-9_]{1,99}$. */
   name: string;
+  /** Human-facing label (upstream RoleRead.display_name); may be non-ASCII. */
+  display_name?: string;
   description?: string | null;
+  /**
+   * Legacy/optional: upstream RoleRead does not actually return a scope, so this
+   * is effectively always absent. Kept optional to avoid breaking older callers.
+   */
   scope?: RoleScope;
   permissions?: string[];
   /** System-builtin roles cannot be edited or deleted. */
@@ -761,10 +772,18 @@ export interface AdminRole {
   updated_at?: string;
 }
 
+/**
+ * Matches upstream foundation-authz ``CreateRoleRequest`` (extra="forbid"):
+ *   name          — required, lowercase ^[a-z][a-z0-9_]{1,99}$
+ *   display_name  — required, human-facing (1–200 chars, may be non-ASCII)
+ *   description   — optional
+ *   permissions   — list of permission tokens
+ * No ``scope`` field — upstream rejects unknown keys with 422.
+ */
 export interface CreateRoleRequest {
   name: string;
+  display_name: string;
   description?: string;
-  scope: RoleScope;
   permissions: string[];
 }
 
@@ -1632,6 +1651,48 @@ export interface RecordConsentRequest {
   ip_address?: string | null;
 }
 
+// ─── HITL — human-in-the-loop ────────────────────────────────────────────────
+
+/** Body for POST /sessions/{id}/runs/{runId}/respond */
+export interface RespondBody {
+  kind: 'confirm' | 'answer';
+  tool_call_id: string;
+  confirmed?: boolean | null;
+  answer?: string | null;
+}
+
+/**
+ * A pending HITL interaction awaiting user input.
+ * Kept in the chat store's `pendingInteractions` map (per-session).
+ */
+export interface PendingInteraction {
+  runId: string;
+  toolCallId: string;
+  kind: 'confirm' | 'question';
+  /** Tool name — present when kind === 'confirm' */
+  name?: string;
+  /** Raw JSON string of tool args — present when kind === 'confirm' */
+  args?: string;
+  /** Question text — present when kind === 'question' */
+  question?: string;
+}
+
+/**
+ * One paused HITL interaction returned by GET /sessions/{id}/pending.
+ * Used on mount to rehydrate ConfirmCard / QuestionCard after a refresh.
+ */
+export interface PendingInteractionItem {
+  run_id: string;
+  kind: 'confirm' | 'answer' | 'question';
+  tool_calls: { id: string; name?: string; args?: string }[];
+  question?: string | null;
+  paused_at?: string | null;
+}
+
+export interface PendingInteractionsResponse {
+  items: PendingInteractionItem[];
+}
+
 // ─── Storage admin (→ foundation-lifecycle Phase 7) ─────────────────────────────
 
 export type BucketPurpose = 'audit' | 'workspace' | 'kb_raw' | 'kb_derived';
@@ -1671,6 +1732,46 @@ export interface OrphanReport {
 export interface OrphanReportListResponse {
   items: OrphanReport[];
   next_cursor: string | null;
+}
+
+// ─── Schedules (CronJobs) ─────────────────────────────────────────────────────
+
+export type CronJobStatus = 'ok' | 'error' | 'skipped';
+
+export interface CronJob {
+  id: string;
+  tenant_id: string;
+  app_id: string;
+  name: string;
+  cron_expression: string;
+  timezone: string;
+  input_values: Record<string, unknown>;
+  enabled: boolean;
+  source: string;
+  last_run_at: string | null;
+  next_run_at: string | null;
+  last_status: CronJobStatus | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CronJobCreate {
+  app_id: string;
+  name: string;
+  cron_expression: string;
+  timezone?: string;
+  input_values?: { text?: Record<string, string>; multi?: Record<string, string[]> };
+  enabled?: boolean;
+  source?: string;
+}
+
+export interface CronJobUpdate {
+  name?: string;
+  cron_expression?: string;
+  timezone?: string;
+  input_values?: { text?: Record<string, string>; multi?: Record<string, string[]> };
+  enabled?: boolean;
 }
 
 // Prometheus range-query response (just the slice the admin UI needs).

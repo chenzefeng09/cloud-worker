@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
+import { useChatStore } from '../../stores/chatStore';
+import { isPlatformAdmin } from '../../lib/permissions';
+import { formatDateTimeAuto } from '../../i18n/dates';
 import { useConfirm } from '../components/dialogs';
 import { Dialog } from '../components/Dialog';
 import { CustomSelect } from '../components/CustomSelect';
@@ -11,12 +14,11 @@ import type {
   CreateRoleRequest,
   PermissionDefinition,
   RoleBinding,
-  RoleScope,
 } from '../../api/types';
 
-const SCOPES: RoleScope[] = ['TENANT', 'ORG_UNIT', 'TEAM', 'RESOURCE'];
 const SUBJECT_TYPES: BindingSubjectType[] = ['USER', 'TEAM', 'ORG_UNIT'];
-const ROLE_NAME_RE = /^[A-Z][A-Z0-9_]*$/;
+// Upstream authz requires lowercase role names: ^[a-z][a-z0-9_]{1,99}$.
+const ROLE_NAME_RE = /^[a-z][a-z0-9_]{1,99}$/;
 
 type Tab = 'roles' | 'permissions' | 'bindings';
 
@@ -123,18 +125,19 @@ function CreateRoleForm({
 }) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState('');
+  const [displayName, setDisplayName] = useState('');
   const [description, setDescription] = useState('');
-  const [scope, setScope] = useState<RoleScope>('TENANT');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const nameValid = ROLE_NAME_RE.test(name);
+  const displayNameValid = displayName.trim().length > 0;
 
   const reset = () => {
     setName('');
+    setDisplayName('');
     setDescription('');
-    setScope('TENANT');
     setSelected(new Set());
     setError(null);
   };
@@ -150,7 +153,11 @@ function CreateRoleForm({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!nameValid) {
-      setError('角色名须匹配 ^[A-Z][A-Z0-9_]*$');
+      setError('角色名须匹配 ^[a-z][a-z0-9_]{1,99}$');
+      return;
+    }
+    if (!displayNameValid) {
+      setError('请填写显示名称');
       return;
     }
     setLoading(true);
@@ -158,7 +165,7 @@ function CreateRoleForm({
     try {
       const body: CreateRoleRequest = {
         name: name.trim(),
-        scope,
+        display_name: displayName.trim(),
         permissions: Array.from(selected),
       };
       if (description.trim()) body.description = description.trim();
@@ -173,76 +180,78 @@ function CreateRoleForm({
     }
   };
 
-  if (!open) {
-    return (
+  const close = () => { reset(); setOpen(false); };
+
+  return (
+    <>
       <button
         onClick={() => setOpen(true)}
-        className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90"
+        className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 self-start"
       >
         + 新建角色
       </button>
-    );
-  }
-
-  return (
-    <form
-      onSubmit={handleSubmit}
-      className="border border-line rounded-md p-4 bg-surface flex flex-col gap-3 max-w-lg"
-    >
-      <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-dim">新建角色</div>
-      {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
-      <div className="flex flex-col gap-1">
-        <label className="text-[11px] text-dim font-mono">角色名 (大写/数字/下划线)</label>
-        <input
-          className={`border rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none font-mono ${
-            name && !nameValid ? 'border-accent focus:border-accent' : 'border-line focus:border-accent'
-          }`}
-          value={name}
-          onChange={(e) => setName(e.target.value.toUpperCase())}
-          placeholder="TENANT_ADMIN"
-          required
-        />
-        {name && !nameValid && (
-          <span className="text-[10.5px] text-accent">须以大写字母开头，仅含大写字母/数字/下划线</span>
-        )}
-      </div>
-      <div className="flex flex-col gap-1">
-        <label className="text-[11px] text-dim font-mono">描述 (可选)</label>
-        <input
-          className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-        />
-      </div>
-      <div className="flex flex-col gap-1">
-        <label className="text-[11px] text-dim font-mono">作用域 (Scope)</label>
-        <CustomSelect
-          options={SCOPES.map((s) => ({ value: s, label: s }))}
-          value={scope}
-          onChange={(v) => setScope(v as RoleScope)}
-        />
-      </div>
-      <div className="flex flex-col gap-1">
-        <label className="text-[11px] text-dim font-mono">权限 (从权限目录多选)</label>
-        <PermissionPicker permissions={permissions} selected={selected} onToggle={toggle} />
-      </div>
-      <div className="flex gap-2">
-        <button
-          type="submit"
-          disabled={loading || !nameValid}
-          className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
-        >
-          {loading ? '创建中…' : '创建'}
-        </button>
-        <button
-          type="button"
-          onClick={() => { reset(); setOpen(false); }}
-          className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink"
-        >
-          取消
-        </button>
-      </div>
-    </form>
+      {open && (
+        <Dialog title="新建角色" onClose={close} dismissable={!loading} className="w-full max-w-lg">
+          <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+            {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">角色名 (小写技术标识)</label>
+              <input
+                className={`border rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none font-mono ${
+                  name && !nameValid ? 'border-accent focus:border-accent' : 'border-line focus:border-accent'
+                }`}
+                value={name}
+                onChange={(e) => setName(e.target.value.toLowerCase())}
+                placeholder="kb_editor"
+                required
+              />
+              {name && !nameValid && (
+                <span className="text-[10.5px] text-accent">须以小写字母开头，仅含小写字母/数字/下划线</span>
+              )}
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">显示名称</label>
+              <input
+                className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
+                value={displayName}
+                onChange={(e) => setDisplayName(e.target.value)}
+                placeholder="知识库编辑员"
+                required
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">描述 (可选)</label>
+              <input
+                className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">权限 (从权限目录多选)</label>
+              <PermissionPicker permissions={permissions} selected={selected} onToggle={toggle} />
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={close}
+                disabled={loading}
+                className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                disabled={loading || !nameValid || !displayNameValid}
+                className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
+              >
+                {loading ? '创建中…' : '创建'}
+              </button>
+            </div>
+          </form>
+        </Dialog>
+      )}
+    </>
   );
 }
 
@@ -293,7 +302,7 @@ function EditRolePermissions({
 
   return (
     <Dialog
-      title={`编辑权限 · ${role.name}`}
+      title={`编辑权限 · ${role.display_name || role.name}`}
       onClose={onClose}
       dismissable={!loading}
       className="w-full max-w-lg"
@@ -342,7 +351,7 @@ function RolesTab({
 
   const handleDelete = async (role: AdminRole) => {
     if (role.is_system) return;
-    if (!(await confirm({ title: '删除角色', message: `确定删除角色「${role.name}」吗？`, tone: 'danger', confirmText: '删除' }))) return;
+    if (!(await confirm({ title: '删除角色', message: `确定删除角色「${role.display_name || role.name}」吗？`, tone: 'danger', confirmText: '删除' }))) return;
     setDeleting(role.id);
     onError('');
     try {
@@ -366,7 +375,6 @@ function RolesTab({
             <thead className="bg-paper-2 border-b border-line">
               <tr>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">名称</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">作用域</th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">权限数</th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">类型</th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">操作</th>
@@ -375,8 +383,12 @@ function RolesTab({
             <tbody>
               {roles.map((r) => (
                 <tr key={r.id} className="border-b border-line-2 hover:bg-paper-2 transition-colors">
-                  <td className="px-3 py-2 text-[13px] text-ink font-mono">{r.name}</td>
-                  <td className="px-3 py-2 font-mono text-[11px] text-ink-2">{r.scope ?? '—'}</td>
+                  <td className="px-3 py-2">
+                    <div className="text-[13px] text-ink">{r.display_name || r.name}</div>
+                    {r.display_name && (
+                      <div className="font-mono text-[10.5px] text-dim mt-0.5">{r.name}</div>
+                    )}
+                  </td>
                   <td className="px-3 py-2 font-mono text-[12px] text-dim">{r.permissions?.length ?? 0}</td>
                   <td className="px-3 py-2">
                     {r.is_system ? (
@@ -622,86 +634,86 @@ function CreateBindingForm({
     }
   };
 
-  if (!open) {
-    return (
+  const close = () => { reset(); setOpen(false); };
+
+  return (
+    <>
       <button
         onClick={() => setOpen(true)}
-        className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90"
+        className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 self-start"
       >
         + 新建绑定
       </button>
-    );
-  }
-
-  return (
-    <form
-      onSubmit={handleSubmit}
-      className="border border-line rounded-md p-4 bg-surface flex flex-col gap-3 max-w-md"
-    >
-      <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-dim">新建角色绑定</div>
-      {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
-      <div className="grid grid-cols-2 gap-3">
-        <div className="flex flex-col gap-1">
-          <label className="text-[11px] text-dim font-mono">主体类型</label>
-          <CustomSelect
-            options={SUBJECT_TYPES.map((s) => ({ value: s, label: s }))}
-            value={subjectType}
-            onChange={(v) => setSubjectType(v as BindingSubjectType)}
-          />
-        </div>
-        <div className="flex flex-col gap-1">
-          <label className="text-[11px] text-dim font-mono">角色</label>
-          <CustomSelect
-            options={[{ value: '', label: '— 选择角色 —' }, ...roles.map((r) => ({ value: r.id, label: r.name }))]}
-            value={roleId}
-            onChange={(v) => setRoleId(v)}
-          />
-        </div>
-      </div>
-      <div className="flex flex-col gap-1">
-        <label className="text-[11px] text-dim font-mono">主体 ID</label>
-        <input
-          className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
-          value={subjectId}
-          onChange={(e) => setSubjectId(e.target.value)}
-          placeholder="user-id / team-id / org-unit-id"
-          required
-        />
-      </div>
-      <div className="flex flex-col gap-1">
-        <label className="text-[11px] text-dim font-mono">过期时间 (可选 · 临时授权)</label>
-        <input
-          type="datetime-local"
-          className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
-          value={expiresAt}
-          onChange={(e) => setExpiresAt(e.target.value)}
-        />
-      </div>
-      <div className="flex flex-col gap-1">
-        <label className="text-[11px] text-dim font-mono">原因 (可选)</label>
-        <input
-          className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
-          value={reason}
-          onChange={(e) => setReason(e.target.value)}
-        />
-      </div>
-      <div className="flex gap-2">
-        <button
-          type="submit"
-          disabled={loading || !subjectId.trim() || !roleId}
-          className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
-        >
-          {loading ? '创建中…' : '创建'}
-        </button>
-        <button
-          type="button"
-          onClick={() => { reset(); setOpen(false); }}
-          className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink"
-        >
-          取消
-        </button>
-      </div>
-    </form>
+      {open && (
+        <Dialog title="新建角色绑定" onClose={close} dismissable={!loading} className="w-full max-w-md">
+          <form onSubmit={handleSubmit} className="flex flex-col gap-3">
+            {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
+            <div className="grid grid-cols-2 gap-3">
+              <div className="flex flex-col gap-1">
+                <label className="text-[11px] text-dim font-mono">主体类型</label>
+                <CustomSelect
+                  options={SUBJECT_TYPES.map((s) => ({ value: s, label: s }))}
+                  value={subjectType}
+                  onChange={(v) => setSubjectType(v as BindingSubjectType)}
+                />
+              </div>
+              <div className="flex flex-col gap-1">
+                <label className="text-[11px] text-dim font-mono">角色</label>
+                <CustomSelect
+                  options={[{ value: '', label: '— 选择角色 —' }, ...roles.map((r) => ({ value: r.id, label: r.display_name || r.name }))]}
+                  value={roleId}
+                  onChange={(v) => setRoleId(v)}
+                />
+              </div>
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">主体 ID</label>
+              <input
+                className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
+                value={subjectId}
+                onChange={(e) => setSubjectId(e.target.value)}
+                placeholder="user-id / team-id / org-unit-id"
+                required
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">过期时间 (可选 · 临时授权)</label>
+              <input
+                type="datetime-local"
+                className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
+                value={expiresAt}
+                onChange={(e) => setExpiresAt(e.target.value)}
+              />
+            </div>
+            <div className="flex flex-col gap-1">
+              <label className="text-[11px] text-dim font-mono">原因 (可选)</label>
+              <input
+                className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
+                value={reason}
+                onChange={(e) => setReason(e.target.value)}
+              />
+            </div>
+            <div className="flex items-center justify-end gap-2 pt-1">
+              <button
+                type="button"
+                onClick={close}
+                disabled={loading}
+                className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
+              >
+                取消
+              </button>
+              <button
+                type="submit"
+                disabled={loading || !subjectId.trim() || !roleId}
+                className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
+              >
+                {loading ? '创建中…' : '创建'}
+              </button>
+            </div>
+          </form>
+        </Dialog>
+      )}
+    </>
   );
 }
 
@@ -719,7 +731,10 @@ function BindingsTab({
   onError: (m: string) => void;
 }) {
   const [deleting, setDeleting] = useState<string | null>(null);
-  const roleName = (id?: string) => roles.find((r) => r.id === id)?.name ?? id ?? '—';
+  const roleName = (id?: string) => {
+    const r = roles.find((x) => x.id === id);
+    return r?.display_name || r?.name || id || '—';
+  };
   const confirm = useConfirm();
 
   const handleDelete = async (b: RoleBinding) => {
@@ -763,7 +778,7 @@ function BindingsTab({
                   <td className="px-3 py-2 font-mono text-[12px] text-ink">{roleName(b.role_id)}</td>
                   <td className="px-3 py-2 font-mono text-[11px] text-dim">
                     {b.expires_at ? (
-                      <span className="text-amber-700">{new Date(b.expires_at).toLocaleString('zh-CN')}</span>
+                      <span className="text-amber-700">{formatDateTimeAuto(new Date(b.expires_at))}</span>
                     ) : (
                       '永久'
                     )}
@@ -792,6 +807,12 @@ function BindingsTab({
 export function RbacPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading, selectedTenantId, setSelectedTenantId } =
     useAdminStore();
+  const userProfile = useChatStore((s) => s.userProfile);
+  // Platform admins may pick any tenant; tenant admins are locked to their own
+  // tenant (selectedTenantId stays null → BFF omits ?tenant_id= → own tenant).
+  const canSwitchTenant = isPlatformAdmin(userProfile?.permissions);
+  const ownTenantName =
+    tenants.find((t) => t.id === userProfile?.tenant_id)?.name ?? userProfile?.tenant_id ?? '当前租户';
 
   const [tab, setTab] = useState<Tab>('roles');
   const [roles, setRoles] = useState<AdminRole[]>([]);
@@ -837,6 +858,14 @@ export function RbacPage() {
     }
   }, [selectedTenantId]);
 
+  // Tenant admins must never carry a cross-tenant selection (the adminStore is
+  // shared and could hold a stale id from a prior platform-admin session).
+  useEffect(() => {
+    if (!canSwitchTenant && selectedTenantId !== null) {
+      setSelectedTenantId(null);
+    }
+  }, [canSwitchTenant, selectedTenantId, setSelectedTenantId]);
+
   useEffect(() => {
     load();
   }, [load]);
@@ -854,16 +883,25 @@ export function RbacPage() {
         <p className="text-[12px] text-dim mt-0.5">管理 RBAC 角色、权限目录与角色绑定</p>
       </div>
 
-      {/* Tenant selector */}
+      {/* Tenant selector — only platform admins may switch; tenant admins are
+          locked to their own tenant (shown read-only). */}
       <div className="flex items-center gap-3">
-        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
-        <CustomSelect
-          options={[{ value: '', label: '（默认 / 当前租户）' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
-          value={selectedTenantId ?? ''}
-          onChange={(v) => setSelectedTenantId(v || null)}
-          disabled={tenantsLoading}
-          className="min-w-[200px]"
-        />
+        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">
+          {canSwitchTenant ? '选择租户' : '当前租户'}
+        </label>
+        {canSwitchTenant ? (
+          <CustomSelect
+            options={[{ value: '', label: '（默认 / 当前租户）' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+            value={selectedTenantId ?? ''}
+            onChange={(v) => setSelectedTenantId(v || null)}
+            disabled={tenantsLoading}
+            className="min-w-[200px]"
+          />
+        ) : (
+          <span className="min-w-[200px] text-[13px] text-ink font-mono px-3 py-1.5 rounded-sm border border-line bg-surface">
+            {ownTenantName}
+          </span>
+        )}
       </div>
 
       {/* Tabs */}

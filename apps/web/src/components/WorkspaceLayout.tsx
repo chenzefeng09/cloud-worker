@@ -5,17 +5,16 @@ import { useChatStore } from '../stores/chatStore';
 import { WorkspaceProvider } from '../lib/workspaceContext';
 import { Sidebar } from './shell/Sidebar';
 import { HomePage } from '../pages/HomePage';
-import { TasksPage } from '../pages/TasksPage';
 import { AgentPage } from '../pages/AgentPage';
 import { AppRunPage } from '../pages/AppRunPage';
 import { AppResultPage } from '../pages/AppResultPage';
 import { AppEditorPage } from '../pages/AppEditorPage';
 import { FilesPage } from '../pages/FilesPage';
 import { LibraryPage } from '../pages/LibraryPage';
-import { FleetPage } from '../pages/FleetPage';
+import { SchedulesPage } from '../pages/SchedulesPage';
 import { WorkspacePage } from '../pages/WorkspacePage';
 import { ProfilePage } from '../pages/ProfilePage';
-import { AdminLayout } from '../admin/AdminLayout';
+import { AdminLayout, canAccessAdmin } from '../admin/AdminLayout';
 
 /**
  * Authenticated app shell: sidebar + routed main view. WorkspaceProvider lives
@@ -24,23 +23,24 @@ import { AdminLayout } from '../admin/AdminLayout';
  * cloud-worker-specific state.
  *
  * The route table is kept flat and mirrors the cloud-worker hash routes:
- *   /home /tasks /tasks/:id /files /library /fleet /workspace
+ *   /home /tasks/:id /files /library /workspace
  * Anything else falls back to /home.
  */
 export function WorkspaceLayout() {
   const userProfile = useChatStore((s) => s.userProfile);
-  const isSuperAdmin = userProfile?.roles?.includes('super_admin') ?? false;
+  const canAdmin = canAccessAdmin(userProfile?.permissions);
 
   return (
     <WorkspaceProvider>
       <div className="h-screen flex bg-paper">
         <SessionsBootstrap />
         <Routes>
-          {/* Admin shell — only super_admin may access /admin/* */}
+          {/* Admin shell — accessible to anyone holding at least one admin
+              module permission (platform admins see everything). */}
           <Route
             path="/admin/*"
             element={
-              isSuperAdmin ? (
+              canAdmin ? (
                 <div className="flex-1 flex min-w-0 h-full">
                   <AdminLayout />
                 </div>
@@ -58,7 +58,6 @@ export function WorkspaceLayout() {
                 <main className="flex-1 flex flex-col min-w-0">
                   <Routes>
                     <Route path="/home" element={<HomePage />} />
-                    <Route path="/tasks" element={<TasksPage />} />
                     <Route path="/tasks/:id" element={<AgentPage />} />
                     {/* App routes — static/longer paths first so react-router v6
                         ranking never lets `/apps/:id` shadow `/apps/new` etc. */}
@@ -66,9 +65,9 @@ export function WorkspaceLayout() {
                     <Route path="/apps/runs/:sessionId/:runId" element={<AppResultPage />} />
                     <Route path="/apps/:id/edit" element={<AppEditorPage />} />
                     <Route path="/apps/:id" element={<AppRunPage />} />
+                    <Route path="/schedules" element={<SchedulesPage />} />
                     <Route path="/files" element={<FilesPage />} />
                     <Route path="/library" element={<LibraryPage />} />
-                    <Route path="/fleet" element={<FleetPage />} />
                     <Route path="/workspace" element={<WorkspacePage />} />
                     <Route path="/profile" element={<ProfilePage />} />
                     <Route path="*" element={<Navigate to="/home" replace />} />

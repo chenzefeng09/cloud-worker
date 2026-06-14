@@ -22,17 +22,50 @@ Notes on the foundation surface
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Environments where a weak/placeholder broker lease secret is tolerated.
+# Anything else (prod/production/staging/...) must supply a strong secret when
+# the scheduler signs broker leases, or it refuses to start.
+_DEV_LIKE_ENVS = frozenset({"dev", "test", "local"})
+
+_LEASE_SECRET_PLACEHOLDER = "dev-tool-broker-lease-secret-change-me"
+
+
+def _lease_secret_is_weak(secret: str) -> bool:
+    """Return ``True`` when ``secret`` is empty, a placeholder, or too short."""
+    value = secret or ""
+    lowered = value.lower()
+    return (
+        not value
+        or value == _LEASE_SECRET_PLACEHOLDER
+        or "change-me" in lowered
+        or "replace_me" in lowered
+        or len(value) < 32
+    )
+
 # Smallest scope set that lets the in-sandbox AgentScope worker do useful
-# work: call the LLM gateway, write audit events for tool calls, and
-# dispatch notifications.  Expanding this list is a code change, on purpose.
+# work.  Expanding this list is a code change, on purpose.
+#
+# Security fix B7 (least privilege) — ``notification.send`` was removed: it was
+# a dead capability in the sandbox token.  Nothing in the sandbox/worker path
+# consumes it (no ``notification``/``notify`` caller in agentscope_ext), there
+# is no tool-broker route that proxies to a notification service, and it is not
+# in ``egress_policy.BROKER_LEASE_SCOPES``.  Carrying it only widened the
+# token's blast radius if leaked, for zero functional benefit.
+#
+# ``audit.write`` is deliberately KEPT: the ``event_audit_sink`` worker
+# extension (default-enabled via ``runtime_extensions``) POSTs each agent event
+# directly to ``{FOUNDATION_API_URL}/audit/v1/events`` carrying this minted
+# token.  That direct call is air-gapped (and silently fails open) in ``broker``
+# egress mode, but in ``foundation`` egress mode the sandbox shares the
+# foundation network and the audit service genuinely enforces ``audit.write``.
+# Dropping it would break audit forwarding in foundation mode, so it stays.
 SANDBOX_TOKEN_SCOPES: tuple[str, ...] = (
     "audit.write",
     "llm-gateway.invoke",
-    "notification.send",
 )
 
 # Comma-separated X-Service-Scopes value the scheduler injects into the sandbox
@@ -93,6 +126,15 @@ class Settings(BaseSettings):
     runtime: str = "docker"
     cube_controller_url: str = ""  # required when runtime="cube"
 
+    # CubeVS egress allowlist (CIDRs) applied to broker-mode microVMs via the
+    # E2B ``allow_out`` field. Must contain the tool-broker ClusterIP/32 and the
+    # cluster DNS ClusterIP/32 — resolve per cluster (kubectl get svc ap-tool-broker
+    # / kube-dns) as documented in deploy/cube/README.md. Comma-separated.
+    # Empty in broker mode is a deployment error (see the spawn guard): an empty
+    # allow_out with allow_internet_access=false air-gaps the sandbox so it cannot
+    # even reach the broker. Only consumed by the cube runtime; docker ignores it.
+    cube_sandbox_allow_out: str = ""
+
     # mTLS to the CubeSandbox controller — see ADR 0001 §5 "trust boundary
     # between scheduler and CubeProxy".  Modes:
     #   * "mtls" (default, production): present a client cert *and* verify
@@ -137,6 +179,26 @@ class Settings(BaseSettings):
     llm_base_url: str = ""
     workspace_base: str = "/var/agent-platform/workspaces"
     docker_network: str = "saas-foundation-dev_foundation"
+    # Sandbox egress policy:
+    #   foundation — legacy/dev compatibility: sandbox joins the foundation net.
+    #   broker     — sandbox joins only sandbox_broker_network and must use
+    #                TOOL_BROKER_URL façades for LLM/MCP/WebFetch/etc.
+    #   none       — Docker network is disabled; only local filesystem tools work.
+    sandbox_egress_mode: Literal["foundation", "broker", "none"] = "broker"
+    # FIX B6 — ``foundation`` egress joins the shared foundation network, giving
+    # the sandbox direct (un-brokered) reach to internal services and, depending
+    # on the network, the internet.  That "silent open" posture is fine for
+    # dev/test/local but unsafe in prod, so outside dev-like envs it requires an
+    # EXPLICIT opt-in via this flag (see the spawn-time guard in
+    # ``DockerRuntime._assert_foundation_egress_allowed``).  Default ``broker``
+    # mode is unaffected.
+    allow_insecure_foundation_egress: bool = False
+    sandbox_broker_network: str = "agent-platform-dev_sandbox_broker"
+    tool_broker_url: str = "http://tool-broker:8024/api/tool-broker/v1"
+    # HMAC secret shared with tool-broker for per-run capability leases. In
+    # broker mode the scheduler signs a short-lived lease, the worker snapshots
+    # it, then removes it from process env before Bash/MCP subprocesses run.
+    tool_broker_lease_secret: str = "dev-tool-broker-lease-secret-change-me"
 
     # Stage-2 block B: content-addressed cache for materialised skill blobs.
     # The scheduler resolves a run's skill names via skill-store, downloads
@@ -225,3 +287,25 @@ class Settings(BaseSettings):
     # ``GET /runs`` proxies the orchestrator's tenant-scoped runs list endpoint
     # (GET {url}/runs) forwarding the caller's X-Tenant-Id / X-User-Id.
     session_orchestrator_url: str = "http://session-orchestrator:8006/api/session/v1"
+
+    def model_post_init(self, __context: Any) -> None:
+        """Fail closed on a weak broker lease secret in broker egress mode.
+
+        The scheduler signs the per-run capability leases that tool-broker
+        validates; a placeholder/weak ``tool_broker_lease_secret`` would let a
+        sandbox forge its own leases.  Only enforced when egress actually runs
+        through the broker (``sandbox_egress_mode == "broker"``) — in the other
+        modes the secret is unused, so a placeholder must not block startup —
+        and only outside dev-like environments.
+        """
+        if (
+            self.sandbox_egress_mode == "broker"
+            and self.env not in _DEV_LIKE_ENVS
+            and _lease_secret_is_weak(self.tool_broker_lease_secret)
+        ):
+            raise ValueError(
+                "SCHEDULER_TOOL_BROKER_LEASE_SECRET must be a strong secret "
+                "(>= 32 chars, no placeholder) when the scheduler runs in "
+                "broker egress mode outside dev. Generate one with: "
+                'python -c "import secrets; print(secrets.token_urlsafe(48))"'
+            )

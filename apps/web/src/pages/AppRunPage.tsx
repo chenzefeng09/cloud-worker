@@ -2,11 +2,12 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { PageHead } from '../components/shell/PageHead';
 import { Chip } from '../components/shell/Chip';
-import { Dropdown } from '../components/shell/Dropdown';
 import { api, ApiError } from '../api/client';
-import type { App, AppVersion, Attachment, InputField } from '../api/types';
+import type { App, AppVersion, InputField } from '../api/types';
 import { modelLabel, effortLabel } from '../lib/modelOptions';
 import { useCanUploadAttachment } from '../hooks/useCanUploadAttachment';
+import { SchemaForm } from '../components/form/SchemaForm';
+import type { SchemaFormValue } from '../components/form/SchemaForm';
 
 /** Resolve the published version of an App (the one current_version_id points at). */
 function resolvePublishedVersion(app: App | null): AppVersion | null {
@@ -25,8 +26,6 @@ function humanSize(bytes: number): string {
   return `${bytes} B`;
 }
 
-const isImage = (mime: string) => mime.startsWith('image/');
-
 export function AppRunPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
@@ -38,9 +37,11 @@ export function AppRunPage() {
 
   // Per-field form state. text/textarea/select hold a string; multiselect holds
   // string[]; file holds Attachment[] (uploaded to the draft session).
-  const [textValues, setTextValues] = useState<Record<string, string>>({});
-  const [multiValues, setMultiValues] = useState<Record<string, string[]>>({});
-  const [fileValues, setFileValues] = useState<Record<string, Attachment[]>>({});
+  const [formValue, setFormValue] = useState<SchemaFormValue>({
+    text: {},
+    multi: {},
+    file: {},
+  });
 
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [uploadingKey, setUploadingKey] = useState<string | null>(null);
@@ -49,8 +50,6 @@ export function AppRunPage() {
 
   // One draft session shared by all file uploads + the final run call.
   const sessionRef = useRef<string | null>(null);
-  // One hidden <input type=file> per field key.
-  const fileInputsRef = useRef<Record<string, HTMLInputElement | null>>({});
 
   const version = useMemo(() => resolvePublishedVersion(app), [app]);
   const schema: InputField[] = version?.input_schema ?? [];
@@ -71,17 +70,16 @@ export function AppRunPage() {
         // Pre-fill defaults from the resolved version's schema.
         const v = resolvePublishedVersion(a);
         if (v) {
-          const tv: Record<string, string> = {};
-          const mv: Record<string, string[]> = {};
+          const text: Record<string, string> = {};
+          const multi: Record<string, string[]> = {};
           for (const f of v.input_schema ?? []) {
             if (f.type === 'multiselect') {
-              mv[f.key] = Array.isArray(f.default) ? f.default : [];
+              multi[f.key] = Array.isArray(f.default) ? f.default : [];
             } else if (f.type !== 'file') {
-              tv[f.key] = typeof f.default === 'string' ? f.default : '';
+              text[f.key] = typeof f.default === 'string' ? f.default : '';
             }
           }
-          setTextValues(tv);
-          setMultiValues(mv);
+          setFormValue({ text, multi, file: {} });
         }
       })
       .catch((e) => {
@@ -151,9 +149,12 @@ export function AppRunPage() {
           return;
         }
         const att = await api.attachments.upload(sid, file);
-        setFileValues((prev) => {
-          const existing = single ? [] : prev[field.key] ?? [];
-          return { ...prev, [field.key]: [...existing, att] };
+        setFormValue((prev) => {
+          const existing = single ? [] : prev.file[field.key] ?? [];
+          return {
+            ...prev,
+            file: { ...prev.file, [field.key]: [...existing, att] },
+          };
         });
       }
     } catch (err) {
@@ -161,42 +162,33 @@ export function AppRunPage() {
       console.warn('app input upload failed', err);
     } finally {
       setUploadingKey(null);
-      const el = fileInputsRef.current[field.key];
-      if (el) el.value = '';
     }
   };
 
-  const removeFile = (key: string, attId: string) => {
-    setFileValues((prev) => ({
+  const handleFileRemove = (_field: InputField, attId: string) => {
+    setFormValue((prev) => ({
       ...prev,
-      [key]: (prev[key] ?? []).filter((a) => a.id !== attId),
+      file: {
+        ...prev.file,
+        [_field.key]: (prev.file[_field.key] ?? []).filter((a) => a.id !== attId),
+      },
     }));
-  };
-
-  const toggleMulti = (key: string, value: string) => {
-    setMultiValues((prev) => {
-      const cur = prev[key] ?? [];
-      return {
-        ...prev,
-        [key]: cur.includes(value) ? cur.filter((v) => v !== value) : [...cur, value],
-      };
-    });
   };
 
   const validate = (): boolean => {
     const errs: Record<string, string> = {};
     for (const f of schema) {
       if (f.type === 'file') {
-        const files = fileValues[f.key] ?? [];
+        const files = formValue.file[f.key] ?? [];
         const hasDefault = typeof f.default === 'string' && f.default.trim() !== '';
         if (f.required && files.length === 0 && !hasDefault) errs[f.key] = '此项为必填。';
       } else if (f.type === 'multiselect') {
-        const vals = multiValues[f.key] ?? [];
+        const vals = formValue.multi[f.key] ?? [];
         const allowed = new Set((f.options ?? []).map((o) => o.value));
         if (f.required && vals.length === 0) errs[f.key] = '此项为必填。';
         else if (vals.some((v) => !allowed.has(v))) errs[f.key] = '存在无效的选项。';
       } else {
-        const val = (textValues[f.key] ?? '').trim();
+        const val = (formValue.text[f.key] ?? '').trim();
         if (f.required && !val) errs[f.key] = '此项为必填。';
         else if (f.type === 'select' && val) {
           const allowed = new Set((f.options ?? []).map((o) => o.value));
@@ -218,12 +210,12 @@ export function AppRunPage() {
       const fileInputs: Record<string, string[]> = {};
       for (const f of schema) {
         if (f.type === 'file') {
-          const files = fileValues[f.key] ?? [];
+          const files = formValue.file[f.key] ?? [];
           if (files.length) fileInputs[f.key] = files.map((a) => a.id);
         } else if (f.type === 'multiselect') {
-          inputs[f.key] = multiValues[f.key] ?? [];
+          inputs[f.key] = formValue.multi[f.key] ?? [];
         } else {
-          inputs[f.key] = textValues[f.key] ?? '';
+          inputs[f.key] = formValue.text[f.key] ?? '';
         }
       }
       const res = await api.apps.run(id, {
@@ -349,147 +341,16 @@ export function AppRunPage() {
 
           <div className="h-px bg-line" />
 
-          {/* Dynamic form */}
-          <div className="flex flex-col gap-5">
-            {schema.length === 0 && (
-              <div className="font-mono italic text-dim text-[12px]">该应用无需输入，直接执行即可。</div>
-            )}
-            {schema.map((field) => {
-              const err = fieldErrors[field.key];
-              return (
-                <div key={field.key} className="flex flex-col gap-1.5">
-                  <label className="text-[13px] font-medium text-ink">
-                    {field.label}
-                    {field.required && <span className="text-accent ml-1">*</span>}
-                  </label>
-                  {field.help && (
-                    <div className="text-[11.5px] text-dim leading-[1.45] -mt-0.5">{field.help}</div>
-                  )}
-
-                  {field.type === 'text' && (
-                    <input
-                      type="text"
-                      value={textValues[field.key] ?? ''}
-                      onChange={(e) =>
-                        setTextValues((p) => ({ ...p, [field.key]: e.target.value }))
-                      }
-                      className="w-full bg-surface border border-line rounded-md px-3 py-2 text-[14px] text-ink outline-none focus:border-ink-2"
-                    />
-                  )}
-
-                  {field.type === 'textarea' && (
-                    <textarea
-                      value={textValues[field.key] ?? ''}
-                      onChange={(e) =>
-                        setTextValues((p) => ({ ...p, [field.key]: e.target.value }))
-                      }
-                      className="w-full min-h-[110px] resize-y bg-surface border border-line rounded-md px-3 py-2 text-[14px] leading-[1.5] text-ink outline-none focus:border-ink-2"
-                    />
-                  )}
-
-                  {field.type === 'select' && (
-                    <div className="flex items-center gap-2 bg-surface border border-line rounded-md px-3 py-2">
-                      <span className="text-[13px] text-ink flex-1 truncate">
-                        {(field.options ?? []).find((o) => o.value === textValues[field.key])
-                          ?.label || <span className="text-dim">请选择…</span>}
-                      </span>
-                      <Dropdown
-                        value={textValues[field.key] ?? ''}
-                        options={(field.options ?? []).map((o) => ({ id: o.value, label: o.label }))}
-                        onChange={(v) => setTextValues((p) => ({ ...p, [field.key]: v }))}
-                        align="left"
-                        title={field.label}
-                      />
-                    </div>
-                  )}
-
-                  {field.type === 'multiselect' && (
-                    <div className="flex flex-wrap gap-1.5">
-                      {(field.options ?? []).map((o) => {
-                        const on = (multiValues[field.key] ?? []).includes(o.value);
-                        return (
-                          <Chip
-                            key={o.value}
-                            accent={on}
-                            dashed={!on}
-                            onClick={() => toggleMulti(field.key, o.value)}
-                          >
-                            {o.label}
-                          </Chip>
-                        );
-                      })}
-                    </div>
-                  )}
-
-                  {field.type === 'file' && (
-                    <div className="flex flex-col gap-1.5">
-                      <input
-                        ref={(el) => {
-                          fileInputsRef.current[field.key] = el;
-                        }}
-                        type="file"
-                        multiple={!!field.file?.multiple}
-                        accept={(field.file?.accept ?? []).join(',')}
-                        className="hidden"
-                        onChange={(e) =>
-                          handleFilePick(field, Array.from(e.target.files || []))
-                        }
-                        disabled={uploadingKey === field.key}
-                      />
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() => fileInputsRef.current[field.key]?.click()}
-                          disabled={uploadingKey === field.key}
-                          className="cw-btn cw-btn-ghost cw-btn-sm disabled:opacity-50"
-                        >
-                          <span className="font-mono">⊕</span> 选择文件
-                        </button>
-                        {uploadingKey === field.key && (
-                          <span className="font-mono text-[11px] text-dim animate-pulse">
-                            上传中…
-                          </span>
-                        )}
-                        {field.file?.max_size_bytes && (
-                          <span className="font-mono text-[10.5px] text-dim">
-                            ≤ {humanSize(field.file.max_size_bytes)}
-                          </span>
-                        )}
-                        {typeof field.default === 'string' && field.default && (
-                          <span className="font-mono text-[10.5px] text-dim truncate">
-                            默认 {field.default}
-                          </span>
-                        )}
-                      </div>
-                      {(fileValues[field.key] ?? []).length > 0 && (
-                        <div className="flex flex-wrap gap-1.5">
-                          {(fileValues[field.key] ?? []).map((att) => (
-                            <div
-                              key={att.id}
-                              className="flex items-center gap-1 px-2 py-1 border border-line rounded-md text-[11px] bg-surface"
-                            >
-                              <span className="text-ink-2">{isImage(att.mime) ? '🖼' : '📎'}</span>
-                              <span className="max-w-[160px] truncate text-ink">{att.filename}</span>
-                              <button
-                                type="button"
-                                onClick={() => removeFile(field.key, att.id)}
-                                className="font-mono text-dim hover:text-ink ml-0.5 leading-none"
-                                aria-label="移除附件"
-                              >
-                                ×
-                              </button>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  {err && <div className="text-[11.5px] text-accent">{err}</div>}
-                </div>
-              );
-            })}
-          </div>
+          {/* Dynamic form — delegated to SchemaForm */}
+          <SchemaForm
+            schema={schema}
+            value={formValue}
+            onChange={setFormValue}
+            errors={fieldErrors}
+            onFilePick={handleFilePick}
+            onFileRemove={handleFileRemove}
+            uploadingKey={uploadingKey}
+          />
 
           {submitError && (
             <div className="px-3 py-2 border border-accent-line bg-accent-soft rounded-md text-[12.5px] text-accent">

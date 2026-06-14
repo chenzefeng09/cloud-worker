@@ -674,3 +674,251 @@ def test_org_unit_delete_not_empty_surfaces_reason_and_user_message(
     assert body["detail"]["detail"]["code"] == "FOUNDATION.ORG.STATE.NOT_EMPTY"
     # … and the failed archive must short-circuit before any DELETE.
     assert not any(m == "DELETE" for (m, _u) in seen)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Binding field translation (anti-corruption layer)
+#
+# The admin SPA speaks subject_type / subject_id / reason / scope_resource_id;
+# foundation-authz's CreateBindingRequest is ``extra="forbid"`` and wants
+# principal_kind / principal_id / grant_reason / scope_id (+ scope_kind).  The
+# BFF must translate both directions, else every create 422s.
+# ──────────────────────────────────────────────────────────────────────────────
+
+from agent_bff.api.v1.admin_authz import _binding_in, _binding_out  # noqa: E402
+
+_ROLE_ID = "rol_01J5TEST0000000000000ROLE1"
+_BND_ID = "rbd_01J5TEST00000000000000BND1"
+_TENANT = "tnt_01J5TEST00000000000000TNT1"
+
+
+def test_binding_in_translates_keys_and_strips_frontend_vocabulary() -> None:
+    out = _binding_in(
+        {
+            "subject_type": "USER",
+            "subject_id": "usr_alice",
+            "role_id": _ROLE_ID,
+            "reason": "promotion",
+        }
+    )
+    # upstream vocabulary present …
+    assert out["principal_kind"] == "USER"
+    assert out["principal_id"] == "usr_alice"
+    assert out["grant_reason"] == "promotion"
+    assert out["role_id"] == _ROLE_ID
+    # … and the front-end vocabulary is gone (would trip extra="forbid").
+    assert "subject_type" not in out
+    assert "subject_id" not in out
+    assert "reason" not in out
+    assert "scope_resource_id" not in out
+
+
+def test_binding_in_scope_kind_resource_when_scope_present() -> None:
+    out = _binding_in(
+        {
+            "subject_type": "TEAM",
+            "subject_id": "tm_1",
+            "role_id": _ROLE_ID,
+            "scope_resource_id": "res_42",
+        }
+    )
+    assert out["scope_id"] == "res_42"
+    assert out["scope_kind"] == "RESOURCE"
+
+
+def test_binding_in_scope_kind_tenant_when_no_scope() -> None:
+    out = _binding_in(
+        {"subject_type": "USER", "subject_id": "usr_alice", "role_id": _ROLE_ID}
+    )
+    assert out["scope_kind"] == "TENANT"
+    assert "scope_id" not in out
+
+
+def test_binding_in_empty_reason_omitted() -> None:
+    """An untouched (empty / blank) reason field must NOT become grant_reason."""
+    assert "grant_reason" not in _binding_in(
+        {"subject_type": "USER", "subject_id": "u", "role_id": _ROLE_ID, "reason": ""}
+    )
+    assert "grant_reason" not in _binding_in(
+        {"subject_type": "USER", "subject_id": "u", "role_id": _ROLE_ID, "reason": "   "}
+    )
+
+
+def test_binding_in_omits_none_and_missing_keys() -> None:
+    out = _binding_in(
+        {
+            "subject_type": "USER",
+            "subject_id": "u",
+            "role_id": _ROLE_ID,
+            "scope_resource_id": None,
+            "expires_at": None,
+        }
+    )
+    assert "scope_id" not in out
+    assert "expires_at" not in out
+    assert out["scope_kind"] == "TENANT"  # None scope ⇒ tenant-wide
+
+
+def test_binding_in_carries_expires_at() -> None:
+    out = _binding_in(
+        {
+            "subject_type": "USER",
+            "subject_id": "u",
+            "role_id": _ROLE_ID,
+            "expires_at": "2026-12-31T00:00:00Z",
+        }
+    )
+    assert out["expires_at"] == "2026-12-31T00:00:00Z"
+
+
+def test_binding_out_translates_upstream_to_frontend() -> None:
+    upstream = {
+        "id": _BND_ID,
+        "tenant_id": _TENANT,
+        "principal_kind": "USER",
+        "principal_id": "usr_alice",
+        "role_id": _ROLE_ID,
+        "scope_kind": "RESOURCE",
+        "scope_id": "res_42",
+        "granted_at": "2026-06-13T00:00:00Z",
+        "expires_at": None,
+        "granted_by": "usr_admin",
+        "grant_reason": "promotion",
+        "revoked_at": None,
+    }
+    out = _binding_out(upstream)
+    # front-end RoleBinding keys present …
+    assert out["subject_type"] == "USER"
+    assert out["subject_id"] == "usr_alice"
+    assert out["reason"] == "promotion"
+    assert out["scope_resource_id"] == "res_42"
+    # … passthrough identity / audit fields preserved …
+    assert out["id"] == _BND_ID
+    assert out["tenant_id"] == _TENANT
+    assert out["role_id"] == _ROLE_ID
+    assert out["granted_by"] == "usr_admin"
+    assert out["granted_at"] == "2026-06-13T00:00:00Z"
+
+
+def test_binding_out_tolerates_missing_keys() -> None:
+    out = _binding_out({"id": _BND_ID, "role_id": _ROLE_ID})
+    assert out["id"] == _BND_ID
+    assert out["role_id"] == _ROLE_ID
+    assert "subject_type" not in out  # absent upstream ⇒ absent here, no raise
+
+
+def test_binding_roundtrip_in_then_out() -> None:
+    """_binding_in's output, echoed by upstream as a RoleBindingRead, must come
+    back through _binding_out matching the original front-end vocabulary."""
+    fe_in = {
+        "subject_type": "USER",
+        "subject_id": "usr_alice",
+        "role_id": _ROLE_ID,
+        "scope_resource_id": "res_42",
+        "reason": "promotion",
+    }
+    upstream = _binding_in(fe_in)
+    # Simulate the upstream RoleBindingRead echo (server-assigned fields added).
+    upstream_read = {**upstream, "id": _BND_ID, "tenant_id": _TENANT,
+                     "granted_at": "2026-06-13T00:00:00Z", "granted_by": "usr_admin"}
+    fe_out = _binding_out(upstream_read)
+    assert fe_out["subject_type"] == fe_in["subject_type"]
+    assert fe_out["subject_id"] == fe_in["subject_id"]
+    assert fe_out["scope_resource_id"] == fe_in["scope_resource_id"]
+    assert fe_out["reason"] == fe_in["reason"]
+    assert fe_out["role_id"] == fe_in["role_id"]
+
+
+# ── endpoint-level: the wire really carries the mapped body / response ────────
+
+def _binding_capture_client(monkeypatch: pytest.MonkeyPatch, *, list_mode: bool = False):
+    """Install an AsyncClient stub that records the JSON body sent upstream and
+    returns an upstream-shaped binding response.  Returns the captured-calls
+    list ``[(method, url, json_body)]``."""
+    captured: list[tuple[str, str, dict | None]] = []
+
+    upstream_binding = {
+        "id": _BND_ID,
+        "tenant_id": _TENANT,
+        "principal_kind": "USER",
+        "principal_id": "usr_alice",
+        "role_id": _ROLE_ID,
+        "scope_kind": "TENANT",
+        "scope_id": None,
+        "granted_at": "2026-06-13T00:00:00Z",
+        "expires_at": None,
+        "granted_by": "usr_admin",
+        "grant_reason": "promotion",
+        "revoked_at": None,
+    }
+
+    class _AC:
+        def __init__(self, *a, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return None
+
+        async def get(self, url, **kw):
+            captured.append(("GET", url, kw.get("json")))
+            if url.endswith("/check"):
+                return httpx.Response(200, json={"allowed": True})
+            return httpx.Response(200, json={"items": [upstream_binding], "next_cursor": None})
+
+        async def post(self, url, **kw):
+            captured.append(("POST", url, kw.get("json")))
+            if url.endswith("/check"):
+                return httpx.Response(200, json={"allowed": True})
+            return httpx.Response(201, json=upstream_binding)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _AC)
+    return captured
+
+
+def test_create_binding_sends_upstream_vocabulary_and_returns_frontend(
+    foundation_client, authed_cookie, monkeypatch,
+) -> None:
+    captured = _binding_capture_client(monkeypatch)
+    resp = foundation_client.post(
+        PREFIX + "/admin/authz/bindings",
+        json={
+            "subject_type": "USER",
+            "subject_id": "usr_alice",
+            "role_id": _ROLE_ID,
+            "reason": "promotion",
+        },
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 201, resp.text
+    # The body sent to foundation-authz must be in upstream vocabulary.
+    posted = [j for (m, u, j) in captured if m == "POST" and u.endswith("/bindings")]
+    assert posted, "no POST /bindings reached upstream"
+    body = posted[0]
+    assert body["principal_kind"] == "USER"
+    assert body["principal_id"] == "usr_alice"
+    assert body["grant_reason"] == "promotion"
+    assert body["scope_kind"] == "TENANT"
+    assert "subject_type" not in body and "reason" not in body
+    # The response handed back to the SPA must be in front-end vocabulary.
+    out = resp.json()
+    assert out["subject_type"] == "USER"
+    assert out["subject_id"] == "usr_alice"
+    assert out["reason"] == "promotion"
+    assert "scope_resource_id" in out
+
+
+def test_list_bindings_maps_items_preserving_pagination(
+    foundation_client, authed_cookie, monkeypatch,
+) -> None:
+    _binding_capture_client(monkeypatch, list_mode=True)
+    resp = foundation_client.get(PREFIX + "/admin/authz/bindings", cookies=authed_cookie)
+    assert resp.status_code == 200, resp.text
+    page = resp.json()
+    assert "items" in page and "next_cursor" in page  # envelope preserved
+    item = page["items"][0]
+    assert item["subject_type"] == "USER"
+    assert item["subject_id"] == "usr_alice"
+    assert item["reason"] == "promotion"
+    assert "scope_resource_id" in item
+    # upstream vocabulary must not leak to the SPA.
+    assert "principal_kind" not in item
+    assert "principal_id" not in item
+    assert "grant_reason" not in item

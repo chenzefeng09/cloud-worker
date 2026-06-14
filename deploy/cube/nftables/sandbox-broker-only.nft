@@ -1,0 +1,91 @@
+#!/usr/sbin/nft -f
+# =============================================================================
+# sandbox-broker-only.nft — HOST-LEVEL egress fallback for CubeSandbox microVMs
+# =============================================================================
+#
+# WHEN TO USE THIS (instead of CubeVS allow_out):
+#   CubeSandbox's native primitive is CubeVS (eBPF, via the E2B create call —
+#   see ../sandbox-broker-only.policy.yaml). Prefer it. Use THIS host ruleset
+#   only when CubeVS cannot express the policy you need, specifically:
+#     * your tool-broker ClusterIP lives inside an RFC-1918 range that CubeVS
+#       HARD-denies (10/8, 172.16/12, 192.168/16) — CubeVS would drop it even
+#       if allow_out lists it; nftables has no such hardwired guard; OR
+#     * your CubeSandbox build does not enable CubeVS and you enforce egress at
+#       the host firewall on the sandbox node instead.
+#
+# WHAT IT DOES:
+#   Default-deny egress for the sandbox microVM's traffic as it transits the
+#   host. ALLOW only: (a) the tool-broker host:port, (b) DNS to the cluster
+#   resolver, (c) the sandbox gateway / loopback housekeeping. DROP everything
+#   else — Redis, MinIO, Keycloak, mcp-registry, the public internet, the cloud
+#   metadata IP 169.254.169.254, and all other RFC-1918 hosts.
+#
+# HOW IT SELECTS THE SANDBOX TRAFFIC (adapt to your backend — see install.sh):
+#   CubeSandbox attaches each microVM to a host TAP device. This ruleset filters
+#   in the `forward` hook and matches sandbox traffic by INPUT INTERFACE NAME
+#   using a wildcard that matches the TAP devices CubeVS/Cubelet create
+#   (default glob `cube*` / `tap*`). If your build names sandbox TAPs
+#   differently, or pins them to a cgroup/netns instead, adjust `define
+#   SANDBOX_IIF` (or swap the `iifname` match for a `meta cgroup` / `ct mark`
+#   match) below. This is the host analogue of the dev `internal: true`
+#   `sandbox_broker` docker network: same reachability set, enforced in the
+#   host netfilter forward path.
+#
+# VALIDATE before install:  nft -c -f sandbox-broker-only.nft
+# -----------------------------------------------------------------------------
+
+# ----- PARAMETERS (edit for your cluster, or template them in via install.sh) -
+# tool-broker façade ClusterIP + port (helm: Service ap-tool-broker, port 8024).
+define TOOL_BROKER_ADDR = 10.96.0.24       # <-- REPLACE with ap-tool-broker ClusterIP
+define TOOL_BROKER_PORT = 8024             # <-- toolBroker.port (helm default)
+
+# Cluster DNS resolver ClusterIP (CoreDNS / kube-dns).
+define CLUSTER_DNS_ADDR = 10.96.0.10       # <-- REPLACE with kube-dns ClusterIP
+
+# Sandbox-facing host interfaces (TAP devices CubeVS/Cubelet create per microVM).
+# Wildcards: cube* matches cube-tap0, tap* matches tap0, etc. Trim to match
+# YOUR backend's actual TAP naming to avoid over-matching unrelated interfaces.
+define SANDBOX_IIF = { "cube*", "tap*" }
+
+# CubeVS internal sandbox gateway (kept allowed — internal housekeeping).
+define SANDBOX_GW = 169.254.68.5
+# -----------------------------------------------------------------------------
+
+table inet sandbox_egress {
+
+	chain forward {
+		# We only police the FORWARD path for sandbox-originated egress.
+		type filter hook forward priority filter; policy accept;
+
+		# Positively select traffic LEAVING a sandbox TAP and hand it to the
+		# sandbox_out chain. Non-sandbox forwarded traffic falls through to the
+		# chain's `accept` policy and is left to the host's other rules.
+		# (We use a positive `iifname { ... } jump` rather than `iifname != {…}`
+		#  because negating an anonymous wildcard set is rejected by some nft
+		#  versions; this form parses everywhere.)
+		iifname $SANDBOX_IIF jump sandbox_out
+	}
+
+	# All rules here apply ONLY to sandbox-originated egress (entered via jump).
+	chain sandbox_out {
+		# ---- ALLOW: established/related return traffic for sandbox flows ----
+		ct state established,related accept
+
+		# ---- ALLOW: internal sandbox gateway (CubeVS housekeeping) ----------
+		ip daddr $SANDBOX_GW accept
+
+		# ---- ALLOW: DNS to the cluster resolver (UDP + TCP 53) --------------
+		ip daddr $CLUSTER_DNS_ADDR udp dport 53 accept
+		ip daddr $CLUSTER_DNS_ADDR tcp dport 53 accept
+
+		# ---- ALLOW: tool-broker façade ONLY (host:port) ---------------------
+		ip daddr $TOOL_BROKER_ADDR tcp dport $TOOL_BROKER_PORT accept
+
+		# ---- DROP: cloud metadata + everything else from the sandbox --------
+		# (explicit metadata drop first for an unambiguous counter/log line)
+		ip daddr 169.254.169.254 drop
+		# Default-deny: any other sandbox-originated egress is dropped. This is
+		# what makes the reachability set EXACTLY {tool-broker, DNS, gateway}.
+		drop
+	}
+}

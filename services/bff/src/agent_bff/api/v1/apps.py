@@ -542,6 +542,16 @@ async def run_app(
     file_inputs: dict[str, list[str]] = body.get("file_inputs") or {}
     session_id: str | None = body.get("session_id") or None
 
+    # Run origin forwarded from the caller ("user" by default; cron-runner
+    # sends "schedule").  Validate early so the caller gets a clear 400.
+    _VALID_SOURCES = {"user", "schedule"}
+    source: str = body.get("source") or "user"
+    if source not in _VALID_SOURCES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"invalid source {source!r}; must be one of {sorted(_VALID_SOURCES)}",
+        )
+
     async with httpx.AsyncClient(timeout=30) as client:
         # 1. Fetch the App + versions (RLS + visibility authorize the caller).
         resp = await client.get(f"{registry_url}/apps/{app_id}", headers=headers)
@@ -678,6 +688,9 @@ async def run_app(
                 "sys_prompt": system_prompt,
                 "sampling_params": sampling_params,
                 "app_snapshot": app_snapshot,
+                # Forwarded origin — "user" for interactive runs, "schedule" for
+                # cron-runner-triggered runs.
+                "source": source,
             },
             headers=headers,
         )

@@ -519,7 +519,31 @@ async def me(request: Request) -> dict:
     if resp.status_code >= 400:
         raise AuthenticationError("Identity rejected token")
 
-    return resp.json()
+    profile = resp.json()
+
+    # Additionally resolve the caller's effective permission set for the current
+    # tenant from authz, so the SPA receives roles + permissions in a single
+    # /auth/me round-trip and can drive permission-gated UI without a second
+    # call.  Fail-soft: authz being unreachable / non-200 / unparseable must not
+    # break identity rehydration — attach an empty list and let the SPA degrade.
+    permissions: list = []
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            authz_resp = await client.get(
+                f"{settings.authz_url}/my-permissions",
+                headers=headers,
+            )
+        if authz_resp.status_code == 200:
+            body = authz_resp.json()
+            if isinstance(body, dict) and isinstance(body.get("permissions"), list):
+                permissions = body["permissions"]
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("me: authz permissions fetch failed", extra={"exc": str(exc)})
+
+    if isinstance(profile, dict):
+        profile["permissions"] = permissions
+
+    return profile
 
 
 @router.get("/auth/sessions")

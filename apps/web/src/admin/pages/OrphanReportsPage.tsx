@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import type { OrphanReport } from '../../api/types';
+import { formatDateTimeAuto } from '../../i18n/dates';
 
 const PAGE_LIMIT = 20;
 
@@ -11,7 +12,7 @@ const isTodo = (err: unknown) =>
 function fmt(iso?: string | null): string {
   if (!iso) return '—';
   const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN');
+  return Number.isNaN(d.getTime()) ? iso : formatDateTimeAuto(d);
 }
 
 function fmtDuration(ms: number): string {

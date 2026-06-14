@@ -7,6 +7,35 @@ import { useChatStore } from '../stores/chatStore';
 import { useSessions } from '../hooks/useSessions';
 import { sessionStatusZh } from '../lib/format';
 import { FilePreviewPanel } from '../components/FilePreviewPanel';
+import {
+  ArticleCanvasPanel,
+  loadStoredCanvasDraft,
+} from '../components/ArticleCanvasPanel';
+import {
+  applyCanvasReplacement,
+  createCanvasDraft,
+  extractCanvasDeliverable,
+  extractCanvasReplacement,
+  inferCanvasAuthoringIntent,
+  prepareCanvasOpenSeed,
+  sanitizeCanvasDraft,
+  type CanvasDocumentDraft,
+  type CanvasEditRequest,
+  type CanvasEditSuggestion,
+  type CanvasOpenSeed,
+} from '../lib/canvasObjects';
+import { findCanvasCreationReply } from '../lib/canvasCreation';
+import type { MessageAttachment } from '../api/types';
+
+interface PendingCanvasEdit {
+  request: CanvasEditRequest;
+  fromMessageIndex: number;
+}
+
+interface PendingCanvasCreation {
+  documentId: string;
+  fromMessageIndex: number;
+}
 
 /**
  * Single-task agent view. The URL `/tasks/:id` drives `activeSessionId` in the
@@ -26,15 +55,26 @@ export function AgentPage() {
   const { sessions } = useSessions();
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const setActiveSession = useChatStore((s) => s.setActiveSession);
-  const { sendMessage } = useChat();
+  const { sendMessage, isStreaming, messages } = useChat();
 
   const [previewFile, setPreviewFile] = useState<{ id: string; filename: string; mime?: string } | null>(null);
+  const [canvasDraft, setCanvasDraft] = useState<CanvasDocumentDraft | null>(() =>
+    id ? loadStoredCanvasDraft(id) : null,
+  );
+  const [canvasOpen, setCanvasOpen] = useState(false);
+  const [inlineCanvasOpen, setInlineCanvasOpen] = useState(false);
+  const [inlineCanvasAnchorMessageId, setInlineCanvasAnchorMessageId] = useState<string | null>(null);
+  const [hiddenCanvasMessageIds, setHiddenCanvasMessageIds] = useState<string[]>([]);
+  const [pendingCanvasEdit, setPendingCanvasEdit] = useState<PendingCanvasEdit | null>(null);
+  const [pendingCanvasCreation, setPendingCanvasCreation] = useState<PendingCanvasCreation | null>(null);
+  const [canvasSuggestion, setCanvasSuggestion] = useState<CanvasEditSuggestion | null>(null);
   // Resizable preview panel width (px). Persisted across opens within a session.
   const [previewWidth, setPreviewWidth] = useState(360);
   const PREVIEW_MIN = 280;
   const PREVIEW_MAX = 760;
   const splitContainerRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
+  const sanitizedCanvasDraftKeyRef = useRef<string | null>(null);
 
   const startPreviewDrag = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -66,8 +106,113 @@ export function AgentPage() {
     if (id && id !== activeSessionId) setActiveSession(id);
   }, [id, activeSessionId, setActiveSession]);
 
+  useEffect(() => {
+    if (!id) return;
+    setCanvasDraft(loadStoredCanvasDraft(id));
+    setCanvasOpen(false);
+    setInlineCanvasOpen(false);
+    setInlineCanvasAnchorMessageId(null);
+    setHiddenCanvasMessageIds([]);
+    setCanvasSuggestion(null);
+    setPreviewFile(null);
+  }, [id]);
+
+  useEffect(() => {
+    if (!canvasDraft) {
+      sanitizedCanvasDraftKeyRef.current = null;
+      return;
+    }
+    const draftKey = [
+      canvasDraft.id,
+      canvasDraft.sourceMessageId ?? '',
+      canvasDraft.title,
+      canvasDraft.content,
+    ].join('\u0000');
+    if (sanitizedCanvasDraftKeyRef.current === draftKey) return;
+    sanitizedCanvasDraftKeyRef.current = draftKey;
+    const sanitized = sanitizeCanvasDraft(canvasDraft);
+    if (sanitized !== canvasDraft) setCanvasDraft(sanitized);
+  }, [canvasDraft]);
+
+  const session = sessions.find((s) => s.id === id);
+
+  const openPreviewFile = useCallback((file: { id: string; filename: string; mime?: string }) => {
+    setPreviewFile(file);
+    setCanvasOpen(false);
+  }, []);
+
+  const openBlankCanvas = useCallback(() => {
+    setCanvasDraft((current) => current ?? createCanvasDraft('article'));
+    setInlineCanvasOpen(true);
+    setInlineCanvasAnchorMessageId(null);
+    setCanvasOpen(false);
+    setCanvasSuggestion(null);
+    setPreviewFile(null);
+  }, []);
+
+  const openCanvasFromMessage = useCallback((seed: CanvasOpenSeed) => {
+    const sourceMessageId = seed.sourceMessageId;
+    const extracted = prepareCanvasOpenSeed(seed);
+    if (sourceMessageId) {
+      setHiddenCanvasMessageIds((current) =>
+        current.includes(sourceMessageId) ? current : [...current, sourceMessageId],
+      );
+    }
+    setCanvasDraft(
+      createCanvasDraft(extracted.kind, {
+        title: extracted.title,
+        content: extracted.content,
+        sourceMessageId: extracted.sourceMessageId,
+      }),
+    );
+    setInlineCanvasOpen(true);
+    setInlineCanvasAnchorMessageId(sourceMessageId ?? null);
+    setCanvasOpen(false);
+    setCanvasSuggestion(null);
+    setPreviewFile(null);
+  }, []);
+
+  const openInlineCanvasInPanel = useCallback(() => {
+    if (!canvasDraft) return;
+    setCanvasOpen(true);
+    setInlineCanvasOpen(false);
+    setPreviewFile(null);
+  }, [canvasDraft]);
+
+  const maybeStartCanvasFromPrompt = useCallback(
+    (text: string, attachmentIds?: string[]) => {
+      if (attachmentIds && attachmentIds.length > 0) return;
+      const intent = inferCanvasAuthoringIntent(text);
+      if (!intent) return;
+      const draft = createCanvasDraft(intent.kind, {
+        title: intent.title,
+        content: '',
+      });
+      setCanvasDraft(draft);
+      setInlineCanvasOpen(true);
+      setInlineCanvasAnchorMessageId(null);
+      setCanvasOpen(false);
+      setPreviewFile(null);
+      setPendingCanvasEdit(null);
+      setCanvasSuggestion(null);
+      setPendingCanvasCreation({
+        documentId: draft.id,
+        fromMessageIndex: messages.length,
+      });
+    },
+    [messages.length],
+  );
+
+  const sendMessageWithCanvasDetection = useCallback(
+    (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => {
+      maybeStartCanvasFromPrompt(text, attachmentIds);
+      return sendMessage(text, attachmentIds, attachmentsMeta);
+    },
+    [maybeStartCanvasFromPrompt, sendMessage],
+  );
+
   // If HomePage routed us here with an `initialMessage` in state, dispatch it
-  // once the chat store has bound to this session.  Guard with a ref so React
+  // once the chat store has bound to this session. Guard with a ref so React
   // Strict Mode's double-effect doesn't double-send.
   const sentInitialRef = useRef<string | null>(null);
   useEffect(() => {
@@ -81,17 +226,123 @@ export function AgentPage() {
     if (!initial && attachmentIds.length === 0) return;
     if (sentInitialRef.current === id) return;
     sentInitialRef.current = id;
-    sendMessage(initial ?? '', attachmentIds);
+    sendMessageWithCanvasDetection(initial ?? '', attachmentIds);
     // Clear router state so a refresh won't re-send.
     navigate(location.pathname, { replace: true, state: null });
-  }, [id, activeSessionId, location.pathname, location.state, navigate, sendMessage]);
+  }, [id, activeSessionId, location.pathname, location.state, navigate, sendMessageWithCanvasDetection]);
 
-  const session = sessions.find((s) => s.id === id);
+  const requestCanvasEdit = useCallback(
+    async (request: CanvasEditRequest, prompt: string) => {
+      setPendingCanvasCreation(null);
+      setCanvasSuggestion(null);
+      setPendingCanvasEdit({ request, fromMessageIndex: messages.length });
+      await sendMessage(prompt);
+    },
+    [messages.length, sendMessage],
+  );
+
+  useEffect(() => {
+    if (!pendingCanvasEdit || isStreaming) return;
+
+    let assistantReply: { id?: string; content: string } | null = null;
+    for (const message of messages.slice(pendingCanvasEdit.fromMessageIndex)) {
+      const role = (message.role || '').toUpperCase();
+      if (
+        role === 'ASSISTANT' &&
+        message.blockKind !== 'tool' &&
+        message.blockKind !== 'thinking' &&
+        !message.streaming
+      ) {
+        assistantReply = message;
+      }
+    }
+
+    if (!assistantReply) return;
+
+    const replacement = extractCanvasReplacement(assistantReply.content);
+    if (replacement) {
+      setCanvasSuggestion({
+        request: pendingCanvasEdit.request,
+        replacement,
+        receivedAt: new Date().toISOString(),
+      });
+      setInlineCanvasOpen(true);
+      setCanvasOpen(false);
+      setPreviewFile(null);
+      if (assistantReply.id) {
+        const assistantReplyId = assistantReply.id;
+        setHiddenCanvasMessageIds((current) =>
+          current.includes(assistantReplyId) ? current : [...current, assistantReplyId],
+        );
+      }
+    }
+    setPendingCanvasEdit(null);
+  }, [isStreaming, messages, pendingCanvasEdit]);
+
+  useEffect(() => {
+    if (!pendingCanvasCreation) return;
+
+    const assistantReply = findCanvasCreationReply(messages, pendingCanvasCreation.fromMessageIndex);
+    if (!assistantReply) return;
+
+    const replacement = extractCanvasReplacement(assistantReply.content) ?? assistantReply.content.trim();
+    if (replacement) {
+      const extracted = extractCanvasDeliverable(replacement, {
+        kind: canvasDraft?.kind ?? 'article',
+        fallbackTitle: canvasDraft?.title,
+        sourceMessageId: assistantReply.id,
+      });
+      setCanvasDraft((current) => {
+        if (!current || current.id !== pendingCanvasCreation.documentId) return current;
+        if (
+          current.content === extracted.content &&
+          current.title === (extracted.title || current.title) &&
+          current.sourceMessageId === (assistantReply.id ?? current.sourceMessageId)
+        ) {
+          return current;
+        }
+        return {
+          ...current,
+          title: extracted.title || current.title,
+          content: extracted.content,
+          sourceMessageId: assistantReply.id ?? current.sourceMessageId,
+          updatedAt: new Date().toISOString(),
+        };
+      });
+      setInlineCanvasOpen(true);
+      setInlineCanvasAnchorMessageId(assistantReply.id ?? null);
+      setCanvasOpen(false);
+      setPreviewFile(null);
+      if (assistantReply.id) {
+        const assistantReplyId = assistantReply.id;
+        setHiddenCanvasMessageIds((current) =>
+          current.includes(assistantReplyId) ? current : [...current, assistantReplyId],
+        );
+      }
+    }
+    if (!isStreaming && !assistantReply.streaming) {
+      setPendingCanvasCreation(null);
+    }
+  }, [canvasDraft?.kind, canvasDraft?.title, isStreaming, messages, pendingCanvasCreation]);
+
+  const acceptCanvasSuggestion = useCallback(() => {
+    setCanvasDraft((current) => {
+      if (!current || !canvasSuggestion || current.id !== canvasSuggestion.request.documentId) return current;
+      return applyCanvasReplacement(current, canvasSuggestion.request, canvasSuggestion.replacement);
+    });
+    setCanvasSuggestion(null);
+  }, [canvasSuggestion]);
+
+  const rejectCanvasSuggestion = useCallback(() => {
+    setCanvasSuggestion(null);
+  }, []);
+
+  const hasSidePanel = previewFile !== null || (canvasOpen && canvasDraft !== null);
 
   if (!id) {
     return (
       <div className="flex flex-col h-full min-w-0 bg-paper">
-        <PageHead crumbs={[{ label: '首页', to: '/home' }, { label: '任务' }]} />
+        <PageHead crumbs={[{ label: '首页', to: '/home' }, { label: '会话' }]} />
         <div className="flex-1 flex items-center justify-center text-dim">未指定任务。</div>
       </div>
     );
@@ -102,7 +353,7 @@ export function AgentPage() {
       <PageHead
         crumbs={[
           { label: '首页', to: '/home' },
-          { label: friendly ? 'Chat' : '任务', to: friendly ? '/home' : '/tasks' },
+          { label: friendly ? 'Chat' : '会话', to: '/home' },
           { label: session?.title || '未命名任务' },
         ]}
         status={
@@ -113,16 +364,22 @@ export function AgentPage() {
           )
         }
         actions={
-          friendly ? null : (
-            <>
+          <>
+            <button
+              onClick={openBlankCanvas}
+              className="cw-btn cw-btn-ghost cw-btn-sm"
+            >
+              <span className="font-mono">◇</span> 画布
+            </button>
+            {!friendly && (
               <button
                 onClick={() => navigate('/files')}
                 className="cw-btn cw-btn-ghost cw-btn-sm"
               >
                 <span className="font-mono">⌗</span> 文件
               </button>
-            </>
-          )
+            )}
+          </>
         }
       />
 
@@ -166,13 +423,29 @@ export function AgentPage() {
             ref={splitContainerRef}
             className="flex-1 min-h-0"
             style={
-              previewFile
+              hasSidePanel
                 ? { display: 'grid', gridTemplateColumns: `1fr 6px ${previewWidth}px`, minHeight: 0 }
                 : { display: 'flex', flexDirection: 'column', minHeight: 0 }
             }
           >
-            <ChatWindow sessionId={id} friendly={friendly} onPreviewFile={setPreviewFile} />
-            {previewFile && (
+            <ChatWindow
+              sessionId={id}
+              friendly={friendly}
+              onPreviewFile={openPreviewFile}
+              onOpenCanvas={openCanvasFromMessage}
+              onSendMessage={sendMessageWithCanvasDetection}
+              inlineCanvasDraft={inlineCanvasOpen ? canvasDraft : null}
+              inlineCanvasPending={Boolean(pendingCanvasCreation)}
+              inlineCanvasSuggestion={canvasSuggestion}
+              inlineCanvasAnchorMessageId={inlineCanvasAnchorMessageId}
+              hiddenMessageIds={hiddenCanvasMessageIds}
+              onInlineCanvasDraftChange={setCanvasDraft}
+              onInlineCanvasRequestEdit={requestCanvasEdit}
+              onInlineCanvasOpenPanel={canvasDraft ? openInlineCanvasInPanel : undefined}
+              onInlineCanvasAcceptSuggestion={canvasSuggestion ? acceptCanvasSuggestion : undefined}
+              onInlineCanvasRejectSuggestion={canvasSuggestion ? rejectCanvasSuggestion : undefined}
+            />
+            {hasSidePanel && (
               <>
                 {/* Draggable divider */}
                 <div
@@ -199,11 +472,22 @@ export function AgentPage() {
                     style={{ width: 1, background: 'var(--line)' }}
                   />
                 </div>
-                <FilePreviewPanel
-                  sessionId={id}
-                  file={previewFile}
-                  onClose={() => setPreviewFile(null)}
-                />
+                {previewFile ? (
+                  <FilePreviewPanel
+                    sessionId={id}
+                    file={previewFile}
+                    onClose={() => setPreviewFile(null)}
+                  />
+                ) : canvasDraft ? (
+                  <ArticleCanvasPanel
+                    sessionId={id}
+                    draft={canvasDraft}
+                    aiDisabled={isStreaming}
+                    onDraftChange={setCanvasDraft}
+                    onClose={() => setCanvasOpen(false)}
+                    onRequestEdit={requestCanvasEdit}
+                  />
+                ) : null}
               </>
             )}
           </div>

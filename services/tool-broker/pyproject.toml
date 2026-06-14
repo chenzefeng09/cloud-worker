@@ -1,0 +1,35 @@
+[tool.poetry]
+name = "tool-broker"
+version = "0.1.0a1"
+description = "Policy-controlled façade for sandbox access to foundation tool services"
+authors = ["Agent Platform Team"]
+packages = [{ include = "tool_broker", from = "src" }]
+
+[tool.poetry.dependencies]
+python = "^3.12"
+fastapi = "^0.115.0"
+uvicorn = { extras = ["standard"], version = "^0.32.0" }
+pydantic = "^2.9.0"
+pydantic-settings = "^2.6.0"
+httpx = "^0.28.0"
+# /state façade talks to foundation Redis via the async client.
+redis = "^5.2.0"
+# /s3 façade reads tenant-scoped objects from the foundation object store.
+boto3 = "^1.35.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
+pytest-asyncio = "^0.24.0"
+ruff = "^0.7.0"
+mypy = "^1.13.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

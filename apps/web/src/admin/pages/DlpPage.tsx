@@ -10,6 +10,7 @@ import {
 } from 'recharts';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
+import { formatDateTimeAuto } from '../../i18n/dates';
 import { useToast } from '../components/dialogs';
 import { CustomSelect } from '../components/CustomSelect';
 import type {
@@ -75,7 +76,7 @@ const PAGE_LIMIT = 50;
 function fmtTime(s?: string | null): string {
   if (!s) return '—';
   const d = new Date(s);
-  return Number.isNaN(d.getTime()) ? s : d.toLocaleString('zh-CN');
+  return Number.isNaN(d.getTime()) ? s : formatDateTimeAuto(d);
 }
 
 function decisionBadgeClass(decision: string): string {

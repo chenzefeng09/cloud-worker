@@ -51,6 +51,557 @@ body {
   background: transparent;
 }
 
+.chat-scroll-to-bottom {
+  position: absolute;
+  left: 50%;
+  bottom: 82px;
+  z-index: 20;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  transform: translateX(-50%);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 10px 30px -18px rgba(15, 17, 20, 0.45);
+  cursor: pointer;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 18px;
+  line-height: 1;
+  transition: background 120ms ease, border-color 120ms ease, transform 120ms ease;
+}
+
+.chat-scroll-to-bottom:hover {
+  background: var(--paper-2);
+  border-color: var(--ink-2);
+  transform: translateX(-50%) translateY(-1px);
+}
+
+/* ── Canvas rich-text editor ─────────────────────────────────────────────── */
+.canvas-rich-editor {
+  white-space: normal;
+}
+
+.canvas-rich-editor h1 {
+  margin: 0 0 18px;
+  font-size: 22px;
+  line-height: 1.32;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+
+.canvas-rich-editor h2 {
+  margin: 26px 0 10px;
+  font-size: 17px;
+  line-height: 1.42;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.canvas-rich-editor h3 {
+  margin: 20px 0 8px;
+  font-size: 14.5px;
+  line-height: 1.5;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.canvas-rich-editor p {
+  margin: 0 0 14px;
+}
+
+.canvas-rich-editor ul,
+.canvas-rich-editor ol {
+  margin: 0 0 14px;
+  padding-left: 22px;
+}
+
+.canvas-rich-editor ul {
+  list-style: disc;
+}
+
+.canvas-rich-editor ol {
+  list-style: decimal;
+}
+
+.canvas-rich-editor li {
+  margin: 4px 0;
+  padding-left: 2px;
+}
+
+.canvas-rich-editor blockquote {
+  margin: 14px 0;
+  padding-left: 12px;
+  border-left: 2px solid var(--accent-line);
+  color: var(--ink-2);
+  font-style: italic;
+}
+
+.canvas-rich-editor hr {
+  margin: 20px 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.canvas-rich-editor table {
+  width: 100%;
+  margin: 14px 0;
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.canvas-rich-editor th,
+.canvas-rich-editor td {
+  padding: 6px 9px;
+  border: 1px solid var(--line-2);
+  vertical-align: top;
+}
+
+.canvas-rich-editor th {
+  background: var(--paper-2);
+  font-weight: 650;
+  text-align: left;
+}
+
+.canvas-rich-editor code {
+  padding: 1px 4px;
+  border: 1px solid var(--line-2);
+  border-radius: var(--r-sm);
+  background: var(--paper-2);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.canvas-rich-editor:empty::before {
+  content: '开始写作…';
+  color: var(--dim);
+}
+
+/* ── Inline canvas card ──────────────────────────────────────────────────── */
+.canvas-message-shell {
+  position: relative;
+  width: 100%;
+  margin: 10px 0 14px;
+}
+
+.canvas-message-card {
+  width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 18px 42px rgba(21, 23, 26, 0.06);
+}
+
+.canvas-message-card button:disabled,
+.canvas-message-card input:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+.canvas-message-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line-2);
+  background: var(--surface);
+}
+
+.canvas-card-edit-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 11px;
+  border: 1px solid var(--line-2);
+  border-radius: 999px;
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.canvas-card-kind-select {
+  min-width: 92px;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--ink);
+  padding: 0 9px;
+  font-size: 12px;
+  outline: none;
+}
+
+.canvas-card-kind-select:focus,
+.canvas-card-request-input:focus,
+.canvas-card-title-input:focus,
+.canvas-selection-input:focus {
+  border-color: var(--accent);
+}
+
+.canvas-message-card-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line-2);
+  background: rgba(247, 245, 238, 0.58);
+  overflow-x: auto;
+}
+
+.canvas-message-card-body {
+  position: relative;
+  padding: 28px 38px 20px;
+}
+
+.canvas-card-title-input {
+  width: 100%;
+  margin: 0 0 22px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 22px;
+  line-height: 1.35;
+  font-weight: 700;
+  letter-spacing: 0;
+  outline: none;
+  padding: 0 0 14px;
+}
+
+.canvas-suggestion-review {
+  position: relative;
+  margin: 0 0 20px;
+  border: 1px solid rgba(44, 95, 138, 0.22);
+  border-radius: 8px;
+  background: rgba(44, 95, 138, 0.06);
+  overflow: hidden;
+}
+
+.canvas-suggestion-review-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(44, 95, 138, 0.14);
+  background: rgba(255, 253, 247, 0.72);
+}
+
+.canvas-suggestion-kicker {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #2c5f8a;
+  font-weight: 700;
+}
+
+.canvas-suggestion-instruction {
+  margin-top: 2px;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.canvas-suggestion-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 2px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 6px 16px rgba(21, 23, 26, 0.08);
+}
+
+.canvas-suggestion-reject,
+.canvas-suggestion-accept {
+  height: 28px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 10px;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.canvas-suggestion-reject {
+  background: transparent;
+  color: var(--ink-2);
+}
+
+.canvas-suggestion-reject:hover {
+  background: var(--paper-2);
+}
+
+.canvas-suggestion-accept {
+  background: #2d6cdf;
+  color: white;
+}
+
+.canvas-suggestion-accept:hover {
+  background: #2458b8;
+}
+
+.canvas-suggestion-before {
+  margin: 12px 12px 0;
+  padding: 8px 10px;
+  border-left: 2px solid rgba(210, 58, 31, 0.45);
+  color: var(--dim);
+  background: rgba(210, 58, 31, 0.05);
+  font-size: 13px;
+  line-height: 1.55;
+  text-decoration: line-through;
+}
+
+.canvas-suggestion-after {
+  margin: 0;
+  padding: 12px;
+  color: #1f5db8;
+  background: rgba(45, 108, 223, 0.08);
+  font-size: 14px;
+  line-height: 1.68;
+}
+
+.canvas-suggestion-after p:last-child,
+.canvas-suggestion-after ul:last-child,
+.canvas-suggestion-after ol:last-child {
+  margin-bottom: 0;
+}
+
+.canvas-suggestion-preview-document {
+  min-height: 360px;
+  user-select: text;
+}
+
+.canvas-suggestion-preview-segment:empty {
+  display: none;
+}
+
+.canvas-inline-suggestion-card {
+  position: relative;
+  margin: 12px 0 18px;
+  border: 1px solid rgba(44, 95, 138, 0.2);
+  border-radius: 8px;
+  background: rgba(44, 95, 138, 0.05);
+  overflow: hidden;
+}
+
+.canvas-inline-suggestion-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(44, 95, 138, 0.14);
+  background: rgba(255, 253, 247, 0.76);
+}
+
+.canvas-inline-suggestion-old {
+  margin: 12px 12px 0;
+  padding: 8px 10px;
+  border-left: 2px solid rgba(210, 58, 31, 0.45);
+  color: var(--dim);
+  background: rgba(210, 58, 31, 0.05);
+  font-size: 13px;
+  line-height: 1.55;
+  text-decoration: line-through;
+}
+
+.canvas-inline-suggestion-new {
+  margin: 0;
+  padding: 12px;
+  color: #1f5db8;
+  background: rgba(45, 108, 223, 0.08);
+  font-size: 14px;
+  line-height: 1.68;
+}
+
+.canvas-inline-suggestion-new p:last-child,
+.canvas-inline-suggestion-new ul:last-child,
+.canvas-inline-suggestion-new ol:last-child {
+  margin-bottom: 0;
+}
+
+.canvas-inline-editor {
+  min-height: 360px;
+  font-size: 15px;
+  line-height: 1.72;
+  caret-color: var(--accent);
+}
+
+.canvas-card-pending {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--accent-line);
+  border-radius: var(--r-md);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.canvas-message-card-foot {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 12px 14px 14px;
+  border-top: 1px solid var(--line-2);
+  background: var(--paper);
+}
+
+.canvas-card-request-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.canvas-card-request-input {
+  min-width: 0;
+  height: 34px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--ink);
+  padding: 0 11px;
+  font-size: 12.5px;
+  outline: none;
+}
+
+.canvas-selection-popover {
+  position: fixed;
+  z-index: 80;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: calc(100vw - 24px);
+  padding: 7px;
+  border: 1px solid var(--line-2);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 12px 30px rgba(21, 23, 26, 0.14);
+  transform: translate(-50%, calc(-100% - 8px));
+}
+
+.canvas-selection-command,
+.canvas-selection-icon,
+.canvas-selection-send {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 28px;
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--ink);
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.canvas-selection-command {
+  padding: 0 9px;
+}
+
+.canvas-selection-icon,
+.canvas-selection-send {
+  width: 28px;
+  padding: 0;
+}
+
+.canvas-selection-command:hover,
+.canvas-selection-icon:hover,
+.canvas-selection-send:hover {
+  background: var(--paper-2);
+}
+
+.canvas-selection-divider {
+  width: 1px;
+  height: 20px;
+  background: var(--line);
+}
+
+.canvas-selection-input-form {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) 28px;
+  gap: 7px;
+  align-items: center;
+  width: min(360px, calc(100vw - 48px));
+}
+
+.canvas-selection-input {
+  min-width: 0;
+  height: 30px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  color: var(--ink);
+  padding: 0 10px;
+  font-size: 12.5px;
+  outline: none;
+}
+
+.canvas-selection-send {
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.canvas-selection-send:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
+@media (max-width: 720px) {
+  .canvas-message-card-head {
+    align-items: flex-start;
+  }
+
+  .canvas-message-card-body {
+    padding: 22px 18px 18px;
+  }
+
+  .canvas-card-title-input {
+    font-size: 19px;
+  }
+
+  .canvas-suggestion-review-head,
+  .canvas-inline-suggestion-head,
+  .canvas-suggestion-actions {
+    align-items: stretch;
+  }
+
+  .canvas-suggestion-review-head,
+  .canvas-inline-suggestion-head {
+    flex-direction: column;
+  }
+
+  .canvas-inline-editor {
+    min-height: 300px;
+    font-size: 14px;
+  }
+
+  .canvas-card-request-row {
+    grid-template-columns: 1fr;
+  }
+}
+
 /* ── cloud-worker design atoms (ported from cloud-worker/web/mid/styles.css) ── */
 @layer components {
 

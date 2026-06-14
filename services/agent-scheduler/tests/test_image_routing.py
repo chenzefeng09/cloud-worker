@@ -17,6 +17,7 @@ keep the exact image + python argv it had before Phase 5.
 
 from __future__ import annotations
 
+import tempfile
 from unittest.mock import MagicMock
 
 import httpx
@@ -239,6 +240,15 @@ def _make_cube_runtime() -> CubeSandboxRuntime:
         runtime="cube",
         cube_controller_url="http://cube-test:8443",
         agent_image=_AGENT_IMAGE,
+        # Broker mode (the default) now fail-closes without a CubeVS allow_out
+        # CIDR list; these image-routing tests don't exercise egress, so give
+        # the runtime a valid allowlist to reach the spawn POST.
+        cube_sandbox_allow_out="10.96.0.10/32, 10.96.0.53/32",
+        # The cube spawn path now writes a 0600 ``.secrets.json`` under
+        # ``workspace_base`` (secret-leak hardening); the module default
+        # (/var/agent-platform/workspaces) isn't writable in CI, so point it at
+        # a tmp dir for these image-routing spawns.
+        workspace_base=tempfile.mkdtemp(prefix="cube-imgtest-"),
     )
     client = MagicMock()
     client.post.return_value = httpx.Response(

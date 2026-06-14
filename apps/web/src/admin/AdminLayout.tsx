@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import { NavLink, Navigate, Route, Routes } from 'react-router-dom';
 import { useChatStore } from '../stores/chatStore';
 import { TenantsPage } from './pages/TenantsPage';
@@ -30,11 +31,19 @@ import { OrphanReportsPage } from './pages/OrphanReportsPage';
 import { SsoPage } from './pages/SsoPage';
 import { DialogProvider } from './components/dialogs';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { hasPermission, isPlatformAdmin } from '../lib/permissions';
 
 interface AdminNavSpec {
   to: string;
   label: string;
   glyph: string;
+  /**
+   * Permission token required for this module to be visible/usable. When
+   * omitted, the module is platform-super-admin only (requires `*` /
+   * `platform.admin`). As more modules gain tenant-scoped support they should
+   * declare their `requires` token here and add a matching per-route gate.
+   */
+  requires?: string;
 }
 
 interface AdminNavGroup {
@@ -47,14 +56,14 @@ const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
     title: '租户与组织',
     items: [
       { to: '/admin/tenants', label: '租户管理', glyph: '◫' },
-      { to: '/admin/org', label: '组织架构', glyph: '⊞' },
+      { to: '/admin/org', label: '组织架构', glyph: '⊞', requires: 'org.read' },
     ],
   },
   {
     title: '用户与权限',
     items: [
       { to: '/admin/users', label: '用户管理', glyph: '◎' },
-      { to: '/admin/rbac', label: '角色与权限', glyph: '⊙' },
+      { to: '/admin/rbac', label: '角色与权限', glyph: '⊙', requires: 'authz.role.manage' },
       { to: '/admin/pam', label: '特权访问', glyph: '⊘' },
       { to: '/admin/sso', label: '身份源管理', glyph: '⊜' },
     ],
@@ -63,25 +72,25 @@ const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
     title: '计费与配额',
     items: [
       { to: '/admin/plans', label: '套餐目录', glyph: '◈' },
-      { to: '/admin/quota', label: '订阅与配额', glyph: '◷' },
+      { to: '/admin/quota', label: '订阅与配额', glyph: '◷', requires: 'quota.read' },
     ],
   },
   {
     title: '模型与 AI',
     items: [
-      { to: '/admin/models', label: '模型管理', glyph: '⊕' },
+      { to: '/admin/models', label: '模型管理', glyph: '⊕', requires: 'model.read' },
     ],
   },
   {
     title: '平台治理',
     items: [
       { to: '/admin/apps', label: '应用审核', glyph: '▣' },
-      { to: '/admin/skills', label: '技能管理', glyph: '✦' },
-      { to: '/admin/mcp', label: 'MCP 服务器', glyph: '⊟' },
-      { to: '/admin/knowledge', label: '知识库', glyph: '❖' },
-      { to: '/admin/ops', label: '运行与沙箱', glyph: '◳' },
+      { to: '/admin/skills', label: '技能管理', glyph: '✦', requires: 'skill.create' },
+      { to: '/admin/mcp', label: 'MCP 服务器', glyph: '⊟', requires: 'mcp_server.create' },
+      { to: '/admin/knowledge', label: '知识库', glyph: '❖', requires: 'document.create' },
+      { to: '/admin/ops', label: '运行与沙箱', glyph: '◳', requires: 'sandbox.read' },
       { to: '/admin/pool-monitor', label: '温池监控', glyph: '▦' },
-      { to: '/admin/large-attachment', label: '大附件能力', glyph: '⊠' },
+      { to: '/admin/large-attachment', label: '大附件能力', glyph: '⊠', requires: 'session.attachment.large.create' },
       { to: '/admin/api-platform', label: 'API 平台', glyph: '⌘' },
     ],
   },
@@ -108,15 +117,64 @@ const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
   },
 ];
 
+/** Whether a given nav item is visible/usable for the supplied permission set. */
+function isNavItemVisible(item: AdminNavSpec, perms: string[] | undefined): boolean {
+  return item.requires ? hasPermission(perms, item.requires) : isPlatformAdmin(perms);
+}
+
 /**
- * Admin-only shell. Rendered only when the authenticated user has
- * the 'super_admin' role — enforced at the route level in WorkspaceLayout.
+ * Whether the user may enter the admin console at all — true if they are a
+ * platform admin OR hold the permission required by at least one admin module.
+ * Shared by the route-level gate (WorkspaceLayout), the sidebar entry, and the
+ * component-level gate below so all three stay in lock-step.
+ */
+export function canAccessAdmin(perms: string[] | undefined): boolean {
+  if (isPlatformAdmin(perms)) return true;
+  return ADMIN_NAV_GROUPS.some((g) => g.items.some((i) => isNavItemVisible(i, perms)));
+}
+
+/** First admin path the user can actually reach, for default-landing redirects. */
+function firstAccessiblePath(perms: string[] | undefined): string {
+  for (const group of ADMIN_NAV_GROUPS) {
+    for (const item of group.items) {
+      if (isNavItemVisible(item, perms)) return item.to;
+    }
+  }
+  return '/home';
+}
+
+/**
+ * Per-route guard. Renders children only when the permission set satisfies
+ * `required` (or, when `required` is omitted, the user is a platform admin).
+ * Otherwise bounces to the user's first reachable admin page (or /home).
+ */
+function RequirePerm({
+  perms,
+  required,
+  children,
+}: {
+  perms: string[] | undefined;
+  required?: string;
+  children: ReactNode;
+}) {
+  const ok = required ? hasPermission(perms, required) : isPlatformAdmin(perms);
+  if (!ok) {
+    return <Navigate to={firstAccessiblePath(perms)} replace />;
+  }
+  return <>{children}</>;
+}
+
+/**
+ * Admin shell. Entry is gated by effective authz permissions — platform admins
+ * see everything; tenant admins see only the modules they hold permissions for.
+ * Enforced at the route level in WorkspaceLayout and re-checked here.
  */
 export function AdminLayout() {
   const userProfile = useChatStore((s) => s.userProfile);
+  const perms = userProfile?.permissions;
 
   // Double-check gate: belt-and-suspenders, route-level gate should already block
-  if (!userProfile?.roles?.includes('super_admin')) {
+  if (!canAccessAdmin(perms)) {
     return <Navigate to="/home" replace />;
   }
 
@@ -133,12 +191,15 @@ export function AdminLayout() {
         </div>
 
         <nav className="flex-1 min-h-0 overflow-y-auto flex flex-col gap-4 -mr-1 pr-1">
-          {ADMIN_NAV_GROUPS.map((group) => (
+          {ADMIN_NAV_GROUPS.map((group) => {
+            const visibleItems = group.items.filter((n) => isNavItemVisible(n, perms));
+            if (visibleItems.length === 0) return null;
+            return (
             <div key={group.title} className="flex flex-col gap-0.5">
               <div className="px-2 mb-1 font-mono text-[9.5px] font-semibold tracking-[0.12em] uppercase text-dim">
                 {group.title}
               </div>
-              {group.items.map((n) => (
+              {visibleItems.map((n) => (
                 <NavLink
                   key={n.to}
                   to={n.to}
@@ -169,7 +230,8 @@ export function AdminLayout() {
                 </NavLink>
               ))}
             </div>
-          ))}
+            );
+          })}
         </nav>
 
         {/* Back to main */}
@@ -192,35 +254,47 @@ export function AdminLayout() {
         <div className="h-full w-full flex flex-col">
           <ErrorBoundary>
           <Routes>
-            <Route path="tenants" element={<TenantsPage />} />
-            <Route path="org" element={<OrgStructurePage />} />
-            <Route path="users" element={<UsersPage />} />
-            <Route path="rbac" element={<RbacPage />} />
-            <Route path="plans" element={<PlanCataloguePage />} />
-            <Route path="quota" element={<QuotaPage />} />
-            <Route path="models" element={<ModelManagementPage />} />
-            <Route path="apps" element={<AppReviewPage />} />
-            <Route path="skills" element={<SkillsAdminPage />} />
-            <Route path="mcp" element={<McpServersPage />} />
-            <Route path="knowledge" element={<KnowledgeAdminPage />} />
-            <Route path="ops" element={<OpsDashboardPage />} />
-            <Route path="pool-monitor" element={<PoolMonitorPage />} />
-            <Route path="large-attachment" element={<LargeAttachmentPage />} />
-            <Route path="pam" element={<PamPage />} />
-            <Route path="sso" element={<SsoPage />} />
-            <Route path="api-platform" element={<ApiPlatformPage />} />
-            <Route path="flags" element={<FeatureFlagsPage />} />
-            <Route path="audit" element={<AuditPage />} />
-            <Route path="replay" element={<SessionReplayPage />} />
-            <Route path="notification" element={<NotificationAdminPage />} />
-            <Route path="dlp" element={<DlpPage />} />
-            <Route path="compliance" element={<CompliancePage />} />
-            <Route path="security-ops" element={<SecurityOpsPage />} />
-            <Route path="lifecycle" element={<LifecyclePage />} />
-            <Route path="data-protection" element={<DataProtectionPage />} />
-            <Route path="storage-quotas" element={<StorageManagementPage />} />
-            <Route path="storage-orphans" element={<OrphanReportsPage />} />
-            <Route path="*" element={<Navigate to="/admin/tenants" replace />} />
+            {/* Tenant-scoped modules are gated on a module-create token so tenant
+                admins may reach them (RBAC → authz.role.manage; skills →
+                skill.create; mcp → mcp_server.create; knowledge →
+                document.create; ops → sandbox.read; large-attachment →
+                session.attachment.large.create; models →
+                model.read — tenant admins pick their tenant defaults while the
+                provider directory stays platform-admin-only).  Pool-monitor
+                stays platform-admin-only (no `requires`). These must match the
+                `requires` token declared
+                in ADMIN_NAV_GROUPS *and* the BFF guard's action so "visible"
+                tracks "reachable".  Every other module has no `required`, so
+                RequirePerm falls back to isPlatformAdmin (platform-admin only). */}
+            <Route path="rbac" element={<RequirePerm perms={perms} required="authz.role.manage"><RbacPage /></RequirePerm>} />
+            <Route path="tenants" element={<RequirePerm perms={perms}><TenantsPage /></RequirePerm>} />
+            <Route path="org" element={<RequirePerm perms={perms} required="org.read"><OrgStructurePage /></RequirePerm>} />
+            <Route path="users" element={<RequirePerm perms={perms}><UsersPage /></RequirePerm>} />
+            <Route path="plans" element={<RequirePerm perms={perms}><PlanCataloguePage /></RequirePerm>} />
+            <Route path="quota" element={<RequirePerm perms={perms} required="quota.read"><QuotaPage /></RequirePerm>} />
+            <Route path="models" element={<RequirePerm perms={perms} required="model.read"><ModelManagementPage /></RequirePerm>} />
+            <Route path="apps" element={<RequirePerm perms={perms}><AppReviewPage /></RequirePerm>} />
+            <Route path="skills" element={<RequirePerm perms={perms} required="skill.create"><SkillsAdminPage /></RequirePerm>} />
+            <Route path="mcp" element={<RequirePerm perms={perms} required="mcp_server.create"><McpServersPage /></RequirePerm>} />
+            <Route path="knowledge" element={<RequirePerm perms={perms} required="document.create"><KnowledgeAdminPage /></RequirePerm>} />
+            <Route path="ops" element={<RequirePerm perms={perms} required="sandbox.read"><OpsDashboardPage /></RequirePerm>} />
+            <Route path="pool-monitor" element={<RequirePerm perms={perms}><PoolMonitorPage /></RequirePerm>} />
+            <Route path="large-attachment" element={<RequirePerm perms={perms} required="session.attachment.large.create"><LargeAttachmentPage /></RequirePerm>} />
+            <Route path="pam" element={<RequirePerm perms={perms}><PamPage /></RequirePerm>} />
+            <Route path="sso" element={<RequirePerm perms={perms}><SsoPage /></RequirePerm>} />
+            <Route path="api-platform" element={<RequirePerm perms={perms}><ApiPlatformPage /></RequirePerm>} />
+            <Route path="flags" element={<RequirePerm perms={perms}><FeatureFlagsPage /></RequirePerm>} />
+            <Route path="audit" element={<RequirePerm perms={perms}><AuditPage /></RequirePerm>} />
+            <Route path="replay" element={<RequirePerm perms={perms}><SessionReplayPage /></RequirePerm>} />
+            <Route path="notification" element={<RequirePerm perms={perms}><NotificationAdminPage /></RequirePerm>} />
+            <Route path="dlp" element={<RequirePerm perms={perms}><DlpPage /></RequirePerm>} />
+            <Route path="compliance" element={<RequirePerm perms={perms}><CompliancePage /></RequirePerm>} />
+            <Route path="security-ops" element={<RequirePerm perms={perms}><SecurityOpsPage /></RequirePerm>} />
+            <Route path="lifecycle" element={<RequirePerm perms={perms}><LifecyclePage /></RequirePerm>} />
+            <Route path="data-protection" element={<RequirePerm perms={perms}><DataProtectionPage /></RequirePerm>} />
+            <Route path="storage-quotas" element={<RequirePerm perms={perms}><StorageManagementPage /></RequirePerm>} />
+            <Route path="storage-orphans" element={<RequirePerm perms={perms}><OrphanReportsPage /></RequirePerm>} />
+            <Route path="*" element={<Navigate to={firstAccessiblePath(perms)} replace />} />
           </Routes>
           </ErrorBoundary>
         </div>

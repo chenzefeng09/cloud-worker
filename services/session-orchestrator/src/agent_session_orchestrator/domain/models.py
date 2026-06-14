@@ -92,6 +92,9 @@ class Run(Base):
     # Immutable App-run harness snapshot (model/version/inputs/etc.) captured
     # at run creation.  NULL for ordinary chat runs.
     app_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Origin of the run: "user" for interactive chat/app runs, "schedule" for
+    # cron-triggered runs dispatched by the cron-runner service.
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="user", server_default="user")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
     )

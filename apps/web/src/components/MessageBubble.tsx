@@ -8,11 +8,13 @@ import { useCopied, CopyIcon } from './CopyButton';
 import { formatRelativeTimeZh, formatAbsoluteTimeZh } from '../lib/format';
 import { sanitizeStreamingMarkdown } from '../lib/sanitizeStreamingMarkdown';
 import { useFeatureFlag } from '../hooks/useFeatureFlags';
+import type { CanvasOpenSeed } from '../lib/canvasObjects';
 
 interface MessageBubbleProps {
   message: Message;
   friendly?: boolean;
   onPreviewFile?: (att: { id: string; filename: string; mime?: string }) => void;
+  onOpenCanvas?: (seed: CanvasOpenSeed) => void;
   onRewind?: (message: Message) => void;
   /** True when this is the LAST assistant text message of its run — only then
    *  is the copy button shown, and it copies the whole round's text. */
@@ -84,7 +86,7 @@ const userActionBtnHoverOut = (e: React.MouseEvent<HTMLButtonElement>) => {
 
 // ── MessageBubble ─────────────────────────────────────────────────────────────
 
-export function MessageBubble({ message, friendly, onPreviewFile, onRewind, showRoundCopy, roundCopyText }: MessageBubbleProps) {
+export function MessageBubble({ message, friendly, onPreviewFile, onOpenCanvas, onRewind, showRoundCopy, roundCopyText }: MessageBubbleProps) {
   const [toolExpanded, setToolExpanded] = useState<Record<string, boolean>>({});
   const [groupOpen, setGroupOpen] = useState(() => !friendly);
   const { copied: userCopied, copy: copyUser } = useCopied();
@@ -277,11 +279,13 @@ export function MessageBubble({ message, friendly, onPreviewFile, onRewind, show
   // ── ASSISTANT (text block) ────────────────────────────────────────────────
   return (
     <AssistantTextBlock
+      messageId={message.id}
       content={message.content}
       streaming={message.streaming}
       showCopy={showRoundCopy}
       copyText={roundCopyText}
       createdAt={message.created_at}
+      onOpenCanvas={onOpenCanvas}
     />
   );
 }
@@ -289,17 +293,21 @@ export function MessageBubble({ message, friendly, onPreviewFile, onRewind, show
 // ── Assistant text block with hover copy action row ───────────────────────────
 
 function AssistantTextBlock({
+  messageId,
   content,
   streaming,
   showCopy,
   copyText,
   createdAt,
+  onOpenCanvas,
 }: {
+  messageId: string;
   content: string;
   streaming?: boolean;
   showCopy?: boolean;
   copyText?: string;
   createdAt?: string;
+  onOpenCanvas?: (seed: CanvasOpenSeed) => void;
 }) {
   const { copied, copy } = useCopied();
   const displayContent = streaming ? sanitizeStreamingMarkdown(content) : content;
@@ -381,7 +389,48 @@ function AssistantTextBlock({
             {formatRelativeTimeZh(createdAt)}
           </time>
         )}
-        {/* Placeholder slot for future actions (e.g. rewind) */}
+        {onOpenCanvas && (
+          <button
+            onClick={() =>
+              onOpenCanvas({
+                kind: 'article',
+                content: copyText ?? content,
+                sourceMessageId: messageId,
+              })
+            }
+            aria-label="放入画布"
+            title="放入画布"
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+              justifyContent: 'center',
+              minWidth: 44,
+              height: 26,
+              padding: '0 7px',
+              background: 'transparent',
+              border: 'none',
+              borderRadius: 'var(--r-sm)',
+              cursor: 'pointer',
+              color: 'var(--ink-2)',
+              fontFamily: 'var(--font-mono)',
+              fontSize: 11,
+              whiteSpace: 'nowrap',
+              transition: 'color 0.15s, background 0.1s',
+            }}
+            onMouseEnter={(e) => {
+              (e.currentTarget as HTMLButtonElement).style.background = 'var(--paper-2)';
+              (e.currentTarget as HTMLButtonElement).style.color = 'var(--ink)';
+            }}
+            onMouseLeave={(e) => {
+              (e.currentTarget as HTMLButtonElement).style.background = 'transparent';
+              (e.currentTarget as HTMLButtonElement).style.color = 'var(--ink-2)';
+            }}
+          >
+            <span>◇</span>
+            <span>画布</span>
+          </button>
+        )}
       </div>
       )}
     </div>

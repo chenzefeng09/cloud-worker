@@ -8,6 +8,16 @@ Plus large-attachment specifics:
   * tenant scoping is forwarded via ``X-Tenant-Id`` (never the body),
   * the user-allows list is passed through verbatim, and a *bare array*
     upstream shape is tolerated.
+
+Tenant delegation (``require_admin_module_bff("session.attachment.large.create")``):
+  * a tenant_admin (holds ``session.attachment.large.create`` via ``session.*``)
+    passes the same-tenant gate;
+  * a plain member (holds only ``session.attachment.read`` /
+    ``session.attachment.create``) is 403'd at the BFF;
+  * a tenant_admin targeting a *foreign* ``?tenant_id=`` is 403'd by the
+    cross-tenant lane (it lacks ``platform.admin``);
+  * the tenant-delegated path forwards no ``X-Actor: ADMIN`` (only the static
+    ``X-Foundation-Scopes`` grant lifecycle needs to admit the call).
 """
 
 from __future__ import annotations
@@ -77,12 +87,15 @@ class FakeLifecycle:
         self,
         *,
         authz_allowed: bool = True,
+        allowed_actions: set[str] | None = None,
         error_status: int | None = None,
         bare_array_allows: bool = False,
     ) -> None:
         self.authz_allowed = authz_allowed
+        self.allowed_actions = allowed_actions
         self.error_status = error_status
         self.bare_array_allows = bare_array_allows
+        self.checked_actions: list[str] = []
         self.requests: list[tuple[str, str, dict, dict]] = []
 
     def route(self, method: str, url: str, **kw: Any) -> httpx.Response:
@@ -91,7 +104,13 @@ class FakeLifecycle:
         )
 
         if url.endswith("/check"):
-            return httpx.Response(200, json={"allowed": self.authz_allowed})
+            action = (kw.get("json") or {}).get("action", "")
+            self.checked_actions.append(action)
+            if self.allowed_actions is not None:
+                allowed = action in self.allowed_actions
+            else:
+                allowed = self.authz_allowed
+            return httpx.Response(200, json={"allowed": allowed})
 
         if self.error_status is not None:
             return httpx.Response(
@@ -174,6 +193,33 @@ def la_unreachable(monkeypatch: pytest.MonkeyPatch) -> FakeLifecycle:
 
     monkeypatch.setattr(httpx, "AsyncClient", _AC)
     return fake
+
+
+# The ``member`` system role's session-attachment grants are
+# ``session.attachment.read`` / ``session.attachment.create`` — crucially NOT
+# ``session.attachment.large.create`` (the BFF gate action).
+_MEMBER_ACTIONS = {
+    "session.attachment.read",
+    "session.attachment.create",
+}
+
+# tenant_admin holds ``session.attachment.large.create`` (via the ``session.*``
+# wildcard) but NOT ``platform.admin`` — passes the same-tenant gate, barred
+# from cross-tenant operations.
+_TENANT_ADMIN_ACTIONS = {"session.attachment.large.create"}
+
+# The single action the BFF guard authorizes for every large-attachment endpoint.
+_GATE_ACTION = "session.attachment.large.create"
+
+
+@pytest.fixture
+def la_member(monkeypatch: pytest.MonkeyPatch) -> FakeLifecycle:
+    return _install(FakeLifecycle(allowed_actions=_MEMBER_ACTIONS), monkeypatch)
+
+
+@pytest.fixture
+def la_tenant_admin(monkeypatch: pytest.MonkeyPatch) -> FakeLifecycle:
+    return _install(FakeLifecycle(allowed_actions=_TENANT_ADMIN_ACTIONS), monkeypatch)
 
 
 # (method, path, json-body, happy-status)
@@ -309,3 +355,77 @@ def test_delete_hits_user_path(la_client, la_cookie, la_allowed) -> None:
         u == f"{LIFECYCLE_URL}/large-attachment/user-allows/usr_ABC"
         for (m, u, _, _) in la_allowed.requests if m == "DELETE"
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Tenant delegation — gated on ``session.attachment.large.create`` (held by
+# tenant_admin via ``session.*``, not by member).
+# ──────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("method,path,body,ok", ENDPOINTS)
+def test_tenant_admin_allowed(
+    la_client, la_cookie, la_tenant_admin, method, path, body, ok,
+) -> None:
+    """tenant_admin (holds session.attachment.large.create, no platform.admin)."""
+    resp = _call(la_client, method, path, body, cookies=la_cookie)
+    assert resp.status_code == ok, f"{method} {path} → {resp.status_code} ({resp.text})"
+    assert _GATE_ACTION in la_tenant_admin.checked_actions
+
+
+@pytest.mark.parametrize("method,path,body,_ok", ENDPOINTS)
+def test_member_denied(
+    la_client, la_cookie, la_member, method, path, body, _ok,
+) -> None:
+    """A plain member (no session.attachment.large.create) is 403'd at the BFF."""
+    resp = _call(la_client, method, path, body, cookies=la_cookie)
+    assert resp.status_code == 403, f"{method} {path} → {resp.status_code}"
+
+
+@pytest.mark.parametrize("method,path,body,_ok", ENDPOINTS)
+def test_no_admin_actor_forwarded(
+    la_client, la_cookie, la_tenant_admin, method, path, body, _ok,
+) -> None:
+    """The tenant-delegated path forwards no X-Actor:ADMIN (only the static
+    X-Foundation-Scopes grant lifecycle needs to admit the call)."""
+    resp = _call(la_client, method, path, body, cookies=la_cookie)
+    assert resp.status_code in (200, 201)
+    forwarded = [
+        h for (_, u, h, _) in la_tenant_admin.requests if not u.endswith("/check")
+    ]
+    assert forwarded, "no upstream call recorded"
+    for hdrs in forwarded:
+        assert "X-Actor" not in hdrs, f"{method} {path} leaked X-Actor: {hdrs}"
+
+
+def test_tenant_admin_cross_tenant_forbidden(
+    la_client, la_cookie, la_tenant_admin,
+) -> None:
+    """tenant_admin (no platform.admin) targeting a foreign tenant → 403, and no
+    lifecycle call is forwarded."""
+    foreign = "tnt_OTHER0000000000000000000001"
+    resp = la_client.get(
+        PREFIX + f"/admin/large-attachment/tenant-setting?tenant_id={foreign}",
+        cookies=la_cookie,
+    )
+    assert resp.status_code == 403
+    assert not any(
+        u.startswith(f"{LIFECYCLE_URL}/large-attachment")
+        for (_, u, _, _) in la_tenant_admin.requests
+    )
+
+
+def test_super_admin_cross_tenant_allowed(
+    la_client, la_cookie, la_allowed,
+) -> None:
+    """super_admin (platform.admin via authz_allowed) may target any tenant."""
+    target = "tnt_OTHER0000000000000000000001"
+    resp = la_client.get(
+        PREFIX + f"/admin/large-attachment/tenant-setting?tenant_id={target}",
+        cookies=la_cookie,
+    )
+    assert resp.status_code == 200
+    calls = [
+        h for (_, u, h, _) in la_allowed.requests
+        if u == f"{LIFECYCLE_URL}/large-attachment/tenant-setting"
+    ]
+    assert calls and calls[-1].get("X-Tenant-Id") == target

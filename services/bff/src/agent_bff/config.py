@@ -122,3 +122,13 @@ class Settings(BaseSettings):
     db_pool_size: int = 5
     db_max_overflow: int = 10
     db_pool_recycle: int = 1800
+
+    # ── Service-account token ────────────────────────────────────────────────
+    # Shared secret used by internal services (cron-runner) to authenticate
+    # without a user session cookie.  When empty/unset the machine-auth path
+    # is DISABLED — requests with X-Service-Token are rejected like any other
+    # unauthenticated request.
+    service_token: str = ""
+
+    # ── Cron runner — schedules proxy ────────────────────────────────────────
+    cron_runner_url: str = "http://localhost:8013/api/cron/v1"

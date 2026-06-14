@@ -138,3 +138,8 @@ webFetchGateway:
     minAvailable: 1
   networkPolicy:
     enabled: true
+
+# tool-broker is on the critical egress path for EVERY sandbox in broker mode;
+# match peer HA posture (replicas / HPA / PDB / NetworkPolicy).
+toolBroker:
+  <<: *svcDefaults

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import type { PoolSnapshot } from '../../api/types';
+import { formatTimeAuto } from '../../i18n/dates';
 
 const isTodo = (err: unknown) =>
   err instanceof ApiError && (err.status === 404 || err.status === 501 || err.status === 502);
@@ -142,7 +143,7 @@ export function PoolMonitorPage() {
             <span>分档占用</span>
             {lastRefreshed && (
               <span className="normal-case tracking-normal text-dim">
-                最后刷新 {lastRefreshed.toLocaleTimeString('zh-CN')}
+                最后刷新 {formatTimeAuto(lastRefreshed)}
               </span>
             )}
           </div>

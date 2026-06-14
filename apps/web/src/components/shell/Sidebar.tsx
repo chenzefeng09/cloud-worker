@@ -1,41 +1,50 @@
 import { NavLink, useNavigate } from 'react-router-dom';
-import { useWorkspace } from '../../lib/workspaceContext';
 import { useChatStore } from '../../stores/chatStore';
 import { useSessions } from '../../hooks/useSessions';
 import { api } from '../../api/client';
 import { WorkspaceSwitcher } from './WorkspaceSwitcher';
+import { useTranslation } from '../../i18n';
+import { canAccessAdmin } from '../../admin/AdminLayout';
+import {
+  RECENCY_BUCKET_ORDER,
+  recencyBucketZh,
+  formatAbsoluteTimeZh,
+} from '../../lib/format';
+import type { Session } from '../../api/types';
 
 interface NavSpec {
   to: string;
   label: string;
   glyph: string;
   count?: string;
-  countFrom?: 'tasks';
 }
 
 const NAV: NavSpec[] = [
-  { to: '/home', label: '首页', glyph: '◇' },
-  { to: '/tasks', label: '任务', glyph: '▤', countFrom: 'tasks' },
+  { to: '/home', label: '新任务', glyph: '◇' },
+  { to: '/schedules', label: '定时任务', glyph: '◷' },
   { to: '/files', label: '基础文件', glyph: '⌗' },
   { to: '/library', label: '资源库', glyph: '✦', count: '13' },
-  { to: '/fleet', label: '工作节点', glyph: '◈', count: '6' },
 ];
 
 export function Sidebar() {
-  const { ws } = useWorkspace();
-  const { sessions } = useSessions();
+  const { sessions, loadMore, loadingMore, hasMore } = useSessions();
   const userProfile = useChatStore((s) => s.userProfile);
   const logout = useChatStore((s) => s.logout);
   const navigate = useNavigate();
+  const { lang, setLang } = useTranslation();
 
-  const navCounts = {
-    tasks: String(sessions.length),
-  };
-
-  const recent = sessions.slice(0, 3);
   const devBuildLabel = import.meta.env.DEV
     ? `dev ${import.meta.env.VITE_DEV_BUILD_STAMP ?? 'local'}`
     : null;
+
+  // Section the recent sessions into calendar-recency buckets (ChatGPT/Claude
+  // style) so a long list reads as 今天 / 昨天 / 过去 7 天 / … instead of one
+  // undifferentiated wall. `sessions` already arrives newest-first from the
+  // store, so each bucket preserves that order.
+  const recentGroups = RECENCY_BUCKET_ORDER.map((bucket) => ({
+    bucket,
+    items: sessions.filter((s) => recencyBucketZh(s.updated_at) === bucket),
+  })).filter((g) => g.items.length > 0);
 
   const handleLogout = async () => {
     try {
@@ -62,9 +71,10 @@ export function Sidebar() {
 
       <WorkspaceSwitcher />
 
-      <nav className="flex flex-col gap-0.5">
+      <nav className="flex-1 min-h-0 flex flex-col gap-0.5">
+        <div className="flex flex-col gap-0.5 shrink-0">
         {NAV.map((n) => {
-          const count = n.countFrom ? navCounts[n.countFrom] : n.count;
+          const count = n.count;
           return (
             <NavLink
               key={n.to}
@@ -100,52 +110,39 @@ export function Sidebar() {
             </NavLink>
           );
         })}
-
-        <div className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim px-2 pt-3 pb-1">
-          最近 · {ws.name}
         </div>
-        {recent.length === 0 && (
-          <div className="font-mono italic text-dim text-[11px] px-2.5 py-1">暂无任务</div>
+
+        <div className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim px-2 pt-3 pb-0.5 shrink-0">
+          最近
+        </div>
+        {sessions.length === 0 && (
+          <div className="font-mono italic text-dim text-[11px] px-2.5 py-1 shrink-0">暂无任务</div>
         )}
-        {recent.map((s) => (
-          <NavLink
-            key={s.id}
-            to={`/tasks/${s.id}`}
-            className={({ isActive }) =>
-              [
-                'flex items-center gap-2.5 px-2 py-1.5 rounded-sm border cursor-pointer no-underline truncate',
-                isActive
-                  ? 'bg-surface border-line text-ink'
-                  : 'border-transparent text-ink-2 hover:bg-paper-2 hover:text-ink',
-              ].join(' ')
-            }
-          >
-            <span
-              className="w-4 text-center font-mono text-[11px]"
-              style={{
-                color:
-                  s.status === 'ACTIVE'
-                    ? 'var(--cw-accent, #d23a1f)'
-                    : s.status === 'COMPLETED'
-                      ? '#2c8f5d'
-                      : '#75756f',
-              }}
+        <div className="flex-1 min-h-0 overflow-y-auto cw-scroll -mx-0.5 px-0.5">
+          {recentGroups.map((g) => (
+            <div key={g.bucket} className="mb-1.5">
+              <div className="text-[10px] text-dim px-2 pt-1.5 pb-1 select-none">{g.bucket}</div>
+              <div className="flex flex-col gap-px">
+                {g.items.map((s) => (
+                  <RecentItem key={s.id} session={s} />
+                ))}
+              </div>
+            </div>
+          ))}
+          {hasMore && (
+            <button
+              onClick={loadMore}
+              disabled={loadingMore}
+              className="mt-1 w-full px-2 py-1.5 text-left font-mono text-[10px] text-dim hover:text-ink-2 disabled:opacity-50"
             >
-              {s.status === 'ACTIVE'
-                ? '●'
-                : s.status === 'COMPLETED'
-                  ? '✓'
-                  : s.status === 'PAUSED'
-                    ? '‖'
-                    : '◷'}
-            </span>
-            <span className="truncate text-[12.5px]">{s.title || '未命名任务'}</span>
-          </NavLink>
-        ))}
+              {loadingMore ? '加载中…' : '显示更多'}
+            </button>
+          )}
+        </div>
       </nav>
 
-      {/* Admin entry — only super_admin */}
-      {userProfile?.roles?.includes('super_admin') && (
+      {/* Admin entry — visible to anyone with at least one admin permission */}
+      {canAccessAdmin(userProfile?.permissions) && (
         <div className="pt-2 border-t border-line-2">
           <NavLink
             to="/admin"
@@ -192,12 +189,22 @@ export function Sidebar() {
           </span>
           <span className="truncate">{userProfile?.email ?? 'you@acme.co'}</span>
         </NavLink>
-        <button
-          onClick={handleLogout}
-          className="text-left font-mono text-[10px] text-dim hover:text-ink-2 pl-[30px]"
-        >
-          登出
-        </button>
+        <div className="flex items-center gap-2 pl-[30px]">
+          <button
+            onClick={handleLogout}
+            className="text-left font-mono text-[10px] text-dim hover:text-ink-2"
+          >
+            登出
+          </button>
+          <span className="font-mono text-[10px] text-dim select-none">·</span>
+          <button
+            onClick={() => setLang(lang === 'zh' ? 'en' : 'zh')}
+            title={lang === 'zh' ? '切换到英文' : 'Switch to Chinese'}
+            className="font-mono text-[10px] text-dim hover:text-ink-2"
+          >
+            {lang === 'zh' ? 'EN' : '中'}
+          </button>
+        </div>
         {devBuildLabel && (
           <div className="pl-[30px] font-mono text-[9px] text-dim" title="Frontend dev build stamp">
             {devBuildLabel}
@@ -205,5 +212,30 @@ export function Sidebar() {
         )}
       </div>
     </aside>
+  );
+}
+
+/**
+ * A single recent-session row in the sidebar. Title-only (ChatGPT/Claude
+ * style) — no status glyph, since a wall of coloured dots reads as noise once
+ * the list is long. The session's last-updated time is exposed as a hover
+ * tooltip instead.
+ */
+function RecentItem({ session }: { session: Session }) {
+  return (
+    <NavLink
+      to={`/tasks/${session.id}`}
+      title={formatAbsoluteTimeZh(session.updated_at)}
+      className={({ isActive }) =>
+        [
+          'block px-2 py-1.5 rounded-sm text-[12.5px] cursor-pointer no-underline truncate',
+          isActive
+            ? 'bg-surface text-ink'
+            : 'text-ink-2 hover:bg-paper-2 hover:text-ink',
+        ].join(' ')
+      }
+    >
+      {session.title || '未命名任务'}
+    </NavLink>
   );
 }

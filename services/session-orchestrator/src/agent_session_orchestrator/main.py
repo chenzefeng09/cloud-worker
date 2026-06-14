@@ -68,17 +68,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     init_observability(service_name="session-orchestrator")
     await init_db(settings)
 
+    from agent_session_orchestrator.services.reconcile_sweeper import run_sweeper
+
     sweep_task = asyncio.create_task(
         _retention_sweep_loop(settings), name="session-retention-sweep"
+    )
+    reconcile_task = asyncio.create_task(
+        run_sweeper(app), name="run-reconcile-sweep"
     )
     try:
         yield
     finally:
         sweep_task.cancel()
+        reconcile_task.cancel()
         # Cancelled tasks raise CancelledError on await — expected; suppress
         # so shutdown completes cleanly.
         with contextlib.suppress(asyncio.CancelledError):
             await sweep_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await reconcile_task
         await close_db()
 
 

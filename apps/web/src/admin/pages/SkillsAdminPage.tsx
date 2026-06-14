@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useConfirm, useToast } from '../components/dialogs';
+import { formatDateAuto, formatDateTimeAuto } from '../../i18n/dates';
 import { Dialog } from '../components/Dialog';
 import type { AdminSkill, AdminSkillVersion } from '../../api/types';
 
@@ -103,7 +104,7 @@ function SkillDetailPanel({
         <span className="font-mono text-ink-2">{d.visibility || '—'}</span>
         <span className="font-mono text-dim">创建时间</span>
         <span className="font-mono text-ink-2">
-          {d.created_at ? new Date(d.created_at).toLocaleString('zh-CN') : '—'}
+          {d.created_at ? formatDateTimeAuto(new Date(d.created_at)) : '—'}
         </span>
       </div>
 
@@ -157,7 +158,7 @@ function SkillDetailPanel({
                     </td>
                     <td className="px-3 py-1.5 text-[12px] text-ink-2">{v.uploaded_by || '—'}</td>
                     <td className="px-3 py-1.5 font-mono text-[11px] text-dim">
-                      {v.uploaded_at ? new Date(v.uploaded_at).toLocaleString('zh-CN') : '—'}
+                      {v.uploaded_at ? formatDateTimeAuto(new Date(v.uploaded_at)) : '—'}
                     </td>
                   </tr>
                 ))}
@@ -250,7 +251,7 @@ export function SkillsAdminPage() {
                       {s.description || '—'}
                     </td>
                     <td className="px-3 py-2 font-mono text-[11px] text-dim">
-                      {s.created_at ? new Date(s.created_at).toLocaleDateString('zh-CN') : '—'}
+                      {s.created_at ? formatDateAuto(new Date(s.created_at)) : '—'}
                     </td>
                   </tr>
                 ))}

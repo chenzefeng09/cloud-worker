@@ -231,6 +231,49 @@ paths:
               schema:
                 $ref: '#/components/schemas/Run'
 
+  /api/session/v1/sessions/{session_id}/pending:
+    get:
+      operationId: orchestrator_session_pending
+      summary: List currently-paused HITL interactions across the session's runs
+      description: >-
+        Best-effort mount-time pull so the frontend can rehydrate ConfirmCard /
+        QuestionCard for a run paused while the page was closed. Always 200 with
+        a (possibly empty) items array; never 404/500. Reads the Redis
+        agent:run:{run_id}:paused blob per run (authoritative pause signal).
+      tags: [Runs]
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Paused interactions (possibly empty)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        run_id: { type: string }
+                        kind:
+                          type: string
+                          enum: [confirm, answer, question]
+                        tool_calls:
+                          type: array
+                          items:
+                            type: object
+                            properties:
+                              id: { type: string }
+                              name: { type: string, nullable: true }
+                              args: { type: string, nullable: true }
+                        question: { type: string, nullable: true }
+                        paused_at: { type: string, nullable: true }
+
   /api/session/v1/sessions/{session_id}/runs/{run_id}:
     get:
       operationId: orchestrator_runs_get
@@ -278,10 +321,31 @@ paths:
   # ---------------------------------------------------------------------------
   # SSE Stream
   # ---------------------------------------------------------------------------
-  /api/session/v1/sessions/{session_id}/messages/stream:
+  /api/session/v1/sessions/{session_id}/stream:
     get:
-      operationId: orchestrator_messages_stream
-      summary: SSE stream of session messages and run events
+      operationId: orchestrator_session_stream
+      summary: Session-scoped multiplexing SSE stream
+      description: >
+        Holds the HTTP connection open for the lifetime of the session view and
+        surfaces events from whatever run is currently active, including runs that
+        start after the connection is opened. Unlike the legacy per-run stream
+        (removed), this endpoint never closes on run completion — it keeps waiting
+        for the next run.
+
+        **Event names emitted:**
+
+        - `run_started`          — a new run has become active on this session.
+        - `token`                — incremental assistant text delta (from Redis stream).
+        - `tool`                 — tool call / result (from Redis stream).
+        - `thinking`             — reasoning text (from Redis stream).
+        - `plan`                 — structured plan-steps update.
+        - `message`              — newly persisted message row.
+        - `pending_confirmation` — run paused waiting for user to confirm a tool call.
+        - `pending_question`     — run paused waiting for a free-text answer.
+        - `run_paused`           — run entered HITL pause state.
+        - `run_complete`         — active run reached a terminal state.
+        - `done`                 — stream deadline exhausted; client should reconnect.
+        - `error`                — unexpected server error; detail is opaque.
       tags: [Messages]
       parameters:
         - name: session_id

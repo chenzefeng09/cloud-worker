@@ -29,6 +29,7 @@ def fetch_mcp_servers(
     token: str,
     tenant_id: str,
     service_scopes: str = "",
+    broker_lease: str = "",
 ) -> list[dict[str, Any]]:
     """GET ``{base_url}/internal/mcp-servers?tenant_id=...``.
 
@@ -60,6 +61,8 @@ def fetch_mcp_servers(
         headers["X-Tenant-Id"] = tenant_id
     if service_scopes:
         headers["X-Service-Scopes"] = service_scopes
+    if broker_lease:
+        headers["X-Tool-Broker-Lease"] = broker_lease
     response = _client().get(url, params={"tenant_id": tenant_id}, headers=headers)
     response.raise_for_status()
     body = response.json()

@@ -9,6 +9,7 @@ import {
   YAxis,
 } from 'recharts';
 import { api, ApiError } from '../../api/client';
+import { formatDateTimeAuto, formatTimeAuto } from '../../i18n/dates';
 import type {
   BucketPurpose,
   StorageQuotaSummaryItem,
@@ -30,7 +31,7 @@ const isTodo = (err: unknown) =>
 function fmt(iso?: string | null): string {
   if (!iso) return '—';
   const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN');
+  return Number.isNaN(d.getTime()) ? iso : formatDateTimeAuto(d);
 }
 
 // Human-readable byte size.  Keeps two significant figures past the unit
@@ -449,7 +450,7 @@ export function StorageManagementPage() {
                 <XAxis
                   dataKey="t"
                   tickFormatter={(t) =>
-                    new Date(t * 1000).toLocaleTimeString('zh-CN', {
+                    formatTimeAuto(new Date(t * 1000), {
                       hour: '2-digit',
                       minute: '2-digit',
                     })
@@ -463,7 +464,7 @@ export function StorageManagementPage() {
                 />
                 <Tooltip
                   labelFormatter={(t) =>
-                    new Date(Number(t) * 1000).toLocaleString('zh-CN')
+                    formatDateTimeAuto(new Date(Number(t) * 1000))
                   }
                   formatter={(value) => [formatBytes(Number(value) || 0), '已用']}
                 />

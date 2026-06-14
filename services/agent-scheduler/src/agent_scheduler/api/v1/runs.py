@@ -283,6 +283,117 @@ async def _fetch_tenant_virtual_key(
     return None
 
 
+async def _mint_run_virtual_key(
+    *,
+    settings,  # type: ignore[no-untyped-def]
+    tenant_id: str,
+    run_id: str,
+    bearer: str,
+) -> str | None:
+    """Mint a short-lived, run-scoped virtual key from the LLM gateway.
+
+    Security: the sandbox should never see the long-lived tenant key — if it
+    leaked it could bill the tenant indefinitely.  Instead we ask the gateway
+    for an *ephemeral* key whose ``expires_at`` is bounded by the sandbox
+    timeout (+ grace), so a leaked key dies shortly after the run.
+
+    Returns the ephemeral virtual key string, or ``None`` if:
+      * ``llm_gateway_url`` is unset, or
+      * the gateway does not support ephemeral minting (older gateway → 404 /
+        405), or the mint call otherwise fails / is unreachable.
+
+    Returning ``None`` is intentional: ``create_run`` falls back to the
+    long-lived tenant key so runs never break on an older or briefly-unhealthy
+    gateway.  The fallback is logged so the weaker posture is observable.
+    """
+    if not settings.llm_gateway_url:
+        return None
+    url = f"{settings.llm_gateway_url.rstrip('/')}/tenant-keys/ephemeral"
+    # Match the minted-token TTL convention used for the sandbox identity token
+    # (capped at the sandbox timeout, clamped to a sane window).  A small grace
+    # window keeps the key valid for any in-flight request as the run winds
+    # down; the gateway clamps the final value defensively as well.
+    ttl_seconds = min(max(settings.sandbox_timeout + 60, 60), 86_400)
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.post(
+                url,
+                json={"run_id": run_id, "ttl_seconds": ttl_seconds},
+                headers={
+                    "Authorization": f"Bearer {bearer}",
+                    # Gateway resolves the tenant from X-Tenant-Id (its
+                    # TenantContextMiddleware); without it the request is 401.
+                    "X-Tenant-Id": tenant_id,
+                },
+            )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "llm-gateway unreachable while minting run-scoped key "
+            "(falling back to tenant key): %s",
+            exc,
+        )
+        return None
+
+    if resp.status_code not in (status.HTTP_200_OK, status.HTTP_201_CREATED):
+        # 404/405 → older gateway without the ephemeral endpoint; anything else
+        # → a transient mint failure.  Either way we fall back to the tenant key
+        # rather than failing the run.
+        logger.warning(
+            "llm-gateway returned HTTP %s for POST /tenant-keys/ephemeral "
+            "(falling back to tenant key)",
+            resp.status_code,
+        )
+        return None
+
+    try:
+        data = resp.json()
+        key_val = (
+            data.get("virtual_key") or data.get("key") or data.get("value")
+        )
+        if key_val:
+            return str(key_val)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("failed to parse /tenant-keys/ephemeral response: %s", exc)
+    return None
+
+
+async def _revoke_run_virtual_keys(
+    *,
+    settings,  # type: ignore[no-untyped-def]
+    tenant_id: str,
+    run_id: str,
+    bearer: str,
+) -> None:
+    """Best-effort proactive revoke of a run's ephemeral keys on completion.
+
+    Defense-in-depth complement to TTL expiry: when the scheduler observes a
+    run finishing (e.g. an explicit cancel) it asks the gateway to disable the
+    run's ephemeral keys immediately rather than waiting for the TTL.  Failures
+    are swallowed — TTL expiry remains the authoritative safety net, so a flaky
+    revoke must never surface as a run error.
+    """
+    if not settings.llm_gateway_url:
+        return
+    url = f"{settings.llm_gateway_url.rstrip('/')}/tenant-keys/revoke-run"
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            await client.post(
+                url,
+                json={"run_id": run_id},
+                headers={
+                    "Authorization": f"Bearer {bearer}",
+                    "X-Tenant-Id": tenant_id,
+                },
+            )
+    except httpx.HTTPError as exc:
+        # Non-fatal: the key will still expire on its own via TTL.
+        logger.warning(
+            "llm-gateway unreachable while revoking run-scoped key "
+            "(TTL expiry will still apply): %s",
+            exc,
+        )
+
+
 def _require_tenant_owner(
     runtime: DockerRuntime, container_id: str, tenant_id: str
 ) -> None:
@@ -359,6 +470,14 @@ async def create_run(
     # memory limit (small tier by default, large tier at/above the threshold).
     total_attachment_bytes: int = int(body.get("total_attachment_bytes") or 0)
 
+    # HITL: tool-confirmation gate + optional resume payload for continuing a
+    # PAUSED run (forwarded from the orchestrator; written into task.json).
+    hitl: bool = bool(body.get("hitl", True))
+    resume_raw = body.get("resume")
+    resume: dict[str, Any] | None = (
+        resume_raw if isinstance(resume_raw, dict) else None
+    )
+
     # Optional per-message LLM selection (model + reasoning effort), nested in
     # agent_config by the orchestrator. Falls back to top-level for direct callers.
     agent_config: dict[str, Any] = body.get("agent_config") or {}
@@ -403,19 +522,37 @@ async def create_run(
         run_id=run_id,
     )
 
-    # Fetch the tenant's virtual key from the LLM gateway so the sandbox can
-    # route every model call through the foundation gateway.  With the gateway
-    # enforcer enabled this is fail-closed: no virtual key, no sandbox spawn.
+    # Obtain the virtual key the sandbox uses to route model calls through the
+    # foundation gateway.  Security: prefer a SHORT-LIVED, run-scoped ephemeral
+    # key (expires at/after the run) so a key exfiltrated from the sandbox can
+    # only bill the tenant for ~one run's lifetime — not indefinitely.  If the
+    # gateway is older (no ephemeral endpoint) or minting fails, fall back to
+    # the long-lived tenant key so runs don't break (logged as a weaker
+    # posture).  With the gateway enforcer enabled this remains fail-closed: no
+    # virtual key at all → no sandbox spawn.
     scheduler_bearer = _settings.scheduler_service_token
     if scheduler_bearer in _PLACEHOLDER_TOKENS:
         # Best-effort: try the cached KC token without re-minting to avoid a
         # second round-trip.  If it's still empty we simply skip the key fetch.
         scheduler_bearer = str(_kc_token_cache.get("token", ""))
-    virtual_key: str | None = await _fetch_tenant_virtual_key(
+    virtual_key: str | None = await _mint_run_virtual_key(
         settings=_settings,
         tenant_id=tenant_id,
+        run_id=run_id,
         bearer=scheduler_bearer,
     )
+    if not virtual_key:
+        # Fallback path: ephemeral minting unavailable → use the tenant key.
+        logger.warning(
+            "run %s: ephemeral key mint unavailable; falling back to "
+            "long-lived tenant virtual key",
+            run_id,
+        )
+        virtual_key = await _fetch_tenant_virtual_key(
+            settings=_settings,
+            tenant_id=tenant_id,
+            bearer=scheduler_bearer,
+        )
     extensions = {
         e.strip()
         for e in (_settings.runtime_extensions or "").split(",")
@@ -446,6 +583,8 @@ async def create_run(
             reasoning_effort=reasoning_effort,
             sys_prompt=sys_prompt,
             sampling_params=sampling_params,
+            hitl=hitl,
+            resume=resume,
         )
     except SandboxSpawnError as exc:
         raise HTTPException(
@@ -535,6 +674,7 @@ async def get_run(
              dependencies=[Depends(require_permission("run.cancel", "run"))])
 async def cancel_run(
     run_id: str,
+    request: Request,
     body: dict[str, Any] | None = None,
     runtime: DockerRuntime = TRuntime,
     tenant_id: str = TTenantId,
@@ -548,6 +688,28 @@ async def cancel_run(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="run not found",
         ) from exc
+
+    # Defense-in-depth: cancel is a definite run-completion signal we own, so
+    # proactively kill the run's short-lived ephemeral key instead of waiting
+    # for its TTL.  Best-effort only — TTL expiry is the authoritative net, so
+    # a revoke failure must never turn a successful cancel into an error.
+    #
+    # TODO(revoke-on-natural-completion): the scheduler does not own a single
+    # reliable signal for a run that finishes *on its own* (the orchestrator's
+    # Postgres is the source of truth; ``run_events`` is per-connection and may
+    # never be consumed for headless runs).  Until the orchestrator drives a
+    # completion callback into the scheduler, natural completions rely purely on
+    # TTL expiry — which already bounds the blast radius.
+    _settings = request.app.state.settings
+    scheduler_bearer = _settings.scheduler_service_token
+    if scheduler_bearer in _PLACEHOLDER_TOKENS:
+        scheduler_bearer = str(_kc_token_cache.get("token", ""))
+    await _revoke_run_virtual_keys(
+        settings=_settings,
+        tenant_id=tenant_id,
+        run_id=run_id,
+        bearer=scheduler_bearer,
+    )
     return {"id": run_id, "status": "CANCELLED"}
 
 

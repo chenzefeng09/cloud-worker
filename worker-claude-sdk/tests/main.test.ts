@@ -73,6 +73,13 @@ describe("main", () => {
       "FOUNDATION_TENANT_ID",
       "FOUNDATION_USER_ID",
       "AGENT_TASK_JSON",
+      "LLM_GATEWAY_URL",
+      "LLM_VIRTUAL_KEY",
+      "MCP_REGISTRY_URL",
+      "TOOL_BROKER_URL",
+      "TOOL_BROKER_LEASE",
+      "SANDBOX_EGRESS_MODE",
+      "S3_SECRET_ACCESS_KEY",
       "REDIS_URL",
     ]) {
       saved[k] = process.env[k];
@@ -141,6 +148,61 @@ describe("main", () => {
     expect(result.summary).toBe("hi back");
     expect(result.usage.input_tokens).toBe(90);
     expect(result.usage.total_tokens).toBe(120);
+  });
+
+  it("scrubs control-plane env before SDK query can run tools", async () => {
+    setEnv(REQUIRED_ENV);
+    setEnv({
+      AGENT_TASK_JSON: JSON.stringify({ task: "inspect env" }),
+      LLM_GATEWAY_URL: "http://llm-gateway:8011/api/llm-gateway/v1",
+      LLM_VIRTUAL_KEY: "vk-secret",
+      MCP_REGISTRY_URL: "http://mcp-registry:8010/api/mcp/v1",
+      TOOL_BROKER_URL: "http://tool-broker:8024/api/tool-broker/v1",
+      TOOL_BROKER_LEASE: "v1.payload.signature",
+      SANDBOX_EGRESS_MODE: "broker",
+      REDIS_URL: "redis://:secret@foundation-redis:6379/0",
+      S3_SECRET_ACCESS_KEY: "minio-secret",
+    });
+
+    const keys = [
+      "FOUNDATION_API_TOKEN",
+      "FOUNDATION_TENANT_ID",
+      "FOUNDATION_USER_ID",
+      "AGENT_TASK_JSON",
+      "LLM_GATEWAY_URL",
+      "LLM_VIRTUAL_KEY",
+      "MCP_REGISTRY_URL",
+      "TOOL_BROKER_URL",
+      "TOOL_BROKER_LEASE",
+      "SANDBOX_EGRESS_MODE",
+      "REDIS_URL",
+      "S3_SECRET_ACCESS_KEY",
+    ];
+    const inspected: Record<string, string | undefined> = {};
+    const queryFn = () =>
+      (async function* () {
+        for (const key of keys) inspected[key] = process.env[key];
+        yield {
+          type: "assistant",
+          message: {
+            content: [{ type: "text", text: "scrubbed" }],
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        } as AnyMsg;
+        yield { type: "result", subtype: "success" } as AnyMsg;
+      })() as AnyMsg;
+
+    const code = await main({
+      makeRedis: () => new RedisStateClient("run", undefined),
+      makeAdapter: () => new FakeAdapter() as never,
+      queryFn: queryFn as never,
+    });
+
+    expect(code).toBe(0);
+    expect(Object.keys(inspected)).toHaveLength(keys.length);
+    for (const key of keys) {
+      expect(inspected[key]).toBeUndefined();
+    }
   });
 
   it("empty task text → exit 0 with FAILED status (matches Python)", async () => {

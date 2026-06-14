@@ -162,3 +162,12 @@ webFetchGateway:
   resources:
     requests: { cpu: 200m, memory: 256Mi }
     limits:   { cpu: 1,    memory: 512Mi }
+
+# tool-broker is on the critical egress path for EVERY sandbox in broker mode,
+# so give it the same HA posture (replicas / HPA / PDB / NP / spread) as peers.
+toolBroker:
+  <<: *svcDefaults
+  replicaCount: 3
+  resources:
+    requests: { cpu: 200m, memory: 256Mi }
+    limits:   { cpu: 1,    memory: 512Mi }

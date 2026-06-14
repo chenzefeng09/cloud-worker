@@ -12,9 +12,38 @@ Covers cross-tenant governance over the agent-platform's *own* services
   * Sandbox pool     → sandbox-pool       (settings.sandbox_pool_url)
   * Token usage      → session-orchestr.  (settings.session_orchestrator_url)
 
-Every endpoint is guarded by ``require_super_admin_bff`` (imported from
-``admin.py``): the caller must hold ``platform.admin`` or the BFF fast-fails
-403 before any upstream call.
+Guard split
+───────────
+Two altitudes of guard apply here:
+
+  * Skills / MCP / Knowledge (modules 7-9) are *tenant-scoped* resources that
+    are delegated to tenant administrators.  They use
+    ``require_admin_module_bff(action)`` — a fail-closed guard that authorizes
+    a per-module ``action`` (``skill.create`` / ``mcp_server.create`` /
+    ``document.create``) against the caller's own tenant, and reserves
+    cross-tenant ``?tenant_id=`` operation for the platform super_admin.  These
+    endpoints forward **without** ``X-Actor: ADMIN`` so each upstream service's
+    own ``require_permission`` guard re-authorizes the *real* caller per action
+    (a tenant_admin holds the ``skill.*`` / ``mcp_server.*`` / ``document.*``
+    wildcards; a member, holding only ``*.read``, is denied on writes).
+  * Ops runs / sandboxes / usage (module 10) are delegated to tenant admins
+    the same way, gated on ``sandbox.read`` — held by ``tenant_admin`` (via the
+    ``sandbox.*`` wildcard) but NOT by ``member`` (whose run grants are
+    ``run.*`` only, with no ``sandbox.*``) — and forward **without**
+    ``X-Actor: ADMIN`` so agent-scheduler's own ``require_permission`` guard
+    re-authorizes the real caller (tenant_admin holds ``run.*`` / ``sandbox.*``;
+    super_admin holds ``*``).
+  * The sandbox-pool snapshot (``/admin/ops/pool``) is platform-level
+    infrastructure (process-global, not tenant-scoped) and remains
+    platform-super-admin only (``require_super_admin_bff``), still asserting
+    ``X-Actor: ADMIN`` downstream.
+
+Why ``skill.create`` (and not ``skill.read``) is the BFF gate action:
+the ``member`` system role holds ``skill.read`` / ``document.read`` /
+``document.search`` / ``mcp_server.read``, so gating on ``read`` would let a
+plain member into these admin modules.  The ``create`` token is held by
+``tenant_admin`` (via the ``skill.*`` etc. wildcards) but NOT by ``member`` —
+so it is the discriminator that admits tenant admins while excluding members.
 
 Cross-tenant convention
 ───────────────────────
@@ -27,16 +56,23 @@ caller's own tenant is used.  ``_scope_headers`` centralises this.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Awaitable, Callable
+
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from agent_bff.api._http import foundation_headers
+from agent_bff.api.dependencies import require_auth
 
 # Reuse the admin guard + upstream-error helper verbatim so the platform
 # proxies share exactly one super_admin enforcement + error-surfacing path.
 from agent_bff.api.v1.admin import _raise_for_upstream, require_super_admin_bff
 
 router = APIRouter(tags=["Platform Admin"])
+logger = logging.getLogger(__name__)
+
+_AUTHZ_TIMEOUT = 2.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -47,18 +83,142 @@ def _scope_headers(
     auth: tuple[str, str, str],
     *,
     tenant_id: str | None,
+    admin_actor: bool = True,
 ) -> dict[str, str]:
     """Build forward headers, letting the admin override the target tenant.
 
     ``auth`` is ``(caller_tenant_id, user_id, access_token)``.  When
     ``tenant_id`` is supplied (the super_admin is acting cross-tenant) it
     replaces the caller's tenant in the forwarded ``X-Tenant-Id`` header.
+
+    ``admin_actor`` controls whether ``X-Actor: ADMIN`` is asserted downstream:
+
+      * ``True`` (default) — used by the platform-super-admin-only ops/pool/usage
+        endpoints; the upstream trusts the BFF's ADMIN assertion and bypasses its
+        own per-user RBAC.
+      * ``False`` — used by the tenant-delegated skills/mcp/knowledge endpoints;
+        no ``X-Actor`` is sent so each upstream service's ``require_permission``
+        guard re-authorizes the *real* caller (by ``X-User-Id`` + ``X-Tenant-Id``)
+        per action.  This is what makes per-tenant delegation safe end-to-end.
     """
     caller_tenant, user_id, access_token = auth
     effective = tenant_id or caller_tenant
     hdrs = foundation_headers(effective, user_id, access_token)
-    hdrs["X-Actor"] = "ADMIN"
+    if admin_actor:
+        hdrs["X-Actor"] = "ADMIN"
     return hdrs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tenant-delegated module guard (skills / mcp / knowledge)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Mirrors ``admin_authz.require_tenant_rbac_bff``: a fail-closed BFF dependency
+# with two lanes.
+#
+#   • Cross-tenant lane — ``?tenant_id=`` pointing at a foreign tenant is a
+#     cross-tenant operation reserved for the platform super_admin
+#     (``platform.admin``).  A tenant_admin passing someone else's tenant is
+#     403'd here, before any upstream call.
+#   • Same-tenant lane — authorize the module's ``action`` (e.g. ``skill.create``)
+#     against the caller's own tenant.  ``create`` is chosen deliberately: it is
+#     held by ``tenant_admin`` (via the ``skill.*`` wildcard) but not by the
+#     ``member`` role (whose grants for these services are read-only), so the
+#     gate admits tenant admins while excluding members.
+#
+# The matching upstream service then re-checks the real per-endpoint action
+# (read/create/update/delete/search) on arrival — dual enforcement — because
+# these endpoints forward without ``X-Actor: ADMIN``.
+
+
+async def _check_allows(
+    *, authz_url: str, tenant_id: str, user_id: str, action: str, resource_type: str,
+) -> bool:
+    """Run one authz ``/check``; True only on an explicit ``allowed: true``.
+
+    Fail-closed: any transport error, non-200, unparseable body, or a decision
+    other than ``allowed=True`` returns False (the caller raises 403).
+    """
+    try:
+        async with httpx.AsyncClient(timeout=_AUTHZ_TIMEOUT) as client:
+            resp = await client.post(
+                f"{authz_url}/check",
+                json={
+                    "user_id": user_id,
+                    "action": action,
+                    "resource_type": resource_type,
+                },
+                headers={"X-Tenant-Id": tenant_id},
+            )
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.HTTPError) as exc:
+        logger.warning(
+            "bff.require_admin_module.authz_unreachable",
+            extra={"action": action, "exc": str(exc)},
+        )
+        return False
+
+    if resp.status_code != 200:
+        return False
+    try:
+        body = resp.json()
+    except Exception:
+        return False
+    return body.get("allowed") is True
+
+
+def require_admin_module_bff(
+    action: str,
+) -> Callable[..., Awaitable[tuple[str, str, str]]]:
+    """Build a fail-closed BFF guard delegating a tenant-scoped admin module.
+
+    ``action`` is the per-module discriminator authorized in the same-tenant
+    lane (``skill.create`` / ``mcp_server.create`` / ``document.create``).
+
+    super_admin (holding ``*``) satisfies every ``/check`` and therefore passes
+    both lanes — its existing cross-tenant ``?tenant_id=`` reach is preserved.
+    """
+
+    async def _dep(
+        request: Request,
+        _auth: tuple = Depends(require_auth()),
+    ) -> tuple[str, str, str]:
+        tenant_id, user_id, access_token = _auth
+        authz_url: str = request.app.state.settings.authz_url
+
+        requested_tenant = request.query_params.get("tenant_id")
+        is_cross_tenant = bool(requested_tenant) and requested_tenant != tenant_id
+
+        if is_cross_tenant:
+            if not await _check_allows(
+                authz_url=authz_url,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                action="platform.admin",
+                resource_type="platform",
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        "cross-tenant operation requires platform.admin "
+                        "(super_admin)"
+                    ),
+                )
+            return tenant_id, user_id, access_token
+
+        if not await _check_allows(
+            authz_url=authz_url,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            action=action,
+            resource_type=action.split(".", 1)[0],
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"permission denied ({action} required)",
+            )
+        return tenant_id, user_id, access_token
+
+    return _dep
 
 
 def _forward_params(request: Request) -> dict[str, str]:
@@ -74,8 +234,9 @@ async def _proxy_get(
     *,
     forward_params: bool = False,
     timeout: float = 15,
+    admin_actor: bool = True,
 ) -> dict:
-    headers = _scope_headers(auth, tenant_id=tenant_id)
+    headers = _scope_headers(auth, tenant_id=tenant_id, admin_actor=admin_actor)
     params = _forward_params(request) if forward_params else None
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -105,11 +266,13 @@ async def _proxy_get(
 async def admin_list_skills(
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("skill.create")),
 ) -> dict:
     """List skills published to a tenant's shelf (cross-tenant via tenant_id)."""
     url = f"{request.app.state.settings.skill_store_url}/skills"
-    return await _proxy_get(request, url, _auth, tenant_id, forward_params=True)
+    return await _proxy_get(
+        request, url, _auth, tenant_id, forward_params=True, admin_actor=False,
+    )
 
 
 @router.get("/admin/skills/{name}")
@@ -117,11 +280,11 @@ async def admin_get_skill(
     name: str,
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("skill.create")),
 ) -> dict:
     """Get a single skill by id (skill-store keys on skill_id, not name)."""
     url = f"{request.app.state.settings.skill_store_url}/skills/{name}"
-    return await _proxy_get(request, url, _auth, tenant_id)
+    return await _proxy_get(request, url, _auth, tenant_id, admin_actor=False)
 
 
 @router.get("/admin/skills/{name}/versions")
@@ -129,7 +292,7 @@ async def admin_list_skill_versions(
     name: str,
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("skill.create")),
 ) -> dict:
     """List a skill's versions.
 
@@ -137,7 +300,7 @@ async def admin_list_skill_versions(
     ``{items, total}`` envelope of the skill's versions (newest upload first).
     """
     url = f"{request.app.state.settings.skill_store_url}/skills/{name}/versions"
-    return await _proxy_get(request, url, _auth, tenant_id)
+    return await _proxy_get(request, url, _auth, tenant_id, admin_actor=False)
 
 
 @router.delete("/admin/skills/{name}")
@@ -145,14 +308,14 @@ async def admin_delete_skill(
     name: str,
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("skill.create")),
 ) -> dict:
     """Delete a skill.
 
     Proxies to skill-store ``DELETE /skills/{id}``, which removes the skill
     along with all of its versions (blobs + rows) and per-user install records.
     """
-    headers = _scope_headers(_auth, tenant_id=tenant_id)
+    headers = _scope_headers(_auth, tenant_id=tenant_id, admin_actor=False)
     url = f"{request.app.state.settings.skill_store_url}/skills/{name}"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -177,19 +340,21 @@ async def admin_delete_skill(
 async def admin_list_mcp_servers(
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("mcp_server.create")),
 ) -> dict:
     url = f"{request.app.state.settings.mcp_registry_url}/mcp-servers"
-    return await _proxy_get(request, url, _auth, tenant_id, forward_params=True)
+    return await _proxy_get(
+        request, url, _auth, tenant_id, forward_params=True, admin_actor=False,
+    )
 
 
 @router.post("/admin/mcp/servers", status_code=201)
 async def admin_create_mcp_server(
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("mcp_server.create")),
 ) -> dict:
-    headers = _scope_headers(_auth, tenant_id=tenant_id)
+    headers = _scope_headers(_auth, tenant_id=tenant_id, admin_actor=False)
     body = await request.json() if await request.body() else {}
     url = f"{request.app.state.settings.mcp_registry_url}/mcp-servers"
     try:
@@ -209,10 +374,10 @@ async def admin_get_mcp_server(
     server_id: str,
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("mcp_server.create")),
 ) -> dict:
     url = f"{request.app.state.settings.mcp_registry_url}/mcp-servers/{server_id}"
-    return await _proxy_get(request, url, _auth, tenant_id)
+    return await _proxy_get(request, url, _auth, tenant_id, admin_actor=False)
 
 
 @router.patch("/admin/mcp/servers/{server_id}")
@@ -220,9 +385,9 @@ async def admin_update_mcp_server(
     server_id: str,
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("mcp_server.create")),
 ) -> dict:
-    headers = _scope_headers(_auth, tenant_id=tenant_id)
+    headers = _scope_headers(_auth, tenant_id=tenant_id, admin_actor=False)
     body = await request.json() if await request.body() else {}
     url = f"{request.app.state.settings.mcp_registry_url}/mcp-servers/{server_id}"
     try:
@@ -242,9 +407,9 @@ async def admin_delete_mcp_server(
     server_id: str,
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("mcp_server.create")),
 ) -> dict:
-    headers = _scope_headers(_auth, tenant_id=tenant_id)
+    headers = _scope_headers(_auth, tenant_id=tenant_id, admin_actor=False)
     url = f"{request.app.state.settings.mcp_registry_url}/mcp-servers/{server_id}"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
@@ -271,10 +436,12 @@ async def admin_delete_mcp_server(
 async def admin_list_documents(
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("document.create")),
 ) -> dict:
     url = f"{request.app.state.settings.knowledge_ingest_url}/documents"
-    return await _proxy_get(request, url, _auth, tenant_id, forward_params=True)
+    return await _proxy_get(
+        request, url, _auth, tenant_id, forward_params=True, admin_actor=False,
+    )
 
 
 @router.get("/admin/knowledge/documents/{document_id}")
@@ -282,13 +449,13 @@ async def admin_get_document(
     document_id: str,
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("document.create")),
 ) -> dict:
     url = (
         f"{request.app.state.settings.knowledge_ingest_url}"
         f"/documents/{document_id}"
     )
-    return await _proxy_get(request, url, _auth, tenant_id)
+    return await _proxy_get(request, url, _auth, tenant_id, admin_actor=False)
 
 
 @router.post("/admin/knowledge/documents/{document_id}/reingest")
@@ -296,14 +463,14 @@ async def admin_reingest_document(
     document_id: str,
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("document.create")),
 ) -> dict:
     """Re-run chunking + embedding for a document.
 
     Maps to knowledge-ingest ``POST /documents/{id}/ingest`` (idempotent
     re-ingest).  No request body is required.
     """
-    headers = _scope_headers(_auth, tenant_id=tenant_id)
+    headers = _scope_headers(_auth, tenant_id=tenant_id, admin_actor=False)
     url = (
         f"{request.app.state.settings.knowledge_ingest_url}"
         f"/documents/{document_id}/ingest"
@@ -325,14 +492,14 @@ async def admin_delete_document(
     document_id: str,
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("document.create")),
 ) -> dict:
     """Delete a knowledge document.
 
     Proxies to knowledge-ingest ``DELETE /documents/{id}``, which removes the
     document row (chunks cascade) and best-effort deletes the source blob.
     """
-    headers = _scope_headers(_auth, tenant_id=tenant_id)
+    headers = _scope_headers(_auth, tenant_id=tenant_id, admin_actor=False)
     url = (
         f"{request.app.state.settings.knowledge_ingest_url}"
         f"/documents/{document_id}"
@@ -368,11 +535,13 @@ async def admin_delete_document(
 async def admin_list_runs(
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("sandbox.read")),
 ) -> dict:
     """List runs via the scheduler's tenant-wide ``GET /runs`` (params透传)."""
     url = f"{request.app.state.settings.agent_scheduler_url}/runs"
-    return await _proxy_get(request, url, _auth, tenant_id, forward_params=True)
+    return await _proxy_get(
+        request, url, _auth, tenant_id, forward_params=True, admin_actor=False,
+    )
 
 
 @router.post("/admin/ops/runs/{run_id}/cancel")
@@ -380,10 +549,10 @@ async def admin_cancel_run(
     run_id: str,
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("sandbox.read")),
 ) -> dict:
     """Cancel a run via the scheduler (looked up by container/sandbox id)."""
-    headers = _scope_headers(_auth, tenant_id=tenant_id)
+    headers = _scope_headers(_auth, tenant_id=tenant_id, admin_actor=False)
     body = await request.json() if await request.body() else {}
     url = f"{request.app.state.settings.agent_scheduler_url}/runs/{run_id}/cancel"
     try:
@@ -402,11 +571,13 @@ async def admin_cancel_run(
 async def admin_list_sandboxes(
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("sandbox.read")),
 ) -> dict:
     """List running sandbox containers for a tenant (scheduler)."""
     url = f"{request.app.state.settings.agent_scheduler_url}/sandboxes"
-    return await _proxy_get(request, url, _auth, tenant_id, forward_params=True)
+    return await _proxy_get(
+        request, url, _auth, tenant_id, forward_params=True, admin_actor=False,
+    )
 
 
 @router.post("/admin/ops/sandboxes/{sandbox_id}/stop")
@@ -414,10 +585,10 @@ async def admin_stop_sandbox(
     sandbox_id: str,
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("sandbox.read")),
 ) -> dict:
     """Stop a running sandbox container (scheduler; 204 upstream)."""
-    headers = _scope_headers(_auth, tenant_id=tenant_id)
+    headers = _scope_headers(_auth, tenant_id=tenant_id, admin_actor=False)
     url = (
         f"{request.app.state.settings.agent_scheduler_url}"
         f"/sandboxes/{sandbox_id}/stop"
@@ -453,7 +624,7 @@ async def admin_pool_snapshot(
 async def admin_daily_usage(
     request: Request,
     tenant_id: str | None = None,
-    _auth: tuple = Depends(require_super_admin_bff),
+    _auth: tuple = Depends(require_admin_module_bff("sandbox.read")),
 ) -> dict:
     """Per-day token totals (orchestrator GET /runs/token-usage/daily).
 
@@ -463,4 +634,6 @@ async def admin_daily_usage(
         f"{request.app.state.settings.session_orchestrator_url}"
         f"/runs/token-usage/daily"
     )
-    return await _proxy_get(request, url, _auth, tenant_id, forward_params=True)
+    return await _proxy_get(
+        request, url, _auth, tenant_id, forward_params=True, admin_actor=False,
+    )

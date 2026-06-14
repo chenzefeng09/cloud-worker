@@ -62,7 +62,9 @@ async function postMessages(body: unknown): Promise<Response> {
 beforeEach(async () => {
   process.env.FOUNDATION_API_TOKEN = "tok-foundation";
   process.env.FOUNDATION_TENANT_ID = "tnt-abc";
+  process.env.FOUNDATION_USER_ID = "usr-abc";
   process.env.LLM_VIRTUAL_KEY = "vk-xyz";
+  process.env.TOOL_BROKER_LEASE = "v1.payload.signature";
 
   nextOpenAIResponse = {
     id: "cmpl-1",
@@ -83,6 +85,11 @@ beforeEach(async () => {
 afterEach(async () => {
   await adapter.stop();
   vi.restoreAllMocks();
+  delete process.env.FOUNDATION_API_TOKEN;
+  delete process.env.FOUNDATION_TENANT_ID;
+  delete process.env.FOUNDATION_USER_ID;
+  delete process.env.LLM_VIRTUAL_KEY;
+  delete process.env.TOOL_BROKER_LEASE;
 });
 
 describe("header injection (F.1)", () => {
@@ -93,7 +100,9 @@ describe("header injection (F.1)", () => {
     expect(captured!.url).toBe("http://gateway.test/api/llm-gateway/v1/chat/completions");
     expect(captured!.headers["authorization"]).toBe("Bearer tok-foundation");
     expect(captured!.headers["x-tenant-id"]).toBe("tnt-abc");
+    expect(captured!.headers["x-user-id"]).toBe("usr-abc");
     expect(captured!.headers["x-llm-virtual-key"]).toBe("vk-xyz");
+    expect(captured!.headers["x-tool-broker-lease"]).toBe("v1.payload.signature");
   });
 
   it("rewrites the inbound Claude model to the target model", async () => {

@@ -1,6 +1,9 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
+import { useChatStore } from '../../stores/chatStore';
+import { isPlatformAdmin } from '../../lib/permissions';
+import { formatDateTimeAuto } from '../../i18n/dates';
 import { useConfirm, useToast } from '../components/dialogs';
 import { CustomSelect } from '../components/CustomSelect';
 import type {
@@ -54,7 +57,7 @@ function formatDate(iso?: string | null): string {
   if (!iso) return '—';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString('zh-CN');
+  return formatDateTimeAuto(d);
 }
 
 // ─── Bind Plan (create subscription for tenant without one) ─────────────────
@@ -236,6 +239,23 @@ function SubscriptionActions({
 export function QuotaPage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading, selectedTenantId, setSelectedTenantId } =
     useAdminStore();
+  const userProfile = useChatStore((s) => s.userProfile);
+
+  // Dual mode (mirrors KnowledgeAdminPage / RbacPage):
+  //  • Platform super_admin → may switch across tenants and mutate (change-plan
+  //    / cancel / bind subscription). The selector and action forms render.
+  //  • tenant_admin (quota.read only) → locked to their own tenant, read-only.
+  //    The selector is shown as a static label; every mutation form is hidden.
+  // The shared adminStore may hold a stale cross-tenant id from a prior
+  // platform-admin session, so a tenant_admin never trusts selectedTenantId.
+  const canSwitchTenant = isPlatformAdmin(userProfile?.permissions);
+  const ownTenantId = userProfile?.tenant_id ?? null;
+  const ownTenantName = tenants.find((t) => t.id === ownTenantId)?.name ?? ownTenantId ?? '当前租户';
+
+  // The tenant we view: platform-admins follow the selector; tenant-admins are
+  // pinned to their own tenant. The composite quota endpoint requires a
+  // tenant_id, so a tenant_admin always passes their own (== same-tenant lane).
+  const effectiveTenantId = canSwitchTenant ? selectedTenantId : ownTenantId;
 
   const [quota, setQuota] = useState<QuotaInfo | null>(null);
   const [quotaLoading, setQuotaLoading] = useState(false);
@@ -265,7 +285,16 @@ export function QuotaPage() {
       .finally(() => setTenantsLoading(false));
   }, [tenants.length, setTenants, setTenantsLoading]);
 
-  // Plan catalogue — needed for BindPlanForm and SubscriptionActions.
+  // Tenant admins must never carry a cross-tenant selection in the shared store.
+  useEffect(() => {
+    if (!canSwitchTenant && selectedTenantId !== null) {
+      setSelectedTenantId(null);
+    }
+  }, [canSwitchTenant, selectedTenantId, setSelectedTenantId]);
+
+  // Plan catalogue — used to resolve plan names + (for platform-admins) feed
+  // BindPlanForm / SubscriptionActions. Read-only (gated by quota.read on the
+  // BFF), so a tenant_admin may load it too.
   useEffect(() => {
     let cancelled = false;
     api.admin.billing
@@ -275,14 +304,16 @@ export function QuotaPage() {
     return () => { cancelled = true; };
   }, []);
 
-  // Tenant-scoped data: quota, subscription, usage.
+  // Tenant-scoped data: quota, subscription, usage. Keyed on effectiveTenantId
+  // so a tenant_admin loads their own tenant immediately (no selector needed).
   useEffect(() => {
-    if (!selectedTenantId) {
+    if (!effectiveTenantId) {
       setQuota(null);
       setSubscription(null);
       setUsage(null);
       return;
     }
+    const tid = effectiveTenantId;
     let cancelled = false;
     setError(null);
 
@@ -292,7 +323,7 @@ export function QuotaPage() {
     setQuotaLoading(true);
     setQuotaTodo(false);
     api.admin.billing
-      .quota(selectedTenantId)
+      .quota(tid)
       .then((data) => { if (!cancelled) setQuota(data); })
       .catch((err) => {
         if (cancelled) return;
@@ -304,7 +335,7 @@ export function QuotaPage() {
     setSubLoading(true);
     setSubTodo(false);
     api.admin.billing
-      .subscription(selectedTenantId)
+      .subscription(tid)
       .then((data) => { if (!cancelled) setSubscription(data); })
       .catch((err) => {
         if (cancelled) return;
@@ -315,7 +346,7 @@ export function QuotaPage() {
     setUsageLoading(true);
     setUsageTodo(false);
     api.admin.billing
-      .usage({ tenant_id: selectedTenantId })
+      .usage({ tenant_id: tid })
       .then((data) => { if (!cancelled) setUsage(data); })
       .catch((err) => {
         if (cancelled) return;
@@ -324,7 +355,7 @@ export function QuotaPage() {
       .finally(() => { if (!cancelled) setUsageLoading(false); });
 
     return () => { cancelled = true; };
-  }, [selectedTenantId, subReloadKey]);
+  }, [effectiveTenantId, subReloadKey]);
 
   const planNameById = (id: string) => plans.find((p) => p.id === id)?.name ?? id;
   const refreshSubscription = () => setSubReloadKey((k) => k + 1);
@@ -345,27 +376,37 @@ export function QuotaPage() {
       )}
 
       {/* ─── 租户选择 ─────────────────────────────────────────── */}
+      {/* Platform admins may switch tenants; tenant admins are locked to their
+          own tenant (shown read-only) and see only their own quota. */}
       <div className="flex items-center gap-3">
-        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
-        <CustomSelect
-          options={[{ value: '', label: '— 请选择 —' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
-          value={selectedTenantId ?? ''}
-          onChange={(v) => {
-            setSelectedTenantId(v || null);
-            setQuota(null);
-            setSubscription(null);
-            setUsage(null);
-          }}
-          disabled={tenantsLoading}
-          className="min-w-[200px]"
-        />
+        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">
+          {canSwitchTenant ? '选择租户' : '当前租户'}
+        </label>
+        {canSwitchTenant ? (
+          <CustomSelect
+            options={[{ value: '', label: '— 请选择 —' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+            value={selectedTenantId ?? ''}
+            onChange={(v) => {
+              setSelectedTenantId(v || null);
+              setQuota(null);
+              setSubscription(null);
+              setUsage(null);
+            }}
+            disabled={tenantsLoading}
+            className="min-w-[200px]"
+          />
+        ) : (
+          <span className="min-w-[200px] text-[13px] text-ink font-mono px-3 py-1.5 rounded-sm border border-line bg-surface">
+            {ownTenantName}
+          </span>
+        )}
       </div>
 
-      {!selectedTenantId && (
+      {canSwitchTenant && !effectiveTenantId && (
         <div className="font-mono text-[12px] text-dim italic">选择一个租户以查看其订阅与用量</div>
       )}
 
-      {selectedTenantId && (
+      {effectiveTenantId && (
         <>
           {/* ─── 当前套餐 + 用量 ──────────────────────────────── */}
           <section className="flex flex-col gap-2">
@@ -378,12 +419,17 @@ export function QuotaPage() {
             )}
             {!quotaLoading && !quotaTodo && quota && !quota.plan && (
               <div className="border border-line rounded-md p-4 flex flex-col gap-2">
-                <div className="text-[13px] text-dim">该租户暂无有效订阅</div>
-                <BindPlanForm
-                  tenantId={selectedTenantId}
-                  plans={plans}
-                  onBound={refreshSubscription}
-                />
+                <div className="text-[13px] text-dim">
+                  {canSwitchTenant ? '该租户暂无有效订阅' : '当前租户暂无有效订阅，如需开通请联系平台管理员'}
+                </div>
+                {/* Binding a plan is a mutation → platform super_admin only. */}
+                {canSwitchTenant && (
+                  <BindPlanForm
+                    tenantId={effectiveTenantId}
+                    plans={plans}
+                    onBound={refreshSubscription}
+                  />
+                )}
               </div>
             )}
             {!quotaLoading && !quotaTodo && quota && quota.plan && (
@@ -488,9 +534,11 @@ export function QuotaPage() {
                     </>
                   )}
                 </div>
-                {selectedTenantId && (
+                {/* Change-plan / cancel are contract-bound mutations →
+                    platform super_admin only; hidden for tenant admins. */}
+                {canSwitchTenant && effectiveTenantId && (
                   <SubscriptionActions
-                    tenantId={selectedTenantId}
+                    tenantId={effectiveTenantId}
                     subscription={subscription}
                     plans={plans}
                     onChanged={refreshSubscription}

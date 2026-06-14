@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { PageHead } from '../components/shell/PageHead';
+import { formatDateTimeAuto } from '../i18n/dates';
 import { Chip } from '../components/shell/Chip';
 import { useChatStore } from '../stores/chatStore';
 import { useWorkspace } from '../lib/workspaceContext';
@@ -1173,8 +1174,8 @@ export function ProfilePage() {
                     {authSessions.map((s) => {
                       const isMobile = s.device.includes('iOS') || s.device.includes('Android');
                       const timeLabel = s.last_seen_at
-                        ? new Date(s.last_seen_at).toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-                        : new Date(s.issued_at).toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                        ? formatDateTimeAuto(new Date(s.last_seen_at), { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+                        : formatDateTimeAuto(new Date(s.issued_at), { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
                       return (
                         <div key={s.id} style={{
                           display: 'flex',
@@ -1302,7 +1303,11 @@ export function ProfilePage() {
                                 checked={elevResources.has(r.value)}
                                 onChange={() => setElevResources((prev) => {
                                   const next = new Set(prev);
-                                  next.has(r.value) ? next.delete(r.value) : next.add(r.value);
+                                  if (next.has(r.value)) {
+                                    next.delete(r.value);
+                                  } else {
+                                    next.add(r.value);
+                                  }
                                   return next;
                                 })}
                               />
@@ -1365,7 +1370,7 @@ export function ProfilePage() {
                           <span style={{ fontSize: 13 }}>{el.reason ?? '—'}</span>
                           <Chip accent={el.status === 'APPROVED'}>{el.status ?? '—'}</Chip>
                           <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)' }}>
-                            {el.requested_at ? new Date(el.requested_at).toLocaleString('zh-CN') : '—'}
+                            {el.requested_at ? formatDateTimeAuto(new Date(el.requested_at)) : '—'}
                           </span>
                         </div>
                       ))}

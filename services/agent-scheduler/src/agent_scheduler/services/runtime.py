@@ -87,6 +87,8 @@ class SandboxRuntime(Protocol):
         reasoning_effort: str | None = None,
         sys_prompt: str | None = None,
         sampling_params: dict[str, Any] | None = None,
+        hitl: bool = True,
+        resume: dict[str, Any] | None = None,
     ) -> str:
         """Spawn a sandbox for one agent run; return the runtime-specific id.
 

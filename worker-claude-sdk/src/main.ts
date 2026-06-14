@@ -12,6 +12,9 @@
  * always stop the adapter and close Redis on the way out.
  */
 
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import path from "node:path";
+
 import type { query } from "@anthropic-ai/claude-agent-sdk";
 
 import {
@@ -39,6 +42,119 @@ const OPAQUE_AUTH_TOKEN = "foundation-runtime-opaque";
 
 const EMPTY_USAGE = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
 
+const TOOL_ENV_SCRUB_KEYS = [
+  "FOUNDATION_API_URL",
+  "FOUNDATION_API_TOKEN",
+  "FOUNDATION_TENANT_ID",
+  "FOUNDATION_USER_ID",
+  "FOUNDATION_SERVICE_SCOPES",
+  "LLM_GATEWAY_URL",
+  "LLM_VIRTUAL_KEY",
+  "LLM_MODEL",
+  "S3_ENDPOINT",
+  "S3_ENDPOINT_URL",
+  "S3_BUCKET",
+  "S3_ACCESS_KEY_ID",
+  "S3_SECRET_ACCESS_KEY",
+  "S3_REGION",
+  "REDIS_URL",
+  "RUN_ID",
+  "MCP_REGISTRY_URL",
+  "SKILL_STORE_URL",
+  "WEB_FETCH_GATEWAY_URL",
+  "TOOL_BROKER_URL",
+  "TOOL_BROKER_LEASE",
+  "SANDBOX_EGRESS_MODE",
+  "OTEL_EXPORTER_OTLP_ENDPOINT",
+  "AGENT_TASK_JSON",
+] as const;
+
+/**
+ * Secret keys the scheduler may deliver via the on-disk `<workspace>/.secrets.json`
+ * file instead of container env. The scheduler stopped passing these as container
+ * env to close a leak: a sandboxed agent could `cat /proc/1/environ` to recover
+ * secrets that scrubProcessEnvForTools() (which only mutates process.env, never
+ * the kernel environ) cannot remove. Only these keys are trusted from the file;
+ * any other key present is ignored.
+ */
+export const SECRET_FILE_KEYS = [
+  "FOUNDATION_API_TOKEN",
+  "TOOL_BROKER_LEASE",
+  "LLM_VIRTUAL_KEY",
+  "LLM_API_KEY",
+  "S3_ACCESS_KEY_ID",
+  "S3_SECRET_ACCESS_KEY",
+  "REDIS_URL",
+] as const;
+
+/**
+ * Load secrets the scheduler dropped at `<workspace>/.secrets.json` into
+ * process.env, then unlink the file. Must run BEFORE validateRequiredEnv() /
+ * readEnv() because FOUNDATION_API_TOKEN (a required gate var) now arrives this
+ * way. Loading into process.env (not just the Env snapshot) is required because
+ * redis_state.fromEnv() reads process.env.REDIS_URL directly.
+ *
+ * The file is unlinked unconditionally — even on malformed JSON — so the secret
+ * bytes never survive on the writable /workspace mount. Values are never logged.
+ */
+export function loadSecretFileIntoEnv(): void {
+  const secretsPath = path.join(getWorkspaceDir(), ".secrets.json");
+  // Runtime / tests may not provide the file; that's not an error.
+  if (!existsSync(secretsPath)) return;
+
+  try {
+    let loaded = 0;
+    try {
+      const raw = readFileSync(secretsPath, "utf8");
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      if (typeof parsed === "object" && parsed !== null) {
+        for (const key of SECRET_FILE_KEYS) {
+          if (Object.prototype.hasOwnProperty.call(parsed, key)) {
+            const value = parsed[key];
+            if (value != null) {
+              process.env[key] = String(value);
+              loaded += 1;
+            }
+          }
+        }
+      } else {
+        console.warn(
+          "[main] .secrets.json did not contain a JSON object; ignoring",
+        );
+      }
+      console.log(`[main] loaded ${loaded} secret(s) from .secrets.json`);
+    } catch (err) {
+      // Never log values. validateRequiredEnv() fails naturally afterward if
+      // FOUNDATION_API_TOKEN was supposed to arrive via this file.
+      console.warn(
+        `[main] failed to parse .secrets.json: ${(err as Error).message}`,
+      );
+    }
+  } finally {
+    // The secret bytes must not survive on the writable mount, even on failure.
+    try {
+      unlinkSync(secretsPath);
+    } catch {
+      // best-effort; file may already be gone
+    }
+  }
+}
+
+function scrubProcessEnvForTools(): void {
+  let removed = 0;
+  for (const key of TOOL_ENV_SCRUB_KEYS) {
+    if (process.env[key] !== undefined) {
+      delete process.env[key];
+      removed += 1;
+    }
+  }
+  if (removed > 0) {
+    console.log(
+      `[main] scrubbed ${removed} control-plane env vars before tool execution`,
+    );
+  }
+}
+
 /** Injectable dependencies so main() is unit-testable without the real SDK. */
 export interface MainDeps {
   /** Injectable SDK query() so main() runs without the real model in tests. */
@@ -50,6 +166,11 @@ export interface MainDeps {
 }
 
 export async function main(deps: MainDeps = {}): Promise<number> {
+  // ── secret delivery via file → load into process.env, then unlink ───────
+  // Must run before validateRequiredEnv(): FOUNDATION_API_TOKEN (a required gate
+  // var) now arrives via <workspace>/.secrets.json rather than container env.
+  loadSecretFileIntoEnv();
+
   // ── infra env gate → exit 1 ─────────────────────────────────────────────
   const missing = validateRequiredEnv();
   if (missing.length > 0) {
@@ -98,6 +219,11 @@ export async function main(deps: MainDeps = {}): Promise<number> {
     : new GatewayAdapter({
         gatewayUrl: env.LLM_GATEWAY_URL || undefined,
         targetModel: task.model_override || env.LLM_MODEL,
+        foundationToken: env.FOUNDATION_API_TOKEN,
+        tenantId: env.FOUNDATION_TENANT_ID,
+        virtualKey: env.LLM_VIRTUAL_KEY,
+        userId: env.FOUNDATION_USER_ID,
+        brokerLease: env.TOOL_BROKER_LEASE,
         port: 0,
       });
 
@@ -117,6 +243,7 @@ export async function main(deps: MainDeps = {}): Promise<number> {
     // than into the system prompt, so the static system prefix stays stable
     // across runs and remains hittable by DeepSeek's automatic prefix cache.
     const systemPrompt = buildSystemPrompt(task, env, downloaded);
+    scrubProcessEnvForTools();
 
     const result: RunResult = await runQuery(task, env, {
       systemPrompt,

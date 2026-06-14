@@ -63,6 +63,7 @@ The sibling extensions (``event_audit_sink``, ``llm_gateway_enforcer``,
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -73,6 +74,140 @@ from agentscope_ext.runtime_worker import hooks as _hooks
 from agentscope_ext.runtime_worker import redis_state as _redis
 
 WORKSPACE = Path("/workspace")
+
+# Secrets the scheduler delivers via /workspace/.secrets.json instead of the
+# container's ``environment=`` block.  Keeping them out of the container env
+# means they never appear in the kernel environ (/proc/1/environ), closing a
+# leak where an in-sandbox agent reads /proc/1/environ to recover credentials
+# that ``os.environ.pop()`` could not remove from the kernel-level environ.
+# ONLY these keys are honoured from the file -- arbitrary keys are ignored.
+_SECRET_FILE_KEYS: tuple[str, ...] = (
+    "FOUNDATION_API_TOKEN",
+    "TOOL_BROKER_LEASE",
+    "LLM_VIRTUAL_KEY",
+    "LLM_API_KEY",
+    "S3_ACCESS_KEY_ID",
+    "S3_SECRET_ACCESS_KEY",
+    "REDIS_URL",
+)
+
+_TOOL_ENV_SCRUB_KEYS: tuple[str, ...] = (
+    # Runtime/control-plane credentials and routing.
+    "FOUNDATION_API_TOKEN",
+    "FOUNDATION_SERVICE_SCOPES",
+    "LLM_API_KEY",
+    "LLM_BASE_URL",
+    "LLM_GATEWAY_URL",
+    "LLM_VIRTUAL_KEY",
+    # Tenant/run metadata. Treat these as control-plane context, not model data.
+    "FOUNDATION_API_URL",
+    "FOUNDATION_TENANT_ID",
+    "FOUNDATION_USER_ID",
+    "RUN_ID",
+    "WORKSPACE_BASE",
+    # Internal service topology.
+    "MCP_REGISTRY_URL",
+    "SKILL_STORE_URL",
+    "WEB_FETCH_GATEWAY_URL",
+    "TOOL_BROKER_URL",
+    "TOOL_BROKER_LEASE",
+    "SANDBOX_EGRESS_MODE",
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "RUNTIME_EXTENSIONS",
+    # Storage and hot-state endpoints/credentials.
+    "S3_ENDPOINT_URL",
+    "S3_BUCKET",
+    "S3_REGION",
+    "S3_ACCESS_KEY_ID",
+    "S3_SECRET_ACCESS_KEY",
+    "REDIS_URL",
+    # Cube runtime delivers task.json here; after _read_task() it should not be
+    # inherited by tool subprocesses.
+    "AGENT_TASK_JSON",
+)
+
+
+def _scrub_process_env_for_tools() -> list[str]:
+    """Remove control-plane env vars before agent tools can spawn subprocesses.
+
+    The worker snapshots the required env values into a local dict before this
+    runs. Runtime code continues to use that dict, while Bash and any stdio MCP
+    subprocesses inherit a reduced environment.
+    """
+    removed: list[str] = []
+    for key in _TOOL_ENV_SCRUB_KEYS:
+        if key in os.environ:
+            os.environ.pop(key, None)
+            removed.append(key)
+    if removed:
+        logging.getLogger(__name__).info(
+            "scrubbed %d control-plane env vars before tool execution",
+            len(removed),
+        )
+    return removed
+
+
+def _load_secret_file_into_env() -> int:
+    """Load scheduler-delivered secrets from ``/workspace/.secrets.json`` then unlink it.
+
+    The scheduler writes the 7 control-plane secrets (see ``_SECRET_FILE_KEYS``)
+    to a mode-0600 host file that surfaces in the container as
+    ``/workspace/.secrets.json`` -- a JSON object ``{"KEY": "value", ...}`` --
+    instead of passing them through the container's ``environment=`` block.
+    Because the secrets enter ``os.environ`` only inside this running Python
+    process (userspace), the kernel environ ``/proc/1/environ`` never holds
+    them, closing the /proc-read leak.
+
+    Behaviour:
+
+    * **Absent file** -> return quietly.  The cube runtime and the unit tests
+      may not provide it; ``main()``'s ``_require_env`` gate still fails loudly
+      on genuinely-missing creds such as ``FOUNDATION_API_TOKEN``.
+    * **Present file** -> parse JSON (expected ``dict[str, str]``).  For each
+      key in the allowlist ``_SECRET_FILE_KEYS`` set ``os.environ[key]``.  Any
+      key not in the allowlist is ignored -- we never blindly trust arbitrary
+      keys from the file.
+    * **Always unlink** the file afterwards (even on parse failure or a
+      malformed key) so the secret bytes cannot survive on the writable
+      ``/workspace`` mount where the agent's Read/Bash tools could later cat it.
+
+    Returns the number of allowlisted keys loaded (count only -- values are
+    never logged).
+    """
+    logger = logging.getLogger(__name__)
+    path = WORKSPACE / ".secrets.json"
+    if not path.exists():
+        return 0
+
+    loaded = 0
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            logger.warning(
+                "secrets file is not a JSON object; ignoring (env gate will fail "
+                "naturally on missing creds)",
+            )
+        else:
+            for key in _SECRET_FILE_KEYS:
+                if key in data:
+                    os.environ[key] = str(data[key])
+                    loaded += 1
+    except (OSError, ValueError) as exc:
+        # Parse/read failure: log a warning (no values) and still unlink below;
+        # main()'s env gate then fails naturally on missing FOUNDATION_API_TOKEN.
+        logger.warning("failed to load secrets file: %s: %s", type(exc).__name__, exc)
+    finally:
+        # Unlink unconditionally -- the secret bytes must not remain on the
+        # writable workspace mount.
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:  # pragma: no cover - defensive
+            logger.warning("could not unlink secrets file: %s", exc)
+
+    if loaded:
+        logger.info("loaded %d secret(s) from secrets file into env", loaded)
+    return loaded
 
 
 def _exit(
@@ -218,18 +353,53 @@ def _write_result_json(
         pass
 
 
+
+
+class _PauseSignal(Exception):
+    """Internal sentinel: raised from _dispatch to signal a HITL pause.
+
+    Attributes
+    ----------
+    event_type : str
+        "RequireUserConfirmEvent" or "RequireExternalExecutionEvent"
+    event : object
+        The actual event object emitted by reply_stream.
+    usage : dict
+        Token usage accumulated up to the pause point.
+    plan_steps : list
+        Plan steps accumulated up to the pause point.
+    """
+
+    def __init__(
+        self,
+        event_type: str,
+        event: object,
+        usage: dict,
+        plan_steps: list,
+    ) -> None:
+        super().__init__(event_type)
+        self.event_type = event_type
+        self.event = event
+        self.usage = usage
+        self.plan_steps = plan_steps
+
+
 async def _dispatch(
     agent: object,
-    task_text: str,
+    task_input: "str | object",
     events_path: Path,
     state_client: "_redis.RunStateClient | None" = None,
 ) -> tuple[str, dict, list]:
-    """Call the agent with the task text and return ``(reply_text, usage, plan_steps)``.
+    """Call the agent with the task input and return ``(reply_text, usage, plan_steps)``.
 
     We use ``reply_stream`` so every event lands in ``events.jsonl``;
     AgentScope 2.0's ``ReplyEndEvent`` is just a marker (no Msg attached),
     so we reconstruct the assistant text by accumulating
     ``TextBlockDeltaEvent.delta`` chunks per block id.
+
+    ``task_input`` is either a plain task-text string (initial run) or an
+    already-built event object for resume legs (``UserConfirmResultEvent``
+    or ``ExternalExecutionResultEvent``).
 
     ``state_client`` is optional: when provided, hot-state is written to
     Redis on every event so a restart can detect the last checkpoint.
@@ -241,14 +411,28 @@ async def _dispatch(
     completes) we re-read ``agent.state.tasks_context.tasks`` and overwrite
     ``result.json`` so the scheduler's RUNNING-state poll can surface
     ``plan_steps`` to the orchestrator's SSE stream.
+
+    HITL pause detection
+    --------------------
+    When ``RequireUserConfirmEvent`` or ``RequireExternalExecutionEvent``
+    appears in the event stream the loop raises ``_PauseSignal`` immediately
+    (preferred over post-loop context inspection -- it avoids consuming any
+    further events and keeps the agent state clean).  The caller
+    (``_run_real``) handles the signal via ``_handle_pause``.
     """
     from agentscope.message import Msg, TextBlock
 
-    user_msg = Msg(
-        name="user",
-        content=[TextBlock(type="text", text=task_text)],
-        role="user",
-    )
+    # On a fresh run task_input is a plain string; on resume it is already
+    # a resume event object (UserConfirmResultEvent / ExternalExecutionResultEvent).
+    if isinstance(task_input, str):
+        agent_input = Msg(
+            name="user",
+            content=[TextBlock(type="text", text=task_input)],
+            role="user",
+        )
+    else:
+        # Resume path: pass the event directly.
+        agent_input = task_input
 
     # Accumulate delta chunks per text-block id; preserve insertion order
     # so concurrent blocks come out in stream order.
@@ -265,9 +449,29 @@ async def _dispatch(
     # Current plan_steps — updated on every ToolCallEndEvent.
     plan_steps: list = []
 
-    async for event in agent.reply_stream(user_msg):
+    async for event in agent.reply_stream(agent_input):
         _hooks.write_event(events_path, event)
         event_type = type(event).__name__
+
+        # HITL pause detection -- RequireUserConfirmEvent signals that one or
+        # more MCP tool calls need user approval; RequireExternalExecutionEvent
+        # signals that the external ask_user tool is awaiting a human answer.
+        # We raise _PauseSignal immediately so the generator is abandoned
+        # cleanly and the agent state captures exactly the pending tool calls.
+        # Do NOT push an "end" entry to the token stream here -- the reply is
+        # not finished; _handle_pause pushes pending_confirmation/question
+        # entries instead.
+        if event_type in (
+            "RequireUserConfirmEvent",
+            "RequireExternalExecutionEvent",
+        ):
+            usage = {
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": input_tokens + output_tokens,
+            }
+            plan_steps = _extract_plan_steps(agent)
+            raise _PauseSignal(event_type, event, usage, plan_steps)
 
         # Extract plan text from ThinkEvent (AgentScope 2.x reasoning event).
         if event_type == "ThinkEvent":
@@ -389,20 +593,96 @@ async def _dispatch(
     return reply_text, usage, plan_steps
 
 
+class _BrokerS3Body:
+    """``Body``-like wrapper so broker reads look identical to boto3's."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def read(self) -> bytes:
+        return self._data
+
+
+class _BrokerS3Client:
+    """Read-only S3 shim that routes ``get_object`` through the tool-broker.
+
+    Exposes the single boto3 call site the worker uses — ``get_object`` —
+    returning ``{"Body": <obj with .read()>}`` so ``_s3_read_text`` and
+    ``_download_attachments`` need no changes.  Other boto3 operations (e.g.
+    ``put_object``) are intentionally absent: the broker S3 façade is
+    read-only, and artifact upload happens scheduler-side, not in-sandbox.
+
+    Failure-open: a missing object (broker 404) or any HTTP error raises an
+    exception, exactly like boto3's ``NoSuchKey`` — the callers already catch
+    broad exceptions and treat them as "object absent".
+    """
+
+    def __init__(
+        self,
+        *,
+        broker_url: str,
+        tenant_id: str,
+        user_id: str,
+        token: str,
+        lease: str,
+        timeout: float = 30.0,
+    ) -> None:
+        self._base = broker_url.rstrip("/")
+        self._timeout = timeout
+        self._headers = {
+            "Authorization": f"Bearer {token}",
+            "X-Tenant-Id": tenant_id,
+            "X-User-Id": user_id,
+            "X-Tool-Broker-Lease": lease,
+        }
+
+    def get_object(self, Bucket: str, Key: str) -> dict:  # noqa: N803
+        import httpx
+
+        resp = httpx.get(
+            f"{self._base}/s3/v1/object",
+            params={"bucket": Bucket, "key": Key},
+            headers=self._headers,
+            timeout=self._timeout,
+        )
+        resp.raise_for_status()
+        return {"Body": _BrokerS3Body(resp.content)}
+
+
 def _s3_client(env: dict):
-    """Build a boto3 S3 client from the S3_* env vars.
+    """Build an S3 client (boto3 or broker shim) from the env.
 
     Returns ``None`` (failure-open) if boto3 is unavailable or credentials
     are missing.  Callers must guard with ``if client is None: return ...``.
 
-    We always pass the S3_* credentials explicitly because boto3 defaults to
-    looking for AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY; those names are
-    NOT injected into the sandbox, so relying on boto3's auto-discovery would
-    silently produce an unauthenticated client that fails every call.
+    In *broker egress mode* (``S3_ENDPOINT_URL`` blank, ``TOOL_BROKER_URL``
+    set) object reads are routed through the tool-broker ``/s3/v1`` façade via
+    :class:`_BrokerS3Client`, so the sandbox never needs a direct object-store
+    route or credentials.
+
+    Otherwise we build a boto3 client, always passing the S3_* credentials
+    explicitly because boto3 defaults to looking for
+    AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY; those names are NOT injected
+    into the sandbox, so relying on boto3's auto-discovery would silently
+    produce an unauthenticated client that fails every call.
     """
     import warnings
 
     endpoint_url = env.get("S3_ENDPOINT_URL") or None
+    broker_url = (env.get("TOOL_BROKER_URL") or "").strip()
+    lease = (env.get("TOOL_BROKER_LEASE") or "").strip()
+
+    # Broker egress mode: no direct object-store endpoint, but the broker
+    # /s3/v1 façade is reachable with the per-run lease.
+    if not endpoint_url and broker_url and lease:
+        return _BrokerS3Client(
+            broker_url=broker_url,
+            tenant_id=env.get("FOUNDATION_TENANT_ID", ""),
+            user_id=env.get("FOUNDATION_USER_ID", ""),
+            token=env.get("FOUNDATION_API_TOKEN", ""),
+            lease=lease,
+        )
+
     region = env.get("S3_REGION") or "us-east-1"
     access_key = env.get("S3_ACCESS_KEY_ID") or None
     secret_key = env.get("S3_SECRET_ACCESS_KEY") or None
@@ -538,6 +818,287 @@ def _download_attachments(task: dict, env: dict) -> list[str]:
     return downloaded
 
 
+
+
+# ---------------------------------------------------------------------------
+# HITL helpers -- permission context, ask_user tool, pause serialisation
+# ---------------------------------------------------------------------------
+
+# Native sandbox tool names that should be auto-allowed without confirmation.
+# These are the tools registered by _workspace_tools.register_into().
+_NATIVE_TOOL_NAMES = ("Read", "Grep", "Glob", "Write", "Edit", "Bash")
+
+
+def _build_hitl_permission_context() -> "object":
+    """Build a PermissionContext for HITL-enabled runs.
+
+    Permission design (engine source justification)
+    -----------------------------------------------
+    *  PermissionMode.BYPASS skips all checks (step 5 in engine) and
+       auto-approves every tool -- unsuitable for HITL.
+    *  PermissionMode.DEFAULT falls through to _default_decision_ask
+       (step 7) for any tool not matched by earlier rules, which returns ASK.
+    *  PermissionMode.DONT_ASK converts ASK->DENY -- also unsuitable.
+
+    So we use DEFAULT and add explicit ALLOW rules for every built-in
+    native tool (by tool name, with rule_content=None = match everything).
+    MCP tools are named mcp__{server}__{tool} -- they will not match any
+    allow rule and will hit the default ASK path, causing reply_stream to
+    emit RequireUserConfirmEvent and pause.
+
+    Returns the constructed PermissionContext, or None on ImportError
+    (old AgentScope, no permission sub-system).
+    """
+    try:
+        from agentscope.permission import (
+            PermissionContext,
+            PermissionMode,
+            PermissionRule,
+            PermissionBehavior,
+        )
+
+        ctx = PermissionContext(mode=PermissionMode.DEFAULT)
+        for tool_name in _NATIVE_TOOL_NAMES:
+            rule = PermissionRule(
+                tool_name=tool_name,
+                rule_content=None,  # None = match every invocation of this tool
+                behavior=PermissionBehavior.ALLOW,
+                source="hitl_sandbox_policy",
+            )
+            ctx.allow_rules.setdefault(tool_name, []).append(rule)
+        return ctx
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "HITL: could not build DEFAULT permission context; "
+            "falling back to BYPASS: %s",
+            exc,
+        )
+        return None
+
+
+def _build_bypass_permission_context() -> "object":
+    """Build a PermissionContext with BYPASS for non-HITL runs.
+
+    Used when task.get("hitl", True) is False (scheduled / background
+    runs where no human is present to confirm tool calls).
+    """
+    try:
+        from agentscope.permission import PermissionContext, PermissionMode
+
+        return PermissionContext(mode=PermissionMode.BYPASS)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "could not set BYPASS permission; tool calls may require confirmation: %s",
+            exc,
+        )
+        return None
+
+
+def _build_ask_user_tool() -> "object | None":
+    """Build and return the ask_user external tool, or None on failure.
+
+    External tool API (verified against agentscope source)
+    -------------------------------------------------------
+    ToolBase.is_external_tool = True signals that the tool has no
+    callable __call__ implementation; instead, when the permission
+    engine processes it the agent yields RequireExternalExecutionEvent
+    and pauses, awaiting an ExternalExecutionResultEvent with the
+    human's answer.
+
+    Returns the tool instance, or None if AgentScope's tool sub-system is
+    unavailable (failure-open: the run proceeds without ask_user).
+    """
+    try:
+        from agentscope.tool import ToolBase
+        from agentscope.permission import PermissionContext, PermissionDecision, PermissionBehavior
+
+        class AskUserTool(ToolBase):
+            """Interactive clarification tool -- pauses the run for a human answer."""
+
+            name: str = "ask_user"
+            description: str = (
+                "Ask the user a clarifying question and wait for their response. "
+                "Use this when you are uncertain about a key requirement, ambiguous "
+                "instruction, or need explicit confirmation before proceeding with "
+                "an irreversible action. Provide a clear, concise question."
+            )
+            input_schema: dict = {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question to ask the user.",
+                    },
+                },
+                "required": ["question"],
+            }
+            is_concurrency_safe: bool = False
+            is_read_only: bool = True  # asking is non-destructive
+            is_external_tool: bool = True  # triggers RequireExternalExecutionEvent
+
+            async def check_permissions(
+                self,
+                tool_input: dict,
+                context: PermissionContext,
+            ) -> PermissionDecision:
+                # External tools are always allowed to pause (the pause IS
+                # the execution); return ALLOW so the engine emits the
+                # external execution event.
+                return PermissionDecision(
+                    behavior=PermissionBehavior.ALLOW,
+                    message="ask_user: external execution allowed",
+                )
+
+            async def __call__(self, **kwargs):  # pragma: no cover
+                # Never actually called -- the agent pauses before invocation.
+                raise NotImplementedError("ask_user is an external tool; __call__ should not be invoked")
+
+        return AskUserTool()
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "HITL: could not build ask_user tool: %s", exc
+        )
+        return None
+
+
+def _handle_pause(
+    *,
+    event_type: str,
+    event: object,
+    agent: object,
+    run_id: str,
+    state_client: "_redis.RunStateClient",
+    usage: dict,
+    plan_steps: list,
+) -> bool:
+    """Serialise a HITL pause and return True if the run should pause.
+
+    Called from _dispatch when RequireUserConfirmEvent or
+    RequireExternalExecutionEvent is detected in the event stream.
+
+    Steps
+    -----
+    1. Extract pending tool_call(s) from the event.
+    2. Determine kind: "confirm" for RequireUserConfirmEvent,
+       "question" for RequireExternalExecutionEvent (ask_user).
+    3. Push pending_confirmation / pending_question entries to the
+       token stream (one per pending tool call).
+    4. Serialise agent.state with model_dump(mode="json") and write
+       agent:run:{run_id}:paused via state_client.write_paused.
+    5. Update hot state to "PAUSED" via state_client.mark_paused.
+    6. Write result.json with status="paused".
+
+    Returns True on success, False on any internal error (caller falls back
+    to treating the run as a normal failure -- failure-open contract).
+    """
+    logger = logging.getLogger(__name__)
+
+    try:
+        # ----------------------------------------------------------------
+        # 1. Extract pending tool calls and reply_id from the event.
+        # ----------------------------------------------------------------
+        reply_id: str = getattr(event, "reply_id", "") or ""
+        raw_tool_calls: list = list(getattr(event, "tool_calls", []) or [])
+        kind = (
+            "question"
+            if event_type == "RequireExternalExecutionEvent"
+            else "confirm"
+        )
+
+        tool_call_dicts: list[dict] = []
+        for tc in raw_tool_calls:
+            tc_id = str(getattr(tc, "id", "") or "")
+            tc_name = str(getattr(tc, "name", "") or "")
+            tc_input = getattr(tc, "input", None)
+            if isinstance(tc_input, str):
+                tc_args = tc_input
+            else:
+                try:
+                    tc_args = json.dumps(tc_input or {}, ensure_ascii=False)
+                except Exception:  # noqa: BLE001
+                    tc_args = str(tc_input or {})
+            tool_call_dicts.append({"id": tc_id, "name": tc_name, "args": tc_args})
+
+        # ----------------------------------------------------------------
+        # 2. Push pending_confirmation / pending_question to the token stream.
+        #    For ask_user (kind=question), extract the question text from args.
+        # ----------------------------------------------------------------
+        for tc in tool_call_dicts:
+            if kind == "question":
+                # The question lives in the args JSON under "question" key.
+                try:
+                    question_text = json.loads(tc["args"]).get("question", "")
+                except Exception:  # noqa: BLE001
+                    question_text = tc["args"]
+                state_client.push_pending_question(
+                    tool_call_id=tc["id"],
+                    question=question_text,
+                )
+            else:
+                state_client.push_pending_confirmation(
+                    tool_call_id=tc["id"],
+                    name=tc["name"],
+                    args=tc["args"],
+                )
+
+        # ----------------------------------------------------------------
+        # 3. Serialise agent state.  mode="json" is MANDATORY -- plain
+        #    model_dump writes enum reprs that fail model_validate on reload.
+        # ----------------------------------------------------------------
+        agent_state_dict: dict = {}
+        try:
+            agent_state_dict = agent.state.model_dump(mode="json")  # type: ignore[union-attr]
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("HITL: could not serialise agent state: %s", exc)
+            return False
+
+        # ----------------------------------------------------------------
+        # 4. Write paused blob.
+        # ----------------------------------------------------------------
+        question_str: str | None = None
+        if kind == "question" and tool_call_dicts:
+            try:
+                question_str = json.loads(tool_call_dicts[0]["args"]).get("question")
+            except Exception:  # noqa: BLE001
+                question_str = tool_call_dicts[0]["args"]
+
+        paused_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        blob = {
+            "kind": kind,
+            "reply_id": reply_id,
+            "tool_calls": tool_call_dicts,
+            "question": question_str,
+            "agent_state": agent_state_dict,
+            "paused_at": paused_at,
+        }
+        state_client.write_paused(blob)
+
+        # ----------------------------------------------------------------
+        # 5. Update hot state -> PAUSED.
+        # ----------------------------------------------------------------
+        state_client.mark_paused()
+
+        # ----------------------------------------------------------------
+        # 6. Write result.json with status="paused".
+        # ----------------------------------------------------------------
+        _write_result_json(
+            plan_steps,
+            status="paused",
+            usage=usage,
+        )
+
+        logger.info(
+            "HITL: run %s paused (%s) -- %d pending tool call(s)",
+            run_id,
+            kind,
+            len(tool_call_dicts),
+        )
+        return True
+
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("HITL: _handle_pause failed: %s", exc)
+        return False
+
 def _run_real(task: dict) -> tuple[str, str, dict, list]:
     """Build an Agent from the configured hooks and run the task.
 
@@ -546,11 +1107,53 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
     exit-1).  ``usage`` is a dict with keys ``input_tokens``,
     ``output_tokens``, ``total_tokens``.  ``plan_steps`` is a list of
     ``{n, t, d, live}`` dicts (empty list when the agent made no tasks).
+
+    HITL flag
+    ---------
+    ``task.get("hitl", True)`` controls whether tool-call confirmation is
+    enabled.  When True (the default), native sandbox tools (Read/Write/
+    Bash/Edit/Grep/Glob) are auto-allowed; MCP-injected tools pause the run
+    for human approval.  When False, BYPASS mode is used (all tools
+    auto-approved -- suitable for scheduled/background runs).
+
+    Resume path
+    -----------
+    ``task.get("resume")`` carries the orchestrator's resume payload::
+
+        {
+          "kind":        "confirm" | "answer",
+          "tool_call_id": str,
+          "confirmed":   bool | null,
+          "answer":      str | null,
+          "agent_state": <AgentState.model_dump(mode="json")>
+        }
+
+    On resume the worker restores ``AgentState`` from the saved dict
+    (bypassing history-rebuild and checkpoint-resume logic) and drives
+    ``reply_stream`` with the appropriate confirm/answer event.  The run_id
+    is reused so tokens stream to the same Redis stream.  A resumed run can
+    pause again (e.g. second MCP call) -- the pause path is reachable on
+    every leg.
     """
     logger = logging.getLogger(__name__)
 
+    # ------------------------------------------------------------------
+    # HITL flag -- gating variable for the whole permission policy.
+    # ------------------------------------------------------------------
+    hitl_enabled: bool = bool(task.get("hitl", True))
+
+    # ------------------------------------------------------------------
+    # Resume detection: task["resume"] is present when the orchestrator is
+    # driving a HITL resume leg.  We detect it early so we can skip the
+    # checkpoint/memory injection that is only relevant for fresh runs.
+    # ------------------------------------------------------------------
+    resume_payload: dict | None = task.get("resume") or None
+
     text = str(task.get("task", "")).strip()
-    if not text:
+    # Allow empty task text on resume legs (the agent resumes from its
+    # serialised state, so the original task text is only needed to build
+    # the initial Msg -- on resume we pass the confirm/answer event instead).
+    if not text and resume_payload is None:
         return "FAILED", "task text is empty", {}, []
 
     # Local imports so this module is importable without ``agentscope``;
@@ -559,33 +1162,42 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
 
     env = _hooks.snapshot_env()
     tenant_id = env.get("FOUNDATION_TENANT_ID", "")
+    run_id = env.get("RUN_ID", "")
 
     # ------------------------------------------------------------------
-    # Hot-state: connect to Redis and detect checkpoint from a prior run.
-    # failure-open — RunStateClient swallows all Redis errors internally.
+    # Hot-state: connect to Redis.
+    # failure-open -- RunStateClient swallows all Redis errors internally.
     # ------------------------------------------------------------------
     state_client = _redis.from_env()
+    _scrub_process_env_for_tools()
 
-    checkpoint = state_client.read_checkpoint()
-    if checkpoint is not None and checkpoint.get("status") not in ("COMPLETED", "FAILED"):
-        prior_step = checkpoint.get("step", 0)
-        prior_plan = checkpoint.get("plan", "")
-        logger.info(
-            "resuming from step %d (prior plan: %.120s...)",
-            prior_step,
-            prior_plan,
-        )
-        # Inject resume context into task so the agent knows it is restarting.
-        # We surface this via the memory field so it reaches the system prompt
-        # through the existing memory-injection path in _load_prompt_files.
-        existing_memory = str(task.get("memory") or "").strip()
-        resume_note = (
-            f"[系统：本次运行是从断点恢复，上次已完成 {prior_step} 步。"
-            + (f"上次计划：{prior_plan}" if prior_plan else "")
-            + "]"
-        )
-        task = dict(task)
-        task["memory"] = (resume_note + "\n\n" + existing_memory).strip() if existing_memory else resume_note
+    # ------------------------------------------------------------------
+    # For fresh (non-resume) runs only: detect a Redis checkpoint and
+    # inject a memory note so the agent knows it is restarting from a
+    # previous crash-resume (different from HITL pause-resume).
+    # ------------------------------------------------------------------
+    if resume_payload is None:
+        checkpoint = state_client.read_checkpoint()
+        if checkpoint is not None and checkpoint.get("status") not in (
+            "COMPLETED", "FAILED", "PAUSED"
+        ):
+            prior_step = checkpoint.get("step", 0)
+            prior_plan = checkpoint.get("plan", "")
+            logger.info(
+                "resuming from step %d (prior plan: %.120s...)",
+                prior_step,
+                prior_plan,
+            )
+            existing_memory = str(task.get("memory") or "").strip()
+            resume_note = (
+                "[\u7cfb\u7edf\uff1a\u672c\u6b21\u8fd0\u884c\u662f\u4ece\u65ad\u70b9\u6062\u590d\uff0c\u4e0a\u6b21\u5df2\u5b8c\u6210 "
+                + str(prior_step)
+                + " \u6b65\u3002"
+                + ("\u4e0a\u6b21\u8ba1\u5212\uff1a" + prior_plan if prior_plan else "")
+                + "]"
+            )
+            task = dict(task)
+            task["memory"] = (resume_note + "\n\n" + existing_memory).strip() if existing_memory else resume_note
 
     # Download user-uploaded attachments before building the agent so the
     # agent can reference them in its context.  Failure-open: missing files
@@ -594,6 +1206,21 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
 
     model = _hooks.build_model(task, env)
     toolkit = _hooks.build_toolkit(task, tenant_id, env)
+
+    # ------------------------------------------------------------------
+    # HITL: register the ask_user external tool when HITL is enabled.
+    # The tool is added to the toolkit's basic ToolGroup alongside the
+    # built-in workspace tools.  Failure-open: if the tool cannot be built
+    # (old AgentScope, missing ToolBase) the run proceeds without it.
+    # ------------------------------------------------------------------
+    if hitl_enabled:
+        ask_user_tool = _build_ask_user_tool()
+        if ask_user_tool is not None:
+            try:
+                toolkit.tool_groups[0].tools.append(ask_user_tool)
+                logger.debug("HITL: registered ask_user external tool")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("HITL: could not register ask_user tool: %s", exc)
 
     # Build system prompt: soul/identity/user files from S3 + task-level override.
     sys_prompt = _load_prompt_files(env, task)
@@ -604,14 +1231,14 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
     # main instructions.
     memory_snippets = str(task.get("memory") or "").strip()
     if memory_snippets:
-        sys_prompt = f"## 相关历史记忆\n\n{memory_snippets}\n\n---\n\n{sys_prompt}"
+        sys_prompt = f"## \u76f8\u5173\u5386\u53f2\u8bb0\u5fc6\n\n{memory_snippets}\n\n---\n\n{sys_prompt}"
 
     # Append uploaded-file context if any were downloaded.
     if downloaded:
         file_list = ", ".join(downloaded)
         sys_prompt += (
-            f"\n\n用户上传了以下文件，位于 /workspace/inputs/：{file_list}\n"
-            "请使用 Read 工具读取 /workspace/inputs/ 下的文件来完成任务。"
+            f"\n\n\u7528\u6237\u4e0a\u4f20\u4e86\u4ee5\u4e0b\u6587\u4ef6\uff0c\u4f4d\u4e8e /workspace/inputs/\uff1a{file_list}\n"
+            "\u8bf7\u4f7f\u7528 Read \u5de5\u5177\u8bfb\u53d6 /workspace/inputs/ \u4e0b\u7684\u6587\u4ef6\u6765\u5b8c\u6210\u4efb\u52a1\u3002"
         )
 
     # Pre-create /workspace/outputs/ so the agent can write there without
@@ -622,28 +1249,35 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
     except OSError as exc:
         logger.warning("cannot pre-create /workspace/outputs: %s", exc)
 
-    # File-output policy: reply inline by default; only persist a file when the
-    # user explicitly asks to be *delivered* a file. Let the model judge intent
-    # rather than relying on brittle keyword matching.
     sys_prompt += (
-        "\n\n## 关于文件输出\n"
-        "默认情况下，请把结果（包括代码、文本、表格等）直接写在回复正文里："
-        "代码用 Markdown 代码块（```语言 ... ```）展示，便于用户直接阅读和复制；"
-        "不要为此创建任何文件。\n"
-        "只有当用户明确要求“交付/生成/导出/下载/保存为文件”（例如“生成一个 .docx”、"
-        "“把它导出成 Excel”、“给我一个 txt 文件”）时，才使用 Write 工具把产物写入 "
-        "/workspace/outputs/ 目录（路径示例：/workspace/outputs/report.docx）；"
-        "任务结束后该目录下的文件会自动作为产物回传给用户。如需先创建子目录，可用 Bash 执行 mkdir -p。\n"
-        "判断不确定时，优先直接在正文回复，而不是写文件。"
+        "\n\n## \u5173\u4e8e\u6587\u4ef6\u8f93\u51fa\n"
+        "\u9ed8\u8ba4\u60c5\u51b5\u4e0b\uff0c\u8bf7\u628a\u7ed3\u679c\uff08\u5305\u62ec\u4ee3\u7801\u3001\u6587\u672c\u3001\u8868\u683c\u7b49\uff09\u76f4\u63a5\u5199\u5728\u56de\u590d\u6b63\u6587\u91cc\uff1a"
+        "\u4ee3\u7801\u7528 Markdown \u4ee3\u7801\u5757\uff08```\u8bed\u8a00 ... ```\uff09\u5c55\u793a\uff0c\u4fbf\u4e8e\u7528\u6237\u76f4\u63a5\u9605\u8bfb\u548c\u590d\u5236\uff1b"
+        "\u4e0d\u8981\u4e3a\u6b64\u521b\u5efa\u4efb\u4f55\u6587\u4ef6\u3002\n"
+        "\u53ea\u6709\u5f53\u7528\u6237\u660e\u786e\u8981\u6c42\u201c\u4ea4\u4ed8/\u751f\u6210/\u5bfc\u51fa/\u4e0b\u8f7d/\u4fdd\u5b58\u4e3a\u6587\u4ef6\u201d\uff08\u4f8b\u5982\u201c\u751f\u6210\u4e00\u4e2a .docx\u201d\u3001"
+        "\u201c\u628a\u5b83\u5bfc\u51fa\u6210 Excel\u201d\u3001\u201c\u7ed9\u6211\u4e00\u4e2a txt \u6587\u4ef6\u201d\uff09\u65f6\uff0c\u624d\u4f7f\u7528 Write \u5de5\u5177\u628a\u4ea7\u7269\u5199\u5165 "
+        "/workspace/outputs/ \u76ee\u5f55\uff08\u8def\u5f84\u793a\u4f8b\uff1a/workspace/outputs/report.docx\uff09\uff1b"
+        "\u4efb\u52a1\u7ed3\u675f\u540e\u8be5\u76ee\u5f55\u4e0b\u7684\u6587\u4ef6\u4f1a\u81ea\u52a8\u4f5c\u4e3a\u4ea7\u7269\u56de\u4f20\u7ed9\u7528\u6237\u3002\u5982\u9700\u5148\u521b\u5efa\u5b50\u76ee\u5f55\uff0c\u53ef\u7528 Bash \u6267\u884c mkdir -p\u3002\n"
+        "\u5224\u65ad\u4e0d\u786e\u5b9a\u65f6\uff0c\u4f18\u5148\u76f4\u63a5\u5728\u6b63\u6587\u56de\u590d\uff0c\u800c\u4e0d\u662f\u5199\u6587\u4ef6\u3002"
     )
 
+    # HITL: tell the model HOW to ask the user.  Without this the model asks
+    # clarification questions as plain reply text and keeps going (or stops
+    # with an unanswerable question) instead of calling the ask_user tool,
+    # so the pause/resume machinery never engages.
+    if hitl_enabled:
+        sys_prompt += (
+            "\n\n## \u5411\u7528\u6237\u63d0\u95ee\uff08ask_user\uff09\n"
+            "\u5f53\u4f60\u9700\u8981\u7528\u6237\u6f84\u6e05\u9700\u6c42\u3001\u5728\u591a\u4e2a\u65b9\u6848\u4e2d\u505a\u9009\u62e9\uff0c"
+            "\u6216\u7f3a\u5c11\u7ee7\u7eed\u6267\u884c\u6240\u5fc5\u9700\u7684\u4fe1\u606f\u65f6\uff0c"
+            "\u5fc5\u987b\u8c03\u7528 ask_user \u5de5\u5177\u63d0\u95ee\u5e76\u7b49\u5f85\u7528\u6237\u56de\u7b54\uff1b"
+            "\u4e0d\u8981\u5728\u6b63\u6587\u91cc\u63d0\u95ee\u540e\u81ea\u884c\u731c\u6d4b\u7ee7\u7eed\uff0c"
+            "\u4e5f\u4e0d\u8981\u628a\u95ee\u9898\u4f5c\u4e3a\u6700\u7ec8\u56de\u590d\u7ed3\u675f\u4efb\u52a1\u3002"
+            "\u7528\u6237\u56de\u7b54\u540e\u4f1a\u81ea\u52a8\u7ee7\u7eed\u672c\u6b21\u4efb\u52a1\u3002"
+        )
+
     # ------------------------------------------------------------------
-    # Available skills (progressive disclosure).  The scheduler has already
-    # mounted each task-selected skill read-only at /home/skills/<name>/; we
-    # just advertise name + description + the SKILL.md path so the agent can
-    # Read the full instructions on demand.  No user-uploaded code is ever
-    # imported or executed.  Failure-open: collect_skill_prompts swallows
-    # all per-skill errors and returns only the successfully-mounted ones.
+    # Available skills (progressive disclosure).
     # ------------------------------------------------------------------
     try:
         from agentscope_ext.skills_loader import collect_skill_prompts
@@ -654,52 +1288,84 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
         skill_prompts = []
 
     if skill_prompts:
-        # Compact one-line-per-skill format. The header is a single sentence
-        # to keep base overhead low; each entry shows name, description, and
-        # the absolute SKILL.md path so the agent can Read it on demand
-        # (the description is bounded to MAX_DESCRIPTION_LEN at upload time).
-        lines = ["\n\n## 可用技能（需要时用 Read 工具读取指令文件）"]
+        lines = ["\n\n## \u53ef\u7528\u6280\u80fd\uff08\u9700\u8981\u65f6\u7528 Read \u5de5\u5177\u8bfb\u53d6\u6307\u4ee4\u6587\u4ef6\uff09"]
         for sp in skill_prompts:
             lines.append(
-                f"- {sp['name']}：{sp.get('description', '')}"
-                f"  → {sp['skill_md_abspath']}"
+                f"- {sp['name']}\uff1a{sp.get('description', '')}  \u2192 {sp['skill_md_abspath']}"
             )
         sys_prompt += "\n".join(lines)
 
-    # Build an AgentState with BYPASS permission so tool calls are auto-approved
-    # in the headless sandbox (no human is present to confirm).  Failure-open:
-    # if the permission sub-system is absent in this AgentScope version we fall
-    # back to state=None and Agent uses its default (which may prompt).
-    agent_state = None
-    try:
-        from agentscope.state import AgentState
-        from agentscope.permission import PermissionContext, PermissionMode
-
-        agent_state = AgentState(
-            permission_context=PermissionContext(mode=PermissionMode.BYPASS)
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "could not set BYPASS permission; tool calls may require confirmation: %s",
-            exc,
-        )
-
-    # Restore prior-turn conversation history (multi-turn memory).  The
-    # orchestrator assembles task["history"] from the session's message rows;
-    # we rebuild it as agentscope Msg objects and pre-populate
-    # ``agent_state.context`` so the agent sees the full prior conversation —
-    # including tool calls/results — before the current instruction.
+    # ------------------------------------------------------------------
+    # Build AgentState.
     #
-    # Constraints (verified against agentscope 2.0):
-    #  * We populate ``context`` directly rather than calling ``observe()``,
-    #    which only accepts user/assistant text and would reject tool blocks.
-    #  * Tool blocks MUST ride on role="assistant" Msgs (a ToolResultBlock on a
-    #    role="user" Msg raises ValidationError); the OpenAI formatter still
-    #    emits them as the standard tool_calls + role:tool pair.
-    #  * ToolCallBlock.id and ToolResultBlock.id share the same id to pair up.
-    # Failure-open: a bad item is skipped, never crashes the run.
+    # Three paths:
+    #   A) HITL resume: restore from saved agent_state dict passed by the
+    #      orchestrator.
+    #   B) HITL fresh run: DEFAULT permission mode + explicit ALLOW rules
+    #      for every built-in native tool; MCP tools hit the default ASK
+    #      path and trigger RequireUserConfirmEvent.
+    #   C) Non-HITL (hitl=False): BYPASS mode.
+    # ------------------------------------------------------------------
+    agent_state = None
+
+    if resume_payload is not None:
+        # Path A -- HITL resume: restore AgentState from the saved dict.
+        try:
+            from agentscope.state import AgentState
+
+            saved_state_dict = resume_payload.get("agent_state") or {}
+            agent_state = AgentState.model_validate(saved_state_dict)
+            logger.info(
+                "HITL resume: restored AgentState (reply_id=%s, context_len=%d)",
+                getattr(agent_state, "reply_id", "?"),
+                len(getattr(agent_state, "context", [])),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "HITL resume: could not restore AgentState; "
+                "falling back to fresh state: %s",
+                exc,
+            )
+            resume_payload = None  # treat as fresh run
+
+    if agent_state is None and hitl_enabled:
+        # Path B -- HITL fresh run: DEFAULT permission mode + ALLOW rules
+        # for built-in native tools.
+        try:
+            from agentscope.state import AgentState
+
+            perm_ctx = _build_hitl_permission_context()
+            if perm_ctx is not None:
+                agent_state = AgentState(permission_context=perm_ctx)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "HITL: could not build AgentState with DEFAULT permission; "
+                "falling back to BYPASS: %s",
+                exc,
+            )
+
+    if agent_state is None:
+        # Path C -- non-HITL (hitl=False) OR any HITL failure fallback.
+        try:
+            from agentscope.state import AgentState
+
+            perm_ctx = _build_bypass_permission_context()
+            if perm_ctx is not None:
+                agent_state = AgentState(permission_context=perm_ctx)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "could not set BYPASS permission; tool calls may require "
+                "confirmation: %s",
+                exc,
+            )
+
+    # ------------------------------------------------------------------
+    # Restore prior-turn conversation history (multi-turn memory).
+    # Only on fresh runs -- resume runs already have context from the
+    # restored AgentState.
+    # ------------------------------------------------------------------
     history = task.get("history") or []
-    if agent_state is not None and isinstance(history, list):
+    if resume_payload is None and agent_state is not None and isinstance(history, list):
         from agentscope.message import (
             Msg,
             TextBlock,
@@ -712,18 +1378,18 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
             try:
                 role = item.get("role")
                 if role == "user":
-                    content = str(item.get("content") or "")
-                    if content:
+                    content_text = str(item.get("content") or "")
+                    if content_text:
                         restored.append(
                             Msg(name="user", role="user",
-                                content=[TextBlock(type="text", text=content)])
+                                content=[TextBlock(type="text", text=content_text)])
                         )
                 elif role == "assistant":
-                    content = str(item.get("content") or "")
-                    if content:
+                    content_text = str(item.get("content") or "")
+                    if content_text:
                         restored.append(
                             Msg(name="assistant", role="assistant",
-                                content=[TextBlock(type="text", text=content)])
+                                content=[TextBlock(type="text", text=content_text)])
                         )
                 elif role == "tool":
                     t = item.get("tool") or {}
@@ -775,11 +1441,129 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
     # Mark run as RUNNING in Redis before dispatching (first write).
     state_client.write_step(plan="", cursor="start", status="RUNNING")
 
+    # ------------------------------------------------------------------
+    # Build the input for reply_stream:
+    #   - Fresh run: plain text string (converted to Msg inside _dispatch).
+    #   - HITL resume: appropriate confirm/answer event.
+    # ------------------------------------------------------------------
+    if resume_payload is not None:
+        resume_kind = resume_payload.get("kind", "confirm")
+        resume_reply_id = str(resume_payload.get("reply_id") or "")
+        resume_tool_call_id = str(resume_payload.get("tool_call_id") or "")
+
+        # Find the pending ToolCallBlock in the restored context.
+        pending_tc = None
+        try:
+            for msg in reversed(list(agent_state.context)):  # type: ignore[union-attr]
+                for block in getattr(msg, "content", []) or []:
+                    if (
+                        getattr(block, "type", None) == "tool_call"
+                        and getattr(block, "id", None) == resume_tool_call_id
+                    ):
+                        pending_tc = block
+                        break
+                if pending_tc is not None:
+                    break
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("HITL resume: could not find pending ToolCallBlock: %s", exc)
+
+        if resume_kind == "answer":
+            # External tool (ask_user) result.
+            try:
+                from agentscope.event import ExternalExecutionResultEvent
+                from agentscope.message import ToolResultBlock
+
+                answer_text = str(resume_payload.get("answer") or "")
+                result_block = ToolResultBlock(
+                    type="tool_result",
+                    id=resume_tool_call_id,
+                    name="ask_user",
+                    output=answer_text,
+                )
+                dispatch_input: object = ExternalExecutionResultEvent(
+                    reply_id=resume_reply_id,
+                    execution_results=[result_block],
+                )
+                logger.info(
+                    "HITL resume: ExternalExecutionResultEvent tool_call_id=%s",
+                    resume_tool_call_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "HITL resume: could not build ExternalExecutionResultEvent; "
+                    "aborting: %s",
+                    exc,
+                )
+                state_client.mark_failed()
+                return "FAILED", f"HITL resume event build failed: {exc}", {}, []
+        else:
+            # MCP tool confirmation result.
+            confirmed = bool(resume_payload.get("confirmed", True))
+            try:
+                from agentscope.event import UserConfirmResultEvent, ConfirmResult
+
+                if pending_tc is None:
+                    raise ValueError(
+                        f"pending ToolCallBlock for id={resume_tool_call_id!r} "
+                        "not found in restored context"
+                    )
+                confirm_result = ConfirmResult(
+                    confirmed=confirmed,
+                    tool_call=pending_tc,
+                    rules=None,
+                )
+                dispatch_input = UserConfirmResultEvent(
+                    reply_id=resume_reply_id,
+                    confirm_results=[confirm_result],
+                )
+                logger.info(
+                    "HITL resume: UserConfirmResultEvent tool_call_id=%s confirmed=%s",
+                    resume_tool_call_id,
+                    confirmed,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "HITL resume: could not build UserConfirmResultEvent; "
+                    "aborting: %s",
+                    exc,
+                )
+                state_client.mark_failed()
+                return "FAILED", f"HITL resume event build failed: {exc}", {}, []
+    else:
+        # Fresh run: pass plain task text (converted to Msg inside _dispatch).
+        dispatch_input = text
+
+    # ------------------------------------------------------------------
+    # Drive reply_stream.  A _PauseSignal means the run hit a HITL pause.
+    # _handle_pause serialises the state and writes result.json with
+    # status="paused"; we return a dedicated "paused" status tuple.
+    #
+    # IMPORTANT: a resumed run can pause AGAIN (second MCP call, second
+    # ask_user).  The _PauseSignal catch is always reachable regardless of
+    # whether this is a fresh or resume leg.
+    # ------------------------------------------------------------------
     try:
         summary, usage, plan_steps = asyncio.run(
-            _dispatch(agent, text, events_path, state_client=state_client)
+            _dispatch(agent, dispatch_input, events_path, state_client=state_client)
         )
         summary = summary.strip()
+    except _PauseSignal as pause:
+        # Failure-open: if _handle_pause itself errors, fall through to
+        # the normal failure path.
+        paused_ok = _handle_pause(
+            event_type=pause.event_type,
+            event=pause.event,
+            agent=agent,
+            run_id=run_id,
+            state_client=state_client,
+            usage=pause.usage,
+            plan_steps=pause.plan_steps,
+        )
+        if paused_ok:
+            return "paused", "(run paused for HITL confirmation)", pause.usage, pause.plan_steps
+        # If _handle_pause failed, treat as a worker crash.
+        state_client.mark_failed()
+        return "FAILED", "HITL pause serialisation failed", pause.usage, pause.plan_steps
     except Exception:
         state_client.mark_failed()
         raise
@@ -791,8 +1575,15 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
     return "OK", summary, usage, plan_steps
 
 
+
 def main(argv: list[str] | None = None) -> int:
     del argv
+
+    # Load scheduler-delivered secrets from /workspace/.secrets.json into
+    # os.environ (userspace only) and unlink the file.  This MUST run before
+    # the _require_env gate below: FOUNDATION_API_TOKEN now arrives via the
+    # file, so it must be present in os.environ before the gate checks for it.
+    _load_secret_file_into_env()
 
     # Fail loudly on missing context -- the scheduler should never spawn
     # a worker without these set.

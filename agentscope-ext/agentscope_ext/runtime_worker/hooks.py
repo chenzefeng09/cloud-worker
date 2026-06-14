@@ -272,6 +272,13 @@ def snapshot_env() -> dict[str, str]:
         # Web-fetch gateway — injected by the scheduler so the web_fetch
         # extension can POST to the gateway sidecar inside the foundation net.
         "WEB_FETCH_GATEWAY_URL",
+        # Broker egress mode — the scheduler rewrites service URLs to
+        # tool-broker façades and injects a per-run lease.  The S3 shim in
+        # ``_s3_client`` keys off ``TOOL_BROKER_URL`` (+ lease) to route
+        # attachment reads through ``/s3/v1/object``; omitting the URL here
+        # silently falls back to boto3 with blanked creds (download fails).
+        "TOOL_BROKER_URL",
+        "TOOL_BROKER_LEASE",
         # LLM gateway enforcer (M1) — injected by the scheduler when the
         # llm_gateway_enforcer extension is active.  LLM_GATEWAY_URL points
         # at the OpenAI-compatible gateway endpoint (includes /api/llm-gateway/v1

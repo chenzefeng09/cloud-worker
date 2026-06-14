@@ -152,6 +152,13 @@ in-memory.  B-M2 follow-ups:
 
 All three are the same code; values come from helm ``values.profile``.
 
+**Sandbox egress isolation (cube runtime).**  In broker egress mode the
+scheduler stamps ``agent-platform.network-policy=sandbox-broker-only`` on each
+microVM; the concrete per-VM egress policy that physically confines it to the
+tool-broker façade + DNS (default-deny everything else — the prod analogue of
+the dev ``internal: true`` ``sandbox_broker`` network) ships as a deploy asset
+in ``deploy/cube/`` (CubeVS ``allow_out`` overlay + host nftables fallback).
+
 ## 7. Compliance mapping
 
 | Control | How B-M2 delivers it |

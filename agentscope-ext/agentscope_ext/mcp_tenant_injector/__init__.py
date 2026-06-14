@@ -66,6 +66,7 @@ def install() -> None:
                 token=env.get("FOUNDATION_API_TOKEN", ""),
                 tenant_id=tenant_id,
                 service_scopes=service_scopes,
+                broker_lease=env.get("TOOL_BROKER_LEASE", ""),
             )
         except Exception as exc:  # noqa: BLE001 -- never break boot
             _LOG.warning("mcp_tenant_injector: registry fetch failed: %r", exc)

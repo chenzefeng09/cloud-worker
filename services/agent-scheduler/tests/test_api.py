@@ -2,9 +2,25 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from fastapi.testclient import TestClient
+
+# Mirrors conftest._TENANT / _USER (the headers the gateway injects).
+_TENANT = "tnt_01J5TEST00000000000000TNT1"
+
+
+def _read_run_secrets(
+    workspace_base: str, *, tenant_id: str, session_id: str, run_id: str
+) -> dict[str, str]:
+    """Secrets are delivered out-of-band via /workspace/.secrets.json (0600),
+    not the container env (which leaks via /proc/1/environ)."""
+    path = (
+        Path(workspace_base) / tenant_id / session_id / run_id / ".secrets.json"
+    )
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def test_healthz(app_client: TestClient) -> None:
@@ -69,11 +85,22 @@ def test_create_run_mints_token_then_spawns(
     minted = fake_identity.calls[0]
     assert minted["tenant_id"] == auth_headers["X-Tenant-Id"]
     assert "llm-gateway.invoke" in minted["scopes"]
-    # And the spawn used the *minted* token, not the scheduler's own.
+    # And the spawn used the *minted* token, not the scheduler's own.  Secrets
+    # are now delivered via /workspace/.secrets.json, not the container env, so
+    # they must NOT appear in environment= but MUST be in the file.
     spawn_env = mock_docker_client.containers.run.call_args.kwargs["environment"]
-    assert spawn_env["FOUNDATION_API_TOKEN"] == "minted-jwt"
-    assert spawn_env["LLM_VIRTUAL_KEY"] == "vk-test-default"
-    assert spawn_env["LLM_API_KEY"] == ""
+    assert "FOUNDATION_API_TOKEN" not in spawn_env
+    assert "LLM_VIRTUAL_KEY" not in spawn_env
+    assert "LLM_API_KEY" not in spawn_env
+    secrets = _read_run_secrets(
+        "/tmp/agent-platform-test",
+        tenant_id=_TENANT,
+        session_id="ses_01J5SES0000000000000000001",
+        run_id="run_01J5RUN0000000000000000001",
+    )
+    assert secrets["FOUNDATION_API_TOKEN"] == "minted-jwt"
+    assert secrets["LLM_VIRTUAL_KEY"] == "vk-test-default"
+    assert secrets["LLM_API_KEY"] == ""
 
 
 def test_create_run_large_attachment_uses_large_memory_tier(

@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
+import { useChatStore } from '../../stores/chatStore';
+import { isPlatformAdmin } from '../../lib/permissions';
 import { CustomSelect } from '../components/CustomSelect';
 import { Dialog } from '../components/Dialog';
 import { useConfirm, usePrompt } from '../components/dialogs';
@@ -832,6 +834,12 @@ function TeamsPanel({
 export function OrgStructurePage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading, selectedTenantId, setSelectedTenantId } =
     useAdminStore();
+  const userProfile = useChatStore((s) => s.userProfile);
+  // Platform admins may pick any tenant; tenant admins are locked to their own
+  // tenant (selectedTenantId stays null → BFF omits ?tenant_id= → own tenant).
+  const canSwitchTenant = isPlatformAdmin(userProfile?.permissions);
+  const ownTenantName =
+    tenants.find((t) => t.id === userProfile?.tenant_id)?.name ?? userProfile?.tenant_id ?? '当前租户';
 
   const [units, setUnits] = useState<OrgUnit[]>([]);
   const [teams, setTeams] = useState<Team[]>([]);
@@ -881,6 +889,14 @@ export function OrgStructurePage() {
     }
   }, [selectedTenantId]);
 
+  // Tenant admins must never carry a cross-tenant selection (the adminStore is
+  // shared and could hold a stale id from a prior platform-admin session).
+  useEffect(() => {
+    if (!canSwitchTenant && selectedTenantId !== null) {
+      setSelectedTenantId(null);
+    }
+  }, [canSwitchTenant, selectedTenantId, setSelectedTenantId]);
+
   useEffect(() => {
     setSelectedTeamId(null);
     load();
@@ -893,19 +909,28 @@ export function OrgStructurePage() {
         <p className="text-[12px] text-dim mt-0.5">管理部门层级与团队成员</p>
       </div>
 
-      {/* Tenant selector */}
+      {/* Tenant selector — only platform admins may switch; tenant admins are
+          locked to their own tenant (shown read-only). */}
       <div className="flex items-center gap-3">
-        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
-        <CustomSelect
-          className="min-w-[200px]"
-          options={[
-            { value: '', label: '（默认 / 当前租户）' },
-            ...tenants.map((t) => ({ value: t.id, label: t.name })),
-          ]}
-          value={selectedTenantId ?? ''}
-          onChange={(v) => setSelectedTenantId(v || null)}
-          disabled={tenantsLoading}
-        />
+        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">
+          {canSwitchTenant ? '选择租户' : '当前租户'}
+        </label>
+        {canSwitchTenant ? (
+          <CustomSelect
+            className="min-w-[200px]"
+            options={[
+              { value: '', label: '（默认 / 当前租户）' },
+              ...tenants.map((t) => ({ value: t.id, label: t.name })),
+            ]}
+            value={selectedTenantId ?? ''}
+            onChange={(v) => setSelectedTenantId(v || null)}
+            disabled={tenantsLoading}
+          />
+        ) : (
+          <span className="min-w-[200px] text-[13px] text-ink font-mono px-3 py-1.5 rounded-sm border border-line bg-surface">
+            {ownTenantName}
+          </span>
+        )}
       </div>
 
       {error && (
