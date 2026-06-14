@@ -44,6 +44,18 @@ networks:
   # and private-range blocking before forwarding the request.
   egress:
     driver: bridge
+  # Broker-only sandbox network. In SCHEDULER_SANDBOX_EGRESS_MODE=broker,
+  # agent sandboxes join this network instead of the foundation network and
+  # reach platform capabilities through tool-broker façades. The network is
+  # internal by default so Bash cannot use it for arbitrary internet egress.
+  sandbox_broker:
+    driver: bridge
+    internal: true
+    # TODO(security): per-run isolated network so sibling sandboxes can't reach each other; enable_icc:false would also break sandbox->broker on a shared bridge
+    # (tool-broker is attached to THIS sandbox_broker network — see the tool-broker
+    #  service's `networks: [foundation, sandbox_broker]`. sandbox->broker is
+    #  container-to-container traffic on this bridge, which enable_icc:false would
+    #  also block. So ICC-off is intentionally NOT applied here.)
 
 services:
   # ===========================================================================
@@ -310,10 +322,15 @@ services:
       # The pool uses it to start/stop idle sandbox containers.
       DOCKER_HOST: tcp://docker-socket-proxy:2375
       SANDBOX_POOL_SANDBOX_IMAGE: ${AGENT_IMAGE:-ghcr.io/agent-platform/agentscope-sandbox:0.1}
-      SANDBOX_POOL_DOCKER_NETWORK: ${FOUNDATION_NETWORK:-saas-foundation-dev_foundation}
+      # Prewarmed sandboxes join the internal sandbox_broker network (broker
+      # egress mode), NOT the flat foundation network. Mirrors the scheduler's
+      # SCHEDULER_SANDBOX_BROKER_NETWORK so warm + cold sandboxes land on the
+      # same net. The pool service itself also joins sandbox_broker below so it
+      # can attach the containers it manages to that network.
+      SANDBOX_POOL_DOCKER_NETWORK: ${SANDBOX_BROKER_NETWORK:-agent-platform-dev_sandbox_broker}
     ports:
       - "${PORT_SANDBOX_POOL:-8008}:8008"
-    networks: [foundation, agent_internal]
+    networks: [foundation, agent_internal, sandbox_broker]
     depends_on:
       docker-socket-proxy:
         condition: service_started
@@ -408,6 +425,15 @@ services:
       # the ``AGENT_WORKSPACE_BASE`` env on hosts where /tmp isn't shared.
       SCHEDULER_WORKSPACE_BASE: ${AGENT_WORKSPACE_BASE:-/tmp/agent-workspaces}
       SCHEDULER_DOCKER_NETWORK: ${FOUNDATION_NETWORK:-saas-foundation-dev_foundation}
+      # Sandbox egress policy:
+      #   foundation = legacy/dev direct access to foundation network
+      #   broker     = attach sandboxes only to sandbox_broker network and
+      #                rewrite worker service URLs to TOOL_BROKER_URL façades
+      #   none       = Docker network_disabled=True; local filesystem tools only
+      SCHEDULER_SANDBOX_EGRESS_MODE: ${SANDBOX_EGRESS_MODE:-broker}
+      SCHEDULER_SANDBOX_BROKER_NETWORK: ${SANDBOX_BROKER_NETWORK:-agent-platform-dev_sandbox_broker}
+      SCHEDULER_TOOL_BROKER_URL: ${TOOL_BROKER_URL:-http://tool-broker:8024/api/tool-broker/v1}
+      SCHEDULER_TOOL_BROKER_LEASE_SECRET: ${TOOL_BROKER_LEASE_SECRET:-dev-tool-broker-lease-secret-change-me}
       SCHEDULER_SANDBOX_MEMORY_LIMIT: "2g"
       SCHEDULER_SANDBOX_CPU_SHARES: "1024"
       SCHEDULER_SANDBOX_TIMEOUT: "600"
@@ -443,11 +469,10 @@ services:
       SCHEDULER_S3_REGION: us-east-1
       SCHEDULER_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-foundation}
       SCHEDULER_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_change_me_min_12_chars}
-      # Hot-state layer — Redis URL the scheduler forwards into each sandbox so
-      # the runtime_worker can write step/plan/cursor checkpoints.
-      # foundation-redis is on the saas-foundation-dev_foundation network;
-      # sandbox containers share that network (SCHEDULER_DOCKER_NETWORK above)
-      # so they reach foundation-redis:6379 directly without any proxy.
+      # Hot-state layer — in foundation egress mode this is forwarded into each
+      # sandbox so runtime_worker can write checkpoints directly. In broker/none
+      # modes the scheduler blanks REDIS_URL before spawn; state streaming must
+      # be provided by a broker-side path instead of direct Redis access.
       # Password from foundation-redis requirepass (see saas-foundation dev.yml).
       SCHEDULER_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
       SCHEDULER_AUTHZ_URL: http://authz:8002/api/authz/v1
@@ -563,6 +588,10 @@ services:
       # BFF-local DB (notification_preferences, future api_keys)
       BFF_DB_DSN: postgresql+asyncpg://app_user:${APP_USER_PASSWORD:-app_user_change_me}@postgres:5432/foundation
       BFF_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+      # Service-account token — shared with cron-runner for machine-path auth.
+      BFF_SERVICE_TOKEN: ${BFF_SERVICE_TOKEN:-dev_service_token_change_me}
+      # Cron-runner proxy target.
+      BFF_CRON_RUNNER_URL: http://cron-runner:8013/api/cron/v1
     ports:
       - "${PORT_BFF:-8005}:8005"
     networks: [foundation]
@@ -782,15 +811,18 @@ services:
       WEB_FETCH_LOG_LEVEL: ${WEB_FETCH_LOG_LEVEL:-INFO}
       WEB_FETCH_HTTP_PORT: "8013"
       # Set to a comma-separated list of allowed domains. Empty fails closed.
-      WEB_FETCH_ALLOWED_DOMAINS: ${WEB_FETCH_ALLOWED_DOMAINS:-*}
+      # fail-closed: set explicit domains to enable web fetch; empty blocks all
+      WEB_FETCH_ALLOWED_DOMAINS: ${WEB_FETCH_ALLOWED_DOMAINS:-}
       WEB_FETCH_REQUIRE_AUTH: "true"
       WEB_FETCH_REQUIRED_SCOPE: web_fetch.invoke
       WEB_FETCH_MAX_RESPONSE_BYTES: "1048576"
       WEB_FETCH_FETCH_TIMEOUT_SECONDS: "15"
-      WEB_FETCH_SKIP_IP_CHECK: "true"
+      # SSRF private-IP / metadata-IP blocklist stays ON by default.
+      # WEB_FETCH_SKIP_IP_CHECK=true  # DEV ONLY — never enable in prod; disables SSRF IP blocklist
       WEB_FETCH_RESTRICT_CONTENT_TYPES: "true"
     ports:
       - "${PORT_WEB_FETCH_GATEWAY:-8023}:8013"
+    # TODO(security): web-fetch-gateway should sit only on the egress network, not the flat foundation network
     networks: [foundation, egress]
     healthcheck:
       test:
@@ -798,6 +830,108 @@ services:
         - >
           python -c "import urllib.request;
           urllib.request.urlopen('http://127.0.0.1:8013/api/web-fetch/v1/healthz').read()"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ===========================================================================
+  # Tool Broker — broker-only façade exposed to sandbox_broker network
+  #
+  # In SCHEDULER_SANDBOX_EGRESS_MODE=broker, sandboxes attach only to the
+  # internal sandbox_broker network and call this service for LLM/MCP/Skill/
+  # WebFetch façades. The broker is also attached to foundation so it can reach
+  # the real platform services. Bash stays available, but direct Redis/MinIO/
+  # MCP/LLM service DNS is no longer reachable from the sandbox network.
+  # ===========================================================================
+  tool-broker:
+    build:
+      context: ../../services/tool-broker
+    container_name: agent-tool-broker
+    restart: unless-stopped
+    environment:
+      TOOL_BROKER_ENV: ${TOOL_BROKER_ENV:-dev}
+      TOOL_BROKER_LOG_LEVEL: ${TOOL_BROKER_LOG_LEVEL:-INFO}
+      TOOL_BROKER_HTTP_PORT: "8024"
+      TOOL_BROKER_REQUIRE_AUTH: "true"
+      TOOL_BROKER_REQUIRE_LEASE: "true"
+      TOOL_BROKER_LEASE_SECRET: ${TOOL_BROKER_LEASE_SECRET:-dev-tool-broker-lease-secret-change-me}
+      TOOL_BROKER_LLM_GATEWAY_URL: ${LLM_GATEWAY_URL:-http://llm-gateway:8011/api/llm-gateway/v1}
+      TOOL_BROKER_MCP_REGISTRY_URL: ${MCP_REGISTRY_URL:-http://mcp-registry:8010/api/mcp/v1}
+      TOOL_BROKER_SKILL_STORE_URL: ${SKILL_STORE_URL:-http://skill-store:8011/api/skills/v1}
+      TOOL_BROKER_WEB_FETCH_GATEWAY_URL: ${WEB_FETCH_GATEWAY_URL:-http://web-fetch-gateway:8013/api/web-fetch/v1}
+      # /state/v1 (Redis) and /s3/v1 (object-store) façades. The broker holds
+      # the REAL backend creds here; sandboxes get none and reach Redis/S3 only
+      # through the narrow lease-scoped HTTP façades. Reuse the SAME env vars /
+      # defaults as the scheduler so the password + MinIO creds stay in sync.
+      TOOL_BROKER_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
+      TOOL_BROKER_S3_ENDPOINT_URL: http://foundation-minio:9000
+      TOOL_BROKER_S3_REGION: us-east-1
+      TOOL_BROKER_S3_BUCKET: agent-platform
+      TOOL_BROKER_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-foundation}
+      TOOL_BROKER_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_change_me_min_12_chars}
+    ports:
+      - "${PORT_TOOL_BROKER:-8024}:8024"
+    networks: [foundation, sandbox_broker]
+    depends_on:
+      web-fetch-gateway:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >
+          python -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:8024/api/tool-broker/v1/healthz').read()"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ===========================================================================
+  # cron-runner-migrate — Alembic migration sidecar for cron_runner schema
+  # ===========================================================================
+  cron-runner-migrate:
+    build:
+      context: ../../services/cron-runner
+      dockerfile: Dockerfile
+    image: agent-platform-dev-cron-runner
+    container_name: agent-cron-runner-migrate
+    restart: "no"
+    working_dir: /app
+    environment:
+      CRON_RUNNER_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+    entrypoint: ["alembic", "upgrade", "head"]
+    networks: [foundation]
+
+  # ===========================================================================
+  # cron-runner — scheduled App execution via APScheduler + BFF service token
+  # ===========================================================================
+  cron-runner:
+    build:
+      context: ../../services/cron-runner
+      dockerfile: Dockerfile
+    container_name: agent-cron-runner
+    restart: unless-stopped
+    environment:
+      CRON_RUNNER_ENV: dev
+      CRON_RUNNER_LOG_LEVEL: DEBUG
+      CRON_RUNNER_HTTP_PORT: "8013"
+      # Runtime DB: same postgres:5432 direct path that session-orchestrator and
+      # app-registry use (not pgbouncer) — asyncpg prepared-statement cache
+      # incompatibility with pgbouncer transaction mode.
+      CRON_RUNNER_DB_DSN: postgresql+asyncpg://app_user:${APP_USER_PASSWORD:-app_user_change_me}@postgres:5432/foundation
+      CRON_RUNNER_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
+      # BFF internal port is 8005 (see bff service above).
+      CRON_RUNNER_BFF_URL: http://bff:8005
+      CRON_RUNNER_SERVICE_TOKEN: ${BFF_SERVICE_TOKEN:-dev_service_token_change_me}
+    ports:
+      - "${PORT_CRON_RUNNER:-8015}:8013"
+    networks: [foundation]
+    depends_on:
+      cron-runner-migrate:
+        condition: service_completed_successfully
+      bff:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8013/api/cron/v1/healthz').read()\""]
       interval: 10s
       timeout: 5s
       retries: 10

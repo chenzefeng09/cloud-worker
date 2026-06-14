@@ -172,6 +172,14 @@ class Settings(BaseSettings):
     #                TOOL_BROKER_URL façades for LLM/MCP/WebFetch/etc.
     #   none       — Docker network is disabled; only local filesystem tools work.
     sandbox_egress_mode: Literal["foundation", "broker", "none"] = "broker"
+    # FIX B6 — ``foundation`` egress joins the shared foundation network, giving
+    # the sandbox direct (un-brokered) reach to internal services and, depending
+    # on the network, the internet.  That "silent open" posture is fine for
+    # dev/test/local but unsafe in prod, so outside dev-like envs it requires an
+    # EXPLICIT opt-in via this flag (see the spawn-time guard in
+    # ``DockerRuntime._assert_foundation_egress_allowed``).  Default ``broker``
+    # mode is unaffected.
+    allow_insecure_foundation_egress: bool = False
     sandbox_broker_network: str = "agent-platform-dev_sandbox_broker"
     tool_broker_url: str = "http://tool-broker:8024/api/tool-broker/v1"
     # HMAC secret shared with tool-broker for per-run capability leases. In

@@ -30,17 +30,24 @@ Three hardening rules apply until then:
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import mimetypes
+import os
 import re
 from pathlib import Path
 from typing import Any
 
 import docker
-from docker.types import Mount
+from docker.types import Mount, Ulimit
 
-from agent_scheduler.config import SANDBOX_SERVICE_SCOPES, Settings
+from agent_scheduler.config import (
+    SANDBOX_SERVICE_SCOPES,
+    Settings,
+    _DEV_LIKE_ENVS,
+)
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
+from agent_scheduler.services import egress_policy
 from agent_scheduler.services.feature_flag import evaluate_flag
 from agent_scheduler.services.runtime import RUNTIME_REGISTRY
 from agent_scheduler.services.skill_cache import MountedSkill, SkillCache
@@ -67,6 +74,68 @@ _SAFE_ID = re.compile(r"^[A-Za-z0-9_\-]{1,40}$")
 # the workspace task.json or our log files.  32 KiB is generous for
 # natural language and matches the limit advertised in contracts/openapi.
 _MAX_TASK_LEN = 32 * 1024
+
+
+# FIX B4 — kernel hardening applied to EVERY sandbox ``containers.run(...)``.
+# The same kwargs are duplicated in ``sandbox_pool.docker_runtime`` (a separate
+# service that cannot import this module); keep the two copies identical.
+#
+# * ``no-new-privileges`` neuters setuid binaries so a compromised worker can't
+#   re-escalate via e.g. a stray ``sudo``/``ping`` even if one slips into the
+#   image.
+# * ``cap_drop=["ALL"]`` — the worker is a non-root python/node process that
+#   needs no Linux capabilities; dropping them all removes the usual container
+#   escape primitives (CAP_SYS_ADMIN, CAP_NET_RAW, …).  If a test ever reveals a
+#   genuinely required cap, add back the MINIMAL set here with a comment.
+# * ``pids_limit`` caps the process table inside the sandbox so a uid-1000 fork
+#   bomb can't exhaust the host's pid space; 512 is generous for the worker.
+# * ``ulimits`` (nofile) bounds open file descriptors so the sandbox cannot
+#   exhaust the daemon's fd table.
+#
+# TODO(security): read_only rootfs + tmpfs — the worker writes outside
+# /workspace (npm/pip caches, /tmp) so a read-only rootfs needs separate tmpfs
+# wiring; left for a follow-up pass.  Network/mem/cpu limits are handled by the
+# egress policy + per-run sizing at the call site, not here.
+_SANDBOX_PIDS_LIMIT = 512
+_SANDBOX_NOFILE_SOFT = 4096
+_SANDBOX_NOFILE_HARD = 8192
+
+
+def _kernel_hardening_kwargs() -> dict[str, Any]:
+    """Return the shared ``containers.run`` kernel-hardening kwargs (FIX B4)."""
+    return {
+        "security_opt": ["no-new-privileges:true"],
+        "cap_drop": ["ALL"],
+        "pids_limit": _SANDBOX_PIDS_LIMIT,
+        "ulimits": [
+            Ulimit(
+                name="nofile",
+                soft=_SANDBOX_NOFILE_SOFT,
+                hard=_SANDBOX_NOFILE_HARD,
+            )
+        ],
+    }
+
+# Credentials that must NEVER reach the container via ``environment=``.  The
+# kernel exposes a process' full environ at ``/proc/1/environ``, which is
+# world-readable to any code running inside the sandbox — so an in-sandbox
+# agent could ``cat /proc/1/environ`` and recover every secret we passed as
+# env, defeating the worker's env-scrub defense.  These keys are instead
+# delivered out-of-band via a 0600 file on the ``/workspace`` bind mount
+# (see ``.secrets.json`` below), which the worker reads into its own env and
+# unlinks before any tool subprocess runs.  Routing/metadata (URLs, tenant/
+# user/run IDs, model, egress mode, scopes, bucket/region) stay in env.
+_SECRET_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "FOUNDATION_API_TOKEN",
+        "TOOL_BROKER_LEASE",
+        "LLM_VIRTUAL_KEY",
+        "LLM_API_KEY",
+        "S3_ACCESS_KEY_ID",
+        "S3_SECRET_ACCESS_KEY",
+        "REDIS_URL",
+    }
+)
 
 
 def _check_ids(**named: str) -> None:
@@ -136,6 +205,8 @@ class DockerRuntime:
         reasoning_effort: str | None = None,
         sys_prompt: str | None = None,
         sampling_params: dict[str, Any] | None = None,
+        hitl: bool = True,
+        resume: dict[str, Any] | None = None,
     ) -> str:
         """Spawn a sandbox container for one agent run.
 
@@ -193,6 +264,8 @@ class DockerRuntime:
             reasoning_effort=reasoning_effort,
             sys_prompt=sys_prompt,
             sampling_params=sampling_params,
+            hitl=hitl,
+            resume=resume,
         )
 
         # When the ``llm_gateway_enforcer`` extension is active, the sandbox
@@ -211,7 +284,29 @@ class DockerRuntime:
                 "was provided; refusing direct-connect fallback",
             )
         _sandbox_llm_api_key = "" if _gateway_mode else self._settings.llm_api_key
+        try:
+            service_env = egress_policy.service_env(
+                self._settings,
+                llm_gateway_url=llm_gateway_url,
+            )
+            network_kwargs = egress_policy.docker_run_network_kwargs(self._settings)
+            egress_labels = egress_policy.metadata(self._settings)
+            tool_broker_lease = egress_policy.mint_tool_broker_lease(
+                self._settings,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                run_id=run_id,
+                ttl_seconds=self._settings.sandbox_timeout,
+            )
+        except ValueError as exc:
+            raise SandboxSpawnError(str(exc)) from exc
 
+        # NOTE: this dict is assembled with every value (including secrets)
+        # for clarity, but the ``_SECRET_ENV_KEYS`` subset is popped out below
+        # (after the conditional appends) and delivered via
+        # ``/workspace/.secrets.json`` instead of ``environment=`` — see the
+        # comment on ``_SECRET_ENV_KEYS``.  Only routing/metadata reaches the
+        # container env.
         env_vars = {
             "LLM_API_KEY": _sandbox_llm_api_key,
             "LLM_MODEL": self._settings.llm_model,
@@ -223,19 +318,21 @@ class DockerRuntime:
             "LLM_BASE_URL": self._settings.llm_base_url,
             # LLM gateway env vars.  The enforcer is enabled by default and
             # refuses to build a model if either URL or virtual key is absent.
-            "LLM_GATEWAY_URL": llm_gateway_url or self._settings.llm_gateway_url,
+            "LLM_GATEWAY_URL": service_env["LLM_GATEWAY_URL"],
             "WORKSPACE_BASE": str(workspace_dir),
             "FOUNDATION_API_URL": self._settings.foundation_api_url,
             "FOUNDATION_API_TOKEN": foundation_token,
             "FOUNDATION_TENANT_ID": tenant_id,
             "FOUNDATION_USER_ID": user_id,
             "OTEL_EXPORTER_OTLP_ENDPOINT": self._settings.otel_exporter_endpoint,
+            "SANDBOX_EGRESS_MODE": service_env["SANDBOX_EGRESS_MODE"],
+            "TOOL_BROKER_URL": service_env["TOOL_BROKER_URL"],
             # B-M3: service URLs for the in-sandbox extensions.
             # mcp_tenant_injector reads MCP_REGISTRY_URL;
             # skills_loader reads SKILL_STORE_URL.
             # RUNTIME_EXTENSIONS activates them in declaration order.
-            "MCP_REGISTRY_URL": self._settings.mcp_registry_url,
-            "SKILL_STORE_URL": self._settings.skill_store_url,
+            "MCP_REGISTRY_URL": service_env["MCP_REGISTRY_URL"],
+            "SKILL_STORE_URL": service_env["SKILL_STORE_URL"],
             "RUNTIME_EXTENSIONS": self._settings.runtime_extensions,
             # Dev-mode shim: in prod the API gateway translates the verified
             # Bearer JWT into X-Service-Scopes before requests reach internal
@@ -245,30 +342,57 @@ class DockerRuntime:
             # TODO: remove once the gateway enforces scope injection in prod.
             "FOUNDATION_SERVICE_SCOPES": SANDBOX_SERVICE_SCOPES,
             # S3/MinIO credentials — consumed by runtime_worker to download
-            # user-uploaded attachments listed in task.json ``files``.
-            "S3_ENDPOINT_URL": self._settings.s3_endpoint_url,
-            "S3_BUCKET": self._settings.s3_bucket,
-            "S3_REGION": self._settings.s3_region,
-            "S3_ACCESS_KEY_ID": self._settings.s3_access_key_id,
-            "S3_SECRET_ACCESS_KEY": self._settings.s3_secret_access_key,
+            # user-uploaded attachments listed in task.json ``files``.  ALL of
+            # these come from ``service_env`` (not ``self._settings``) so the
+            # egress mode is the single source of truth: in broker mode the
+            # access/secret keys are blanked (the broker /s3 façade holds the
+            # real MinIO creds) while bucket/region stay populated.
+            "S3_ENDPOINT_URL": service_env["S3_ENDPOINT_URL"],
+            "S3_BUCKET": service_env["S3_BUCKET"],
+            "S3_REGION": service_env["S3_REGION"],
+            "S3_ACCESS_KEY_ID": service_env["S3_ACCESS_KEY_ID"],
+            "S3_SECRET_ACCESS_KEY": service_env["S3_SECRET_ACCESS_KEY"],
             # Hot-state layer: stable run identifier + Redis URL so the
             # in-sandbox worker can write step/plan/cursor checkpoints.
-            # The sandbox is on saas-foundation-dev_foundation network (same
-            # as foundation-redis) so it reaches foundation-redis:6379 directly
-            # (plan a — no sidecar needed).
             "RUN_ID": run_id,
-            "REDIS_URL": self._settings.redis_url,
+            "REDIS_URL": service_env["REDIS_URL"],
             # Web-fetch gateway — the web_fetch extension reads this to
             # POST fetch requests to the gateway sidecar.  The gateway is
-            # on the foundation network so sandbox containers reach it by
-            # service name without any additional proxy.
-            "WEB_FETCH_GATEWAY_URL": self._settings.web_fetch_gateway_url,
+            # either reached directly (foundation mode) or through tool-broker.
+            "WEB_FETCH_GATEWAY_URL": service_env["WEB_FETCH_GATEWAY_URL"],
         }
+        if tool_broker_lease:
+            env_vars["TOOL_BROKER_LEASE"] = tool_broker_lease
 
         # M1-P3: inject LLM_VIRTUAL_KEY only when present (omit rather than
         # blank so the enforcer can reliably detect "no key configured").
         if llm_virtual_key:
             env_vars["LLM_VIRTUAL_KEY"] = llm_virtual_key
+
+        # Security: the credential subset of ``env_vars`` is intentionally
+        # moved OUT of the container environment here and delivered via
+        # ``/workspace/.secrets.json`` (0600, read-then-unlinked by the
+        # worker).  Passing them as ``environment=`` would leak them through
+        # the kernel ``/proc/1/environ`` interface to any in-sandbox code.
+        # ``pop`` preserves the existing conditional semantics: a key is only
+        # written to the file if it was present in ``env_vars`` (so falsy
+        # LLM_VIRTUAL_KEY / TOOL_BROKER_LEASE are absent here too), while
+        # LLM_API_KEY — which is always present, possibly "" under the
+        # gateway enforcer — is carried through verbatim.
+        secret_file_payload = {
+            k: env_vars.pop(k) for k in _SECRET_ENV_KEYS if k in env_vars
+        }
+        secrets_path = workspace_dir / ".secrets.json"
+        try:
+            secrets_path.write_text(
+                json.dumps(secret_file_payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            os.chmod(secrets_path, 0o600)
+        except OSError as exc:
+            raise SandboxSpawnError(
+                f"Failed to write sandbox secrets file at {secrets_path}: {exc}"
+            ) from exc
 
         # Stage-2 block B: materialise the run's skills into the
         # content-addressed host cache and prepare read-only bind mounts
@@ -338,6 +462,14 @@ class DockerRuntime:
             },
         )
 
+        # FIX B5/B6 — fail-closed spawn-time egress invariants, checked here
+        # where we hold ``self.client``, before we ever start the container:
+        #   B6: ``foundation`` egress is prod-unsafe unless explicitly opted in.
+        #   B5: broker/none mode MUST land on an internal-only docker network so
+        #       a compromised worker has no direct route off-box.
+        self._assert_foundation_egress_allowed()
+        self._assert_isolated_network(network_kwargs)
+
         try:
             container = self.client.containers.run(
                 image=selected_image,
@@ -347,7 +479,10 @@ class DockerRuntime:
                 command=selected_cmd,
                 environment=env_vars,
                 mounts=mounts,
-                network=self._settings.docker_network,
+                **network_kwargs,
+                # FIX B4 — kernel hardening (no-new-privileges, cap_drop=ALL,
+                # pids_limit, nofile ulimit).  See ``_kernel_hardening_kwargs``.
+                **_kernel_hardening_kwargs(),
                 mem_limit=memory_limit or self._settings.sandbox_memory_limit,
                 cpu_shares=self._settings.sandbox_cpu_shares,
                 detach=True,
@@ -355,6 +490,7 @@ class DockerRuntime:
                     "agent-platform.run-id": run_id,
                     "agent-platform.session-id": session_id,
                     "agent-platform.tenant-id": tenant_id,
+                    **egress_labels,
                 },
                 remove=False,
             )
@@ -376,6 +512,87 @@ class DockerRuntime:
             },
         )
         return str(container.id)
+
+    # ----------------------------------------------------------- egress guard
+    def _assert_foundation_egress_allowed(self) -> None:
+        """FIX B6 — gate prod-unsafe ``foundation`` egress behind an opt-in.
+
+        ``foundation`` mode puts the sandbox directly on the shared foundation
+        network (un-brokered reach to internal services / the internet).  That
+        is intentional for dev/test/local, but in any other environment it is a
+        "silent open" risk, so it must be explicitly enabled via
+        ``allow_insecure_foundation_egress``.  Broker/none modes are unaffected.
+        """
+        mode = str(
+            getattr(self._settings, "sandbox_egress_mode", "foundation")
+            or "foundation"
+        )
+        if mode != "foundation":
+            return
+        env = str(getattr(self._settings, "env", "") or "")
+        if env in _DEV_LIKE_ENVS:
+            return
+        if getattr(self._settings, "allow_insecure_foundation_egress", False):
+            return
+        raise SandboxSpawnError(
+            f"sandbox_egress_mode 'foundation' is unsafe in env {env!r}; it "
+            "puts the sandbox directly on the foundation network. Set "
+            "SCHEDULER_ALLOW_INSECURE_FOUNDATION_EGRESS=true to opt in, or use "
+            "'broker' egress (the default). Refusing to spawn."
+        )
+
+    def _assert_isolated_network(self, network_kwargs: dict[str, Any]) -> None:
+        """FIX B5/B6 — refuse to spawn onto a non-internal egress network.
+
+        ``egress_policy.docker_run_network_kwargs`` chooses a named docker
+        network for broker (and, in principle, none) mode, but cannot verify
+        the network is actually isolated because it has no docker client.  We
+        do that here, fail-closed: a named broker/none network MUST be
+        ``Internal == True`` (no default gateway → no direct off-box egress),
+        otherwise a misconfigured network would silently give the sandbox open
+        internet access.
+
+        ``foundation`` mode is exempt — it deliberately joins the shared
+        foundation network for legacy/dev direct service access.
+
+        Tolerance for test fakes: when the docker client can't inspect the
+        network (a minimal fake without ``.networks.get(...).attrs``), we skip
+        the assertion rather than break.  A real client always supports it, so
+        the invariant holds in every deployment.
+        """
+        mode = str(
+            getattr(self._settings, "sandbox_egress_mode", "foundation")
+            or "foundation"
+        )
+        if mode == "foundation":
+            return
+        network = network_kwargs.get("network")
+        if not network:
+            # ``none`` mode uses ``network_disabled=True`` (no named network) —
+            # already isolated, nothing to verify.
+            return
+        try:
+            net = self.client.networks.get(network)
+            is_internal = bool(net.attrs["Internal"])
+        except AttributeError:
+            # Minimal fake docker client without a ``networks`` collection /
+            # ``.attrs`` — can't verify, so don't enforce (real clients always
+            # support this).
+            return
+        except docker.errors.NotFound:
+            # Network doesn't exist yet; let ``containers.run`` surface the
+            # real error rather than masking it with a confusing message.
+            return
+        except (KeyError, docker.errors.APIError):
+            # Malformed inspect payload or transient API error — don't block
+            # the spawn on an inspect hiccup (the network choice itself is
+            # already pinned by the egress policy).
+            return
+        if not is_internal:
+            raise SandboxSpawnError(
+                f"egress mode {mode!r} requires network {network!r} to be "
+                "internal:true, refusing to spawn"
+            )
 
     # --------------------------------------------------------------- inspect
     def get_run_status(self, container_id: str) -> dict[str, Any]:
@@ -644,6 +861,8 @@ class DockerRuntime:
         reasoning_effort: str | None = None,
         sys_prompt: str | None = None,
         sampling_params: dict[str, Any] | None = None,
+        hitl: bool = True,
+        resume: dict[str, Any] | None = None,
     ) -> Path:
         """Write the task payload ``runtime_worker`` will read.
 
@@ -702,6 +921,11 @@ class DockerRuntime:
             # ``sampling_params`` per-run in the gateway model builder.
             "sys_prompt": sys_prompt or "",
             "sampling_params": sampling_params or {},
+            # HITL: tool-confirmation gate (False for scheduled/background
+            # runs) and the resume payload for continuing a PAUSED run
+            # ({"kind","tool_call_id","confirmed","answer","agent_state"}).
+            "hitl": bool(hitl),
+            "resume": resume,
         }
         task_path = workspace_dir / "task.json"
         task_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

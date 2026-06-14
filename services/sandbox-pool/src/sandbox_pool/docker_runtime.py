@@ -40,6 +40,7 @@ import os
 
 import docker
 import docker.errors
+from docker.types import Ulimit
 
 from sandbox_pool.config import Settings
 
@@ -48,6 +49,48 @@ logger = logging.getLogger(__name__)
 # Label prefix shared with agent-scheduler so both services' containers can
 # be enumerated with a common filter.
 _LABEL_PREFIX = "agent-platform"
+
+
+# FIX B4 — kernel hardening applied to EVERY warm-pool ``containers.run(...)``.
+# These kwargs are an exact duplicate of
+# ``agent_scheduler.services.docker_runtime._kernel_hardening_kwargs`` (a
+# separate service we cannot import from here); keep the two copies identical.
+#
+# * ``no-new-privileges`` neuters setuid binaries so a compromised worker can't
+#   re-escalate via e.g. a stray ``sudo``/``ping`` even if one slips into the
+#   image.
+# * ``cap_drop=["ALL"]`` — the worker is a non-root python/node process that
+#   needs no Linux capabilities; dropping them all removes the usual container
+#   escape primitives (CAP_SYS_ADMIN, CAP_NET_RAW, …).  If a test ever reveals a
+#   genuinely required cap, add back the MINIMAL set here with a comment.
+# * ``pids_limit`` caps the process table inside the sandbox so a uid-1000 fork
+#   bomb can't exhaust the host's pid space; 512 is generous for the worker.
+# * ``ulimits`` (nofile) bounds open file descriptors so the sandbox cannot
+#   exhaust the daemon's fd table.
+#
+# TODO(security): read_only rootfs + tmpfs — the worker writes outside
+# /workspace (npm/pip caches, /tmp) so a read-only rootfs needs separate tmpfs
+# wiring; left for a follow-up pass.  Network/mem/cpu limits are handled by the
+# pool's per-tier sizing at the call site, not here.
+_SANDBOX_PIDS_LIMIT = 512
+_SANDBOX_NOFILE_SOFT = 4096
+_SANDBOX_NOFILE_HARD = 8192
+
+
+def _kernel_hardening_kwargs() -> dict[str, object]:
+    """Return the shared ``containers.run`` kernel-hardening kwargs (FIX B4)."""
+    return {
+        "security_opt": ["no-new-privileges:true"],
+        "cap_drop": ["ALL"],
+        "pids_limit": _SANDBOX_PIDS_LIMIT,
+        "ulimits": [
+            Ulimit(
+                name="nofile",
+                soft=_SANDBOX_NOFILE_SOFT,
+                hard=_SANDBOX_NOFILE_HARD,
+            )
+        ],
+    }
 
 
 class PoolDockerRuntime:
@@ -115,6 +158,9 @@ class PoolDockerRuntime:
                 image=self._settings.sandbox_image,
                 command=["sleep", "infinity"],
                 network=self._settings.docker_network,
+                # FIX B4 — kernel hardening (no-new-privileges, cap_drop=ALL,
+                # pids_limit, nofile ulimit).  See ``_kernel_hardening_kwargs``.
+                **_kernel_hardening_kwargs(),
                 mem_limit=memory_limit or self._settings.sandbox_memory_limit,
                 cpu_shares=self._settings.sandbox_cpu_shares,
                 detach=True,

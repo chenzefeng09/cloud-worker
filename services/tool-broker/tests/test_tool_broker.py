@@ -448,6 +448,28 @@ def test_s3_object_returns_bytes_for_tenant_key() -> None:
     assert s3.calls == [("agent-platform", key)]
 
 
+def test_s3_object_ignores_request_bucket_uses_settings_bucket() -> None:
+    # B8: a sandbox-chosen ?bucket= must be ignored; the broker always reads
+    # from its own configured bucket (the broker holds MinIO root creds, so a
+    # request-supplied bucket would allow cross-bucket reads of any same-key
+    # bucket like backups/billing/logs).
+    key = "tenant/tnt_123/prompts/identity.md"
+    # Object only exists in the broker's configured bucket. If the handler
+    # honoured ?bucket=other-bucket the FakeS3 lookup would miss -> 404.
+    s3 = _FakeS3({("agent-platform", key): b"you are an agent"})
+    client = _s3_client_app(s3)
+
+    resp = client.get(
+        f"/api/tool-broker/v1/s3/v1/object?bucket=other-bucket&key={key}",
+        headers=_state_headers(["s3.read"]),
+    )
+
+    assert resp.status_code == 200
+    assert resp.content == b"you are an agent"
+    # get_object was called with the settings bucket, NOT "other-bucket".
+    assert s3.calls == [("agent-platform", key)]
+
+
 def test_s3_object_attachment_key_allowed() -> None:
     key = "tenant/tnt_123/sessions/sess_1/attachments/att_1/report.pdf"
     s3 = _FakeS3({("agent-platform", key): b"%PDF-1.7"})
@@ -567,6 +589,28 @@ def test_sandbox_identity_headers_are_dropped_and_lease_wins(monkeypatch) -> Non
     # Identity is re-derived from the lease (the sandbox sent no X-User-Id).
     assert forwarded["x-tenant-id"] == "tnt_123"
     assert forwarded["x-user-id"] == "usr_123"
+
+
+def test_identity_authz_headers_are_in_strip_denylist() -> None:
+    """The four identity/authz headers MUST stay in the hop-by-hop denylist.
+
+    ``_HOP_BY_HOP_REQUEST_HEADERS`` is what the proxy uses to scrub
+    sandbox-supplied headers before forwarding upstream.  ``x-actor``,
+    ``x-service-scopes``, ``x-user-id`` and ``x-tenant-id`` are the
+    privilege-escalation / identity-spoof vectors: if any one is removed from
+    this denylist a sandbox could smuggle ``X-Actor: ADMIN`` (an unconditional
+    RBAC bypass in the mcp-registry / skill-store internal guards) or spoof the
+    upstream tenant/user.
+
+    The behavioral test ``test_sandbox_identity_headers_are_dropped_and_lease_wins``
+    only exercises x-actor and x-service-scopes end-to-end (it sends no
+    x-user-id), so it would NOT catch x-user-id / x-tenant-id silently falling
+    out of the denylist.  This constant-level guard pins all four.
+    """
+    from tool_broker.main import _HOP_BY_HOP_REQUEST_HEADERS
+
+    for h in ("x-actor", "x-service-scopes", "x-user-id", "x-tenant-id"):
+        assert h in _HOP_BY_HOP_REQUEST_HEADERS
 
 
 def test_mcp_proxy_injects_trusted_service_scope_dropping_spoof(monkeypatch) -> None:

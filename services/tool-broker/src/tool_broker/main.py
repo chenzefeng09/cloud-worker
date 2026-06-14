@@ -585,7 +585,11 @@ async def s3_object(request: Request) -> Response:
     lease = _require_lease(
         request, settings, required_scope="s3.read", tenant_id=tenant_id
     )
-    bucket = (request.query_params.get("bucket") or settings.s3_bucket).strip()
+    # SECURITY (B8): always use the broker's own configured bucket and ignore
+    # any sandbox-supplied ``?bucket=`` param. The broker holds MinIO root
+    # credentials, so honouring an attacker-chosen bucket would let a sandbox
+    # read any same-key-convention bucket (backups, billing, logs) cross-bucket.
+    bucket = settings.s3_bucket.strip()
     key = _require_s3_key(request.query_params.get("key", ""), lease, tenant_id)
 
     client = _get_s3(request)
