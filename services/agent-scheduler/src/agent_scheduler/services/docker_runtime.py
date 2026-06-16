@@ -360,6 +360,10 @@ class DockerRuntime:
             # POST fetch requests to the gateway sidecar.  The gateway is
             # either reached directly (foundation mode) or through tool-broker.
             "WEB_FETCH_GATEWAY_URL": service_env["WEB_FETCH_GATEWAY_URL"],
+            # Foundation DLP — the worker POSTs tool-call content to
+            # ${DLP_URL}/core/scan for scanning.  Reached directly (foundation
+            # mode) or through the tool-broker /dlp façade (broker mode).
+            "DLP_URL": service_env["DLP_URL"],
         }
         if tool_broker_lease:
             env_vars["TOOL_BROKER_LEASE"] = tool_broker_lease
@@ -440,6 +444,13 @@ class DockerRuntime:
             flag_url=self._settings.feature_flag_url,
             timeout_ms=self._settings.feature_flag_timeout_ms,
         )
+        # Global config fallback: when the per-run flag is False/unreachable, a
+        # deployment can still route every run to the Claude SDK worker via
+        # ``SCHEDULER_USE_CLAUDE_SDK_WORKER_DEFAULT``.  The flag wins when it
+        # returns True; the default only applies on the False branch.  Committed
+        # default is False, so this is a no-op for existing behaviour.
+        if not use_claude_sdk:
+            use_claude_sdk = self._settings.use_claude_sdk_worker_default
         selected_image = (
             self._settings.claude_sdk_image
             if use_claude_sdk

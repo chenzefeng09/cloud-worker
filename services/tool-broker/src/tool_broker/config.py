@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     mcp_registry_url: str = "http://mcp-registry:8010/api/mcp/v1"
     skill_store_url: str = "http://skill-store:8011/api/skills/v1"
     web_fetch_gateway_url: str = "http://web-fetch-gateway:8013/api/web-fetch/v1"
+    dlp_url: str = "http://foundation-dlp:80/api/dlp/v1"
 
     # --- B2: per-route upstream path allowlist -----------------------------
     # Each passthrough proxy route forwards the sandbox-chosen ``{path}`` to an

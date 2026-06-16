@@ -17,6 +17,10 @@ export interface ToolCallUpdate {
 
 interface ChatState {
   sessions: Session[];
+  /** Cursor for the next page of the sidebar recents list (null = no more pages). Shared across all useSessions() instances so the Sidebar's "显示更多" button reflects the page that WorkspaceLayout fetched. */
+  sessionsCursor: string | null;
+  /** True while a loadMore() page fetch is in flight. */
+  sessionsLoadingMore: boolean;
   activeSessionId: string | null;
   messages: Record<string, Message[]>;
   /**
@@ -100,6 +104,8 @@ interface ChatState {
   acknowledgedPendingInteractions: Record<string, Set<string>>;
 
   setSessions: (sessions: Session[]) => void;
+  setSessionsCursor: (cursor: string | null) => void;
+  setSessionsLoadingMore: (loading: boolean) => void;
   addSession: (session: Session) => void;
   setActiveSession: (sessionId: string | null) => void;
   setMessages: (sessionId: string, messages: Message[]) => void;
@@ -300,6 +306,9 @@ interface ChatState {
   clearPendingInteractions: (sessionId: string, runId?: string) => void;
   login: (profile: UserProfile) => void;
   logout: () => void;
+  /** Replace the cached user profile (e.g. after a display-name rename) so
+   *  every consumer — sidebar avatar, account menu — reflects it immediately. */
+  setUserProfile: (profile: UserProfile) => void;
   setBootstrapped: (value: boolean) => void;
   /** Toggle a skill on/off for a session (used by the context rail). */
   toggleSkill: (sessionId: string, name: string) => void;
@@ -447,6 +456,8 @@ export function hasPendingInteraction(
 
 export const useChatStore = create<ChatState>((set) => ({
   sessions: [],
+  sessionsCursor: null,
+  sessionsLoadingMore: false,
   activeSessionId: null,
   messages: {},
   planSteps: {},
@@ -463,6 +474,8 @@ export const useChatStore = create<ChatState>((set) => ({
   acknowledgedPendingInteractions: {},
 
   setSessions: (sessions) => set({ sessions }),
+  setSessionsCursor: (cursor) => set({ sessionsCursor: cursor }),
+  setSessionsLoadingMore: (loading) => set({ sessionsLoadingMore: loading }),
   addSession: (session) => set((s) => ({ sessions: [session, ...s.sessions] })),
   setActiveSession: (sessionId) => set({ activeSessionId: sessionId }),
   setMessages: (sessionId, messages) =>
@@ -897,6 +910,8 @@ export const useChatStore = create<ChatState>((set) => ({
       isLoggedIn: false,
       userProfile: null,
       sessions: [],
+      sessionsCursor: null,
+      sessionsLoadingMore: false,
       messages: {},
       planSteps: {},
       streamOffsets: {},
@@ -909,6 +924,7 @@ export const useChatStore = create<ChatState>((set) => ({
       pendingInteractions: {},
       acknowledgedPendingInteractions: {},
     }),
+  setUserProfile: (profile) => set({ userProfile: profile }),
   setBootstrapped: (value) => set({ bootstrapped: value }),
   toggleSkill: (sessionId, name) =>
     set((s) => {

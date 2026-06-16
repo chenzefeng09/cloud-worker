@@ -41,15 +41,24 @@ def _login(email: str, password: str) -> tuple[httpx.Client, str, str, str]:
 
 @pytest.fixture(scope="session")
 def alice() -> TenantClient:
-    """Tenant A user — alice@example.com."""
-    client, tenant_id, user_id, email = _login("alice@example.com", "test123")
+    """Tenant A user — alice@tenant-a.local (foundation realm seed)."""
+    client, tenant_id, user_id, email = _login(
+        "alice@tenant-a.local", "Tenant-A-Dev-Pwd-15chars!"
+    )
     return TenantClient(client=client, tenant_id=tenant_id, user_id=user_id, email=email)
 
 
 @pytest.fixture(scope="session")
 def bob() -> TenantClient:
-    """Tenant B user — bob@other-tenant.com."""
-    client, tenant_id, user_id, email = _login("bob@other-tenant.com", "test123")
+    """The "other tenant" user for cross-tenant isolation — carol@tenant-b.local (Tenant B).
+
+    The fixture name is kept as ``bob`` to avoid churning all reference sites;
+    it logs in as carol@tenant-b.local, who lives in a *different* tenant than
+    alice (Tenant A), which is what the isolation tests require.
+    """
+    client, tenant_id, user_id, email = _login(
+        "carol@tenant-b.local", "Tenant-B-Dev-Pwd-15chars!"
+    )
     return TenantClient(client=client, tenant_id=tenant_id, user_id=user_id, email=email)
 
 

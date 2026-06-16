@@ -46,7 +46,7 @@ class TestSnakeCase:
         """Login response uses snake_case."""
         r = unauthenticated_client.post(
             "/api/bff/v1/auth/login",
-            json={"email": "alice@example.com", "password": "test123"},
+            json={"email": "alice@tenant-a.local", "password": "Tenant-A-Dev-Pwd-15chars!"},
         )
         if r.status_code == 200:
             violations = _check_snake_case(r.json(), "$")

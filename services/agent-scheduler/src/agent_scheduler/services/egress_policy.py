@@ -18,8 +18,15 @@ from typing import Any
 BROKER_LEASE_SCOPES: tuple[str, ...] = (
     "llm-gateway.invoke",
     "mcp.read_internal",
+    # Tenant MCP server tool invocation via the tool-broker /mcp-tenant
+    # passthrough route; without it the broker returns 403 on that route.
+    "mcp.tenant_invoke",
     "skill.read_internal",
     "web_fetch.invoke",
+    # DLP tool-call scanning is mediated by the tool-broker /dlp façade so the
+    # worker can submit content to foundation-dlp's /core/scan endpoint without
+    # direct infra network reach.
+    "dlp.scan",
     # State (Redis hot-state) and object-store reads are mediated by the
     # tool-broker /state and /s3 façades so a sandbox with no direct infra
     # network can still checkpoint run state and read tenant-scoped objects.
@@ -121,6 +128,7 @@ def service_env(settings: Any, *, llm_gateway_url: str | None = None) -> dict[st
             "MCP_REGISTRY_URL": settings.mcp_registry_url,
             "SKILL_STORE_URL": settings.skill_store_url,
             "WEB_FETCH_GATEWAY_URL": settings.web_fetch_gateway_url,
+            "DLP_URL": settings.dlp_url,
             "S3_ENDPOINT_URL": settings.s3_endpoint_url,
             "S3_BUCKET": settings.s3_bucket,
             "S3_REGION": settings.s3_region,
@@ -145,6 +153,9 @@ def service_env(settings: Any, *, llm_gateway_url: str | None = None) -> dict[st
             "WEB_FETCH_GATEWAY_URL": _broker_url(
                 settings, "web-fetch/api/web-fetch/v1"
             ),
+            # The worker appends /core/scan; the broker /dlp route allowlists
+            # that single path on the foundation-dlp upstream.
+            "DLP_URL": _broker_url(settings, "dlp/api/dlp/v1"),
             # Direct object-store endpoint and Redis access must not be
             # available in broker mode; the worker reaches both through the
             # tool-broker /s3 and /state façades, which hold their own creds.
@@ -170,6 +181,7 @@ def service_env(settings: Any, *, llm_gateway_url: str | None = None) -> dict[st
             "MCP_REGISTRY_URL": "",
             "SKILL_STORE_URL": "",
             "WEB_FETCH_GATEWAY_URL": "",
+            "DLP_URL": "",
             "S3_ENDPOINT_URL": "",
             "S3_BUCKET": "",
             "S3_REGION": "",

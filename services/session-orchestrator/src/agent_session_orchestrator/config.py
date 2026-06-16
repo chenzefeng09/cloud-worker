@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     #   • download check:download (fail-open on DLP error — see dlp_guard.py)
     #   • upload   scan + classification:tag (fail-open)
     # Env var: SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL
-    foundation_dlp_url: str = "http://foundation-dlp:8013/api/dlp/v1"
+    foundation_dlp_url: str = "http://foundation-dlp:80/api/dlp/v1"
 
     # Session-retention sweep — background job that soft-deletes sessions older
     # than ``session_retention_days``.  Env vars carry the ``SESSION_ORCHESTRATOR_``

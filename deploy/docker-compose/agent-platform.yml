@@ -272,6 +272,10 @@ services:
       SESSION_ORCHESTRATOR_AUTHZ_URL: http://authz:8002/api/authz/v1
       SESSION_ORCHESTRATOR_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
       SESSION_ORCHESTRATOR_FEATURE_FLAG_URL: http://feature-flag:8012/api/feature-flag/v1
+      # Foundation DLP — attachment download check + upload scan/tag (fail-open).
+      # Shared FOUNDATION_DLP_URL override aligns with scheduler/tool-broker; dev
+      # DLP is the `dlp` service on the foundation network at :8007.
+      SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL: ${FOUNDATION_DLP_URL:-http://dlp:8007/api/dlp/v1}
       # Redis — reads agent run hot-state (plan/step/cursor) written by the sandbox.
       # Same Redis instance the scheduler forwards into sandboxes (SCHEDULER_REDIS_URL).
       SESSION_ORCHESTRATOR_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
@@ -408,6 +412,14 @@ services:
       # /var/run/docker.sock bind-mount on this container.
       DOCKER_HOST: tcp://docker-socket-proxy:2375
       SCHEDULER_AGENT_IMAGE: ${AGENT_IMAGE:-ghcr.io/agent-platform/agentscope-sandbox:0.1}
+      # Phase 5: alternate Claude SDK worker image, selected per-run by the
+      # ``enable_claude_sdk_worker`` flag or globally by the default below.
+      SCHEDULER_CLAUDE_SDK_IMAGE: ${CLAUDE_SDK_IMAGE:-ghcr.io/agent-platform/claude-sdk-sandbox:0.1}
+      # Global fallback for Claude SDK worker selection.  Stays false so the
+      # committed default keeps routing to AgentScope unless the per-run flag
+      # enables the SDK worker; a deploy can flip every run by setting
+      # USE_CLAUDE_SDK_WORKER_DEFAULT=true.  The per-run flag still wins when on.
+      SCHEDULER_USE_CLAUDE_SDK_WORKER_DEFAULT: ${USE_CLAUDE_SDK_WORKER_DEFAULT:-false}
       SCHEDULER_LLM_API_KEY: ${LLM_API_KEY:-}
       SCHEDULER_LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-20250514}
       # Optional provider/base-URL overrides — forwarded by docker_runtime.py
@@ -463,6 +475,11 @@ services:
       SCHEDULER_RUNTIME_EXTENSIONS: ${RUNTIME_EXTENSIONS:-mcp_tenant_injector,skills_loader,web_fetch,event_audit_sink,llm_gateway_enforcer}
       # Web-fetch gateway — forwarded into sandbox as WEB_FETCH_GATEWAY_URL.
       SCHEDULER_WEB_FETCH_GATEWAY_URL: ${WEB_FETCH_GATEWAY_URL:-http://web-fetch-gateway:8013}
+      # Foundation DLP — distributed to the sandbox worker as DLP_URL via
+      # egress_policy.service_env() for tool-call content scanning.  In broker
+      # egress mode the scheduler rewrites this to the tool-broker /dlp façade;
+      # the value here is the direct foundation DLP base used otherwise.
+      SCHEDULER_DLP_URL: ${FOUNDATION_DLP_URL:-http://dlp:8007/api/dlp/v1}
       # S3 credentials forwarded into sandbox for attachment download
       SCHEDULER_S3_ENDPOINT_URL: http://foundation-minio:9000
       SCHEDULER_S3_BUCKET: agent-platform
@@ -859,6 +876,10 @@ services:
       TOOL_BROKER_MCP_REGISTRY_URL: ${MCP_REGISTRY_URL:-http://mcp-registry:8010/api/mcp/v1}
       TOOL_BROKER_SKILL_STORE_URL: ${SKILL_STORE_URL:-http://skill-store:8011/api/skills/v1}
       TOOL_BROKER_WEB_FETCH_GATEWAY_URL: ${WEB_FETCH_GATEWAY_URL:-http://web-fetch-gateway:8013/api/web-fetch/v1}
+      # Upstream foundation DLP base the broker's /dlp/api/dlp/v1/{path} route
+      # proxies to (allowlists /core/scan).  Sandboxes never reach DLP directly;
+      # they POST to the broker /dlp façade, which forwards here.
+      TOOL_BROKER_DLP_URL: ${FOUNDATION_DLP_URL:-http://dlp:8007/api/dlp/v1}
       # /state/v1 (Redis) and /s3/v1 (object-store) façades. The broker holds
       # the REAL backend creds here; sandboxes get none and reach Redis/S3 only
       # through the narrow lease-scoped HTTP façades. Reuse the SAME env vars /

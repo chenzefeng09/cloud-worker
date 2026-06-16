@@ -161,6 +161,16 @@ class Settings(BaseSettings):
     # enabling grey-release / instant rollback without a redeploy.  The Claude
     # SDK image runs via its own ENTRYPOINT (node), not the AgentScope CMD.
     claude_sdk_image: str = "ghcr.io/agent-platform/claude-sdk-sandbox:0.1"
+    # Global fallback for the Claude SDK worker selection.  The runtimes first
+    # evaluate the per-run ``enable_claude_sdk_worker`` feature flag (for
+    # gradual / per-tenant grey rollout); when that flag returns False (or the
+    # flag service is unreachable, since ``evaluate_flag`` is failure-open) they
+    # fall back to this default.  Deliberately False in committed code — flipping
+    # it globally is a deploy-time decision made via
+    # ``SCHEDULER_USE_CLAUDE_SDK_WORKER_DEFAULT``, not a code change.  The flag
+    # still wins when it returns True; this only applies on the False/unreachable
+    # branch.
+    use_claude_sdk_worker_default: bool = False
     # Timeout (ms) for the synchronous feature-flag evaluate call on the spawn
     # path.  Kept tight: the call is failure-open, so a slow flag service must
     # not stall run scheduling.
@@ -250,6 +260,13 @@ class Settings(BaseSettings):
     # service name ``web-fetch-gateway`` which is routable on the ``foundation``
     # docker network shared by all platform services and sandbox containers.
     web_fetch_gateway_url: str = "http://web-fetch-gateway:8013"
+
+    # Foundation DLP — base URL *with* API version prefix.  Forwarded into the
+    # sandbox as DLP_URL so the worker can POST tool-call content to
+    # ``{DLP_URL}/core/scan`` for scanning.  In broker egress mode the URL is
+    # rewritten to the tool-broker /dlp façade (which allowlists /core/scan);
+    # in foundation mode it is this direct service URL.
+    dlp_url: str = "http://foundation-dlp:80/api/dlp/v1"
 
     # LLM Gateway (M1-P3) — base URL *with* API version prefix.
     # Forwarded into every sandbox as LLM_GATEWAY_URL.  The scheduler also

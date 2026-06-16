@@ -709,6 +709,37 @@ async def daily_token_usage(
     return _proxy_json(resp)
 
 
+@router.get("/runs/token-usage/breakdown")
+async def token_usage_breakdown(
+    request: Request,
+    days: int = 7,
+    _auth: tuple = Depends(require_auth()),
+) -> JSONResponse:
+    """Proxy GET /runs/token-usage/breakdown?days=N to orchestrator.
+
+    Returns a token-usage breakdown for the last N days (default 7): a per-day
+    input/output/total series plus a per-source rollup.
+    Response: {
+        "days_window": int,
+        "daily": [{ "day": "YYYY-MM-DD", "input_tokens": int,
+                    "output_tokens": int, "total_tokens": int }, ...],
+        "by_source": [{ "source": str, "total_tokens": int,
+                        "run_count": int }, ...]
+    }
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = await _orchestrator_url(request)
+    hdrs = foundation_headers(tenant_id, user_id, access_token)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{orch_url}/runs/token-usage/breakdown",
+            params={"days": days},
+            headers=hdrs,
+        )
+    return _proxy_json(resp)
+
+
 @router.get("/runs/token-usage")
 async def token_usage(
     request: Request,

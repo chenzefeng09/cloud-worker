@@ -84,7 +84,7 @@ class TestErrorFormat:
         """Login with wrong password returns RFC 9457 error."""
         r = unauthenticated_client.post(
             "/api/bff/v1/auth/login",
-            json={"email": "alice@example.com", "password": "wrongpassword"},
+            json={"email": "alice@tenant-a.local", "password": "wrongpassword"},
         )
         assert r.status_code in (401, 403), f"Expected 401/403, got {r.status_code}"
         _assert_rfc_9457_shape(r.json(), r.status_code, path_hint="login")

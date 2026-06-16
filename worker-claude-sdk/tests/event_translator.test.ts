@@ -5,6 +5,7 @@
  * fields, cumulative usage accumulation, and ReplyEndEvent-on-success.
  */
 
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { EventTranslator, type EventPayload } from "../src/event_translator.js";
 
@@ -215,5 +216,628 @@ describe("EventTranslator", () => {
       message: { content: [{ type: "text", text: "y" }], usage: {} },
     } as AnyMsg);
     expect(first[0].block_id).not.toBe(second[0].block_id);
+  });
+});
+
+// ── Block 2: per-token streaming via type:"stream_event" ─────────────────────
+//
+// includePartialMessages=true makes the SDK emit SDKPartialAssistantMessage
+// (`type:"stream_event"`, carrying an Anthropic RawMessageStreamEvent on
+// `.event`). The translator turns each raw delta into one incremental
+// agentscope event, and dedups the consolidated `assistant` message that
+// follows so text/tool blocks are not written twice. These helpers build the
+// raw stream_event wire shapes.
+
+/** Wrap an Anthropic raw streaming event into an SDK stream_event message. */
+function streamEvent(event: AnyMsg): AnyMsg {
+  return { type: "stream_event", event };
+}
+
+const msgStart = (id?: string) =>
+  streamEvent({
+    type: "message_start",
+    message: { ...(id ? { id } : {}), usage: {} },
+  });
+const cbStart = (index: number, content_block: AnyMsg) =>
+  streamEvent({ type: "content_block_start", index, content_block });
+const cbDelta = (index: number, delta: AnyMsg) =>
+  streamEvent({ type: "content_block_delta", index, delta });
+const cbStop = (index: number) =>
+  streamEvent({ type: "content_block_stop", index });
+const msgStop = () => streamEvent({ type: "message_stop" });
+
+describe("EventTranslator — per-token streaming (stream_event)", () => {
+  it("emits one TextBlockDeltaEvent per text_delta (per-token, not coalesced)", () => {
+    const t = new EventTranslator();
+    t.translateMessage(msgStart());
+    const start = t.translateMessage(cbStart(0, { type: "text", text: "" }));
+    expect(types(start)).toEqual(["TextBlockStartEvent"]);
+    const blockId = start[0].block_id as string;
+    expect(blockId).toBeTruthy();
+
+    // Three consecutive text_delta tokens -> three separate delta events.
+    const d1 = t.translateMessage(cbDelta(0, { type: "text_delta", text: "Hel" }));
+    const d2 = t.translateMessage(cbDelta(0, { type: "text_delta", text: "lo " }));
+    const d3 = t.translateMessage(cbDelta(0, { type: "text_delta", text: "world" }));
+
+    for (const d of [d1, d2, d3]) {
+      expect(types(d)).toEqual(["TextBlockDeltaEvent"]);
+      // Every delta carries the same block_id minted on content_block_start.
+      expect(d[0].block_id).toBe(blockId);
+    }
+    // Per-token: deltas are NOT merged — three events, three fragments in order.
+    expect([d1[0].delta, d2[0].delta, d3[0].delta]).toEqual([
+      "Hel",
+      "lo ",
+      "world",
+    ]);
+
+    const stop = t.translateMessage(cbStop(0));
+    expect(types(stop)).toEqual(["TextBlockEndEvent"]);
+    expect(stop[0].block_id).toBe(blockId);
+  });
+
+  it("does NOT re-emit text/tool blocks on the consolidated assistant message when partials streamed this turn (dedup)", () => {
+    const t = new EventTranslator();
+    // Streamed turn: a text block and a tool_use block arrive as partials.
+    t.translateMessage(msgStart());
+    t.translateMessage(cbStart(0, { type: "text", text: "" }));
+    t.translateMessage(cbDelta(0, { type: "text_delta", text: "hi" }));
+    t.translateMessage(cbStop(0));
+    t.translateMessage(
+      cbStart(1, { type: "tool_use", id: "tc-1", name: "Bash" }),
+    );
+    t.translateMessage(cbDelta(1, { type: "input_json_delta", partial_json: '{"cmd":"pwd"}' }));
+    t.translateMessage(cbStop(1));
+    t.translateMessage(msgStop());
+
+    // The SDK now delivers the consolidated assistant message for the SAME turn.
+    const consolidated = t.translateMessage({
+      type: "assistant",
+      message: {
+        content: [
+          { type: "text", text: "hi" },
+          { type: "tool_use", id: "tc-1", name: "Bash", input: { cmd: "pwd" } },
+        ],
+        usage: { input_tokens: 120, output_tokens: 30 },
+      },
+    } as AnyMsg);
+
+    // Dedup: NO TextBlock*/ToolCall* re-emission — only the usage accounting.
+    expect(types(consolidated)).toEqual(["ModelCallEndEvent"]);
+    expect(consolidated[0].input_tokens).toBe(120);
+    expect(consolidated[0].output_tokens).toBe(30);
+  });
+
+  it("counts usage exactly once (from final assistant), never doubled by partials", () => {
+    const t = new EventTranslator();
+    t.translateMessage(msgStart());
+    t.translateMessage(cbStart(0, { type: "text", text: "" }));
+    t.translateMessage(cbDelta(0, { type: "text_delta", text: "x" }));
+    t.translateMessage(cbStop(0));
+    // message_delta carries Anthropic's running output usage — must be ignored
+    // so it does not double-count against the final assistant message.
+    t.translateMessage(
+      streamEvent({
+        type: "message_delta",
+        delta: {},
+        usage: { input_tokens: 999, output_tokens: 999 },
+      }),
+    );
+    t.translateMessage(msgStop());
+
+    t.translateMessage({
+      type: "assistant",
+      message: {
+        content: [{ type: "text", text: "x" }],
+        usage: { input_tokens: 200, output_tokens: 50 },
+      },
+    } as AnyMsg);
+
+    // Only the authoritative assistant usage is accumulated; partials added 0.
+    const usage = t.getCumulativeUsage();
+    expect(usage.input_tokens).toBe(200);
+    expect(usage.output_tokens).toBe(50);
+    expect(usage.total_tokens).toBe(250);
+  });
+
+  it("translates input_json_delta into per-token ToolCallDeltaEvent carrying the tool_call_id", () => {
+    const t = new EventTranslator();
+    t.translateMessage(msgStart());
+    const start = t.translateMessage(
+      cbStart(0, { type: "tool_use", id: "tc-9", name: "Write" }),
+    );
+    expect(types(start)).toEqual(["ToolCallStartEvent"]);
+    expect(start[0].tool_call_id).toBe("tc-9");
+    expect(start[0].tool_call_name).toBe("Write");
+    // The name is remembered for the later tool_result lookup.
+    expect(t.toolNameFor("tc-9")).toBe("Write");
+
+    // Streamed argument JSON arrives in fragments — each is its own delta event.
+    const f1 = t.translateMessage(
+      cbDelta(0, { type: "input_json_delta", partial_json: '{"path":' }),
+    );
+    const f2 = t.translateMessage(
+      cbDelta(0, { type: "input_json_delta", partial_json: '"/tmp/a"}' }),
+    );
+    expect(types(f1)).toEqual(["ToolCallDeltaEvent"]);
+    expect(types(f2)).toEqual(["ToolCallDeltaEvent"]);
+    expect(f1[0].tool_call_id).toBe("tc-9");
+    expect(f2[0].tool_call_id).toBe("tc-9");
+    expect(f1[0].delta).toBe('{"path":');
+    expect(f2[0].delta).toBe('"/tmp/a"}');
+
+    // content_block_stop on a tool_use index closes with ToolCallEndEvent.
+    const stop = t.translateMessage(cbStop(0));
+    expect(types(stop)).toEqual(["ToolCallEndEvent"]);
+    expect(stop[0].tool_call_id).toBe("tc-9");
+  });
+
+  it("translates thinking_delta into per-token ThinkingBlockDeltaEvent", () => {
+    const t = new EventTranslator();
+    t.translateMessage(msgStart());
+    const start = t.translateMessage(cbStart(0, { type: "thinking", thinking: "" }));
+    expect(types(start)).toEqual(["ThinkingBlockStartEvent"]);
+    const blockId = start[0].block_id as string;
+    expect(blockId).toBeTruthy();
+
+    const d1 = t.translateMessage(cbDelta(0, { type: "thinking_delta", thinking: "step " }));
+    const d2 = t.translateMessage(cbDelta(0, { type: "thinking_delta", thinking: "one" }));
+    expect(types(d1)).toEqual(["ThinkingBlockDeltaEvent"]);
+    expect(types(d2)).toEqual(["ThinkingBlockDeltaEvent"]);
+    expect(d1[0].block_id).toBe(blockId);
+    expect(d2[0].block_id).toBe(blockId);
+    expect(d1[0].delta).toBe("step ");
+    expect(d2[0].delta).toBe("one");
+
+    const stop = t.translateMessage(cbStop(0));
+    expect(types(stop)).toEqual(["ThinkingBlockEndEvent"]);
+    expect(stop[0].block_id).toBe(blockId);
+  });
+
+  it("produces no stray content events for non-delta framing (message_start / *_stop unmatched / message_stop)", () => {
+    const t = new EventTranslator();
+    // message_start: bookkeeping reset only, no events.
+    expect(t.translateMessage(msgStart())).toEqual([]);
+    // content_block_stop for an index we never opened: nothing to close.
+    expect(t.translateMessage(cbStop(7))).toEqual([]);
+    // message_delta / message_stop: framing only, no events.
+    expect(
+      t.translateMessage(
+        streamEvent({ type: "message_delta", delta: {}, usage: { output_tokens: 5 } }),
+      ),
+    ).toEqual([]);
+    expect(t.translateMessage(msgStop())).toEqual([]);
+  });
+
+  // NOTE (corrected assumption): the previous version of this test asserted the
+  // dedup state is "cleared after the consolidated message". That was the OLD
+  // (buggy) behavior — clearing per consolidated wiped the records the next
+  // per-block consolidated of the SAME turn needs, re-emitting the whole reply.
+  // The real SDK delivers MULTIPLE per-block consolidated assistants per turn,
+  // so state is now reset only on a NEW-turn message_start (different id), never
+  // after a consolidated. This test keeps the same end-to-end guarantee — a
+  // later turn whose text differs still emits full blocks — but no longer
+  // depends on the wrong "clears after consolidated" mechanic. The dedup is
+  // text-prefix based, so distinct texts ("a" then "b") never false-match.
+  it("a later turn with different text still emits full blocks (text-prefix dedup, not index/clear)", () => {
+    const t = new EventTranslator();
+    // Turn 1: streamed -> consolidated assistant deduped to usage only.
+    t.translateMessage(msgStart("msg_clear_1"));
+    t.translateMessage(cbStart(0, { type: "text", text: "" }));
+    t.translateMessage(cbDelta(0, { type: "text_delta", text: "a" }));
+    t.translateMessage(cbStop(0));
+    const turn1 = t.translateMessage({
+      type: "assistant",
+      message: { id: "msg_clear_1", content: [{ type: "text", text: "a" }], usage: { input_tokens: 10, output_tokens: 5 } },
+    } as AnyMsg);
+    expect(types(turn1)).toEqual(["ModelCallEndEvent"]);
+
+    // Turn 2: NO partials this turn, NEW id, different text -> full-block emit.
+    const turn2 = t.translateMessage({
+      type: "assistant",
+      message: { id: "msg_clear_2", content: [{ type: "text", text: "b" }], usage: { input_tokens: 20, output_tokens: 8 } },
+    } as AnyMsg);
+    expect(types(turn2)).toEqual([
+      "TextBlockStartEvent",
+      "TextBlockDeltaEvent",
+      "ModelCallEndEvent",
+    ]);
+    expect(turn2[1].delta).toBe("b");
+
+    // Both turns' usage accumulated exactly once each.
+    expect(t.getCumulativeUsage().input_tokens).toBe(30);
+    expect(t.getCumulativeUsage().output_tokens).toBe(13);
+  });
+
+  // ── regression: render doubling on a thinking-style turn ───────────────────
+  // The bug: under includePartialMessages, a stray `message_start` arrives AFTER
+  // the last text_delta and BEFORE the consolidated `assistant` message. The old
+  // single-bool `streamedThisTurn` was reset by that trailing message_start, so
+  // the consolidated message re-emitted the WHOLE answer as one big delta — the
+  // reply text rendered twice. Per-block dedup keyed on the SDK message id (same
+  // on the partials' message_start and the consolidated message) survives the
+  // stray reset. This reproduces the exact wire sequence we captured.
+  it("does NOT re-emit the full reply when a stray message_start lands after the last delta (render-doubling regression)", () => {
+    const t = new EventTranslator();
+    const id = "msg_deepseek_001";
+    // Real deepseek turn: per-token text deltas under one message id.
+    t.translateMessage(msgStart(id));
+    t.translateMessage(cbStart(0, { type: "text", text: "" }));
+    const d1 = t.translateMessage(cbDelta(0, { type: "text_delta", text: "hello" }));
+    const d2 = t.translateMessage(cbDelta(0, { type: "text_delta", text: " world" }));
+    expect(d1[0].delta).toBe("hello");
+    expect(d2[0].delta).toBe(" world");
+    t.translateMessage(cbStop(0));
+    // The stray trailing message_start (SAME id) that defeated the old bool.
+    t.translateMessage(msgStart(id));
+
+    // Consolidated assistant for the SAME turn carries the whole "hello world".
+    const consolidated = t.translateMessage({
+      type: "assistant",
+      message: {
+        id,
+        content: [{ type: "text", text: "hello world" }],
+        usage: { input_tokens: 200, output_tokens: 90 },
+      },
+    } as AnyMsg);
+
+    // The big whole-text delta must NOT be re-emitted — only usage is accounted.
+    expect(types(consolidated)).toEqual(["ModelCallEndEvent"]);
+    expect(
+      consolidated.some(
+        (e) =>
+          e.event_type === "TextBlockDeltaEvent" && e.delta === "hello world",
+      ),
+    ).toBe(false);
+    // "hello world" appears exactly once in the streamed token deltas, never
+    // again from the consolidated message.
+    expect(consolidated[0].input_tokens).toBe(200);
+    expect(consolidated[0].output_tokens).toBe(90);
+  });
+
+  it("dedups via the (kind,index)/text-prefix fallback when the SDK omits a message id", () => {
+    const t = new EventTranslator();
+    // id-less partials (older/leaner SDK shape).
+    t.translateMessage(msgStart());
+    t.translateMessage(cbStart(0, { type: "text", text: "" }));
+    t.translateMessage(cbDelta(0, { type: "text_delta", text: "the " }));
+    t.translateMessage(cbDelta(0, { type: "text_delta", text: "answer" }));
+    t.translateMessage(cbStop(0));
+    // Tool block streamed too — text-prefix fallback can't cover this, but the
+    // (kind,index) fallback can.
+    t.translateMessage(cbStart(1, { type: "tool_use", id: "tc-7", name: "Bash" }));
+    t.translateMessage(
+      cbDelta(1, { type: "input_json_delta", partial_json: '{"cmd":"ls"}' }),
+    );
+    t.translateMessage(cbStop(1));
+    t.translateMessage(msgStop());
+
+    const consolidated = t.translateMessage({
+      type: "assistant",
+      message: {
+        // no id
+        content: [
+          { type: "text", text: "the answer" },
+          { type: "tool_use", id: "tc-7", name: "Bash", input: { cmd: "ls" } },
+        ],
+        usage: { input_tokens: 50, output_tokens: 20 },
+      },
+    } as AnyMsg);
+
+    // Both the text block and the tool block are recognized as already streamed.
+    expect(types(consolidated)).toEqual(["ModelCallEndEvent"]);
+  });
+
+  it("does NOT re-emit a streamed thinking block on the consolidated assistant message", () => {
+    const t = new EventTranslator();
+    const id = "msg_think_001";
+    t.translateMessage(msgStart(id));
+    t.translateMessage(cbStart(0, { type: "thinking", thinking: "" }));
+    t.translateMessage(cbDelta(0, { type: "thinking_delta", thinking: "step " }));
+    t.translateMessage(cbDelta(0, { type: "thinking_delta", thinking: "one" }));
+    t.translateMessage(cbStop(0));
+    t.translateMessage(cbStart(1, { type: "text", text: "" }));
+    t.translateMessage(cbDelta(1, { type: "text_delta", text: "done" }));
+    t.translateMessage(cbStop(1));
+    t.translateMessage(msgStart(id)); // stray trailing reset
+
+    const consolidated = t.translateMessage({
+      type: "assistant",
+      message: {
+        id,
+        content: [
+          { type: "thinking", thinking: "step one" },
+          { type: "text", text: "done" },
+        ],
+        usage: { input_tokens: 80, output_tokens: 40 },
+      },
+    } as AnyMsg);
+
+    // Neither the thinking block nor the text block is re-emitted.
+    expect(types(consolidated)).toEqual(["ModelCallEndEvent"]);
+    expect(
+      consolidated.some((e) => e.event_type.startsWith("ThinkingBlock")),
+    ).toBe(false);
+  });
+
+  it("STILL emits full blocks on a non-streamed consolidated message (no partials at all)", () => {
+    const t = new EventTranslator();
+    // No stream_event partials this turn — the model returned a complete message.
+    const consolidated = t.translateMessage({
+      type: "assistant",
+      message: {
+        id: "msg_nonstream_001",
+        content: [
+          { type: "thinking", thinking: "reasoning" },
+          { type: "text", text: "final answer" },
+        ],
+        usage: { input_tokens: 30, output_tokens: 12 },
+      },
+    } as AnyMsg);
+
+    // Full reconstruction: text + thinking blocks ARE emitted (nothing lost).
+    expect(types(consolidated)).toEqual([
+      "ThinkingBlockStartEvent",
+      "ThinkingBlockDeltaEvent",
+      "ThinkingBlockEndEvent",
+      "TextBlockStartEvent",
+      "TextBlockDeltaEvent",
+      "ModelCallEndEvent",
+    ]);
+    const textDelta = consolidated.find(
+      (e) => e.event_type === "TextBlockDeltaEvent",
+    )!;
+    expect(textDelta.delta).toBe("final answer");
+  });
+
+  it("counts usage exactly once across both streamed and non-streamed turns", () => {
+    const t = new EventTranslator();
+    // Streamed turn with stray trailing message_start.
+    const id = "msg_u1";
+    t.translateMessage(msgStart(id));
+    t.translateMessage(cbStart(0, { type: "text", text: "" }));
+    t.translateMessage(cbDelta(0, { type: "text_delta", text: "x" }));
+    t.translateMessage(cbStop(0));
+    t.translateMessage(msgStart(id));
+    t.translateMessage({
+      type: "assistant",
+      message: {
+        id,
+        content: [{ type: "text", text: "x" }],
+        usage: { input_tokens: 100, output_tokens: 40 },
+      },
+    } as AnyMsg);
+    // Non-streamed turn.
+    t.translateMessage({
+      type: "assistant",
+      message: {
+        id: "msg_u2",
+        content: [{ type: "text", text: "y" }],
+        usage: { input_tokens: 60, output_tokens: 25 },
+      },
+    } as AnyMsg);
+
+    const usage = t.getCumulativeUsage();
+    expect(usage.input_tokens).toBe(160);
+    expect(usage.output_tokens).toBe(65);
+    expect(usage.total_tokens).toBe(225);
+  });
+
+  // ── real SDK shape: per-block consolidated assistants interleaved with the
+  // partial stream (Bug B ground truth) ──────────────────────────────────────
+  //
+  // Captured from a real deepseek-v4-pro turn (see sdk-messages-sample.jsonl):
+  // one message_start, then thinking streams at content index 0, then text
+  // streams at content index 1. The SDK delivers a SEPARATE consolidated
+  // `assistant` per block — the thinking one MID-STREAM (before text finishes),
+  // the text one after — and BOTH place their single block at content-array
+  // index 0 (so the consolidated array index != the streaming index). Both
+  // consolidated messages and the message_start share ONE msg_… id, and both
+  // carry the SAME usage snapshot.
+  //
+  // The old code (clear-per-consolidated + index-based dedup) re-emitted the
+  // whole text block (answer rendered twice) and double-counted usage. This
+  // reproduces that exact shape and asserts single emission + single usage.
+  it("does NOT duplicate text when per-block consolidated assistants interleave the stream (real SDK shape)", () => {
+    const t = new EventTranslator();
+    const id = "msg_real_001";
+    const answer =
+      "北京是中华人民共和国的首都，是全国的政治、文化、国际交往和科技创新中心。";
+    const reasoning = "用户问北京，我给一段简介。";
+
+    const allDeltas: string[] = [];
+    const push = (events: EventPayload[]) => {
+      for (const e of events) {
+        if (e.event_type === "TextBlockDeltaEvent") allDeltas.push(e.delta as string);
+      }
+    };
+
+    t.translateMessage(msgStart(id));
+    // thinking streams at content index 0
+    t.translateMessage(cbStart(0, { type: "thinking", thinking: "" }));
+    for (const ch of [...reasoning]) {
+      t.translateMessage(cbDelta(0, { type: "thinking_delta", thinking: ch }));
+    }
+    // text streams at content index 1
+    t.translateMessage(cbStart(1, { type: "text", text: "" }));
+    for (const ch of [...answer]) {
+      push(t.translateMessage(cbDelta(1, { type: "text_delta", text: ch })));
+    }
+
+    // per-block consolidated for the THINKING block arrives mid-stream, at array
+    // index 0, SAME id, full usage snapshot.
+    const cThink = t.translateMessage({
+      type: "assistant",
+      message: {
+        id,
+        content: [{ type: "thinking", thinking: reasoning }],
+        usage: { input_tokens: 13154, output_tokens: 117, cache_read_input_tokens: 13056 },
+      },
+    } as AnyMsg);
+    push(cThink);
+    t.translateMessage(cbStop(0));
+
+    // per-block consolidated for the TEXT block, also at array index 0, SAME id,
+    // SAME usage snapshot — must NOT re-emit the answer.
+    const cText = t.translateMessage({
+      type: "assistant",
+      message: {
+        id,
+        content: [{ type: "text", text: answer }],
+        usage: { input_tokens: 13154, output_tokens: 117, cache_read_input_tokens: 13056 },
+      },
+    } as AnyMsg);
+    push(cText);
+    t.translateMessage(cbStop(1));
+
+    // The full answer appears EXACTLY ONCE across all TextBlockDeltaEvents.
+    const joined = allDeltas.join("");
+    expect(joined).toBe(answer);
+    expect(joined.split(answer).length - 1).toBe(1);
+    // The thinking consolidated (first of the turn) dedups its block but DOES
+    // account the turn's usage exactly once -> ModelCallEndEvent only, no
+    // re-emitted ThinkingBlock*.
+    expect(types(cThink)).toEqual(["ModelCallEndEvent"]);
+    expect(cThink.some((e) => e.event_type.startsWith("ThinkingBlock"))).toBe(
+      false,
+    );
+    // The text consolidated (same id, already-accounted) re-emits nothing at
+    // all — neither the text block nor a second usage event.
+    expect(types(cText)).toEqual([]);
+    expect(cText.some((e) => e.event_type === "TextBlockDeltaEvent")).toBe(false);
+
+    // Usage counted exactly once for the whole turn (one snapshot, repeated).
+    const usage = t.getCumulativeUsage();
+    expect(usage.input_tokens).toBe(13154);
+    expect(usage.output_tokens).toBe(117);
+    expect(usage.cache_read_input_tokens).toBe(13056);
+  });
+
+  // Replays the captured 127-message sequence verbatim and asserts the reply
+  // text appears exactly once (163 chars, not 326) — the precise real-stack
+  // failure. This is the ground-truth regression: it reads the SAME file the
+  // worker would receive, with no hand-authored assumptions about SDK ordering.
+  it("real sample replay: reply text and thinking each appear exactly once, usage counted once", () => {
+    const sample = readFileSync(
+      new URL("../sdk-messages-sample.jsonl", import.meta.url),
+      "utf8",
+    )
+      .split("\n")
+      .filter((l) => l.trim());
+
+    // Derive the single ground-truth answer/thinking straight from raw deltas.
+    let rawAnswer = "";
+    let rawThink = "";
+    for (const l of sample) {
+      const m = JSON.parse(l);
+      if (m.type === "stream_event" && m.event?.type === "content_block_delta") {
+        const d = m.event.delta ?? {};
+        if (d.type === "text_delta") rawAnswer += d.text ?? "";
+        if (d.type === "thinking_delta") rawThink += d.thinking ?? "";
+      }
+    }
+    expect(rawAnswer.length).toBeGreaterThan(0);
+
+    const t = new EventTranslator();
+    let textConcat = "";
+    let thinkConcat = "";
+    for (const l of sample) {
+      const events = t.translateMessage(JSON.parse(l) as AnyMsg);
+      for (const e of events) {
+        if (e.event_type === "TextBlockDeltaEvent") textConcat += e.delta as string;
+        if (e.event_type === "ThinkingBlockDeltaEvent")
+          thinkConcat += e.delta as string;
+      }
+    }
+
+    // Exactly one copy of the answer in the emitted text stream (not doubled).
+    expect(textConcat).toBe(rawAnswer);
+    expect(textConcat.split(rawAnswer).length - 1).toBe(1);
+    // Thinking likewise emitted exactly once.
+    expect(thinkConcat).toBe(rawThink);
+
+    // Usage from the turn's repeated consolidated snapshots counted ONCE.
+    const usage = t.getCumulativeUsage();
+    expect(usage.input_tokens).toBe(13154);
+    expect(usage.output_tokens).toBe(117);
+    expect(usage.cache_read_input_tokens).toBe(13056);
+  });
+
+  // Covers "plain conversation also duplicated": a turn with only a text block
+  // (no thinking consolidated to prematurely clear state). Must still emit once.
+  it("pure-text turn (no thinking) emits the reply exactly once", () => {
+    const t = new EventTranslator();
+    const id = "msg_plain_001";
+    const answer = "这是一个普通的纯文本回答。";
+
+    const deltas: string[] = [];
+    t.translateMessage(msgStart(id));
+    t.translateMessage(cbStart(0, { type: "text", text: "" }));
+    for (const ch of [...answer]) {
+      const ev = t.translateMessage(cbDelta(0, { type: "text_delta", text: ch }));
+      for (const e of ev)
+        if (e.event_type === "TextBlockDeltaEvent") deltas.push(e.delta as string);
+    }
+    t.translateMessage(cbStop(0));
+
+    const consolidated = t.translateMessage({
+      type: "assistant",
+      message: {
+        id,
+        content: [{ type: "text", text: answer }],
+        usage: { input_tokens: 50, output_tokens: 20 },
+      },
+    } as AnyMsg);
+
+    // Consolidated re-emits nothing; the streamed deltas already hold the answer.
+    expect(types(consolidated)).toEqual(["ModelCallEndEvent"]);
+    const joined = deltas.join("");
+    expect(joined).toBe(answer);
+    expect(joined.split(answer).length - 1).toBe(1);
+  });
+
+  // Two full turns each with their own message_start + new id. The second turn's
+  // consolidated must not be skipped because of residual first-turn records, and
+  // each turn's reply appears exactly once with its own usage.
+  it("two consecutive turns: each reply emitted once, no cross-turn false dedup", () => {
+    const t = new EventTranslator();
+
+    const collectText = (id: string, answer: string) => {
+      const deltas: string[] = [];
+      t.translateMessage(msgStart(id));
+      t.translateMessage(cbStart(0, { type: "text", text: "" }));
+      for (const ch of [...answer]) {
+        const ev = t.translateMessage(cbDelta(0, { type: "text_delta", text: ch }));
+        for (const e of ev)
+          if (e.event_type === "TextBlockDeltaEvent") deltas.push(e.delta as string);
+      }
+      t.translateMessage(cbStop(0));
+      const consolidated = t.translateMessage({
+        type: "assistant",
+        message: {
+          id,
+          content: [{ type: "text", text: answer }],
+          usage: { input_tokens: 100, output_tokens: 40 },
+        },
+      } as AnyMsg);
+      return { joined: deltas.join(""), consolidated };
+    };
+
+    const a1 = "第一轮的答案内容。";
+    const a2 = "第二轮完全不同的答案。";
+    const turn1 = collectText("msg_turn_1", a1);
+    const turn2 = collectText("msg_turn_2", a2);
+
+    expect(turn1.joined).toBe(a1);
+    expect(turn2.joined).toBe(a2);
+    expect(turn1.joined.split(a1).length - 1).toBe(1);
+    expect(turn2.joined.split(a2).length - 1).toBe(1);
+    // Neither consolidated re-emitted text.
+    expect(types(turn1.consolidated)).toEqual(["ModelCallEndEvent"]);
+    expect(types(turn2.consolidated)).toEqual(["ModelCallEndEvent"]);
+    // Two turns, two usage increments.
+    expect(t.getCumulativeUsage().input_tokens).toBe(200);
+    expect(t.getCumulativeUsage().output_tokens).toBe(80);
   });
 });

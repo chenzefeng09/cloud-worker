@@ -956,6 +956,94 @@ async def daily_token_usage(
     return {"days": out}
 
 
+@router.get("/runs/token-usage/breakdown")
+async def token_usage_breakdown(
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+    days: int = Query(default=7, ge=1, le=90),
+) -> dict[str, Any]:
+    """Return a token-usage breakdown for the last N days (default 7).
+
+    Combines the per-day series (like ``daily_token_usage`` but split into
+    input/output/total) with a per-source rollup over the same window.
+
+    The ``daily`` list always contains exactly ``days`` entries in ascending
+    order (missing days zero-filled, today is the last entry).  ``by_source``
+    holds one row per distinct ``Run.source`` that actually appears in the
+    window, sorted by ``total_tokens`` descending; it is not zero-filled.
+    """
+    cutoff = dt.datetime.now(tz=dt.UTC) - dt.timedelta(days=days)
+
+    # Per-day series, split into input/output/total token sums.
+    daily_stmt = (
+        select(
+            func.date(Run.created_at).label("day"),
+            func.sum(func.coalesce(Run.input_tokens, 0)).label("input_tokens"),
+            func.sum(func.coalesce(Run.output_tokens, 0)).label("output_tokens"),
+            func.sum(func.coalesce(Run.total_tokens, 0)).label("total_tokens"),
+        )
+        .where(Run.tenant_id == tenant_id, Run.created_at >= cutoff)
+        .group_by(func.date(Run.created_at))
+        .order_by(func.date(Run.created_at))
+    )
+    daily_result = await db.execute(daily_stmt)
+    daily_rows = daily_result.all()
+
+    # Build a dict keyed by date string for fast lookup.
+    by_day: dict[str, dict[str, int]] = {}
+    for row in daily_rows:
+        # row.day may be a date object or a string depending on the DB driver.
+        day_key = str(row.day) if not isinstance(row.day, str) else row.day
+        by_day[day_key] = {
+            "input_tokens": int(row.input_tokens or 0),
+            "output_tokens": int(row.output_tokens or 0),
+            "total_tokens": int(row.total_tokens or 0),
+        }
+
+    # Generate the full range of the last N days (today is index days-1).
+    today = dt.date.today()
+    daily: list[dict[str, Any]] = []
+    for i in range(days):
+        d = today - dt.timedelta(days=days - 1 - i)
+        key = d.isoformat()
+        totals = by_day.get(key)
+        daily.append(
+            {
+                "day": key,
+                "input_tokens": totals["input_tokens"] if totals else 0,
+                "output_tokens": totals["output_tokens"] if totals else 0,
+                "total_tokens": totals["total_tokens"] if totals else 0,
+            }
+        )
+
+    # Per-source rollup over the same window (no zero-fill).
+    source_stmt = (
+        select(
+            Run.source.label("source"),
+            func.sum(func.coalesce(Run.total_tokens, 0)).label("total_tokens"),
+            func.count().label("run_count"),
+        )
+        .where(Run.tenant_id == tenant_id, Run.created_at >= cutoff)
+        .group_by(Run.source)
+        .order_by(func.sum(func.coalesce(Run.total_tokens, 0)).desc())
+    )
+    source_result = await db.execute(source_stmt)
+    source_rows = source_result.all()
+
+    by_source: list[dict[str, Any]] = []
+    for row in source_rows:
+        # Coalesce a NULL/empty source to "user" so the output never crashes.
+        by_source.append(
+            {
+                "source": row.source or "user",
+                "total_tokens": int(row.total_tokens or 0),
+                "run_count": int(row.run_count or 0),
+            }
+        )
+
+    return {"days_window": days, "daily": daily, "by_source": by_source}
+
+
 @router.post("/sessions/{session_id}/runs/{run_id}/cancel",
              dependencies=[Depends(require_permission("run.cancel", "run"))])
 async def cancel_run(

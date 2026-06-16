@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { readTask, validateRequiredEnv } from "../src/task.js";
+import { readEnv, readTask, validateRequiredEnv } from "../src/task.js";
 
 const SAVED = { ...process.env };
 
@@ -112,5 +112,25 @@ describe("validateRequiredEnv", () => {
     setAll();
     process.env.FOUNDATION_TENANT_ID = "   ";
     expect(validateRequiredEnv()).toContain("FOUNDATION_TENANT_ID");
+  });
+});
+
+describe("readEnv", () => {
+  it("snapshots SANDBOX_EGRESS_MODE and TOOL_BROKER_URL from process.env", () => {
+    process.env.SANDBOX_EGRESS_MODE = "broker";
+    process.env.TOOL_BROKER_URL = "http://tool-broker:8024/api/tool-broker/v1";
+    process.env.TOOL_BROKER_LEASE = "v1.body.sig";
+    const env = readEnv();
+    expect(env.SANDBOX_EGRESS_MODE).toBe("broker");
+    expect(env.TOOL_BROKER_URL).toBe("http://tool-broker:8024/api/tool-broker/v1");
+    expect(env.TOOL_BROKER_LEASE).toBe("v1.body.sig");
+  });
+
+  it("defaults missing egress/broker env vars to empty strings", () => {
+    delete process.env.SANDBOX_EGRESS_MODE;
+    delete process.env.TOOL_BROKER_URL;
+    const env = readEnv();
+    expect(env.SANDBOX_EGRESS_MODE).toBe("");
+    expect(env.TOOL_BROKER_URL).toBe("");
   });
 });

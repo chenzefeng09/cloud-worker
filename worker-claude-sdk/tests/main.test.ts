@@ -205,6 +205,48 @@ describe("main", () => {
     }
   });
 
+  it("paused run → result.json status=paused, exit 0, neither markCompleted nor markFailed", async () => {
+    setEnv(REQUIRED_ENV);
+    setEnv({ AGENT_TASK_JSON: JSON.stringify({ task: "search the repo", hitl: true }) });
+
+    // A redis spy that records the terminal marks; the worker writes PAUSED state
+    // itself (markPaused / writePaused), so main must NOT call mark*.
+    let completed = false;
+    let failed = false;
+    const redis = new RedisStateClient("run", undefined);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (redis as any).markCompleted = async () => {
+      completed = true;
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (redis as any).markFailed = async () => {
+      failed = true;
+    };
+
+    // A fake query that drives canUseTool to pause on an mcp tool call.
+    const queryFn = (args: AnyMsg) =>
+      (async function* () {
+        const gate = args.options.canUseTool as (
+          n: string,
+          i: Record<string, unknown>,
+          o: { toolUseID: string },
+        ) => Promise<unknown>;
+        await gate("mcp__github__search_code", { q: "x" }, { toolUseID: "tu_1" });
+      })() as AnyMsg;
+
+    const code = await main({
+      makeRedis: () => redis,
+      makeAdapter: () => new FakeAdapter() as never,
+      queryFn: queryFn as never,
+    });
+
+    expect(code).toBe(0);
+    const result = JSON.parse(readFileSync(path.join(ws, "result.json"), "utf8"));
+    expect(result.status).toBe("paused");
+    expect(completed).toBe(false);
+    expect(failed).toBe(false);
+  });
+
   it("empty task text → exit 0 with FAILED status (matches Python)", async () => {
     setEnv(REQUIRED_ENV);
     setEnv({ AGENT_TASK_JSON: JSON.stringify({ task: "   " }) });

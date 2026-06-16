@@ -104,6 +104,10 @@ spec:
               value: {{ .Values.toolBroker.config.skillStoreUrl | default (printf "http://ap-skill-store:%d/api/skills/v1" (int .Values.skillStore.port)) | quote }}
             - name: TOOL_BROKER_WEB_FETCH_GATEWAY_URL
               value: {{ .Values.toolBroker.config.webFetchGatewayUrl | default (printf "http://ap-web-fetch-gateway:%d/api/web-fetch/v1" (int .Values.webFetchGateway.port)) | quote }}
+            # Upstream foundation DLP base for the broker's /dlp/api/dlp/v1/{path}
+            # proxy route (allowlists /core/scan).
+            - name: TOOL_BROKER_DLP_URL
+              value: {{ .Values.toolBroker.config.dlpUrl | default .Values.global.foundation.dlpUrl | quote }}
             # ---- /state façade: the broker's OWN trusted Redis connection ----
             # Reuse the platform Redis secret (same ref every service uses).
             # The broker consumes a SINGLE TOOL_BROKER_REDIS_URL (redis.from_url),

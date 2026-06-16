@@ -525,6 +525,28 @@ export interface DailyTokenUsageResponse {
   days: DailyTokenUsage[];
 }
 
+/** One day's input/output/total split in a usage-breakdown response. */
+export interface DailyTokenBreakdown {
+  day: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+}
+
+/** Per-source token aggregate over the breakdown window. */
+export interface SourceTokenUsage {
+  source: string;
+  total_tokens: number;
+  run_count: number;
+}
+
+/** Multi-dimensional token-usage breakdown (daily split + by source). */
+export interface TokenUsageBreakdown {
+  days_window: number;
+  daily: DailyTokenBreakdown[];
+  by_source: SourceTokenUsage[];
+}
+
 export type RunStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 
 export interface Run {

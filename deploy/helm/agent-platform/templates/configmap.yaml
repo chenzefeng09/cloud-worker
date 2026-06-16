@@ -22,6 +22,7 @@ data:
   FOUNDATION_BILLING_URL:   {{ .Values.global.foundation.billingUrl | quote }}
   FOUNDATION_AUDIT_URL:     {{ .Values.global.foundation.auditUrl | quote }}
   FOUNDATION_LLM_GATEWAY_URL: {{ .Values.global.foundation.llmGatewayUrl | quote }}
+  FOUNDATION_DLP_URL:       {{ .Values.global.foundation.dlpUrl | quote }}
 
   # Keycloak
   KEYCLOAK_URL:   {{ .Values.global.foundation.keycloak.url | quote }}
@@ -92,6 +93,13 @@ data:
 
   # Knowledge ingest config
   KNOWLEDGE_INGEST_EMBEDDING_BACKEND: {{ .Values.knowledgeIngest.config.embeddingBackend | quote }}
+
+  # session-orchestrator reads env under its SESSION_ORCHESTRATOR_ prefix (its
+  # config.py ignores the unprefixed FOUNDATION_DLP_URL above). Unlike scheduler/
+  # tool-broker — which rename FOUNDATION_DLP_URL via an explicit Deployment env —
+  # session-orchestrator is rendered by the generic services.yaml loop with only
+  # `envFrom: ap-config`, so the prefixed key must live here for it to take effect.
+  SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL: {{ .Values.global.foundation.dlpUrl | quote }}
 
   # DB pool sizes (per-service env picked up by each service's own config.py)
   SESSION_ORCHESTRATOR_DB_POOL_SIZE:     {{ .Values.sessionOrchestrator.config.dbPoolSize | quote }}

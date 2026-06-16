@@ -110,6 +110,7 @@ import type {
   TenantDefaultModel,
   TenantSubscription,
   TokenUsage,
+  TokenUsageBreakdown,
   TopologyGraph,
   UpdateOrgUnitRequest,
   UpdateProviderRequest,
@@ -252,6 +253,8 @@ export const api = {
       request<LoginResponse>('POST', '/auth/login', { email, password }),
     logout: () => request<void>('POST', '/auth/logout'),
     me: () => request<UserProfile>('GET', '/auth/me'),
+    updateProfile: (body: { display_name: string }) =>
+      request<UserProfile>('PATCH', '/auth/me', body),
     mfaMethods: () => request<MfaMethod[]>('GET', '/auth/mfa/methods'),
     sessions: () => request<ActiveSession[]>('GET', '/auth/sessions'),
     // PUBLIC — enterprise SSO login options shown on the login page before
@@ -294,11 +297,13 @@ export const api = {
       request<TokenUsage>('GET', '/runs/token-usage'),
     tokenUsageDaily: (days = 7) =>
       request<DailyTokenUsageResponse>('GET', `/runs/token-usage/daily?days=${days}`),
+    tokenUsageBreakdown: (days = 30) =>
+      request<TokenUsageBreakdown>('GET', `/runs/token-usage/breakdown?days=${days}`),
   },
 
   sessions: {
     list: (cursor?: string) =>
-      request<CursorPage<Session>>('GET', `/sessions?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`),
+      request<CursorPage<Session>>('GET', `/sessions?limit=20${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`),
     create: (title?: string, agentConfig?: Record<string, unknown>) =>
       request<Session>('POST', '/sessions', { title, agent_config: agentConfig }),
     get: (id: string) =>
@@ -1201,17 +1206,6 @@ export const api = {
       request<void>('DELETE', `/llm/user-preferences/${encodeURIComponent(purpose)}`),
     resolve: (purpose: ModelPurpose) =>
       request<ResolvedDefault>('GET', `/llm/user-preferences/resolve?purpose=${purpose}`),
-  },
-
-  // User-facing PAM — request elevation, view own history.
-  pam: {
-    requestElevation: (body: RequestElevationRequest) =>
-      request<PamElevation>('POST', '/pam/elevations', body),
-    myElevations: () =>
-      request<{ items: PamElevation[] } | PamElevation[]>(
-        'GET',
-        '/pam/elevations/mine',
-      ).then((r) => (Array.isArray(r) ? r : r.items ?? [])),
   },
 
   schedules: {

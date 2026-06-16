@@ -320,6 +320,7 @@ class CubeSandboxRuntime:
             "MCP_REGISTRY_URL": service_env["MCP_REGISTRY_URL"],
             "SKILL_STORE_URL": service_env["SKILL_STORE_URL"],
             "WEB_FETCH_GATEWAY_URL": service_env["WEB_FETCH_GATEWAY_URL"],
+            "DLP_URL": service_env["DLP_URL"],
             "RUNTIME_EXTENSIONS": self._settings.runtime_extensions,
             "FOUNDATION_SERVICE_SCOPES": SANDBOX_SERVICE_SCOPES,
             "RUN_ID": run_id,
@@ -432,6 +433,13 @@ class CubeSandboxRuntime:
             flag_url=self._settings.feature_flag_url,
             timeout_ms=self._settings.feature_flag_timeout_ms,
         )
+        # Global config fallback: when the per-run flag is False/unreachable, a
+        # deployment can still route every run to the Claude SDK worker via
+        # ``SCHEDULER_USE_CLAUDE_SDK_WORKER_DEFAULT``.  The flag wins when it
+        # returns True; the default only applies on the False branch.  Committed
+        # default is False, so this is a no-op for existing behaviour.
+        if not use_claude_sdk:
+            use_claude_sdk = self._settings.use_claude_sdk_worker_default
         selected_image = (
             self._settings.claude_sdk_image
             if use_claude_sdk

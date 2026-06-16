@@ -110,6 +110,52 @@ def test_foundation_mode_exposes_direct_mcp_and_skill_urls() -> None:
     assert env["SKILL_STORE_URL"] == settings.skill_store_url
 
 
+def test_dlp_url_present_in_all_three_modes() -> None:
+    """DLP_URL must be distributed in every egress mode.
+
+    Foundation mode exposes the direct foundation-dlp URL; broker mode rewrites
+    it to the tool-broker /dlp façade (whose /core/scan path is allowlisted);
+    none mode blanks it.  The worker POSTs to ``${DLP_URL}/core/scan``, so the
+    base must omit that suffix.
+    """
+    foundation = egress_policy.service_env(
+        _settings(
+            sandbox_egress_mode="foundation",
+            dlp_url="http://foundation-dlp:8013/api/dlp/v1",
+        )
+    )
+    assert foundation["DLP_URL"] == "http://foundation-dlp:8013/api/dlp/v1"
+
+    broker = egress_policy.service_env(
+        _settings(
+            sandbox_egress_mode="broker",
+            tool_broker_url="http://tool-broker:8024/api/tool-broker/v1",
+        )
+    )
+    # Forced through the broker façade (not the direct DLP service), and the
+    # base ends at the route prefix so the worker can append /core/scan.
+    assert broker["DLP_URL"] == (
+        "http://tool-broker:8024/api/tool-broker/v1/dlp/api/dlp/v1"
+    )
+    assert "tool-broker" in broker["DLP_URL"]
+
+    none = egress_policy.service_env(_settings(sandbox_egress_mode="none"))
+    assert none["DLP_URL"] == ""
+
+
+def test_dlp_scan_is_a_granted_broker_lease_scope() -> None:
+    """The per-run broker lease must grant ``dlp.scan`` so the /dlp façade is
+    reachable; the tool-broker route checks for exactly this scope."""
+    assert "dlp.scan" in egress_policy.BROKER_LEASE_SCOPES
+
+
+def test_mcp_tenant_invoke_is_a_granted_broker_lease_scope() -> None:
+    """The per-run broker lease must grant ``mcp.tenant_invoke`` so the
+    /mcp-tenant/v1/{server_id} passthrough route is reachable; the tool-broker
+    route checks for exactly this scope and returns 403 without it."""
+    assert "mcp.tenant_invoke" in egress_policy.BROKER_LEASE_SCOPES
+
+
 def test_none_mode_blanks_every_s3_field_and_redis() -> None:
     env = egress_policy.service_env(_settings(sandbox_egress_mode="none"))
     for key in (
