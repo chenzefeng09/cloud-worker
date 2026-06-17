@@ -126,6 +126,17 @@ class Settings(BaseSettings):
     runtime: str = "docker"
     cube_controller_url: str = ""  # required when runtime="cube"
 
+    # Public IP/host of the scheduler's machine, reachable by the cube microVM.
+    # CubeVS only forwards public egress, so a cube VM cannot reach the host's
+    # internal container network (container names / private IPs are unresolvable
+    # inside the VM). The cube runtime therefore rewrites the worker's gateway
+    # URLs (tool-broker / llm-gateway) to point at this public host:hostPort and
+    # adds it to the CubeVS ``allowOut`` allowlist, so the VM loops back to the
+    # host over the public IP. When empty, the cube runtime auto-detects the
+    # machine's public IP at startup (ifconfig.me / api.ipify.org). Set
+    # SCHEDULER_CUBE_PUBLIC_HOST to pin it explicitly (recommended in prod).
+    cube_public_host: str = ""
+
     # CubeVS egress allowlist (CIDRs) applied to broker-mode microVMs via the
     # E2B ``allow_out`` field. Must contain the tool-broker ClusterIP/32 and the
     # cluster DNS ClusterIP/32 — resolve per cluster (kubectl get svc ap-tool-broker
@@ -149,6 +160,9 @@ class Settings(BaseSettings):
     cube_client_cert: str | None = None
     cube_client_key: str | None = None
     cube_ca_cert: str | None = None
+    # API key for CubeSandbox's E2B-compatible API (``X-API-Key`` header).
+    # Dev one-click default is ``e2b_000000``; override via SCHEDULER_CUBE_API_KEY.
+    cube_api_key: str = "e2b_000000"
 
     # Sandbox image — built from ``sandbox-images/base.Dockerfile``,
     # ships AgentScope 2.x + agentscope_ext.runtime_worker.  The
@@ -236,6 +250,18 @@ class Settings(BaseSettings):
     sandbox_large_attachment_threshold_bytes: int = 50 * 1024 * 1024  # 50 MiB
     sandbox_cpu_shares: int = 1024
     sandbox_timeout: int = 600  # seconds; also caps minted token TTL
+
+    # Scheduler-side cube-sandbox reaper.  The cube controller's spawn-time
+    # ``timeout`` TTL has been observed NOT to reap microVMs (VMs alive 4+
+    # hours), so they oversubscribe host RAM and OOM-kill live workers.  A
+    # background task (see ``main.lifespan``) sweeps periodically and deletes
+    # agent-platform cube sandboxes older than the max-age below.
+    #   * ``max_age_seconds`` is set comfortably above ``sandbox_timeout`` (the
+    #     600s run cap) so the reaper never kills a live run.
+    #   * ``interval_seconds`` is how often the sweep runs.
+    # Only consumed on the cube path; docker's ``reap_expired`` is a no-op.
+    sandbox_reaper_max_age_seconds: int = 900  # delete VMs older than 15 min
+    sandbox_reaper_interval_seconds: int = 120  # sweep every 2 min
 
     # B-M3: base URLs for the MCP registry and skill-store services.
     # These are forwarded to the sandbox as MCP_REGISTRY_URL / SKILL_STORE_URL
