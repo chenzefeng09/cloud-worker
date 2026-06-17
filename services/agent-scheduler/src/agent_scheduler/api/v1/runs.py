@@ -19,6 +19,7 @@ not let a caller read or stop another tenant's workload.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import time
@@ -565,31 +566,50 @@ async def create_run(
         )
 
     try:
-        container_id = runtime.spawn_run(
-            run_id=run_id,
-            session_id=session_id,
-            task=task,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            foundation_token=foundation_token,
-            skills=skills,
-            files=files,
-            memory=memory,
-            memory_limit=memory_limit,
-            history=history,
-            llm_gateway_url=_settings.llm_gateway_url,
-            llm_virtual_key=virtual_key,
-            model_override=model_override,
-            reasoning_effort=reasoning_effort,
-            sys_prompt=sys_prompt,
-            sampling_params=sampling_params,
-            hitl=hitl,
-            resume=resume,
+        # ``spawn_run`` is a SYNCHRONOUS call (docker SDK / sync httpx.Client) —
+        # see the SandboxRuntime protocol docstring.  Running it inline on the
+        # event loop would block every other request for the full sandbox
+        # create round-trip (and, under the Cube runtime, the sync httpx.Client
+        # does blocking socket I/O on the loop thread).  Offload it to a worker
+        # thread so the loop stays responsive.  ``functools.partial`` carries
+        # the keyword args across the ``to_thread`` boundary.
+        container_id = await asyncio.to_thread(
+            functools.partial(
+                runtime.spawn_run,
+                run_id=run_id,
+                session_id=session_id,
+                task=task,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                foundation_token=foundation_token,
+                skills=skills,
+                files=files,
+                memory=memory,
+                memory_limit=memory_limit,
+                history=history,
+                llm_gateway_url=_settings.llm_gateway_url,
+                llm_virtual_key=virtual_key,
+                model_override=model_override,
+                reasoning_effort=reasoning_effort,
+                sys_prompt=sys_prompt,
+                sampling_params=sampling_params,
+                hitl=hitl,
+                resume=resume,
+            )
         )
     except SandboxSpawnError as exc:
+        logger.error(
+            "sandbox spawn failed for run %s: %s", run_id, exc, exc_info=True
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc),
         ) from exc
+    except Exception as exc:  # TEMP-DIAG: surface the real spawn exception type
+        logger.error(
+            "spawn unexpected %s for run %s: %s",
+            type(exc).__name__, run_id, exc, exc_info=True,
+        )
+        raise
 
     await quota_guard.record(
         tenant_id=tenant_id,

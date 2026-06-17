@@ -51,6 +51,10 @@ def _make_runtime(client: object | None = None) -> CubeSandboxRuntime:
     rt._settings = settings  # noqa: SLF001 — test setup
     rt._client = client  # noqa: SLF001
     rt._skill_cache = None  # noqa: SLF001
+    # __init__ resolves this once at startup; tests bypass __init__, so set a
+    # deterministic value here (the spawn path reads it for the public-host URL
+    # rewrite + CubeVS allowOut).
+    rt._public_host = "203.0.113.10"  # noqa: SLF001
     return rt
 
 
@@ -427,6 +431,73 @@ def test_cancel_run_treats_non_404_errors_as_gone(caplog) -> None:
     rt.cancel_run("sb_dying")  # no raise
 
 
+# --------------------------------------------------------------------------- #
+# reap_expired — scheduler-side leaked-sandbox sweep
+# --------------------------------------------------------------------------- #
+
+
+def test_reap_expired_deletes_only_old_agent_platform_sandboxes() -> None:
+    """Reaper deletes only OUR old sandboxes; spares fresh + foreign ones."""
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    old_started = (now - timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    fresh_started = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    client = MagicMock()
+    # Bare array (what the controller returns in practice).
+    client.get.return_value = _ok_response([  # type: ignore[arg-type]
+        {
+            "sandboxID": "sb_old",
+            "startedAt": old_started,
+            "metadata": {"agent-platform.run-id": "r_old"},
+        },
+        {
+            "sandboxID": "sb_fresh",
+            "startedAt": fresh_started,
+            "metadata": {"agent-platform.run-id": "r_fresh"},
+        },
+        {
+            # Foreign VM (no agent-platform marker), old — must NOT be touched.
+            "sandboxID": "sb_foreign",
+            "startedAt": old_started,
+            "metadata": {"someone-else.id": "x"},
+        },
+    ])
+    client.delete.return_value = _ok_response({}, status=204)
+
+    rt = _make_runtime(client)
+    deleted = rt.reap_expired(max_age_seconds=900)
+
+    assert deleted == 1
+    # Only the old agent-platform sandbox was deleted.
+    client.delete.assert_called_once_with("/sandboxes/sb_old")
+    # And the list was fetched with NO params (all sandboxes across tenants).
+    _, kwargs = client.get.call_args
+    assert "params" not in kwargs
+
+
+def test_reap_expired_skips_unparseable_started_at() -> None:
+    """A missing/unparseable ``startedAt`` is fail-safe: never deleted."""
+    client = MagicMock()
+    client.get.return_value = _ok_response({  # wrapper shape, defensively handled
+        "items": [
+            {
+                "sandboxID": "sb_no_started",
+                "metadata": {"agent-platform.tenant-id": "tnt_a"},
+            },
+            {
+                "sandboxID": "sb_bad_started",
+                "startedAt": "not-a-date",
+                "metadata": {"agent-platform.tenant-id": "tnt_a"},
+            },
+        ],
+    })
+    rt = _make_runtime(client)
+    assert rt.reap_expired(max_age_seconds=900) == 0
+    client.delete.assert_not_called()
+
+
 def test_list_containers_filters_by_tenant_label() -> None:
     client = MagicMock()
     client.get.return_value = _ok_response({
@@ -498,6 +569,7 @@ def _make_runtime_with_workspace(client: object, workspace_base: Path) -> CubeSa
     rt._settings = settings  # noqa: SLF001
     rt._client = client  # noqa: SLF001
     rt._skill_cache = None  # noqa: SLF001
+    rt._public_host = "203.0.113.10"  # noqa: SLF001
     return rt
 
 

@@ -815,6 +815,11 @@ class DockerRuntime:
             # Removed concurrently; nothing to do.
             c.remove()
 
+    # ------------------------------------------------------------------ reap
+    def reap_expired(self, *, max_age_seconds: int) -> int:
+        """Docker containers are reaped by their own lifecycle; no-op here."""
+        return 0
+
     # ------------------------------------------------------------------ list
     def list_containers(self, *, tenant_id: str) -> list[dict[str, Any]]:
         """List agent-platform containers belonging to ``tenant_id``.

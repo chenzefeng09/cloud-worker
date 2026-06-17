@@ -20,6 +20,54 @@
 
 import http from "node:http";
 import { Buffer } from "node:buffer";
+import { Agent } from "undici";
+
+/**
+ * Hard wall-clock cap (ms) on the WHOLE adapter→gateway exchange (connect +
+ * headers + full body / stream). Defense-in-depth paired with the no-keep-alive
+ * dispatcher below: even if a hop stalls it FAILS FAST rather than hanging the
+ * run for minutes. Sized generously so a legitimately slow model call is never
+ * cut off.
+ */
+const GATEWAY_EXCHANGE_TIMEOUT_MS = 120_000;
+
+/**
+ * Dedicated undici dispatcher for EVERY adapter→gateway fetch — the actual fix
+ * for the cube "Request timed out" hang.
+ *
+ * The worker runs inside a cube microVM and reaches the gateway over the host's
+ * PUBLIC IP via hairpin/loopback NAT. With undici's (Node global fetch) DEFAULT
+ * pooled keep-alive dispatcher, the response *body* read (`gwResp.text()` for
+ * the non-streaming first call, and the SSE reader for streamed turns) stalls
+ * indefinitely over that hairpin path: the response headers (200) arrive in ~1s
+ * but the body never EOFs, so the run hangs until the SDK gives up with "Request
+ * timed out". curl never hit this because it opens a brand-new, non-pooled
+ * connection per call. (A `Connection: close` *request header* cannot fix it —
+ * `connection` is a forbidden fetch header and is silently dropped — so the
+ * dispatcher is the only reliable lever.)
+ *
+ * Settings force a fresh single-use socket per request and a fail-fast body:
+ *   - pipelining: 0                      → never reuse a request on one socket
+ *   - keepAliveTimeout/MaxTimeout: 1ms   → effectively no pooled reuse
+ *   - headersTimeout / bodyTimeout       → a stalled hop errors instead of hanging
+ * Harmless in docker mode (container-name host, no hairpin) where keep-alive
+ * worked anyway.
+ */
+const GATEWAY_DISPATCHER = new Agent({
+  // No pipelining: never multiplex requests on one socket (the behaviour that
+  // poisons the body read over hairpin NAT).
+  pipelining: 0,
+  // Allow brief keep-alive reuse (10s) rather than a fresh socket per request:
+  // the SDK fires a burst of requests per turn (count-token probe + cache-warming
+  // streams + the main turn), and forcing a brand-new hairpin-NAT socket for each
+  // can exhaust/stall the NAT under burst. 10s is long enough to reuse within a
+  // turn, short enough that a connection never goes stale between turns.
+  keepAliveTimeout: 10_000,
+  keepAliveMaxTimeout: 10_000,
+  // A hung hop fails fast instead of hanging the run for minutes.
+  headersTimeout: GATEWAY_EXCHANGE_TIMEOUT_MS,
+  bodyTimeout: GATEWAY_EXCHANGE_TIMEOUT_MS,
+});
 
 /** Anything translated out of the SDK's dynamic Anthropic/OpenAI JSON. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic wire JSON
@@ -807,6 +855,32 @@ export class GatewayAdapter {
       return;
     }
 
+    // Token counting: the Claude Agent SDK calls POST /v1/messages/count_tokens
+    // to size the context window before a turn. The OpenAI-compatible gateway has
+    // no token-count endpoint, so we answer locally with a cheap char-based
+    // estimate in Anthropic's `{input_tokens}` shape. Returning a 404 here makes
+    // the SDK fall back to an extra haiku round-trip (latency + the model rewrite
+    // path) and muddies the logs; a best-effort estimate is plenty for the SDK's
+    // budgeting and keeps the turn on the fast path.
+    if (req.method === "POST" && pathname === "/v1/messages/count_tokens") {
+      let body: Json = {};
+      try {
+        body = JSON.parse((await readBody(req)) || "{}");
+      } catch {
+        /* tolerate — estimate over whatever we have */
+      }
+      let chars = 0;
+      try {
+        if (body.system) chars += flattenContent(body.system).length;
+        for (const m of body.messages ?? []) chars += flattenContent(m.content).length;
+        if (Array.isArray(body.tools)) chars += JSON.stringify(body.tools).length;
+      } catch {
+        /* best-effort */
+      }
+      sendJson(res, 200, { input_tokens: Math.max(1, Math.ceil(chars * 0.4)) });
+      return;
+    }
+
     if (req.method === "GET" && pathname === "/healthz") {
       sendJson(res, 200, { status: "ok" });
       return;
@@ -877,7 +951,21 @@ export class GatewayAdapter {
       });
 
     const callGateway = (body: Record<string, unknown>): Promise<Response> =>
-      fetch(target, { method: "POST", headers: gwHeaders, body: JSON.stringify(body) });
+      fetch(target, {
+        method: "POST",
+        headers: gwHeaders,
+        body: JSON.stringify(body),
+        // No-keep-alive-poisoning dispatcher (the cube hairpin-NAT fix): a fresh-
+        // enough, non-pipelined socket so the response body never stalls (see
+        // GATEWAY_DISPATCHER). `dispatcher` is an undici extension to RequestInit,
+        // absent from the DOM fetch lib types, hence the cast.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- undici dispatcher not in lib.dom fetch types
+        dispatcher: GATEWAY_DISPATCHER as any,
+        // Defense-in-depth wall-clock cap: aborts connect+headers+body so even an
+        // unforeseen stall fails fast instead of hanging the run for minutes.
+        signal: AbortSignal.timeout(GATEWAY_EXCHANGE_TIMEOUT_MS),
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dispatcher widening
+      } as any);
 
     try {
       let gwResp = await callGateway(buildBody(this.jsonSchemaUnsupported));

@@ -1,5 +1,8 @@
 """FastAPI main app factory."""
 
+import asyncio
+import contextlib
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -9,11 +12,48 @@ from foundation_sdk.fastapi import install_request_context, register_problem_det
 from agent_scheduler.config import Settings
 from agent_scheduler.observability import init_observability
 
+logger = logging.getLogger(__name__)
+
+
+async def _sandbox_reaper_loop(app: FastAPI) -> None:
+    """Periodically delete leaked sandboxes older than the configured max age.
+
+    The cube controller's spawn-time ``timeout`` TTL has been observed NOT to
+    reap microVMs, so they oversubscribe host RAM and OOM-kill live workers.
+    This loop is the scheduler-side safety net.  The cube runtime uses a SYNC
+    ``httpx.Client``, so the sweep runs in a thread to avoid blocking the event
+    loop.  Any exception is caught and logged so the loop never dies.
+    """
+    settings: Settings = app.state.settings
+    interval = settings.sandbox_reaper_interval_seconds
+    max_age = settings.sandbox_reaper_max_age_seconds
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            reaped = await asyncio.to_thread(
+                app.state.runtime.reap_expired, max_age_seconds=max_age
+            )
+            if reaped > 0:
+                logger.info("sandbox reaper deleted %d expired sandbox(es)", reaped)
+        except Exception:  # noqa: BLE001 -- loop must never die
+            logger.exception("sandbox reaper sweep failed; continuing")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     init_observability(service_name="agent-scheduler")
-    yield
+    reaper_task: asyncio.Task[None] | None = None
+    if getattr(app.state.runtime, "reap_expired", None) is not None:
+        reaper_task = asyncio.create_task(_sandbox_reaper_loop(app))
+    else:
+        logger.info("runtime has no reap_expired; sandbox reaper disabled")
+    try:
+        yield
+    finally:
+        if reaper_task is not None:
+            reaper_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reaper_task
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
