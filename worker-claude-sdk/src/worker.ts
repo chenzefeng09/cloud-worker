@@ -641,6 +641,167 @@ function buildAskUserServer(): McpServerConfig {
   return createSdkMcpServer({ name: "hitl", tools: [askUser] }) as McpServerConfig;
 }
 
+// ── web_fetch: controlled-egress page fetcher ────────────────────────────────
+
+/**
+ * The sandbox network is Internal=true isolated: the model cannot `curl` an
+ * arbitrary URL and reach the public internet. The ONLY sanctioned egress for
+ * web content is the web-fetch gateway (a direct base in foundation mode, or the
+ * tool-broker passthrough in broker mode), whose URL the scheduler injects as
+ * `WEB_FETCH_GATEWAY_URL`. The AgentScope worker exposed this as a tool; this
+ * function ports it to the Claude SDK as an in-process MCP server named
+ * `webfetch` with one tool `web_fetch` (the model sees `mcp__webfetch__web_fetch`).
+ *
+ * This is deliberately NOT named `WebFetch` — that name is the SDK's hosted
+ * server-side tool, which we disable via `disallowedTools` (it can't run against
+ * the OpenAI-compatible gateway). The MCP-namespaced `mcp__webfetch__web_fetch`
+ * is a wholly distinct identifier and does not collide.
+ */
+const WEB_FETCH_DEFAULT_MAX_BYTES = 1048576;
+const WEB_FETCH_TIMEOUT_MS = 30000;
+
+/**
+ * Resolve the gateway POST endpoint from the configured base. Mirrors the
+ * AgentScope reference (tool.py:200-203): a base already ending in
+ * `/api/web-fetch/v1` (the broker-passthrough shape) only needs `/fetch`
+ * appended; any other base gets the full `/api/web-fetch/v1/fetch` suffix.
+ */
+export function webFetchEndpoint(gatewayUrl: string): string {
+  if (gatewayUrl.endsWith("/api/web-fetch/v1")) {
+    return `${gatewayUrl}/fetch`;
+  }
+  return `${gatewayUrl}/api/web-fetch/v1/fetch`;
+}
+
+/**
+ * Perform one gateway fetch and render the agent-readable text. Pure I/O wrapper
+ * over the gateway; the error-string vocabulary matches the AgentScope reference
+ * (tool.py:217-262) so the model sees identical signals across both workers.
+ * Never throws — every failure path returns a `[WebFetch error]`/`[WebFetch
+ * blocked]` string.
+ */
+export async function runWebFetch(
+  env: Env,
+  url: string,
+  maxBytes: number | undefined,
+): Promise<string> {
+  const gatewayUrl = env.WEB_FETCH_GATEWAY_URL;
+  const endpoint = webFetchEndpoint(gatewayUrl);
+  const body = JSON.stringify({
+    url,
+    max_bytes: maxBytes && maxBytes > 0 ? maxBytes : WEB_FETCH_DEFAULT_MAX_BYTES,
+  });
+
+  // Identity headers: only attach those with a value (parity with tool.py:205-215).
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (env.FOUNDATION_API_TOKEN) {
+    headers["authorization"] = `Bearer ${env.FOUNDATION_API_TOKEN}`;
+  }
+  if (env.FOUNDATION_TENANT_ID) headers["x-tenant-id"] = env.FOUNDATION_TENANT_ID;
+  if (env.FOUNDATION_USER_ID) headers["x-user-id"] = env.FOUNDATION_USER_ID;
+  if (env.FOUNDATION_SERVICE_SCOPES) {
+    headers["x-service-scopes"] = env.FOUNDATION_SERVICE_SCOPES;
+  }
+  if (env.TOOL_BROKER_LEASE) headers["x-tool-broker-lease"] = env.TOOL_BROKER_LEASE;
+
+  let resp: Response;
+  try {
+    resp = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body,
+      signal: AbortSignal.timeout(WEB_FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const e = err as Error;
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") {
+      return `[WebFetch error] Request to ${url} timed out (30 s)`;
+    }
+    return `[WebFetch error] Could not reach gateway at ${gatewayUrl}: ${e?.message ?? String(err)}`;
+  }
+
+  // ── gateway error codes (tool.py:226-241) ──
+  if (resp.status === 403) {
+    let detail: string;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- gateway JSON
+      const j: any = await resp.json();
+      detail = typeof j?.detail === "string" ? j.detail : JSON.stringify(j).slice(0, 200);
+    } catch {
+      detail = (await safeText(resp)).slice(0, 200);
+    }
+    return `[WebFetch blocked] ${url}: ${detail}`;
+  }
+  if (resp.status === 504) {
+    return (
+      `[WebFetch error] Gateway timed out while fetching ${url}. ` +
+      "The remote server did not respond in time."
+    );
+  }
+  if (resp.status >= 400) {
+    return `[WebFetch error] Gateway returned HTTP ${resp.status} for ${url}`;
+  }
+
+  // ── success (tool.py:243-262) ──
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- gateway JSON
+  let data: any;
+  try {
+    data = await resp.json();
+  } catch (err) {
+    return `[WebFetch error] Could not parse gateway response: ${(err as Error).message}`;
+  }
+  if (data?.error) {
+    return `[WebFetch error] ${url}: ${data.error}`;
+  }
+  const statusCode = data?.status_code ?? "?";
+  const contentType = data?.content_type ?? "?";
+  const fetched = data?.body ?? "";
+  const truncated = data?.truncated === true;
+  let result = `[WebFetch] ${url} — HTTP ${statusCode} (${contentType})\n\n${fetched}`;
+  if (truncated) result += "\n[... response truncated at limit ...]";
+  return result;
+}
+
+/** Read a Response body as text without throwing. */
+async function safeText(resp: Response): Promise<string> {
+  try {
+    return await resp.text();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Build the in-process web_fetch MCP server. Unlike ask_user (whose handler is
+ * unreachable), this handler REALLY executes: it POSTs to the controlled
+ * web-fetch gateway via {@link runWebFetch}. The handler never reaches out to an
+ * arbitrary URL itself — the gateway is the sole, controlled egress, preserving
+ * the sandbox's Internal=true isolation.
+ */
+function buildWebFetchServer(env: Env): McpServerConfig {
+  const webFetch = tool(
+    "web_fetch",
+    "抓取公开 HTTP/HTTPS 网页、API 或文档的内容。这是本沙盒唯一的联网方式：" +
+      "沙盒网络被隔离，无法直接 curl/访问外网，任何需要联网获取的信息（网页正文、" +
+      "公开 API 响应、在线文档等）都必须调用本工具，绝不要尝试用 Bash/curl 直连外网。" +
+      "返回网页文本内容（可能被截断）。",
+    {
+      url: z
+        .string()
+        .describe("要抓取的完整 http/https URL（必填）"),
+      max_bytes: z
+        .number()
+        .optional()
+        .describe("响应正文最大字节数（可选，默认 1048576 = 1 MiB）"),
+    },
+    async (args: { url: string; max_bytes?: number }) => {
+      const text = await runWebFetch(env, args.url, args.max_bytes);
+      return { content: [{ type: "text", text }] };
+    },
+  );
+  return createSdkMcpServer({ name: "webfetch", tools: [webFetch] }) as McpServerConfig;
+}
+
 // ── the run ─────────────────────────────────────────────────────────────────
 
 export interface RunQueryDeps {
@@ -691,6 +852,14 @@ export async function runQuery(
   // alongside the tenant servers (its name `mcp__hitl__ask_user` is recognised by
   // the gate as a question-pause).
   const mcpServers: Record<string, McpServerConfig> = { ...opts.mcpServers };
+
+  // web_fetch: the sandbox's only sanctioned network egress for page content.
+  // Mounted in BOTH headless and HITL modes (the model needs it regardless of a
+  // human gate), but only when the scheduler injected a gateway URL — matching
+  // the AgentScope behavior of not registering the tool when egress is unset.
+  if (env.WEB_FETCH_GATEWAY_URL) {
+    mcpServers.webfetch = buildWebFetchServer(env);
+  }
 
   const options: Options = {
     cwd: ws,

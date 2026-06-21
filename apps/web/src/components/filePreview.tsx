@@ -26,6 +26,7 @@ const KIND_GLYPH: Record<string, string> = {
   jpg: '◰',
   jpeg: '◰',
   txt: '☷',
+  html: '◳',
   ics: '◷',
   folder: '▸',
 };
@@ -42,6 +43,7 @@ export function mimeToKind(mime?: string): string {
   if (mime.includes('presentation') || mime.includes('pptx')) return 'pptx';
   if (mime.includes('image/png')) return 'png';
   if (mime.includes('image/jpeg')) return 'jpg';
+  if (mime.includes('html')) return 'html';
   if (mime.includes('text/')) return 'txt';
   return 'md';
 }
@@ -159,8 +161,19 @@ interface TextPreviewProps {
   filename: string;
 }
 
-function TextPreview({ contentText, contentLoading, contentError, filename }: TextPreviewProps) {
-  const lang = extToHljsLang(filename);
+/**
+ * Headless highlighted-text body (no header bar). Shared by TextPreview and the
+ * HtmlPreview "source" mode so the highlight/plain-text logic lives in one place.
+ * `lang` overrides the filename-derived language (HTML source forces 'xml').
+ */
+function TextContent({
+  contentText,
+  contentLoading,
+  contentError,
+  filename,
+  lang: langOverride,
+}: TextPreviewProps & { lang?: string }) {
+  const lang = langOverride ?? extToHljsLang(filename);
 
   // Highlighted HTML (memoised). Returns null when we should render plain text
   // (no language detected, file too large, or hljs errored).
@@ -175,6 +188,29 @@ function TextPreview({ contentText, contentLoading, contentError, filename }: Te
     }
   }, [contentText, lang]);
 
+  if (contentLoading) {
+    return <div className="px-4 py-3 font-mono text-[11px] text-dim">加载预览…</div>;
+  }
+  if (contentError) {
+    return <div className="px-4 py-3 font-mono text-[11px] text-accent">{contentError}</div>;
+  }
+  if (contentText === null) return null;
+
+  return highlightedHtml !== null ? (
+    <pre className="cw-scroll px-4 py-3 font-mono text-[11.5px] leading-[1.6] overflow-auto max-h-[480px]" style={{ whiteSpace: 'pre' }}>
+      <code
+        className={`hljs language-${lang}`}
+        dangerouslySetInnerHTML={{ __html: highlightedHtml }}
+      />
+    </pre>
+  ) : (
+    <pre className="cw-scroll px-4 py-3 font-mono text-[11.5px] text-ink-2 whitespace-pre-wrap break-words max-h-[480px]">
+      {contentText}
+    </pre>
+  );
+}
+
+function TextPreview({ contentText, contentLoading, contentError, filename }: TextPreviewProps) {
   return (
     <div className="border border-line rounded-md overflow-hidden bg-surface">
       <div className="flex items-center justify-between px-4 py-2 border-b border-line-2">
@@ -183,27 +219,152 @@ function TextPreview({ contentText, contentLoading, contentError, filename }: Te
           <PreviewCopyButton text={contentText} />
         )}
       </div>
+      <TextContent
+        contentText={contentText}
+        contentLoading={contentLoading}
+        contentError={contentError}
+        filename={filename}
+      />
+    </div>
+  );
+}
+
+// ── HTML preview: rendered webpage (default) + source toggle ───────────────────
+
+function HtmlPreview({ contentText, contentLoading, contentError, filename }: TextPreviewProps) {
+  const [mode, setMode] = useState<'render' | 'source'>('render');
+
+  const segBtn = (active: boolean) =>
+    `cw-btn cw-btn-ghost cw-btn-sm${active ? ' text-accent' : ''}`;
+
+  return (
+    <div className="border border-line rounded-md overflow-hidden bg-surface">
+      <div className="flex items-center justify-between px-4 py-2 border-b border-line-2">
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            className={segBtn(mode === 'render')}
+            style={mode === 'render' ? { borderColor: 'var(--accent)' } : undefined}
+            onClick={() => setMode('render')}
+          >
+            预览
+          </button>
+          <button
+            type="button"
+            className={segBtn(mode === 'source')}
+            style={mode === 'source' ? { borderColor: 'var(--accent)' } : undefined}
+            onClick={() => setMode('source')}
+          >
+            源码
+          </button>
+        </div>
+        {mode === 'source' && contentText !== null && !contentLoading && (
+          <PreviewCopyButton text={contentText} />
+        )}
+      </div>
+
       {contentLoading && (
         <div className="px-4 py-3 font-mono text-[11px] text-dim">加载预览…</div>
       )}
       {contentError && (
         <div className="px-4 py-3 font-mono text-[11px] text-accent">{contentError}</div>
       )}
-      {contentText !== null && !contentLoading && (
-        highlightedHtml !== null ? (
-          <pre className="cw-scroll px-4 py-3 font-mono text-[11.5px] leading-[1.6] overflow-auto max-h-[480px]" style={{ whiteSpace: 'pre' }}>
-            <code
-              className={`hljs language-${lang}`}
-              dangerouslySetInnerHTML={{ __html: highlightedHtml }}
-            />
-          </pre>
+
+      {!contentLoading && !contentError && contentText !== null && (
+        mode === 'render' ? (
+          <div className="p-3 flex flex-col gap-2">
+            <div className="border border-line rounded-md overflow-hidden bg-surface">
+              <iframe
+                // sandbox WITH allow-scripts but WITHOUT allow-same-origin: with srcDoc
+                // this puts the frame in a null (opaque) origin — agent-produced scripts
+                // can run (e.g. Mermaid/chart rendering) but cannot read the parent app's
+                // cookies/localStorage/same-origin data. Never add allow-same-origin here:
+                // the combo would let untrusted scripts touch same-origin state → XSS.
+                sandbox="allow-scripts"
+                srcDoc={contentText ?? ''}
+                title={filename}
+                style={{ width: '100%', height: 480, border: 0, background: '#fff' }}
+                className="min-h-[480px]"
+              />
+            </div>
+            <div className="font-mono text-[10.5px] text-dim">
+              脚本在隔离沙箱中运行（无法访问站点数据）。引用站点相对资源的内容可能无法加载，如需完整效果请下载查看。
+            </div>
+          </div>
         ) : (
-          <pre className="cw-scroll px-4 py-3 font-mono text-[11.5px] text-ink-2 whitespace-pre-wrap break-words max-h-[480px]">
-            {contentText}
-          </pre>
+          <TextContent
+            contentText={contentText}
+            contentLoading={contentLoading}
+            contentError={contentError}
+            filename={filename}
+            lang="xml"
+          />
         )
       )}
     </div>
+  );
+}
+
+// ── Image preview + lightbox ──────────────────────────────────────────────────
+
+// 全屏放大遮罩。点遮罩空白 / 点图 / ESC / 右上角 ✕ 均可关闭(点图也关闭符合
+// zoom-out 语义,故整个遮罩 onClick 关闭、图片不 stopPropagation)。打开时锁滚动。
+function ImageLightbox({ src, alt, onClose }: { src: string; alt: string; onClose: () => void }) {
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    document.addEventListener('keydown', onKeyDown);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [onClose]);
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      onClick={onClose}
+      className="fixed inset-0 z-50 flex items-center justify-center"
+      style={{ background: 'rgba(0,0,0,0.8)' }}
+    >
+      <button
+        type="button"
+        aria-label="关闭"
+        onClick={onClose}
+        className="fixed top-4 right-4 text-white text-2xl leading-none"
+      >
+        ✕
+      </button>
+      <img
+        src={src}
+        alt={alt}
+        className="max-w-[92vw] max-h-[92vh] object-contain cursor-zoom-out"
+        style={{ display: 'block' }}
+      />
+    </div>
+  );
+}
+
+function ImagePreview({ src, alt }: { src: string; alt: string }) {
+  const [zoomed, setZoomed] = useState(false);
+  return (
+    <>
+      <div className="border border-line rounded-md overflow-hidden bg-surface p-2">
+        <img
+          src={src}
+          alt={alt}
+          title="点击放大"
+          onClick={() => setZoomed(true)}
+          className="max-w-full max-h-[480px] object-contain cursor-zoom-in"
+          style={{ display: 'block' }}
+        />
+      </div>
+      {zoomed && <ImageLightbox src={src} alt={alt} onClose={() => setZoomed(false)} />}
+    </>
   );
 }
 
@@ -231,9 +392,12 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
     (mime?.includes('officedocument.wordprocessing') ?? false) ||
     (mime?.includes('msword') ?? false);
   const needsBlob = isExcel || isWord;
+  // HTML renders as a webpage (iframe) by default, with a source-code toggle —
+  // so it must NOT fall into TextPreview. Detect it before the text gate.
+  const isHtml = mime === 'text/html' || ext === 'html' || ext === 'htm';
   // Office docs take precedence: never treat them as text even if MIME/ext is
   // ambiguous, otherwise the binary zip renders as garbled bytes.
-  const isText = !isWord && !isExcel && isTextLikeMime(mime);
+  const isText = !isWord && !isExcel && !isHtml && isTextLikeMime(mime);
 
   const [contentText, setContentText] = useState<string | null>(null);
   const [contentBlob, setContentBlob] = useState<Blob | null>(null);
@@ -241,8 +405,8 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
   const [contentError, setContentError] = useState<string | null>(null);
 
   useEffect(() => {
-    // 文本走 text,Excel/Word 走 blob;PDF 用 URL、图片用 <img>,都无需 fetch。
-    if (!isText && !needsBlob) {
+    // 文本/HTML 走 text,Excel/Word 走 blob;PDF 用 URL、图片用 <img>,都无需 fetch。
+    if (!isText && !isHtml && !needsBlob) {
       setContentText(null);
       setContentBlob(null);
       setContentError(null);
@@ -258,7 +422,7 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
     api.attachments.getContent(sessionId, fileId)
       .then((res) => {
         if (cancelled) return;
-        if (isText) setContentText(res.text);
+        if (isText || isHtml) setContentText(res.text);
         if (needsBlob) setContentBlob(res.blob);
       })
       .catch((e) => {
@@ -276,19 +440,22 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
       setContentBlob(null);
       setContentText(null);
     };
-  }, [sessionId, fileId, isText, needsBlob]);
+  }, [sessionId, fileId, isText, isHtml, needsBlob]);
 
   // Image preview
   if (isImage) {
+    return <ImagePreview src={contentUrl} alt={filename} />;
+  }
+
+  // HTML preview — rendered webpage (iframe, default) + source toggle
+  if (isHtml) {
     return (
-      <div className="border border-line rounded-md overflow-hidden bg-surface p-2">
-        <img
-          src={contentUrl}
-          alt={filename}
-          className="max-w-full max-h-[480px] object-contain"
-          style={{ display: 'block' }}
-        />
-      </div>
+      <HtmlPreview
+        contentText={contentText}
+        contentLoading={contentLoading}
+        contentError={contentError}
+        filename={filename}
+      />
     );
   }
 

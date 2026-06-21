@@ -49,6 +49,51 @@ RUN groupadd --gid 1000 agent 2>/dev/null || groupmod -n agent node \
  && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash agent 2>/dev/null \
     || usermod -l agent -d /home/agent -m node
 
+# ── Python toolchain for the agent (Office / data-viz via Bash) ───────────────
+# The AgentScope worker image (base.Dockerfile, FROM python:3.12-slim) shipped a
+# Python runtime + Office/plotting libs; the Claude SDK worker is Node-only, so
+# the agent lost the ability to run `python3` for Office docs, charts, graphs.
+# We install them back here.  This is purely an agent-callable runtime — the
+# worker itself remains the Node ENTRYPOINT below, unchanged.
+#
+# bookworm's apt python3 is 3.11.  We install all Python libs from PyPI (not the
+# pre-fetched cp312 wheels in sandbox-images/wheels/, which are ABI-incompatible
+# with 3.11).  graphviz the apt package provides the `dot` system binary that
+# the `graphviz` Python binding shells out to.
+# NOTE: this build's proxy is flaky on large .deb fetches (intermittent 502 /
+# connection timeouts) and re-signs TLS with an untrusted CA, so HTTPS mirrors
+# fail cert verification.  Keep the default HTTP deb.debian.org sources (the
+# proxy passes plain HTTP) but add generous retries to make the build reliable.
+RUN printf 'Acquire::Retries "12";\nAcquire::http::Timeout "120";\nAcquire::https::Timeout "120";\nAcquire::Retries::Delay::Maximum "30";\n' > /etc/apt/apt.conf.d/80-retries \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      python3 python3-pip python3-venv graphviz \
+      fonts-noto-cjk fontconfig \
+ && pip3 install --break-system-packages --no-cache-dir \
+      python-docx openpyxl python-pptx pypdf Pillow lxml xlsxwriter \
+      pandas numpy matplotlib graphviz diagrams \
+ && apt-get clean \
+ && rm -rf /var/lib/apt/lists/*
+
+# Configure matplotlib for headless (no GUI backend) so agent scripts never
+# try to open a display.  MPLBACKEND=Agg is honoured process-wide.
+ENV MPLBACKEND=Agg
+
+# CJK fonts: fonts-noto-cjk (installed above) provides Chinese/Japanese/Korean
+# glyphs.  matplotlib defaults to DejaVu Sans (no CJK), so we append the Noto CJK
+# family as a fallback in the system matplotlibrc — this makes Chinese labels in
+# agent-generated charts render instead of showing tofu boxes.  ``axes.unicode_minus``
+# is disabled because the CJK font lacks the proper minus glyph.  The matplotlibrc
+# path is resolved at build time from matplotlib's install location.
+RUN MPLDIR="$(python3 -c 'import matplotlib, os; print(os.path.join(os.path.dirname(matplotlib.__file__), "mpl-data"))')" \
+ && printf 'font.family: sans-serif\nfont.sans-serif: Noto Sans CJK SC, Noto Sans CJK JP, DejaVu Sans, sans-serif\naxes.unicode_minus: False\n' >> "$MPLDIR/matplotlibrc" \
+ && fc-cache -f >/dev/null 2>&1 || true
+
+# Sanity check: fail the build immediately if any library is missing, AND verify
+# the CJK font is actually discoverable by matplotlib's font manager (so a broken
+# font install fails the build rather than silently producing tofu charts).
+RUN python3 -c "import matplotlib; matplotlib.use('Agg'); import docx, openpyxl, pptx, pypdf, PIL, lxml, xlsxwriter, pandas, numpy, graphviz, diagrams; from diagrams import Diagram; from matplotlib import font_manager; names={f.name for f in font_manager.fontManager.ttflist}; assert any('CJK' in n for n in names), 'Noto CJK font not found by matplotlib: '+str(sorted(n for n in names if 'Noto' in n)); print('py libs + CJK font OK')"
+
 WORKDIR /app
 
 # Install production deps first (better layer caching: deps change rarely).
