@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -916,14 +917,21 @@ def test_stream_tokens_waits_through_worker_coldstart() -> None:
         (event_name, json.loads(data))
         for event_name, data in _parse_sse_events("".join(events))
     ]
-    assert parsed[0] == (
+    # Idle reads while the worker cold-starts now emit ``ping`` heartbeats so the
+    # client's stall watchdog sees bytes; filter them out to assert on the
+    # meaningful token/end sequence.
+    meaningful = [(name, payload) for name, payload in parsed if name != "ping"]
+    assert meaningful[0] == (
         "token",
         {"run_id": "run_cold", "delta": "spring", "offset": "1-0"},
     )
-    assert parsed[-1] == (
+    assert meaningful[-1] == (
         "run_stream_end",
         {"run_id": "run_cold", "paused": False},
     )
+    # The cold-start silence produced heartbeats (4 empty reads before the
+    # delta) — that is the whole point of the ping: bytes on a quiet stream.
+    assert any(name == "ping" for name, _ in parsed)
 
 
 def test_stream_tokens_replay_bails_out_fast_when_empty() -> None:
@@ -964,7 +972,11 @@ def test_stream_tokens_replay_bails_out_fast_when_empty() -> None:
         (event_name, json.loads(data))
         for event_name, data in _parse_sse_events("".join(events))
     ]
-    assert parsed == [
+    # An idle read that does NOT end the tail emits a ``ping`` heartbeat; the
+    # last read here breaks out, so we may see one ping before the terminal
+    # ``run_stream_end``.  Filter pings to assert on the meaningful terminator.
+    meaningful = [(name, payload) for name, payload in parsed if name != "ping"]
+    assert meaningful == [
         ("run_stream_end", {"run_id": "run_replay", "paused": False}),
     ]
     # Old fast-exit preserved: returns after the 2nd idle read, not 30s of polls.
@@ -1090,6 +1102,174 @@ def test_stream_tokens_active_run_idle_does_not_break_until_inactive() -> None:
         "run_stream_end",
         {"run_id": "run_stall", "paused": False},
     )
+
+
+def test_stream_tokens_emits_ping_on_idle_reads() -> None:
+    """Stall-watchdog heartbeat: every idle read that keeps the tail alive emits
+    an ``event: ping`` so the client sees bytes during long silent gaps (the
+    model can go quiet for tens of seconds between tool batches).
+
+    Feed: one delta, then several empty reads (model thinking), then the ``end``
+    marker.  The empty reads before ``end`` must each surface a ping carrying the
+    run_id, interleaved with the token/terminal events.
+    """
+    from agent_session_orchestrator.api.v1.messages import _stream_tokens
+
+    # read 0: token; reads 1-3: idle (silence); read 4: end marker.
+    batches = [
+        [("1-0", {"type": "delta", "text": "hi"})],
+        [],
+        [],
+        [],
+        [("2-0", {"type": "end"})],
+    ]
+
+    class _IdleThenEndRedis:
+        _i = 0
+
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def xread(self, streams, block=0, count=None):
+            key = list(streams.keys())[0]
+            i = self.__class__._i
+            self.__class__._i += 1
+            if i < len(batches):
+                b = batches[i]
+                return [(key, b)] if b else []
+            return []
+
+        async def aclose(self): pass
+
+    # Stay RUNNING throughout so idle reads keep the tail alive rather than
+    # breaking — this is exactly when a heartbeat matters.
+    async def _is_run_active() -> bool:
+        return True
+
+    async def _run():
+        with _patch_redis_asyncio(_IdleThenEndRedis):
+            _IdleThenEndRedis._i = 0
+            deadline = asyncio.get_event_loop().time() + 30.0
+            events = []
+            async for ev in _stream_tokens(
+                redis_url="redis://localhost:6379",
+                run_id="run_ping",
+                deadline=deadline,
+                wait_for_worker=True,
+                is_run_active=_is_run_active,
+            ):
+                events.append(ev)
+        return events
+
+    events = asyncio.get_event_loop().run_until_complete(_run())
+    parsed = [
+        (event_name, json.loads(data))
+        for event_name, data in _parse_sse_events("".join(events))
+    ]
+
+    ping_events = [payload for name, payload in parsed if name == "ping"]
+    # The 3 idle reads between the token and the end marker each emit a ping.
+    assert len(ping_events) == 3, (
+        f"Expected 3 idle-read pings, got {len(ping_events)}: {parsed}"
+    )
+    # Each ping carries the run_id so the client can attribute the heartbeat.
+    assert all(p == {"run_id": "run_ping"} for p in ping_events), ping_events
+
+    # The token and terminal events are still delivered around the pings.
+    non_ping = [(name, payload) for name, payload in parsed if name != "ping"]
+    assert non_ping[0] == (
+        "token",
+        {"run_id": "run_ping", "delta": "hi", "offset": "1-0"},
+    )
+    assert non_ping[-1] == (
+        "run_stream_end",
+        {"run_id": "run_ping", "paused": False},
+    )
+
+
+def test_stream_session_emits_ping_on_empty_poll() -> None:
+    """stream_session heartbeat: a poll with no active/paused run and nothing new
+    to send emits an ``event: ping`` before sleeping, so the client's stall
+    watchdog can distinguish a quiet-but-healthy stream from a wedged one.
+
+    Drives ``stream_session`` directly with ``acquire_db_session`` and
+    ``SessionService`` patched so each poll finds an empty session (no runs, no
+    messages).  ``asyncio.sleep`` is stubbed to a no-op and the generator is
+    consumed for a bounded number of events, then closed.
+    """
+    import contextlib
+    import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1 import messages as messages_module
+
+    # Fake DB session context: acquire_db_session is an async generator that
+    # yields a db handle; the code only passes it to SessionService (patched
+    # below), so a bare sentinel object is enough.
+    async def _fake_acquire(*, tenant_id: str, **_kw):
+        yield object()
+
+    # SessionService whose list_runs / list_messages report an empty session.
+    class _EmptySvc:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        async def list_runs(self, session_id):
+            return []
+
+        async def list_messages(self, session_id, cursor=None, limit=50):
+            return [], None
+
+        async def get_session(self, session_id):
+            raise AssertionError("get_session must not be called for empty poll")
+
+    # Minimal fake Request carrying just the settings the generator reads.
+    settings_stub = SimpleNamespace(
+        agent_scheduler_url="http://scheduler",
+        knowledge_ingest_url="",
+        foundation_dlp_url="",
+        redis_url=None,
+    )
+    request_stub = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(settings=settings_stub)),
+    )
+
+    async def _run():
+        collected: list[str] = []
+        with (
+            mock.patch.object(messages_module, "acquire_db_session", _fake_acquire),
+            mock.patch.object(messages_module, "SessionService", _EmptySvc),
+            mock.patch.object(
+                messages_module.asyncio, "sleep", new=AsyncMock(return_value=None)
+            ),
+        ):
+            response = await messages_module.stream_session(
+                session_id="ses_empty",
+                request=request_stub,  # type: ignore[arg-type]
+                tenant_id=TEST_TENANT,
+            )
+            agen = response.body_iterator
+            try:
+                # First poll primes completion (no terminal run → nothing) and,
+                # finding no active/paused run and no new messages, emits a ping.
+                # Pull a handful of events so we cross at least one full poll.
+                for _ in range(3):
+                    chunk = await agen.__anext__()
+                    collected.append(
+                        chunk.decode() if isinstance(chunk, bytes) else chunk
+                    )
+            finally:
+                with contextlib.suppress(Exception):
+                    await agen.aclose()
+        return collected
+
+    events = asyncio.get_event_loop().run_until_complete(_run())
+    parsed = _parse_sse_events("".join(events))
+    event_names = [name for name, _ in parsed]
+    assert "ping" in event_names, f"empty poll should emit a ping, got {event_names}"
+    # The ping payload for the session-level heartbeat is intentionally empty.
+    ping_payload = next(json.loads(data) for name, data in parsed if name == "ping")
+    assert ping_payload == {}
 
 
 def test_stream_tokens_active_run_stops_on_end_marker_despite_idle() -> None:

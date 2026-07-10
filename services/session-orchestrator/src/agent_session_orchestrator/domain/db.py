@@ -55,7 +55,10 @@ async def init_db(settings: Settings) -> None:
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
         pool_recycle=settings.db_pool_recycle,
-        echo=settings.env == "dev",
+        # Off by default (see Settings.sql_echo).  Previously ``env == "dev"``,
+        # which turned the engine echo firehose on for every dev deploy and
+        # could back up the log pipe enough to stall the SSE event loop.
+        echo=settings.sql_echo,
         connect_args={"statement_cache_size": 0},
     )
     _session_factory = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)

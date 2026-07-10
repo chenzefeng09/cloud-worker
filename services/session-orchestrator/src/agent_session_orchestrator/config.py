@@ -13,6 +13,13 @@ class Settings(BaseSettings):
     env: str = "dev"
     log_level: str = "INFO"
     log_format: str = "console"
+    # Emit SQLAlchemy engine SQL/echo logs.  Kept OFF by default even in dev:
+    # ``echo=True`` fire-hoses every statement (and every bound param) into the
+    # log stream, which — under load on the session SSE path — can back the
+    # ``docker logs`` pipe up enough to starve the event loop and stall the
+    # stream mid-flight.  Turn on deliberately (SESSION_ORCHESTRATOR_SQL_ECHO=true)
+    # only for a targeted SQL-debugging session.
+    sql_echo: bool = False
     http_port: int = 8006
     api_prefix: str = "/api/session/v1"
 
