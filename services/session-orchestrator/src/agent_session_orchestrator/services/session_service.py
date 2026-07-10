@@ -19,7 +19,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.config import Settings
@@ -175,7 +175,24 @@ class SessionService:
 
     async def delete_session(self, session_id: str) -> None:
         session = await self.get_session(session_id)
-        session.deleted_at = _now()
+        now = _now()
+        session.deleted_at = now
+        # Canvas v2 retention cascade (design §3.5): soft-delete the session's
+        # canvas documents in the same transaction so no canvas outlives its
+        # session (avoids a second "soft-deleted orphan" leak class).  Versions
+        # and suggestions are pruned with the document on physical purge; the
+        # soft-delete only needs to flip the parent's deleted_at.
+        from agent_session_orchestrator.domain.models import CanvasDocument
+
+        await self._db.execute(
+            update(CanvasDocument)
+            .where(
+                CanvasDocument.session_id == session_id,
+                CanvasDocument.tenant_id == self._tenant_id,
+                CanvasDocument.deleted_at.is_(None),
+            )
+            .values(deleted_at=now)
+        )
         await self._db.flush()
 
     async def create_message(

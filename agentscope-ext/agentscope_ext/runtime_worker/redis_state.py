@@ -102,7 +102,7 @@ class _BrokerTransport:
     """
 
     # Maps the canonical Redis key suffix to the façade ``kind`` value.
-    _SET_KINDS = ("state", "paused")
+    _SET_KINDS = ("state", "paused", "canvas")
 
     def __init__(
         self,
@@ -234,6 +234,10 @@ def _make_paused_key(run_id: str) -> str:
     return f"{_KEY_PREFIX}:{run_id}:paused"
 
 
+def _make_canvas_key(run_id: str) -> str:
+    return f"{_KEY_PREFIX}:{run_id}:canvas"
+
+
 # Maximum number of entries to retain in the token stream.
 # XADD uses approximate trimming (MAXLEN ~) which keeps Redis CPU cheap.
 _TOKEN_STREAM_MAXLEN = 10_000
@@ -258,6 +262,7 @@ class RunStateClient:
         self._key = _make_key(run_id)
         self._token_stream_key = _make_token_stream_key(run_id)
         self._paused_key = _make_paused_key(run_id)
+        self._canvas_key = _make_canvas_key(run_id)
         self._client: Any | None = None
         self._step = 0
         # Tracks whether we have already set EXPIRE on the token stream key.
@@ -691,6 +696,56 @@ class RunStateClient:
                 self._run_id,
                 exc,
             )
+
+    def push_canvas(self, payload: dict) -> int:
+        """Append a canvas payload to ``agent:run:{run_id}:canvas`` (Phase B).
+
+        The key holds a JSON *list* so multiple ``create_canvas`` tool calls in
+        one run accumulate.  Each stored entry is the given ``payload`` plus a
+        1-based ``seq`` field the orchestrator uses to dedupe materialization
+        (idempotency: a payload with a given ``seq`` is materialized at most
+        once).  The orchestrator reads this list on the streaming and reconcile
+        paths and materializes any not-yet-seen entry into a canvas document.
+
+        ``payload`` must be a JSON-serialisable dict; the canonical shape is::
+
+            {"kind": str, "title": str, "content_markdown": str}
+
+        Returns the ``seq`` assigned to this entry (1-based), or ``0`` when
+        hot-state is disabled (no Redis / broker) so the tool can still return a
+        confirmation to the model.  Failure-open: any Redis error is logged as
+        WARNING and swallowed (returns 0) — a canvas write must never crash the
+        run; the reply text is still delivered via the normal message path.
+        """
+        if self._client is None:
+            return 0
+        try:
+            raw = self._client.get(self._canvas_key)
+            items = json.loads(raw) if raw else []
+            if not isinstance(items, list):
+                items = []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis canvas read failed for run %s: %s", self._run_id, exc
+            )
+            items = []
+
+        seq = len(items) + 1
+        entry = dict(payload)
+        entry["seq"] = seq
+        items.append(entry)
+        try:
+            self._client.set(
+                self._canvas_key,
+                json.dumps(items, ensure_ascii=False),
+                ex=STATE_TTL_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis canvas write failed for run %s: %s", self._run_id, exc
+            )
+            return 0
+        return seq
 
     # ------------------------------------------------------------------
     # Internal helpers

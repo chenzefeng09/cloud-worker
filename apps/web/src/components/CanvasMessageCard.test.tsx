@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CanvasMessageCard } from './CanvasMessageCard';
 import {
   applyCanvasReplacement,
@@ -9,6 +9,7 @@ import {
   type CanvasEditRequest,
   type CanvasEditSuggestion,
 } from '../lib/canvasObjects';
+import { useCanvasStore } from '../stores/canvasStore';
 
 function makeDraft(content: string): CanvasDocumentDraft {
   return {
@@ -69,6 +70,10 @@ describe('CanvasMessageCard', () => {
       configurable: true,
       value: (callback: FrameRequestCallback) => window.setTimeout(callback, 0),
     });
+  });
+
+  afterEach(() => {
+    useCanvasStore.getState().reset();
   });
 
   it('renders markdown as editable rich text', async () => {
@@ -352,5 +357,28 @@ describe('CanvasMessageCard', () => {
 
     await waitFor(() => expect(screen.getByRole('textbox', { name: '页内画布正文' })).toHaveTextContent('这一句需要修改'));
     expect(screen.queryByText('这句话可以说得更自然一点')).not.toBeInTheDocument();
+  });
+
+  it('renders in canvasId mode by binding to a server canvas from canvasStore', async () => {
+    useCanvasStore.getState().setCanvas({
+      id: 'cvs_1',
+      session_id: 'ses_test',
+      kind: 'article',
+      title: '测试',
+      current_version: 1,
+      blocks: [
+        { id: 'blk_1', type: 'heading', text: '# 标题' },
+        { id: 'blk_2', type: 'paragraph', text: '正文内容' },
+      ],
+      created_at: '2026-06-14T00:00:00.000Z',
+      updated_at: '2026-06-14T00:00:00.000Z',
+    });
+
+    render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
+
+    expect(screen.getByDisplayValue('测试')).toBeInTheDocument();
+    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    await waitFor(() => expect(editor.querySelector('h1')).toHaveTextContent('标题'));
+    expect(editor).toHaveTextContent('正文内容');
   });
 });

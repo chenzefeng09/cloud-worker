@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import sys
 import types
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -840,3 +840,76 @@ def test_broker_transport_failure_open(broker_env, monkeypatch):
     client.write_step()  # must not raise
     client.push_token("x")  # must not raise
     assert client.read_checkpoint() is None  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# push_canvas — canvas v2 Phase B run-state channel
+# ---------------------------------------------------------------------------
+
+
+def test_push_canvas_writes_seq_1_on_first_call(fake_redis):
+    """First push_canvas stores a 1-element list with seq=1 and returns 1."""
+    _, mock_instance = fake_redis
+    from agentscope_ext.runtime_worker.redis_state import (
+        RunStateClient,
+        _make_canvas_key,
+    )
+
+    mock_instance.get.return_value = None  # no prior canvas list
+    client = RunStateClient(run_id="run_cvs", redis_url="redis://host:6379/0")
+
+    seq = client.push_canvas(
+        {"kind": "article", "title": "T1", "content_markdown": "body"}
+    )
+    assert seq == 1
+
+    # set() called with the canvas key and a JSON list carrying seq=1.
+    (key, value), kwargs = mock_instance.set.call_args
+    assert key == _make_canvas_key("run_cvs")
+    stored = json.loads(value)
+    assert stored == [
+        {"kind": "article", "title": "T1", "content_markdown": "body", "seq": 1}
+    ]
+    assert kwargs.get("ex")  # TTL applied
+
+
+def test_push_canvas_accumulates_and_increments_seq(fake_redis):
+    """A second push_canvas appends and returns seq=2, preserving the first."""
+    _, mock_instance = fake_redis
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient
+
+    existing = [
+        {"kind": "article", "title": "T1", "content_markdown": "b1", "seq": 1}
+    ]
+    mock_instance.get.return_value = json.dumps(existing)
+    client = RunStateClient(run_id="run_cvs", redis_url="redis://host:6379/0")
+
+    seq = client.push_canvas(
+        {"kind": "report", "title": "T2", "content_markdown": "b2"}
+    )
+    assert seq == 2
+
+    (_key, value), _ = mock_instance.set.call_args
+    stored = json.loads(value)
+    assert [e["seq"] for e in stored] == [1, 2]
+    assert stored[1]["title"] == "T2"
+
+
+def test_push_canvas_noop_when_disabled(no_redis):
+    """No Redis → push_canvas returns 0 and never raises (fail-open)."""
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient
+
+    client = RunStateClient(run_id="run_cvs", redis_url=None)
+    assert client.push_canvas({"title": "x", "content_markdown": "y"}) == 0
+
+
+def test_push_canvas_failopen_on_set_error(fake_redis):
+    """A Redis set() error is swallowed and returns 0 (fail-open)."""
+    _, mock_instance = fake_redis
+    mock_instance.get.return_value = None
+    mock_instance.set.side_effect = RuntimeError("write failed")
+
+    from agentscope_ext.runtime_worker.redis_state import RunStateClient
+
+    client = RunStateClient(run_id="run_cvs", redis_url="redis://host:6379/0")
+    assert client.push_canvas({"title": "x", "content_markdown": "y"}) == 0

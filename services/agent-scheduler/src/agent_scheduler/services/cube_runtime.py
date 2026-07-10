@@ -30,7 +30,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -40,7 +40,10 @@ import httpx
 from agent_scheduler.config import SANDBOX_SERVICE_SCOPES, Settings
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
 from agent_scheduler.services import egress_policy
-from agent_scheduler.services.feature_flag import evaluate_flag
+from agent_scheduler.services.feature_flag import (
+    evaluate_flag,
+    runtime_extensions_for_run,
+)
 from agent_scheduler.services.runtime import RUNTIME_REGISTRY
 from agent_scheduler.services.skill_cache import MountedSkill, SkillCache
 
@@ -440,6 +443,16 @@ class CubeSandboxRuntime:
         )
         public_llm_gateway = _rewrite_to_public(raw_llm_gateway, self._public_host)
         public_tool_broker = _rewrite_to_public(raw_tool_broker, self._public_host)
+        # Canvas v2 (Phase B): append ``canvas_tool`` to RUNTIME_EXTENSIONS when
+        # the per-run ``enable_canvas_tool`` flag is on (failure-open — flag off
+        # leaves the base extensions unchanged).
+        runtime_extensions = runtime_extensions_for_run(
+            base_extensions=self._settings.runtime_extensions,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            flag_url=self._settings.feature_flag_url,
+            timeout_ms=self._settings.feature_flag_timeout_ms,
+        )
         env = {
             "LLM_API_KEY": sandbox_llm_api_key,
             "LLM_MODEL": self._settings.llm_model,
@@ -457,7 +470,7 @@ class CubeSandboxRuntime:
             "SKILL_STORE_URL": service_env["SKILL_STORE_URL"],
             "WEB_FETCH_GATEWAY_URL": service_env["WEB_FETCH_GATEWAY_URL"],
             "DLP_URL": service_env["DLP_URL"],
-            "RUNTIME_EXTENSIONS": self._settings.runtime_extensions,
+            "RUNTIME_EXTENSIONS": runtime_extensions,
             "FOUNDATION_SERVICE_SCOPES": SANDBOX_SERVICE_SCOPES,
             "RUN_ID": run_id,
             # The Claude Agent SDK CLI tries to phone home (Statsig / BigQuery 1P
@@ -993,7 +1006,7 @@ class CubeSandboxRuntime:
         # and a ``{"items": [...]}`` wrapper (the shape ``list_containers`` reads).
         sandboxes = body if isinstance(body, list) else body.get("items", [])
 
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         deleted = 0
         for vm in sandboxes:
             meta = vm.get("metadata") or {}
@@ -1017,7 +1030,7 @@ class CubeSandboxRuntime:
             except ValueError:
                 continue  # unparseable -> fail safe, skip
             if started.tzinfo is None:
-                started = started.replace(tzinfo=timezone.utc)
+                started = started.replace(tzinfo=UTC)
             age = (now - started).total_seconds()
             if age <= max_age_seconds:
                 continue

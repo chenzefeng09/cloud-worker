@@ -31,6 +31,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import re
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import suppress
 from typing import Any
@@ -80,6 +81,38 @@ _SANDBOX_GONE_GRACE_SECONDS = 30 * 60  # 30 minutes
 
 def _run_token_stream_key(run_id: str) -> str:
     return f"agent:run:{run_id}:tokens"
+
+
+def _run_canvas_key(run_id: str) -> str:
+    return f"agent:run:{run_id}:canvas"
+
+
+# ── Canvas materialization guard (canvas v2, Phase B) ─────────────────────────
+# Server-authoritative over-trigger guard: even though the worker's system
+# prompt tells the model to reserve ``create_canvas`` for substantial
+# deliverables, the model can still over-fire.  Before materializing a payload
+# from run-state we require it to look like a real long-form document; anything
+# below threshold is skipped (logged at INFO, fail-open — the content is already
+# in the chat message, so skipping loses nothing).  Module-level so they are
+# easy to tune.
+_CANVAS_MIN_CHARS = 200  # min whitespace-stripped content_markdown length
+_CANVAS_MIN_BLOCKS = 2    # min paragraphs (split on blank lines)
+
+
+def _canvas_payload_passes_guard(payload: dict[str, Any]) -> bool:
+    """True when a run-state canvas payload is substantial enough to materialize.
+
+    Rejects payloads whose ``content_markdown`` is shorter than
+    ``_CANVAS_MIN_CHARS`` (whitespace-stripped) or splits into fewer than
+    ``_CANVAS_MIN_BLOCKS`` blank-line-separated segments.  Shared by the
+    streaming and reconcile materialization paths so both apply the identical
+    rule.
+    """
+    content = str(payload.get("content_markdown") or "")
+    if len(content.strip()) < _CANVAS_MIN_CHARS:
+        return False
+    segments = [seg for seg in re.split(r"\n{2,}", content.strip()) if seg.strip()]
+    return len(segments) >= _CANVAS_MIN_BLOCKS
 
 
 def _sanitize_tool_text(value: Any, *, limit: int = _MAX_TOOL_TEXT_CHARS) -> str:
@@ -634,6 +667,164 @@ async def _redis_stream_has_end_marker(
     finally:
         with suppress(Exception):
             await client.aclose()
+
+
+async def _read_canvas_payloads_from_redis(
+    *,
+    redis_url: str,
+    run_id: str,
+) -> list[dict[str, Any]]:
+    """Read the run's accumulated canvas payloads from ``agent:run:{id}:canvas``.
+
+    The worker's ``create_canvas`` tool appends each payload (``{kind, title,
+    content_markdown, seq}``) to a JSON list under this key (see
+    ``RunStateClient.push_canvas``).  Returns the list ordered by the 1-based
+    ``seq`` the worker assigned; ``[]`` on any connect/read/parse error
+    (failure-open — a missing canvas channel simply means no canvas to
+    materialize, and the reply text is always in the chat message).
+    """
+    try:
+        import redis.asyncio as aioredis  # type: ignore[import-not-found]
+
+        client = aioredis.Redis.from_url(
+            redis_url,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+            decode_responses=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis canvas connect failed: %s", exc)
+        return []
+
+    try:
+        raw = await client.get(_run_canvas_key(run_id))
+        if not raw:
+            return []
+        items = json.loads(raw)
+        if not isinstance(items, list):
+            return []
+        payloads = [it for it in items if isinstance(it, dict)]
+        payloads.sort(key=lambda it: int(it.get("seq") or 0))
+        return payloads
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis canvas read failed: %s", exc)
+        return []
+    finally:
+        with suppress(Exception):
+            await client.aclose()
+
+
+async def _materialize_pending_canvases(
+    *,
+    run: Run,
+    user_id: str,
+    svc: SessionService,
+    tenant_id: str,
+    redis_url: str | None,
+) -> list[str]:
+    """Materialize not-yet-created canvas payloads for ``run`` (canvas v2, Phase B).
+
+    Shared by the streaming loop and the run-completion reconcile path so both
+    check run-state for canvas payloads the worker's ``create_canvas`` tool
+    wrote.  Steps, per payload ordered by ``seq``:
+
+    1. **Idempotency** — payloads carry a 1-based ``seq``; we materialize only
+       those whose ``seq`` exceeds the count of canvases already created for this
+       run (``count_canvases_for_run``).  A replay (SSE reconnect / reconcile
+       re-poll) therefore never double-creates.
+    2. **Over-trigger guard** — ``_canvas_payload_passes_guard`` skips payloads
+       that are too short / too few blocks (logged at INFO, fail-open).  A
+       skipped payload still counts against the seq cursor so a later, larger
+       payload keeps its own seq alignment.
+    3. **Materialize** — ``CanvasService.create_canvas`` (content + source_run_id)
+       creates the document + v1 version; then backfill the run's assistant
+       message ``canvas_id`` when one is already persisted.
+
+    Returns a list of ``canvas_created`` SSE strings (one per newly materialized
+    canvas).  Fail-open (design invariant 5): any error is logged as a WARNING
+    and the reply body still flows through the normal message path — a failed
+    materialization never blocks run completion.
+    """
+    if not redis_url:
+        return []
+    try:
+        payloads = await _read_canvas_payloads_from_redis(
+            redis_url=redis_url, run_id=run.id
+        )
+        if not payloads:
+            return []
+
+        # Local import: keep the canvas service off the hot import path for
+        # runs that never touch canvases.
+        from agent_session_orchestrator.services.canvas_service import CanvasService
+
+        canvas_svc = CanvasService(svc._db, tenant_id=tenant_id)  # noqa: SLF001
+        already = await canvas_svc.count_canvases_for_run(run.id)
+
+        events: list[str] = []
+        for payload in payloads:
+            seq = int(payload.get("seq") or 0)
+            # Skip any payload at or below the count already materialized —
+            # idempotency across replays/paths.
+            if seq <= already:
+                continue
+
+            if not _canvas_payload_passes_guard(payload):
+                logger.info(
+                    "canvas payload below guard threshold; skipping "
+                    "materialization",
+                    extra={
+                        "run_id": run.id,
+                        "title": str(payload.get("title") or ""),
+                        "chars": len(str(payload.get("content_markdown") or "").strip()),
+                    },
+                )
+                # Count it as consumed so the seq cursor stays aligned; the next
+                # eligible payload is judged against the same ``already`` base
+                # because no canvas row was created.  We bump ``already`` to this
+                # seq so re-reads on the next poll don't re-log the same skip.
+                already = seq
+                continue
+
+            canvas = await canvas_svc.create_canvas(
+                run.session_id,
+                user_id=user_id,
+                content=str(payload.get("content_markdown") or ""),
+                kind=str(payload.get("kind") or "article"),
+                title=str(payload.get("title") or "").strip() or None,
+                source_run_id=run.id,
+            )
+            already = seq
+
+            message_id = await canvas_svc.backfill_message_canvas_id(
+                session_id=run.session_id,
+                run_id=run.id,
+                canvas_id=canvas.id,
+            )
+
+            event_payload: dict[str, Any] = {
+                "canvas_id": canvas.id,
+                "run_id": run.id,
+            }
+            if message_id is not None:
+                event_payload["message_id"] = message_id
+            events.append(_sse("canvas_created", event_payload))
+            logger.info(
+                "materialized canvas from run-state",
+                extra={
+                    "run_id": run.id,
+                    "canvas_id": canvas.id,
+                    "seq": seq,
+                },
+            )
+        return events
+    except Exception as exc:  # noqa: BLE001 — fail-open (invariant 5)
+        logger.warning(
+            "canvas materialization failed (fail-open): %s",
+            exc,
+            extra={"run_id": run.id},
+        )
+        return []
 
 
 async def _dlp_scan_transcript(
@@ -1328,6 +1519,19 @@ async def stream_session(
                         if _plan:
                             latest_plan_steps = _plan
                             latest_plan_run_id = r.id
+                        # Materialize any canvas payloads the worker wrote to
+                        # run-state (Phase B).  Idempotent + fail-open — safe to
+                        # run every poll while the run is active (a canvas created
+                        # mid-run surfaces immediately) and again post-completion.
+                        events.extend(
+                            await _materialize_pending_canvases(
+                                run=r,
+                                user_id=session_user_id,
+                                svc=svc,
+                                tenant_id=tenant_id,
+                                redis_url=redis_url,
+                            )
+                        )
                         # If the run we're about to stream just reached a terminal
                         # state, remember it: once its durable message rows are
                         # emitted below we can skip the (duplicate) token replay.
@@ -1484,6 +1688,20 @@ async def stream_session(
                                         },
                                     )
                                 )
+                            # Materialize canvas payloads written by this run's
+                            # create_canvas tool (Phase B).  Placed BEFORE the
+                            # message emit below so the backfilled canvas_id lands
+                            # on the assistant message row we then stream out.
+                            # Idempotent with the in-poll materialization above.
+                            post_stream_events.extend(
+                                await _materialize_pending_canvases(
+                                    run=run_obj,
+                                    user_id=session_user_id,
+                                    svc=svc,
+                                    tenant_id=tenant_id,
+                                    redis_url=redis_url,
+                                )
+                            )
                             # Emit newly persisted messages produced by reconcile.
                             new_items, _ = await svc.list_messages(
                                 session_id,

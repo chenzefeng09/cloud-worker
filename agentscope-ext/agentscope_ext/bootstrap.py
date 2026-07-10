@@ -25,6 +25,7 @@ _LOG = logging.getLogger(__name__)
 
 # Map env-name -> dotted module path with an ``install`` callable.
 _KNOWN: dict[str, str] = {
+    "canvas_tool": "agentscope_ext.canvas_tool",
     "event_audit_sink": "agentscope_ext.event_audit_sink",
     "llm_gateway_enforcer": "agentscope_ext.llm_gateway_enforcer",
     "mcp_tenant_injector": "agentscope_ext.mcp_tenant_injector",

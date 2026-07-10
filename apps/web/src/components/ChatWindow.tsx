@@ -36,6 +36,7 @@ import {
   isUserScrollingAwayFromBottom,
   resolveTranscriptScrollState,
 } from '../lib/chatScroll';
+import { useCanvasStore } from '../stores/canvasStore';
 
 // Stable empty list for the pending-interactions selector — a fresh `[]` per
 // getSnapshot call would re-render forever (Zustand caches by reference).
@@ -302,6 +303,7 @@ export function ChatWindow({
   inlineCanvasEditError,
   inlineCanvasSuggestion,
   inlineCanvasAnchorMessageId,
+  inlineCanvasV2Id,
   hiddenMessageIds,
   onInlineCanvasDraftChange,
   onInlineCanvasRequestEdit,
@@ -309,6 +311,8 @@ export function ChatWindow({
   onInlineCanvasOpenPanel,
   onInlineCanvasAcceptSuggestion,
   onInlineCanvasRejectSuggestion,
+  externalPrefill,
+  onExternalPrefillConsumed,
 }: {
   sessionId: string;
   friendly?: boolean;
@@ -321,6 +325,8 @@ export function ChatWindow({
   inlineCanvasEditError?: string | null;
   inlineCanvasSuggestion?: CanvasEditSuggestion | null;
   inlineCanvasAnchorMessageId?: string | null;
+  /** canvas.v2 ON: id of a server canvas object to render inline instead of the draft-mode card. */
+  inlineCanvasV2Id?: string | null;
   hiddenMessageIds?: string[];
   onInlineCanvasDraftChange?: (draft: CanvasDocumentDraft) => void;
   onInlineCanvasRequestEdit?: (request: CanvasEditRequest) => void | Promise<void>;
@@ -328,6 +334,10 @@ export function ChatWindow({
   onInlineCanvasOpenPanel?: () => void;
   onInlineCanvasAcceptSuggestion?: () => void;
   onInlineCanvasRejectSuggestion?: () => void;
+  /** canvas.v2: text to push back into the composer after a failed silent edit
+   *  (fail-open — the user's input is never lost). */
+  externalPrefill?: string | null;
+  onExternalPrefillConsumed?: () => void;
 }) {
   const {
     messages,
@@ -384,16 +394,25 @@ export function ChatWindow({
   // First-use data-usage notice: show once per device, then remember the
   // acknowledgement in localStorage so it never appears again.
   const [showDataNotice, setShowDataNotice] = useState(false);
+  // canvas.v2: read the server canvas directly so the hide-gate can verify it
+  // actually holds non-empty content, same structural guarantee as draft mode.
+  // Selector returns a stable reference (or undefined) — never a fresh object.
+  const v2Canvas = useCanvasStore((s) => (inlineCanvasV2Id ? s.canvasesById[inlineCanvasV2Id] : undefined));
+  const v2HasContent = Boolean(v2Canvas && v2Canvas.blocks.some((b) => b.text.trim().length > 0));
   const canRenderInlineCanvas = Boolean(
-    inlineCanvasDraft && onInlineCanvasDraftChange && onInlineCanvasRequestEdit,
+    (inlineCanvasDraft && onInlineCanvasDraftChange && onInlineCanvasRequestEdit) ||
+      (inlineCanvasV2Id && v2Canvas),
   );
   // A message may only be hidden behind the inline canvas when that canvas is
   // both renderable AND actually carries the lifted body. Hiding on the basis
   // of `hiddenMessageIds` alone black-holes the message whenever the canvas is
   // torn down or its draft is still empty (the cross-page/home→task race). This
   // couples "message hidden" to "content is rendered somewhere" structurally.
+  // The v2 path mirrors this exactly: it's only "hideable" once the server
+  // canvas is loaded AND has at least one non-empty block.
   const canHideBehindCanvas = Boolean(
-    canRenderInlineCanvas && inlineCanvasDraft && inlineCanvasDraft.content.trim().length > 0,
+    (canRenderInlineCanvas && inlineCanvasDraft && inlineCanvasDraft.content.trim().length > 0) ||
+      (inlineCanvasV2Id && v2HasContent),
   );
   const visibleMessages = useMemo(
     () =>
@@ -509,9 +528,23 @@ export function ChatWindow({
   // and the design-fixture flag is on. DESIGN FIXTURE — remove the fixture
   // block when backend provides real data.
   const showFixture =
-    SHOW_DESIGN_FIXTURES && visibleMessages.length === 0 && !isStreaming && !inlineCanvasDraft;
+    SHOW_DESIGN_FIXTURES &&
+    visibleMessages.length === 0 &&
+    !isStreaming &&
+    !inlineCanvasDraft &&
+    !inlineCanvasV2Id;
 
   const renderInlineCanvasCard = () => {
+    if (inlineCanvasV2Id) {
+      return (
+        <CanvasMessageCard
+          sessionId={sessionId}
+          canvasId={inlineCanvasV2Id}
+          aiDisabled={isStreaming}
+          onOpenPanel={onInlineCanvasOpenPanel}
+        />
+      );
+    }
     if (!canRenderInlineCanvas || !inlineCanvasDraft || !onInlineCanvasDraftChange || !onInlineCanvasRequestEdit) {
       return null;
     }
@@ -648,7 +681,11 @@ export function ChatWindow({
             ))}
 
           {/* ── Empty state (fixtures off, no messages) ── */}
-          {!showFixture && visibleMessages.length === 0 && !isStreaming && !inlineCanvasDraft && (
+          {!showFixture &&
+            visibleMessages.length === 0 &&
+            !isStreaming &&
+            !inlineCanvasDraft &&
+            !inlineCanvasV2Id && (
             <div className="flex-1 flex items-center justify-center py-16">
               <span className="font-mono italic text-dim text-[12px]">
                 开始与 AI Agent 对话
@@ -708,8 +745,14 @@ export function ChatWindow({
         isStreaming={isStreaming}
         onStop={cancel}
         onUpload={handleUpload}
-        prefill={prefillText}
-        onPrefillConsumed={clearPrefill}
+        prefill={externalPrefill || prefillText}
+        onPrefillConsumed={() => {
+          if (externalPrefill) {
+            onExternalPrefillConsumed?.();
+          } else {
+            clearPrefill();
+          }
+        }}
         sessionId={sessionId}
         skills={skills}
         selectedSkills={selectedSkills}
