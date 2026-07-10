@@ -205,6 +205,15 @@ async def _stream_tokens(
                             break
                     elif idle_reads >= 2:
                         break
+                # Reached only when this empty read did NOT break out of the
+                # tail (i.e. we're staying to wait for more entries).  Emit a
+                # ``ping`` heartbeat so the client's stall watchdog sees bytes
+                # during long silent gaps — the model thinking between tool
+                # batches has been observed at 36.7s of silence, well past any
+                # reasonable client-side stall timeout.  Placed after all break
+                # decisions so we never ping on a read that is about to end the
+                # tail (an extra ping there would be harmless but pointless).
+                yield _sse("ping", {"run_id": run_id})
                 continue
 
             for _key, entries in batches:
@@ -893,6 +902,16 @@ async def stream_session(
       ``plan``          — structured plan steps update.
       ``message``       — newly persisted message row.
       ``run_complete``  — active run reached a terminal state.
+      ``ping``          — liveness heartbeat carrying no payload of interest.
+        Emitted on every otherwise-silent poll (no active run, nothing new to
+        send) and on every idle read while tailing an active run's token stream
+        (the model can go quiet for tens of seconds between tool batches).  It
+        exists purely so the client can run a stall watchdog: "no bytes at all"
+        is indistinguishable from a wedged connection, whereas a missing ping
+        past the heartbeat interval means the stream has silently stopped and
+        the client should reconnect (reconnect replays from ``0-0`` and the
+        first ``/messages`` poll synthesises ``run_complete``, so recovery is
+        self-converging).  Clients MUST treat ``ping`` as a no-op otherwise.
       ``done``          — stream deadline exhausted; client should close.
       ``error``         — unexpected server error; detail is opaque.
 
@@ -1378,7 +1397,15 @@ async def stream_session(
                     await asyncio.sleep(_POLL_INTERVAL_SECONDS)
                     continue
 
-                # No active run this poll — sleep and keep the connection alive.
+                # No active run this poll — reaching here means no active tail
+                # and no paused replay ran (both `continue` above), so the only
+                # thing that could have been yielded is the buffered `events`
+                # list.  If that too was empty, emit a ``ping`` heartbeat so the
+                # client's stall watchdog can tell a quiet-but-healthy stream
+                # from a silently wedged one.  A poll that DID yield events skips
+                # the ping — it already proved the stream is live.
+                if not events:
+                    yield _sse("ping", {})
                 await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
             yield _sse("done", {})

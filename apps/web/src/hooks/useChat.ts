@@ -23,7 +23,9 @@ import type { Message, MessageAttachment, PendingInteractionItem } from '../api/
 //   message_created→ addMessage  (backend echo of the user message)
 //   agent_message  → addMessage  (legacy event name — treated same as message)
 //   plan           → setPlanSteps
-//   run_complete   → setIsStreaming(false)
+//   run_complete   → setIsStreaming(false) + one-shot messages.list reconcile
+//   ping           → no-op (SSE keepalive heartbeat; see the silent-watchdog
+//                    note on runConnectLoop — presence of pings is what arms it)
 //   done           → onDone()  (5-min server window closed; NOT isStreaming)
 //   error          → addMessage SYSTEM + onDone()
 //   <unknown>      → console.warn (never silently dropped — a silent `message`
@@ -240,6 +242,29 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     } else {
       store.clearPendingInteractions(_ctx.sessionId);
     }
+
+    // Final durable-row backstop.  The silent-stall watchdog + replay path
+    // recovers a stream that stopped mid-flight, but a stream can also reach
+    // run_complete having dropped an individual durable row (e.g. a `message`
+    // frame lost to a transient hiccup that did NOT stall the whole tail).  On
+    // every completion we do a fire-and-forget re-pull of the canonical message
+    // list and feed each row back through addMessage — which dedups by id and
+    // inserts in sequence order, so this is fully idempotent and cheap when
+    // nothing is missing.  This is the LAST line of defence for lost durable
+    // rows; it never blocks the handler (must stay synchronous), so we run it
+    // inside a detached async IIFE.
+    const sessionId = _ctx.sessionId;
+    void (async () => {
+      try {
+        const page = await api.messages.list(sessionId);
+        const s = useChatStore.getState();
+        for (const m of page.items) {
+          s.addMessage(sessionId, m);
+        }
+      } catch (err) {
+        console.warn('[useChat] run_complete reconcile failed', err);
+      }
+    })();
   },
 
   run_stream_end(ctx, data) {
@@ -268,6 +293,17 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     }
     // When paused === true the pending_confirmation event (relayed in the same
     // stream) is the source of truth — leave the card and let the user act.
+  },
+
+  ping(_ctx, _data) {
+    // SSE keepalive heartbeat.  The orchestrator emits `event: ping` roughly
+    // once a second while it is otherwise idle (poll spin between runs, or an
+    // active tail that is momentarily quiet between tool batches).  It carries
+    // no application state — its ONLY purpose is liveness.  We intentionally do
+    // nothing here so it does not fall into the unknown-event console.warn path;
+    // the value is extracted in runConnectLoop, which treats every parsed event
+    // (ping included) as proof the connection is alive and arms the silent-
+    // stall watchdog once the first ping has been seen.
   },
 
   done(_ctx, _data) {
@@ -351,11 +387,26 @@ export async function parseSSEStream(
     }
     const rawData = dataLines.join('\n');
     const type = eventType || 'message';
+    // Two SEPARATE try/catch blocks on purpose.  Parsing and dispatching used to
+    // share one try, so a throw from inside a handler (onEvent) was swallowed by
+    // the "non-JSON frame" catch — a real handler bug would vanish silently and,
+    // worse, could look like a malformed frame.  Split them: a JSON.parse failure
+    // is an expected non-JSON data frame (skip quietly, SSE allows arbitrary
+    // data); a handler throw is a bug we must surface, but it must NOT abort the
+    // read loop — one bad frame can't be allowed to tear down the whole stream.
+    let data: Record<string, unknown>;
     try {
-      const data = JSON.parse(rawData);
-      onEvent(type, data);
+      data = JSON.parse(rawData);
     } catch {
       // Non-JSON data — skip silently (SSE allows arbitrary data frames).
+      eventType = '';
+      dataLines = [];
+      return;
+    }
+    try {
+      onEvent(type, data);
+    } catch (err) {
+      console.error('[useChat] SSE handler error for', type, err);
     }
     eventType = '';
     dataLines = [];
@@ -489,22 +540,103 @@ export function subscribeSessionStream(sid: string): () => void {
   };
 }
 
+// ── Silent-stall watchdog ─────────────────────────────────────────────────────
+//
+// The bug this guards against: the backend session SSE stream can go silent
+// mid-flight — the orchestrator's event loop starves after emitting a few
+// tokens, so the worker has finished and Redis holds the full transcript, but
+// the socket sends no further bytes AND never closes.  runConnectLoop's reader
+// only reconnects when the read loop RETURNS (EOF) or THROWS; "connected but
+// forever byteless" is invisible to it, so the UI hangs (a lone THOUGHT, no
+// answer) until a manual refresh.
+//
+// The fix, in the same "consumer-side idempotent convergence" spirit as C2/C3:
+// the backend now emits an `event: ping` heartbeat roughly once a second while
+// otherwise idle.  We time the gap between parsed SSE events (pings included)
+// and, if it exceeds the threshold, abort THIS connection attempt so the outer
+// loop reconnects.  On reconnect the server replays from the head (synthetic
+// run_complete + full message replay + a run_started that resets the offset
+// watermark), and the existing idempotency (offset watermark, closedStreamRuns,
+// addMessage id-dedup) makes the replay converge with zero extra state.
+//
+// Why only AFTER the first ping (`sawPing`):
+//   Older backends that predate the heartbeat never send pings, and on those a
+//   legitimately busy run can sit silent for 30s+ between tool batches while the
+//   model thinks.  Arming the watchdog there would kill healthy connections.
+//   Requiring at least one ping first means we only ever fire against a backend
+//   that has PROMISED ~1Hz liveness — so a long gap genuinely means "stalled",
+//   not "thinking".
+//
+// Why 30s:
+//   Comfortably above the ~1s ping cadence (so ordinary jitter, GC pauses, or a
+//   brief network hiccup never trip it) yet short enough that a real stall is
+//   recovered in well under the old "refresh the page" timescale.
+const WATCHDOG_STALL_MS = 30_000;
+const WATCHDOG_CHECK_MS = 5_000;
+
+/**
+ * Pure predicate for the silent-stall watchdog: should the current connection
+ * attempt be aborted?  Extracted so the decision is unit-testable without
+ * standing up a fetch/reader.
+ *
+ *   sawPing     — has THIS connection received at least one `ping` event?
+ *   lastEventAt — Date.now() of the most recent parsed SSE event (any type).
+ *   now         — current time.
+ *
+ * Only fires once a ping has been seen (see the sawPing rationale above) and the
+ * gap since the last event exceeds WATCHDOG_STALL_MS.
+ */
+export function shouldWatchdogFire(
+  sawPing: boolean,
+  lastEventAt: number,
+  now: number,
+): boolean {
+  return sawPing && now - lastEventAt > WATCHDOG_STALL_MS;
+}
+
 /** The reconnecting fetch loop for one session's SSE stream. */
 async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> {
-  const { controller } = handle;
+  const { controller: master } = handle;
   let backoffMs = 1000;
 
   while (!handle.cancelled) {
     const connectStart = Date.now();
+
+    // Per-attempt controller.  The master controller (handle.controller) is the
+    // real unsubscribe/teardown signal; each connection attempt gets its OWN
+    // controller so the watchdog can abort just this attempt (triggering a
+    // reconnect) without touching the master.  We bridge master → attempt so a
+    // genuine teardown still kills the in-flight fetch.
+    const attempt = new AbortController();
+    const onMasterAbort = () => attempt.abort();
+    if (master.signal.aborted) {
+      // Torn down between iterations — bail before opening another fetch.
+      break;
+    }
+    master.signal.addEventListener('abort', onMasterAbort, { once: true });
+
+    // Watchdog state for THIS attempt.  lastEventAt is refreshed by every parsed
+    // event (including ping) via the onEvent callback below; sawPing latches once
+    // the first ping lands and only then does the interval arm the abort.
+    let lastEventAt = Date.now();
+    let sawPing = false;
+    let watchdogFired = false;
+    const watchdogTimer = setInterval(() => {
+      if (shouldWatchdogFire(sawPing, lastEventAt, Date.now())) {
+        watchdogFired = true;
+        attempt.abort();
+      }
+    }, WATCHDOG_CHECK_MS);
+
     try {
       const res = await fetch(`/api/bff/v1/sessions/${sid}/stream`, {
         credentials: 'include',
-        signal: controller.signal,
+        signal: attempt.signal,
       });
 
       if (!res.ok || !res.body) {
         console.warn(`[useChat] session stream ${res.status} for ${sid}; backing off ${backoffMs}ms`);
-        await delay(backoffMs, controller.signal);
+        await delay(backoffMs, attempt.signal);
         backoffMs = Math.min(backoffMs * 2, 8000);
         continue;
       }
@@ -514,24 +646,86 @@ async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> 
       const reader = res.body.getReader();
       let doneFired = false;
 
-      await parseSSEStream(reader, (eventType, data) => {
-        if (eventType === 'done') doneFired = true;
-        handleSSEEvent(sid, eventType, data, () => {
-          doneFired = true;
+      // Explicitly cancel the reader when the attempt aborts.  Aborting the
+      // fetch signal errors the body stream in a live browser, but we do NOT
+      // rely on that propagation: a watchdog abort must reject the parked
+      // reader.read() promptly (and this also makes the path testable with a
+      // hand-rolled response body).  reader.cancel() rejects the pending read,
+      // surfacing as an AbortError-shaped rejection routed to the catch below.
+      const onAttemptAbort = () => {
+        reader.cancel().catch(() => {});
+      };
+      if (attempt.signal.aborted) {
+        onAttemptAbort();
+      } else {
+        attempt.signal.addEventListener('abort', onAttemptAbort, { once: true });
+      }
+
+      try {
+        await parseSSEStream(reader, (eventType, data) => {
+          // Every parsed event proves the connection is alive — refresh the
+          // watchdog clock before dispatching (ping included; that's the point).
+          lastEventAt = Date.now();
+          if (eventType === 'ping') sawPing = true;
+          if (eventType === 'done') doneFired = true;
+          handleSSEEvent(sid, eventType, data, () => {
+            doneFired = true;
+          });
         });
-      });
+      } finally {
+        attempt.signal.removeEventListener('abort', onAttemptAbort);
+      }
+
+      // parseSSEStream returned normally.  If the watchdog aborted mid-stream,
+      // reader.cancel() makes the read loop hit EOF (a clean return) rather than
+      // throw — so translate a watchdog abort here into the reconnect path
+      // instead of falling through to the "closed unexpectedly" backoff.
+      if (watchdogFired && !handle.cancelled) {
+        console.warn(
+          `[useChat] session stream for ${sid} silent >${WATCHDOG_STALL_MS}ms after ping; watchdog reconnecting`,
+        );
+        backoffMs = 1000;
+        try {
+          await delay(backoffMs, master.signal);
+          continue;
+        } catch {
+          break; // master aborted during backoff delay
+        }
+      }
 
       if (!handle.cancelled) {
         if (doneFired) {
-          await delay(1000, controller.signal);
+          await delay(1000, attempt.signal);
         } else {
           console.warn(`[useChat] session stream closed unexpectedly for ${sid}; reconnecting in ${backoffMs}ms`);
-          await delay(backoffMs, controller.signal);
+          await delay(backoffMs, attempt.signal);
           backoffMs = Math.min(backoffMs * 2, 8000);
         }
       }
     } catch (e) {
-      if ((e as Error).name === 'AbortError') break;
+      if ((e as Error).name === 'AbortError') {
+        // Distinguish a genuine teardown from a watchdog-forced reconnect.  Only
+        // a real unsubscribe (handle.cancelled) should exit the loop; a watchdog
+        // abort must fall through to the reconnect path.
+        if (handle.cancelled) break;
+        if (watchdogFired) {
+          console.warn(
+            `[useChat] session stream for ${sid} silent >${WATCHDOG_STALL_MS}ms after ping; watchdog reconnecting`,
+          );
+          // Reset backoff to 1s: the server is reachable (it was heartbeating),
+          // this is a stall not an outage, so reconnect promptly.
+          backoffMs = 1000;
+          try {
+            await delay(backoffMs, master.signal);
+          } catch {
+            break; // master aborted during backoff delay
+          }
+          continue;
+        }
+        // AbortError without cancelled/watchdogFired: master aborted mid-fetch
+        // (teardown raced the once-listener) — exit.
+        break;
+      }
       const elapsed = Date.now() - connectStart;
       if (elapsed < 200) {
         backoffMs = Math.min(backoffMs * 2, 8000);
@@ -539,11 +733,16 @@ async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> 
       if (!handle.cancelled) {
         console.warn(`[useChat] session stream error for ${sid}; reconnecting in ${backoffMs}ms`, e);
         try {
-          await delay(backoffMs, controller.signal);
+          await delay(backoffMs, master.signal);
         } catch {
           break; // aborted during backoff delay
         }
       }
+    } finally {
+      // Always tear down this attempt's watchdog + master bridge so neither
+      // leaks across reconnects.
+      clearInterval(watchdogTimer);
+      master.signal.removeEventListener('abort', onMasterAbort);
     }
   }
 }

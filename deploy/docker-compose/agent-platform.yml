@@ -246,7 +246,11 @@ services:
     restart: unless-stopped
     environment:
       SESSION_ORCHESTRATOR_ENV: dev
-      SESSION_ORCHESTRATOR_LOG_LEVEL: DEBUG
+      # INFO (not DEBUG): DEBUG on the SSE path fire-hoses the log pipe and can
+      # back up ``docker logs`` enough to starve the event loop and stall the
+      # stream. SQL echo is separately gated (SESSION_ORCHESTRATOR_SQL_ECHO,
+      # default false) — raise the log level here only for targeted debugging.
+      SESSION_ORCHESTRATOR_LOG_LEVEL: INFO
       SESSION_ORCHESTRATOR_HTTP_PORT: "8006"
       # asyncpg's prepared-statement model is incompatible with pgbouncer
       # in transaction pool mode (see ``DuplicatePreparedStatementError``).
