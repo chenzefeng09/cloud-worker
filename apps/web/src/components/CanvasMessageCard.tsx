@@ -15,9 +15,11 @@ import {
   markdownToCanvasHtml,
 } from '../lib/canvasRichText';
 import { CopyIcon, useCopied } from './CopyButton';
+import { SuggestionDiffView } from './SuggestionDiffView';
 import { useCanvasStore } from '../stores/canvasStore';
 import { useChatStore } from '../stores/chatStore';
-import type { CanvasBlock } from '../api/types';
+import { api } from '../api/client';
+import type { CanvasBlock, CanvasVersionSummary } from '../api/types';
 
 interface CanvasMessageCardProps {
   sessionId: string;
@@ -172,6 +174,7 @@ export function CanvasMessageCard({
   const requestEditAction = useCanvasStore((s) => s.requestEdit);
   const applySuggestionAction = useCanvasStore((s) => s.applySuggestion);
   const saveManualAction = useCanvasStore((s) => s.saveManual);
+  const revertAction = useCanvasStore((s) => s.revert);
   const clearErrorAction = useCanvasStore((s) => s.clearError);
 
   // Derive a CanvasDocumentDraft-shaped view from the server canvas so the
@@ -295,6 +298,11 @@ export function CanvasMessageCard({
   const [busy, setBusy] = useState(false);
   const [history, setHistory] = useState<string[]>([]);
   const [future, setFuture] = useState<string[]>([]);
+  // ── Version history (canvasId mode only) ──────────────────────────────────
+  const [versionsOpen, setVersionsOpen] = useState(false);
+  const [versions, setVersions] = useState<CanvasVersionSummary[] | null>(null);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [versionsError, setVersionsError] = useState<string | null>(null);
   const inlineSuggestionPreview = useMemo(
     () => buildInlineSuggestionPreview(draft.content, suggestion),
     [draft.content, suggestion],
@@ -386,6 +394,44 @@ export function CanvasMessageCard({
     const blocks = splitIntoBlocks(content, storeCanvas.blocks);
     void saveManualAction(canvasId, blocks, storeCanvas.current_version);
   }, [canvasId, saveManualAction, storeCanvas]);
+
+  // ── Version history (canvasId mode only) ──────────────────────────────────
+  // Lightweight: toggle a dropdown, lazily fetch the version list, revert to a
+  // chosen version (append a new version server-side). No diff preview.
+  const toggleVersions = useCallback(() => {
+    if (!canvasId) return;
+    setVersionsOpen((open) => {
+      const next = !open;
+      if (next) {
+        setVersionsLoading(true);
+        setVersionsError(null);
+        api.canvas
+          .versions(canvasId)
+          .then((res) => setVersions(res.items))
+          .catch((err) => {
+            setVersionsError(
+              err instanceof Error && err.message ? err.message : '无法加载版本历史。',
+            );
+          })
+          .finally(() => setVersionsLoading(false));
+      }
+      return next;
+    });
+  }, [canvasId]);
+
+  const handleRevert = useCallback(
+    async (toVersion: number) => {
+      if (!canvasId) return;
+      const ok = window.confirm(`确定回退到版本 ${toVersion}？将基于该版本创建一个新版本。`);
+      if (!ok) return;
+      const reverted = await revertAction(canvasId, toVersion);
+      if (reverted) {
+        setVersionsOpen(false);
+        setVersions(null);
+      }
+    },
+    [canvasId, revertAction],
+  );
 
   const commitContent = useCallback(
     (next: string, recordHistory = true) => {
@@ -659,6 +705,61 @@ export function CanvasMessageCard({
             </select>
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            {canvasId && (
+              <div className="canvas-card-history">
+                <button
+                  type="button"
+                  className="cw-btn cw-btn-ghost cw-btn-sm"
+                  onClick={toggleVersions}
+                  title="版本历史"
+                  aria-label="版本历史"
+                  aria-expanded={versionsOpen}
+                >
+                  历史
+                </button>
+                {versionsOpen && (
+                  <div className="canvas-card-history-pop" role="menu" aria-label="版本历史">
+                    <div className="canvas-card-history-head">版本历史</div>
+                    {versionsLoading && (
+                      <div className="canvas-card-history-empty">加载中…</div>
+                    )}
+                    {versionsError && (
+                      <div className="canvas-card-history-error" role="alert">
+                        {versionsError}
+                      </div>
+                    )}
+                    {!versionsLoading && !versionsError && versions && versions.length === 0 && (
+                      <div className="canvas-card-history-empty">暂无历史版本。</div>
+                    )}
+                    {!versionsLoading &&
+                      !versionsError &&
+                      versions &&
+                      versions.map((v) => (
+                        <button
+                          key={v.id}
+                          type="button"
+                          role="menuitem"
+                          className="canvas-card-history-item"
+                          onClick={() => void handleRevert(v.version)}
+                          disabled={revisingEffective}
+                          title={`回退到版本 ${v.version}`}
+                        >
+                          <span className="canvas-card-history-ver">v{v.version}</span>
+                          <span className="canvas-card-history-meta">
+                            <span className="canvas-card-history-summary">
+                              {v.change_summary?.trim() ||
+                                (v.created_by === 'user' ? '手动编辑' : '模型修改')}
+                            </span>
+                            <span className="canvas-card-history-sub">
+                              {new Date(v.created_at).toLocaleString()} · {v.created_by}
+                            </span>
+                          </span>
+                        </button>
+                      ))}
+                  </div>
+                )}
+              </div>
+            )}
             <button
               type="button"
               className="cw-btn cw-btn-ghost cw-btn-sm"
@@ -789,40 +890,12 @@ export function CanvasMessageCard({
             </section>
           )}
           {showCanvasIdSuggestion && storeSuggestion && (
-            <section className="canvas-suggestion-review" aria-label="修改建议">
-              <div className="canvas-suggestion-review-head">
-                <div className="min-w-0">
-                  <div className="canvas-suggestion-kicker">修改建议</div>
-                  <div className="canvas-suggestion-instruction">
-                    {storeSuggestion.change_summary || storeSuggestion.instruction}
-                  </div>
-                </div>
-                <div className="canvas-suggestion-actions">
-                  <button
-                    type="button"
-                    className="canvas-suggestion-reject"
-                    onClick={handleRejectSuggestion}
-                  >
-                    撤销
-                  </button>
-                  <button
-                    type="button"
-                    className="canvas-suggestion-accept"
-                    onClick={handleAcceptSuggestion}
-                  >
-                    接受
-                  </button>
-                </div>
-              </div>
-              <div className="canvas-suggestion-diffs">
-                {storeSuggestion.diffs.map((diff, i) => (
-                  <div key={`${diff.block_id}_${i}`} className="canvas-suggestion-diff-row">
-                    {diff.orig && <div className="canvas-inline-suggestion-old">{diff.orig}</div>}
-                    {diff.sugg && <div className="canvas-inline-suggestion-new">{diff.sugg}</div>}
-                  </div>
-                ))}
-              </div>
-            </section>
+            <SuggestionDiffView
+              suggestion={storeSuggestion}
+              onAccept={handleAcceptSuggestion}
+              onReject={handleRejectSuggestion}
+              busy={revisingEffective}
+            />
           )}
           {inlineSuggestionPreview && suggestion ? (
             <div className="canvas-rich-editor canvas-inline-editor canvas-suggestion-preview-document text-ink break-words">

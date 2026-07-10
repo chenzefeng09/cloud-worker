@@ -311,6 +311,8 @@ export function ChatWindow({
   onInlineCanvasOpenPanel,
   onInlineCanvasAcceptSuggestion,
   onInlineCanvasRejectSuggestion,
+  externalPrefill,
+  onExternalPrefillConsumed,
 }: {
   sessionId: string;
   friendly?: boolean;
@@ -332,6 +334,10 @@ export function ChatWindow({
   onInlineCanvasOpenPanel?: () => void;
   onInlineCanvasAcceptSuggestion?: () => void;
   onInlineCanvasRejectSuggestion?: () => void;
+  /** canvas.v2: text to push back into the composer after a failed silent edit
+   *  (fail-open — the user's input is never lost). */
+  externalPrefill?: string | null;
+  onExternalPrefillConsumed?: () => void;
 }) {
   const {
     messages,
@@ -739,8 +745,14 @@ export function ChatWindow({
         isStreaming={isStreaming}
         onStop={cancel}
         onUpload={handleUpload}
-        prefill={prefillText}
-        onPrefillConsumed={clearPrefill}
+        prefill={externalPrefill || prefillText}
+        onPrefillConsumed={() => {
+          if (externalPrefill) {
+            onExternalPrefillConsumed?.();
+          } else {
+            clearPrefill();
+          }
+        }}
         sessionId={sessionId}
         skills={skills}
         selectedSkills={selectedSkills}

@@ -25,6 +25,7 @@ import {
   type CanvasOpenSeed,
 } from '../lib/canvasObjects';
 import { findCanvasCreationReply } from '../lib/canvasCreation';
+import { routeCanvasIntent } from '../lib/canvasIntentRouting';
 import { api } from '../api/client';
 import type { MessageAttachment } from '../api/types';
 import { useFeatureFlag } from '../hooks/useFeatureFlags';
@@ -70,6 +71,7 @@ export function AgentPage() {
   const canvasV2 = useFeatureFlag('canvas.v2');
   const createCanvasFromMessage = useCanvasStore((s) => s.createFromMessage);
   const createCanvasFromContent = useCanvasStore((s) => s.createFromContent);
+  const requestCanvasEditAction = useCanvasStore((s) => s.requestEdit);
 
   const [previewFile, setPreviewFile] = useState<{ id: string; filename: string; mime?: string } | null>(null);
   const [canvasDraft, setCanvasDraft] = useState<CanvasDocumentDraft | null>(() =>
@@ -85,6 +87,9 @@ export function AgentPage() {
   // so the flag-off path never touches (and can never be affected by) these.
   const [pendingCanvasV2, setPendingCanvasV2] = useState<PendingCanvasCreationV2 | null>(null);
   const [inlineCanvasV2Id, setInlineCanvasV2Id] = useState<string | null>(null);
+  // canvas.v2 three-state routing: when an update-canvas send fails (409 / edit
+  // error), we refill the composer so the user never loses their typed text.
+  const [composerRefill, setComposerRefill] = useState<string | null>(null);
   // Silent canvas revision: request in flight + last error, both scoped to the
   // canvas card (never surfaced as chat messages).
   const [canvasRevising, setCanvasRevising] = useState(false);
@@ -144,6 +149,7 @@ export function AgentPage() {
     // is enough since nothing renders without it.
     setPendingCanvasV2(null);
     setInlineCanvasV2Id(null);
+    setComposerRefill(null);
   }, [id]);
 
   useEffect(() => {
@@ -277,10 +283,42 @@ export function AgentPage() {
 
   const sendMessageWithCanvasDetection = useCallback(
     (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => {
+      // canvas.v2 three-state routing (design §6.3 Phase A): when the flag is on
+      // and the session has an active canvas, a *modify-intent* message routes to
+      // the silent edit path — no chat message, no run. Attachments force the
+      // normal chat path (an edit request carries no files). The composer has
+      // already cleared its text (InputBar clears on send); on failure we refill
+      // it so the user never loses input (fail-open).
+      const hasAttachments = Boolean(attachmentIds && attachmentIds.length > 0);
+      if (
+        canvasV2 &&
+        id &&
+        inlineCanvasV2Id &&
+        !hasAttachments &&
+        routeCanvasIntent(text, true) === 'update_canvas'
+      ) {
+        const canvasId = inlineCanvasV2Id;
+        requestCanvasEditAction(canvasId, id, {
+          instruction: text,
+          scope: { type: 'document' },
+        })
+          .then((suggestion) => {
+            if (!suggestion) {
+              // 409 / edit failure — the store recorded a localized error on the
+              // card; refill the composer so nothing is lost.
+              setComposerRefill(text);
+            }
+          })
+          .catch(() => {
+            setComposerRefill(text);
+          });
+        return Promise.resolve();
+      }
+
       maybeStartCanvasFromPrompt(text, attachmentIds);
       return sendMessage(text, attachmentIds, attachmentsMeta);
     },
-    [maybeStartCanvasFromPrompt, sendMessage],
+    [canvasV2, id, inlineCanvasV2Id, maybeStartCanvasFromPrompt, requestCanvasEditAction, sendMessage],
   );
 
   // If HomePage routed us here with an `initialMessage` in state, dispatch it
@@ -580,6 +618,8 @@ export function AgentPage() {
               inlineCanvasSuggestion={canvasSuggestion}
               inlineCanvasAnchorMessageId={inlineCanvasAnchorMessageId}
               inlineCanvasV2Id={canvasV2 ? inlineCanvasV2Id : null}
+              externalPrefill={composerRefill}
+              onExternalPrefillConsumed={() => setComposerRefill(null)}
               hiddenMessageIds={hiddenCanvasMessageIds}
               onInlineCanvasDraftChange={setCanvasDraft}
               onInlineCanvasRequestEdit={requestCanvasEdit}
