@@ -173,7 +173,8 @@ POST /api/bff/v1/sessions/{sid}/canvases/{cid}/edit
   body: {
     instruction: str,                    # 用户指令
     scope: {type: "blocks"|"document", block_ids?: [str]},
-    model?: str                          # 缺省走 _resolve_default_model
+    model?: str,                         # 缺省走 _resolve_default_model
+    base_version?: int                   # 前端所见版本；与当前版本不符→立即 409，不调 LLM（前置乐观锁，省掉白烧的模型调用）
   }
   → 200 {suggestion: {id, base_version, diffs: [{block_id, op, orig, sugg}], change_summary}}
 ```
@@ -211,9 +212,17 @@ LLM 输出 schema：
 
 1. worker 注册 `create_canvas(kind, title, content_markdown)` 客户端工具——沿用现有 toolkit append 机制（同 `web_fetch`/`ask_user`：包裹 `hooks.build_toolkit`，append 到 `toolkit.tool_groups[0].tools`）。deepseek 经 gateway 走客户端工具已验证可行，但需系统提示强指令（本仓已知：deepseek 要强指令才调工具）。
 2. 工具执行 = 把 payload 写入 Redis run-state（复用 `RunStateClient`，模式对齐 `plan_steps`：worker 只写，orchestrator 读）。**不走 HTTP 回调**（worker→orchestrator 无内部端点，架构事实）。
-3. orchestrator 流式循环读到 canvas payload → 物化 canvas_document/version → SSE 推 `canvas_created {canvas_id, run_id, message_id?}`；run 结束的对账路径同样检查未物化的 payload（对齐 result.json 兜底模式），保证掉流也不丢。
+3. orchestrator 流式循环读到 canvas payload → **服务端二次过滤守卫**（内容 <200 字符或 <2 段 → 跳过物化，log 后 fail-open 到气泡；模型判断之外的权威护栏，防过度触发）→ 物化 canvas_document/version → SSE 推 `canvas_created {canvas_id, run_id, message_id?}`；run 结束的对账路径同样检查未物化的 payload（对齐 result.json 兜底模式），保证掉流也不丢。
 4. 前端 `useChat.ts` 的 `SSE_HANDLERS` 增加 `canvas_created`：拉取 canvas、渲染卡片。系统提示同步要求模型：调用工具后正文回复只写一句简短说明（内容在画布里），从供给侧消除「散文提取」需求。
 5. Phase B 稳定后：前端意图正则整体退役，`maybeStartCanvasFromPrompt` / `pendingCanvasCreation` 状态机删除。
+
+### 6.3 三态意图路由：create / update / chat（对标 ChatGPT 实测补强）
+
+会话存在**活跃画布**（本会话最近创建/编辑的 canvas）时，聊天框里的修改类指令（「把这段改简洁」「换个标题」「精简第二段」）必须路由到**编辑通路而绝不新建块**：
+
+- **Phase A（前端路由，随 PR-4）**：旗标开 + 活跃画布存在 + 消息命中修改意图（指代词/修改动词，谓词从窄）→ 直接调 §5.2 编辑端点（scope=document，携 base_version），suggestion 在卡内呈现；不建 run、不落聊天消息。未命中 → 正常聊天（含创作意图检测）。
+- **Phase B（模型路由）**：worker 增配套工具 `update_canvas(canvas_id, instruction)`——系统提示注入当前会话活跃画布的 id/title/摘要，模型自主选择 create/update/chat 三态；`update_canvas` 经同一 Redis 通道由 orchestrator 转发到编辑流程。
+- 铁律：存在活跃画布且用户在指代它时，禁止 create——「误新建第二块」与「误伤原文」同级严重。
 
 ---
 
@@ -294,3 +303,11 @@ interface CanvasStore {
 2. **LLM 调用位置**：本设计放 BFF（复用虚拟密钥/默认模型基建）。若后续画布编辑要进 run 语境（带会话历史），再评估移到 orchestrator 或 worker。
 3. **deepseek json 模式稳定性**：schema 校验 + 单次重试是否足够，灰度期看 `CANVAS.BAD_MODEL_OUTPUT` 错误率决定是否加第二重（few-shot 或切换支持严格 json_schema 的模型档）。
 4. **悬案 SSE handler**：`message_created` / `plan` 的产生方核实（PR-3 顺带）。
+
+### 12.1 对标 ChatGPT magic-edit 的取舍备忘（评审输入）
+
+**已吸收**：编辑请求 `base_version` 前置乐观锁（§5.2）；三态意图路由 create/update/chat（§6.3）；物化前服务端二次过滤守卫（§6 Phase B）。
+
+**刻意不同（不改）**：① suggestion 服务端落库持久化——对标实现的 diff 只活在前端内存、刷新即丢，与本仓「关键状态不放前端内存」的教训相悖；② 编辑走结构化 JSON 输出——对标实现让模型返回裸替换文本，正是我们退役的「回显+解析脆弱」老路；③ diffs 支持 insert_after/delete——对标只支持段替换。
+
+**P2（Tiptap 落地时）采纳**：块内子选区（PM 坐标 from/to + selectedText 冗余校验）；diff 以标记节点渲染（`data-me-role="orig|sugg"` / `data-me-id` / `data-me-segment` 风格的 DOM 约定，便于调试对照）；选区 BubbleMenu 浮动工具栏。块模型 [{id,type,text}] 可无损转 ProseMirror JSON，服务端 schema 不需要为此变更。
