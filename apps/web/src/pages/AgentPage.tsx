@@ -336,6 +336,25 @@ export function AgentPage() {
     }
   }, [canvasDraft?.kind, canvasDraft?.title, isStreaming, messages, pendingCanvasCreation]);
 
+  // Keep the inline-canvas anchor pinned to the draft's source message even
+  // after `pendingCanvasCreation` has cleared. On the home → task path the
+  // assistant reply's id changes when its transient streaming block is swapped
+  // for the durable DB row (and again on the run_complete re-pull). If that
+  // final id swap lands after pending creation is cleared, the anchor + hidden
+  // set would otherwise be stranded on a stale id — the message stays hidden
+  // while its card no longer renders anchored (the reported black hole). This
+  // effect re-binds both to whichever message currently carries the draft
+  // content, independent of the pending-creation lifecycle.
+  useEffect(() => {
+    const sourceId = canvasDraft?.sourceMessageId;
+    if (!sourceId || !inlineCanvasOpen) return;
+    if (!messages.some((m) => m.id === sourceId)) return;
+    setInlineCanvasAnchorMessageId((current) => (current === sourceId ? current : sourceId));
+    setHiddenCanvasMessageIds((current) =>
+      current.includes(sourceId) ? current : [...current, sourceId],
+    );
+  }, [canvasDraft?.sourceMessageId, inlineCanvasOpen, messages]);
+
   const acceptCanvasSuggestion = useCallback(() => {
     setCanvasDraft((current) => {
       if (!current || !canvasSuggestion || current.id !== canvasSuggestion.request.documentId) return current;
