@@ -5,7 +5,16 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -64,6 +73,10 @@ class Message(Base):
     tool_calls: Mapped[dict[str, object] | None] = mapped_column(JSONB, nullable=True)
     attachments: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     run_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Canvas v2: links a message to a materialized canvas document.  Phase A
+    # backfills this on the source assistant message; Phase B model replies
+    # carry it directly.  NULL for every ordinary (non-canvas) message.
+    canvas_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
     sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
@@ -134,3 +147,100 @@ class Attachment(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
     )
+
+
+class CanvasDocument(Base):
+    """A first-class canvas document (canvas v2 §3.1).
+
+    The canvas is scoped to a session so it rides the session's RLS / retention
+    / soft-delete.  ``current_version`` points at the head ``CanvasVersion``;
+    the actual block content lives in the version snapshots, never on this row.
+    """
+
+    __tablename__ = "canvas_document"
+    __table_args__ = {"schema": "session_orchestrator"}
+
+    id: Mapped[str] = mapped_column(String(30), primary_key=True, default=lambda: new_id("cvs"))
+    tenant_id: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    session_id: Mapped[str] = mapped_column(
+        String(30), ForeignKey("session_orchestrator.session.id"), nullable=False, index=True,
+    )
+    user_id: Mapped[str] = mapped_column(String(30), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    current_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default="1",
+    )
+    source_message_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    source_run_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=utcnow, onupdate=utcnow, server_default=func.now(),
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class CanvasVersion(Base):
+    """An immutable full-blocks snapshot of a canvas (canvas v2 §3.2).
+
+    Every change — model-suggestion accept, manual save, or revert — appends a
+    new row; history is never mutated.  ``blocks`` is the whole document
+    (``[{id, type, text}]``), so a revert is a straight copy of an older
+    snapshot into a new version.  ``UNIQUE(canvas_id, version)`` is the
+    optimistic-lock's authority.
+    """
+
+    __tablename__ = "canvas_version"
+    __table_args__ = (
+        UniqueConstraint("canvas_id", "version", name="uq_canvas_version_canvas_version"),
+        {"schema": "session_orchestrator"},
+    )
+
+    id: Mapped[str] = mapped_column(String(30), primary_key=True, default=lambda: new_id("cvv"))
+    tenant_id: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    canvas_id: Mapped[str] = mapped_column(
+        String(30), ForeignKey("session_orchestrator.canvas_document.id"),
+        nullable=False, index=True,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    blocks: Mapped[list] = mapped_column(JSONB, nullable=False)
+    change_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str] = mapped_column(String(10), nullable=False)
+    base_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
+    )
+
+
+class CanvasSuggestion(Base):
+    """A proposed edit awaiting accept/reject (canvas v2 §3.3).
+
+    ``diffs`` (``[{block_id, op, orig, sugg}]``, op ∈ replace/delete/insert_after)
+    is applied only on accept, inside one transaction guarded by
+    ``base_version`` (optimistic lock).  A suggestion never mutates the canvas
+    on its own.
+    """
+
+    __tablename__ = "canvas_suggestion"
+    __table_args__ = {"schema": "session_orchestrator"}
+
+    id: Mapped[str] = mapped_column(String(30), primary_key=True, default=lambda: new_id("csg"))
+    tenant_id: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    canvas_id: Mapped[str] = mapped_column(
+        String(30), ForeignKey("session_orchestrator.canvas_document.id"),
+        nullable=False, index=True,
+    )
+    base_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="proposed", server_default="proposed",
+    )
+    instruction: Mapped[str] = mapped_column(Text, nullable=False)
+    diffs: Mapped[list] = mapped_column(JSONB, nullable=False)
+    change_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
