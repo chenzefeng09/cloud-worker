@@ -70,6 +70,7 @@ class CanvasV2EditRequest(BaseModel):
     instruction: str
     scope: _Scope
     model: str | None = None
+    base_version: int | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -415,6 +416,16 @@ async def canvas_v2_edit(
             code="AGENT.BFF.CANVAS.ORCH_BAD_PAYLOAD",
             detail="unexpected canvas detail response shape",
         ) from exc
+
+    # ── 乐观锁前置校验：客户端显示的版本与服务端当前版本不一致，直接 409，
+    #    不解析虚拟密钥、不调 LLM gateway。req.base_version 为 None 时行为不变。──
+    if req.base_version is not None and req.base_version != base_version:
+        raise _problem(
+            409,
+            "画布已被更新，请刷新后再修改。",
+            code="AGENT.BFF.CANVAS.VERSION_CONFLICT",
+            detail=f"client base_version {req.base_version} != current {base_version}",
+        )
 
     # ── 作用域：blocks 时校验 block_ids 都存在；document 时目标 = 全部块 ──────────
     existing_ids = {b["id"] for b in blocks if isinstance(b, dict) and "id" in b}

@@ -100,6 +100,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from agent_bff.api.v1.canvas_v2 import router as canvas_v2_router
     app.include_router(canvas_v2_router, prefix=settings.api_prefix)
 
+    # Canvas v2 CRUD/版本/建议 — 哑代理转发到 orchestrator（system of record）。
+    from agent_bff.api.v1.canvas_v2_proxy import router as canvas_v2_proxy_router
+    app.include_router(canvas_v2_proxy_router, prefix=settings.api_prefix)
+
     from agent_bff.api.v1.library import router as library_router
     app.include_router(library_router, prefix=settings.api_prefix)
 

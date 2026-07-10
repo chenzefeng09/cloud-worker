@@ -3,6 +3,13 @@ import type {
   RespondBody,
   CanvasEditBody,
   CanvasEditResult,
+  CanvasDocument,
+  CanvasCreateBody,
+  CanvasManualVersionBody,
+  CanvasV2EditBody,
+  CanvasEditResponse,
+  CanvasSuggestion,
+  CanvasVersionSummary,
   PendingInteractionsResponse,
   AddTeamMemberRequest,
   AdminRole,
@@ -348,6 +355,43 @@ export const api = {
      */
     canvasEdit: (sessionId: string, body: CanvasEditBody) =>
       request<CanvasEditResult>('POST', `/sessions/${sessionId}/canvas/edit`, body),
+  },
+
+  // ─── Canvas v2 (→ session-orchestrator /sessions/{sid}/canvases, /canvases/{cid}) ──
+  //
+  // Server-owned canvas documents with versioned blocks + scoped-edit
+  // suggestions. list/versions return a CursorPage envelope; get/accept/
+  // revert/saveVersion return a bare CanvasDocument; reject returns a bare
+  // CanvasSuggestion; edit (the BFF LLM edge) returns { suggestion }.
+  canvas: {
+    create: (sessionId: string, body: CanvasCreateBody) =>
+      request<CanvasDocument>('POST', `/sessions/${sessionId}/canvases`, body),
+    list: (sessionId: string) =>
+      request<{ items: CanvasDocument[]; next_cursor: string | null }>(
+        'GET',
+        `/sessions/${sessionId}/canvases`,
+      ),
+    get: (canvasId: string) =>
+      request<CanvasDocument>('GET', `/canvases/${canvasId}`),
+    versions: (canvasId: string) =>
+      request<{ items: CanvasVersionSummary[]; next_cursor: string | null }>(
+        'GET',
+        `/canvases/${canvasId}/versions`,
+      ),
+    saveVersion: (canvasId: string, body: CanvasManualVersionBody) =>
+      request<CanvasDocument>('POST', `/canvases/${canvasId}/versions`, body),
+    accept: (canvasId: string, suggestionId: string) =>
+      request<CanvasDocument>('POST', `/canvases/${canvasId}/suggestions/${suggestionId}/accept`),
+    reject: (canvasId: string, suggestionId: string) =>
+      request<CanvasSuggestion>('POST', `/canvases/${canvasId}/suggestions/${suggestionId}/reject`),
+    revert: (canvasId: string, toVersion: number) =>
+      request<CanvasDocument>('POST', `/canvases/${canvasId}/revert`, { to_version: toVersion }),
+    edit: (sessionId: string, canvasId: string, body: CanvasV2EditBody) =>
+      request<CanvasEditResponse>(
+        'POST',
+        `/sessions/${sessionId}/canvases/${canvasId}/edit`,
+        body,
+      ),
   },
 
   messages: {
