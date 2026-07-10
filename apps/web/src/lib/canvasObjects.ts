@@ -71,6 +71,7 @@ export interface CanvasEditRequest {
 export interface CanvasEditSuggestion {
   request: CanvasEditRequest;
   replacement: string;
+  summary?: string | null;
   receivedAt: string;
 }
 
@@ -202,31 +203,6 @@ export function createCanvasDraft(
     sourceMessageId: seed?.sourceMessageId,
     updatedAt: new Date().toISOString(),
   };
-}
-
-export function buildCanvasEditPrompt(request: CanvasEditRequest): string {
-  const object = getCanvasObject(request.kind);
-  const target =
-    request.scope === 'selection' && request.selection
-      ? `选中片段（字符 ${request.selection.start}-${request.selection.end}）：\n${request.selection.text}`
-      : `整篇${object.label}：\n${request.content}`;
-
-  return [
-    `请作为专业编辑，帮我修改下面这份${object.label}。`,
-    `标题：${request.title || object.defaultTitle}`,
-    `修改范围：${request.scope === 'selection' ? '只修改选中片段' : '整篇修改'}`,
-    `修改要求：${request.instruction}`,
-    '',
-    target,
-    '',
-    '请严格按下面格式返回，不要在 <canvas-replacement> 内放解释：',
-    '<canvas-replacement>',
-    '这里放可直接替换到画布里的文本',
-    '</canvas-replacement>',
-    '<change-summary>',
-    '- 这里列出关键改动',
-    '</change-summary>',
-  ].join('\n');
 }
 
 export function extractCanvasReplacement(content: string): string | null {

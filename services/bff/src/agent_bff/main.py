@@ -92,6 +92,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from agent_bff.api.v1.conversations import router as chat_router
     app.include_router(chat_router, prefix=settings.api_prefix)
 
+    # Canvas 局部修订 — 直连 llm-gateway 做一次 chat completion，不建 run/不落消息。
+    from agent_bff.api.v1.canvas import router as canvas_router
+    app.include_router(canvas_router, prefix=settings.api_prefix)
+
     from agent_bff.api.v1.library import router as library_router
     app.include_router(library_router, prefix=settings.api_prefix)
 

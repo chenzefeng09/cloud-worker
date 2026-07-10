@@ -298,11 +298,14 @@ export function ChatWindow({
   onSendMessage,
   inlineCanvasDraft,
   inlineCanvasPending,
+  inlineCanvasRevising,
+  inlineCanvasEditError,
   inlineCanvasSuggestion,
   inlineCanvasAnchorMessageId,
   hiddenMessageIds,
   onInlineCanvasDraftChange,
   onInlineCanvasRequestEdit,
+  onInlineCanvasDismissEditError,
   onInlineCanvasOpenPanel,
   onInlineCanvasAcceptSuggestion,
   onInlineCanvasRejectSuggestion,
@@ -314,11 +317,14 @@ export function ChatWindow({
   onSendMessage?: (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => void | Promise<void>;
   inlineCanvasDraft?: CanvasDocumentDraft | null;
   inlineCanvasPending?: boolean;
+  inlineCanvasRevising?: boolean;
+  inlineCanvasEditError?: string | null;
   inlineCanvasSuggestion?: CanvasEditSuggestion | null;
   inlineCanvasAnchorMessageId?: string | null;
   hiddenMessageIds?: string[];
   onInlineCanvasDraftChange?: (draft: CanvasDocumentDraft) => void;
-  onInlineCanvasRequestEdit?: (request: CanvasEditRequest, prompt: string) => void | Promise<void>;
+  onInlineCanvasRequestEdit?: (request: CanvasEditRequest) => void | Promise<void>;
+  onInlineCanvasDismissEditError?: () => void;
   onInlineCanvasOpenPanel?: () => void;
   onInlineCanvasAcceptSuggestion?: () => void;
   onInlineCanvasRejectSuggestion?: () => void;
@@ -507,8 +513,11 @@ export function ChatWindow({
         draft={inlineCanvasDraft}
         pending={inlineCanvasPending}
         aiDisabled={isStreaming}
+        revising={inlineCanvasRevising}
+        editError={inlineCanvasEditError}
         onDraftChange={onInlineCanvasDraftChange}
         onRequestEdit={onInlineCanvasRequestEdit}
+        onDismissEditError={onInlineCanvasDismissEditError}
         onOpenPanel={onInlineCanvasOpenPanel}
         suggestion={inlineCanvasSuggestion}
         onAcceptSuggestion={onInlineCanvasAcceptSuggestion}

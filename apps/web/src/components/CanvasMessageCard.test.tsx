@@ -124,7 +124,7 @@ describe('CanvasMessageCard', () => {
   it('creates a selection edit request from the floating toolbar', async () => {
     const user = userEvent.setup();
     const draft = makeDraft('第一段文字。\n\n这一句需要修改，保持其他内容不变。');
-    const onRequestEdit = vi.fn<(_: CanvasEditRequest, prompt: string) => Promise<void>>().mockResolvedValue();
+    const onRequestEdit = vi.fn<(_: CanvasEditRequest) => Promise<void>>().mockResolvedValue();
 
     render(
       <CanvasMessageCard
@@ -146,11 +146,57 @@ describe('CanvasMessageCard', () => {
     await user.click(screen.getByTitle('发送修改要求'));
 
     await waitFor(() => expect(onRequestEdit).toHaveBeenCalledTimes(1));
-    const [request, prompt] = onRequestEdit.mock.calls[0];
+    // The revision no longer produces a chat prompt — the callback receives the
+    // structured request only, and the BFF endpoint does the rest silently.
+    expect(onRequestEdit.mock.calls[0]).toHaveLength(1);
+    const [request] = onRequestEdit.mock.calls[0];
     expect(request.scope).toBe('selection');
     expect(request.selection?.text).toBe('这一句需要修改');
     expect(request.instruction).toBe('改得更口语');
-    expect(prompt).toContain('<canvas-replacement>');
+  });
+
+  it('shows a revising indicator and blocks re-submission while a revision is in flight', async () => {
+    const draft = makeDraft('第一段文字。\n\n这一句需要修改。');
+    const onRequestEdit = vi.fn<(_: CanvasEditRequest) => Promise<void>>().mockResolvedValue();
+
+    render(
+      <CanvasMessageCard
+        sessionId="ses_test"
+        draft={draft}
+        revising
+        onDraftChange={vi.fn()}
+        onRequestEdit={onRequestEdit}
+      />,
+    );
+
+    // Visual "修订中…" feedback appears (status role + input placeholder).
+    expect(screen.getByRole('status')).toHaveTextContent('修订中…');
+    expect(screen.getByPlaceholderText('修订中…')).toBeDisabled();
+
+    // The document / selection request buttons are disabled — no double submit.
+    expect(screen.getByRole('button', { name: '整篇' })).toBeDisabled();
+    expect(onRequestEdit).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a revision error inside the card and lets the user dismiss it', async () => {
+    const user = userEvent.setup();
+    const draft = makeDraft('第一段文字。');
+    const onDismissEditError = vi.fn();
+
+    render(
+      <CanvasMessageCard
+        sessionId="ses_test"
+        draft={draft}
+        editError="模型暂时不可用，请稍后重试。"
+        onDraftChange={vi.fn()}
+        onRequestEdit={vi.fn()}
+        onDismissEditError={onDismissEditError}
+      />,
+    );
+
+    expect(screen.getByRole('alert')).toHaveTextContent('模型暂时不可用，请稍后重试。');
+    await user.click(screen.getByRole('button', { name: '关闭错误提示' }));
+    expect(onDismissEditError).toHaveBeenCalledTimes(1);
   });
 
   it('shows an AI suggestion before applying it', async () => {
@@ -199,6 +245,60 @@ describe('CanvasMessageCard', () => {
 
     expect(onAcceptSuggestion).toHaveBeenCalledTimes(1);
     expect(onRejectSuggestion).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders a whole-document suggestion (apply_to=document) without splicing the selection', async () => {
+    const user = userEvent.setup();
+    const draft = makeDraft('第一段文字。\n\n这是文末的结尾句需要改。');
+    // AgentPage overrides scope to 'document' when the BFF returns apply_to==='document'
+    // (model echoed the whole doc), keeping the original selection for display only.
+    const request: CanvasEditRequest = {
+      documentId: draft.id,
+      kind: draft.kind,
+      title: draft.title,
+      scope: 'document',
+      instruction: '把结尾改得更有力',
+      content: draft.content,
+      selection: {
+        text: '这是文末的结尾句需要改',
+        start: draft.content.indexOf('这是文末的结尾句需要改'),
+        end: draft.content.indexOf('这是文末的结尾句需要改') + '这是文末的结尾句需要改'.length,
+      },
+    };
+    const replacement = '第一段文字。\n\n结尾改写成了一句更有力的收束。';
+    const onAcceptSuggestion = vi.fn();
+
+    render(
+      <CanvasMessageCard
+        sessionId="ses_test"
+        draft={draft}
+        suggestion={{
+          request,
+          replacement,
+          receivedAt: '2026-06-14T00:01:00.000Z',
+        }}
+        onDraftChange={vi.fn()}
+        onRequestEdit={vi.fn()}
+        onAcceptSuggestion={onAcceptSuggestion}
+        onRejectSuggestion={vi.fn()}
+      />,
+    );
+
+    // Whole-document card form, not the inline selection diff.
+    expect(screen.getByLabelText('整篇修改建议')).toHaveTextContent('把结尾改得更有力');
+    // The inline selection diff card ("选区修改建议") must NOT render.
+    expect(screen.queryByLabelText('选区修改建议')).not.toBeInTheDocument();
+    // The whole-document replacement is previewed as-is (no duplicated body).
+    expect(screen.getByText('结尾改写成了一句更有力的收束。')).toBeInTheDocument();
+
+    // Applying the document suggestion cleanly replaces the whole content.
+    const applied = applyCanvasReplacement(draft, request, replacement);
+    expect(applied.content).toBe(replacement);
+    // No duplication of the surrounding body.
+    expect(applied.content.match(/第一段文字。/g)).toHaveLength(1);
+
+    await user.click(screen.getByRole('button', { name: '接受' }));
+    expect(onAcceptSuggestion).toHaveBeenCalledTimes(1);
   });
 
   it('records accepted AI suggestions in the local undo stack', async () => {

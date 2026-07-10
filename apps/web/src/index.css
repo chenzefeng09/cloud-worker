@@ -456,6 +456,41 @@ body {
   font-weight: 600;
 }
 
+.canvas-card-edit-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border: 1px solid rgba(210, 58, 31, 0.5);
+  border-radius: var(--r-md);
+  background: rgba(210, 58, 31, 0.08);
+  color: #d23a1f;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.canvas-card-edit-error-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.canvas-card-edit-error-dismiss {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: #d23a1f;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 1px 2px;
+  opacity: 0.7;
+}
+
+.canvas-card-edit-error-dismiss:hover {
+  opacity: 1;
+}
+
 .canvas-message-card-foot {
   display: flex;
   flex-direction: column;

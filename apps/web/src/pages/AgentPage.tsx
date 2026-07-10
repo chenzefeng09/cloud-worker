@@ -25,12 +25,8 @@ import {
   type CanvasOpenSeed,
 } from '../lib/canvasObjects';
 import { findCanvasCreationReply } from '../lib/canvasCreation';
+import { api } from '../api/client';
 import type { MessageAttachment } from '../api/types';
-
-interface PendingCanvasEdit {
-  request: CanvasEditRequest;
-  fromMessageIndex: number;
-}
 
 interface PendingCanvasCreation {
   documentId: string;
@@ -65,9 +61,12 @@ export function AgentPage() {
   const [inlineCanvasOpen, setInlineCanvasOpen] = useState(false);
   const [inlineCanvasAnchorMessageId, setInlineCanvasAnchorMessageId] = useState<string | null>(null);
   const [hiddenCanvasMessageIds, setHiddenCanvasMessageIds] = useState<string[]>([]);
-  const [pendingCanvasEdit, setPendingCanvasEdit] = useState<PendingCanvasEdit | null>(null);
   const [pendingCanvasCreation, setPendingCanvasCreation] = useState<PendingCanvasCreation | null>(null);
   const [canvasSuggestion, setCanvasSuggestion] = useState<CanvasEditSuggestion | null>(null);
+  // Silent canvas revision: request in flight + last error, both scoped to the
+  // canvas card (never surfaced as chat messages).
+  const [canvasRevising, setCanvasRevising] = useState(false);
+  const [canvasEditError, setCanvasEditError] = useState<string | null>(null);
   // Resizable preview panel width (px). Persisted across opens within a session.
   const [previewWidth, setPreviewWidth] = useState(360);
   const PREVIEW_MIN = 280;
@@ -114,6 +113,8 @@ export function AgentPage() {
     setInlineCanvasAnchorMessageId(null);
     setHiddenCanvasMessageIds([]);
     setCanvasSuggestion(null);
+    setCanvasRevising(false);
+    setCanvasEditError(null);
     setPreviewFile(null);
   }, [id]);
 
@@ -193,8 +194,8 @@ export function AgentPage() {
       setInlineCanvasAnchorMessageId(null);
       setCanvasOpen(false);
       setPreviewFile(null);
-      setPendingCanvasEdit(null);
       setCanvasSuggestion(null);
+      setCanvasEditError(null);
       setPendingCanvasCreation({
         documentId: draft.id,
         fromMessageIndex: messages.length,
@@ -231,53 +232,63 @@ export function AgentPage() {
     navigate(location.pathname, { replace: true, state: null });
   }, [id, activeSessionId, location.pathname, location.state, navigate, sendMessageWithCanvasDetection]);
 
+  // Silent canvas revision. Unlike creation, this does NOT go through the chat
+  // pipeline: no user prompt message, no agent run, nothing in the transcript.
+  // We call the dedicated BFF endpoint directly and drop the returned
+  // replacement straight into the existing suggestion / diff / accept flow.
   const requestCanvasEdit = useCallback(
-    async (request: CanvasEditRequest, prompt: string) => {
+    async (request: CanvasEditRequest) => {
+      if (!id) return;
       setPendingCanvasCreation(null);
       setCanvasSuggestion(null);
-      setPendingCanvasEdit({ request, fromMessageIndex: messages.length });
-      await sendMessage(prompt);
-    },
-    [messages.length, sendMessage],
-  );
-
-  useEffect(() => {
-    if (!pendingCanvasEdit || isStreaming) return;
-
-    let assistantReply: { id?: string; content: string } | null = null;
-    for (const message of messages.slice(pendingCanvasEdit.fromMessageIndex)) {
-      const role = (message.role || '').toUpperCase();
-      if (
-        role === 'ASSISTANT' &&
-        message.blockKind !== 'tool' &&
-        message.blockKind !== 'thinking' &&
-        !message.streaming
-      ) {
-        assistantReply = message;
-      }
-    }
-
-    if (!assistantReply) return;
-
-    const replacement = extractCanvasReplacement(assistantReply.content);
-    if (replacement) {
-      setCanvasSuggestion({
-        request: pendingCanvasEdit.request,
-        replacement,
-        receivedAt: new Date().toISOString(),
-      });
-      setInlineCanvasOpen(true);
-      setCanvasOpen(false);
-      setPreviewFile(null);
-      if (assistantReply.id) {
-        const assistantReplyId = assistantReply.id;
-        setHiddenCanvasMessageIds((current) =>
-          current.includes(assistantReplyId) ? current : [...current, assistantReplyId],
+      setCanvasEditError(null);
+      setCanvasRevising(true);
+      try {
+        const model = useChatStore.getState().selectedModel[id] || undefined;
+        const result = await api.sessions.canvasEdit(id, {
+          title: request.title,
+          content: request.content,
+          scope: request.scope,
+          selection:
+            request.scope === 'selection' && request.selection
+              ? {
+                  text: request.selection.text,
+                  start: request.selection.start,
+                  end: request.selection.end,
+                }
+              : null,
+          instruction: request.instruction,
+          ...(model ? { model } : {}),
+        });
+        // The BFF may downgrade a selection-scoped request to a whole-document
+        // replacement when it detects the model echoed the full document (or the
+        // selection's surrounding context). In that case we must apply the
+        // replacement as the entire document — splicing it at the selection would
+        // duplicate the surrounding text. Override the suggestion's scope so both
+        // the review card and applyCanvasReplacement take the whole-document path.
+        const suggestionRequest =
+          result.apply_to === 'document' && request.scope === 'selection'
+            ? { ...request, scope: 'document' as const }
+            : request;
+        setCanvasSuggestion({
+          request: suggestionRequest,
+          replacement: result.replacement,
+          summary: result.summary,
+          receivedAt: new Date().toISOString(),
+        });
+        setInlineCanvasOpen(true);
+        setCanvasOpen(false);
+        setPreviewFile(null);
+      } catch (err) {
+        setCanvasEditError(
+          err instanceof Error && err.message ? err.message : '修订失败，请稍后重试。',
         );
+      } finally {
+        setCanvasRevising(false);
       }
-    }
-    setPendingCanvasEdit(null);
-  }, [isStreaming, messages, pendingCanvasEdit]);
+    },
+    [id],
+  );
 
   useEffect(() => {
     if (!pendingCanvasCreation) return;
@@ -335,6 +346,10 @@ export function AgentPage() {
 
   const rejectCanvasSuggestion = useCallback(() => {
     setCanvasSuggestion(null);
+  }, []);
+
+  const dismissCanvasEditError = useCallback(() => {
+    setCanvasEditError(null);
   }, []);
 
   const hasSidePanel = previewFile !== null || (canvasOpen && canvasDraft !== null);
@@ -436,11 +451,14 @@ export function AgentPage() {
               onSendMessage={sendMessageWithCanvasDetection}
               inlineCanvasDraft={inlineCanvasOpen ? canvasDraft : null}
               inlineCanvasPending={Boolean(pendingCanvasCreation)}
+              inlineCanvasRevising={canvasRevising}
+              inlineCanvasEditError={canvasEditError}
               inlineCanvasSuggestion={canvasSuggestion}
               inlineCanvasAnchorMessageId={inlineCanvasAnchorMessageId}
               hiddenMessageIds={hiddenCanvasMessageIds}
               onInlineCanvasDraftChange={setCanvasDraft}
               onInlineCanvasRequestEdit={requestCanvasEdit}
+              onInlineCanvasDismissEditError={dismissCanvasEditError}
               onInlineCanvasOpenPanel={canvasDraft ? openInlineCanvasInPanel : undefined}
               onInlineCanvasAcceptSuggestion={canvasSuggestion ? acceptCanvasSuggestion : undefined}
               onInlineCanvasRejectSuggestion={canvasSuggestion ? rejectCanvasSuggestion : undefined}
@@ -483,9 +501,12 @@ export function AgentPage() {
                     sessionId={id}
                     draft={canvasDraft}
                     aiDisabled={isStreaming}
+                    revising={canvasRevising}
+                    editError={canvasEditError}
                     onDraftChange={setCanvasDraft}
                     onClose={() => setCanvasOpen(false)}
                     onRequestEdit={requestCanvasEdit}
+                    onDismissEditError={dismissCanvasEditError}
                   />
                 ) : null}
               </>
