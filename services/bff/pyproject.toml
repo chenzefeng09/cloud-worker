@@ -68,6 +68,7 @@ module = [
     "agent_bff.api.v1.api_keys",
     "agent_bff.api.v1.auth",
     "agent_bff.api.v1.billing",
+    "agent_bff.api.v1.canvas",
     "agent_bff.api.v1.conversations",
     "agent_bff.api.v1.fleet",
     "agent_bff.api.v1.library",

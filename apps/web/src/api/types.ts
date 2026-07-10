@@ -1684,6 +1684,34 @@ export interface RespondBody {
 }
 
 /**
+ * Body for POST /sessions/{id}/canvas/edit — the silent, chat-invisible canvas
+ * revision endpoint. Unlike the normal chat flow this does NOT start an agent
+ * run or produce any transcript message; the BFF returns the replacement text
+ * synchronously and the result flows straight into the canvas suggestion card.
+ */
+export interface CanvasEditBody {
+  title: string;
+  content: string;
+  scope: 'selection' | 'document';
+  selection?: { text: string; start: number; end: number } | null;
+  instruction: string;
+  model?: string;
+}
+
+export interface CanvasEditResult {
+  replacement: string;
+  summary: string | null;
+  /**
+   * How the replacement should be applied. Defaults to 'selection' (replace the
+   * selected fragment in place). The BFF returns 'document' when it detects the
+   * model returned a whole-document rewrite for a selection-scoped request — the
+   * frontend then applies `replacement` as the entire new document instead of
+   * splicing it at the selection (which would duplicate the surrounding text).
+   */
+  apply_to?: 'selection' | 'document';
+}
+
+/**
  * A pending HITL interaction awaiting user input.
  * Kept in the chat store's `pendingInteractions` map (per-session).
  */

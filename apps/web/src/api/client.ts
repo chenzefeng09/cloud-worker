@@ -1,6 +1,8 @@
 import type {
   ActiveSession,
   RespondBody,
+  CanvasEditBody,
+  CanvasEditResult,
   PendingInteractionsResponse,
   AddTeamMemberRequest,
   AdminRole,
@@ -336,6 +338,16 @@ export const api = {
      */
     pending: (sessionId: string) =>
       request<PendingInteractionsResponse>('GET', `/sessions/${sessionId}/pending`),
+    /**
+     * Silent canvas revision — the ChatGPT-canvas-style局部修订. Unlike the
+     * normal chat flow this does NOT go through POST /chat, does NOT start an
+     * agent run, and leaves the transcript untouched. The BFF returns the
+     * replacement text synchronously; the caller feeds it into the canvas
+     * suggestion card (accept / reject) without any message ever appearing.
+     * Throws ApiError carrying the localised `user_message` on failure.
+     */
+    canvasEdit: (sessionId: string, body: CanvasEditBody) =>
+      request<CanvasEditResult>('POST', `/sessions/${sessionId}/canvas/edit`, body),
   },
 
   messages: {
