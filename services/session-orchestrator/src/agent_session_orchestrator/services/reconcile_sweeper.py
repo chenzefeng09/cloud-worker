@@ -68,13 +68,25 @@ async def _sweep_once(app: FastAPI) -> None:
     cutoff = dt.datetime.now(tz=dt.UTC) - dt.timedelta(seconds=STALE_AFTER_SECONDS)
 
     # ── 1. Cross-tenant scan (BYPASSRLS migrator connection) ───────────────
-    # We encode three values as a single string to fit the scalar helper's
-    # one-column contract: "tenant_id\x1frun_id\x1fsession_id".
-    # The session.user_id is fetched later per-run via a tenant-bound session.
+    # We encode four values as a single string to fit the scalar helper's
+    # one-column contract: "tenant_id\x1frun_id\x1fsession_id\x1fuser_id".
+    #
+    # The session.user_id is carried out of the scan directly via a LEFT JOIN
+    # on session_orchestrator.session.  A LEFT JOIN (not INNER) is deliberate:
+    # a session soft-deleted by the 30-day retention sweep only has its
+    # ``deleted_at`` column set — the row still exists — so the JOIN resolves
+    # its user_id even though the tenant-bound ``get_session`` path (which
+    # filters ``deleted_at IS NULL``) would raise SessionNotFoundError for it.
+    # Without this, orphaned runs of soft-deleted sessions fell back to a
+    # ``SYSTEM`` user_id, which the scheduler rejects with 403 → run stuck
+    # RUNNING forever.  COALESCE guards the (rare) case of a run whose session
+    # row is genuinely gone, yielding an empty string handled below.
     rows = await privileged_scalars(
         settings,
         "SELECT r.tenant_id || '\x1f' || r.id || '\x1f' || r.session_id"
+        "       || '\x1f' || COALESCE(s.user_id, '')"
         "  FROM session_orchestrator.run r"
+        "  LEFT JOIN session_orchestrator.session s ON s.id = r.session_id"
         " WHERE r.status IN ('RUNNING', 'PENDING')"
         "   AND COALESCE(r.started_at, r.created_at) < :cutoff"
         " ORDER BY r.tenant_id",
@@ -99,11 +111,13 @@ async def _sweep_once(app: FastAPI) -> None:
 
     # ── 2. Reconcile each run in its own tenant-bound session ──────────────
     for row in rows:
-        parts = str(row).split("\x1f", 2)
-        if len(parts) != 3:
+        parts = str(row).split("\x1f", 3)
+        if len(parts) != 4:
             logger.warning("reconcile_sweeper: malformed scan row %r — skipping", row)
             continue
-        tenant_id, run_id, session_id = parts
+        tenant_id, run_id, session_id, scan_user_id = parts
+        # user_id may legitimately be an empty string (session row genuinely
+        # gone); only the first three fields are required to identify a run.
         if not tenant_id or not run_id or not session_id:
             logger.warning(
                 "reconcile_sweeper: empty field in scan row %r — skipping", row
@@ -116,16 +130,39 @@ async def _sweep_once(app: FastAPI) -> None:
             ):
                 svc = SessionService(db, tenant_id=tenant_id)
 
-                # Fetch session for user_id (scheduler authz needs a real user).
-                try:
-                    session_obj = await svc.get_session(session_id)
-                    user_id = session_obj.user_id
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "reconcile_sweeper: session not found, using SYSTEM",
-                        extra={"tenant_id": tenant_id, "session_id": session_id},
-                    )
-                    user_id = "SYSTEM"
+                # user_id is taken from the cross-tenant scan (LEFT JOIN on
+                # session), which — unlike the RLS-bound get_session below —
+                # resolves it even for soft-deleted sessions.  This keeps the
+                # scheduler authz happy (a real user, never SYSTEM) for
+                # orphaned runs of retention-purged sessions.
+                user_id = scan_user_id
+                # get_session is still probed purely for observability: for a
+                # soft-deleted session it raises, which is the expected signal
+                # that this run is orphaned.  It never overrides user_id.
+                if not user_id:
+                    # Scan produced no user_id (session row genuinely gone).
+                    # Fall back: get_session if it somehow succeeds, else the
+                    # historical SYSTEM sentinel.
+                    try:
+                        session_obj = await svc.get_session(session_id)
+                        user_id = session_obj.user_id
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "reconcile_sweeper: no user_id from scan and "
+                            "session not found, falling back to SYSTEM",
+                            extra={"tenant_id": tenant_id, "session_id": session_id},
+                        )
+                        user_id = "SYSTEM"
+                else:
+                    try:
+                        await svc.get_session(session_id)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "reconcile_sweeper: session not visible via RLS "
+                            "(likely soft-deleted); reconciling orphaned run "
+                            "with its real user_id from scan",
+                            extra={"tenant_id": tenant_id, "session_id": session_id},
+                        )
 
                 # Re-fetch the run inside the RLS-scoped session.
                 runs = await svc.list_runs(session_id)
