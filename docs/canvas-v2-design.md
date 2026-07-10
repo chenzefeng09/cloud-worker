@@ -106,7 +106,7 @@ orchestrator 服务端一次性物化              前端渲染 CanvasMessageCar
 | base_version | Integer | 否 | 基于哪个版本提出；accept 时乐观锁校验 |
 | status | String(10) | 否 | `proposed` / `accepted` / `rejected`，default proposed |
 | instruction | Text | 否 | 用户指令原文 |
-| diffs | JSONB | 否 | `[{block_id, op, orig, sugg}]`，op ∈ replace/delete/insert_after |
+| diffs | JSONB | 否 | `[{block_id, op, orig, sugg}]`，op ∈ replace/delete/insert_after；**统一用 block_id**——op=insert_after 时其语义为锚点块（插在其后）。after_block_id 只出现在 §5.2 面向模型的输出 schema，由 BFF 换算 |
 | change_summary | Text | 是 | |
 | created_at / resolved_at | DateTime(tz) | 否/是 | |
 

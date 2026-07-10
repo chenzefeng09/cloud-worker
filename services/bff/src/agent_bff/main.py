@@ -96,6 +96,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from agent_bff.api.v1.canvas import router as canvas_router
     app.include_router(canvas_router, prefix=settings.api_prefix)
 
+    # Canvas v2 作用域编辑 — LLM 边缘产出「建议」经 orchestrator 落库（建议-确认制）。
+    from agent_bff.api.v1.canvas_v2 import router as canvas_v2_router
+    app.include_router(canvas_v2_router, prefix=settings.api_prefix)
+
     from agent_bff.api.v1.library import router as library_router
     app.include_router(library_router, prefix=settings.api_prefix)
 
