@@ -123,6 +123,55 @@ class CanvasService:
         result = await self._db.execute(stmt)
         return list(result.scalars().all())
 
+    async def count_canvases_for_run(self, run_id: str) -> int:
+        """Count live canvases already materialized from ``run_id`` (Phase B).
+
+        Used for idempotent materialization of the run's Redis canvas payloads:
+        payloads carry a 1-based ``seq``; a payload is materialized only when
+        ``seq`` exceeds the count of canvases already created for this run, so a
+        replay (SSE reconnect, reconcile re-poll) never double-creates.  Includes
+        soft-deleted rows would over-count and drop a re-create, so we count only
+        live rows — matching what a fresh materialization would append after.
+        """
+        stmt = select(CanvasDocument).where(
+            CanvasDocument.source_run_id == run_id,
+            CanvasDocument.tenant_id == self._tenant_id,
+            CanvasDocument.deleted_at.is_(None),
+        )
+        result = await self._db.execute(stmt)
+        return len(list(result.scalars().all()))
+
+    async def backfill_message_canvas_id(
+        self, *, session_id: str, run_id: str, canvas_id: str
+    ) -> str | None:
+        """Point the run's assistant message at ``canvas_id`` (best-effort).
+
+        Finds the latest assistant message for ``run_id`` in ``session_id`` that
+        does not already carry a ``canvas_id`` and sets it, so the frontend can
+        anchor the canvas card to that message.  Returns the message id it
+        updated, or ``None`` when no eligible message exists yet (the assistant
+        row may not be persisted at materialization time — the ``canvas_created``
+        event still carries ``canvas_id`` so the card renders regardless).
+        """
+        stmt = (
+            select(Message)
+            .where(
+                Message.session_id == session_id,
+                Message.tenant_id == self._tenant_id,
+                Message.run_id == run_id,
+                Message.role == "assistant",
+                Message.canvas_id.is_(None),
+            )
+            .order_by(Message.sequence.desc())
+        )
+        result = await self._db.execute(stmt)
+        msg = result.scalars().first()
+        if msg is None:
+            return None
+        msg.canvas_id = canvas_id
+        await self._db.flush()
+        return msg.id
+
     async def list_versions(self, canvas_id: str) -> list[CanvasVersion]:
         await self._get_canvas(canvas_id)
         stmt = (
@@ -164,6 +213,7 @@ class CanvasService:
         content: str | None = None,
         kind: str = "article",
         title: str | None = None,
+        source_run_id: str | None = None,
     ) -> CanvasDocument:
         """Materialize a canvas from a source message or supplied content.
 
@@ -174,6 +224,12 @@ class CanvasService:
         ``source_message_id`` and ``content`` are mutually exclusive; exactly
         one must be provided.  When ``source_message_id`` is given the server
         reads that message's content and backfills ``message.canvas_id``.
+
+        ``source_run_id`` records the run whose ``create_canvas`` tool call
+        produced this canvas (Phase B).  It is orthogonal to the
+        source_message_id/content choice — both a run-triggered create (content
+        + source_run_id) and a Phase A create (source_message_id) set it when
+        available.
         """
         # Ownership + soft-delete guard.
         await self._sessions.get_session(session_id)
@@ -208,6 +264,7 @@ class CanvasService:
             title=resolved_title,
             current_version=1,
             source_message_id=source_message_id,
+            source_run_id=source_run_id,
         )
         self._db.add(canvas)
         await self._db.flush()  # populate canvas.id via PK default

@@ -42,13 +42,16 @@ import docker
 from docker.types import Mount, Ulimit
 
 from agent_scheduler.config import (
+    _DEV_LIKE_ENVS,
     SANDBOX_SERVICE_SCOPES,
     Settings,
-    _DEV_LIKE_ENVS,
 )
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
 from agent_scheduler.services import egress_policy
-from agent_scheduler.services.feature_flag import evaluate_flag
+from agent_scheduler.services.feature_flag import (
+    evaluate_flag,
+    runtime_extensions_for_run,
+)
 from agent_scheduler.services.runtime import RUNTIME_REGISTRY
 from agent_scheduler.services.skill_cache import MountedSkill, SkillCache
 
@@ -301,6 +304,19 @@ class DockerRuntime:
         except ValueError as exc:
             raise SandboxSpawnError(str(exc)) from exc
 
+        # Canvas v2 (Phase B): append ``canvas_tool`` to RUNTIME_EXTENSIONS when
+        # the per-run ``enable_canvas_tool`` flag is on.  Failure-open (handled
+        # inside ``evaluate_flag``): a down/slow flag service leaves the base
+        # extensions unchanged, so the flag-off path is byte-for-byte identical
+        # to pre-canvas behaviour.
+        runtime_extensions = runtime_extensions_for_run(
+            base_extensions=self._settings.runtime_extensions,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            flag_url=self._settings.feature_flag_url,
+            timeout_ms=self._settings.feature_flag_timeout_ms,
+        )
+
         # NOTE: this dict is assembled with every value (including secrets)
         # for clarity, but the ``_SECRET_ENV_KEYS`` subset is popped out below
         # (after the conditional appends) and delivered via
@@ -333,7 +349,7 @@ class DockerRuntime:
             # RUNTIME_EXTENSIONS activates them in declaration order.
             "MCP_REGISTRY_URL": service_env["MCP_REGISTRY_URL"],
             "SKILL_STORE_URL": service_env["SKILL_STORE_URL"],
-            "RUNTIME_EXTENSIONS": self._settings.runtime_extensions,
+            "RUNTIME_EXTENSIONS": runtime_extensions,
             # Dev-mode shim: in prod the API gateway translates the verified
             # Bearer JWT into X-Service-Scopes before requests reach internal
             # endpoints.  In this deployment (no gateway between sandbox and

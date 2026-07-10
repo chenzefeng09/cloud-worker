@@ -56,6 +56,9 @@ class FakeResult:
     def all(self) -> list[Any]:
         return list(self._rows)
 
+    def first(self) -> Any:
+        return self._rows[0] if self._rows else None
+
 
 class FakeDB:
     """Minimal stateful AsyncSession stand-in backed by python lists."""
@@ -141,14 +144,32 @@ class FakeDB:
             ]
             return FakeResult(rows)
         if entity is Message:
+            rows = [m for m in self.messages if m.tenant_id == tenant]
             mid = _p("id_1", "id")
-            rows = [
-                m for m in self.messages if m.id == mid and m.tenant_id == tenant
-            ]
+            if mid is not None:
+                rows = [m for m in rows if m.id == mid]
+            # backfill_message_canvas_id filters: session_id / run_id / role /
+            # canvas_id IS NULL, ordered by sequence DESC.
+            msg_sid = _p("session_id_1")
+            if msg_sid is not None:
+                rows = [m for m in rows if m.session_id == msg_sid]
+            run_id = _p("run_id_1")
+            if run_id is not None:
+                rows = [m for m in rows if getattr(m, "run_id", None) == run_id]
+            role = _p("role_1")
+            if role is not None:
+                rows = [m for m in rows if m.role == role]
+            # ``canvas_id IS NULL`` predicate compiles without a bound param;
+            # honour it whenever the statement targets the backfill query (a
+            # run_id filter is present) so already-anchored rows are excluded.
+            if run_id is not None:
+                rows = [m for m in rows if getattr(m, "canvas_id", None) is None]
+                rows.sort(key=lambda m: getattr(m, "sequence", 0), reverse=True)
             return FakeResult(rows)
         if entity is CanvasDocument:
             cid = _p("id_1")
             sid = _p("session_id_1")
+            run_id = _p("source_run_id_1")
             rows = [
                 c
                 for c in self.canvases
@@ -158,6 +179,10 @@ class FakeDB:
                 rows = [c for c in rows if c.id == cid]
             if sid is not None:
                 rows = [c for c in rows if c.session_id == sid]
+            if run_id is not None:
+                rows = [
+                    c for c in rows if getattr(c, "source_run_id", None) == run_id
+                ]
             return FakeResult(rows)
         if entity is CanvasVersion:
             cid = _p("canvas_id_1")
@@ -279,6 +304,87 @@ def test_create_on_soft_deleted_session_rejected() -> None:
     svc = _svc(db)
     with pytest.raises(SessionNotFoundError):
         _run(svc.create_canvas("ses_1", user_id=TEST_USER, content="hi"))
+
+
+def test_create_records_source_run_id() -> None:
+    db = FakeDB()
+    _seed_session(db)
+    svc = _svc(db)
+    canvas = _run(
+        svc.create_canvas(
+            "ses_1",
+            user_id=TEST_USER,
+            content="# T\n\nbody",
+            source_run_id="run_abc",
+        )
+    )
+    assert canvas.source_run_id == "run_abc"
+
+
+# ── Phase B materialization support (count + backfill) ───────────────────────
+
+
+def test_count_canvases_for_run() -> None:
+    db = FakeDB()
+    _seed_session(db)
+    svc = _svc(db)
+    assert _run(svc.count_canvases_for_run("run_x")) == 0
+    _run(
+        svc.create_canvas(
+            "ses_1", user_id=TEST_USER, content="a\n\nb", source_run_id="run_x"
+        )
+    )
+    _run(
+        svc.create_canvas(
+            "ses_1", user_id=TEST_USER, content="c\n\nd", source_run_id="run_x"
+        )
+    )
+    # A canvas from a different run must not be counted.
+    _run(
+        svc.create_canvas(
+            "ses_1", user_id=TEST_USER, content="e\n\nf", source_run_id="run_y"
+        )
+    )
+    assert _run(svc.count_canvases_for_run("run_x")) == 2
+    assert _run(svc.count_canvases_for_run("run_y")) == 1
+
+
+def test_backfill_message_canvas_id_sets_latest_assistant() -> None:
+    db = FakeDB()
+    _seed_session(db)
+    older = Message(
+        id="msg_1", tenant_id=TEST_TENANT, session_id="ses_1", role="assistant",
+        content="x", sequence=1, run_id="run_z", canvas_id=None, created_at=_NOW,
+    )
+    newer = Message(
+        id="msg_2", tenant_id=TEST_TENANT, session_id="ses_1", role="assistant",
+        content="y", sequence=2, run_id="run_z", canvas_id=None, created_at=_NOW,
+    )
+    db.messages.extend([older, newer])
+    svc = _svc(db)
+    updated_id = _run(
+        svc.backfill_message_canvas_id(
+            session_id="ses_1", run_id="run_z", canvas_id="cvs_target"
+        )
+    )
+    assert updated_id == "msg_2"  # latest by sequence
+    assert newer.canvas_id == "cvs_target"
+    assert older.canvas_id is None
+
+
+def test_backfill_message_canvas_id_returns_none_when_no_eligible_message() -> None:
+    db = FakeDB()
+    _seed_session(db)
+    svc = _svc(db)
+    # No assistant message for this run yet.
+    assert (
+        _run(
+            svc.backfill_message_canvas_id(
+                session_id="ses_1", run_id="run_none", canvas_id="cvs_x"
+            )
+        )
+        is None
+    )
 
 
 # ── manual version + optimistic lock ─────────────────────────────────────────
