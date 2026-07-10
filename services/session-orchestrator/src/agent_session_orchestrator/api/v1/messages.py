@@ -69,6 +69,13 @@ _WORKER_COLDSTART_GRACE_SECONDS = 90.0
 # ever writing its `end` marker.
 _ACTIVE_IDLE_HARDCAP_READS = 600  # ~10 min of pure silence ⇒ assume crashed worker
 _RUN_STATUS_RECHECK_READS = 5  # recheck run status every ~5s of idle
+# Grace window after which a RUNNING/PENDING run whose sandbox the scheduler no
+# longer knows about (``GET /runs/{sandbox_id}`` → 404) *and* whose token stream
+# carries no ``end`` marker is force-FAILED.  A 404 can be momentary right at
+# spawn (the container id is registered a beat after the run row is written), so
+# we only give up once the run has been alive comfortably longer than any cold
+# start.  Module-level so tests can monkeypatch it to a small value.
+_SANDBOX_GONE_GRACE_SECONDS = 30 * 60  # 30 minutes
 
 
 def _run_token_stream_key(run_id: str) -> str:
@@ -469,6 +476,157 @@ async def _write_memory(
         logger.debug("memory write failed (failure-open): %s", exc)
 
 
+async def _replay_run_blocks_into_messages(
+    *,
+    run: Run,
+    svc: SessionService,
+    tenant_id: str,
+    redis_url: str,
+    dlp_url: str = "",
+) -> tuple[bool, bool]:
+    """Replay a run's Redis token stream into ordered persisted message rows.
+
+    Shared by the two terminal-completion paths that both need to turn the
+    worker's ordered token/tool/thinking blocks into durable message rows:
+
+    * the normal 200-``COMPLETED`` scheduler path, and
+    * the 404 + ``end`` marker path (sandbox pruned after the worker finished
+      writing its stream — see ``_reconcile_run_completion``).
+
+    Keeping both callers on one helper guarantees identical side-effects:
+    the ``already_persisted_for_run`` idempotency guard, the role='thinking'
+    /'assistant'/'tool' row mapping, and the fail-open output-side DLP scan.
+
+    Returns ``(persisted_from_stream, already_persisted_for_run)``:
+    * ``persisted_from_stream`` — at least one message row was written from the
+      replayed blocks this call.
+    * ``already_persisted_for_run`` — assistant/tool/thinking rows for this run
+      already existed, so the replay was skipped (idempotent no-op).
+
+    ``redis_url`` must be truthy; callers gate on it before invoking.
+    """
+    existing_messages, _ = await svc.list_messages(run.session_id, limit=200)
+    already_persisted_for_run = any(
+        m.run_id == run.id and (m.role or "").lower() in {"assistant", "tool", "thinking"}
+        for m in existing_messages
+    )
+    persisted_from_stream = False
+    if already_persisted_for_run:
+        return persisted_from_stream, already_persisted_for_run
+
+    blocks = await _read_ordered_blocks_from_redis(
+        redis_url=redis_url,
+        run_id=run.id,
+    )
+    for block in blocks:
+        if block.get("kind") == "thinking":
+            # Persist reasoning as a dedicated role='thinking' row so the
+            # UI can show a collapsible "已思考" section after the run
+            # (DeepSeek/Claude-style). It is ordered before the assistant
+            # text in `blocks`, so the thinking row gets a lower sequence
+            # and renders above the answer. role is a free String(10)
+            # column (no enum/CHECK), so 'thinking' is accepted.
+            text = str(block.get("text") or "")
+            if text:
+                await svc.create_message(
+                    session_id=run.session_id,
+                    role="thinking",
+                    content=text,
+                    tool_calls=None,
+                    run_id=run.id,
+                )
+                persisted_from_stream = True
+        elif block.get("kind") == "text":
+            text = str(block.get("text") or "")
+            if text:
+                msg = await svc.create_message(
+                    session_id=run.session_id,
+                    role="assistant",
+                    content=text,
+                    tool_calls=None,
+                    run_id=run.id,
+                )
+                persisted_from_stream = True
+                # ── DLP scan (output side): fail-open ───────────────
+                # Scan the assistant's natural-language reply as it is
+                # persisted on its way out to the user, mirroring the
+                # attachment upload path. A hit tags the message, it is
+                # never blocked; any DLP error is swallowed inside
+                # scan_and_tag. Off the hot path: this runs once per
+                # completed text block at run finalization, not per
+                # streamed token.
+                if dlp_url:
+                    await _dlp_scan_transcript(
+                        dlp_url=dlp_url,
+                        tenant_id=tenant_id,
+                        content=text,
+                        resource_id=msg.id,
+                    )
+        elif block.get("kind") == "tool":
+            tool_call = {
+                "id": _sanitize_tool_text(block.get("tool_call_id") or ""),
+                "name": _sanitize_tool_text(block.get("name") or "tool"),
+                "input": _sanitize_json_value(block.get("input") or {}),
+                "result": _sanitize_tool_text(block.get("result")),
+                "state": _sanitize_tool_text(block.get("state")),
+            }
+            await svc.create_message(
+                session_id=run.session_id,
+                role="tool",
+                content=_sanitize_tool_text(block.get("name") or "tool"),
+                tool_calls=[tool_call],
+                run_id=run.id,
+            )
+            persisted_from_stream = True
+
+    return persisted_from_stream, already_persisted_for_run
+
+
+async def _redis_stream_has_end_marker(
+    *,
+    redis_url: str,
+    run_id: str,
+) -> bool:
+    """Return True iff the run's token stream contains a ``type=end`` entry.
+
+    The worker pushes exactly one authoritative ``type=end`` marker as the last
+    stream entry of a *normal* completion (``push_token_end`` in the runtime
+    worker's ``redis_state``).  On an HITL pause it deliberately pushes NO
+    ``end`` marker — only ``pending_confirmation`` / ``pending_question``
+    entries.  So the presence of ``end`` is a reliable "the worker finished
+    normally" signal, which lets the 404 branch of ``_reconcile_run_completion``
+    tell a completed-but-sandbox-pruned run apart from a paused one.
+
+    Failure-open: any connect/read error returns ``False`` (caller then falls
+    through to the grace-window logic, never mis-marking COMPLETED).
+    """
+    try:
+        import redis.asyncio as aioredis  # type: ignore[import-not-found]
+
+        client = aioredis.Redis.from_url(
+            redis_url,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+            decode_responses=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis end-marker connect failed: %s", exc)
+        return False
+
+    try:
+        entries = await client.xrange(_run_token_stream_key(run_id), min="-", max="+")
+        for _entry_id, raw_entry in entries:
+            if _coerce_redis_entry(raw_entry).get("type") == "end":
+                return True
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis end-marker read failed: %s", exc)
+        return False
+    finally:
+        with suppress(Exception):
+            await client.aclose()
+
+
 async def _dlp_scan_transcript(
     *,
     dlp_url: str,
@@ -555,6 +713,95 @@ async def _reconcile_run_completion(
         logger.warning("scheduler poll failed", extra={"run_id": run.id, "err": str(exc)})
         return False, []
 
+    # ── Sandbox-gone (404) reconciliation ──────────────────────────────────
+    # A 404 means the scheduler no longer has a container for this sandbox_id.
+    # The common cause in practice is the Docker container having been pruned
+    # out from under a RUNNING run row — the scheduler then returns 404 forever
+    # and, without this branch, the run stays RUNNING permanently (the sweeper
+    # re-hits the same 404 and gives up too).  We resolve the run definitively
+    # instead of treating 404 as "still running":
+    #
+    #   1. Token stream carries an ``end`` marker  → the worker DID finish
+    #      normally before the sandbox vanished. Replay the ordered blocks into
+    #      durable message rows (same path as a 200-COMPLETED) and mark
+    #      COMPLETED. The scheduler-only fields (result_summary/usage/artifacts)
+    #      are simply unavailable here, so they stay None/absent.
+    #   2. No ``end`` marker, run older than the grace window → the sandbox is
+    #      genuinely gone with no completion recorded. Mark FAILED so the run
+    #      stops hanging.
+    #   3. No ``end`` marker, run still within the grace window → a 404 can be
+    #      momentary right after spawn (container id registered a beat late), so
+    #      keep treating it as still-running and retry on the next poll.
+    #
+    # Only an explicit ``end`` marker takes the COMPLETED path: an HITL pause
+    # writes NO ``end`` marker (only pending_* entries), so a paused run whose
+    # sandbox was pruned correctly falls through to the grace/FAILED logic and
+    # is never mis-marked COMPLETED.
+    if resp.status_code == 404:
+        has_end = bool(redis_url) and await _redis_stream_has_end_marker(
+            redis_url=redis_url,
+            run_id=run.id,
+        )
+        if has_end:
+            logger.info(
+                "sandbox gone (404) but token stream has end marker; "
+                "finalizing run as COMPLETED from Redis replay",
+                extra={"run_id": run.id},
+            )
+            # Replay the ordered blocks into durable rows (idempotent via the
+            # helper's already_persisted_for_run guard).  There is no scheduler
+            # ``summary`` fallback on this path, so the helper's return values
+            # are not needed — the replayed rows ARE the reply.
+            await _replay_run_blocks_into_messages(
+                run=run,
+                svc=svc,
+                tenant_id=tenant_id,
+                redis_url=redis_url,  # non-empty (gated by has_end above)
+                dlp_url=dlp_url,
+            )
+            run.status = "COMPLETED"
+            run.finished_at = dt.datetime.now(tz=dt.UTC)
+            # Scheduler-only fields are unavailable once the sandbox is gone.
+            run.result_summary = None
+            run.error_message = None
+            return True, []
+
+        # No end marker: decide FAILED vs. keep-waiting on the run's age.  Both
+        # started_at and created_at are tz-aware (DateTime(timezone=True)); guard
+        # a naive value defensively so the comparison never raises.
+        reference = run.started_at or run.created_at
+        if reference is not None and reference.tzinfo is None:
+            reference = reference.replace(tzinfo=dt.UTC)
+        now = dt.datetime.now(tz=dt.UTC)
+        age_seconds = (
+            (now - reference).total_seconds() if reference is not None else None
+        )
+        if age_seconds is not None and age_seconds >= _SANDBOX_GONE_GRACE_SECONDS:
+            logger.warning(
+                "sandbox gone (404), no end marker, past grace window; "
+                "marking run FAILED",
+                extra={"run_id": run.id, "age_seconds": int(age_seconds)},
+            )
+            run.status = "FAILED"
+            run.finished_at = now
+            run.result_summary = (
+                "sandbox no longer exists (scheduler returned 404); "
+                "marked FAILED by reconcile"
+            )
+            run.error_message = (
+                "sandbox no longer exists (scheduler returned 404); "
+                "marked FAILED by reconcile"
+            )
+            return True, []
+
+        # Within the grace window — a transient 404 is plausible; retry later.
+        logger.info(
+            "sandbox 404, no end marker, within grace window; treating as "
+            "still-running and retrying next poll",
+            extra={"run_id": run.id},
+        )
+        return False, []
+
     if resp.status_code != 200:
         return False, []
 
@@ -609,76 +856,15 @@ async def _reconcile_run_completion(
     persisted_from_stream = False
     already_persisted_for_run = False
     if redis_url:
-        existing_messages, _ = await svc.list_messages(run.session_id, limit=200)
-        already_persisted_for_run = any(
-            m.run_id == run.id and (m.role or "").lower() in {"assistant", "tool", "thinking"}
-            for m in existing_messages
-        )
-        if not already_persisted_for_run:
-            blocks = await _read_ordered_blocks_from_redis(
+        persisted_from_stream, already_persisted_for_run = (
+            await _replay_run_blocks_into_messages(
+                run=run,
+                svc=svc,
+                tenant_id=tenant_id,
                 redis_url=redis_url,
-                run_id=run.id,
+                dlp_url=dlp_url,
             )
-            for block in blocks:
-                if block.get("kind") == "thinking":
-                    # Persist reasoning as a dedicated role='thinking' row so the
-                    # UI can show a collapsible "已思考" section after the run
-                    # (DeepSeek/Claude-style). It is ordered before the assistant
-                    # text in `blocks`, so the thinking row gets a lower sequence
-                    # and renders above the answer. role is a free String(10)
-                    # column (no enum/CHECK), so 'thinking' is accepted.
-                    text = str(block.get("text") or "")
-                    if text:
-                        await svc.create_message(
-                            session_id=run.session_id,
-                            role="thinking",
-                            content=text,
-                            tool_calls=None,
-                            run_id=run.id,
-                        )
-                        persisted_from_stream = True
-                elif block.get("kind") == "text":
-                    text = str(block.get("text") or "")
-                    if text:
-                        msg = await svc.create_message(
-                            session_id=run.session_id,
-                            role="assistant",
-                            content=text,
-                            tool_calls=None,
-                            run_id=run.id,
-                        )
-                        persisted_from_stream = True
-                        # ── DLP scan (output side): fail-open ───────────────
-                        # Scan the assistant's natural-language reply as it is
-                        # persisted on its way out to the user, mirroring the
-                        # attachment upload path. A hit tags the message, it is
-                        # never blocked; any DLP error is swallowed inside
-                        # scan_and_tag. Off the hot path: this runs once per
-                        # completed text block at run finalization, not per
-                        # streamed token.
-                        if dlp_url:
-                            await _dlp_scan_transcript(
-                                dlp_url=dlp_url,
-                                tenant_id=tenant_id,
-                                content=text,
-                                resource_id=msg.id,
-                            )
-                elif block.get("kind") == "tool":
-                    tool_call = {
-                        "id": _sanitize_tool_text(block.get("tool_call_id") or ""),
-                        "name": _sanitize_tool_text(block.get("name") or "tool"),
-                        "input": _sanitize_json_value(block.get("input") or {}),
-                        "result": _sanitize_tool_text(block.get("result")),
-                        "state": _sanitize_tool_text(block.get("state")),
-                    }
-                    await svc.create_message(
-                        session_id=run.session_id,
-                        role="tool",
-                        content=_sanitize_tool_text(block.get("name") or "tool"),
-                        tool_calls=[tool_call],
-                        run_id=run.id,
-                    )
-                    persisted_from_stream = True
+        )
 
     # Write an assistant message so the UI sees the reply. If Redis replay
     # already produced ordered text/tool blocks, avoid appending a duplicate

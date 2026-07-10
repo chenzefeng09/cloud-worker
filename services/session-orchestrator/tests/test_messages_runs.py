@@ -2122,3 +2122,287 @@ def test_create_run_includes_hitl_flag(
     assert body.get("hitl") is True, (
         f"Expected hitl=True in scheduler payload, got: {body.get('hitl')}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests -- PART H: sandbox-gone (scheduler 404) reconciliation
+#
+# When the Docker container backing a RUNNING run is pruned, the scheduler's
+# GET /runs/{sandbox_id} returns 404 forever.  _reconcile_run_completion must
+# resolve the run definitively instead of treating every 404 as "still running"
+# (which left runs stuck RUNNING permanently).  These tests drive the three 404
+# branches plus a regression guard that other non-200 statuses are unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _fake_client_with_status(status_code: int):
+    """Build ``(httpx_module, client_instance)`` whose GET returns ``status_code``.
+
+    Callers patch via
+    ``mock.patch.object(httpx_module, "AsyncClient", return_value=client_instance)``.
+    """
+    import httpx as httpx_mod
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.status_code = status_code
+
+        def json(self):  # only reached for 200; 404/503 short-circuit before this
+            return {}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            return _Resp()
+
+    return httpx_mod, _Client()
+
+
+def _fake_redis_with_stream(stream):
+    """Fake redis.asyncio.Redis whose xrange returns ``stream``."""
+
+    class _FakeRedis:
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def xrange(self, key, min="-", max="+"):
+            return stream
+
+        async def xread(self, *a, **kw):
+            return []
+
+        async def aclose(self):
+            pass
+
+    return _FakeRedis
+
+
+def test_reconcile_404_with_end_marker_marks_completed_and_replays() -> None:
+    """404 + Redis stream carrying an end marker → COMPLETED, blocks replayed.
+
+    The sandbox was pruned but the worker had already finished and written the
+    authoritative ``type=end`` marker, so the run is finalized COMPLETED and the
+    ordered blocks are persisted as durable message rows (create_message called).
+    """
+    import asyncio
+    import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
+
+    run = Run(
+        id="run_404_end", tenant_id=TEST_TENANT, session_id="ses_404_end",
+        task_description="finished before prune", status="RUNNING",
+        sandbox_id="sb_pruned",
+        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+
+    stream = [
+        ("1-0", {"type": "delta", "text": "all done"}),
+        ("2-0", {"type": "end", "text": ""}),
+    ]
+    fake_redis = _fake_redis_with_stream(stream)
+
+    created_messages: list[dict] = []
+
+    async def _fake_create_message(session_id, role, content, tool_calls, run_id):
+        created_messages.append({"role": role, "content": content})
+
+    svc = MagicMock()
+    svc.list_messages = AsyncMock(return_value=([], None))
+    svc.create_message = AsyncMock(side_effect=_fake_create_message)
+
+    httpx_mod, fake_client = _fake_client_with_status(404)
+
+    with (
+        _patch_redis_asyncio(fake_redis),
+        mock.patch.object(httpx_mod, "AsyncClient", return_value=fake_client),
+    ):
+        terminal, plan = asyncio.get_event_loop().run_until_complete(
+            _reconcile_run_completion(
+                scheduler_url="http://scheduler:8080",
+                tenant_id=TEST_TENANT,
+                user_id="u1",
+                run=run,
+                svc=svc,
+                knowledge_ingest_url="",
+                redis_url="redis://localhost:6379",
+            )
+        )
+
+    assert terminal is True
+    assert plan == []
+    assert run.status == "COMPLETED"
+    assert run.finished_at is not None
+    # Scheduler-only fields are unavailable once the sandbox is gone.
+    assert run.result_summary is None
+    # The single assistant text block was replayed into a durable row.
+    assert svc.create_message.call_count == 1
+    assert created_messages[0]["role"] == "assistant"
+    assert created_messages[0]["content"] == "all done"
+
+
+def test_reconcile_404_no_end_marker_past_grace_marks_failed() -> None:
+    """404 + no end marker + run older than the grace window → FAILED.
+
+    The sandbox is genuinely gone with no completion recorded, so the run is
+    force-FAILED with an explanatory result_summary/error_message instead of
+    hanging RUNNING forever.
+    """
+    import asyncio
+    import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1 import messages as messages_mod
+    from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
+
+    # started_at well in the past so it is comfortably past the grace window.
+    run = Run(
+        id="run_404_fail", tenant_id=TEST_TENANT, session_id="ses_404_fail",
+        task_description="sandbox vanished", status="RUNNING",
+        sandbox_id="sb_gone",
+        started_at=dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
+    )
+
+    # Stream has deltas but NO end marker (e.g. crashed worker).
+    stream = [("1-0", {"type": "delta", "text": "partial"})]
+    fake_redis = _fake_redis_with_stream(stream)
+
+    svc = MagicMock()
+    svc.list_messages = AsyncMock(return_value=([], None))
+    svc.create_message = AsyncMock()
+
+    httpx_mod, fake_client = _fake_client_with_status(404)
+
+    with (
+        _patch_redis_asyncio(fake_redis),
+        mock.patch.object(httpx_mod, "AsyncClient", return_value=fake_client),
+        mock.patch.object(messages_mod, "_SANDBOX_GONE_GRACE_SECONDS", 1),
+    ):
+        terminal, plan = asyncio.get_event_loop().run_until_complete(
+            _reconcile_run_completion(
+                scheduler_url="http://scheduler:8080",
+                tenant_id=TEST_TENANT,
+                user_id="u1",
+                run=run,
+                svc=svc,
+                knowledge_ingest_url="",
+                redis_url="redis://localhost:6379",
+            )
+        )
+
+    assert terminal is True
+    assert plan == []
+    assert run.status == "FAILED"
+    assert run.finished_at is not None
+    assert run.result_summary and "404" in run.result_summary
+    assert run.error_message and "sandbox no longer exists" in run.error_message
+    # No completion → nothing replayed.
+    svc.create_message.assert_not_called()
+
+
+def test_reconcile_404_no_end_marker_within_grace_keeps_running() -> None:
+    """404 + no end marker + fresh run → treated as still-running, status unchanged.
+
+    A 404 can be momentary right after spawn; within the grace window we retry
+    on the next poll rather than prematurely failing the run.
+    """
+    import asyncio
+    import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
+
+    # started_at = now → within any positive grace window.
+    now = dt.datetime.now(tz=dt.UTC)
+    run = Run(
+        id="run_404_fresh", tenant_id=TEST_TENANT, session_id="ses_404_fresh",
+        task_description="just spawned", status="RUNNING",
+        sandbox_id="sb_fresh",
+        started_at=now,
+        created_at=now,
+    )
+
+    # No end marker in the stream.
+    stream = [("1-0", {"type": "delta", "text": "warming up"})]
+    fake_redis = _fake_redis_with_stream(stream)
+
+    svc = MagicMock()
+    svc.list_messages = AsyncMock(return_value=([], None))
+    svc.create_message = AsyncMock()
+
+    httpx_mod, fake_client = _fake_client_with_status(404)
+
+    with (
+        _patch_redis_asyncio(fake_redis),
+        mock.patch.object(httpx_mod, "AsyncClient", return_value=fake_client),
+    ):
+        terminal, plan = asyncio.get_event_loop().run_until_complete(
+            _reconcile_run_completion(
+                scheduler_url="http://scheduler:8080",
+                tenant_id=TEST_TENANT,
+                user_id="u1",
+                run=run,
+                svc=svc,
+                knowledge_ingest_url="",
+                redis_url="redis://localhost:6379",
+            )
+        )
+
+    assert terminal is False
+    assert plan == []
+    assert run.status == "RUNNING"  # unchanged
+    assert run.finished_at is None
+    svc.create_message.assert_not_called()
+
+
+def test_reconcile_503_keeps_running_unchanged() -> None:
+    """Non-404 non-200 (503) → (False, []), status unchanged (regression guard).
+
+    Only 404 gets the sandbox-gone handling; other error statuses must still be
+    treated as "still running" so the next poll retries.
+    """
+    import asyncio
+    import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
+
+    run = Run(
+        id="run_503", tenant_id=TEST_TENANT, session_id="ses_503",
+        task_description="scheduler hiccup", status="RUNNING",
+        sandbox_id="sb_503",
+        # Old run so age can't be the reason we keep it running — proving the
+        # 503 path (not the 404 grace window) is what returns (False, []).
+        started_at=dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
+    )
+
+    svc = MagicMock()
+    svc.list_messages = AsyncMock(return_value=([], None))
+    svc.create_message = AsyncMock()
+
+    httpx_mod, fake_client = _fake_client_with_status(503)
+
+    with mock.patch.object(httpx_mod, "AsyncClient", return_value=fake_client):
+        terminal, plan = asyncio.get_event_loop().run_until_complete(
+            _reconcile_run_completion(
+                scheduler_url="http://scheduler:8080",
+                tenant_id=TEST_TENANT,
+                user_id="u1",
+                run=run,
+                svc=svc,
+                knowledge_ingest_url="",
+                redis_url="redis://localhost:6379",
+            )
+        )
+
+    assert terminal is False
+    assert plan == []
+    assert run.status == "RUNNING"  # unchanged
+    assert run.finished_at is None
+    svc.create_message.assert_not_called()
