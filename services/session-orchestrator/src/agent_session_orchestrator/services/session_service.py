@@ -295,6 +295,7 @@ class SessionService:
         *,
         app_snapshot: dict | None = None,
         source: str = "user",
+        execution_mode: str = "sandbox",
     ) -> Run:
         await self.get_session(session_id)
         run = Run(
@@ -304,6 +305,7 @@ class SessionService:
             status="PENDING",
             app_snapshot=app_snapshot,
             source=source,
+            execution_mode=execution_mode,
         )
         self._db.add(run)
         await self._db.flush()

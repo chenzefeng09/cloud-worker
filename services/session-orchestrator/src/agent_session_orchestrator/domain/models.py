@@ -95,6 +95,13 @@ class Run(Base):
     # Origin of the run: "user" for interactive chat/app runs, "schedule" for
     # cron-triggered runs dispatched by the cron-runner service.
     source: Mapped[str] = mapped_column(String(16), nullable=False, default="user", server_default="user")
+    # Execution mode: "sandbox" (default) spawns an agent worker container via
+    # the scheduler; "inline" streams a plain chat completion directly from the
+    # LLM gateway in the orchestrator process (chat mode — no sandbox, no
+    # scheduler).  Orthogonal to the scheduler's RuntimeKind (docker vs cube).
+    execution_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="sandbox", server_default="sandbox"
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
     )
