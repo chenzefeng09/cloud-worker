@@ -387,15 +387,23 @@ export function ChatWindow({
   const canRenderInlineCanvas = Boolean(
     inlineCanvasDraft && onInlineCanvasDraftChange && onInlineCanvasRequestEdit,
   );
+  // A message may only be hidden behind the inline canvas when that canvas is
+  // both renderable AND actually carries the lifted body. Hiding on the basis
+  // of `hiddenMessageIds` alone black-holes the message whenever the canvas is
+  // torn down or its draft is still empty (the cross-page/home→task race). This
+  // couples "message hidden" to "content is rendered somewhere" structurally.
+  const canHideBehindCanvas = Boolean(
+    canRenderInlineCanvas && inlineCanvasDraft && inlineCanvasDraft.content.trim().length > 0,
+  );
   const visibleMessages = useMemo(
     () =>
       getCanvasVisibleMessages(
         messages,
         hiddenMessageIds,
-        canRenderInlineCanvas,
+        canHideBehindCanvas,
         inlineCanvasAnchorMessageId,
       ),
-    [canRenderInlineCanvas, hiddenMessageIds, inlineCanvasAnchorMessageId, messages],
+    [canHideBehindCanvas, hiddenMessageIds, inlineCanvasAnchorMessageId, messages],
   );
   const anchoredInlineCanvasVisible = Boolean(
     hasVisibleCanvasAnchor(visibleMessages, canRenderInlineCanvas, inlineCanvasAnchorMessageId),
