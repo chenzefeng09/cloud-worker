@@ -411,6 +411,7 @@ async def _stream_completion_into_redis(
     model: str,
     messages: list[dict[str, Any]],
     sampling_params: dict[str, Any],
+    reasoning_effort: str | None = None,
 ) -> tuple[dict[str, int], str]:
     """POST a streaming chat completion and fan its SSE chunks into Redis.
 
@@ -453,6 +454,16 @@ async def _stream_completion_into_redis(
     for key in ("temperature", "max_tokens", "top_p", "stop"):
         if key in sampling_params and sampling_params[key] is not None:
             payload[key] = sampling_params[key]
+
+    # reasoning_effort: original passthrough, no clamp; None omits the field.
+    # NB: the current dev llm-gateway parses the request into a typed
+    # ChatCompletionRequest (extra="ignore", no reasoning_effort field) and
+    # rebuilds the upstream payload field-by-field, so it accepts this field
+    # (HTTP 200) but drops it before forwarding to the provider.  Sending it is
+    # a forward-compatible no-op — it begins to take effect the instant the
+    # gateway adds reasoning_effort to its request model.
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
 
     usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     reasoning_buf: list[str] = []
@@ -555,6 +566,7 @@ async def _execute_inline_run(
     memory: str,
     history: list[dict[str, Any]],
     sampling_params: dict[str, Any],
+    reasoning_effort: str | None = None,
 ) -> None:
     """Run one inline chat completion to terminal state.
 
@@ -623,6 +635,7 @@ async def _execute_inline_run(
                 model=model,
                 messages=messages,
                 sampling_params=sampling_params,
+                reasoning_effort=reasoning_effort,
             )
             final_status = "COMPLETED"
     except asyncio.CancelledError:
@@ -755,6 +768,7 @@ def start_inline_run(
     memory: str,
     history: list[dict[str, Any]],
     sampling_params: dict[str, Any],
+    reasoning_effort: str | None = None,
 ) -> None:
     """Launch the background inline-run task and register it for cancel.
 
@@ -762,6 +776,9 @@ def start_inline_run(
     RUNNING and committed by the surrounding request transaction — the task
     finalizes in its own fresh transaction, so it must not observe the row as
     PENDING.  Fire-and-forget: the HTTP response returns immediately.
+
+    ``reasoning_effort`` is passed through verbatim to the /chat/completions
+    payload when non-None (see ``_stream_completion_into_redis``).
     """
     task_obj = asyncio.create_task(
         _execute_inline_run(
@@ -776,6 +793,7 @@ def start_inline_run(
             memory=memory,
             history=history,
             sampling_params=sampling_params,
+            reasoning_effort=reasoning_effort,
         ),
         name=f"inline-run-{run_id}",
     )
