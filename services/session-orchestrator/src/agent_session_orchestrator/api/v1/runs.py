@@ -231,6 +231,40 @@ async def create_run(
             ),
         )
 
+    # ── Sandbox hard-guard for App / scheduled runs ─────────────────────────
+    # The inline (chat-mode) path is an interactive, in-process conversation
+    # turn with no sandbox isolation.  App-harness runs (carry ``app_snapshot``)
+    # and scheduled runs (``source != "user"``) MUST run inside a sandbox: they
+    # execute untrusted, published-app or unattended workloads and rely on the
+    # scheduler's isolation + resource limits.  Silently force them back to
+    # ``sandbox`` (never 400 — an over-eager caller should still succeed) and
+    # warn so the downgrade is visible in the logs.
+    if execution_mode == "inline" and (source != "user" or app_snapshot is not None):
+        logger.warning(
+            "forcing execution_mode=sandbox for a non-interactive run "
+            "(App/scheduled runs may not use inline chat mode)",
+            extra={
+                "session_id": session_id,
+                "source": source,
+                "has_app_snapshot": app_snapshot is not None,
+            },
+        )
+        execution_mode = "sandbox"
+
+    # ── Inline quota check (fail-closed) ────────────────────────────────────
+    # Inline runs bypass the scheduler entirely, so the scheduler's QuotaGuard
+    # never sees them.  Enforce the same ``agent_sessions`` dimension here,
+    # BEFORE the run row is created, so a rejected check leaves no RUNNING
+    # orphan behind.  402 (quota exceeded) / 502 (billing bad status) / 503
+    # (billing unreachable) propagate straight to the caller via the shared
+    # problem+json channel.  The sandbox path is untouched — its quota is still
+    # metered by the scheduler, so metering it here too would double-count.
+    if execution_mode == "inline":
+        quota_guard = request.app.state.quota_guard
+        await quota_guard.check(
+            tenant_id=tenant_id, dimension="agent_sessions", requested=1,
+        )
+
     # Persist the snapshot, source and execution_mode atomically with the run
     # row (same transaction).
     run = await svc.create_run(
@@ -305,10 +339,31 @@ async def create_run(
             run_id=run.id,
             task=task,
             model_hint=body.get("model"),
+            # reasoning_effort: original passthrough (None omits the field).  The
+            # current dev gateway parses /chat/completions into a typed
+            # ChatCompletionRequest without a reasoning_effort field and rebuilds
+            # the upstream payload field-by-field, so it *accepts* the field
+            # (HTTP 200, extra="ignore") but silently drops it before forwarding.
+            # Threading it here is therefore a forward-compatible no-op: it starts
+            # taking effect the moment the gateway adds the field to its model, and
+            # never regresses the request today.
+            reasoning_effort=body.get("reasoning_effort"),
             sys_prompt=sys_prompt,
             memory=memory_snippets,
             history=history,
             sampling_params=sampling_params,
+        )
+
+        # Record inline-run usage against the ``agent_sessions`` quota dimension
+        # (matches the scheduler's "spawn succeeded → record" semantics: we bill
+        # for the launched run, not the completed one).  Best-effort — the guard
+        # swallows all record errors, so a billing hiccup never fails an already
+        # started run.
+        await request.app.state.quota_guard.record(
+            tenant_id=tenant_id,
+            dimension="agent_sessions",
+            amount=1.0,
+            description=f"inline run {run.id}",
         )
 
         # Same response shape as the sandbox branch (sandbox_id is null).

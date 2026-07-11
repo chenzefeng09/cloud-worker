@@ -590,6 +590,8 @@ def test_create_run_inline_branch_no_scheduler(
     mock_db.refresh.side_effect = _refresh
 
     scheduler_calls: list[str] = []
+    quota_checks: list[dict] = []
+    quota_records: list[dict] = []
     started: list[dict] = []
 
     class _FakeClient(AuthzAwareClient):
@@ -600,6 +602,13 @@ def test_create_run_inline_branch_no_scheduler(
         async def post(self, url, json=None, **kw):
             if "/check" in url and "authz" in url:
                 return self._authz_allowed_resp()
+            # Billing quota guard (dimension=agent_sessions) — allow.
+            if url.endswith("/quota/check"):
+                quota_checks.append(json or {})
+                return __import__("httpx").Response(200, json={"allowed": True})
+            if url.endswith("/quota/usage"):
+                quota_records.append(json or {})
+                return __import__("httpx").Response(200, json={})
             # Any scheduler /runs call would be a contract violation for inline.
             scheduler_calls.append(url)
             return __import__("httpx").Response(201, json={"sandbox_id": "x"})
@@ -626,6 +635,9 @@ def test_create_run_inline_branch_no_scheduler(
     assert body["execution_mode"] == "inline"
     # Scheduler was NOT called.
     assert scheduler_calls == [], scheduler_calls
+    # Quota was checked (agent_sessions, 1) before the run and recorded after.
+    assert len(quota_checks) == 1 and quota_checks[0]["dimension"] == "agent_sessions"
+    assert len(quota_records) == 1 and quota_records[0]["dimension"] == "agent_sessions"
     # The background executor was launched with the right run id + task.
     assert started and started[0]["run_id"] == "run_inline"
     assert started[0]["task"] == "你好"
@@ -645,6 +657,307 @@ def test_create_run_invalid_execution_mode_400(
     )
     assert resp.status_code == 400
     assert "execution_mode" in resp.json()["detail"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# create_run endpoint — sandbox hard-guard for App / scheduled runs
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _drive_guard_case(
+    app_client: TestClient,
+    mock_db: AsyncMock,
+    auth_headers,
+    *,
+    body: dict,
+) -> tuple[list[str], list[Run], list[dict], list[dict]]:
+    """POST a create_run that requests inline but should be forced to sandbox.
+
+    Returns (scheduler_urls, created_runs, started_inline_kwargs, quota_checks).
+    Asserts a 201 and returns the interaction records for the caller to check.
+    """
+    session = Session(id="ses_g", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    created_runs: list[Run] = []
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_guard"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+            created_runs.append(obj)
+
+    mock_db.refresh.side_effect = _refresh
+
+    scheduler_urls: list[str] = []
+    quota_checks: list[dict] = []
+    started: list[dict] = []
+
+    class _FakeClient(AuthzAwareClient):
+        async def get(self, url, **kw):
+            return __import__("httpx").Response(200, json={"hits": []})
+
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if url.endswith("/quota/check"):
+                quota_checks.append(json or {})
+                return __import__("httpx").Response(200, json={"allowed": True})
+            if url.endswith("/quota/usage"):
+                return __import__("httpx").Response(200, json={})
+            # A scheduler /runs POST — the sandbox path.
+            scheduler_urls.append(url)
+            return __import__("httpx").Response(201, json={"sandbox_id": "sbx012345678"})
+
+    def _fake_start(**kw):
+        started.append(kw)
+
+    import httpx
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()), \
+            patch(
+                "agent_session_orchestrator.api.v1.runs.start_inline_run",
+                new=_fake_start,
+            ):
+        resp = app_client.post(
+            "/api/session/v1/sessions/ses_g/runs",
+            headers=auth_headers,
+            json=body,
+        )
+
+    assert resp.status_code == 201, resp.text
+    return scheduler_urls, created_runs, started, quota_checks
+
+
+def test_scheduled_inline_run_forced_to_sandbox(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """source='schedule' + execution_mode='inline' → forced to sandbox: the run
+    row is persisted with execution_mode='sandbox', the scheduler IS called, and
+    the inline executor is NOT launched (nor is inline quota checked)."""
+    scheduler_urls, created_runs, started, quota_checks = _drive_guard_case(
+        app_client, mock_db, auth_headers,
+        body={"task": "cron work", "execution_mode": "inline", "source": "schedule"},
+    )
+    assert created_runs and created_runs[0].execution_mode == "sandbox"
+    assert created_runs[0].source == "schedule"
+    # Sandbox path taken: scheduler called, inline executor NOT launched.
+    assert scheduler_urls and scheduler_urls[0].endswith("/runs")
+    assert started == [], "inline executor must not run for a scheduled run"
+    # Inline quota check is skipped (sandbox path is metered by the scheduler).
+    assert quota_checks == [], "inline quota must not be checked on the sandbox path"
+
+
+def test_app_snapshot_inline_run_forced_to_sandbox(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """A run carrying app_snapshot + execution_mode='inline' → forced to sandbox
+    even though source='user'."""
+    scheduler_urls, created_runs, started, quota_checks = _drive_guard_case(
+        app_client, mock_db, auth_headers,
+        body={
+            "task": "run app",
+            "execution_mode": "inline",
+            "app_snapshot": {"app_id": "app_1", "version": 3},
+        },
+    )
+    assert created_runs and created_runs[0].execution_mode == "sandbox"
+    assert created_runs[0].app_snapshot == {"app_id": "app_1", "version": 3}
+    assert scheduler_urls and scheduler_urls[0].endswith("/runs")
+    assert started == [], "inline executor must not run for an App run"
+    assert quota_checks == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# create_run endpoint — inline quota (fail-closed)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_inline_quota_exceeded_returns_402_no_running_run(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """A rejected quota check (allowed=false) → 402 and NO run row is created
+    (the check runs before create_run, so no RUNNING orphan survives)."""
+    session = Session(id="ses_q", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    started: list[dict] = []
+
+    class _FakeClient(AuthzAwareClient):
+        async def get(self, url, **kw):
+            return __import__("httpx").Response(200, json={"hits": []})
+
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if url.endswith("/quota/check"):
+                # Quota exhausted.
+                return __import__("httpx").Response(
+                    200,
+                    json={
+                        "allowed": False, "dimension": "agent_sessions",
+                        "current": 10, "limit": 10, "remaining": 0,
+                    },
+                )
+            raise AssertionError(f"unexpected POST {url}")
+
+    def _fake_start(**kw):
+        started.append(kw)
+
+    import httpx
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()), \
+            patch(
+                "agent_session_orchestrator.api.v1.runs.start_inline_run",
+                new=_fake_start,
+            ):
+        resp = app_client.post(
+            "/api/session/v1/sessions/ses_q/runs",
+            headers=auth_headers,
+            json={"task": "hi", "execution_mode": "inline"},
+        )
+
+    assert resp.status_code == 402, resp.text
+    detail = resp.json()["detail"]
+    assert detail["message"] == "quota exceeded"
+    assert detail["dimension"] == "agent_sessions"
+    # No run row was ever created → no RUNNING orphan (db.add never saw a Run).
+    added_runs = [
+        c.args[0] for c in mock_db.add.call_args_list
+        if c.args and isinstance(c.args[0], Run)
+    ]
+    assert added_runs == [], "no Run must be created when quota is exceeded"
+    # The inline executor was never launched.
+    assert started == []
+
+
+def test_inline_quota_billing_unreachable_returns_503(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """Billing unreachable during the inline quota check → 503 (fail-closed), and
+    no run row / executor launch."""
+    session = Session(id="ses_q2", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    started: list[dict] = []
+
+    class _FakeClient(AuthzAwareClient):
+        async def get(self, url, **kw):
+            return __import__("httpx").Response(200, json={"hits": []})
+
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if url.endswith("/quota/check"):
+                raise __import__("httpx").ConnectError("billing down")
+            raise AssertionError(f"unexpected POST {url}")
+
+    def _fake_start(**kw):
+        started.append(kw)
+
+    import httpx
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()), \
+            patch(
+                "agent_session_orchestrator.api.v1.runs.start_inline_run",
+                new=_fake_start,
+            ):
+        resp = app_client.post(
+            "/api/session/v1/sessions/ses_q2/runs",
+            headers=auth_headers,
+            json={"task": "hi", "execution_mode": "inline"},
+        )
+
+    assert resp.status_code == 503, resp.text
+    added_runs = [
+        c.args[0] for c in mock_db.add.call_args_list
+        if c.args and isinstance(c.args[0], Run)
+    ]
+    assert added_runs == []
+    assert started == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# reasoning_effort passthrough (accept-and-ignore on the current gateway)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_create_run_inline_threads_reasoning_effort(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """reasoning_effort on the create_run body is passed to start_inline_run."""
+    session = Session(id="ses_re", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_re"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+
+    started: list[dict] = []
+
+    class _FakeClient(AuthzAwareClient):
+        async def get(self, url, **kw):
+            return __import__("httpx").Response(200, json={"hits": []})
+
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if url.endswith("/quota/check"):
+                return __import__("httpx").Response(200, json={"allowed": True})
+            if url.endswith("/quota/usage"):
+                return __import__("httpx").Response(200, json={})
+            raise AssertionError(f"unexpected POST {url}")
+
+    def _fake_start(**kw):
+        started.append(kw)
+
+    import httpx
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()), \
+            patch(
+                "agent_session_orchestrator.api.v1.runs.start_inline_run",
+                new=_fake_start,
+            ):
+        resp = app_client.post(
+            "/api/session/v1/sessions/ses_re/runs",
+            headers=auth_headers,
+            json={"task": "hi", "execution_mode": "inline", "reasoning_effort": "high"},
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert started and started[0]["reasoning_effort"] == "high"
+
+
+def test_stream_payload_includes_reasoning_effort_when_set() -> None:
+    """When reasoning_effort is provided, it lands on the /chat/completions
+    payload verbatim; when None it is omitted (no clamp, original passthrough)."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    lines = [
+        _sse({"choices": [{"delta": {"content": "ok"}}]}),
+        _usage_frame(1, 1, 2),
+        "data: [DONE]",
+    ]
+
+    async def _run(reasoning_effort):
+        _FakeRedisStream.reset()
+        redis_client = _FakeRedisStream.from_url()
+        client = _FakeGatewayClient(sse_lines=lines)
+        await ex._stream_completion_into_redis(
+            client=client,  # type: ignore[arg-type]
+            redis_client=redis_client,
+            gateway_url="http://gw/api/llm-gateway/v1",
+            tenant_id=TEST_TENANT, user_id=TEST_USER, session_id="ses_1",
+            run_id="run_1", virtual_key="ek", model="deepseek-reasoner",
+            messages=[{"role": "user", "content": "hi"}], sampling_params={},
+            reasoning_effort=reasoning_effort,
+        )
+        return client.chat_payloads[0]
+
+    payload_high = asyncio.get_event_loop().run_until_complete(_run("high"))
+    assert payload_high["reasoning_effort"] == "high"
+
+    payload_none = asyncio.get_event_loop().run_until_complete(_run(None))
+    assert "reasoning_effort" not in payload_none
 
 
 # ─────────────────────────────────────────────────────────────────────────────
