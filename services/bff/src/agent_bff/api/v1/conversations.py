@@ -4,16 +4,49 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Literal
 
 import httpx
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ValidationError
 
 from agent_bff.api._http import foundation_headers
 from agent_bff.api.dependencies import require_auth
 
 router = APIRouter(tags=["Conversations"])
 logger = logging.getLogger(__name__)
+
+
+class _ExecutionModeEnvelope(BaseModel):
+    """Validates only the optional ``execution_mode`` field of a chat request.
+
+    The chat endpoint reads the rest of its body as a loose dict (message,
+    attachment_ids, skills, model, reasoning_effort), but ``execution_mode``
+    must be strictly one of ``inline`` / ``sandbox`` — an unknown value is a
+    422, not a silent fallthrough.  Defaults to ``sandbox`` when omitted so
+    existing clients keep the current agent-mode behaviour with zero change.
+
+    * ``inline``  — chat mode: the orchestrator answers in-process via the LLM
+                    gateway, no sandbox is dispatched.
+    * ``sandbox`` — agent mode (default): the existing sandboxed-run behaviour.
+    """
+
+    execution_mode: Literal["inline", "sandbox"] = "sandbox"
+
+
+def _validate_execution_mode(body: dict) -> str:
+    """Return the validated execution_mode, raising 422 on an illegal value.
+
+    Only the ``execution_mode`` key is inspected; anything else in ``body`` is
+    ignored here (the endpoint reads those fields separately).
+    """
+    try:
+        return _ExecutionModeEnvelope(
+            execution_mode=body.get("execution_mode", "sandbox")
+        ).execution_mode
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
 
 async def _resolve_attachment_files(
@@ -74,6 +107,9 @@ async def chat(
     * ``skills``           — optional list of skill names
     * ``model``            — optional model name
     * ``reasoning_effort`` — optional reasoning effort string
+    * ``execution_mode``   — optional ``"inline"`` | ``"sandbox"`` (default
+                             ``"sandbox"``); ``inline`` = chat mode (no sandbox),
+                             ``sandbox`` = agent mode.  An illegal value → 422.
 
     Returns JSON ``{"run_id": "...", "message_id": "...", "run": {...}}``.
     On upstream failure returns a JSON error with the upstream status code.
@@ -86,6 +122,9 @@ async def chat(
     skills: list[str] = body.get("skills") or []
     model: str | None = body.get("model") or None
     reasoning_effort: str | None = body.get("reasoning_effort") or None
+    # Strictly validated (inline/sandbox); defaults to sandbox for existing
+    # clients so agent mode remains the zero-change default.
+    execution_mode = _validate_execution_mode(body)
 
     async with httpx.AsyncClient(timeout=30) as client:
         headers = foundation_headers(tenant_id, user_id, access_token)
@@ -122,6 +161,7 @@ async def chat(
                 "skills": skills,
                 "model": model,
                 "reasoning_effort": reasoning_effort,
+                "execution_mode": execution_mode,
             },
             headers=headers,
         )

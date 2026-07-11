@@ -47,6 +47,11 @@ from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, T
 # duplicating any of its logic.
 from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
 from agent_session_orchestrator.domain.models import Run
+from agent_session_orchestrator.services.inline_run_executor import (
+    cancel_inline_run,
+    has_inline_task,
+    start_inline_run,
+)
 from agent_session_orchestrator.services.session_service import SessionService
 
 router = APIRouter(tags=["Runs"])
@@ -77,23 +82,44 @@ def _serialize_run(r: Run) -> dict[str, Any]:
         "total_tokens": r.total_tokens,
         "app_snapshot": r.app_snapshot,
         "source": r.source,
+        "execution_mode": r.execution_mode,
     }
 
 
-async def _fetch_memory(*, knowledge_ingest_url: str, tenant_id: str, query: str) -> str:
+async def _fetch_memory(
+    *,
+    knowledge_ingest_url: str,
+    tenant_id: str,
+    user_id: str,
+    query: str,
+    session_id: str = "",
+) -> str:
     """Query knowledge-ingest for relevant memories and return a formatted string.
 
     Uses ``GET /search?q=<query>&k=<K>`` with ``X-Tenant-Id`` header.
     Returns an empty string on any error (failure-open).
+
+    ``user_id`` must be the real requesting user (``usr_...``) — knowledge-
+    ingest's authz guard is fail-closed and rejects the ``SYSTEM`` sentinel,
+    which used to make this search silently 403 and return no memory.
+
+    ``session_id`` is passed as ``exclude_origin_session_id`` so this session's
+    own prior-turn Q&A memory documents are dropped from the RAG result — those
+    turns are already restored into the agent via conversation history, so
+    surfacing them again as "memory" would double-feed the same context.  The
+    remaining hits are therefore cross-session RAG memory only.
     """
     if not query.strip() or not knowledge_ingest_url:
         return ""
+    params: dict[str, Any] = {"q": query[:500], "k": _MEMORY_SEARCH_K}
+    if session_id:
+        params["exclude_origin_session_id"] = session_id
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(
                 f"{knowledge_ingest_url}/search",
-                params={"q": query[:500], "k": _MEMORY_SEARCH_K},
-                headers={"X-Tenant-Id": tenant_id, "X-User-Id": "SYSTEM"},
+                params=params,
+                headers={"X-Tenant-Id": tenant_id, "X-User-Id": user_id},
             )
         if resp.status_code != 200:
             logger.debug(
@@ -209,8 +235,28 @@ async def create_run(
             detail=f"invalid source {source!r}; must be one of {sorted(_VALID_SOURCES)}",
         )
 
-    # Persist the snapshot and source atomically with the run row (same transaction).
-    run = await svc.create_run(session_id, task, app_snapshot=app_snapshot, source=source)
+    # Execution mode — "sandbox" (default) relays to the agent-scheduler and
+    # spawns an agent worker container; "inline" streams a plain chat completion
+    # directly from the LLM gateway in-process (chat mode, no sandbox, no
+    # scheduler).  Defaulting to "sandbox" keeps the existing behaviour intact
+    # for every caller that omits the field.
+    _VALID_EXECUTION_MODES = {"inline", "sandbox"}
+    execution_mode: str = body.get("execution_mode") or "sandbox"
+    if execution_mode not in _VALID_EXECUTION_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"invalid execution_mode {execution_mode!r}; "
+                f"must be one of {sorted(_VALID_EXECUTION_MODES)}"
+            ),
+        )
+
+    # Persist the snapshot, source and execution_mode atomically with the run
+    # row (same transaction).
+    run = await svc.create_run(
+        session_id, task, app_snapshot=app_snapshot, source=source,
+        execution_mode=execution_mode,
+    )
 
     # Relay to agent-scheduler.
     scheduler_url = await _get_scheduler_url(request)
@@ -245,7 +291,9 @@ async def create_run(
     memory_snippets = await _fetch_memory(
         knowledge_ingest_url=knowledge_ingest_url,
         tenant_id=tenant_id,
+        user_id=user_id,
         query=task,
+        session_id=session_id,
     )
 
     # Assemble prior-turn conversation history so the worker can restore it
@@ -253,6 +301,49 @@ async def create_run(
     # user message *before* triggering this run, so it's already in the table
     # as the latest USER row — we drop it (it's this run's input, not history).
     history = await _assemble_history(svc, session_id, current_task=task)
+
+    # ── Inline (chat-mode) branch ───────────────────────────────────────────
+    # No scheduler, no sandbox: flip the run to RUNNING in THIS transaction so
+    # the session SSE multiplex poll can select it the instant the response
+    # returns, then launch the in-process executor as a background task.  The
+    # executor streams a plain chat completion from the LLM gateway into the
+    # same Redis token stream the sandbox worker uses, finalizes the run in its
+    # own transaction, and persists the assistant/thinking rows itself (the
+    # scheduler reconciler short-circuits on sandbox_id=None and never would).
+    if execution_mode == "inline":
+        run.status = "RUNNING"
+        run.started_at = _now()
+        session.current_run_id = run.id
+        # ``sandbox_id`` stays NULL — the sentinel for an inline run everywhere
+        # downstream (reconcile short-circuit, sweeper orphan branch, cancel).
+        await db.flush()
+
+        settings = request.app.state.settings
+        start_inline_run(
+            settings=settings,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            run_id=run.id,
+            task=task,
+            model_hint=body.get("model"),
+            sys_prompt=sys_prompt,
+            memory=memory_snippets,
+            history=history,
+            sampling_params=sampling_params,
+        )
+
+        # Same response shape as the sandbox branch (sandbox_id is null).
+        return {
+            "id": run.id,
+            "session_id": session_id,
+            "sandbox_id": None,
+            "status": run.status,
+            "task_description": run.task_description,
+            "source": run.source,
+            "execution_mode": run.execution_mode,
+            "created_at": run.created_at.isoformat(),
+        }
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -331,6 +422,7 @@ async def create_run(
         "status": run.status,
         "task_description": run.task_description,
         "source": run.source,
+        "execution_mode": run.execution_mode,
         "created_at": run.created_at.isoformat(),
     }
 
@@ -431,6 +523,8 @@ async def get_run(
         "output_tokens": run.output_tokens,
         "total_tokens": run.total_tokens,
         "app_snapshot": run.app_snapshot,
+        "source": run.source,
+        "execution_mode": run.execution_mode,
     }
 
 
@@ -873,6 +967,32 @@ async def _do_cancel_run(
     """Core cancel logic — shared by the run-level and session-level endpoints."""
     svc = SessionService(db, tenant_id=tenant_id)
     run = await svc.get_run(session_id, run_id)
+
+    # ── Inline (chat-mode) run cancel ───────────────────────────────────────
+    # An inline run has no sandbox / scheduler container: cancel the in-process
+    # asyncio task, push the ``end`` marker so the SSE tail closes, and revoke
+    # the ephemeral key.  We detect inline by execution_mode (authoritative)
+    # OR a live in-process task handle (belt-and-braces).  Never call the
+    # scheduler for these.
+    is_inline = run.execution_mode == "inline" or has_inline_task(run_id)
+    if is_inline:
+        settings = request.app.state.settings
+        await cancel_inline_run(
+            settings=settings,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            run_id=run_id,
+        )
+        run.status = "CANCELLED"
+        run.finished_at = _now()
+        await db.flush()
+        await svc.create_message(
+            session_id,
+            role="system",
+            content="任务已取消",
+            run_id=run_id,
+        )
+        return {"id": run.id, "status": "CANCELLED"}
 
     # Use run.sandbox_id (short Docker container id) as the scheduler path
     # segment — the same convention used by _reconcile_run_completion in

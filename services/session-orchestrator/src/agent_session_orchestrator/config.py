@@ -71,3 +71,18 @@ class Settings(BaseSettings):
     # Failure-open: if unset or unreachable, the /state endpoint returns DB status
     # with empty plan/cursor fields rather than 500.
     redis_url: str | None = None
+
+    # LLM gateway — the OpenAI-protocol proxy the orchestrator talks to directly
+    # for chat-mode "inline" runs (POST {url}/chat/completions with
+    # X-LLM-Virtual-Key).  Default aligns with the BFF value
+    # (``services/bff/src/agent_bff/config.py``); the gateway resolves tenant +
+    # actor from the X-Tenant-Id / X-User-Id / X-Actor headers, so no bearer is
+    # required for the mesh call.  Env: SESSION_ORCHESTRATOR_LLM_GATEWAY_URL.
+    llm_gateway_url: str = "http://llm-gateway:8011/api/llm-gateway/v1"
+
+    # Timeout (seconds) for a single inline /chat/completions stream. Reasoning
+    # models can be slow; give a generous window before we abort the stream.
+    inline_completion_timeout: float = 300.0
+    # Timeout (seconds) for the lightweight gateway metadata calls made during an
+    # inline run (mint/fetch virtual key, resolve default model, revoke key).
+    inline_meta_timeout: float = 5.0

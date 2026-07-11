@@ -68,7 +68,7 @@ def test_tenant_runs_returns_items_shape(
         "id", "session_id", "sandbox_id", "status", "task_description",
         "result_summary", "error_message", "started_at", "finished_at",
         "created_at", "input_tokens", "output_tokens", "total_tokens",
-        "app_snapshot", "source",
+        "app_snapshot", "source", "execution_mode",
     }
     assert set(item.keys()) == expected_keys
 

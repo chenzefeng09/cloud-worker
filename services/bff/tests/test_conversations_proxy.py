@@ -78,6 +78,9 @@ class FakeChatFoundation:
         self.attachment_items = attachment_items  # None means no attachment endpoint
         self.stream_error = stream_error
         self.calls: list[tuple[str, str]] = []
+        # Captures the JSON body of the POST /runs call so tests can assert what
+        # the BFF forwarded to the orchestrator (e.g. execution_mode passthrough).
+        self.runs_body: dict | None = None
 
     def route(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         self.calls.append((method, url))
@@ -90,9 +93,12 @@ class FakeChatFoundation:
             items = self.attachment_items or []
             return httpx.Response(200, json={"items": items})
         if "runs" in url and method == "POST":
+            self.runs_body = kwargs.get("json")
             return httpx.Response(
                 self.run_status,
-                json={"id": "run_01", "status": "QUEUED"},
+                json={"id": "run_01", "status": "QUEUED", "execution_mode": (
+                    (kwargs.get("json") or {}).get("execution_mode", "sandbox")
+                )},
             )
         return httpx.Response(200, json={"ok": True})
 
@@ -226,6 +232,88 @@ def test_chat_attachment_with_unknown_id(
     body = resp.json()
     # Run should still have started
     assert body["run_id"] == "run_01"
+
+
+# ---------------------------------------------------------------------------
+# Tests: POST /sessions/{id}/chat — execution_mode (chat vs agent mode)
+# ---------------------------------------------------------------------------
+
+def test_chat_execution_mode_defaults_to_sandbox(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No execution_mode in the body → forwarded as 'sandbox' (agent mode)."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello"},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert fake.runs_body.get("execution_mode") == "sandbox"
+
+
+def test_chat_execution_mode_inline_passthrough(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """execution_mode='inline' (chat mode) is forwarded to the runs body."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello", "execution_mode": "inline"},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert fake.runs_body.get("execution_mode") == "inline"
+    # The run object echoes it back to the caller.
+    assert resp.json()["run"].get("execution_mode") == "inline"
+
+
+def test_chat_execution_mode_sandbox_passthrough(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """execution_mode='sandbox' (agent mode) is forwarded to the runs body."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello", "execution_mode": "sandbox"},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert fake.runs_body.get("execution_mode") == "sandbox"
+
+
+def test_chat_execution_mode_invalid_returns_422(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An illegal execution_mode value → 422, and no run is started."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello", "execution_mode": "bogus"},
+    )
+    assert resp.status_code == 422
+    # Validation happens before any orchestrator call → no runs POST attempted.
+    assert not any("runs" in u and m == "POST" for m, u in fake.calls)
 
 
 # ---------------------------------------------------------------------------
