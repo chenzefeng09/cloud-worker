@@ -86,7 +86,13 @@ class IngestService:
         return doc, count
 
     async def create_document(
-        self, *, title: str, filename: str, mime: str, data: bytes,
+        self,
+        *,
+        title: str,
+        filename: str,
+        mime: str,
+        data: bytes,
+        origin_session_id: str | None = None,
     ) -> Document:
         # Reject unsupported MIMEs up-front so we don't burn blob storage
         # on something the parser can't process later.
@@ -98,6 +104,7 @@ class IngestService:
             title=title,
             mime=mime,
             status="PENDING",
+            origin_session_id=origin_session_id,
         )
         self._db.add(doc)
         await self._db.flush()
@@ -179,7 +186,20 @@ class IngestService:
 
     # ----------------------------------------------------------- search
 
-    async def search(self, query: str, *, k: int = 5) -> list[SearchHit]:
+    async def search(
+        self,
+        query: str,
+        *,
+        k: int = 5,
+        exclude_origin_session_id: str | None = None,
+    ) -> list[SearchHit]:
+        """Vector search over chunks.
+
+        ``exclude_origin_session_id`` (when non-empty) drops every chunk whose
+        parent document was produced by that session — used by the
+        session-orchestrator memory pre-fetch to avoid re-injecting a session's
+        own prior-turn Q&A that is already restored via conversation history.
+        """
         if not query.strip():
             return []
         vectors = await self._embeddings.embed([query])
@@ -189,12 +209,15 @@ class IngestService:
         if len(qvec) != EMBEDDING_DIM:
             raise EmbeddingDimensionError(EMBEDDING_DIM, len(qvec))
 
+        exclude = (exclude_origin_session_id or "").strip() or None
         bind = self._db.get_bind()
         if bind is not None and bind.dialect.name == "postgresql":
-            return await self._search_pgvector(qvec, k=k)
-        return await self._search_python(qvec, k=k)
+            return await self._search_pgvector(qvec, k=k, exclude_origin_session_id=exclude)
+        return await self._search_python(qvec, k=k, exclude_origin_session_id=exclude)
 
-    async def _search_pgvector(self, qvec: list[float], *, k: int) -> list[SearchHit]:
+    async def _search_pgvector(
+        self, qvec: list[float], *, k: int, exclude_origin_session_id: str | None = None,
+    ) -> list[SearchHit]:
         # pgvector ships ``<=>`` (cosine distance) as an operator on the
         # ``vector`` type.  Lower distance = better match.
         #
@@ -214,6 +237,11 @@ class IngestService:
             .order_by(distance.asc())
             .limit(k)
         )
+        if exclude_origin_session_id is not None:
+            stmt = stmt.where(
+                (Document.origin_session_id.is_(None))
+                | (Document.origin_session_id != exclude_origin_session_id)
+            )
         result = await self._db.execute(stmt)
         hits: list[SearchHit] = []
         for chunk, doc, dist in result.all():
@@ -228,13 +256,20 @@ class IngestService:
             )
         return hits
 
-    async def _search_python(self, qvec: list[float], *, k: int) -> list[SearchHit]:
+    async def _search_python(
+        self, qvec: list[float], *, k: int, exclude_origin_session_id: str | None = None,
+    ) -> list[SearchHit]:
         """Fallback for unit tests on SQLite — small dataset, fine to brute force."""
         stmt = (
             select(Chunk, Document)
             .join(Document, Document.id == Chunk.document_id)
             .where(Document.tenant_id == self._tenant_id)
         )
+        if exclude_origin_session_id is not None:
+            stmt = stmt.where(
+                (Document.origin_session_id.is_(None))
+                | (Document.origin_session_id != exclude_origin_session_id)
+            )
         result = await self._db.execute(stmt)
         rows = list(result.all())
         scored: list[tuple[float, Chunk, Document]] = []

@@ -434,8 +434,10 @@ async def _write_memory(
     *,
     knowledge_ingest_url: str,
     tenant_id: str,
+    user_id: str,
     task_description: str,
     summary: str,
+    session_id: str = "",
 ) -> None:
     """Write a memory document to knowledge-ingest after run completion.
 
@@ -443,6 +445,16 @@ async def _write_memory(
     uploaded as ``text/plain``, then immediately ingested (embedded) so it
     becomes searchable.  Failure-open: any error is logged at DEBUG level
     and the caller is not affected.
+
+    ``user_id`` must be the real originating user (``usr_...``) — knowledge-
+    ingest's authz guard is fail-closed and rejects the ``SYSTEM`` sentinel,
+    which used to make this write silently 403.  Callers resolve the session
+    owner when they only hold a system identity.
+
+    ``session_id`` is stamped onto the document as ``origin_session_id`` so the
+    memory pre-fetch (``_fetch_memory``) can exclude this session's own prior-turn
+    Q&A — that context is already restored into the agent via conversation
+    history, and re-injecting it as RAG double-feeds the same turns.
 
     Two HTTP calls:
       1. ``POST /documents`` (multipart) → document_id
@@ -456,13 +468,17 @@ async def _write_memory(
     content = f"用户任务：{snippet_task}\n\n助理回答：{snippet_summary}"
     title = f"[memory] {snippet_task[:80]}"
 
+    upload_data = {"title": title, "mime": "text/plain"}
+    if session_id:
+        upload_data["origin_session_id"] = session_id
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            headers = {"X-Tenant-Id": tenant_id, "X-User-Id": "SYSTEM"}
+            headers = {"X-Tenant-Id": tenant_id, "X-User-Id": user_id}
             upload_resp = await client.post(
                 f"{knowledge_ingest_url}/documents",
                 headers=headers,
-                data={"title": title, "mime": "text/plain"},
+                data=upload_data,
                 files={"file": ("memory.txt", content.encode("utf-8"), "text/plain")},
             )
             if upload_resp.status_code not in (200, 201):
@@ -912,11 +928,29 @@ async def _reconcile_run_completion(
     # is caught inside _write_memory and logged at DEBUG level, so this
     # never blocks or raises on the reconcile caller.
     if summary and knowledge_ingest_url:
+        # knowledge-ingest's authz guard rejects the "SYSTEM" sentinel
+        # (fail-closed).  Every interactive caller already passes the session
+        # owner, but the reconcile sweeper can fall back to "SYSTEM" when its
+        # cross-tenant scan yields no user — resolve the owner here so the
+        # memory write carries a real identity.  Failure-open: if the session
+        # row is gone the sentinel goes through and knowledge-ingest rejects
+        # it, which _write_memory swallows.
+        memory_user_id = user_id
+        if not memory_user_id or memory_user_id == "SYSTEM":
+            try:
+                memory_user_id = (await svc.get_session(run.session_id)).user_id
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "memory write: could not resolve session owner for %s",
+                    run.session_id,
+                )
         await _write_memory(
             knowledge_ingest_url=knowledge_ingest_url,
             tenant_id=tenant_id,
+            user_id=memory_user_id,
             task_description=run.task_description or "",
             summary=summary,
+            session_id=run.session_id,
         )
 
     return True, plan_steps

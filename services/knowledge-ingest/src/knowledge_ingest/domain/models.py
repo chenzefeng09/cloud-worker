@@ -32,6 +32,11 @@ class Document(Base):
     tenant_id: Mapped[str] = mapped_column(String(40), nullable=False, index=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
     source_uri: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    # Session that produced this document, when it was written as a run-completion
+    # memory doc by the session-orchestrator. NULL for ordinary uploads. Search
+    # can exclude same-session memory docs via ``exclude_origin_session_id`` so a
+    # session's own prior Q&A isn't re-fed as RAG on top of the restored history.
+    origin_session_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     mime: Mapped[str] = mapped_column(String(80), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="PENDING")
     uploaded_at: Mapped[datetime] = mapped_column(

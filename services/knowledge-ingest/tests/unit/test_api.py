@@ -136,6 +136,68 @@ def test_search_returns_hits(
     assert all("score" in h for h in hits)
 
 
+def test_upload_persists_origin_session_id(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    resp = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=tenant_headers,
+        data={
+            "title": "[memory] hi",
+            "mime": "text/plain",
+            "origin_session_id": "ses_upload1",
+        },
+        files={"file": ("memory.txt", b"hello world", "text/plain")},
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["origin_session_id"] == "ses_upload1"
+
+    detail = app_client.get(
+        f"/api/knowledge/v1/documents/{body['id']}", headers=tenant_headers,
+    ).json()
+    assert detail["origin_session_id"] == "ses_upload1"
+
+
+def test_upload_without_origin_session_id_defaults_null(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    resp = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=tenant_headers,
+        data={"title": "plain", "mime": "text/plain"},
+        files={"file": ("plain.txt", b"hello", "text/plain")},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["origin_session_id"] is None
+
+
+def test_search_excludes_origin_session_via_query(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    marker = ("uniquely-identifiable-marker " * 8).encode()
+    own = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=tenant_headers,
+        data={"title": "[memory] own", "mime": "text/plain",
+              "origin_session_id": "ses_self"},
+        files={"file": ("own.txt", marker, "text/plain")},
+    ).json()
+    app_client.post(
+        f"/api/knowledge/v1/documents/{own['id']}/ingest", headers=tenant_headers,
+    )
+
+    resp = app_client.get(
+        "/api/knowledge/v1/search",
+        params={"q": "uniquely-identifiable-marker", "k": 10,
+                "exclude_origin_session_id": "ses_self"},
+        headers=tenant_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    ids = {h["document_id"] for h in resp.json()["hits"]}
+    assert own["id"] not in ids
+
+
 def test_search_empty_query_returns_no_hits(
     app_client: TestClient, tenant_headers: dict[str, str],
 ) -> None:

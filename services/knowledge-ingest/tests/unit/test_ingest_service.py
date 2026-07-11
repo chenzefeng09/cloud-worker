@@ -161,6 +161,80 @@ async def test_search_empty_query_returns_empty(svc: IngestService) -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_document_persists_origin_session_id(
+    svc: IngestService,
+) -> None:
+    doc = await svc.create_document(
+        title="[memory] hi",
+        filename="memory.txt",
+        mime="text/plain",
+        data="用户任务：hi\n\n助理回答：hello".encode(),
+        origin_session_id="ses_abc123",
+    )
+    refreshed, _ = await svc.get_document(doc.id)
+    assert refreshed.origin_session_id == "ses_abc123"
+
+
+@pytest.mark.asyncio
+async def test_search_excludes_origin_session_docs(svc: IngestService) -> None:
+    """exclude_origin_session_id drops chunks from that session's own docs.
+
+    Two docs share the exact same marker text so FakeEmbeddings gives them
+    identical vectors (cosine == 1.0).  One is tagged with the excluded
+    session; only the untagged one may survive the filter.
+    """
+    marker = "uniquely-identifiable-marker " * 8
+    own = await svc.create_document(
+        title="[memory] own",
+        filename="own.txt",
+        mime="text/plain",
+        data=marker.encode(),
+        origin_session_id="ses_self",
+    )
+    await svc.ingest_document(own.id)
+    other = await svc.create_document(
+        title="[memory] other",
+        filename="other.txt",
+        mime="text/plain",
+        data=marker.encode(),
+        origin_session_id="ses_other",
+    )
+    await svc.ingest_document(other.id)
+
+    # Without exclusion, both docs' chunks are eligible.
+    unfiltered = await svc.search("uniquely-identifiable-marker", k=10)
+    ids_all = {h.document_id for h in unfiltered}
+    assert own.id in ids_all
+    assert other.id in ids_all
+
+    # Excluding the self session removes only its chunks.
+    filtered = await svc.search(
+        "uniquely-identifiable-marker", k=10, exclude_origin_session_id="ses_self",
+    )
+    ids_filtered = {h.document_id for h in filtered}
+    assert own.id not in ids_filtered
+    assert other.id in ids_filtered
+
+
+@pytest.mark.asyncio
+async def test_search_exclude_keeps_untagged_docs(svc: IngestService) -> None:
+    """Ordinary (untagged) docs are never dropped by exclude_origin_session_id."""
+    marker = "plain-upload-marker " * 8
+    plain = await svc.create_document(
+        title="plain",
+        filename="plain.txt",
+        mime="text/plain",
+        data=marker.encode(),
+    )
+    await svc.ingest_document(plain.id)
+
+    hits = await svc.search(
+        "plain-upload-marker", k=10, exclude_origin_session_id="ses_anything",
+    )
+    assert plain.id in {h.document_id for h in hits}
+
+
+@pytest.mark.asyncio
 async def test_tenant_isolation_on_listing(
     session: AsyncSession,
     blob_store: InMemoryBlobStore,
