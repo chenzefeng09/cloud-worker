@@ -913,6 +913,10 @@ export function useChat() {
         // Per-session model + reasoning effort, set via the composer dropdowns.
         const model = useChatStore.getState().selectedModel[sessionId] || undefined;
         const effortSel = useChatStore.getState().selectedEffort[sessionId] || '';
+        // Per-session execution mode (chat/inline vs agent/sandbox). Default to
+        // agent mode ('sandbox') so a session the user never toggled behaves
+        // exactly as before. Always sent explicitly so the choice is unambiguous.
+        const executionMode = useChatStore.getState().executionMode[sessionId] || 'sandbox';
 
         const res = await fetch(`/api/bff/v1/sessions/${sessionId}/chat`, {
           method: 'POST',
@@ -923,6 +927,7 @@ export function useChat() {
             skills,
             ...(model ? { model } : {}),
             ...(effortSel ? { reasoning_effort: effortSel } : {}),
+            execution_mode: executionMode,
           }),
           credentials: 'include',
           signal: abortRef.current.signal,

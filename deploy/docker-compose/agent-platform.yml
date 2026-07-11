@@ -283,6 +283,12 @@ services:
       # Redis — reads agent run hot-state (plan/step/cursor) written by the sandbox.
       # Same Redis instance the scheduler forwards into sandboxes (SCHEDULER_REDIS_URL).
       SESSION_ORCHESTRATOR_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
+      # LLM gateway — chat-mode "inline" runs stream a plain chat completion
+      # directly from the gateway in-process (no sandbox).  Same gateway the
+      # scheduler/tool-broker use (LLM_GATEWAY_URL); the orchestrator mints an
+      # ephemeral per-run virtual key and calls /chat/completions with header
+      # auth (X-Tenant-Id / X-User-Id / X-LLM-Virtual-Key), no bearer needed.
+      SESSION_ORCHESTRATOR_LLM_GATEWAY_URL: ${LLM_GATEWAY_URL:-http://llm-gateway:8011/api/llm-gateway/v1}
     ports:
       - "${PORT_SESSION_ORCHESTRATOR:-8006}:8006"
     networks: [foundation]

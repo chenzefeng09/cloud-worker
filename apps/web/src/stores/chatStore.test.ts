@@ -38,6 +38,7 @@ const RESET_STATE = {
   selectedSkills: {},
   selectedModel: {},
   selectedEffort: {},
+  executionMode: {},
   pendingInteractions: {},
   acknowledgedPendingInteractions: {},
 };
@@ -126,6 +127,30 @@ describe('chatStore', () => {
     useChatStore.getState().toggleSkill('ses_1', 'pdf');
     useChatStore.getState().logout();
     expect(useChatStore.getState().selectedSkills).toEqual({});
+  });
+
+  it('setSessionExecutionMode sets per-session mode and isolates sessions', () => {
+    const { setSessionExecutionMode } = useChatStore.getState();
+    // Default (no entry) is undefined; the composer treats that as 'sandbox'.
+    expect(useChatStore.getState().executionMode['ses_1']).toBeUndefined();
+
+    setSessionExecutionMode('ses_1', 'inline');
+    expect(useChatStore.getState().executionMode['ses_1']).toBe('inline');
+
+    // Switching back to agent mode is honoured.
+    setSessionExecutionMode('ses_1', 'sandbox');
+    expect(useChatStore.getState().executionMode['ses_1']).toBe('sandbox');
+
+    // Other sessions are unaffected.
+    setSessionExecutionMode('ses_2', 'inline');
+    expect(useChatStore.getState().executionMode['ses_2']).toBe('inline');
+    expect(useChatStore.getState().executionMode['ses_1']).toBe('sandbox');
+  });
+
+  it('logout clears executionMode', () => {
+    useChatStore.getState().setSessionExecutionMode('ses_1', 'inline');
+    useChatStore.getState().logout();
+    expect(useChatStore.getState().executionMode).toEqual({});
   });
 
   // ─── Optimistic USER message replacement ────────────────────────────────────

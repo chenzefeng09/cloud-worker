@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { Message, PendingInteraction, Session, ToolCallEntry, UserProfile } from '../api/types';
+import type { ExecutionMode, Message, PendingInteraction, Session, ToolCallEntry, UserProfile } from '../api/types';
 import type { PlanStep } from '../lib/designFixtures';
 
 /** Payload for a single tool event from the SSE stream. */
@@ -64,6 +64,14 @@ interface ChatState {
   selectedModel: Record<string, string>;
   /** Per-session reasoning effort ('' = off). Read at send time. */
   selectedEffort: Record<string, string>;
+  /**
+   * Per-session execution mode — 'inline' (chat mode, no sandbox) or 'sandbox'
+   * (agent mode, default). Set via the composer mode toggle, read at send time
+   * and forwarded in the /chat body → orchestrator run.execution_mode. A session
+   * with no entry defaults to agent mode ('sandbox') so existing behaviour is
+   * unchanged.
+   */
+  executionMode: Record<string, ExecutionMode>;
 
   // ── HITL — human-in-the-loop ─────────────────────────────────────────────
   //
@@ -322,6 +330,8 @@ interface ChatState {
   setSessionModel: (sessionId: string, model: string) => void;
   /** Set the reasoning effort for a session ('' = off). */
   setSessionEffort: (sessionId: string, effort: string) => void;
+  /** Set the execution mode for a session ('inline' = chat, 'sandbox' = agent). */
+  setSessionExecutionMode: (sessionId: string, mode: ExecutionMode) => void;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -377,6 +387,35 @@ function isRunStreamClosed(
 
 function pendingInteractionKey(runId: string, toolCallId: string): string {
   return `${runId}:${toolCallId}`;
+}
+
+// ── Execution-mode persistence (per session) ───────────────────────────────
+// Persist the chat/agent mode toggle per session so a refresh keeps the user's
+// choice. Best-effort: any storage failure (privacy mode, quota) is swallowed
+// and the mode simply falls back to the agent-mode default.
+const EXECUTION_MODE_STORAGE_KEY = 'chat-execution-mode-v1';
+
+function loadPersistedExecutionModes(): Record<string, ExecutionMode> {
+  try {
+    const raw = localStorage.getItem(EXECUTION_MODE_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const out: Record<string, ExecutionMode> = {};
+    for (const [sid, mode] of Object.entries(parsed)) {
+      if (mode === 'inline' || mode === 'sandbox') out[sid] = mode;
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+function persistExecutionModes(modes: Record<string, ExecutionMode>): void {
+  try {
+    localStorage.setItem(EXECUTION_MODE_STORAGE_KEY, JSON.stringify(modes));
+  } catch {
+    // Ignore storage failures — the in-memory map is still authoritative.
+  }
 }
 
 function isPendingInteractionAcknowledged(
@@ -470,6 +509,7 @@ export const useChatStore = create<ChatState>((set) => ({
   selectedSkills: {},
   selectedModel: {},
   selectedEffort: {},
+  executionMode: loadPersistedExecutionModes(),
   pendingInteractions: {},
   acknowledgedPendingInteractions: {},
 
@@ -921,6 +961,7 @@ export const useChatStore = create<ChatState>((set) => ({
       selectedSkills: {},
       selectedModel: {},
       selectedEffort: {},
+      executionMode: {},
       pendingInteractions: {},
       acknowledgedPendingInteractions: {},
     }),
@@ -944,4 +985,10 @@ export const useChatStore = create<ChatState>((set) => ({
     set((s) => ({ selectedModel: { ...s.selectedModel, [sessionId]: model } })),
   setSessionEffort: (sessionId, effort) =>
     set((s) => ({ selectedEffort: { ...s.selectedEffort, [sessionId]: effort } })),
+  setSessionExecutionMode: (sessionId, mode) =>
+    set((s) => {
+      const next = { ...s.executionMode, [sessionId]: mode };
+      persistExecutionModes(next);
+      return { executionMode: next };
+    }),
 }));

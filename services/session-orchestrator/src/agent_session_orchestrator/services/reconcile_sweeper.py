@@ -57,9 +57,69 @@ SWEEP_INTERVAL_SECONDS: int = 60
 # freshly-created runs that are still cold-starting their sandbox.
 STALE_AFTER_SECONDS: int = 120
 
+# Inline (chat-mode) runs have no sandbox and no scheduler container, so the
+# scheduler reconciler can never resolve them — a process restart mid-stream
+# would otherwise leave the run RUNNING forever.  After this window an inline
+# run still stuck RUNNING/PENDING is force-FAILED (its executor task died with
+# the process; the registry that held its handle is gone).  Generous so a
+# genuinely slow reasoning completion is never killed out from under a live
+# executor — that completes on its own and finalizes the row before this fires.
+INLINE_ORPHAN_AFTER_SECONDS: int = 20 * 60
+
 # Short startup delay so a fleet of pods restarting together does not all hit
 # the DB at the same instant.
 _SWEEP_STARTUP_DELAY_SECONDS: int = 30
+
+
+def _inline_run_is_orphaned(run_obj: object) -> bool:
+    """True if an inline run is old enough to be considered process-orphaned.
+
+    Age is measured from ``started_at`` (or ``created_at`` when started_at is
+    NULL).  Both are tz-aware DateTime(timezone=True); guard a naive value
+    defensively so the comparison never raises.
+    """
+    reference = getattr(run_obj, "started_at", None) or getattr(
+        run_obj, "created_at", None
+    )
+    if reference is None:
+        return False
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=dt.UTC)
+    age = (dt.datetime.now(tz=dt.UTC) - reference).total_seconds()
+    return age >= INLINE_ORPHAN_AFTER_SECONDS
+
+
+async def _fail_orphaned_inline_run(
+    *, run_obj: object, redis_url: str | None,
+) -> None:
+    """Mark an orphaned inline run FAILED and push the ``end`` SSE marker.
+
+    Mutates the ORM instance in place; the surrounding tenant-bound transaction
+    commits it on teardown (same discipline as ``_reconcile_run_completion``).
+    Fail-open on the Redis push: the DB status flip is what matters; a missing
+    end marker only affects an (unlikely) still-open SSE tail.
+    """
+    run_obj.status = "FAILED"  # type: ignore[attr-defined]
+    run_obj.finished_at = dt.datetime.now(tz=dt.UTC)  # type: ignore[attr-defined]
+    run_obj.error_message = (  # type: ignore[attr-defined]
+        "inline run orphaned (process restart?)"
+    )
+    run_obj.result_summary = (  # type: ignore[attr-defined]
+        "inline run orphaned (process restart?)"
+    )
+
+    if redis_url:
+        try:
+            from agent_session_orchestrator.services.inline_run_executor import (
+                _push_end,  # noqa: PLC0415
+            )
+
+            await _push_end(redis_url, run_obj.id)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 — end marker is best-effort
+            logger.debug(
+                "reconcile_sweeper: end marker push failed for orphaned inline run",
+                extra={"run_id": getattr(run_obj, "id", "?")},
+            )
 
 
 async def _sweep_once(app: FastAPI) -> None:
@@ -172,6 +232,33 @@ async def _sweep_once(app: FastAPI) -> None:
                         "reconcile_sweeper: run not found in RLS session",
                         extra={"tenant_id": tenant_id, "run_id": run_id},
                     )
+                    continue
+
+                # ── Inline (chat-mode) orphan branch ───────────────────────
+                # An inline run (execution_mode='inline', sandbox_id IS NULL) is
+                # never resolvable via the scheduler.  If it is still stuck past
+                # the (much larger) inline window, its in-process executor task
+                # died with a restarted process — force it FAILED and push the
+                # ``end`` marker so any live SSE tail closes.  Deliberately does
+                # NOT touch sandbox runs (which take the reconcile path below).
+                if (
+                    run_obj.execution_mode == "inline"
+                    and run_obj.sandbox_id is None
+                ):
+                    if _inline_run_is_orphaned(run_obj):
+                        await _fail_orphaned_inline_run(
+                            run_obj=run_obj, redis_url=redis_url,
+                        )
+                        logger.info(
+                            "reconcile_sweeper: orphaned inline run marked FAILED",
+                            extra={"run_id": run_id, "tenant_id": tenant_id},
+                        )
+                    else:
+                        logger.debug(
+                            "reconcile_sweeper: inline run within grace window; "
+                            "leaving to its executor",
+                            extra={"run_id": run_id},
+                        )
                     continue
 
                 terminal, _ = await _reconcile_run_completion(

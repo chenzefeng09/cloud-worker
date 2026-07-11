@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import type { Attachment, InstalledSkill } from '../api/types';
+import type { Attachment, ExecutionMode, InstalledSkill } from '../api/types';
 import { Chip } from './shell/Chip';
 import { Dropdown } from './shell/Dropdown';
 import { MODEL_OPTIONS, EFFORT_OPTIONS } from '../lib/modelOptions';
@@ -24,9 +24,62 @@ interface Props {
   effort?: string;
   onModelChange?: (id: string) => void;
   onEffortChange?: (id: string) => void;
+  /**
+   * Per-session execution mode — 'sandbox' (智能体模式) or 'inline' (对话模式).
+   * When both value + onChange are wired, a two-state segmented toggle is shown
+   * in the toolbar. Omit to hide the control entirely.
+   */
+  executionMode?: ExecutionMode;
+  onExecutionModeChange?: (mode: ExecutionMode) => void;
 }
 
-export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, prefill, onPrefillConsumed, skills, selectedSkills, onToggleSkill, model, effort, onModelChange, onEffortChange }: Props) {
+// Two-state segmented toggle for chat/agent mode. Styled to match the mono
+// toolbar controls (same paper/line/accent tokens as the surrounding dropdowns).
+function ModeToggle({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: ExecutionMode;
+  onChange: (mode: ExecutionMode) => void;
+  disabled?: boolean;
+}) {
+  const options: { id: ExecutionMode; label: string; title: string }[] = [
+    { id: 'sandbox', label: '智能体', title: '智能体模式：在沙箱中执行工具与任务' },
+    { id: 'inline', label: '对话', title: '对话模式：直接对话回复，不启动沙箱' },
+  ];
+  return (
+    <div
+      role="radiogroup"
+      aria-label="运行模式"
+      className="inline-flex items-center rounded-sm border border-line bg-paper p-0.5"
+    >
+      {options.map((o) => {
+        const on = o.id === value;
+        return (
+          <button
+            key={o.id}
+            type="button"
+            role="radio"
+            aria-checked={on}
+            disabled={disabled}
+            title={o.title}
+            onClick={() => !on && onChange(o.id)}
+            className={`px-2 py-0.5 rounded-[3px] font-mono text-[10.5px] leading-none transition-colors disabled:opacity-50 ${
+              on
+                ? 'bg-accent-soft text-accent font-medium'
+                : 'text-dim hover:text-ink'
+            }`}
+          >
+            {o.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, prefill, onPrefillConsumed, skills, selectedSkills, onToggleSkill, model, effort, onModelChange, onEffortChange, executionMode, onExecutionModeChange }: Props) {
   const [text, setText] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -307,6 +360,13 @@ export function InputBar({ onSend, disabled, isStreaming, onStop, onUpload, pref
           style={{ scrollbarWidth: 'none' }}
         />
         <div className="flex items-center gap-1.5 px-3 py-2.5 shrink-0">
+          {executionMode && onExecutionModeChange && (
+            <ModeToggle
+              value={executionMode}
+              onChange={onExecutionModeChange}
+              disabled={disabled && !isStreaming}
+            />
+          )}
           {onModelChange && (
             <Dropdown
               value={model ?? ''}

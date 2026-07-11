@@ -549,11 +549,22 @@ export interface TokenUsageBreakdown {
 
 export type RunStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 
+/**
+ * How a run executes:
+ *   'inline'  — chat mode: the orchestrator answers in-process via the LLM
+ *               gateway; no sandbox is dispatched.
+ *   'sandbox' — agent mode (default): the run executes in a sandbox.
+ * Optional on the wire — older runs (and non-chat entry points) omit it, which
+ * the backend treats as 'sandbox'.
+ */
+export type ExecutionMode = 'inline' | 'sandbox';
+
 export interface Run {
   id: string;
   session_id: string;
   sandbox_id: string | null;
   status: RunStatus;
+  execution_mode?: ExecutionMode;
   task_description: string | null;
   result_summary: string | null;
   error_message: string | null;

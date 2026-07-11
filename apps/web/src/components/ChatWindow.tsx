@@ -375,6 +375,10 @@ export function ChatWindow({
   const selectedEffort = useChatStore((s) => s.selectedEffort[sessionId]);
   const setSessionModel = useChatStore((s) => s.setSessionModel);
   const setSessionEffort = useChatStore((s) => s.setSessionEffort);
+  // Per-session chat/agent mode. Atomic selector (no new object) so the snapshot
+  // stays reference-stable; defaults applied at render, not in the selector.
+  const executionMode = useChatStore((s) => s.executionMode[sessionId]);
+  const setSessionExecutionMode = useChatStore((s) => s.setSessionExecutionMode);
   const { modelId: defaultModelId } = useDefaultModel('llm');
 
   // Live plan steps for this session — rendered at the bottom of the transcript.
@@ -761,6 +765,8 @@ export function ChatWindow({
         effort={selectedEffort ?? DEFAULT_EFFORT}
         onModelChange={showThinkingUi ? (m) => setSessionModel(sessionId, m) : undefined}
         onEffortChange={showThinkingUi ? (e) => setSessionEffort(sessionId, e) : undefined}
+        executionMode={executionMode ?? 'sandbox'}
+        onExecutionModeChange={(mode) => setSessionExecutionMode(sessionId, mode)}
       />
       {showDataNotice && <DataNoticeModal onAck={ackDataNotice} />}
       {pendingRewind && (
