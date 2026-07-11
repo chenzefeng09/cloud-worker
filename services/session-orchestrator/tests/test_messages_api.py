@@ -80,6 +80,7 @@ def test_write_memory_success() -> None:
             _write_memory(
                 knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
                 tenant_id=TEST_TENANT,
+                user_id=TEST_USER,
                 task_description="tell me a joke",
                 summary="why did the chicken cross the road",
             )
@@ -92,6 +93,7 @@ def test_write_memory_noop_on_missing_url() -> None:
         _write_memory(
             knowledge_ingest_url="",
             tenant_id=TEST_TENANT,
+            user_id=TEST_USER,
             task_description="task",
             summary="summary",
         )
@@ -116,6 +118,7 @@ def test_write_memory_failure_open() -> None:
             _write_memory(
                 knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
                 tenant_id=TEST_TENANT,
+                user_id=TEST_USER,
                 task_description="task",
                 summary="summary",
             )

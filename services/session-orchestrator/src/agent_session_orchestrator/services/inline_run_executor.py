@@ -732,8 +732,10 @@ async def _execute_inline_run(
             await _write_memory(
                 knowledge_ingest_url=knowledge_ingest_url,
                 tenant_id=tenant_id,
+                user_id=user_id,
                 task_description=task,
                 summary=body_text,
+                session_id=session_id,
             )
         except Exception:  # noqa: BLE001
             logger.debug("inline run memory write-back failed (failure-open)")

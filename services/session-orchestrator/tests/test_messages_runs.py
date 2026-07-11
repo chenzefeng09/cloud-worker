@@ -508,6 +508,7 @@ def test_fetch_memory_returns_empty_on_http_error() -> None:
             _fetch_memory(
                 knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
                 tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
                 query="hello",
             )
         )
@@ -538,11 +539,161 @@ def test_fetch_memory_formats_hits() -> None:
             _fetch_memory(
                 knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
                 tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
                 query="我叫什么",
             )
         )
     assert "张三" in result
     assert "简洁" in result
+
+
+def test_fetch_memory_sends_real_user_header() -> None:
+    """_fetch_memory sends the real user in X-User-Id — never the SYSTEM sentinel.
+
+    knowledge-ingest's authz guard is fail-closed and rejects "SYSTEM", which
+    used to make the memory search silently 403.
+    """
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_memory
+
+    captured_headers: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+        def json(self):
+            return {"hits": []}
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw):
+            captured_headers.update(kw.get("headers") or {})
+            return _FakeResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        asyncio.get_event_loop().run_until_complete(
+            _fetch_memory(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
+                query="hello",
+            )
+        )
+    assert captured_headers.get("X-User-Id") == "usr_TESTUSER00000000000000001"
+    assert captured_headers.get("X-User-Id") != "SYSTEM"
+
+
+def test_fetch_memory_passes_exclude_origin_session_id() -> None:
+    """_fetch_memory forwards session_id as exclude_origin_session_id."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_memory
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+        def json(self):
+            return {"hits": []}
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw):
+            captured.update(kw.get("params") or {})
+            return _FakeResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        asyncio.get_event_loop().run_until_complete(
+            _fetch_memory(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
+                query="我叫什么",
+                session_id="ses_current",
+            )
+        )
+    assert captured.get("exclude_origin_session_id") == "ses_current"
+
+
+def test_fetch_memory_omits_exclude_when_no_session() -> None:
+    """_fetch_memory does not send exclude_origin_session_id when session_id is empty."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_memory
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+        def json(self):
+            return {"hits": []}
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw):
+            captured.update(kw.get("params") or {})
+            return _FakeResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        asyncio.get_event_loop().run_until_complete(
+            _fetch_memory(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
+                query="hi",
+            )
+        )
+    assert "exclude_origin_session_id" not in captured
+
+
+def test_write_memory_stamps_origin_session_id_and_real_user() -> None:
+    """_write_memory sends origin_session_id in the upload data and the real
+    user in X-User-Id (never the SYSTEM sentinel, which knowledge-ingest's
+    fail-closed authz guard rejects)."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.messages import _write_memory
+
+    captured: dict = {}
+    captured_headers: dict = {}
+
+    class _FakeResp:
+        status_code = 201
+        def json(self):
+            return {"id": "doc_x"}
+
+    class _IngestResp:
+        status_code = 200
+        def json(self):
+            return {}
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, url, **kw):
+            if "/documents" in url and "/ingest" not in url:
+                captured.update(kw.get("data") or {})
+                captured_headers.update(kw.get("headers") or {})
+                return _FakeResp()
+            return _IngestResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        asyncio.get_event_loop().run_until_complete(
+            _write_memory(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
+                task_description="hello",
+                summary="world",
+                session_id="ses_writeback",
+            )
+        )
+    assert captured.get("origin_session_id") == "ses_writeback"
+    assert captured_headers.get("X-User-Id") == "usr_TESTUSER00000000000000001"
+    assert captured_headers.get("X-User-Id") != "SYSTEM"
 
 
 def test_write_memory_failure_open() -> None:
@@ -562,6 +713,7 @@ def test_write_memory_failure_open() -> None:
             _write_memory(
                 knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
                 tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
                 task_description="hello",
                 summary="world",
             )

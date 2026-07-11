@@ -1087,6 +1087,149 @@ def test_memory_absent_does_not_break_run(workspace, env, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Tests -- history restore: name unification (msg.name == agent name)
+# ---------------------------------------------------------------------------
+
+
+class _FakeToolCallBlock:
+    def __init__(self, *, type, id, name, input):
+        self.type = type
+        self.id = id
+        self.name = name
+        self.input = input
+
+
+class _FakeToolResultBlock:
+    def __init__(self, *, type, id, name, output):
+        self.type = type
+        self.id = id
+        self.name = name
+        self.output = output
+
+
+class _FakeAgentState:
+    """Minimal AgentState with an observable ``context`` list."""
+
+    def __init__(self, **_kw):
+        self.context: list = []
+
+
+class _FakePermissionMode:
+    BYPASS = "bypass"
+    DEFAULT = "default"
+
+
+class _FakePermissionContext:
+    def __init__(self, *, mode=None, **_kw):
+        self.mode = mode
+
+
+class _FakeAgentCapturingState(_FakeAgent):
+    """Records the ``state`` kwarg so tests can inspect restored context."""
+
+    last_state: "object | None" = None
+
+    def __init__(self, *, name, system_prompt, model, toolkit, **kw):
+        super().__init__(
+            name=name, system_prompt=system_prompt, model=model, toolkit=toolkit, **kw
+        )
+        _FakeAgentCapturingState.last_state = kw.get("state")
+
+
+def _install_fake_agentscope_with_state(monkeypatch):
+    """Extend the base fake so the history-restore + state path actually runs."""
+    _install_fake_agentscope(monkeypatch)
+    _FakeAgentCapturingState.last_state = None
+
+    agent_mod = sys.modules["agentscope.agent"]
+    agent_mod.Agent = _FakeAgentCapturingState
+
+    # Add ToolCallBlock / ToolResultBlock to the message module.
+    message_mod = sys.modules["agentscope.message"]
+    message_mod.ToolCallBlock = _FakeToolCallBlock
+    message_mod.ToolResultBlock = _FakeToolResultBlock
+
+    # agentscope.state.AgentState — a non-None state enables the restore block.
+    state_mod = types.ModuleType("agentscope.state")
+    state_mod.AgentState = _FakeAgentState
+    monkeypatch.setitem(sys.modules, "agentscope.state", state_mod)
+
+    # agentscope.permission — needed by _build_bypass_permission_context so
+    # agent_state is created (Path C) instead of staying None.
+    perm_mod = types.ModuleType("agentscope.permission")
+    perm_mod.PermissionContext = _FakePermissionContext
+    perm_mod.PermissionMode = _FakePermissionMode
+    monkeypatch.setitem(sys.modules, "agentscope.permission", perm_mod)
+
+
+def test_history_restore_uses_agent_name_for_assistant_and_tool_msgs(
+    workspace, env, monkeypatch,
+):
+    """Restored assistant/tool Msgs carry name==agent_name; user Msgs stay 'user'.
+
+    agentscope keys context ownership on ``msg.name == self.name`` — restored
+    assistant/tool turns must share the agent's name or the agent won't
+    recognize them as its own.
+    """
+    ws, worker_mod = workspace
+    _install_fake_agentscope_with_state(monkeypatch)
+
+    history = [
+        {"role": "user", "type": "text", "content": "前一轮问题"},
+        {"role": "assistant", "type": "text", "content": "前一轮回答"},
+        {
+            "role": "tool",
+            "type": "tool",
+            "tool": {
+                "id": "call_1",
+                "name": "Bash",
+                "input": {"cmd": "pwd"},
+                "result": "/workspace",
+            },
+        },
+    ]
+    env.setenv(
+        "AGENT_TASK_JSON",
+        json.dumps({
+            "task": "接着上文",
+            "agent_name": "小龙虾",
+            "hitl": False,  # force BYPASS path so agent_state is created
+            "history": history,
+        }),
+    )
+    _FakeAgent.reply_text = "继续"
+
+    code = worker_mod.main([])
+    assert code == 0
+
+    # Agent itself is named from agent_name.
+    inst = _FakeAgentCapturingState.last_instance
+    assert inst is not None
+    assert inst.name == "小龙虾"
+
+    state = _FakeAgentCapturingState.last_state
+    assert state is not None
+    ctx = state.context
+    # user text + assistant text + tool_call + tool_result = 4 restored msgs.
+    assert len(ctx) == 4
+
+    by_role: dict[str, list] = {}
+    for m in ctx:
+        by_role.setdefault(m.role, []).append(m)
+
+    # User message keeps name="user".
+    assert all(m.name == "user" for m in by_role.get("user", []))
+    assert by_role["user"]
+
+    # Every assistant-role restored msg (text + tool_call + tool_result) is
+    # stamped with the agent name — never the old literal "assistant".
+    assistant_msgs = by_role.get("assistant", [])
+    assert len(assistant_msgs) == 3
+    assert all(m.name == "小龙虾" for m in assistant_msgs)
+    assert not any(m.name == "assistant" for m in ctx)
+
+
+# ---------------------------------------------------------------------------
 # Tests -- token accumulation via ModelCallEndEvent
 # ---------------------------------------------------------------------------
 

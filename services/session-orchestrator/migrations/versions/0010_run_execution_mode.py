@@ -1,7 +1,7 @@
 """Add execution_mode column to run to distinguish inline vs sandbox runs.
 
-Revision ID: 0009_run_execution_mode
-Revises: 0008_run_source
+Revision ID: 0010_run_execution_mode
+Revises: 0009_canvas
 Create Date: 2026-07-10
 
 Notes
@@ -24,8 +24,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0009_run_execution_mode"
-down_revision: str | None = "0008_run_source"
+revision: str = "0010_run_execution_mode"
+down_revision: str | None = "0009_canvas"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

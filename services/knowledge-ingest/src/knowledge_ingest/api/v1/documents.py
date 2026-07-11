@@ -75,6 +75,7 @@ async def upload_document(
     request: Request,
     title: str = Form(...),
     mime: str = Form(...),
+    origin_session_id: str | None = Form(None),
     file: UploadFile = File(...),
     db: AsyncSession = TDbSession,
     blob: BlobStore = TBlobStore,
@@ -94,6 +95,7 @@ async def upload_document(
         filename=file.filename or "upload.bin",
         mime=mime,
         data=payload,
+        origin_session_id=origin_session_id,
     )
 
     # Record actual usage as a float GB value (best-effort).
@@ -174,11 +176,12 @@ async def search(
     request: Request,
     q: str,
     k: int = 5,
+    exclude_origin_session_id: str | None = None,
     db: AsyncSession = TDbSession,
     blob: BlobStore = TBlobStore,
     embeddings: EmbeddingClient = TEmbeddings,
     tenant_id: str = TTenantId,
 ) -> SearchResponse:
     svc = _make_service(request, db, blob, embeddings, tenant_id)
-    hits = await svc.search(q, k=k)
+    hits = await svc.search(q, k=k, exclude_origin_session_id=exclude_origin_session_id)
     return SearchResponse(hits=hits)

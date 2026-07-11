@@ -21,6 +21,7 @@ class DocumentOut(BaseModel):
     title: str
     mime: str
     source_uri: str | None = None
+    origin_session_id: str | None = None
     status: DocumentStatus
     uploaded_at: datetime
     chunk_count: int = 0

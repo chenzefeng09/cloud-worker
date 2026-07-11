@@ -1242,6 +1242,13 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
     # task.json["memory"]).  These arrive as a plain string already formatted
     # by the orchestrator; we prepend them so the agent sees them before the
     # main instructions.
+    #
+    # Scope note: the orchestrator excludes THIS session's own memory documents
+    # from the search (exclude_origin_session_id), so these snippets are
+    # cross-session RAG memory only.  The current session's prior turns are fed
+    # back separately via the restored conversation history below — keeping them
+    # out of here avoids double-injecting the same Q&A into both the system
+    # prompt and the agent context.
     memory_snippets = str(task.get("memory") or "").strip()
     if memory_snippets:
         sys_prompt = f"## \u76f8\u5173\u5386\u53f2\u8bb0\u5fc6\n\n{memory_snippets}\n\n---\n\n{sys_prompt}"
@@ -1396,6 +1403,17 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
     # Only on fresh runs -- resume runs already have context from the
     # restored AgentState.
     # ------------------------------------------------------------------
+    # Resolve the agent name once, up-front: it must be identical for the
+    # restored history Msgs *and* the Agent below.  agentscope keys context
+    # ownership on ``msg.name == self.name`` (_get_last_msg / _save_to_context /
+    # _update_tool_call_state in agentscope.agent._agent) — if restored
+    # assistant/tool Msgs carry a different name than the agent, the agent does
+    # not recognize them as its own: the first new reply block appends a fresh
+    # AssistantMsg instead of merging, and tool-call-state updates targeting the
+    # restored turn silently no-op.  Stamping restored assistant/tool Msgs with
+    # the same ``agent_name`` keeps the restored turns owned by this agent.
+    agent_name = str(task.get("agent_name") or "Worker")
+
     history = task.get("history") or []
     if resume_payload is None and agent_state is not None and isinstance(history, list):
         from agentscope.message import (
@@ -1420,7 +1438,7 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
                     content_text = str(item.get("content") or "")
                     if content_text:
                         restored.append(
-                            Msg(name="assistant", role="assistant",
+                            Msg(name=agent_name, role="assistant",
                                 content=[TextBlock(type="text", text=content_text)])
                         )
                 elif role == "tool":
@@ -1436,13 +1454,13 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
                     )
                     output_str = str(t.get("result") or "")
                     restored.append(
-                        Msg(name="assistant", role="assistant", content=[
+                        Msg(name=agent_name, role="assistant", content=[
                             ToolCallBlock(type="tool_call", id=cid,
                                           name=tname, input=input_str)
                         ])
                     )
                     restored.append(
-                        Msg(name="assistant", role="assistant", content=[
+                        Msg(name=agent_name, role="assistant", content=[
                             ToolResultBlock(type="tool_result", id=cid,
                                             name=tname, output=output_str)
                         ])
@@ -1454,7 +1472,7 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
             logger.info("restored %d history messages into context", len(restored))
 
     agent = Agent(
-        name=str(task.get("agent_name") or "Worker"),
+        name=agent_name,
         system_prompt=sys_prompt,
         model=model,
         toolkit=toolkit,
