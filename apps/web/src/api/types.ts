@@ -1754,6 +1754,93 @@ export interface PendingInteractionsResponse {
   items: PendingInteractionItem[];
 }
 
+// ─── Canvas v2 (→ session-orchestrator schemas/canvas.py) ────────────────────
+//
+// Wire types for the "canvas v2" feature — server-owned canvas documents with
+// versioned blocks + scoped-edit suggestions (accept/reject/revert). Field
+// names match agent_session_orchestrator/schemas/canvas.py EXACTLY (Block,
+// CanvasOut, VersionSummaryOut, SuggestionOut, Diff) so the BFF proxy can pass
+// payloads through without reshaping.
+
+export interface CanvasBlock {
+  id: string;
+  type: 'heading' | 'paragraph';
+  text: string;
+}
+
+/** Full canvas wire object — current version blocks inline (matches CanvasOut). */
+export interface CanvasDocument {
+  id: string;
+  session_id: string;
+  kind: string;
+  title: string;
+  current_version: number;
+  source_message_id?: string | null;
+  source_run_id?: string | null;
+  blocks: CanvasBlock[];
+  created_at: string;
+  updated_at: string;
+}
+
+/** Version list item — metadata only, no blocks (matches VersionSummaryOut). */
+export interface CanvasVersionSummary {
+  id: string;
+  canvas_id: string;
+  version: number;
+  change_summary?: string | null;
+  created_by: string;
+  base_version?: number | null;
+  created_at: string;
+}
+
+/** A single scoped edit in a suggestion (matches Diff). */
+export interface CanvasDiff {
+  block_id: string;
+  op: 'replace' | 'delete' | 'insert_after';
+  orig?: string | null;
+  sugg?: string | null;
+}
+
+/** A proposed scoped edit awaiting accept/reject (matches SuggestionOut). */
+export interface CanvasSuggestion {
+  id: string;
+  canvas_id: string;
+  base_version: number;
+  status: string; // 'proposed' | 'accepted' | 'rejected'
+  instruction: string;
+  diffs: CanvasDiff[];
+  change_summary?: string | null;
+  created_at: string;
+  resolved_at?: string | null;
+}
+
+/** Request body for POST /sessions/{sid}/canvases (create). source_message_id XOR content. */
+export interface CanvasCreateBody {
+  source_message_id?: string;
+  content?: string;
+  kind?: string;
+  title?: string;
+}
+
+/** Body for POST /sessions/{sid}/canvases/{cid}/edit (BFF LLM edge). scope=document | blocks. */
+export interface CanvasV2EditBody {
+  instruction: string;
+  scope: { type: 'document' | 'blocks'; block_ids?: string[] };
+  model?: string;
+  base_version?: number; // optimistic-lock pre-check: BFF returns 409 if != current
+}
+
+/** BFF edit response envelope. */
+export interface CanvasEditResponse {
+  suggestion: CanvasSuggestion;
+}
+
+/** Manual version body: POST /canvases/{cid}/versions */
+export interface CanvasManualVersionBody {
+  blocks: CanvasBlock[];
+  base_version: number;
+}
+
 // ─── Storage admin (→ foundation-lifecycle Phase 7) ─────────────────────────────
 
 export type BucketPurpose = 'audit' | 'workspace' | 'kb_raw' | 'kb_derived';

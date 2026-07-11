@@ -548,7 +548,6 @@ function inferCanvasKind(prompt: string): CanvasObjectKind | null {
   if (/(小红书|朋友圈|微博|推文|帖子|社媒|social)/i.test(prompt)) return 'social_post';
   if (/(readme|接口文档|技术文档|设计说明|技术说明|api\s*doc)/i.test(text)) return 'code_note';
   if (/(文章|长文|科普|博客|公众号|稿件|essay|article|post)/i.test(prompt)) return 'article';
-  if (/(一篇|一份|一个|内容|文案)/i.test(prompt)) return 'article';
   return null;
 }
 

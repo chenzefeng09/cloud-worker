@@ -25,12 +25,23 @@ import {
   type CanvasOpenSeed,
 } from '../lib/canvasObjects';
 import { findCanvasCreationReply } from '../lib/canvasCreation';
+import { routeCanvasIntent } from '../lib/canvasIntentRouting';
 import { api } from '../api/client';
 import type { MessageAttachment } from '../api/types';
+import { useFeatureFlag } from '../hooks/useFeatureFlags';
+import { useCanvasStore } from '../stores/canvasStore';
 
 interface PendingCanvasCreation {
   documentId: string;
   fromMessageIndex: number;
+}
+
+/** canvas.v2: lightweight "expecting a canvas for this send" marker — unlike
+ * the legacy `PendingCanvasCreation`, this never builds an in-memory draft. */
+interface PendingCanvasCreationV2 {
+  fromMessageIndex: number;
+  kind?: string;
+  title?: string;
 }
 
 /**
@@ -53,6 +64,15 @@ export function AgentPage() {
   const setActiveSession = useChatStore((s) => s.setActiveSession);
   const { sendMessage, isStreaming, messages } = useChat();
 
+  // canvas.v2 — when ON, Phase-A creation binds the card to a real server
+  // canvas object (via canvasStore) instead of the in-memory draft. When OFF,
+  // every existing draft-based code path below runs completely unchanged; all
+  // new logic is gated behind `if (canvasV2)` / `canvasV2 ? … : …` branches.
+  const canvasV2 = useFeatureFlag('canvas.v2');
+  const createCanvasFromMessage = useCanvasStore((s) => s.createFromMessage);
+  const createCanvasFromContent = useCanvasStore((s) => s.createFromContent);
+  const requestCanvasEditAction = useCanvasStore((s) => s.requestEdit);
+
   const [previewFile, setPreviewFile] = useState<{ id: string; filename: string; mime?: string } | null>(null);
   const [canvasDraft, setCanvasDraft] = useState<CanvasDocumentDraft | null>(() =>
     id ? loadStoredCanvasDraft(id) : null,
@@ -63,6 +83,13 @@ export function AgentPage() {
   const [hiddenCanvasMessageIds, setHiddenCanvasMessageIds] = useState<string[]>([]);
   const [pendingCanvasCreation, setPendingCanvasCreation] = useState<PendingCanvasCreation | null>(null);
   const [canvasSuggestion, setCanvasSuggestion] = useState<CanvasEditSuggestion | null>(null);
+  // canvas.v2 state — kept entirely separate from the legacy draft state above
+  // so the flag-off path never touches (and can never be affected by) these.
+  const [pendingCanvasV2, setPendingCanvasV2] = useState<PendingCanvasCreationV2 | null>(null);
+  const [inlineCanvasV2Id, setInlineCanvasV2Id] = useState<string | null>(null);
+  // canvas.v2 three-state routing: when an update-canvas send fails (409 / edit
+  // error), we refill the composer so the user never loses their typed text.
+  const [composerRefill, setComposerRefill] = useState<string | null>(null);
   // Silent canvas revision: request in flight + last error, both scoped to the
   // canvas card (never surfaced as chat messages).
   const [canvasRevising, setCanvasRevising] = useState(false);
@@ -116,6 +143,13 @@ export function AgentPage() {
     setCanvasRevising(false);
     setCanvasEditError(null);
     setPreviewFile(null);
+    // canvas.v2 — clear the local anchor id on session switch to avoid
+    // cross-session bleed. We don't reset the whole canvasStore here (other
+    // panels/tabs may still reference cached canvases); clearing the local id
+    // is enough since nothing renders without it.
+    setPendingCanvasV2(null);
+    setInlineCanvasV2Id(null);
+    setComposerRefill(null);
   }, [id]);
 
   useEffect(() => {
@@ -151,27 +185,56 @@ export function AgentPage() {
     setPreviewFile(null);
   }, []);
 
-  const openCanvasFromMessage = useCallback((seed: CanvasOpenSeed) => {
-    const sourceMessageId = seed.sourceMessageId;
-    const extracted = prepareCanvasOpenSeed(seed);
-    if (sourceMessageId) {
-      setHiddenCanvasMessageIds((current) =>
-        current.includes(sourceMessageId) ? current : [...current, sourceMessageId],
+  const openCanvasFromMessage = useCallback(
+    (seed: CanvasOpenSeed) => {
+      const sourceMessageId = seed.sourceMessageId;
+
+      if (canvasV2) {
+        // canvas.v2 ON — materialize a real server canvas object instead of an
+        // in-memory draft. FAIL-OPEN: if creation rejects, warn and leave the
+        // message bubble untouched (do not hide, do not set an anchor).
+        const materialize = sourceMessageId
+          ? createCanvasFromMessage(id!, sourceMessageId, { kind: seed.kind, title: seed.title })
+          : createCanvasFromContent(id!, seed.content, { kind: seed.kind, title: seed.title });
+        materialize
+          .then((canvas) => {
+            setInlineCanvasV2Id(canvas.id);
+            setInlineCanvasAnchorMessageId(sourceMessageId ?? null);
+            if (sourceMessageId) {
+              setHiddenCanvasMessageIds((current) =>
+                current.includes(sourceMessageId) ? current : [...current, sourceMessageId],
+              );
+            }
+            setCanvasOpen(false);
+            setPreviewFile(null);
+          })
+          .catch((err) => {
+            console.warn('canvas.v2 materialize failed', err);
+          });
+        return;
+      }
+
+      const extracted = prepareCanvasOpenSeed(seed);
+      if (sourceMessageId) {
+        setHiddenCanvasMessageIds((current) =>
+          current.includes(sourceMessageId) ? current : [...current, sourceMessageId],
+        );
+      }
+      setCanvasDraft(
+        createCanvasDraft(extracted.kind, {
+          title: extracted.title,
+          content: extracted.content,
+          sourceMessageId: extracted.sourceMessageId,
+        }),
       );
-    }
-    setCanvasDraft(
-      createCanvasDraft(extracted.kind, {
-        title: extracted.title,
-        content: extracted.content,
-        sourceMessageId: extracted.sourceMessageId,
-      }),
-    );
-    setInlineCanvasOpen(true);
-    setInlineCanvasAnchorMessageId(sourceMessageId ?? null);
-    setCanvasOpen(false);
-    setCanvasSuggestion(null);
-    setPreviewFile(null);
-  }, []);
+      setInlineCanvasOpen(true);
+      setInlineCanvasAnchorMessageId(sourceMessageId ?? null);
+      setCanvasOpen(false);
+      setCanvasSuggestion(null);
+      setPreviewFile(null);
+    },
+    [canvasV2, createCanvasFromContent, createCanvasFromMessage, id],
+  );
 
   const openInlineCanvasInPanel = useCallback(() => {
     if (!canvasDraft) return;
@@ -185,6 +248,20 @@ export function AgentPage() {
       if (attachmentIds && attachmentIds.length > 0) return;
       const intent = inferCanvasAuthoringIntent(text);
       if (!intent) return;
+
+      if (canvasV2) {
+        // canvas.v2 ON — do NOT eagerly build an in-memory draft with
+        // extracted prose. Just remember that a canvas is expected once the
+        // assistant reply lands; the materialization effect below (watching
+        // `pendingCanvasV2` + `messages`) does the actual creation.
+        setPendingCanvasV2({
+          fromMessageIndex: messages.length,
+          kind: intent.kind,
+          title: intent.title,
+        });
+        return;
+      }
+
       const draft = createCanvasDraft(intent.kind, {
         title: intent.title,
         content: '',
@@ -201,15 +278,47 @@ export function AgentPage() {
         fromMessageIndex: messages.length,
       });
     },
-    [messages.length],
+    [canvasV2, messages.length],
   );
 
   const sendMessageWithCanvasDetection = useCallback(
     (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => {
+      // canvas.v2 three-state routing (design §6.3 Phase A): when the flag is on
+      // and the session has an active canvas, a *modify-intent* message routes to
+      // the silent edit path — no chat message, no run. Attachments force the
+      // normal chat path (an edit request carries no files). The composer has
+      // already cleared its text (InputBar clears on send); on failure we refill
+      // it so the user never loses input (fail-open).
+      const hasAttachments = Boolean(attachmentIds && attachmentIds.length > 0);
+      if (
+        canvasV2 &&
+        id &&
+        inlineCanvasV2Id &&
+        !hasAttachments &&
+        routeCanvasIntent(text, true) === 'update_canvas'
+      ) {
+        const canvasId = inlineCanvasV2Id;
+        requestCanvasEditAction(canvasId, id, {
+          instruction: text,
+          scope: { type: 'document' },
+        })
+          .then((suggestion) => {
+            if (!suggestion) {
+              // 409 / edit failure — the store recorded a localized error on the
+              // card; refill the composer so nothing is lost.
+              setComposerRefill(text);
+            }
+          })
+          .catch(() => {
+            setComposerRefill(text);
+          });
+        return Promise.resolve();
+      }
+
       maybeStartCanvasFromPrompt(text, attachmentIds);
       return sendMessage(text, attachmentIds, attachmentsMeta);
     },
-    [maybeStartCanvasFromPrompt, sendMessage],
+    [canvasV2, id, inlineCanvasV2Id, maybeStartCanvasFromPrompt, requestCanvasEditAction, sendMessage],
   );
 
   // If HomePage routed us here with an `initialMessage` in state, dispatch it
@@ -335,6 +444,40 @@ export function AgentPage() {
       setPendingCanvasCreation(null);
     }
   }, [canvasDraft?.kind, canvasDraft?.title, isStreaming, messages, pendingCanvasCreation]);
+
+  // canvas.v2 — parallel materialization effect. Unlike the legacy effect
+  // above, this never touches `canvasDraft`/`hiddenCanvasMessageIds` until the
+  // real server canvas object has been created (materialize-then-anchor,
+  // rather than anchor-then-extract). Requires a durable (non-streaming,
+  // has-an-id) assistant reply, same as the legacy path's completion check.
+  useEffect(() => {
+    if (!canvasV2 || !pendingCanvasV2 || !id) return;
+
+    const assistantReply = findCanvasCreationReply(messages, pendingCanvasV2.fromMessageIndex, {
+      completeOnly: true,
+    });
+    if (!assistantReply || !assistantReply.id) return;
+
+    const pending = pendingCanvasV2;
+    const assistantReplyId = assistantReply.id;
+    // Clear immediately so this effect doesn't re-fire while the create
+    // request is in flight (messages/isStreaming may change mid-flight).
+    setPendingCanvasV2(null);
+
+    createCanvasFromMessage(id, assistantReplyId, { kind: pending.kind, title: pending.title })
+      .then((canvas) => {
+        setInlineCanvasV2Id(canvas.id);
+        setInlineCanvasAnchorMessageId(assistantReplyId);
+        setHiddenCanvasMessageIds((current) =>
+          current.includes(assistantReplyId) ? current : [...current, assistantReplyId],
+        );
+      })
+      .catch((err) => {
+        // FAIL-OPEN: never hide the bubble or set an anchor on failure — the
+        // assistant reply stays visible as a normal chat message.
+        console.warn('canvas.v2 materialize failed', err);
+      });
+  }, [canvasV2, createCanvasFromMessage, id, messages, pendingCanvasV2]);
 
   // Keep the inline-canvas anchor pinned to the draft's source message even
   // after `pendingCanvasCreation` has cleared. On the home → task path the
@@ -474,6 +617,9 @@ export function AgentPage() {
               inlineCanvasEditError={canvasEditError}
               inlineCanvasSuggestion={canvasSuggestion}
               inlineCanvasAnchorMessageId={inlineCanvasAnchorMessageId}
+              inlineCanvasV2Id={canvasV2 ? inlineCanvasV2Id : null}
+              externalPrefill={composerRefill}
+              onExternalPrefillConsumed={() => setComposerRefill(null)}
               hiddenMessageIds={hiddenCanvasMessageIds}
               onInlineCanvasDraftChange={setCanvasDraft}
               onInlineCanvasRequestEdit={requestCanvasEdit}

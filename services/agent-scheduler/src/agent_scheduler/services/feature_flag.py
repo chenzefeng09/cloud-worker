@@ -70,3 +70,46 @@ def evaluate_flag(
             extra={"flag": flag, "tenant_id": tenant_id, "err": str(exc)},
         )
         return False
+
+
+# Extension name the ``canvas_tool`` package registers under (must match
+# ``agentscope_ext.bootstrap._KNOWN``).
+_CANVAS_TOOL_EXTENSION = "canvas_tool"
+
+
+def runtime_extensions_for_run(
+    *,
+    base_extensions: str,
+    tenant_id: str,
+    user_id: str,
+    flag_url: str,
+    timeout_ms: int = 200,
+) -> str:
+    """Return the ``RUNTIME_EXTENSIONS`` value for a single run.
+
+    Starts from the configured ``base_extensions`` and appends ``canvas_tool``
+    when the per-run ``enable_canvas_tool`` feature flag is on (canvas v2, Phase
+    B).  The flag is evaluated with the same failure-open ``evaluate_flag`` used
+    for image routing: a down/slow/misconfigured flag service returns False, so
+    the canvas tool is simply not appended — the run is byte-for-byte identical
+    to the pre-canvas behaviour.
+
+    Idempotent: if ``base_extensions`` already lists ``canvas_tool`` (e.g. a
+    deployment hard-wired it) we never add a duplicate.
+    """
+    names = [part.strip() for part in base_extensions.split(",") if part.strip()]
+    if _CANVAS_TOOL_EXTENSION in names:
+        return base_extensions
+
+    enabled = evaluate_flag(
+        "enable_canvas_tool",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        flag_url=flag_url,
+        timeout_ms=timeout_ms,
+    )
+    if not enabled:
+        return base_extensions
+
+    names.append(_CANVAS_TOOL_EXTENSION)
+    return ",".join(names)

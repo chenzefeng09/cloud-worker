@@ -720,6 +720,19 @@ def _s3_read_text(s3_client, bucket: str, key: str) -> str | None:
         return None
 
 
+def _canvas_tool_enabled(env: dict) -> bool:
+    """True when the ``canvas_tool`` extension is active for this run.
+
+    The extension (and thus the ``create_canvas`` tool) is only registered when
+    ``canvas_tool`` appears in ``RUNTIME_EXTENSIONS`` — the scheduler appends it
+    per-run behind the ``enable_canvas_tool`` feature flag.  We gate the
+    system-prompt instruction on the same signal so the tool and its usage
+    guidance always appear/disappear together (flag off ⇒ zero change).
+    """
+    raw = env.get("RUNTIME_EXTENSIONS", "") or ""
+    return "canvas_tool" in {part.strip() for part in raw.split(",")}
+
+
 def _load_prompt_files(env: dict, task: dict) -> str:
     """Load soul / identity / user prompt files from S3 and assemble a system prompt.
 
@@ -1281,6 +1294,25 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
             "\u4e0d\u8981\u5728\u6b63\u6587\u91cc\u63d0\u95ee\u540e\u81ea\u884c\u731c\u6d4b\u7ee7\u7eed\uff0c"
             "\u4e5f\u4e0d\u8981\u628a\u95ee\u9898\u4f5c\u4e3a\u6700\u7ec8\u56de\u590d\u7ed3\u675f\u4efb\u52a1\u3002"
             "\u7528\u6237\u56de\u7b54\u540e\u4f1a\u81ea\u52a8\u7ee7\u7eed\u672c\u6b21\u4efb\u52a1\u3002"
+        )
+
+    # Canvas (canvas v2, Phase B): tell the model WHEN to promote a long-form
+    # deliverable into an editable canvas via ``create_canvas``, and that after
+    # doing so the reply body must be a single short pointer sentence.  Gated on
+    # the ``canvas_tool`` extension being active (the tool is only registered
+    # then) so the instruction and the tool appear/disappear together \u2014 flag off
+    # \u21d2 this block is skipped entirely.
+    if _canvas_tool_enabled(env):
+        sys_prompt += (
+            "\n\n## \u957f\u6587\u4ea4\u4ed8\u7269\uff1a\u753b\u5e03\uff08create_canvas\uff09\n"
+            "\u5f53\u4f60\u4ea7\u51fa\u7684\u662f\u7528\u6237\u4f1a\u60f3\u6301\u7eed\u8fed\u4ee3\u7684\u957f\u7bc7\u4e66\u9762\u4ea4\u4ed8\u7269"
+            "\uff08\u6587\u7ae0\u3001\u62a5\u544a\u3001\u7b80\u62a5\u3001\u65b9\u6848\u3001\u90ae\u4ef6\u521d\u7a3f\u3001\u793e\u5a92\u957f\u6587\u3001\u4ee3\u7801\u7b14\u8bb0\u7b49\uff0c\u7bc7\u5e45\u53ef\u89c2\uff09\u65f6\uff0c"
+            "\u5fc5\u987b\u8c03\u7528 create_canvas \u5de5\u5177\uff0c\u628a\u6807\u9898\u4e0e\u5b8c\u6574 Markdown \u6b63\u6587\u4ea4\u7ed9\u753b\u5e03\uff1b"
+            "\u8c03\u7528\u540e\u4f60\u7684\u6b63\u6587\u56de\u590d\u53ea\u5199\u4e00\u53e5\u7b80\u77ed\u8bf4\u660e\uff08\u4f8b\u5982"
+            "\u300c\u5df2\u4e3a\u4f60\u521b\u5efa\u753b\u5e03\u300a\u2026\u300b\uff0c\u53ef\u5728\u53f3\u4fa7\u67e5\u770b\u548c\u7f16\u8f91\u300d\uff09\uff0c\u4e0d\u8981\u5728\u6b63\u6587\u91cc\u91cd\u590d\u5168\u6587\u3002\n"
+            "\u666e\u901a\u95ee\u7b54\u4e00\u5f8b\u4e0d\u8981\u8c03\u7528\uff1a\u7b80\u77ed\u56de\u7b54\u3001\u89e3\u91ca\u8bf4\u660e\u3001\u6e05\u5355\u3001\u4f9b\u9605\u8bfb\u7684\u4ee3\u7801\u7247\u6bb5\uff0c"
+            "\u4ee5\u53ca\u7528\u6237\u6ca1\u6709\u660e\u786e\u8981\u6c42\u751f\u6210\u4e3a\u72ec\u7acb\u6587\u6863\u7684\u5185\u5bb9\uff0c\u90fd\u76f4\u63a5\u5728\u6b63\u6587\u91cc\u56de\u590d\uff1b"
+            "\u62ff\u4e0d\u51c6\u65f6\u4e0d\u8981\u5efa\u753b\u5e03\u3002"
         )
 
     # ------------------------------------------------------------------

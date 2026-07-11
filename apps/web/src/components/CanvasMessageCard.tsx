@@ -15,10 +15,21 @@ import {
   markdownToCanvasHtml,
 } from '../lib/canvasRichText';
 import { CopyIcon, useCopied } from './CopyButton';
+import { SuggestionDiffView } from './SuggestionDiffView';
+import { useCanvasStore } from '../stores/canvasStore';
+import { useChatStore } from '../stores/chatStore';
+import { api } from '../api/client';
+import type { CanvasBlock, CanvasVersionSummary } from '../api/types';
 
 interface CanvasMessageCardProps {
   sessionId: string;
-  draft: CanvasDocumentDraft;
+  /** Draft mode (canvas.v2 OFF / legacy path). Mutually exclusive with `canvasId`. */
+  draft?: CanvasDocumentDraft;
+  /**
+   * When set, the card binds to a server canvas object from canvasStore
+   * instead of `draft`. Mutually exclusive with `draft`.
+   */
+  canvasId?: string;
   /** True while the underlying creation run streams — freezes the editor. */
   aiDisabled?: boolean;
   pending?: boolean;
@@ -26,13 +37,35 @@ interface CanvasMessageCardProps {
   revising?: boolean;
   /** Localised error from the last failed revision (chat-invisible). */
   editError?: string | null;
-  onDraftChange: (draft: CanvasDocumentDraft) => void;
-  onRequestEdit: (request: CanvasEditRequest) => void | Promise<void>;
+  onDraftChange?: (draft: CanvasDocumentDraft) => void;
+  onRequestEdit?: (request: CanvasEditRequest) => void | Promise<void>;
   onDismissEditError?: () => void;
   onOpenPanel?: () => void;
   suggestion?: CanvasEditSuggestion | null;
   onAcceptSuggestion?: () => void;
   onRejectSuggestion?: () => void;
+}
+
+/** Random 8-char id suffix for newly-split blocks created from manual edits. */
+function randomBlockSuffix(): string {
+  return Math.random().toString(36).slice(2, 10);
+}
+
+/** Split edited markdown into blocks, reusing existing block ids positionally. */
+function splitIntoBlocks(content: string, previousBlocks: CanvasBlock[]): CanvasBlock[] {
+  const chunks = content
+    .split(/\n{2,}/)
+    .map((c) => c.trim())
+    .filter(Boolean);
+  return chunks.map((text, index) => {
+    const existing = previousBlocks[index];
+    const type: CanvasBlock['type'] = /^#{1,6}\s/.test(text) ? 'heading' : 'paragraph';
+    return {
+      id: existing?.id ?? `blk_${randomBlockSuffix()}`,
+      type,
+      text,
+    };
+  });
 }
 
 type ToolbarMode = 'menu' | 'input';
@@ -101,9 +134,21 @@ function shouldPasteAsRichBlocks(text: string): boolean {
   );
 }
 
+// Placeholder empty draft used only to keep hook order stable when in
+// canvasId mode before the store has loaded the canvas. Never rendered from —
+// the component returns null in that case (checked after all hooks run).
+const EMPTY_DRAFT: CanvasDocumentDraft = {
+  id: '',
+  kind: 'article',
+  title: '',
+  content: '',
+  updatedAt: '',
+};
+
 export function CanvasMessageCard({
   sessionId,
-  draft,
+  draft: draftProp,
+  canvasId,
   aiDisabled,
   pending,
   revising,
@@ -112,10 +157,134 @@ export function CanvasMessageCard({
   onRequestEdit,
   onDismissEditError,
   onOpenPanel,
-  suggestion,
-  onAcceptSuggestion,
-  onRejectSuggestion,
+  suggestion: suggestionProp,
+  onAcceptSuggestion: onAcceptSuggestionProp,
+  onRejectSuggestion: onRejectSuggestionProp,
 }: CanvasMessageCardProps) {
+  // ── canvasId mode (canvas.v2 ON): pull from the server-canvas store ────────
+  // Selectors read primitives / stable references only (never a fresh object
+  // literal) — see canvasStore.ts's selector-safety note. Hooks are always
+  // called unconditionally regardless of mode, per Rules of Hooks.
+  const storeCanvas = useCanvasStore((s) => (canvasId ? s.canvasesById[canvasId] : undefined));
+  const storeSuggestion = useCanvasStore((s) =>
+    canvasId ? s.suggestionsByCanvasId[canvasId] ?? null : null,
+  );
+  const storeRevising = useCanvasStore((s) => (canvasId ? s.revisingCanvasIds[canvasId] ?? false : false));
+  const storeError = useCanvasStore((s) => (canvasId ? s.errorByCanvasId[canvasId] ?? null : null));
+  const requestEditAction = useCanvasStore((s) => s.requestEdit);
+  const applySuggestionAction = useCanvasStore((s) => s.applySuggestion);
+  const saveManualAction = useCanvasStore((s) => s.saveManual);
+  const revertAction = useCanvasStore((s) => s.revert);
+  const clearErrorAction = useCanvasStore((s) => s.clearError);
+
+  // Derive a CanvasDocumentDraft-shaped view from the server canvas so the
+  // existing rich-editor JSX (below) can render either mode unmodified.
+  const derivedDraft: CanvasDocumentDraft | null = useMemo(() => {
+    if (!canvasId || !storeCanvas) return null;
+    return {
+      id: storeCanvas.id,
+      kind: (storeCanvas.kind as CanvasObjectKind) || 'article',
+      title: storeCanvas.title,
+      content: storeCanvas.blocks.map((b) => b.text).join('\n\n'),
+      updatedAt: storeCanvas.updated_at,
+    };
+  }, [canvasId, storeCanvas]);
+
+  const missingCanvas = Boolean(canvasId) && !derivedDraft;
+  // `draft` is always non-null while hooks run below; the "really missing"
+  // case is handled by `missingCanvas` short-circuiting the render at the end.
+  const draft = canvasId ? derivedDraft ?? EMPTY_DRAFT : draftProp ?? EMPTY_DRAFT;
+
+  // canvasId-mode suggestion, reshaped into the CanvasEditSuggestion shape the
+  // existing JSX below already knows how to render (whole-document form only —
+  // per-block diff review is PR-4 scope). The real per-block orig/sugg text
+  // (`storeSuggestion.diffs`) is rendered directly in a lightweight extra
+  // section below rather than forced through the character-diff path.
+  const derivedSuggestion: CanvasEditSuggestion | null = useMemo(() => {
+    if (!canvasId || !storeSuggestion) return null;
+    return {
+      request: {
+        documentId: canvasId,
+        kind: (draft.kind as CanvasObjectKind) || 'article',
+        title: draft.title,
+        scope: 'document',
+        instruction: storeSuggestion.instruction,
+        content: draft.content,
+      },
+      replacement: draft.content,
+      summary: storeSuggestion.change_summary,
+      receivedAt: storeSuggestion.created_at,
+    };
+  }, [canvasId, draft.content, draft.kind, draft.title, storeSuggestion]);
+
+  const suggestion = canvasId ? derivedSuggestion : suggestionProp;
+  const revisingEffective = canvasId ? storeRevising : revising;
+  const editErrorEffective = canvasId ? storeError : editError;
+
+  const handleDraftChange = useCallback(
+    (next: CanvasDocumentDraft) => {
+      if (!canvasId) {
+        onDraftChange?.(next);
+      }
+      // canvasId mode: keystroke-level changes stay local to the contentEditable
+      // DOM; persistence to the server happens on blur (handleEditorBlur below)
+      // rather than on every keystroke, to avoid spamming saveManual.
+    },
+    [canvasId, onDraftChange],
+  );
+
+  const handleRequestEdit = useCallback(
+    async (request: CanvasEditRequest) => {
+      if (!canvasId) {
+        await onRequestEdit?.(request);
+        return;
+      }
+      const model = useChatStore.getState().selectedModel[sessionId] || undefined;
+      // This PR: character-level selection is no longer sent to the server.
+      // Whole-document requests map to scope.type='document'. Selection-scoped
+      // requests would ideally resolve to the intersecting block ids, but the
+      // rich editor here only tracks character offsets — cleanly mapping those
+      // to block ids is out of scope for this PR, so we fall back to
+      // 'document' scope (acceptable per the PR notes).
+      const scope: { type: 'document' | 'blocks'; block_ids?: string[] } = { type: 'document' };
+      await requestEditAction(canvasId, sessionId, {
+        instruction: request.instruction,
+        scope,
+        model,
+      });
+    },
+    [canvasId, onRequestEdit, requestEditAction, sessionId],
+  );
+
+  const handleAcceptSuggestion = useCallback(() => {
+    if (!canvasId) {
+      onAcceptSuggestionProp?.();
+      return;
+    }
+    if (!storeSuggestion) return;
+    void applySuggestionAction(canvasId, storeSuggestion.id, true);
+  }, [applySuggestionAction, canvasId, onAcceptSuggestionProp, storeSuggestion]);
+
+  const handleRejectSuggestion = useCallback(() => {
+    if (!canvasId) {
+      onRejectSuggestionProp?.();
+      return;
+    }
+    if (!storeSuggestion) return;
+    void applySuggestionAction(canvasId, storeSuggestion.id, false);
+  }, [applySuggestionAction, canvasId, onRejectSuggestionProp, storeSuggestion]);
+
+  const handleDismissEditError = useCallback(() => {
+    if (canvasId) {
+      clearErrorAction(canvasId);
+      return;
+    }
+    onDismissEditError?.();
+  }, [canvasId, clearErrorAction, onDismissEditError]);
+
+  const onAcceptSuggestion = canvasId ? handleAcceptSuggestion : onAcceptSuggestionProp;
+  const onRejectSuggestion = canvasId ? handleRejectSuggestion : onRejectSuggestionProp;
+
   const editorRef = useRef<HTMLDivElement | null>(null);
   const hydratedDraftIdRef = useRef<string | null>(null);
   const localEditContentRef = useRef<string | null>(null);
@@ -129,6 +298,11 @@ export function CanvasMessageCard({
   const [busy, setBusy] = useState(false);
   const [history, setHistory] = useState<string[]>([]);
   const [future, setFuture] = useState<string[]>([]);
+  // ── Version history (canvasId mode only) ──────────────────────────────────
+  const [versionsOpen, setVersionsOpen] = useState(false);
+  const [versions, setVersions] = useState<CanvasVersionSummary[] | null>(null);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [versionsError, setVersionsError] = useState<string | null>(null);
   const inlineSuggestionPreview = useMemo(
     () => buildInlineSuggestionPreview(draft.content, suggestion),
     [draft.content, suggestion],
@@ -183,12 +357,15 @@ export function CanvasMessageCard({
   }, [draft.content, draft.id, hasInlineSuggestionPreview]);
 
   useEffect(() => {
+    // canvasId mode is server-persisted (saveManual on blur) — the legacy
+    // localStorage draft mirror only applies to the in-memory draft mode.
+    if (canvasId) return;
     try {
       localStorage.setItem(storageKey(sessionId), JSON.stringify(draft));
     } catch {
       // Canvas persistence remains best-effort until backend document APIs land.
     }
-  }, [draft, sessionId]);
+  }, [canvasId, draft, sessionId]);
 
   useEffect(() => {
     if (toolbar?.mode !== 'input') return;
@@ -197,13 +374,63 @@ export function CanvasMessageCard({
 
   const updateDraft = useCallback(
     (patch: Partial<CanvasDocumentDraft>) => {
-      onDraftChange({
+      handleDraftChange({
         ...draft,
         ...patch,
         updatedAt: new Date().toISOString(),
       });
     },
-    [draft, onDraftChange],
+    [draft, handleDraftChange],
+  );
+
+  // Manual-edit save (canvasId mode only): fires on editor blur, mapping the
+  // edited markdown back into blocks via a simple positional split (no
+  // block-level diffing for this PR — see splitIntoBlocks above).
+  const handleEditorBlur = useCallback(() => {
+    if (!canvasId || !storeCanvas || !editorRef.current) return;
+    const content = canvasHtmlToMarkdown(editorRef.current);
+    const currentContent = storeCanvas.blocks.map((b) => b.text).join('\n\n');
+    if (content === currentContent) return;
+    const blocks = splitIntoBlocks(content, storeCanvas.blocks);
+    void saveManualAction(canvasId, blocks, storeCanvas.current_version);
+  }, [canvasId, saveManualAction, storeCanvas]);
+
+  // ── Version history (canvasId mode only) ──────────────────────────────────
+  // Lightweight: toggle a dropdown, lazily fetch the version list, revert to a
+  // chosen version (append a new version server-side). No diff preview.
+  const toggleVersions = useCallback(() => {
+    if (!canvasId) return;
+    setVersionsOpen((open) => {
+      const next = !open;
+      if (next) {
+        setVersionsLoading(true);
+        setVersionsError(null);
+        api.canvas
+          .versions(canvasId)
+          .then((res) => setVersions(res.items))
+          .catch((err) => {
+            setVersionsError(
+              err instanceof Error && err.message ? err.message : '无法加载版本历史。',
+            );
+          })
+          .finally(() => setVersionsLoading(false));
+      }
+      return next;
+    });
+  }, [canvasId]);
+
+  const handleRevert = useCallback(
+    async (toVersion: number) => {
+      if (!canvasId) return;
+      const ok = window.confirm(`确定回退到版本 ${toVersion}？将基于该版本创建一个新版本。`);
+      if (!ok) return;
+      const reverted = await revertAction(canvasId, toVersion);
+      if (reverted) {
+        setVersionsOpen(false);
+        setVersions(null);
+      }
+    },
+    [canvasId, revertAction],
   );
 
   const commitContent = useCallback(
@@ -391,13 +618,13 @@ export function CanvasMessageCard({
   };
 
   const requestEdit = async (scope: 'selection' | 'document', intent?: CanvasEditIntent) => {
-    if (aiDisabled || busy || revising) return;
+    if (aiDisabled || busy || revisingEffective) return;
     const request = buildRequest(scope, intent);
     if (!request) return;
     setBusy(true);
     setToolbar(null);
     try {
-      await onRequestEdit(request);
+      await handleRequestEdit(request);
       setInstruction('');
       if (intent) setInstruction(intent.instruction);
     } finally {
@@ -431,12 +658,25 @@ export function CanvasMessageCard({
   };
 
   const selectedChars = selection ? selection.end - selection.start : 0;
-  const isRevising = Boolean(busy || revising);
+  const isRevising = Boolean(busy || revisingEffective);
   const canRequestSelection = Boolean(selection && instruction.trim() && !aiDisabled && !isRevising);
   const canRequestDocument = Boolean(instruction.trim() && !aiDisabled && !isRevising);
   const suggestionSource =
     suggestion?.request.scope === 'selection' ? suggestion.request.selection?.text : suggestion?.request.content;
-  const showDocumentSuggestion = Boolean(suggestion && !inlineSuggestionPreview);
+  // canvasId mode renders its own lightweight per-block diff section (below)
+  // instead of the legacy whole-document/selection review card — the legacy
+  // card previews `suggestion.replacement`, which in canvasId mode is just the
+  // joined current content (no real diff), so it isn't useful there.
+  const showDocumentSuggestion = Boolean(suggestion && !inlineSuggestionPreview && !canvasId);
+  const showCanvasIdSuggestion = Boolean(canvasId && storeSuggestion);
+
+  // canvasId mode before the canvas has loaded into the store (or, in
+  // practice never, neither draft nor canvasId supplied): render nothing.
+  // This check runs after all hooks above so hook order stays stable
+  // regardless of `missingCanvas`. The caller (ChatWindow) already gates
+  // rendering on the canvas being present in the store, so this is a
+  // defensive no-op in normal operation.
+  if (missingCanvas) return null;
 
   return (
     <div className="canvas-message-shell">
@@ -465,6 +705,61 @@ export function CanvasMessageCard({
             </select>
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            {canvasId && (
+              <div className="canvas-card-history">
+                <button
+                  type="button"
+                  className="cw-btn cw-btn-ghost cw-btn-sm"
+                  onClick={toggleVersions}
+                  title="版本历史"
+                  aria-label="版本历史"
+                  aria-expanded={versionsOpen}
+                >
+                  历史
+                </button>
+                {versionsOpen && (
+                  <div className="canvas-card-history-pop" role="menu" aria-label="版本历史">
+                    <div className="canvas-card-history-head">版本历史</div>
+                    {versionsLoading && (
+                      <div className="canvas-card-history-empty">加载中…</div>
+                    )}
+                    {versionsError && (
+                      <div className="canvas-card-history-error" role="alert">
+                        {versionsError}
+                      </div>
+                    )}
+                    {!versionsLoading && !versionsError && versions && versions.length === 0 && (
+                      <div className="canvas-card-history-empty">暂无历史版本。</div>
+                    )}
+                    {!versionsLoading &&
+                      !versionsError &&
+                      versions &&
+                      versions.map((v) => (
+                        <button
+                          key={v.id}
+                          type="button"
+                          role="menuitem"
+                          className="canvas-card-history-item"
+                          onClick={() => void handleRevert(v.version)}
+                          disabled={revisingEffective}
+                          title={`回退到版本 ${v.version}`}
+                        >
+                          <span className="canvas-card-history-ver">v{v.version}</span>
+                          <span className="canvas-card-history-meta">
+                            <span className="canvas-card-history-summary">
+                              {v.change_summary?.trim() ||
+                                (v.created_by === 'user' ? '手动编辑' : '模型修改')}
+                            </span>
+                            <span className="canvas-card-history-sub">
+                              {new Date(v.created_at).toLocaleString()} · {v.created_by}
+                            </span>
+                          </span>
+                        </button>
+                      ))}
+                  </div>
+                )}
+              </div>
+            )}
             <button
               type="button"
               className="cw-btn cw-btn-ghost cw-btn-sm"
@@ -594,6 +889,14 @@ export function CanvasMessageCard({
               />
             </section>
           )}
+          {showCanvasIdSuggestion && storeSuggestion && (
+            <SuggestionDiffView
+              suggestion={storeSuggestion}
+              onAccept={handleAcceptSuggestion}
+              onReject={handleRejectSuggestion}
+              busy={revisingEffective}
+            />
+          )}
           {inlineSuggestionPreview && suggestion ? (
             <div className="canvas-rich-editor canvas-inline-editor canvas-suggestion-preview-document text-ink break-words">
               <div
@@ -648,6 +951,7 @@ export function CanvasMessageCard({
               role="textbox"
               aria-label="页内画布正文"
               onInput={handleInput}
+              onBlur={handleEditorBlur}
               onMouseUp={() => refreshSelection('menu')}
               onKeyUp={() => refreshSelection('menu')}
               onContextMenu={handleContextMenu}
@@ -666,14 +970,14 @@ export function CanvasMessageCard({
               <span>修订中…</span>
             </div>
           )}
-          {editError && (
+          {editErrorEffective && (
             <div className="canvas-card-edit-error" role="alert">
-              <span className="canvas-card-edit-error-text">{editError}</span>
-              {onDismissEditError && (
+              <span className="canvas-card-edit-error-text">{editErrorEffective}</span>
+              {(canvasId || onDismissEditError) && (
                 <button
                   type="button"
                   className="canvas-card-edit-error-dismiss"
-                  onClick={onDismissEditError}
+                  onClick={handleDismissEditError}
                   aria-label="关闭错误提示"
                 >
                   ✕
