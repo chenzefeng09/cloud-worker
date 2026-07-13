@@ -128,6 +128,22 @@ interface ChatState {
   addMessage: (sessionId: string, message: Message) => void;
   updateLastMessage: (sessionId: string, content: string) => void;
 
+  /**
+   * canvas.v2 Phase B: associate a materialized server canvas with an existing
+   * assistant message by id.  Called from the `canvas_created` SSE handler so
+   * the live transcript renders the canvas card immediately (the durable DB row
+   * carries `canvas_id` on the next hydration, so this is the live-path mirror).
+   *
+   * No-op when the message is not found or already carries this canvas_id —
+   * returns the previous state unchanged so the store reference stays stable
+   * (avoids a needless re-render). Only rewrites the single target message.
+   */
+  setMessageCanvasId: (
+    sessionId: string,
+    messageId: string,
+    canvasId: string,
+  ) => void;
+
   // ── Ordered streaming pipeline (Option A) ─────────────────────────────────
   //
   // Each "block" in an assistant turn is a separate temporary Message whose id
@@ -594,6 +610,18 @@ export const useChatStore = create<ChatState>((set) => ({
       if (msgs.length === 0) return s;
       const updated = [...msgs];
       updated[updated.length - 1] = { ...updated[updated.length - 1], content };
+      return { messages: { ...s.messages, [sessionId]: updated } };
+    }),
+
+  setMessageCanvasId: (sessionId, messageId, canvasId) =>
+    set((s) => {
+      const msgs = getMessages(s, sessionId);
+      const idx = msgs.findIndex((m) => m.id === messageId);
+      // Not found, or already carries this canvas_id → no state change (keeps
+      // the reference stable so subscribers don't re-render for a no-op).
+      if (idx === -1 || msgs[idx].canvas_id === canvasId) return s;
+      const updated = [...msgs];
+      updated[idx] = { ...updated[idx], canvas_id: canvasId };
       return { messages: { ...s.messages, [sessionId]: updated } };
     }),
 

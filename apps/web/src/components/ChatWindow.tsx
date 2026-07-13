@@ -371,6 +371,9 @@ export function ChatWindow({
 
   // Per-session model + reasoning effort, surfaced in the InputBar toolbar.
   const showThinkingUi = useFeatureFlag('ai.thinking_ui');
+  // canvas.v2 Phase B: gate the message-anchored canvas card (rendered under an
+  // assistant bubble whose row carries a materialized canvas_id).
+  const canvasV2 = useFeatureFlag('canvas.v2');
   const selectedModel = useChatStore((s) => s.selectedModel[sessionId]);
   const selectedEffort = useChatStore((s) => s.selectedEffort[sessionId]);
   const setSessionModel = useChatStore((s) => s.setSessionModel);
@@ -431,6 +434,33 @@ export function ChatWindow({
   const anchoredInlineCanvasVisible = Boolean(
     hasVisibleCanvasAnchor(visibleMessages, canRenderInlineCanvas, inlineCanvasAnchorMessageId),
   );
+
+  // canvas.v2 Phase B — warm the canvas cache for message-anchored cards.
+  // The live SSE `canvas_created` handler pre-fetches, but on HYDRATION (page
+  // refresh / session switch) the message rows arrive from the DB carrying
+  // canvas_id with an empty canvas store, and CanvasMessageCard(canvasId) reads
+  // the store without self-fetching. This effect fills that gap: for every
+  // assistant message that carries a canvas_id not yet cached, fire a
+  // best-effort fetchCanvas. Reads canvasesById via getState() (not a selector)
+  // so it never churns the render, and fetchCanvas is idempotent + fail-open.
+  const fetchCanvas = useCanvasStore((s) => s.fetchCanvas);
+  const anchoredCanvasIdsKey = useMemo(
+    () =>
+      messages
+        .filter((m) => m.canvas_id && (m.role || '').toUpperCase() === 'ASSISTANT')
+        .map((m) => m.canvas_id)
+        .join(','),
+    [messages],
+  );
+  useEffect(() => {
+    if (!canvasV2 || !anchoredCanvasIdsKey) return;
+    const cached = useCanvasStore.getState().canvasesById;
+    const ids = new Set(anchoredCanvasIdsKey.split(',').filter(Boolean));
+    for (const cid of ids) {
+      if (!cached[cid]) void fetchCanvas(cid).catch(() => {});
+    }
+  }, [canvasV2, anchoredCanvasIdsKey, fetchCanvas]);
+
   useEffect(() => {
     try {
       if (!localStorage.getItem(DATA_NOTICE_ACK_KEY)) {
@@ -645,6 +675,19 @@ export function ChatWindow({
                 const showRoundCopy =
                   roundKey != null && lastAssistantTextUnitIdx.get(roundKey) === idx;
 
+                // canvas.v2 Phase B: anchor a materialized canvas card under
+                // this assistant bubble when the row carries a canvas_id.  The
+                // card is ADDITIVE — the bubble always renders (a Phase B
+                // assistant turn writes one explanatory sentence as normal
+                // text), so the model's content is never hidden behind the
+                // card.  Skip when the Phase A inlineCanvasV2Id path already
+                // renders THIS canvas, so the same canvas never draws twice.
+                const showCanvasCard =
+                  canvasV2 &&
+                  role === 'ASSISTANT' &&
+                  Boolean(u.message.canvas_id) &&
+                  u.message.canvas_id !== inlineCanvasV2Id;
+
                 return (
                   <div key={u.message.id}>
                     <MessageBubble
@@ -656,6 +699,14 @@ export function ChatWindow({
                       showRoundCopy={showRoundCopy}
                       roundCopyText={roundKey != null ? roundCopyText.get(roundKey) : undefined}
                     />
+                    {showCanvasCard && (
+                      <CanvasMessageCard
+                        sessionId={sessionId}
+                        canvasId={u.message.canvas_id!}
+                        aiDisabled={isStreaming}
+                        onOpenPanel={onInlineCanvasOpenPanel}
+                      />
+                    )}
                     {showCards && (
                       <OutputFileCards
                         files={byRunId.get(runId!)!}

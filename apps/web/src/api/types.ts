@@ -63,6 +63,16 @@ export interface Message {
    * clearStreamingBlocks to remove all temp blocks for a run at once.
    */
   streamRunId?: string;
+
+  /**
+   * canvas.v2 Phase B: id of a server canvas object materialized from this
+   * assistant message (the model called create_canvas → orchestrator
+   * materialized it and backfilled this column).  Present on the durable DB
+   * row after hydration, and set live via the `canvas_created` SSE handler.
+   * When set (and the canvas.v2 flag is on) ChatWindow renders a
+   * CanvasMessageCard anchored under this message's bubble.
+   */
+  canvas_id?: string | null;
 }
 
 export interface CursorPage<T> {

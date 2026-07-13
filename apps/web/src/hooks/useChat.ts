@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
+import { useCanvasStore } from '../stores/canvasStore';
 import { api, ApiError } from '../api/client';
 import type { Message, MessageAttachment, PendingInteractionItem } from '../api/types';
 
@@ -23,6 +24,8 @@ import type { Message, MessageAttachment, PendingInteractionItem } from '../api/
 //   message_created→ addMessage  (backend echo of the user message)
 //   agent_message  → addMessage  (legacy event name — treated same as message)
 //   plan           → setPlanSteps
+//   canvas_created → setMessageCanvasId (anchor a materialized canvas to its
+//                    assistant message) + warm the canvas cache (fetchCanvas)
 //   run_complete   → setIsStreaming(false) + one-shot messages.list reconcile
 //   ping           → no-op (SSE keepalive heartbeat; see the silent-watchdog
 //                    note on runConnectLoop — presence of pings is what arms it)
@@ -138,6 +141,55 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
         steps as import('../lib/designFixtures').PlanStep[],
       );
     }
+  },
+
+  canvas_created(ctx, data) {
+    // canvas.v2 Phase B: the model called create_canvas and the orchestrator
+    // materialized a server canvas, backfilling the assistant message row's
+    // canvas_id column.  Shape: { canvas_id, run_id, message_id? }.
+    //
+    // This is the LIVE path (the hydration path reads canvas_id straight off
+    // the durable DB row).  Two things happen:
+    //   1. Anchor the canvas to its assistant message so ChatWindow renders the
+    //      card under that bubble.  When message_id is present, anchor exactly
+    //      to it; when the orchestrator omits it, fall back to the LAST
+    //      assistant message for this run (the streamed text block that the
+    //      canvas was created from).  If neither can be resolved we silently
+    //      skip anchoring — the durable DB row still carries canvas_id, so the
+    //      card appears on the next hydration; the assistant bubble is never
+    //      affected either way (content stays visible — the card is additive).
+    //   2. Warm the canvas cache with a fire-and-forget fetchCanvas so the card
+    //      has content the instant it mounts.  Failure is swallowed: the card
+    //      re-fetches for itself, and a fetch error must never break the stream.
+    const store = useChatStore.getState();
+    const canvasId = data.canvas_id as string | undefined;
+    const runId = data.run_id as string | undefined;
+    const messageId = data.message_id as string | undefined;
+    if (!canvasId) return;
+
+    let targetMessageId = messageId;
+    if (!targetMessageId && runId) {
+      // Fallback: newest assistant (text) message for this run.  Prefer a
+      // durable row, but a streaming text block is an acceptable live anchor —
+      // hydration later reconciles it to the durable row (same canvas_id).
+      const msgs = store.messages[ctx.sessionId] || [];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        const isAssistant = (m.role || '').toUpperCase() === 'ASSISTANT';
+        const belongsToRun = m.run_id === runId || m.streamRunId === runId;
+        const isTextBlock = m.blockKind !== 'tool' && m.blockKind !== 'thinking';
+        if (isAssistant && belongsToRun && isTextBlock) {
+          targetMessageId = m.id;
+          break;
+        }
+      }
+    }
+    if (targetMessageId) {
+      store.setMessageCanvasId(ctx.sessionId, targetMessageId, canvasId);
+    }
+
+    // Warm the canvas cache (fail-open — the card will fetch it itself).
+    void useCanvasStore.getState().fetchCanvas(canvasId).catch(() => {});
   },
 
   message(ctx, data) {
