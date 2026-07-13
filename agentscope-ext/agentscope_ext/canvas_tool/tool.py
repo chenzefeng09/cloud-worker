@@ -68,31 +68,36 @@ except Exception:  # noqa: BLE001 - keep importable without agentscope
 class CreateCanvasTool(_ToolBase):
     """Promote a substantial written deliverable into an editable canvas.
 
-    Call this tool ONLY for long-form deliverables the user will likely want to
-    keep iterating on as a document — an article, report, brief, proposal,
-    email draft, social post, or code note of real length.  The tool captures
-    the finished content as a versioned canvas the user can then edit block by
-    block.
+    This tool is REQUIRED for every long-form written-creation request.  If the
+    user asks you to WRITE a piece of prose — an article, essay, short piece,
+    report, brief, proposal, email, marketing copy, summary, speech, story,
+    social post, code note, or any titled / 《书名号》 writing assignment — you
+    MUST call this tool FIRST and hand the FULL finished body to
+    ``content_markdown``.  This is the ONLY correct delivery path for such
+    content: do not write the article in the reply body instead of, or in
+    addition to, calling this tool.  The tool captures the finished content as a
+    versioned canvas the user can then edit block by block.
 
     Do NOT call this tool for ordinary conversation: short answers,
-    explanations, quick lists, code snippets shown for reading, or anything the
-    user did not ask to be produced as a standalone document.  When in doubt,
-    do NOT create a canvas — just reply normally in the message body.
+    explanations, quick lists, calculations, code debugging, code snippets shown
+    for reading, or anything where the user is not asking for a written work.
 
     After you call this tool, keep your natural-language reply to ONE short
-    sentence telling the user the document is in the canvas (e.g. "已为你创建
-    画布《…》，可在右侧查看和编辑。").  Do NOT repeat the full content in the
-    reply — it already lives in the canvas.
+    sentence telling the user the document is in the canvas (e.g. "已为你创作
+    《…》，内容在右侧画布中，可查看和编辑。").  Do NOT repeat the full content in
+    the reply — it already lives in the canvas.
 
     Args:
         kind: The document category.  One of ``article``, ``brief``, ``email``,
             ``report``, ``proposal``, ``social_post``, ``code_note``.  Defaults
             to ``article`` if unsure.
-        title: A concise human-readable title for the document (used as the
-            canvas heading and in listings).
-        content_markdown: The full document body in Markdown.  Use ``#`` /
-            ``##`` headings and blank-line-separated paragraphs — the server
-            splits this into editable blocks.
+        title: A concise human-readable title for the document, extracted from
+            the user's assignment / 《书名号》 when given (used as the canvas
+            heading and in listings).
+        content_markdown: The COMPLETE finished document body in Markdown — the
+            whole piece, not a summary or outline.  Use ``#`` / ``##`` headings
+            and blank-line-separated paragraphs; the server splits this into
+            editable blocks.
 
     Returns:
         A short confirmation string that names the created canvas by title.
@@ -101,13 +106,18 @@ class CreateCanvasTool(_ToolBase):
     name = "create_canvas"
 
     description: str = (
-        "Promote a long-form written deliverable (article, report, brief, "
-        "proposal, email draft, social post, code note) into a first-class, "
-        "editable canvas document. Use ONLY for substantial documents the user "
-        "will want to keep iterating on — never for ordinary short answers, "
-        "explanations, or code snippets shown for reading. After calling this, "
-        "reply with just one short sentence saying the document is in the "
-        "canvas; do not repeat the content in the message body."
+        "REQUIRED for ALL long-form written creation. Whenever the user asks you "
+        "to WRITE a piece of prose — an article, essay, short piece, report, "
+        "brief, proposal, email, marketing copy, summary, speech, story, social "
+        "post, code note, or any titled/《书名号》 writing assignment — you MUST "
+        "call this tool FIRST and put the FULL finished body into "
+        "content_markdown. This is the only correct way to deliver such content; "
+        "do not write the article in the reply body instead of, or in addition "
+        "to, calling this tool. After calling it, reply with just ONE short "
+        "sentence saying the document is in the canvas — never repeat the "
+        "content. Do NOT call for ordinary conversation: short answers, "
+        "explanations, lists, calculations, code debugging, or code snippets "
+        "shown for reading — i.e. when the user is not asking for a written work."
     )
 
     input_schema: dict[str, Any] = {
@@ -116,8 +126,10 @@ class CreateCanvasTool(_ToolBase):
             "kind": {
                 "type": "string",
                 "description": (
-                    "Document category. One of: article, brief, email, report, "
-                    "proposal, social_post, code_note. Defaults to 'article'."
+                    "Document category, chosen by the piece's genre: 'article' "
+                    "(essay / short piece / general prose), 'brief', 'email', "
+                    "'report', 'proposal', 'social_post', 'code_note'. Defaults "
+                    "to 'article' when unsure."
                 ),
                 "enum": [
                     "article",
@@ -132,14 +144,18 @@ class CreateCanvasTool(_ToolBase):
             },
             "title": {
                 "type": "string",
-                "description": "A concise human-readable title for the document.",
+                "description": (
+                    "A concise human-readable title for the document. Extract it "
+                    "from the user's assignment or 《书名号》 when one is given."
+                ),
             },
             "content_markdown": {
                 "type": "string",
                 "description": (
-                    "The full document body in Markdown. Use '#'/'##' headings "
-                    "and blank-line-separated paragraphs; the server splits this "
-                    "into editable blocks."
+                    "The COMPLETE finished document body in Markdown — the whole "
+                    "piece, not a summary or outline. Use '#'/'##' headings and "
+                    "blank-line-separated paragraphs; the server splits this into "
+                    "editable blocks."
                 ),
             },
         },
