@@ -31,7 +31,7 @@ import type {
   CanvasEditSuggestion,
   CanvasOpenSeed,
 } from '../lib/canvasObjects';
-import { getCanvasVisibleMessages, hasVisibleCanvasAnchor } from '../lib/canvasAnchoring';
+import { hasVisibleCanvasAnchor } from '../lib/canvasAnchoring';
 import {
   isUserScrollingAwayFromBottom,
   resolveTranscriptScrollState,
@@ -304,7 +304,6 @@ export function ChatWindow({
   inlineCanvasSuggestion,
   inlineCanvasAnchorMessageId,
   inlineCanvasV2Id,
-  hiddenMessageIds,
   onInlineCanvasDraftChange,
   onInlineCanvasRequestEdit,
   onInlineCanvasDismissEditError,
@@ -327,7 +326,6 @@ export function ChatWindow({
   inlineCanvasAnchorMessageId?: string | null;
   /** canvas.v2 ON: id of a server canvas object to render inline instead of the draft-mode card. */
   inlineCanvasV2Id?: string | null;
-  hiddenMessageIds?: string[];
   onInlineCanvasDraftChange?: (draft: CanvasDocumentDraft) => void;
   onInlineCanvasRequestEdit?: (request: CanvasEditRequest) => void | Promise<void>;
   onInlineCanvasDismissEditError?: () => void;
@@ -401,38 +399,21 @@ export function ChatWindow({
   // First-use data-usage notice: show once per device, then remember the
   // acknowledgement in localStorage so it never appears again.
   const [showDataNotice, setShowDataNotice] = useState(false);
-  // canvas.v2: read the server canvas directly so the hide-gate can verify it
-  // actually holds non-empty content, same structural guarantee as draft mode.
-  // Selector returns a stable reference (or undefined) — never a fresh object.
+  // canvas.v2: read the server canvas so the anchor gate can verify it's loaded
+  // before rendering the card at its anchor. Selector returns a stable
+  // reference (or undefined) — never a fresh object.
   const v2Canvas = useCanvasStore((s) => (inlineCanvasV2Id ? s.canvasesById[inlineCanvasV2Id] : undefined));
-  const v2HasContent = Boolean(v2Canvas && v2Canvas.blocks.some((b) => b.text.trim().length > 0));
   const canRenderInlineCanvas = Boolean(
     (inlineCanvasDraft && onInlineCanvasDraftChange && onInlineCanvasRequestEdit) ||
       (inlineCanvasV2Id && v2Canvas),
   );
-  // A message may only be hidden behind the inline canvas when that canvas is
-  // both renderable AND actually carries the lifted body. Hiding on the basis
-  // of `hiddenMessageIds` alone black-holes the message whenever the canvas is
-  // torn down or its draft is still empty (the cross-page/home→task race). This
-  // couples "message hidden" to "content is rendered somewhere" structurally.
-  // The v2 path mirrors this exactly: it's only "hideable" once the server
-  // canvas is loaded AND has at least one non-empty block.
-  const canHideBehindCanvas = Boolean(
-    (canRenderInlineCanvas && inlineCanvasDraft && inlineCanvasDraft.content.trim().length > 0) ||
-      (inlineCanvasV2Id && v2HasContent),
-  );
-  const visibleMessages = useMemo(
-    () =>
-      getCanvasVisibleMessages(
-        messages,
-        hiddenMessageIds,
-        canHideBehindCanvas,
-        inlineCanvasAnchorMessageId,
-      ),
-    [canHideBehindCanvas, hiddenMessageIds, inlineCanvasAnchorMessageId, messages],
-  );
+  // Message hiding has been retired (design §7.1): the "put in canvas" action no
+  // longer removes the source bubble. The card and the bubble coexist — content
+  // is always reachable in the transcript. We still ask whether the inline
+  // canvas is anchored to an on-screen message so the card can render at that
+  // anchor (additively, below the bubble) rather than in the bottom fallback.
   const anchoredInlineCanvasVisible = Boolean(
-    hasVisibleCanvasAnchor(visibleMessages, canRenderInlineCanvas, inlineCanvasAnchorMessageId),
+    hasVisibleCanvasAnchor(messages, canRenderInlineCanvas, inlineCanvasAnchorMessageId),
   );
 
   // canvas.v2 Phase B — warm the canvas cache for message-anchored cards.
@@ -563,7 +544,7 @@ export function ChatWindow({
   // block when backend provides real data.
   const showFixture =
     SHOW_DESIGN_FIXTURES &&
-    visibleMessages.length === 0 &&
+    messages.length === 0 &&
     !isStreaming &&
     !inlineCanvasDraft &&
     !inlineCanvasV2Id;
@@ -612,7 +593,7 @@ export function ChatWindow({
         <div style={{ maxWidth: 780, margin: '0 auto', width: '100%', display: 'flex', flexDirection: 'column', gap: 8 }}>
           {/* ── Real messages ── */}
           {(() => {
-            const units = groupSteps(visibleMessages, isStreaming);
+            const units = groupSteps(messages, isStreaming);
 
             // Pre-compute: for each run_id that has output files, find the
             // index of the LAST assistant message unit with that run_id.
@@ -657,11 +638,12 @@ export function ChatWindow({
               if (u.kind === 'message') {
                 const role = (u.message.role || '').toUpperCase();
                 const runId = u.message.run_id;
+                // Manual "put in canvas": the card renders ADDITIVELY below its
+                // anchor bubble (design §7.1 — no more hiding, card + bubble
+                // coexist). Covers both draft mode (flag off) and the v2
+                // inlineCanvasV2Id path (flag on).
                 const isInlineCanvasAnchor =
                   canRenderInlineCanvas && inlineCanvasAnchorMessageId === u.message.id;
-                if (isInlineCanvasAnchor) {
-                  return <div key={`canvas_${u.message.id}`}>{renderInlineCanvasCard()}</div>;
-                }
                 // Show output file cards only under the last assistant message
                 // for a given run_id (prevents duplicate cards if a run has
                 // multiple assistant text blocks).
@@ -699,6 +681,7 @@ export function ChatWindow({
                       showRoundCopy={showRoundCopy}
                       roundCopyText={roundKey != null ? roundCopyText.get(roundKey) : undefined}
                     />
+                    {isInlineCanvasAnchor && renderInlineCanvasCard()}
                     {showCanvasCard && (
                       <CanvasMessageCard
                         sessionId={sessionId}
@@ -737,7 +720,7 @@ export function ChatWindow({
 
           {/* ── Empty state (fixtures off, no messages) ── */}
           {!showFixture &&
-            visibleMessages.length === 0 &&
+            messages.length === 0 &&
             !isStreaming &&
             !inlineCanvasDraft &&
             !inlineCanvasV2Id && (

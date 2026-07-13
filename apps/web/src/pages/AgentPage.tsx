@@ -14,9 +14,6 @@ import {
 import {
   applyCanvasReplacement,
   createCanvasDraft,
-  extractCanvasDeliverable,
-  extractCanvasReplacement,
-  inferCanvasAuthoringIntent,
   prepareCanvasOpenSeed,
   sanitizeCanvasDraft,
   type CanvasDocumentDraft,
@@ -24,25 +21,11 @@ import {
   type CanvasEditSuggestion,
   type CanvasOpenSeed,
 } from '../lib/canvasObjects';
-import { findCanvasCreationReply } from '../lib/canvasCreation';
 import { routeCanvasIntent } from '../lib/canvasIntentRouting';
 import { api } from '../api/client';
 import type { MessageAttachment } from '../api/types';
 import { useFeatureFlag } from '../hooks/useFeatureFlags';
 import { useCanvasStore } from '../stores/canvasStore';
-
-interface PendingCanvasCreation {
-  documentId: string;
-  fromMessageIndex: number;
-}
-
-/** canvas.v2: lightweight "expecting a canvas for this send" marker — unlike
- * the legacy `PendingCanvasCreation`, this never builds an in-memory draft. */
-interface PendingCanvasCreationV2 {
-  fromMessageIndex: number;
-  kind?: string;
-  title?: string;
-}
 
 /**
  * Single-task agent view. The URL `/tasks/:id` drives `activeSessionId` in the
@@ -80,12 +63,7 @@ export function AgentPage() {
   const [canvasOpen, setCanvasOpen] = useState(false);
   const [inlineCanvasOpen, setInlineCanvasOpen] = useState(false);
   const [inlineCanvasAnchorMessageId, setInlineCanvasAnchorMessageId] = useState<string | null>(null);
-  const [hiddenCanvasMessageIds, setHiddenCanvasMessageIds] = useState<string[]>([]);
-  const [pendingCanvasCreation, setPendingCanvasCreation] = useState<PendingCanvasCreation | null>(null);
   const [canvasSuggestion, setCanvasSuggestion] = useState<CanvasEditSuggestion | null>(null);
-  // canvas.v2 state — kept entirely separate from the legacy draft state above
-  // so the flag-off path never touches (and can never be affected by) these.
-  const [pendingCanvasV2, setPendingCanvasV2] = useState<PendingCanvasCreationV2 | null>(null);
   const [inlineCanvasV2Id, setInlineCanvasV2Id] = useState<string | null>(null);
   // canvas.v2 three-state routing: when an update-canvas send fails (409 / edit
   // error), we refill the composer so the user never loses their typed text.
@@ -138,7 +116,6 @@ export function AgentPage() {
     setCanvasOpen(false);
     setInlineCanvasOpen(false);
     setInlineCanvasAnchorMessageId(null);
-    setHiddenCanvasMessageIds([]);
     setCanvasSuggestion(null);
     setCanvasRevising(false);
     setCanvasEditError(null);
@@ -147,7 +124,6 @@ export function AgentPage() {
     // cross-session bleed. We don't reset the whole canvasStore here (other
     // panels/tabs may still reference cached canvases); clearing the local id
     // is enough since nothing renders without it.
-    setPendingCanvasV2(null);
     setInlineCanvasV2Id(null);
     setComposerRefill(null);
   }, [id]);
@@ -192,7 +168,8 @@ export function AgentPage() {
       if (canvasV2) {
         // canvas.v2 ON — materialize a real server canvas object instead of an
         // in-memory draft. FAIL-OPEN: if creation rejects, warn and leave the
-        // message bubble untouched (do not hide, do not set an anchor).
+        // message bubble untouched (do not set an anchor). The card renders
+        // additively below the anchor bubble — the bubble is never hidden.
         const materialize = sourceMessageId
           ? createCanvasFromMessage(id!, sourceMessageId, { kind: seed.kind, title: seed.title })
           : createCanvasFromContent(id!, seed.content, { kind: seed.kind, title: seed.title });
@@ -200,11 +177,6 @@ export function AgentPage() {
           .then((canvas) => {
             setInlineCanvasV2Id(canvas.id);
             setInlineCanvasAnchorMessageId(sourceMessageId ?? null);
-            if (sourceMessageId) {
-              setHiddenCanvasMessageIds((current) =>
-                current.includes(sourceMessageId) ? current : [...current, sourceMessageId],
-              );
-            }
             setCanvasOpen(false);
             setPreviewFile(null);
           })
@@ -215,11 +187,6 @@ export function AgentPage() {
       }
 
       const extracted = prepareCanvasOpenSeed(seed);
-      if (sourceMessageId) {
-        setHiddenCanvasMessageIds((current) =>
-          current.includes(sourceMessageId) ? current : [...current, sourceMessageId],
-        );
-      }
       setCanvasDraft(
         createCanvasDraft(extracted.kind, {
           title: extracted.title,
@@ -243,44 +210,6 @@ export function AgentPage() {
     setPreviewFile(null);
   }, [canvasDraft]);
 
-  const maybeStartCanvasFromPrompt = useCallback(
-    (text: string, attachmentIds?: string[]) => {
-      if (attachmentIds && attachmentIds.length > 0) return;
-      const intent = inferCanvasAuthoringIntent(text);
-      if (!intent) return;
-
-      if (canvasV2) {
-        // canvas.v2 ON — do NOT eagerly build an in-memory draft with
-        // extracted prose. Just remember that a canvas is expected once the
-        // assistant reply lands; the materialization effect below (watching
-        // `pendingCanvasV2` + `messages`) does the actual creation.
-        setPendingCanvasV2({
-          fromMessageIndex: messages.length,
-          kind: intent.kind,
-          title: intent.title,
-        });
-        return;
-      }
-
-      const draft = createCanvasDraft(intent.kind, {
-        title: intent.title,
-        content: '',
-      });
-      setCanvasDraft(draft);
-      setInlineCanvasOpen(true);
-      setInlineCanvasAnchorMessageId(null);
-      setCanvasOpen(false);
-      setPreviewFile(null);
-      setCanvasSuggestion(null);
-      setCanvasEditError(null);
-      setPendingCanvasCreation({
-        documentId: draft.id,
-        fromMessageIndex: messages.length,
-      });
-    },
-    [canvasV2, messages.length],
-  );
-
   const sendMessageWithCanvasDetection = useCallback(
     (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => {
       // canvas.v2 three-state routing (design §6.3 Phase A): when the flag is on
@@ -289,6 +218,11 @@ export function AgentPage() {
       // normal chat path (an edit request carries no files). The composer has
       // already cleared its text (InputBar clears on send); on failure we refill
       // it so the user never loses input (fail-open).
+      //
+      // NOTE: send-time create-intent detection has been retired (design §7.1).
+      // New-content creation is now driven by the model (Phase B): the worker's
+      // `create_canvas` tool fires materialization and the SPA renders the card
+      // off the assistant message's `canvas_id`. The composer no longer guesses.
       const hasAttachments = Boolean(attachmentIds && attachmentIds.length > 0);
       if (
         canvasV2 &&
@@ -315,10 +249,9 @@ export function AgentPage() {
         return Promise.resolve();
       }
 
-      maybeStartCanvasFromPrompt(text, attachmentIds);
       return sendMessage(text, attachmentIds, attachmentsMeta);
     },
-    [canvasV2, id, inlineCanvasV2Id, maybeStartCanvasFromPrompt, requestCanvasEditAction, sendMessage],
+    [canvasV2, id, inlineCanvasV2Id, requestCanvasEditAction, sendMessage],
   );
 
   // If HomePage routed us here with an `initialMessage` in state, dispatch it
@@ -348,7 +281,6 @@ export function AgentPage() {
   const requestCanvasEdit = useCallback(
     async (request: CanvasEditRequest) => {
       if (!id) return;
-      setPendingCanvasCreation(null);
       setCanvasSuggestion(null);
       setCanvasEditError(null);
       setCanvasRevising(true);
@@ -399,103 +331,18 @@ export function AgentPage() {
     [id],
   );
 
-  useEffect(() => {
-    if (!pendingCanvasCreation) return;
-
-    const assistantReply = findCanvasCreationReply(messages, pendingCanvasCreation.fromMessageIndex);
-    if (!assistantReply) return;
-
-    const replacement = extractCanvasReplacement(assistantReply.content) ?? assistantReply.content.trim();
-    if (replacement) {
-      const extracted = extractCanvasDeliverable(replacement, {
-        kind: canvasDraft?.kind ?? 'article',
-        fallbackTitle: canvasDraft?.title,
-        sourceMessageId: assistantReply.id,
-      });
-      setCanvasDraft((current) => {
-        if (!current || current.id !== pendingCanvasCreation.documentId) return current;
-        if (
-          current.content === extracted.content &&
-          current.title === (extracted.title || current.title) &&
-          current.sourceMessageId === (assistantReply.id ?? current.sourceMessageId)
-        ) {
-          return current;
-        }
-        return {
-          ...current,
-          title: extracted.title || current.title,
-          content: extracted.content,
-          sourceMessageId: assistantReply.id ?? current.sourceMessageId,
-          updatedAt: new Date().toISOString(),
-        };
-      });
-      setInlineCanvasOpen(true);
-      setInlineCanvasAnchorMessageId(assistantReply.id ?? null);
-      setCanvasOpen(false);
-      setPreviewFile(null);
-      if (assistantReply.id) {
-        const assistantReplyId = assistantReply.id;
-        setHiddenCanvasMessageIds((current) =>
-          current.includes(assistantReplyId) ? current : [...current, assistantReplyId],
-        );
-      }
-    }
-    if (!isStreaming && !assistantReply.streaming) {
-      setPendingCanvasCreation(null);
-    }
-  }, [canvasDraft?.kind, canvasDraft?.title, isStreaming, messages, pendingCanvasCreation]);
-
-  // canvas.v2 — parallel materialization effect. Unlike the legacy effect
-  // above, this never touches `canvasDraft`/`hiddenCanvasMessageIds` until the
-  // real server canvas object has been created (materialize-then-anchor,
-  // rather than anchor-then-extract). Requires a durable (non-streaming,
-  // has-an-id) assistant reply, same as the legacy path's completion check.
-  useEffect(() => {
-    if (!canvasV2 || !pendingCanvasV2 || !id) return;
-
-    const assistantReply = findCanvasCreationReply(messages, pendingCanvasV2.fromMessageIndex, {
-      completeOnly: true,
-    });
-    if (!assistantReply || !assistantReply.id) return;
-
-    const pending = pendingCanvasV2;
-    const assistantReplyId = assistantReply.id;
-    // Clear immediately so this effect doesn't re-fire while the create
-    // request is in flight (messages/isStreaming may change mid-flight).
-    setPendingCanvasV2(null);
-
-    createCanvasFromMessage(id, assistantReplyId, { kind: pending.kind, title: pending.title })
-      .then((canvas) => {
-        setInlineCanvasV2Id(canvas.id);
-        setInlineCanvasAnchorMessageId(assistantReplyId);
-        setHiddenCanvasMessageIds((current) =>
-          current.includes(assistantReplyId) ? current : [...current, assistantReplyId],
-        );
-      })
-      .catch((err) => {
-        // FAIL-OPEN: never hide the bubble or set an anchor on failure — the
-        // assistant reply stays visible as a normal chat message.
-        console.warn('canvas.v2 materialize failed', err);
-      });
-  }, [canvasV2, createCanvasFromMessage, id, messages, pendingCanvasV2]);
-
-  // Keep the inline-canvas anchor pinned to the draft's source message even
-  // after `pendingCanvasCreation` has cleared. On the home → task path the
-  // assistant reply's id changes when its transient streaming block is swapped
-  // for the durable DB row (and again on the run_complete re-pull). If that
-  // final id swap lands after pending creation is cleared, the anchor + hidden
-  // set would otherwise be stranded on a stale id — the message stays hidden
-  // while its card no longer renders anchored (the reported black hole). This
-  // effect re-binds both to whichever message currently carries the draft
-  // content, independent of the pending-creation lifecycle.
+  // Keep the manual "put in canvas" card anchored to the draft's source message
+  // even as that message's id changes. On the home → task path the assistant
+  // reply's id is swapped when its transient streaming block becomes the durable
+  // DB row (and again on the run_complete re-pull). Without re-binding, the card
+  // would strand on a stale anchor id and fall back to the bottom slot. Hiding
+  // is gone (design §7.1) — the card renders additively below the bubble, so we
+  // only re-pin the anchor and never touch a hidden set.
   useEffect(() => {
     const sourceId = canvasDraft?.sourceMessageId;
     if (!sourceId || !inlineCanvasOpen) return;
     if (!messages.some((m) => m.id === sourceId)) return;
     setInlineCanvasAnchorMessageId((current) => (current === sourceId ? current : sourceId));
-    setHiddenCanvasMessageIds((current) =>
-      current.includes(sourceId) ? current : [...current, sourceId],
-    );
   }, [canvasDraft?.sourceMessageId, inlineCanvasOpen, messages]);
 
   const acceptCanvasSuggestion = useCallback(() => {
@@ -612,7 +459,6 @@ export function AgentPage() {
               onOpenCanvas={openCanvasFromMessage}
               onSendMessage={sendMessageWithCanvasDetection}
               inlineCanvasDraft={inlineCanvasOpen ? canvasDraft : null}
-              inlineCanvasPending={Boolean(pendingCanvasCreation)}
               inlineCanvasRevising={canvasRevising}
               inlineCanvasEditError={canvasEditError}
               inlineCanvasSuggestion={canvasSuggestion}
@@ -620,7 +466,6 @@ export function AgentPage() {
               inlineCanvasV2Id={canvasV2 ? inlineCanvasV2Id : null}
               externalPrefill={composerRefill}
               onExternalPrefillConsumed={() => setComposerRefill(null)}
-              hiddenMessageIds={hiddenCanvasMessageIds}
               onInlineCanvasDraftChange={setCanvasDraft}
               onInlineCanvasRequestEdit={requestCanvasEdit}
               onInlineCanvasDismissEditError={dismissCanvasEditError}

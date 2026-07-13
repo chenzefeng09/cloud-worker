@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import {
   applyCanvasReplacement,
   extractCanvasDeliverable,
-  inferCanvasAuthoringIntent,
   prepareCanvasOpenSeed,
   sanitizeCanvasDraft,
   type CanvasDocumentDraft,
@@ -238,37 +237,5 @@ describe('extractCanvasDeliverable', () => {
 
     expect(result.title).toBe('测试文章');
     expect(result.content).toBe('引言\n\n这是正文第一段。\n\n谢谢大家！');
-  });
-});
-
-describe('inferCanvasAuthoringIntent', () => {
-  it('matches explicit 文章 word for a science-explainer article', () => {
-    const result = inferCanvasAuthoringIntent('写一篇关于AI的科普文章');
-    expect(result?.kind).toBe('article');
-  });
-
-  it('detects an email authoring request', () => {
-    const result = inferCanvasAuthoringIntent('写一封邮件给客户');
-    expect(result?.kind).toBe('email');
-  });
-
-  it('detects a report authoring request via 报告/分析', () => {
-    const result = inferCanvasAuthoringIntent('写一份关于市场的分析报告');
-    expect(result?.kind).toBe('report');
-  });
-
-  it('TIGHTENING: no longer falls back to article for a bare 一份 phrase', () => {
-    const result = inferCanvasAuthoringIntent('帮我写一份东西');
-    expect(result).toBeNull();
-  });
-
-  it('TIGHTENING: no longer falls back to article for a bare 内容 phrase', () => {
-    const result = inferCanvasAuthoringIntent('写一个内容');
-    expect(result).toBeNull();
-  });
-
-  it('returns null when there is no authoring verb', () => {
-    const result = inferCanvasAuthoringIntent('今天天气怎么样');
-    expect(result).toBeNull();
   });
 });

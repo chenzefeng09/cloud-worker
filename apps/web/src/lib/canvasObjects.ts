@@ -47,11 +47,6 @@ export interface CanvasExtractedDocument {
   sourceMessageId?: string;
 }
 
-export interface CanvasAuthoringIntent {
-  kind: CanvasObjectKind;
-  title: string;
-}
-
 export interface CanvasTextSelection {
   text: string;
   start: number;
@@ -533,54 +528,5 @@ export function applyCanvasReplacement(
     ...draft,
     content: replacement,
     updatedAt: new Date().toISOString(),
-  };
-}
-
-function inferCanvasKind(prompt: string): CanvasObjectKind | null {
-  const text = prompt.toLowerCase();
-  if (/(代码|函数|脚本|sql|程序)/i.test(prompt) && !/(文档|说明|readme|设计)/i.test(prompt)) {
-    return null;
-  }
-  if (/(邮件|email|mail)/i.test(prompt)) return 'email';
-  if (/(报告|调研|分析|复盘)/i.test(prompt)) return 'report';
-  if (/(方案|计划书|proposal|项目计划)/i.test(prompt)) return 'proposal';
-  if (/(简报|纪要|周报|日报|同步|brief)/i.test(prompt)) return 'brief';
-  if (/(小红书|朋友圈|微博|推文|帖子|社媒|social)/i.test(prompt)) return 'social_post';
-  if (/(readme|接口文档|技术文档|设计说明|技术说明|api\s*doc)/i.test(text)) return 'code_note';
-  if (/(文章|长文|科普|博客|公众号|稿件|essay|article|post)/i.test(prompt)) return 'article';
-  return null;
-}
-
-function inferCanvasTitle(prompt: string, kind: CanvasObjectKind): string {
-  const object = getCanvasObject(kind);
-  const normalized = prompt.replace(/\s+/g, ' ').trim();
-  const topicMatch = normalized.match(
-    /(?:关于|有关|围绕|以)(.+?)(?:的)?(?:科普文章|文章|长文|博客|公众号|报告|邮件|方案|简报|帖子|文案|内容|$)/,
-  );
-  const topic = topicMatch?.[1]?.trim().replace(/[，。,.!?！？]+$/g, '');
-  if (topic) return `关于${topic}的${object.label}`;
-
-  const cleaned = normalized
-    .replace(/^(请|帮我|给我|麻烦你|麻烦)?\s*/i, '')
-    .replace(/^(写|撰写|起草|生成|创作|整理|输出)\s*/i, '')
-    .replace(/^(一篇|一份|一个|一下)\s*/i, '')
-    .replace(/[，。,.!?！？]+$/g, '')
-    .trim();
-  if (!cleaned) return object.defaultTitle;
-  return cleaned.length > 36 ? `${cleaned.slice(0, 36)}…` : cleaned;
-}
-
-export function inferCanvasAuthoringIntent(prompt: string): CanvasAuthoringIntent | null {
-  const normalized = prompt.trim();
-  if (!normalized) return null;
-  const hasAuthoringVerb = /(写|撰写|起草|生成|创作|草拟|整理成|输出|draft|write|create|generate)/i.test(
-    normalized,
-  );
-  if (!hasAuthoringVerb) return null;
-  const kind = inferCanvasKind(normalized);
-  if (!kind) return null;
-  return {
-    kind,
-    title: inferCanvasTitle(normalized, kind),
   };
 }
