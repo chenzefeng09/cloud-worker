@@ -161,6 +161,7 @@ services:
       dockerfile: Dockerfile
       additional_contexts:
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+        feature_flag_client: ../../libs/feature-flag-client
       args:
         PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
     image: agent-platform-dev-skill-store
