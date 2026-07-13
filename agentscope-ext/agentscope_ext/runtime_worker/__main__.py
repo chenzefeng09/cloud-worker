@@ -1182,6 +1182,10 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
     # failure-open -- RunStateClient swallows all Redis errors internally.
     # ------------------------------------------------------------------
     state_client = _redis.from_env()
+    # Share the pre-scrub client with late consumers (canvas tool et al.):
+    # after _scrub_process_env_for_tools() removes REDIS_URL / broker lease
+    # from os.environ, any later from_env() yields a silent no-op client.
+    _redis.set_shared_client(state_client)
     _scrub_process_env_for_tools()
 
     # ------------------------------------------------------------------

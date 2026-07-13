@@ -50,11 +50,14 @@ def install() -> None:
             from agentscope_ext.canvas_tool.tool import CreateCanvasTool
             from agentscope_ext.runtime_worker import redis_state as _redis
 
-            # Build a run-scoped, failure-open state client from env (RUN_ID +
-            # REDIS_URL, or the tool-broker /state façade in broker mode) — the
-            # same construction the runtime worker uses.  A no-op client (no
-            # RUN_ID / Redis) still lets the tool return its confirmation text.
-            state_client = _redis.from_env()
+            # Reuse the worker's run-scoped client (built BEFORE the env
+            # scrub removed REDIS_URL / broker lease from os.environ).
+            # build_toolkit runs after the scrub, so a fresh from_env() here
+            # would silently yield a no-op client and every push_canvas would
+            # return seq=0 — the payload would never reach Redis and the
+            # canvas would never materialize.  from_env() stays as fallback
+            # for harnesses that call build_toolkit without booting the worker.
+            state_client = _redis.get_shared_client() or _redis.from_env()
             tool = CreateCanvasTool(state_client=state_client)
             toolkit.tool_groups[0].tools.append(tool)
             _LOG.info("canvas_tool: registered create_canvas tool")
