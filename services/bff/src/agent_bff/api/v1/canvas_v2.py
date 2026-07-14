@@ -52,15 +52,23 @@ _CONTEXT_NEIGHBORS = 1
 # 请求模型
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _SelectionSegment(BaseModel):
+    block_id: str
+    start: int
+    end: int
+    text: str
+
+
 class _Scope(BaseModel):
     type: str
     block_ids: list[str] | None = None
+    segments: list[_SelectionSegment] | None = None
 
     @field_validator("type")
     @classmethod
     def _validate_type(cls, v: str) -> str:
-        if v not in ("blocks", "document"):
-            raise ValueError("scope.type must be 'blocks' or 'document'")
+        if v not in ("blocks", "document", "selection"):
+            raise ValueError("scope.type must be 'blocks', 'document', or 'selection'")
         return v
 
 
@@ -159,6 +167,70 @@ def build_scoped_edit_prompt(
         lines.append(str(b.get("text", "")))
         lines.append("")
 
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def build_selection_edit_prompt(
+    *,
+    instruction: str,
+    blocks: list[dict],
+    segments: list[dict],
+    retry_error: str | None = None,
+) -> str:
+    """Build the strict fragment-only prompt used by character magic-edit.
+
+    The model gets an explicitly addressed slot for each selected fragment and
+    returns only replacement fragments.  Prefix/suffix are context, never model
+    output, so the BFF can splice locally and prove that text outside the range
+    is byte-for-byte unchanged.
+    """
+    text_by_id = {str(block["id"]): str(block.get("text", "")) for block in blocks}
+    slots = []
+    for segment in segments:
+        text = text_by_id[segment["block_id"]]
+        slots.append(
+            {
+                "block_id": segment["block_id"],
+                "before_context": text[: segment["start"]],
+                "selected_text": segment["text"],
+                "after_context": text[segment["end"] :],
+            }
+        )
+
+    lines: list[str] = []
+    if retry_error:
+        lines.extend(
+            [
+                "上一次的输出未通过校验，错误如下，请修正后重新只返回 JSON：",
+                retry_error,
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "你是文档局部改写器。每个 slot 中只有 selected_text 可修改，",
+            "before_context 与 after_context 均为只读上下文，绝不能复述或改写。",
+            "每个 slot 必须返回且只返回一个对应的替换片段；不要返回完整段落或完整文档。",
+            "new_text 可以是空字符串（表示删除选区）。",
+            "只返回 JSON 对象，不要解释、代码围栏或 JSON 之外的文字。",
+            "",
+            "输出 JSON schema：",
+            json.dumps(
+                {
+                    "replacements": [
+                        {"block_id": "blk_xxx", "new_text": "仅选区的新文本"}
+                    ],
+                    "change_summary": "一句话变更说明",
+                },
+                ensure_ascii=False,
+            ),
+            "",
+            f"修改要求：{instruction}",
+            "",
+            "选区 slots（JSON）：",
+            json.dumps(slots, ensure_ascii=False),
+        ]
+    )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -264,6 +336,83 @@ def parse_and_validate_output(
     return edits, insertions, (summary or None)
 
 
+def parse_selection_output(
+    content: str, *, target_ids: list[str]
+) -> tuple[list[dict], str | None]:
+    """Validate fragment-only magic-edit output.
+
+    Every addressed block must appear exactly once and no structural operation
+    (delete block / insertion) is accepted on this path.
+    """
+    raw = _strip_json_fence(content)
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ModelOutputError(f"输出不是合法 JSON：{exc}") from exc
+    if not isinstance(data, dict):
+        raise ModelOutputError("输出顶层必须是 JSON 对象。")
+
+    replacements_raw = data.get("replacements")
+    if not isinstance(replacements_raw, list):
+        raise ModelOutputError("replacements 必须是数组。")
+
+    target_set = set(target_ids)
+    seen: set[str] = set()
+    replacements: list[dict] = []
+    for i, item in enumerate(replacements_raw):
+        if not isinstance(item, dict):
+            raise ModelOutputError(f"replacements[{i}] 必须是对象。")
+        block_id = item.get("block_id")
+        new_text = item.get("new_text")
+        if not isinstance(block_id, str) or block_id not in target_set:
+            raise ModelOutputError(
+                f"replacements[{i}].block_id={block_id!r} 不在选区范围内。"
+            )
+        if block_id in seen:
+            raise ModelOutputError(f"block_id={block_id!r} 重复出现。")
+        if not isinstance(new_text, str):
+            raise ModelOutputError(f"replacements[{i}].new_text 必须是字符串。")
+        seen.add(block_id)
+        replacements.append({"block_id": block_id, "new_text": new_text})
+
+    missing = target_set - seen
+    if missing:
+        raise ModelOutputError(f"缺少选区块的替换结果：{sorted(missing)}。")
+
+    change_summary = data.get("change_summary")
+    if change_summary is not None and not isinstance(change_summary, str):
+        raise ModelOutputError("change_summary 必须是字符串或省略。")
+    summary = change_summary.strip() if isinstance(change_summary, str) else None
+    return replacements, (summary or None)
+
+
+def validate_selection_replacements(
+    *, replacements: list[dict], segments: list[dict], blocks: list[dict]
+) -> None:
+    """Reject obvious whole-block echoes before they can be spliced locally."""
+    text_by_id = {str(block["id"]): str(block.get("text", "")) for block in blocks}
+    segment_by_id = {segment["block_id"]: segment for segment in segments}
+    for replacement in replacements:
+        block_id = replacement["block_id"]
+        segment = segment_by_id[block_id]
+        original = text_by_id[block_id]
+        new_text = replacement["new_text"]
+        before = original[: segment["start"]]
+        after = original[segment["end"] :]
+        echoes_both_sides = bool(
+            before
+            and after
+            and new_text.startswith(before)
+            and new_text.endswith(after)
+        )
+        echoes_long_prefix = len(before) >= 12 and new_text.startswith(before)
+        echoes_long_suffix = len(after) >= 12 and new_text.endswith(after)
+        if echoes_both_sides or echoes_long_prefix or echoes_long_suffix:
+            raise ModelOutputError(
+                f"block_id={block_id!r} 返回了包含只读上下文的完整段落；只允许返回选区替换片段。"
+            )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # edits/insertions → diffs 换算（orig 从当前 blocks 回填）
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,6 +470,40 @@ def build_diffs(
     return diffs
 
 
+def build_selection_diffs(
+    *,
+    replacements: list[dict],
+    segments: list[dict],
+    blocks: list[dict],
+) -> list[dict]:
+    """Splice verified fragment replacements into full-block diffs.
+
+    The orchestrator continues to apply a normal full-block ``replace``.  The
+    optional range metadata survives in the suggestion JSON for inline review.
+    """
+    text_by_id = {str(block["id"]): str(block.get("text", "")) for block in blocks}
+    replacement_by_id = {item["block_id"]: item["new_text"] for item in replacements}
+    diffs: list[dict] = []
+    for segment in segments:
+        block_id = segment["block_id"]
+        original = text_by_id[block_id]
+        selected_sugg = replacement_by_id[block_id]
+        suggested = original[: segment["start"]] + selected_sugg + original[segment["end"] :]
+        diffs.append(
+            {
+                "block_id": block_id,
+                "op": "replace",
+                "orig": original,
+                "sugg": suggested,
+                "selection_start": segment["start"],
+                "selection_end": segment["end"],
+                "selected_orig": segment["text"],
+                "selected_sugg": selected_sugg,
+            }
+        )
+    return diffs
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 端点
 # ─────────────────────────────────────────────────────────────────────────────
@@ -367,6 +550,13 @@ async def canvas_v2_edit(
             "请先选择要修改的段落。",
             code="AGENT.BFF.CANVAS.NO_BLOCK_IDS",
             detail="scope=blocks requires non-empty block_ids",
+        )
+    if req.scope.type == "selection" and not (req.scope.segments or []):
+        raise _problem(
+            400,
+            "请先选择要修改的文字。",
+            code="AGENT.BFF.CANVAS.NO_SELECTION",
+            detail="scope=selection requires non-empty segments",
         )
 
     orch_headers = foundation_headers(tenant_id, user_id, access_token)
@@ -427,8 +617,9 @@ async def canvas_v2_edit(
             detail=f"client base_version {req.base_version} != current {base_version}",
         )
 
-    # ── 作用域：blocks 时校验 block_ids 都存在；document 时目标 = 全部块 ──────────
+    # ── 作用域：block / character selection 都必须精确命中当前版本 ──────────────
     existing_ids = {b["id"] for b in blocks if isinstance(b, dict) and "id" in b}
+    selection_segments: list[dict] = []
     if req.scope.type == "blocks":
         target_ids = list(req.scope.block_ids or [])
         missing = [bid for bid in target_ids if bid not in existing_ids]
@@ -439,6 +630,46 @@ async def canvas_v2_edit(
                 code="AGENT.BFF.CANVAS.BLOCK_NOT_FOUND",
                 detail=f"block_ids not in current version: {missing}",
             )
+    elif req.scope.type == "selection":
+        selection_segments = [segment.model_dump() for segment in req.scope.segments or []]
+        target_ids = [segment["block_id"] for segment in selection_segments]
+        if len(set(target_ids)) != len(target_ids):
+            raise _problem(
+                422,
+                "同一段落包含重复选区，请重新选择后重试。",
+                code="AGENT.BFF.CANVAS.DUPLICATE_SELECTION",
+                detail="selection contains duplicate block ids",
+            )
+        missing = [block_id for block_id in target_ids if block_id not in existing_ids]
+        if missing:
+            raise _problem(
+                422,
+                "选中的段落已不在当前画布版本中，请刷新后重试。",
+                code="AGENT.BFF.CANVAS.BLOCK_NOT_FOUND",
+                detail=f"selection block ids not in current version: {missing}",
+            )
+        text_by_id = {str(b["id"]): str(b.get("text", "")) for b in blocks}
+        for segment in selection_segments:
+            current_text = text_by_id[segment["block_id"]]
+            start = segment["start"]
+            end = segment["end"]
+            if start < 0 or end <= start or end > len(current_text):
+                raise _problem(
+                    422,
+                    "选区位置无效，请重新选择后重试。",
+                    code="AGENT.BFF.CANVAS.BAD_SELECTION_RANGE",
+                    detail=(
+                        f"invalid range {start}:{end} for block {segment['block_id']} "
+                        f"with length {len(current_text)}"
+                    ),
+                )
+            if current_text[start:end] != segment["text"]:
+                raise _problem(
+                    409,
+                    "画布内容已变化，请重新选择文字后再修改。",
+                    code="AGENT.BFF.CANVAS.SELECTION_STALE",
+                    detail=f"selected text mismatch for block {segment['block_id']}",
+                )
     else:  # document
         target_ids = [b["id"] for b in blocks if isinstance(b, dict) and "id" in b]
 
@@ -488,17 +719,27 @@ async def canvas_v2_edit(
     gw_headers["X-LLM-Virtual-Key"] = virtual_key
 
     edits: list[dict] | None = None
+    selection_replacements: list[dict] | None = None
     insertions: list[dict] | None = None
     change_summary: str | None = None
     retry_error: str | None = None
 
     async with httpx.AsyncClient(timeout=_COMPLETION_TIMEOUT) as gw_client:
         for attempt in range(2):  # 首次 + 一次重试
-            prompt = build_scoped_edit_prompt(
-                instruction=req.instruction,
-                blocks=blocks,
-                target_ids=target_ids,
-                retry_error=retry_error,
+            prompt = (
+                build_selection_edit_prompt(
+                    instruction=req.instruction,
+                    blocks=blocks,
+                    segments=selection_segments,
+                    retry_error=retry_error,
+                )
+                if req.scope.type == "selection"
+                else build_scoped_edit_prompt(
+                    instruction=req.instruction,
+                    blocks=blocks,
+                    target_ids=target_ids,
+                    retry_error=retry_error,
+                )
             )
             payload = {
                 "model": model,
@@ -566,9 +807,21 @@ async def canvas_v2_edit(
                 ) from exc
 
             try:
-                edits, insertions, change_summary = parse_and_validate_output(
-                    content, target_ids=target_ids
-                )
+                if req.scope.type == "selection":
+                    selection_replacements, change_summary = parse_selection_output(
+                        content, target_ids=target_ids
+                    )
+                    validate_selection_replacements(
+                        replacements=selection_replacements,
+                        segments=selection_segments,
+                        blocks=blocks,
+                    )
+                    edits = []  # success sentinel; selection uses its own output shape
+                    insertions = []
+                else:
+                    edits, insertions, change_summary = parse_and_validate_output(
+                        content, target_ids=target_ids
+                    )
                 break
             except ModelOutputError as exc:
                 retry_error = str(exc)
@@ -589,7 +842,15 @@ async def canvas_v2_edit(
         )
 
     # ── ④⑤ 换算 diffs → POST 建议落库（orchestrator）────────────────────────────
-    diffs = build_diffs(edits=edits, insertions=insertions or [], blocks=blocks)
+    diffs = (
+        build_selection_diffs(
+            replacements=selection_replacements or [],
+            segments=selection_segments,
+            blocks=blocks,
+        )
+        if req.scope.type == "selection"
+        else build_diffs(edits=edits, insertions=insertions or [], blocks=blocks)
+    )
     suggestion_body = {
         "base_version": base_version,
         "instruction": req.instruction,

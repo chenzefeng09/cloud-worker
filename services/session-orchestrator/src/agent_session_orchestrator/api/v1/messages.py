@@ -775,7 +775,20 @@ async def _materialize_pending_canvases(
         from agent_session_orchestrator.services.canvas_service import CanvasService
 
         canvas_svc = CanvasService(svc._db, tenant_id=tenant_id)  # noqa: SLF001
-        already = await canvas_svc.count_canvases_for_run(run.id)
+        existing_canvases = await canvas_svc.list_canvases_for_run(run.id)
+        already = len(existing_canvases)
+
+        # Creating the canvas and persisting the assistant message happen on
+        # independent timelines.  A previous poll may have created the canvas
+        # before any eligible assistant row existed, so idempotency must skip
+        # document creation but MUST NOT skip the message backfill.  Retrying is
+        # safe: already-linked messages are excluded by the service query.
+        for existing_canvas in existing_canvases:
+            await canvas_svc.backfill_message_canvas_id(
+                session_id=run.session_id,
+                run_id=run.id,
+                canvas_id=existing_canvas.id,
+            )
 
         events: list[str] = []
         for payload in payloads:

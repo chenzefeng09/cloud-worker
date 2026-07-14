@@ -43,6 +43,13 @@ class Diff(BaseModel):
     op: Literal["replace", "delete", "insert_after"]
     orig: str | None = None
     sugg: str | None = None
+    # Character-selection metadata.  orig/sugg stay full-block snapshots so
+    # accept remains a normal atomic block replacement; these fields are only
+    # used to render the pending delta at its exact in-block location.
+    selection_start: int | None = None
+    selection_end: int | None = None
+    selected_orig: str | None = None
+    selected_sugg: str | None = None
 
 
 class SuggestionCreate(BaseModel):

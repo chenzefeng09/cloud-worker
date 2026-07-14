@@ -172,7 +172,8 @@ canvas 对象 wire 格式：
 POST /api/bff/v1/sessions/{sid}/canvases/{cid}/edit
   body: {
     instruction: str,                    # 用户指令
-    scope: {type: "blocks"|"document", block_ids?: [str]},
+    scope: {type: "blocks"|"document", block_ids?: [str]}
+         | {type: "selection", segments: [{block_id, start, end, text}]},
     model?: str,                         # 缺省走 _resolve_default_model
     base_version?: int                   # 前端所见版本；与当前版本不符→立即 409，不调 LLM（前置乐观锁，省掉白烧的模型调用）
   }
@@ -180,6 +181,8 @@ POST /api/bff/v1/sessions/{sid}/canvases/{cid}/edit
 ```
 
 流程：① GET canvas 当前版本（orchestrator）；② 组 prompt——只带目标块（带 block_id 标注）+ 少量相邻块作只读上下文，明确「只返回目标块的新内容，禁止复述未修改内容」；③ 调 gateway，**json 输出模式**（deepseek 支持 json_object；服务端按 schema 校验，不合法重试一次，仍失败 → 502 problem `CANVAS.BAD_MODEL_OUTPUT`）；④ POST suggestion 落库；⑤ 返回。
+
+字符选区走更窄的 magic-edit 分支：服务端先校验 `base_version + block_id + start/end + text` 与当前版本完全一致，再要求模型只返回每个 slot 的替换片段。BFF 在服务端 splice 成完整 block diff，选区外前后缀不由模型生成，因此可保证字节级不变；suggestion 额外保留 `selection_start/end + selected_orig/sugg` 供前端在原位置展示。
 
 LLM 输出 schema：
 
@@ -245,7 +248,7 @@ interface CanvasStore {
 
 ### 7.2 组件
 
-- `CanvasMessageCard` / `ArticleCanvasPanel` props 从 `draft: CanvasDocumentDraft` 改为 `canvasId: string`（store 取对象），编辑器仍是 textarea，但渲染按 blocks join；选区编辑改为「选中块」交互（点击段落选中，shift 多选）——比字符 offset 选区更贴块模型，也为 Tiptap 化过渡。
+- `CanvasMessageCard` / `ArticleCanvasPanel` props 从 `draft: CanvasDocumentDraft` 改为 `canvasId: string`（store 取对象）。v2 编辑 DOM 为每个服务端块保留 `data-canvas-block-id`，浏览器字符选区被换算为 block 内坐标；手动保存也从 DOM 读取稳定 id，避免插删前置段落后位置复用导致错绑。
 - 新增 `SuggestionDiffView`：按块渲染 orig（删除线底色）/sugg（高亮底色）对照 + 每块与整体的 接受/放弃；textarea 时代即可实现（只读 diff 列表 + 按钮）。
 - 错误态：编辑失败在卡内渲染 error chip（复用 problem+json 的 `user_message`），**任何错误字符串不得写入 blocks**。
 
@@ -310,4 +313,4 @@ interface CanvasStore {
 
 **刻意不同（不改）**：① suggestion 服务端落库持久化——对标实现的 diff 只活在前端内存、刷新即丢，与本仓「关键状态不放前端内存」的教训相悖；② 编辑走结构化 JSON 输出——对标实现让模型返回裸替换文本，正是我们退役的「回显+解析脆弱」老路；③ diffs 支持 insert_after/delete——对标只支持段替换。
 
-**P2（Tiptap 落地时）采纳**：块内子选区（PM 坐标 from/to + selectedText 冗余校验）；diff 以标记节点渲染（`data-me-role="orig|sugg"` / `data-me-id` / `data-me-segment` 风格的 DOM 约定，便于调试对照）；选区 BubbleMenu 浮动工具栏。块模型 [{id,type,text}] 可无损转 ProseMirror JSON，服务端 schema 不需要为此变更。
+**已提前采纳（不依赖 Tiptap）**：块内字符子选区（block 内 start/end + selectedText 冗余校验）；diff 以 `data-me-role="orig|sugg"` / `data-me-id` / `data-me-segment` 标记在原位置渲染；选区浮动工具栏。未来换 ProseMirror/Tiptap 时只需把坐标来源替换为 PM selection，服务端协议无需再次变更。

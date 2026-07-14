@@ -1809,6 +1809,15 @@ export interface CanvasDiff {
   op: 'replace' | 'delete' | 'insert_after';
   orig?: string | null;
   sugg?: string | null;
+  /**
+   * Present for a character-selection magic edit. `orig` / `sugg` remain the
+   * complete block snapshots used by the accept transaction; these fields let
+   * the UI render only the selected delta in place.
+   */
+  selection_start?: number | null;
+  selection_end?: number | null;
+  selected_orig?: string | null;
+  selected_sugg?: string | null;
 }
 
 /** A proposed scoped edit awaiting accept/reject (matches SuggestionOut). */
@@ -1832,10 +1841,22 @@ export interface CanvasCreateBody {
   title?: string;
 }
 
-/** Body for POST /sessions/{sid}/canvases/{cid}/edit (BFF LLM edge). scope=document | blocks. */
+export interface CanvasSelectionSegment {
+  block_id: string;
+  start: number;
+  end: number;
+  text: string;
+}
+
+export type CanvasEditScope =
+  | { type: 'document' }
+  | { type: 'blocks'; block_ids: string[] }
+  | { type: 'selection'; segments: CanvasSelectionSegment[] };
+
+/** Body for POST /sessions/{sid}/canvases/{cid}/edit (BFF LLM edge). */
 export interface CanvasV2EditBody {
   instruction: string;
-  scope: { type: 'document' | 'blocks'; block_ids?: string[] };
+  scope: CanvasEditScope;
   model?: string;
   base_version?: number; // optimistic-lock pre-check: BFF returns 409 if != current
 }

@@ -15,7 +15,7 @@
  */
 import { create } from 'zustand';
 import { api } from '../api/client';
-import type { CanvasBlock, CanvasDocument, CanvasSuggestion } from '../api/types';
+import type { CanvasBlock, CanvasDocument, CanvasEditScope, CanvasSuggestion } from '../api/types';
 
 /** Duck-typed error shape — matches ApiError's public fields without importing the class. */
 function errorStatus(err: unknown): number | undefined {
@@ -70,7 +70,7 @@ export interface CanvasState {
   requestEdit: (
     canvasId: string,
     sessionId: string,
-    req: { instruction: string; scope: { type: 'document' | 'blocks'; block_ids?: string[] }; model?: string },
+    req: { instruction: string; scope: CanvasEditScope; model?: string },
   ) => Promise<CanvasSuggestion | null>;
   applySuggestion: (
     canvasId: string,
@@ -128,33 +128,25 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
   },
 
   createFromMessage: async (sessionId, sourceMessageId, opts) => {
-    try {
-      const canvas = await api.canvas.create(sessionId, {
-        source_message_id: sourceMessageId,
-        kind: opts?.kind,
-        title: opts?.title,
-      });
-      get().setCanvas(canvas);
-      return canvas;
-    } catch (err) {
-      // Fail-open contract: caller (AgentPage) falls back to the chat bubble
-      // and console.warns — this must reject, not swallow.
-      throw err;
-    }
+    // Fail-open contract: rejection propagates to AgentPage, which keeps the
+    // chat bubble visible and logs the materialization failure.
+    const canvas = await api.canvas.create(sessionId, {
+      source_message_id: sourceMessageId,
+      kind: opts?.kind,
+      title: opts?.title,
+    });
+    get().setCanvas(canvas);
+    return canvas;
   },
 
   createFromContent: async (sessionId, content, opts) => {
-    try {
-      const canvas = await api.canvas.create(sessionId, {
-        content,
-        kind: opts?.kind,
-        title: opts?.title,
-      });
-      get().setCanvas(canvas);
-      return canvas;
-    } catch (err) {
-      throw err;
-    }
+    const canvas = await api.canvas.create(sessionId, {
+      content,
+      kind: opts?.kind,
+      title: opts?.title,
+    });
+    get().setCanvas(canvas);
+    return canvas;
   },
 
   requestEdit: async (canvasId, sessionId, req) => {
@@ -172,7 +164,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return res.suggestion;
     } catch (err) {
       const status = errorStatus(err);
-      const message = status === 409 ? REFRESH_STALE_MESSAGE : errorMessage(err);
+      const upstreamMessage = errorMessage(err);
+      const message = status === 409 && upstreamMessage === '请求失败'
+        ? REFRESH_STALE_MESSAGE
+        : upstreamMessage;
       set((s) => ({
         errorByCanvasId: { ...s.errorByCanvasId, [canvasId]: message },
       }));
@@ -231,7 +226,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
       return canvas;
     } catch (err) {
       const status = errorStatus(err);
-      const message = status === 409 ? REFRESH_STALE_MESSAGE : errorMessage(err);
+      const upstreamMessage = errorMessage(err);
+      const message = status === 409 && upstreamMessage === '请求失败'
+        ? REFRESH_STALE_MESSAGE
+        : upstreamMessage;
       set((s) => ({
         errorByCanvasId: { ...s.errorByCanvasId, [canvasId]: message },
       }));

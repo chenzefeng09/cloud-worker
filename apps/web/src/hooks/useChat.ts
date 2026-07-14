@@ -199,6 +199,23 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     const msg = data as unknown as Message;
     const roleUpper = (msg.role || '').toUpperCase();
     if ((roleUpper === 'ASSISTANT' || roleUpper === 'TOOL' || roleUpper === 'THINKING') && msg.run_id) {
+      // `canvas_created` can arrive while the assistant answer is still a
+      // transient streaming block.  Preserve that live association when the
+      // durable assistant row arrives without canvas_id; otherwise the clear
+      // below deletes the only copy of the association and the canvas flashes
+      // briefly before disappearing.
+      const liveCanvasId = roleUpper === 'ASSISTANT' && !msg.canvas_id
+        ? (store.messages[ctx.sessionId] || [])
+            .slice()
+            .reverse()
+            .find(
+              (m) =>
+                m.streamRunId === msg.run_id &&
+                m.blockKind === 'text' &&
+                Boolean(m.canvas_id),
+            )?.canvas_id
+        : undefined;
+      const durableMessage = liveCanvasId ? { ...msg, canvas_id: liveCanvasId } : msg;
       // Swap the transient streaming block for the durable DB row — but only
       // the block of the SAME kind this row replaces.  Durable rows arrive
       // THINKING-first, then ASSISTANT text; a non-kind-aware clear would wipe
@@ -208,7 +225,7 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
       const kindForRole =
         roleUpper === 'THINKING' ? 'thinking' : roleUpper === 'TOOL' ? 'tool' : 'text';
       store.clearStreamingBlocks(ctx.sessionId, msg.run_id, kindForRole);
-      store.addMessage(ctx.sessionId, msg);
+      store.addMessage(ctx.sessionId, durableMessage);
       // A durable row for this run has landed → the run reached terminal and was
       // hydrated.  Close its streaming channel and drop its offset watermark so
       // any further (replayed) token/tool/thinking events are discarded instead
@@ -380,6 +397,60 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     ctx.onDone();
   },
 };
+
+/**
+ * Restore canvases whose document row survived but whose message.canvas_id
+ * backfill lost a materialization race.  This makes older affected sessions
+ * self-heal on the next hydration while the server-side retry prevents new
+ * orphaned associations.
+ */
+export async function recoverSessionCanvasAnchors(sessionId: string): Promise<void> {
+  const page = await api.canvas.list(sessionId);
+  if (page.items.length === 0) return;
+
+  const store = useChatStore.getState();
+  const messages = store.messages[sessionId] || [];
+  const claimedMessageIds = new Set(
+    messages.filter((m) => Boolean(m.canvas_id)).map((m) => m.id),
+  );
+
+  for (const canvas of page.items) {
+    const alreadyAnchored = messages.some((m) => m.canvas_id === canvas.id);
+    if (!alreadyAnchored) {
+      let target = canvas.source_message_id
+        ? messages.find(
+            (m) =>
+              m.id === canvas.source_message_id &&
+              (m.role || '').toUpperCase() === 'ASSISTANT',
+          )
+        : undefined;
+
+      if (!target && canvas.source_run_id) {
+        target = messages
+          .slice()
+          .reverse()
+          .find(
+            (m) =>
+              m.run_id === canvas.source_run_id &&
+              (m.role || '').toUpperCase() === 'ASSISTANT' &&
+              !m.canvas_id &&
+              !claimedMessageIds.has(m.id),
+          );
+      }
+
+      if (target && !claimedMessageIds.has(target.id)) {
+        store.setMessageCanvasId(sessionId, target.id, canvas.id);
+        claimedMessageIds.add(target.id);
+      }
+    }
+
+    // List items are summaries without blocks; warm the full document cache so
+    // CanvasMessageCard can render immediately after the recovered anchor lands.
+    if (!useCanvasStore.getState().canvasesById[canvas.id]) {
+      void useCanvasStore.getState().fetchCanvas(canvas.id).catch(() => {});
+    }
+  }
+}
 
 /**
  * Dispatch a single SSE event through the handler registry.
@@ -868,6 +939,16 @@ export function useChat() {
         // addMessage handles dedup; we add in order so sequence is preserved.
         for (const m of page.items) {
           store.addMessage(sid, m);
+        }
+        // A canvas can be committed before its assistant message exists.  The
+        // normal server backfill now retries, but list + recover also repairs
+        // sessions created before that fix.
+        try {
+          await recoverSessionCanvasAnchors(sid);
+        } catch (err) {
+          if (!(err instanceof ApiError) || err.status !== 401) {
+            console.warn('recover canvas anchors failed', err);
+          }
         }
       } catch (err) {
         if (!(err instanceof ApiError) || err.status !== 401) {

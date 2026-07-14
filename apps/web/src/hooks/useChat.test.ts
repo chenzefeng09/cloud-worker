@@ -13,6 +13,7 @@ import {
   parseSSEStream,
   subscribeSessionStream,
   applyPendingInteractions,
+  recoverSessionCanvasAnchors,
   shouldWatchdogFire,
 } from './useChat';
 import type { ToolCallEntry, PendingInteractionItem, Message } from '../api/types';
@@ -31,6 +32,10 @@ vi.mock('../api/client', async (importOriginal) => {
       ...actual.api,
       messages: {
         ...actual.api.messages,
+        list: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
+      },
+      canvas: {
+        ...actual.api.canvas,
         list: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
       },
     },
@@ -1028,6 +1033,7 @@ describe('canvas_created SSE handler', () => {
   // store action key) so the handler's cache-warm never hits the network, while
   // still asserting the call.
   const fetchCanvasSpy = vi.fn().mockResolvedValue(null);
+  const canvasListMock = api.canvas.list as unknown as ReturnType<typeof vi.fn>;
   let realFetchCanvas: ReturnType<typeof useCanvasStore.getState>['fetchCanvas'];
 
   beforeEach(() => {
@@ -1045,6 +1051,8 @@ describe('canvas_created SSE handler', () => {
       acknowledgedPendingInteractions: {},
     });
     fetchCanvasSpy.mockClear();
+    canvasListMock.mockReset();
+    canvasListMock.mockResolvedValue({ items: [], next_cursor: null });
     realFetchCanvas = useCanvasStore.getState().fetchCanvas;
     useCanvasStore.setState({ fetchCanvas: fetchCanvasSpy });
   });
@@ -1102,6 +1110,52 @@ describe('canvas_created SSE handler', () => {
 
     const msgs = useChatStore.getState().messages['ses_cv'];
     expect(msgs.find((m) => m.id === streamId)?.canvas_id).toBe('cvs_3');
+  });
+
+  it('keeps the canvas when the durable assistant row replaces its streaming block', () => {
+    dispatchSSE('ses_cv', 'token', { run_id: 'run_1', delta: 'writing…' });
+    dispatchSSE('ses_cv', 'canvas_created', {
+      canvas_id: 'cvs_race',
+      run_id: 'run_1',
+    });
+
+    // This is the production race: the DB row lands without canvas_id after
+    // the live event already attached it to the transient streaming block.
+    dispatchSSE('ses_cv', 'message', assistantMsg({
+      id: 'msg_durable',
+      canvas_id: null,
+    }) as unknown as Record<string, unknown>);
+
+    const msgs = useChatStore.getState().messages['ses_cv'];
+    expect(msgs.find((m) => m.id === 'msg_durable')?.canvas_id).toBe('cvs_race');
+    expect(msgs.some((m) => m.id.startsWith('stream_run_1'))).toBe(false);
+  });
+
+  it('recovers an older orphaned canvas from the session canvas list', async () => {
+    useChatStore.getState().addMessage(
+      'ses_cv',
+      assistantMsg({ id: 'msg_orphan', canvas_id: null, run_id: 'run_1' }),
+    );
+    canvasListMock.mockResolvedValue({
+      items: [{
+        id: 'cvs_orphan',
+        session_id: 'ses_cv',
+        kind: 'article',
+        title: 'Recovered',
+        current_version: 1,
+        source_message_id: null,
+        source_run_id: 'run_1',
+        created_at: '2026-01-01',
+        updated_at: '2026-01-01',
+      }],
+      next_cursor: null,
+    });
+
+    await recoverSessionCanvasAnchors('ses_cv');
+
+    const recovered = useChatStore.getState().messages['ses_cv'][0];
+    expect(recovered.canvas_id).toBe('cvs_orphan');
+    expect(fetchCanvasSpy).toHaveBeenCalledWith('cvs_orphan');
   });
 
   it('does NOT anchor to a tool or thinking block (only assistant text)', () => {
