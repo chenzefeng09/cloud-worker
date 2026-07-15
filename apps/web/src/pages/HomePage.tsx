@@ -6,11 +6,12 @@ import { formatDate } from '../i18n/dates';
 import { useWorkspace } from '../lib/workspaceContext';
 import { useSessions } from '../hooks/useSessions';
 import { api } from '../api/client';
-import type { Attachment, Session } from '../api/types';
+import type { Attachment, ExecutionMode, Session } from '../api/types';
 import { formatRelativeTimeZh } from '../lib/format';
 import { StatusDot, sessionToDesignStatus } from '../components/shell/StatusDot';
 import { Chip } from '../components/shell/Chip';
 import { Dropdown } from '../components/shell/Dropdown';
+import { ModeToggle } from '../components/InputBar';
 import { useChatStore } from '../stores/chatStore';
 import { useApps } from '../hooks/useApps';
 import { CreateAppModal } from '../components/app/CreateAppModal';
@@ -53,6 +54,7 @@ export function HomePage() {
   const { modelId: defaultModelId, isLoading: defaultModelLoading } = useDefaultModel('llm');
   const [model, setModelRaw] = useState<string>(SYSTEM_FALLBACK_MODEL);
   const [effort, setEffort] = useState<string>(DEFAULT_EFFORT);
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>('inline');
   // Track whether the user has manually picked a model in the composer.
   // If so, don't overwrite it when the hook resolves later.
   const userModelChosen = useRef(false);
@@ -69,6 +71,7 @@ export function HomePage() {
   }, [defaultModelLoading, defaultModelId]);
   const setSessionModel = useChatStore((s) => s.setSessionModel);
   const setSessionEffort = useChatStore((s) => s.setSessionEffort);
+  const setSessionExecutionMode = useChatStore((s) => s.setSessionExecutionMode);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   // Attachments require a session_id (NOT NULL FK), so the session must exist
@@ -87,7 +90,10 @@ export function HomePage() {
   const ensureSession = async (): Promise<Session | null> => {
     if (sessionRef.current) return sessionRef.current;
     const session = await createSession(draft.trim() || undefined);
-    if (session) sessionRef.current = session;
+    if (session) {
+      sessionRef.current = session;
+      setSessionExecutionMode(session.id, executionMode);
+    }
     return session ?? null;
   };
 
@@ -140,6 +146,7 @@ export function HomePage() {
         // useChat picks them up at send time (same store the chat page reads).
         setSessionModel(session.id, model);
         setSessionEffort(session.id, effort);
+        setSessionExecutionMode(session.id, executionMode);
         // Pass the first user message and any pre-uploaded attachments through
         // router state so AgentPage can dispatch them once the chat store is
         // bound to the new session.  Without this the draft was being thrown
@@ -271,6 +278,8 @@ export function HomePage() {
                 <span className="font-mono">⊕</span> 文件
               </button>
               <div className="flex-1" />
+              <ModeToggle value={executionMode} onChange={setExecutionMode} disabled={submitting || uploading} />
+              <span className="text-line-2 text-[10px] select-none">·</span>
               <Dropdown
                 value={model}
                 options={MODEL_OPTIONS}

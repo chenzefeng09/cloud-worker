@@ -161,6 +161,7 @@ services:
       dockerfile: Dockerfile
       additional_contexts:
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+        feature_flag_client: ../../libs/feature-flag-client
       args:
         PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
     image: agent-platform-dev-skill-store
@@ -273,6 +274,10 @@ services:
       SESSION_ORCHESTRATOR_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_change_me_min_12_chars}
       # Memory: knowledge-ingest URL for memory pre-fetch + write-back.
       SESSION_ORCHESTRATOR_KNOWLEDGE_INGEST_URL: http://knowledge-ingest:8012/api/knowledge/v1
+      # Default skills: when a sandbox run omits the skills key, resolve this
+      # user's installed skills whose enabled_by_default flag is true.
+      SESSION_ORCHESTRATOR_SKILL_STORE_URL: ${SKILL_STORE_URL:-http://skill-store:8011/api/skills/v1}
+      SESSION_ORCHESTRATOR_SKILL_STORE_SERVICE_SCOPES: ${SESSION_ORCHESTRATOR_SKILL_STORE_SERVICE_SCOPES:-skill.read_internal}
       SESSION_ORCHESTRATOR_AUTHZ_URL: http://authz:8002/api/authz/v1
       SESSION_ORCHESTRATOR_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
       SESSION_ORCHESTRATOR_FEATURE_FLAG_URL: http://feature-flag:8012/api/feature-flag/v1

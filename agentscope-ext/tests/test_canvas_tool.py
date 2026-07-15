@@ -118,6 +118,52 @@ class TestCreateCanvasTool:
         assert mirror[0]["title"] == "Resilient"
 
 
+class TestCreateCanvasToolSchema:
+    """The description/schema the LLM sees must force prose creation through
+    this tool (deepseek only calls tools under strong wording)."""
+
+    def test_description_carries_forcing_language(self):
+        from agentscope_ext.canvas_tool.tool import CreateCanvasTool
+
+        desc = CreateCanvasTool.description
+        # Mandatory-for-all-prose framing.
+        assert "REQUIRED" in desc
+        assert "MUST" in desc
+        assert "FIRST" in desc
+        # Full body goes into the tool, not the reply.
+        assert "content_markdown" in desc
+        assert "FULL" in desc
+        # One-sentence reply / no-repeat contract.
+        assert "ONE short" in desc
+        # Titled / book-title assignments are explicitly covered.
+        assert "《书名号》" in desc
+
+    def test_schema_field_descriptions_are_clear(self):
+        from agentscope_ext.canvas_tool.tool import CreateCanvasTool
+
+        props = CreateCanvasTool.input_schema["properties"]
+        # kind enum semantics stay intact.
+        assert props["kind"]["enum"] == [
+            "article",
+            "brief",
+            "email",
+            "report",
+            "proposal",
+            "social_post",
+            "code_note",
+        ]
+        # title description tells the model to extract from the assignment/《》.
+        assert "《书名号》" in props["title"]["description"]
+        # content_markdown must be the COMPLETE finished piece, not a summary.
+        assert "COMPLETE" in props["content_markdown"]["description"]
+        assert "not a summary" in props["content_markdown"]["description"]
+        # Required fields unchanged.
+        assert CreateCanvasTool.input_schema["required"] == [
+            "title",
+            "content_markdown",
+        ]
+
+
 # ---------------------------------------------------------------------------
 # install() / hook-wrapping tests
 # ---------------------------------------------------------------------------

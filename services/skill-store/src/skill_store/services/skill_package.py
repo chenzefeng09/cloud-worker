@@ -27,12 +27,19 @@ from __future__ import annotations
 
 import hashlib
 import io
+import posixpath
 import tarfile
 from dataclasses import dataclass
 
 import yaml
 
-from skill_store.errors import SkillPackageInvalidError
+from skill_store.errors import (
+    SkillFileNotFoundError,
+    SkillFileNotTextError,
+    SkillFilePathInvalidError,
+    SkillFileTooLargeError,
+    SkillPackageInvalidError,
+)
 
 # --- Anti-bomb / DoS thresholds -------------------------------------------
 # These are the authoritative limits enforced at the storage boundary.  Block 2
@@ -45,9 +52,11 @@ MAX_MEMBER_SIZE = 5 * 1024 * 1024      # 5 MiB — largest single decompressed m
 MAX_TOTAL_SIZE = 50 * 1024 * 1024      # 50 MiB — largest total decompressed size
 # Frontmatter description goes into every sandbox's system prompt verbatim as a
 # one-line skill index entry.  Bound it so a single user can't blow up the
-# context budget for everyone — Claude skill convention is "one sentence",
-# 200 chars (~150 tokens of Chinese) is generous.
-MAX_DESCRIPTION_LEN = 200
+# context budget for everyone.  Align with the schema/column: the DB column
+# skill_store.skills.description is varchar(2000) and SkillCreate.description's
+# pydantic max_length is also 2000, so 2000 is the real ceiling — anything
+# larger 500s on DB write.  (The old 200 was an isolated, over-tight limit.)
+MAX_DESCRIPTION_LEN = 2000
 
 # Name of the required metadata file (Claude skill convention).
 SKILL_MD_FILENAME = "SKILL.md"
@@ -248,7 +257,113 @@ def _parse_frontmatter(text: str) -> tuple[str, str]:
     description_clean = description.strip()
     if len(description_clean) > MAX_DESCRIPTION_LEN:
         raise SkillPackageInvalidError(
-            f"SKILL.md frontmatter description 过长，最多 {MAX_DESCRIPTION_LEN} 字符（当前 {len(description_clean)}）",
+            "SKILL.md frontmatter description 过长，"
+            f"最多 {MAX_DESCRIPTION_LEN} 字符（当前 {len(description_clean)}）",
         )
 
     return name.strip(), description_clean
+
+
+@dataclass(frozen=True)
+class ExtractedFile:
+    """A single member extracted from a skill package for in-process reading.
+
+    ``path`` is the caller-facing relative path (relative to the skill root, i.e.
+    the directory containing SKILL.md), normalised.  ``content`` is the decoded
+    UTF-8 text of the member.
+    """
+
+    path: str
+    content: str
+
+
+def _skill_root_prefix(skill_md_path: str) -> str:
+    """Archive-relative prefix of the skill root (dir containing SKILL.md).
+
+    Root layout (``SKILL.md``) → ``""``; single-subdir layout
+    (``<dir>/SKILL.md``) → ``"<dir>/"``.
+    """
+    parts = skill_md_path.split("/")
+    if len(parts) <= 1:
+        return ""
+    return "/".join(parts[:-1]) + "/"
+
+
+def _validate_request_path(path: str) -> str:
+    """Reject absolute / traversal ``path`` and return a normalised relative path.
+
+    Raises :class:`SkillFilePathInvalidError` (HTTP 400) on an absolute path or
+    any ``..`` segment.  Returns the POSIX-normalised relative path (``\\`` folded
+    to ``/``), which callers join against the skill root.
+    """
+    candidate = path.replace("\\", "/")
+    if candidate.startswith("/"):
+        raise SkillFilePathInvalidError(path)
+    segments = candidate.split("/")
+    if ".." in segments:
+        raise SkillFilePathInvalidError(path)
+    normalised = posixpath.normpath(candidate)
+    # normpath can still surface a leading ``..`` (e.g. "a/../../b") — reject.
+    if normalised.startswith("/") or normalised == ".." or normalised.startswith("../"):
+        raise SkillFilePathInvalidError(path)
+    if normalised == ".":
+        raise SkillFilePathInvalidError(path)
+    return normalised
+
+
+def read_member(tarball: bytes, skill_md_path: str, path: str) -> ExtractedFile:
+    """Extract a single member from a validated skill package as UTF-8 text.
+
+    ``skill_md_path`` is the archive-relative path of the package's SKILL.md (as
+    persisted in the server-authoritative manifest); ``path`` is resolved
+    *relative to the skill root* (the directory containing SKILL.md), so
+    ``path="SKILL.md"`` hits the package's SKILL.md under both a root layout and a
+    single-subdirectory layout, and ``path="references/notes.md"`` resolves to
+    ``<skill root>/references/notes.md``.
+
+    Reuses the same tar safety posture as :func:`validate_and_parse`: opens in
+    ``mode="r:gz"`` from an in-memory buffer, only regular-file members are
+    served, and the per-member size cap is enforced.
+
+    Raises:
+        SkillFilePathInvalidError (400): ``path`` is absolute or contains ``..``.
+        SkillFileNotFoundError (404): no regular-file member at the resolved path.
+        SkillFileTooLargeError (413): the member exceeds ``MAX_MEMBER_SIZE``.
+        SkillFileNotTextError (415): the member body is not valid UTF-8.
+        SkillPackageInvalidError (400): the stored bytes are not a gzip tar.
+    """
+    normalised = _validate_request_path(path)
+    prefix = _skill_root_prefix(skill_md_path)
+    member_name = f"{prefix}{normalised}"
+
+    try:
+        tar = tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz")  # noqa: SIM115 — closed via `with tar`
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        raise SkillPackageInvalidError(
+            "无效的压缩包，必须是 gzip 压缩的 tar",
+        ) from exc
+
+    with tar:
+        try:
+            member = tar.getmember(member_name)
+        except KeyError as exc:
+            raise SkillFileNotFoundError(normalised) from exc
+
+        # Only regular files are servable — directories, symlinks, hardlinks and
+        # device nodes are never a fetchable "file".
+        if not member.isfile():
+            raise SkillFileNotFoundError(normalised)
+        if member.size > MAX_MEMBER_SIZE:
+            raise SkillFileTooLargeError(normalised)
+
+        extracted = tar.extractfile(member)
+        if extracted is None:  # pragma: no cover — isfile() guaranteed above
+            raise SkillFileNotFoundError(normalised)
+        raw = extracted.read()
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise SkillFileNotTextError(normalised) from exc
+
+    return ExtractedFile(path=normalised, content=text)

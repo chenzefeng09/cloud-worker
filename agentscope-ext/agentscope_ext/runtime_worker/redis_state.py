@@ -804,7 +804,32 @@ def from_env() -> RunStateClient:
     when either is unset — callers need not check.  In broker egress mode
     (``REDIS_URL`` blank, ``TOOL_BROKER_URL`` set) the client routes hot-state
     operations through the tool-broker ``/state/v1`` façade instead.
+
+    WARNING: the runtime worker scrubs control-plane secrets (REDIS_URL,
+    broker lease, …) out of ``os.environ`` before tool execution
+    (``_scrub_process_env_for_tools``), so calling this *after* worker boot
+    yields a silent no-op client.  Late consumers (e.g. the canvas tool built
+    inside ``build_toolkit``) must use :func:`get_shared_client` instead,
+    which returns the client the worker built before the scrub.
     """
     run_id = os.environ.get("RUN_ID", "")
     redis_url = os.environ.get("REDIS_URL", "")
     return RunStateClient(run_id=run_id, redis_url=redis_url or None)
+
+
+# ---------------------------------------------------------------------------
+# Shared per-run client (set once by the runtime worker before env scrub)
+# ---------------------------------------------------------------------------
+
+_SHARED_CLIENT: RunStateClient | None = None
+
+
+def set_shared_client(client: RunStateClient) -> None:
+    """Register the worker's run-scoped client for late consumers."""
+    global _SHARED_CLIENT
+    _SHARED_CLIENT = client
+
+
+def get_shared_client() -> RunStateClient | None:
+    """Return the client registered by the runtime worker, if any."""
+    return _SHARED_CLIENT

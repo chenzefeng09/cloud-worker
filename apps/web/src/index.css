@@ -435,6 +435,95 @@ body {
   margin-bottom: 0;
 }
 
+/* Character-scoped canvas v2 magic-edit.  The accepted document is rendered
+   around paired orig/sugg blocks; only Accept commits the full-block snapshot. */
+.canvas-magic-edit {
+  position: relative;
+  min-height: 360px;
+}
+
+.canvas-magic-edit-head {
+  position: sticky;
+  top: 8px;
+  z-index: 3;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 9px 10px;
+  border: 1px solid rgba(44, 95, 138, 0.2);
+  border-radius: 9px;
+  background: rgba(255, 253, 247, 0.96);
+  box-shadow: 0 8px 22px rgba(21, 23, 26, 0.08);
+}
+
+.canvas-magic-edit-document {
+  user-select: text;
+}
+
+.canvas-magic-edit-segment {
+  margin: 8px 0 18px;
+}
+
+.canvas-magic-edit-context > :first-child {
+  margin-top: 0;
+}
+
+.canvas-magic-edit-context > :last-child {
+  margin-bottom: 8px;
+}
+
+.canvas-magic-edit-orig,
+.canvas-magic-edit-sugg {
+  position: relative;
+  margin: 6px 0;
+  padding: 9px 11px 9px 30px;
+  border-radius: 7px;
+  white-space: pre-wrap;
+}
+
+.canvas-magic-edit-orig::before,
+.canvas-magic-edit-sugg::before {
+  position: absolute;
+  left: 10px;
+  top: 9px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.canvas-magic-edit-orig {
+  border-left: 2px solid rgba(210, 58, 31, 0.5);
+  background: rgba(210, 58, 31, 0.055);
+  color: var(--dim);
+  text-decoration: line-through;
+}
+
+.canvas-magic-edit-orig::before {
+  content: '−';
+  color: #b6452f;
+}
+
+.canvas-magic-edit-sugg {
+  border-left: 2px solid rgba(45, 108, 223, 0.56);
+  background: rgba(45, 108, 223, 0.075);
+  color: #1f5db8;
+}
+
+.canvas-magic-edit-sugg::before {
+  content: '+';
+  color: #2d6cdf;
+}
+
+.canvas-magic-edit-sugg > :first-child {
+  margin-top: 0;
+}
+
+.canvas-magic-edit-sugg > :last-child {
+  margin-bottom: 0;
+}
+
 /* ── SuggestionDiffView (canvas v2 per-block orig/sugg review) ────────────── */
 .canvas-suggestion-diff {
   position: relative;

@@ -18,9 +18,11 @@ from skill_store.api.dependencies import (
 from skill_store.blob.base import BlobStore, make_key
 from skill_store.schemas.common import ListPage
 from skill_store.schemas.skill import (
+    DefaultInstalledSkillOut,
     InstalledSkillOut,
     ResolvedSkillOut,
     SkillCreate,
+    SkillFileOut,
     SkillInstallRequest,
     SkillOut,
     SkillVersionOut,
@@ -330,9 +332,80 @@ async def internal_resolve(
     )
     items = [
         ResolvedSkillOut(
-            name=r.name, version=r.version, sha256=r.sha256, blob_url=r.blob_url,
+            name=r.name,
+            version=r.version,
+            sha256=r.sha256,
+            blob_url=r.blob_url,
+            description=r.description,
         ).model_dump(mode="json")
         for r in resolved
+    ]
+    return ListPage(items=items, total=len(items))
+
+
+@router.get(
+    "/internal/skills/{name}/file",
+    response_model=SkillFileOut,
+    dependencies=[TInternalAuth],
+)
+async def internal_read_skill_file(
+    name: str,
+    tenant_id: str,
+    user_id: str,
+    path: str = "SKILL.md",
+    db: AsyncSession = Depends(internal_db_session),
+    blob: BlobStore = TBlobStore,
+) -> SkillFileOut:
+    """Read a single member of an installed skill's package as UTF-8 text.
+
+    The session-orchestrator's inline mode calls this to pull a skill's
+    ``SKILL.md`` body — or a ``references/`` file — into the process on demand,
+    without downloading and unpacking the whole tarball.  Version resolution is
+    identical to ``/internal/skills/resolve`` (same skill name → same version).
+
+    ``path`` (default ``SKILL.md``) is resolved relative to the skill root (the
+    directory containing SKILL.md).  Absolute paths or ``..`` segments are
+    rejected (400); a missing member is 404; an oversized member is 413; a
+    non-UTF-8 member is 415; an uninstalled / version-less skill is 404.
+    """
+    svc = SkillService(db, blob=blob, tenant_id=tenant_id, user_id=user_id)
+    sv, extracted = await svc.read_skill_file(tenant_id, user_id, name, path)
+    return SkillFileOut(
+        name=name,
+        version=sv.version,
+        sha256=sv.sha256,
+        path=extracted.path,
+        content=extracted.content,
+    )
+
+
+@router.get(
+    "/internal/skills/default-installed",
+    response_model=ListPage,
+    dependencies=[TInternalAuth],
+)
+async def internal_default_installed(
+    tenant_id: str,
+    user_id: str,
+    db: AsyncSession = Depends(internal_db_session),
+    blob: BlobStore = TBlobStore,
+) -> ListPage:
+    """List the user's default-enabled installed skills (names only).
+
+    The orchestrator calls this when a run request does not explicitly name any
+    skills: it takes the user's ``enabled_by_default`` installed skills as the
+    default skill set to auto-inject into the run.  Skills the user installed
+    with ``enabled_by_default=False`` are opt-in per run and are excluded here.
+
+    The response is a ``ListPage`` of ``DefaultInstalledSkillOut`` (``{"name": ...}``)
+    so it shares the wire shape with the other ``/internal/*`` listings.
+    """
+    svc = SkillService(db, blob=blob, tenant_id=tenant_id, user_id=user_id)
+    pairs = await svc.list_installed()
+    items = [
+        DefaultInstalledSkillOut(name=skill.name).model_dump(mode="json")
+        for skill, install in pairs
+        if install.enabled_by_default
     ]
     return ListPage(items=items, total=len(items))
 

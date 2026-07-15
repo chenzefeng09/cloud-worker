@@ -31,7 +31,10 @@ from agent_bff.api.v1.canvas_v2 import (
     ModelOutputError,
     build_diffs,
     build_scoped_edit_prompt,
+    build_selection_diffs,
+    build_selection_edit_prompt,
     parse_and_validate_output,
+    parse_selection_output,
 )
 
 PREFIX = "/api/bff/v1"
@@ -237,6 +240,25 @@ def _body(**over: Any) -> dict:
     return base
 
 
+def _selection_body(**over: Any) -> dict:
+    base = _body(
+        instruction="把选中的两个字改得更专业",
+        scope={
+            "type": "selection",
+            "segments": [
+                {
+                    "block_id": "blk_00000002",
+                    "start": 3,
+                    "end": 5,
+                    "text": "原文",
+                }
+            ],
+        },
+    )
+    base.update(over)
+    return base
+
+
 # ---------------------------------------------------------------------------
 # Auth guard
 # ---------------------------------------------------------------------------
@@ -308,6 +330,68 @@ def test_canvas_v2_happy_blocks(
 
     # no runs / messages touched.
     assert not any("/runs" in u or "/messages" in u for _, u, _ in fake.calls)
+
+
+def test_canvas_v2_happy_character_selection(
+    client: TestClient, authed_cookie: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeBackends(
+        completion_contents=[
+            json.dumps(
+                {
+                    "replacements": [
+                        {"block_id": "blk_00000002", "new_text": "专业表述"}
+                    ],
+                    "change_summary": "局部改写两个字",
+                },
+                ensure_ascii=False,
+            )
+        ]
+    )
+    _patch(fake, monkeypatch)
+
+    resp = client.post(_url(), cookies=authed_cookie, json=_selection_body())
+    assert resp.status_code == 200, resp.json()
+
+    prompt = fake.last_completion_payload["messages"][0]["content"]
+    assert '"selected_text": "原文"' in prompt
+    assert "不要返回完整段落或完整文档" in prompt
+
+    diff = fake.last_suggestion_body["diffs"][0]
+    assert diff["orig"] == "第一段原文内容。"
+    assert diff["sugg"] == "第一段专业表述内容。"
+    assert diff["selection_start"] == 3
+    assert diff["selection_end"] == 5
+    assert diff["selected_orig"] == "原文"
+    assert diff["selected_sugg"] == "专业表述"
+
+
+def test_canvas_v2_rejects_stale_selected_text_before_model_call(
+    client: TestClient, authed_cookie: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeBackends()
+    _patch(fake, monkeypatch)
+
+    resp = client.post(
+        _url(),
+        cookies=authed_cookie,
+        json=_selection_body(
+            scope={
+                "type": "selection",
+                "segments": [
+                    {
+                        "block_id": "blk_00000002",
+                        "start": 3,
+                        "end": 5,
+                        "text": "旧文",
+                    }
+                ],
+            }
+        ),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["detail"]["code"] == "AGENT.BFF.CANVAS.SELECTION_STALE"
+    assert not any("/chat/completions" in url for _, url, _ in fake.calls)
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +632,43 @@ def test_build_diffs_backfills_orig() -> None:
         "orig": None,
         "sugg": "插入内容",
     }
+
+
+def test_selection_helpers_splice_only_the_verified_range() -> None:
+    blocks = [{"id": "b1", "text": "前缀原文后缀"}]
+    segments = [{"block_id": "b1", "start": 2, "end": 4, "text": "原文"}]
+    replacements, summary = parse_selection_output(
+        json.dumps(
+            {
+                "replacements": [{"block_id": "b1", "new_text": "新句"}],
+                "change_summary": "局部替换",
+            },
+            ensure_ascii=False,
+        ),
+        target_ids=["b1"],
+    )
+    diffs = build_selection_diffs(
+        replacements=replacements, segments=segments, blocks=blocks
+    )
+    assert summary == "局部替换"
+    assert diffs == [
+        {
+            "block_id": "b1",
+            "op": "replace",
+            "orig": "前缀原文后缀",
+            "sugg": "前缀新句后缀",
+            "selection_start": 2,
+            "selection_end": 4,
+            "selected_orig": "原文",
+            "selected_sugg": "新句",
+        }
+    ]
+
+    prompt = build_selection_edit_prompt(
+        instruction="改写", blocks=blocks, segments=segments
+    )
+    assert '"before_context": "前缀"' in prompt
+    assert '"after_context": "后缀"' in prompt
 
 
 # ---------------------------------------------------------------------------

@@ -9,8 +9,10 @@
  * the normal chat flow.
  *
  * This module owns ONLY the `update_canvas` vs `chat` decision. Creation
- * (`create_canvas`) intent detection lives in `inferCanvasAuthoringIntent`
- * (canvasObjects.ts) and is intentionally out of scope here.
+ * (`create_canvas`) is now driven entirely by the model (Phase B): the
+ * worker's `create_canvas` tool triggers materialization and the SPA renders
+ * the card off the assistant message's `canvas_id`. The old send-time
+ * create-intent regex has been retired, so no create detection lives here.
  *
  * Predicate philosophy: **从窄** (narrow). The bias is to under-capture —
  * a missed update just falls through to normal chat (fail-open, the user

@@ -62,9 +62,42 @@ import httpx
 
 from agent_session_orchestrator.config import Settings
 from agent_session_orchestrator.domain.db import get_session as acquire_db_session
+from agent_session_orchestrator.services import inline_skill_loader
+from agent_session_orchestrator.services.canvas_tool_spec import (
+    CANVAS_FORCING_PROMPT,
+    CREATE_CANVAS_TOOL,
+    CREATE_CANVAS_TOOL_NAME,
+    canvas_confirmation_reply,
+    extract_creation_title,
+    is_written_creation_prompt,
+)
 from agent_session_orchestrator.services.session_service import SessionService
+from agent_session_orchestrator.services.skill_tool_spec import (
+    READ_SKILL_TOOL,
+    READ_SKILL_TOOL_NAME,
+    build_skills_catalog_prompt,
+)
 
 logger = logging.getLogger(__name__)
+
+# Maximum tool-calling rounds for an inline run.  Round 1 lets the model call a
+# tool (``create_canvas`` and/or ``read_skill``); subsequent rounds let it read
+# more skill files, then emit its final reply after the tool results are fed back.
+# Raised from 2 to 6 to accommodate multi-file skill reading (each read_skill is a
+# round) while still bounding a misbehaving model.  The canvas semantics are
+# unchanged by the higher cap: ``tool_choice`` is only ever forced on round 1 and
+# the single-canvas-per-run guard no-ops any repeat create_canvas call.
+_INLINE_MAX_TOOL_ROUNDS = 6
+
+# Rescue threshold (chars) for the deterministic canvas fallback: when a forced
+# written-creation run finishes WITHOUT a canvas, ≥ this much accumulated body
+# text means the model wrote the whole piece into the chat reply (hijack form) and
+# that body is materialized as-is; below it the reply is a lie/stub ("已为你创作…"
+# with no real content) and a silent extra completion is issued to fetch the full
+# text.  Deliberately looser than the materialization guard's own 200-char/2-block
+# rule (``_CANVAS_MIN_CHARS``): this only PICKS the branch — ``materialize_one_canvas``
+# still applies the stricter guard and fail-opens if the text is too thin.
+_RESCUE_BODY_MIN_CHARS = 120
 
 # ── Module-level registry of in-flight inline run tasks ─────────────────────
 # Maps run_id → asyncio.Task so cancel_inline_run can stop a running task.
@@ -294,6 +327,7 @@ def build_openai_messages(
     memory: str,
     history: list[dict[str, Any]],
     task: str,
+    extra_system: str | None = None,
 ) -> list[dict[str, Any]]:
     """Assemble the OpenAI ``messages`` array for an inline completion.
 
@@ -301,12 +335,13 @@ def build_openai_messages(
     prompt), inline runs map the structured history directly onto native
     OpenAI roles so multi-turn context is first-class:
 
-    * an optional ``system`` message combining ``sys_prompt`` + ``memory``;
+    * an optional ``system`` message combining ``sys_prompt`` + ``memory`` +
+      ``extra_system`` (the canvas forcing block, when the tool is enabled);
     * one message per history item — ``user`` / ``assistant`` text turns and
-      ``tool`` turns flattened to a readable ``assistant`` note (there is no
-      tool execution on the inline path, so we surface prior tool activity as
-      context rather than as OpenAI ``tool`` role frames, which would require
-      matching ``tool_calls`` on a preceding assistant message);
+      ``tool`` turns flattened to a readable ``assistant`` note (prior tool
+      activity is surfaced as context rather than as OpenAI ``tool`` role frames,
+      which would require matching ``tool_calls`` on a preceding assistant
+      message; the live create_canvas tool loop appends its own native frames);
     * the current ``user`` task as the final message.
     """
     messages: list[dict[str, Any]] = []
@@ -316,6 +351,8 @@ def build_openai_messages(
         system_parts.append(sys_prompt.strip())
     if memory and memory.strip():
         system_parts.append("相关记忆（供参考）：\n" + memory.strip())
+    if extra_system and extra_system.strip():
+        system_parts.append(extra_system.strip())
     if system_parts:
         messages.append({"role": "system", "content": "\n\n".join(system_parts)})
 
@@ -378,8 +415,10 @@ async def _xadd(client: Any, run_id: str, entry: dict[str, Any]) -> None:
 async def _push_end(redis_url: str | None, run_id: str) -> None:
     """Push the authoritative ``end`` marker so the SSE tail terminates.
 
-    Used on the cancel / orphan paths where we don't already hold a Redis
-    handle.  Fail-open.
+    ``end`` is a promise that run.status is already terminal in the DB (the
+    post-stream reconcile relies on it to emit run_complete).  Used by the
+    normal executor path (after finalize commits), cancel and orphan paths —
+    all of which don't hold a Redis handle anymore.  Fail-open.
     """
     if not redis_url:
         return
@@ -398,6 +437,31 @@ async def _push_end(redis_url: str | None, run_id: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _assemble_tool_calls(fragments: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse accumulated ``delta.tool_calls`` fragments into OpenAI tool_calls.
+
+    OpenAI/DeepSeek stream a tool call across many chunks: the first fragment at a
+    given ``index`` carries ``id`` + ``function.name``, later fragments append to
+    ``function.arguments``.  ``fragments`` is the per-index accumulator; this
+    returns the completed ``[{id, type, function: {name, arguments}}]`` list
+    ordered by index (empty when the model made no tool call).
+    """
+    calls: list[dict[str, Any]] = []
+    for index in sorted(fragments):
+        frag = fragments[index]
+        name = str(frag.get("name") or "")
+        if not name:
+            continue
+        calls.append(
+            {
+                "id": str(frag.get("id") or f"call_{index}"),
+                "type": "function",
+                "function": {"name": name, "arguments": frag.get("arguments") or ""},
+            }
+        )
+    return calls
+
+
 async def _stream_completion_into_redis(
     *,
     client: httpx.AsyncClient,
@@ -412,14 +476,18 @@ async def _stream_completion_into_redis(
     messages: list[dict[str, Any]],
     sampling_params: dict[str, Any],
     reasoning_effort: str | None = None,
-) -> tuple[dict[str, int], str]:
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any | None = None,
+) -> tuple[dict[str, int], str, list[dict[str, Any]], str | None]:
     """POST a streaming chat completion and fan its SSE chunks into Redis.
 
-    Returns ``(usage, body_text)`` where ``usage`` is
+    Returns ``(usage, body_text, tool_calls, finish_reason)`` where ``usage`` is
     ``{input_tokens, output_tokens, total_tokens}`` (zeros when the gateway did
-    not surface usage) and ``body_text`` is the concatenated assistant content
-    (used for result_summary + memory write-back, so the finalizer never has to
-    re-read Redis).
+    not surface usage), ``body_text`` is the concatenated assistant content (used
+    for result_summary + memory write-back, so the finalizer never has to re-read
+    Redis), ``tool_calls`` is the assembled OpenAI tool-call list for this round
+    (empty when the model made none), and ``finish_reason`` is the terminal reason
+    from the last non-empty choice (``"tool_calls"`` when the model wants a tool).
 
     Wire handling mirrors the gateway's own streaming passthrough:
 
@@ -428,10 +496,16 @@ async def _stream_completion_into_redis(
       DeepSeek-style reasoning token → **accumulate** (never push per-token —
       historical bug fragmented thinking into N blocks) and flush a single
       ``thinking`` entry when reasoning ends (first body token or stream end);
+    * ``delta.tool_calls`` fragments are accumulated by index (never streamed to
+      Redis — the canvas result is surfaced as a synthesized ``canvas_created``
+      event by the caller, not as raw tool tokens);
     * a trailing frame with empty ``choices`` and populated ``usage`` carries
       the token totals;
     * ``data: [DONE]`` ends the stream; a ``{"error": {...}}`` frame raises so
       the caller marks the run FAILED (and never writes the error as a reply).
+
+    ``tools`` / ``tool_choice`` are sent verbatim when provided (OpenAI schema);
+    when ``None`` the request is a plain completion (backward-compatible).
     """
     headers = _mesh_headers(tenant_id, user_id)
     headers["X-LLM-Virtual-Key"] = virtual_key
@@ -455,6 +529,14 @@ async def _stream_completion_into_redis(
         if key in sampling_params and sampling_params[key] is not None:
             payload[key] = sampling_params[key]
 
+    # Tools (OpenAI function schema) + optional tool_choice.  Only sent when the
+    # caller advertises tools (canvas enabled); a plain turn omits both fields so
+    # the request is byte-identical to the pre-canvas behaviour.
+    if tools:
+        payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+
     # reasoning_effort: original passthrough, no clamp; None omits the field.
     # NB: the current dev llm-gateway parses the request into a typed
     # ChatCompletionRequest (extra="ignore", no reasoning_effort field) and
@@ -469,13 +551,20 @@ async def _stream_completion_into_redis(
     reasoning_buf: list[str] = []
     body_buf: list[str] = []
     thinking_flushed = False
+    tool_fragments: dict[int, dict[str, Any]] = {}
+    finish_reason: str | None = None
+    # Count of delta/thinking entries already XADDed to the token stream.  Carried
+    # on InlineGatewayError so the caller knows whether a retry is safe (0 ⇒ the
+    # frontend saw nothing from this round yet).
+    streamed_entries = 0
 
     async def _flush_thinking() -> None:
-        nonlocal thinking_flushed
+        nonlocal streamed_entries, thinking_flushed
         if reasoning_buf and not thinking_flushed:
             text = "".join(reasoning_buf)
             if text:
                 await _xadd(redis_client, run_id, {"type": "thinking", "text": text})
+                streamed_entries += 1
             thinking_flushed = True
 
     url = f"{gateway_url.rstrip('/')}/chat/completions"
@@ -503,7 +592,10 @@ async def _stream_completion_into_redis(
             if isinstance(chunk, dict) and chunk.get("error"):
                 err = chunk["error"]
                 msg = err.get("message") if isinstance(err, dict) else str(err)
-                raise InlineGatewayError(f"gateway stream error: {msg}")
+                raise InlineGatewayError(
+                    f"gateway stream error: {msg}",
+                    streamed_entries=streamed_entries,
+                )
 
             u = chunk.get("usage") or {}
             if u:
@@ -521,11 +613,29 @@ async def _stream_completion_into_redis(
             choices = chunk.get("choices") or []
             if not choices:
                 continue
-            delta = choices[0].get("delta") or {}
+            choice0 = choices[0]
+            if choice0.get("finish_reason"):
+                finish_reason = str(choice0["finish_reason"])
+            delta = choice0.get("delta") or {}
 
             reasoning = delta.get("reasoning_content")
             if reasoning:
                 reasoning_buf.append(str(reasoning))
+
+            # Accumulate tool-call fragments by index (id/name arrive first, then
+            # arguments stream in over subsequent chunks).
+            for frag in delta.get("tool_calls") or []:
+                index = int(frag.get("index") or 0)
+                slot = tool_fragments.setdefault(
+                    index, {"id": None, "name": None, "arguments": ""}
+                )
+                if frag.get("id"):
+                    slot["id"] = str(frag["id"])
+                fn = frag.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] = str(fn["name"])
+                if fn.get("arguments"):
+                    slot["arguments"] += str(fn["arguments"])
 
             content = delta.get("content")
             if content:
@@ -534,6 +644,7 @@ async def _stream_completion_into_redis(
                 text = str(content)
                 body_buf.append(text)
                 await _xadd(redis_client, run_id, {"type": "delta", "text": text})
+                streamed_entries += 1
 
     # Stream ended without any body token after reasoning (rare) — flush now so
     # the reasoning block is not lost.
@@ -541,11 +652,570 @@ async def _stream_completion_into_redis(
 
     if usage["total_tokens"] == 0 and (usage["input_tokens"] or usage["output_tokens"]):
         usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
-    return usage, "".join(body_buf)
+    return usage, "".join(body_buf), _assemble_tool_calls(tool_fragments), finish_reason
 
 
 class InlineGatewayError(Exception):
-    """Raised when the gateway stream reports an error (HTTP >=400 or error frame)."""
+    """Raised when the gateway stream reports an error (HTTP >=400 or error frame).
+
+    ``streamed_entries`` counts the delta/thinking entries already written to the
+    run token stream before the error surfaced.  ``0`` means the failure happened
+    before anything reached the frontend, so a caller may safely retry the round
+    (e.g. the named-tool_choice downgrade in ``_run_completion_with_tools``);
+    anything greater means a retry would duplicate content the user already saw.
+    """
+
+    def __init__(self, message: str, *, streamed_entries: int = 0) -> None:
+        super().__init__(message)
+        self.streamed_entries = streamed_entries
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# In-process canvas materialization (model tool call → DB + SSE)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _parse_tool_arguments(raw: str) -> dict[str, Any]:
+    """Parse an OpenAI tool-call ``arguments`` JSON string, tolerant of junk."""
+    try:
+        parsed = json.loads(raw or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+async def _materialize_inline_canvas(
+    *,
+    settings: Settings,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    run_id: str,
+    redis_client: Any,
+    args: dict[str, Any],
+) -> bool:
+    """Materialize a canvas from an inline ``create_canvas`` tool call, in-process.
+
+    Unlike the sandbox path (which parks payloads in Redis hot-state for the SSE
+    poll to materialize), the inline path materializes directly: it acquires a
+    short tenant-bound DB session, creates the canvas via the shared
+    ``materialize_one_canvas`` helper (identical guard + create + message-backfill
+    semantics as the sandbox reconcile path) and — same shape as the sandbox path
+    — writes a ``canvas_created`` entry into the run token stream so ``stream_session``
+    relays it to the frontend unchanged.
+
+    The assistant message row does not exist yet at this point (it is persisted at
+    finalize from the replayed stream), so ``backfill_message_canvas_id`` finds no
+    target and the event carries only ``canvas_id`` + ``run_id`` — the frontend
+    renders the card from ``canvas_id`` and the finalizer re-runs the backfill once
+    the row exists.
+
+    Returns ``True`` when a canvas was created, ``False`` when the guard rejected
+    the payload or anything failed (fail-open: design invariant — a canvas failure
+    never fails the run; the reply text still flows through the normal path).
+    """
+    content_markdown = str(args.get("content_markdown") or "")
+    title = args.get("title")
+    kind = str(args.get("kind") or "article")
+
+    # ``get_session`` commits in its post-``yield`` teardown, so the loop body
+    # must run to completion — an early ``return``/``break`` abandons the
+    # generator and the ``session.begin()`` context rolls the transaction back
+    # instead of committing.  Buffer outcomes in locals and emit the SSE entry
+    # only after the loop (i.e. after the commit), same convention as the
+    # ``stream_session`` buffering in ``api/v1/messages.py``.
+    created = False
+    event_entry: dict[str, Any] | None = None
+    try:
+        # Local imports keep the canvas service + messages helpers off the hot
+        # import path for runs that never touch canvases.
+        from agent_session_orchestrator.api.v1.messages import (
+            materialize_one_canvas,  # noqa: PLC0415
+        )
+        from agent_session_orchestrator.services.canvas_service import (
+            CanvasService,  # noqa: PLC0415
+        )
+
+        async for db in acquire_db_session(
+            tenant_id=tenant_id, user_id=user_id or "SYSTEM", actor="USER"
+        ):
+            svc = SessionService(db, tenant_id=tenant_id)
+            runs = await svc.list_runs(session_id)
+            run = next((r for r in runs if r.id == run_id), None)
+            canvas_svc = CanvasService(db, tenant_id=tenant_id)
+            if run is None:
+                # The RUNNING row may not be visible yet in this fresh txn; a
+                # missed canvas is fail-open (the finalizer does not retry canvas
+                # creation, but the reply body is unaffected).
+                logger.info(
+                    "inline canvas: run row not visible yet, skipping",
+                    extra={"run_id": run_id},
+                )
+            elif await canvas_svc.count_canvases_for_run(run_id) > 0:
+                # Single-canvas-per-run cap (matches the sandbox over-trigger
+                # semantics for the inline path): if a canvas already exists for
+                # this run, a repeat tool call is a no-op — the model gets the
+                # same confirmation without a second document.
+                logger.info(
+                    "inline canvas: run already has a canvas, skipping duplicate",
+                    extra={"run_id": run_id},
+                )
+            else:
+                result = await materialize_one_canvas(
+                    canvas_svc=canvas_svc,
+                    run=run,
+                    user_id=user_id,
+                    kind=kind,
+                    title=str(title or "").strip() or None,
+                    content_markdown=content_markdown,
+                )
+                if result is not None:
+                    canvas_id, message_id = result
+                    # Buffered ``canvas`` token-stream entry so ``stream_session``
+                    # relays a ``canvas_created`` SSE — the exact event the sandbox
+                    # path yields, so the frontend is unchanged.  ``_stream_tokens``
+                    # translates this entry type (Redis coerces all values to
+                    # strings; ``message_id`` is omitted when None so the SSE
+                    # payload matches the sandbox shape).
+                    event_entry = {
+                        "type": "canvas",
+                        "canvas_id": canvas_id,
+                        "run_id": run_id,
+                    }
+                    if message_id is not None:
+                        event_entry["message_id"] = message_id
+                    created = True
+                # ``result is None`` = below the guard threshold — skipped
+                # (logged inside the helper).
+
+        if event_entry is not None:
+            # Past the loop the transaction is committed — the frontend never
+            # sees an event for a canvas that failed to persist.
+            await _xadd(redis_client, run_id, event_entry)
+            logger.info(
+                "inline canvas materialized from tool call",
+                extra={"run_id": run_id, "canvas_id": event_entry["canvas_id"]},
+            )
+    except Exception:  # noqa: BLE001 — fail-open: never fail the run on canvas error
+        logger.warning(
+            "inline canvas materialization failed (fail-open)",
+            extra={"run_id": run_id},
+            exc_info=True,
+        )
+        # ``created`` stays truthful: a post-commit relay failure still created
+        # the document (finalize re-anchors it; hydration renders it on reload).
+    return created
+
+
+async def _backfill_inline_run_canvases(
+    *, svc: SessionService, run: Any, tenant_id: str
+) -> None:
+    """Re-anchor the run's canvas(es) onto the now-persisted assistant message.
+
+    A canvas created mid-stream (``_materialize_inline_canvas``) could not anchor
+    its ``message.canvas_id`` because the assistant row is only persisted at
+    finalize.  Called right after the replay creates that row, this points the
+    assistant message at the canvas — the same up-front backfill the sandbox
+    ``_materialize_pending_canvases`` performs.  Idempotent (already-linked
+    messages are excluded by the service query) and fail-open.
+    """
+    try:
+        from agent_session_orchestrator.services.canvas_service import (
+            CanvasService,  # noqa: PLC0415
+        )
+
+        canvas_svc = CanvasService(svc._db, tenant_id=tenant_id)  # noqa: SLF001
+        for canvas in await canvas_svc.list_canvases_for_run(run.id):
+            await canvas_svc.backfill_message_canvas_id(
+                session_id=run.session_id, run_id=run.id, canvas_id=canvas.id
+            )
+    except Exception:  # noqa: BLE001 — fail-open: never fail finalize on backfill
+        logger.warning(
+            "inline canvas backfill failed (fail-open)",
+            extra={"run_id": run.id},
+            exc_info=True,
+        )
+
+
+async def _canvas_enabled_for_tenant(tenant_id: str) -> bool:
+    """Whether the ``enable_canvas_tool`` flag is on for ``tenant_id`` (inline).
+
+    Reads the same foundation feature-flag source of truth the sandbox path uses,
+    via the already-wired shared client.  Fail-OPEN to enabled: unlike the shared
+    client's default fail-closed ``is_enabled`` (and the scheduler's fail-open-to-
+    *no-canvas*), the inline path defaults canvas ON when the flag service is
+    unreachable or uninitialised — the tool is advertised opportunistically and a
+    model that never calls it costs nothing, so a flag outage should not silently
+    strip canvas from chat mode.  A tenant that has explicitly disabled the flag is
+    still respected (the client returns ``False`` for a present-but-off flag).
+    """
+    try:
+        from feature_flag_client import get_ff_client  # noqa: PLC0415
+
+        return await get_ff_client().is_enabled("enable_canvas_tool", tenant_id)
+    except RuntimeError:
+        # Client not initialised (e.g. a unit context) — default ON.
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "inline canvas flag check failed; defaulting canvas ON",
+            extra={"tenant_id": tenant_id},
+        )
+        return True
+
+
+def _last_user_task(messages: list[dict[str, Any]]) -> str:
+    """The content of the last ``user`` message — the original task the executor
+    appended before the tool loop mutated ``messages`` (used by the rescue for the
+    canvas title)."""
+    for item in reversed(messages):
+        if item.get("role") == "user":
+            return str(item.get("content") or "")
+    return ""
+
+
+async def _run_completion_with_tools(
+    *,
+    client: httpx.AsyncClient,
+    redis_client: Any,
+    settings: Settings,
+    gateway_url: str,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    run_id: str,
+    virtual_key: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    sampling_params: dict[str, Any],
+    reasoning_effort: str | None,
+    canvas_enabled: bool,
+    force_canvas_first_round: bool,
+    skills_catalog: list[dict[str, Any]] | None = None,
+    skill_store_url: str = "",
+    skill_service_scopes: str = "",
+) -> tuple[dict[str, int], str]:
+    """Drive up to ``_INLINE_MAX_TOOL_ROUNDS`` completion rounds, closing the tool loop.
+
+    Round semantics when canvas is enabled:
+
+    * Round 1 advertises ``tools=[create_canvas]``.  ``tool_choice`` is forced to
+      ``create_canvas`` when ``force_canvas_first_round`` (written-creation prompt
+      on a weak-instruction model), else ``auto``.  If the model returns a
+      ``create_canvas`` tool call, the canvas is materialized in-process (DB + a
+      ``canvas`` token-stream entry → ``canvas_created`` SSE), the assistant
+      tool_calls turn + a tool result are appended to ``messages``, and we loop.
+    * Round 2 drops ``tool_choice`` back to ``auto`` so the model writes its
+      one-sentence pointer reply.  The loop also stops early whenever the model
+      finishes with body text and no tool call (``finish_reason != "tool_calls"``).
+
+    Deterministic rescue: after the rounds, if this is a forced written-creation
+    prompt (``force_canvas_first_round``) that produced NO canvas, one of two
+    fallbacks runs so the user never faces a phantom canvas — either the streamed
+    body IS the article (materialize it verbatim) or a silent, non-streamed extra
+    completion fetches the full text and materializes that (see the rescue block).
+
+    Returns ``(usage, body_text)`` accumulated across the rounds.  ``usage`` is the
+    LAST metered request's totals — the last tool-loop round, OR the silent rescue
+    completion when the lie/stub branch fired (the gateway meters each request, and
+    the rescue fetch is the final request, so it overrides).  ``body_text`` is the
+    concatenation of every round's streamed body (the silent rescue text is NOT part
+    of it — it never reached the frontend and is only used to fill the canvas).
+    A single canvas per run is enforced by ``_materialize_inline_canvas`` (repeat
+    calls no-op), so at most one canvas is ever created regardless of round count.
+
+    Providers that reject a NAMED ``tool_choice`` (deepseek thinking mode) get one
+    same-round retry with ``tool_choice="auto"`` — but only while nothing from the
+    round has streamed to the frontend (``InlineGatewayError.streamed_entries``).
+    """
+    # Assemble the advertised tools list.  ``create_canvas`` is gated on the
+    # canvas flag; ``read_skill`` is gated on a non-empty resolved skill catalog.
+    # Either, both, or neither may be present — with an empty list we send no
+    # ``tools`` at all (a plain completion, identical to the pre-skill behaviour).
+    catalog = skills_catalog or []
+    tool_list: list[dict[str, Any]] = []
+    if canvas_enabled:
+        tool_list.append(CREATE_CANVAS_TOOL)
+    if catalog:
+        tool_list.append(READ_SKILL_TOOL)
+    tools = tool_list or None
+
+    # ``name -> sha256`` for the catalog, so a read_skill call keys the loader's
+    # content-addressed cache off the resolved hash.
+    skill_sha_by_name: dict[str, str] = {
+        str(e.get("name") or ""): str(e.get("sha256") or "") for e in catalog
+    }
+
+    total_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    body_parts: list[str] = []
+    tool_choice_downgraded = False  # at most one named→auto downgrade per run
+    # Track whether ANY round actually materialized a canvas (the return value of
+    # ``_materialize_inline_canvas``, not a DB re-query).  Drives the post-loop
+    # rescue: a forced written-creation run that ends here with no canvas means the
+    # model neither called the tool nor honoured the forcing prompt.
+    canvas_created = False
+
+    for round_index in range(_INLINE_MAX_TOOL_ROUNDS):
+        tool_choice: Any | None = None
+        if tools:
+            # Force create_canvas only on the very first round for a written-
+            # creation prompt; afterwards leave it to the model so it can write
+            # the pointer reply (a forced choice on round 2 would loop the tool).
+            if round_index == 0 and force_canvas_first_round:
+                tool_choice = {
+                    "type": "function",
+                    "function": {"name": CREATE_CANVAS_TOOL_NAME},
+                }
+            else:
+                tool_choice = "auto"
+
+        while True:
+            try:
+                usage, body_text, tool_calls, finish_reason = await _stream_completion_into_redis(
+                    client=client,
+                    redis_client=redis_client,
+                    gateway_url=gateway_url,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    virtual_key=virtual_key,
+                    model=model,
+                    messages=messages,
+                    sampling_params=sampling_params,
+                    reasoning_effort=reasoning_effort,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                )
+                break
+            except InlineGatewayError as exc:
+                # Some providers reject a NAMED tool_choice outright — deepseek
+                # thinking mode 400s with "Thinking mode does not support this
+                # tool_choice".  When the pin itself is what failed (named choice,
+                # error text implicates tool_choice) and nothing from this round
+                # has reached the frontend yet, downgrade to "auto" and retry the
+                # same round once instead of failing the run: on these models the
+                # forcing prompt alone triggers create_canvas reliably (the
+                # sandbox path ships prompt-only forcing with the same model).
+                # Any other gateway error — or one after content already streamed,
+                # where a retry would duplicate frontend output — propagates.
+                if (
+                    isinstance(tool_choice, dict)
+                    and not tool_choice_downgraded
+                    and "tool_choice" in str(exc)
+                    and getattr(exc, "streamed_entries", 0) == 0
+                ):
+                    tool_choice_downgraded = True
+                    logger.info(
+                        "named tool_choice rejected by provider; retrying round "
+                        "with tool_choice=auto",
+                        extra={"run_id": run_id, "model": model, "err": str(exc)},
+                    )
+                    tool_choice = "auto"
+                    continue
+                raise
+        # Last round's usage wins (the gateway meters each request); bodies concat.
+        total_usage = usage
+        if body_text:
+            body_parts.append(body_text)
+
+        # Generalized tool dispatch: route each call by ``function.name`` to a
+        # handler.  Known tools are ``create_canvas`` (materialize a canvas) and
+        # ``read_skill`` (fetch a skill file); anything else gets a "not supported"
+        # tool result.  Preserve the original "stop when no KNOWN tool call this
+        # round" semantics — an empty tool_calls list, or one containing only
+        # unknown tools, still breaks the loop rather than looping on junk.
+        known_calls = [
+            tc for tc in tool_calls
+            if (tc.get("function") or {}).get("name")
+            in (CREATE_CANVAS_TOOL_NAME, READ_SKILL_TOOL_NAME)
+        ]
+        if not known_calls:
+            break
+
+        # Append the assistant tool-call turn so the follow-up round has valid
+        # OpenAI context (a tool result must be preceded by its tool_calls turn).
+        # ALL tool_calls the model emitted go on this frame (OpenAI requires one
+        # tool result per tool_call id), and each gets a matching ``role: tool``
+        # result below — including unknown tools, which get a not-supported note.
+        messages.append(
+            {"role": "assistant", "content": body_text or None, "tool_calls": tool_calls}
+        )
+        for tc in tool_calls:
+            fn_name = (tc.get("function") or {}).get("name")
+            tool_call_id = tc.get("id") or ""
+            args = _parse_tool_arguments((tc.get("function") or {}).get("arguments") or "")
+
+            if fn_name == CREATE_CANVAS_TOOL_NAME:
+                # Canvas: materialize (the single-canvas cap makes all but the
+                # first a no-op) and feed the pointer-reply confirmation back.
+                if await _materialize_inline_canvas(
+                    settings=settings,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    redis_client=redis_client,
+                    args=args,
+                ):
+                    canvas_created = True
+                result_content = canvas_confirmation_reply(args.get("title"))
+            elif fn_name == READ_SKILL_TOOL_NAME:
+                # Skill read: fetch the requested file's body (fail-open — the
+                # loader returns a Chinese error string rather than raising, so a
+                # skill-store hiccup surfaces to the model but never fails the run).
+                skill_name = str(args.get("name") or "").strip()
+                read_path = str(args.get("path") or "SKILL.md").strip() or "SKILL.md"
+                if not skill_name:
+                    result_content = "（read_skill 缺少 name 参数，无法读取技能）"
+                else:
+                    try:
+                        result_content = await inline_skill_loader.fetch_skill_file(
+                            skill_name,
+                            skill_store_url=skill_store_url,
+                            service_scopes=skill_service_scopes,
+                            tenant_id=tenant_id,
+                            user_id=user_id,
+                            sha256=skill_sha_by_name.get(skill_name, ""),
+                            path=read_path,
+                        )
+                    except Exception as exc:  # noqa: BLE001 — never fail the run
+                        logger.warning(
+                            "inline read_skill handler failed (failure-open): %s",
+                            exc,
+                            extra={"run_id": run_id, "skill_name": skill_name},
+                        )
+                        result_content = (
+                            f"（读取技能「{skill_name}」的 {read_path} 时发生内部错误）"
+                        )
+            else:
+                # Unknown tool — feed a note back so the frame stays OpenAI-valid.
+                result_content = f"（不支持的工具调用：{fn_name}）"
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": result_content,
+                }
+            )
+
+    body_text_all = "".join(body_parts)
+
+    # ── Deterministic canvas rescue ─────────────────────────────────────────
+    # Fires ONLY for an explicit written-creation prompt (``force_canvas_first_round``)
+    # that finished the rounds above without materializing a canvas.  On weak-
+    # instruction models (deepseek-reasoner after the named-tool_choice downgrade)
+    # the prompt forcing alone is only ~50% reliable; when it misses the model
+    # either wrote the whole piece into the chat body (hijack) or — worse — copied
+    # the forcing prompt's example sentence and CLAIMED a canvas that never existed.
+    # This closes both cases so the user never faces a phantom canvas.  At most one
+    # rescue per run; the materialize call is fail-open (never fails the run).
+    if force_canvas_first_round and not canvas_created:
+        # Title comes from the ORIGINAL task.  ``messages`` may have been mutated by
+        # the tool loop (appended assistant/tool frames), but the executor appended
+        # the task as the LAST user turn before the loop ran, so the last-user-role
+        # message is still that task.
+        rescue_title = extract_creation_title(_last_user_task(messages))
+        if len(body_text_all.strip()) >= _RESCUE_BODY_MIN_CHARS:
+            # Body-is-the-article: the model wrote the full piece into the reply
+            # instead of calling the tool.  Materialize the streamed body verbatim —
+            # it already reached the frontend as delta tokens, so this only adds the
+            # canvas card alongside it.
+            logger.info(
+                "inline canvas rescue (body-as-article): materializing streamed reply",
+                extra={"run_id": run_id, "chars": len(body_text_all.strip())},
+            )
+            await _materialize_inline_canvas(
+                settings=settings,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                session_id=session_id,
+                run_id=run_id,
+                redis_client=redis_client,
+                args={
+                    "kind": "article",
+                    "title": rescue_title,
+                    "content_markdown": body_text_all,
+                },
+            )
+        else:
+            # Lie/stub reply: the body is too short to be the article (a phantom-
+            # canvas claim or an empty turn).  Issue ONE extra completion — no tools,
+            # no tool_choice, and crucially ``redis_client=None`` so nothing XADDs to
+            # the run token stream — to fetch the full text, then materialize it.
+            # The rescue prompt is appended to a COPY of ``messages`` so the fetch
+            # sees the full context but the mutation never leaks back.
+            rescue_messages = list(messages)
+            rescue_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"请直接输出《{rescue_title}》的完整正文（Markdown 格式），"
+                        "只输出正文本身，不要任何说明、前言或客套话。"
+                    ),
+                }
+            )
+            rescue_usage: dict[str, int] | None = None
+            rescue_text = ""
+            try:
+                rescue_usage, rescue_text, _tc, _fr = await _stream_completion_into_redis(
+                    client=client,
+                    redis_client=None,  # silent: never touches the run token stream
+                    gateway_url=gateway_url,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    virtual_key=virtual_key,
+                    model=model,
+                    messages=rescue_messages,
+                    sampling_params=sampling_params,
+                    reasoning_effort=reasoning_effort,
+                    tools=None,
+                    tool_choice=None,
+                )
+            except InlineGatewayError as exc:
+                # A failed rescue completion is non-fatal: the run still finishes on
+                # the (short) reply it already produced.
+                logger.warning(
+                    "inline canvas rescue (silent-completion): fetch failed, abandoning",
+                    extra={"run_id": run_id, "err": str(exc)},
+                )
+            if rescue_usage is not None:
+                # Fold the rescue round's usage into the totals.  "Last round wins"
+                # (the gateway meters each request separately); the silent completion
+                # IS the last request, so it overrides — same semantics as the loop.
+                total_usage = rescue_usage
+            if len(rescue_text.strip()) >= _RESCUE_BODY_MIN_CHARS:
+                logger.info(
+                    "inline canvas rescue (silent-completion): materializing fetched text",
+                    extra={"run_id": run_id, "chars": len(rescue_text.strip())},
+                )
+                await _materialize_inline_canvas(
+                    settings=settings,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    redis_client=redis_client,
+                    args={
+                        "kind": "article",
+                        "title": rescue_title,
+                        "content_markdown": rescue_text,
+                    },
+                )
+            else:
+                logger.warning(
+                    "inline canvas rescue (silent-completion): fetched text too short, "
+                    "abandoning rescue",
+                    extra={"run_id": run_id, "chars": len(rescue_text.strip())},
+                )
+
+    total_usage["total_tokens"] = total_usage.get("total_tokens", 0) or (
+        total_usage.get("input_tokens", 0) + total_usage.get("output_tokens", 0)
+    )
+    return total_usage, body_text_all
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -567,6 +1237,7 @@ async def _execute_inline_run(
     history: list[dict[str, Any]],
     sampling_params: dict[str, Any],
     reasoning_effort: str | None = None,
+    skills: list[str] | None = None,
 ) -> None:
     """Run one inline chat completion to terminal state.
 
@@ -617,15 +1288,51 @@ async def _execute_inline_run(
                     "no model provided and tenant has no default model"
                 )
 
-            # 3. Assemble OpenAI messages (native roles, not folded into system).
-            messages = build_openai_messages(
-                sys_prompt=sys_prompt, memory=memory, history=history, task=task,
+            # 3. Canvas: is the tool enabled for this tenant, and does the prompt
+            #    warrant forcing it on the first round (weak-instruction models
+            #    fire the tool only probabilistically even under strong wording)?
+            canvas_enabled = await _canvas_enabled_for_tenant(tenant_id)
+            force_canvas_first_round = (
+                canvas_enabled and is_written_creation_prompt(task)
             )
 
-            # 4. Stream the completion into Redis (delta / thinking entries).
-            usage, body_text = await _stream_completion_into_redis(
+            # 3b. Skills: resolve the run's skill names into a catalog (once per
+            #     run, never cached — a skill upgraded between turns must surface
+            #     its new sha immediately).  Failure-open: a bad skill is dropped,
+            #     never fails the run.  A non-empty catalog advertises ``read_skill``
+            #     and injects the catalog prompt (both appear/disappear together).
+            skills_catalog = await inline_skill_loader.resolve_skills(
+                skills,
+                skill_store_url=settings.skill_store_url,
+                service_scopes=settings.skill_store_service_scopes,
+                tenant_id=tenant_id,
+                user_id=user_id,
+            )
+
+            # 4. Assemble OpenAI messages (native roles, not folded into system);
+            #    append the canvas forcing block AND/OR the skills catalog block to
+            #    the system message so each instruction rides with its tool (canvas
+            #    block ↔ create_canvas, catalog block ↔ read_skill).
+            extra_system_parts: list[str] = []
+            if canvas_enabled:
+                extra_system_parts.append(CANVAS_FORCING_PROMPT)
+            if skills_catalog:
+                extra_system_parts.append(build_skills_catalog_prompt(skills_catalog))
+            extra_system = (
+                "\n\n".join(p for p in extra_system_parts if p and p.strip())
+                or None
+            )
+            messages = build_openai_messages(
+                sys_prompt=sys_prompt, memory=memory, history=history, task=task,
+                extra_system=extra_system,
+            )
+
+            # 5. Drive the completion (+ tool loop) into Redis.  With canvas off
+            #    and no skills this is a single plain completion, identical to before.
+            usage, body_text = await _run_completion_with_tools(
                 client=client,
                 redis_client=redis_client,
+                settings=settings,
                 gateway_url=gateway_url,
                 tenant_id=tenant_id,
                 user_id=user_id,
@@ -636,6 +1343,11 @@ async def _execute_inline_run(
                 messages=messages,
                 sampling_params=sampling_params,
                 reasoning_effort=reasoning_effort,
+                canvas_enabled=canvas_enabled,
+                force_canvas_first_round=force_canvas_first_round,
+                skills_catalog=skills_catalog,
+                skill_store_url=settings.skill_store_url,
+                skill_service_scopes=settings.skill_store_service_scopes,
             )
             final_status = "COMPLETED"
     except asyncio.CancelledError:
@@ -650,8 +1362,12 @@ async def _execute_inline_run(
         error_message = f"inline run failed: {exc}"
         logger.exception("inline run unexpected error", extra={"run_id": run_id})
     finally:
-        # Always terminate the SSE tail, whatever happened above.
-        await _xadd(redis_client, run_id, {"type": "end"})
+        # NOTE: the ``end`` marker is deliberately NOT pushed here.  It must
+        # only appear once the terminal status is durable (below): the SSE tail
+        # exits on ``end`` and immediately reconciles run.status — an ``end``
+        # ahead of the finalize commit makes that reconcile read RUNNING, emit
+        # no lifecycle event, and the live connection never delivers
+        # run_complete (frontend stuck on "Working on it…" until a refresh).
         if redis_client is not None:
             with contextlib.suppress(Exception):
                 await redis_client.aclose()
@@ -703,6 +1419,17 @@ async def _execute_inline_run(
                         redis_url=redis_url,
                         dlp_url=dlp_url,
                     )
+
+                    # Anchor any canvas created during streaming onto the assistant
+                    # message row that replay just persisted.  ``_materialize_inline_canvas``
+                    # created the document mid-stream when no assistant row existed
+                    # yet (so its own backfill was a no-op); mirroring the sandbox
+                    # reconcile path, we re-run the backfill here now the row exists,
+                    # so ``message.canvas_id`` is set and the hydration path can
+                    # re-anchor the card on reload.  Fail-open.
+                    await _backfill_inline_run_canvases(
+                        svc=svc, run=run, tenant_id=tenant_id
+                    )
                 if final_status == "COMPLETED" and body_text:
                     # Truncated echo of the reply as result_summary (row-level
                     # convenience; the durable rows are the authoritative reply).
@@ -721,6 +1448,14 @@ async def _execute_inline_run(
             "(sweeper will orphan-fail it)",
             extra={"run_id": run_id},
         )
+
+    # Terminate the SSE tail only now that the terminal status is committed:
+    # ``end`` means "reconciling run.status will observe a terminal state", so
+    # the post-stream reconcile emits run_complete on the live connection.
+    # (Cancel pushes its own ``end`` in cancel_inline_run and never reaches
+    # here; the un-finalized edge keeps the pre-existing semantics — the tail
+    # re-polls and the sweeper eventually orphan-fails the run.)
+    await _push_end(redis_url, run_id)
 
     # ── Memory write-back (COMPLETED only, failure-open) ────────────────────
     if final_status == "COMPLETED" and knowledge_ingest_url and body_text:
@@ -771,6 +1506,7 @@ def start_inline_run(
     history: list[dict[str, Any]],
     sampling_params: dict[str, Any],
     reasoning_effort: str | None = None,
+    skills: list[str] | None = None,
 ) -> None:
     """Launch the background inline-run task and register it for cancel.
 
@@ -781,6 +1517,11 @@ def start_inline_run(
 
     ``reasoning_effort`` is passed through verbatim to the /chat/completions
     payload when non-None (see ``_stream_completion_into_redis``).
+
+    ``skills`` is the resolved-presence skill name list from the create_run
+    endpoint (explicit selection, or the user's default-enabled installs when the
+    request omitted the key).  Empty/None means no skill loop for this run — the
+    executor then behaves exactly as before skills were supported.
     """
     task_obj = asyncio.create_task(
         _execute_inline_run(
@@ -796,6 +1537,7 @@ def start_inline_run(
             history=history,
             sampling_params=sampling_params,
             reasoning_effort=reasoning_effort,
+            skills=skills,
         ),
         name=f"inline-run-{run_id}",
     )

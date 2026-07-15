@@ -30,7 +30,12 @@ from skill_store.errors import (
     VersionConflictError,
     VersionNotFoundError,
 )
-from skill_store.services.skill_package import validate_and_parse
+from skill_store.services.skill_package import (
+    SKILL_MD_FILENAME,
+    ExtractedFile,
+    read_member,
+    validate_and_parse,
+)
 
 # Visibility levels that make a skill visible on the shared shelf (browse list).
 # "private" skills are excluded from the shelf. This filter applies ONLY to the
@@ -46,13 +51,29 @@ class ResolvedSkill:
     """A resolved (skill, version) pair the scheduler should materialise.
 
     ``blob_url`` is a presigned HTTP URL the scheduler fetches once; ``sha256``
-    is the content-address used as the cache key.
+    is the content-address used as the cache key.  ``description`` is copied from
+    the version manifest so callers can index the skill without a second fetch.
     """
 
     name: str
     version: str
     sha256: str
     blob_url: str
+    description: str
+
+
+def _manifest_description(sv: SkillVersion) -> str:
+    """Pull the description out of a version's manifest, empty when absent."""
+    manifest = sv.manifest or {}
+    value = manifest.get("description")
+    return value if isinstance(value, str) else ""
+
+
+def _manifest_skill_md_path(sv: SkillVersion) -> str:
+    """Archive-relative SKILL.md path from the manifest (root layout fallback)."""
+    manifest = sv.manifest or {}
+    value = manifest.get("skill_md_path")
+    return value if isinstance(value, str) and value else SKILL_MD_FILENAME
 
 
 class SkillService:
@@ -350,38 +371,10 @@ class SkillService:
         if not names:
             return []
 
-        stmt = (
-            select(Skill, UserInstalledSkill)
-            .join(UserInstalledSkill, UserInstalledSkill.skill_id == Skill.id)
-            .where(
-                UserInstalledSkill.tenant_id == tenant_id,
-                UserInstalledSkill.user_id == user_id,
-                Skill.name.in_(names),
-            )
-            .order_by(Skill.name.asc())
-        )
-        result = await self._db.execute(stmt)
-        installs = list(result.all())
-
         resolved: list[ResolvedSkill] = []
-        for skill, install in installs:
-            sv: SkillVersion | None
-            if install.pinned_version_id is not None:
-                sv_stmt = select(SkillVersion).where(
-                    SkillVersion.id == install.pinned_version_id,
-                )
-                sv = (await self._db.execute(sv_stmt)).scalar_one_or_none()
-                # A SET NULL race (pinned row was deleted between query &
-                # fetch) would leave sv=None; fall back to latest.
-                if sv is None:
-                    sv = await self._latest_version(skill.id)
-            else:
-                sv = await self._latest_version(skill.id)
-
-            if sv is None:
-                # Skill has zero versions yet — nothing to materialise.
-                continue
-
+        for skill, sv in await self._resolve_installed_versions(
+            tenant_id, user_id, names,
+        ):
             key = make_key(tenant_id, sv.skill_id, sv.version)
             try:
                 blob_url = self._blob.presign_get(key, ttl_seconds=ttl_seconds)
@@ -399,9 +392,94 @@ class SkillService:
                     version=sv.version,
                     sha256=sv.sha256,
                     blob_url=blob_url,
+                    description=_manifest_description(sv),
                 )
             )
         return resolved
+
+    async def resolve_one_installed_version(
+        self, tenant_id: str, user_id: str, name: str,
+    ) -> tuple[Skill, SkillVersion]:
+        """Resolve a single installed skill name → its concrete ``SkillVersion``.
+
+        Shares the exact version-selection semantics of
+        :meth:`resolve_for_runtime` (pinned version, else latest upload) so a
+        given ``name`` resolves to the same version across ``/internal/skills/
+        resolve`` and ``/internal/skills/{name}/file``.
+
+        Raises :class:`SkillNotFoundError` when the user has no matching install
+        or the skill has no uploaded version yet.
+        """
+        pairs = await self._resolve_installed_versions(tenant_id, user_id, [name])
+        if not pairs:
+            raise SkillNotFoundError(name)
+        return pairs[0]
+
+    async def _resolve_installed_versions(
+        self, tenant_id: str, user_id: str, names: list[str],
+    ) -> list[tuple[Skill, SkillVersion]]:
+        """Resolve each installed ``name`` to a concrete (Skill, SkillVersion).
+
+        Version selection per install: ``pinned_version_id`` when set (falling
+        back to latest on a SET NULL race), else the most recently uploaded
+        version.  Names with no install record — or an installed skill with zero
+        uploaded versions — are silently omitted.
+        """
+        stmt = (
+            select(Skill, UserInstalledSkill)
+            .join(UserInstalledSkill, UserInstalledSkill.skill_id == Skill.id)
+            .where(
+                UserInstalledSkill.tenant_id == tenant_id,
+                UserInstalledSkill.user_id == user_id,
+                Skill.name.in_(names),
+            )
+            .order_by(Skill.name.asc())
+        )
+        result = await self._db.execute(stmt)
+        installs = list(result.all())
+
+        pairs: list[tuple[Skill, SkillVersion]] = []
+        for skill, install in installs:
+            sv: SkillVersion | None
+            if install.pinned_version_id is not None:
+                sv_stmt = select(SkillVersion).where(
+                    SkillVersion.id == install.pinned_version_id,
+                )
+                sv = (await self._db.execute(sv_stmt)).scalar_one_or_none()
+                # A SET NULL race (pinned row was deleted between query &
+                # fetch) would leave sv=None; fall back to latest.
+                if sv is None:
+                    sv = await self._latest_version(skill.id)
+            else:
+                sv = await self._latest_version(skill.id)
+
+            if sv is None:
+                # Skill has zero versions yet — nothing to materialise.
+                continue
+            pairs.append((skill, sv))
+        return pairs
+
+    async def read_skill_file(
+        self, tenant_id: str, user_id: str, name: str, path: str,
+    ) -> tuple[SkillVersion, ExtractedFile]:
+        """Read a single member from an installed skill's package as UTF-8 text.
+
+        Resolves ``name`` to the same version as ``resolve_for_runtime`` (shared
+        helper), pulls the tarball bytes straight from blob storage (no presigned
+        HTTP round-trip), and extracts the member at ``path`` — resolved relative
+        to the skill root (the directory containing SKILL.md).
+
+        Raises the storage / package errors surfaced by
+        :func:`skill_package.read_member` (path invalid 400, not found 404, too
+        large 413, non-text 415) plus :class:`SkillNotFoundError` (404) when the
+        skill is not installed / has no version.
+        """
+        _, sv = await self.resolve_one_installed_version(tenant_id, user_id, name)
+        key = make_key(tenant_id, sv.skill_id, sv.version)
+        tarball = self._blob.get(key)
+        skill_md_path = _manifest_skill_md_path(sv)
+        extracted = read_member(tarball, skill_md_path, path)
+        return sv, extracted
 
     async def _latest_version(self, skill_id: str) -> SkillVersion | None:
         stmt = (

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -119,6 +119,7 @@ async def chat(
     body = await request.json()
     message_text = body.get("message", "")
     attachment_ids: list[str] = body.get("attachment_ids") or []
+    skills_provided = "skills" in body
     skills: list[str] = body.get("skills") or []
     model: str | None = body.get("model") or None
     reasoning_effort: str | None = body.get("reasoning_effort") or None
@@ -153,16 +154,22 @@ async def chat(
         )
 
         # 3. Trigger run
+        run_body: dict[str, Any] = {
+            "task": message_text,
+            "files": files,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "execution_mode": execution_mode,
+        }
+        # Presence is meaningful: omitted lets orchestrator inject the user's
+        # enabled-by-default installs; explicit [] disables all skills for this
+        # session/run and must not be replaced with defaults.
+        if skills_provided:
+            run_body["skills"] = skills
+
         resp = await client.post(
             f"{orch_url}/sessions/{session_id}/runs",
-            json={
-                "task": message_text,
-                "files": files,
-                "skills": skills,
-                "model": model,
-                "reasoning_effort": reasoning_effort,
-                "execution_mode": execution_mode,
-            },
+            json=run_body,
             headers=headers,
         )
         if resp.status_code >= 400:

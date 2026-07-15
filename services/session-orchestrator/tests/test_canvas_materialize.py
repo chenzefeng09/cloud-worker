@@ -202,6 +202,45 @@ def test_materialize_idempotent_across_repeated_calls(
     assert len(db.canvases) == 1  # created exactly once
 
 
+def test_materialize_retries_message_backfill_after_canvas_won_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canvas created before its assistant row must anchor on the next poll."""
+    db = FakeDB()
+    _seed_session(db)
+    run = _make_run(db)
+    _patch_redis(
+        monkeypatch,
+        [{"kind": "article", "title": "Race", "content_markdown": _LONG, "seq": 1}],
+    )
+
+    # First poll creates the document, but no assistant message exists yet.
+    first = _materialize(db, run)
+    assert len(first) == 1
+    canvas_id = db.canvases[0].id
+
+    # Reconcile persists the durable row later.  Re-reading the same Redis
+    # payload must not create another canvas, but it must retry the backfill.
+    db.messages.append(
+        Message(
+            id="msg_late",
+            tenant_id=TEST_TENANT,
+            session_id="ses_1",
+            role="assistant",
+            content="已为你创建画布。",
+            sequence=1,
+            run_id="run_cvs",
+            canvas_id=None,
+            created_at=_NOW,
+        )
+    )
+    second = _materialize(db, run)
+
+    assert second == []
+    assert len(db.canvases) == 1
+    assert db.messages[0].canvas_id == canvas_id
+
+
 def test_materialize_second_payload_created_after_first(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

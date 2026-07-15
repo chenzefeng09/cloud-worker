@@ -159,11 +159,14 @@ class FakeDB:
             role = _p("role_1")
             if role is not None:
                 rows = [m for m in rows if m.role == role]
-            # ``canvas_id IS NULL`` predicate compiles without a bound param;
-            # honour it whenever the statement targets the backfill query (a
-            # run_id filter is present) so already-anchored rows are excluded.
+            canvas_id = _p("canvas_id_1")
+            if canvas_id is not None:
+                rows = [m for m in rows if getattr(m, "canvas_id", None) == canvas_id]
+            # ``canvas_id IS NULL`` compiles without a bound param; when no
+            # equality value is present, honour the unlinked backfill query.
             if run_id is not None:
-                rows = [m for m in rows if getattr(m, "canvas_id", None) is None]
+                if canvas_id is None:
+                    rows = [m for m in rows if getattr(m, "canvas_id", None) is None]
                 rows.sort(key=lambda m: getattr(m, "sequence", 0), reverse=True)
             return FakeResult(rows)
         if entity is CanvasDocument:
@@ -385,6 +388,29 @@ def test_backfill_message_canvas_id_returns_none_when_no_eligible_message() -> N
         )
         is None
     )
+
+
+def test_backfill_message_canvas_id_is_idempotent() -> None:
+    db = FakeDB()
+    _seed_session(db)
+    linked = Message(
+        id="msg_linked", tenant_id=TEST_TENANT, session_id="ses_1", role="assistant",
+        content="x", sequence=1, run_id="run_z", canvas_id="cvs_target", created_at=_NOW,
+    )
+    unlinked = Message(
+        id="msg_unlinked", tenant_id=TEST_TENANT, session_id="ses_1", role="assistant",
+        content="y", sequence=2, run_id="run_z", canvas_id=None, created_at=_NOW,
+    )
+    db.messages.extend([linked, unlinked])
+
+    updated_id = _run(
+        _svc(db).backfill_message_canvas_id(
+            session_id="ses_1", run_id="run_z", canvas_id="cvs_target"
+        )
+    )
+
+    assert updated_id == "msg_linked"
+    assert unlinked.canvas_id is None
 
 
 # ── manual version + optimistic lock ─────────────────────────────────────────

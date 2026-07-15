@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
+import { useCanvasStore } from '../stores/canvasStore';
 import { api, ApiError } from '../api/client';
 import type { Message, MessageAttachment, PendingInteractionItem } from '../api/types';
 
@@ -23,6 +24,8 @@ import type { Message, MessageAttachment, PendingInteractionItem } from '../api/
 //   message_created→ addMessage  (backend echo of the user message)
 //   agent_message  → addMessage  (legacy event name — treated same as message)
 //   plan           → setPlanSteps
+//   canvas_created → setMessageCanvasId (anchor a materialized canvas to its
+//                    assistant message) + warm the canvas cache (fetchCanvas)
 //   run_complete   → setIsStreaming(false) + one-shot messages.list reconcile
 //   ping           → no-op (SSE keepalive heartbeat; see the silent-watchdog
 //                    note on runConnectLoop — presence of pings is what arms it)
@@ -140,6 +143,55 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     }
   },
 
+  canvas_created(ctx, data) {
+    // canvas.v2 Phase B: the model called create_canvas and the orchestrator
+    // materialized a server canvas, backfilling the assistant message row's
+    // canvas_id column.  Shape: { canvas_id, run_id, message_id? }.
+    //
+    // This is the LIVE path (the hydration path reads canvas_id straight off
+    // the durable DB row).  Two things happen:
+    //   1. Anchor the canvas to its assistant message so ChatWindow renders the
+    //      card under that bubble.  When message_id is present, anchor exactly
+    //      to it; when the orchestrator omits it, fall back to the LAST
+    //      assistant message for this run (the streamed text block that the
+    //      canvas was created from).  If neither can be resolved we silently
+    //      skip anchoring — the durable DB row still carries canvas_id, so the
+    //      card appears on the next hydration; the assistant bubble is never
+    //      affected either way (content stays visible — the card is additive).
+    //   2. Warm the canvas cache with a fire-and-forget fetchCanvas so the card
+    //      has content the instant it mounts.  Failure is swallowed: the card
+    //      re-fetches for itself, and a fetch error must never break the stream.
+    const store = useChatStore.getState();
+    const canvasId = data.canvas_id as string | undefined;
+    const runId = data.run_id as string | undefined;
+    const messageId = data.message_id as string | undefined;
+    if (!canvasId) return;
+
+    let targetMessageId = messageId;
+    if (!targetMessageId && runId) {
+      // Fallback: newest assistant (text) message for this run.  Prefer a
+      // durable row, but a streaming text block is an acceptable live anchor —
+      // hydration later reconciles it to the durable row (same canvas_id).
+      const msgs = store.messages[ctx.sessionId] || [];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        const isAssistant = (m.role || '').toUpperCase() === 'ASSISTANT';
+        const belongsToRun = m.run_id === runId || m.streamRunId === runId;
+        const isTextBlock = m.blockKind !== 'tool' && m.blockKind !== 'thinking';
+        if (isAssistant && belongsToRun && isTextBlock) {
+          targetMessageId = m.id;
+          break;
+        }
+      }
+    }
+    if (targetMessageId) {
+      store.setMessageCanvasId(ctx.sessionId, targetMessageId, canvasId);
+    }
+
+    // Warm the canvas cache (fail-open — the card will fetch it itself).
+    void useCanvasStore.getState().fetchCanvas(canvasId).catch(() => {});
+  },
+
   message(ctx, data) {
     // A complete message row from the server.  The orchestrator stores roles
     // lowercase ("assistant"/"user"/"system"/"tool"); compare case-insensitively.
@@ -147,6 +199,23 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     const msg = data as unknown as Message;
     const roleUpper = (msg.role || '').toUpperCase();
     if ((roleUpper === 'ASSISTANT' || roleUpper === 'TOOL' || roleUpper === 'THINKING') && msg.run_id) {
+      // `canvas_created` can arrive while the assistant answer is still a
+      // transient streaming block.  Preserve that live association when the
+      // durable assistant row arrives without canvas_id; otherwise the clear
+      // below deletes the only copy of the association and the canvas flashes
+      // briefly before disappearing.
+      const liveCanvasId = roleUpper === 'ASSISTANT' && !msg.canvas_id
+        ? (store.messages[ctx.sessionId] || [])
+            .slice()
+            .reverse()
+            .find(
+              (m) =>
+                m.streamRunId === msg.run_id &&
+                m.blockKind === 'text' &&
+                Boolean(m.canvas_id),
+            )?.canvas_id
+        : undefined;
+      const durableMessage = liveCanvasId ? { ...msg, canvas_id: liveCanvasId } : msg;
       // Swap the transient streaming block for the durable DB row — but only
       // the block of the SAME kind this row replaces.  Durable rows arrive
       // THINKING-first, then ASSISTANT text; a non-kind-aware clear would wipe
@@ -156,7 +225,7 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
       const kindForRole =
         roleUpper === 'THINKING' ? 'thinking' : roleUpper === 'TOOL' ? 'tool' : 'text';
       store.clearStreamingBlocks(ctx.sessionId, msg.run_id, kindForRole);
-      store.addMessage(ctx.sessionId, msg);
+      store.addMessage(ctx.sessionId, durableMessage);
       // A durable row for this run has landed → the run reached terminal and was
       // hydrated.  Close its streaming channel and drop its offset watermark so
       // any further (replayed) token/tool/thinking events are discarded instead
@@ -328,6 +397,60 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     ctx.onDone();
   },
 };
+
+/**
+ * Restore canvases whose document row survived but whose message.canvas_id
+ * backfill lost a materialization race.  This makes older affected sessions
+ * self-heal on the next hydration while the server-side retry prevents new
+ * orphaned associations.
+ */
+export async function recoverSessionCanvasAnchors(sessionId: string): Promise<void> {
+  const page = await api.canvas.list(sessionId);
+  if (page.items.length === 0) return;
+
+  const store = useChatStore.getState();
+  const messages = store.messages[sessionId] || [];
+  const claimedMessageIds = new Set(
+    messages.filter((m) => Boolean(m.canvas_id)).map((m) => m.id),
+  );
+
+  for (const canvas of page.items) {
+    const alreadyAnchored = messages.some((m) => m.canvas_id === canvas.id);
+    if (!alreadyAnchored) {
+      let target = canvas.source_message_id
+        ? messages.find(
+            (m) =>
+              m.id === canvas.source_message_id &&
+              (m.role || '').toUpperCase() === 'ASSISTANT',
+          )
+        : undefined;
+
+      if (!target && canvas.source_run_id) {
+        target = messages
+          .slice()
+          .reverse()
+          .find(
+            (m) =>
+              m.run_id === canvas.source_run_id &&
+              (m.role || '').toUpperCase() === 'ASSISTANT' &&
+              !m.canvas_id &&
+              !claimedMessageIds.has(m.id),
+          );
+      }
+
+      if (target && !claimedMessageIds.has(target.id)) {
+        store.setMessageCanvasId(sessionId, target.id, canvas.id);
+        claimedMessageIds.add(target.id);
+      }
+    }
+
+    // List items are summaries without blocks; warm the full document cache so
+    // CanvasMessageCard can render immediately after the recovered anchor lands.
+    if (!useCanvasStore.getState().canvasesById[canvas.id]) {
+      void useCanvasStore.getState().fetchCanvas(canvas.id).catch(() => {});
+    }
+  }
+}
 
 /**
  * Dispatch a single SSE event through the handler registry.
@@ -817,6 +940,16 @@ export function useChat() {
         for (const m of page.items) {
           store.addMessage(sid, m);
         }
+        // A canvas can be committed before its assistant message exists.  The
+        // normal server backfill now retries, but list + recover also repairs
+        // sessions created before that fix.
+        try {
+          await recoverSessionCanvasAnchors(sid);
+        } catch (err) {
+          if (!(err instanceof ApiError) || err.status !== 401) {
+            console.warn('recover canvas anchors failed', err);
+          }
+        }
       } catch (err) {
         if (!(err instanceof ApiError) || err.status !== 401) {
 
@@ -907,9 +1040,11 @@ export function useChat() {
       try {
         abortRef.current = new AbortController();
 
-        // Skills enabled for this session in the context rail; forwarded so the
-        // worker loads exactly these (BFF → orchestrator → task.json["skills"]).
-        const skills = useChatStore.getState().selectedSkills[sessionId] || [];
+        // ``undefined`` means this session has not established a selection yet:
+        // omit the field so the orchestrator can inject the user's authoritative
+        // enabled-by-default installs. Once seeded/toggled, send the exact list;
+        // an explicit [] therefore means "disable every skill for this session".
+        const skills = useChatStore.getState().selectedSkills[sessionId];
         // Per-session model + reasoning effort, set via the composer dropdowns.
         const model = useChatStore.getState().selectedModel[sessionId] || undefined;
         const effortSel = useChatStore.getState().selectedEffort[sessionId] || '';
@@ -924,7 +1059,7 @@ export function useChat() {
           body: JSON.stringify({
             message: text,
             attachment_ids: attachmentIds || [],
-            skills,
+            ...(skills !== undefined ? { skills } : {}),
             ...(model ? { model } : {}),
             ...(effortSel ? { reasoning_effort: effortSel } : {}),
             execution_mode: executionMode,

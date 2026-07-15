@@ -8,6 +8,7 @@ import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_session_orchestrator.domain.models import Message, Run, Session
@@ -649,6 +650,84 @@ def test_fetch_memory_omits_exclude_when_no_session() -> None:
     assert "exclude_origin_session_id" not in captured
 
 
+def test_fetch_default_installed_skills_uses_internal_contract() -> None:
+    """The skill-store lookup sends authoritative tenant/user context + scope."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import (
+        _fetch_default_installed_skills,
+    )
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "items": [
+                    {"name": "poet"},
+                    {"name": "poet"},
+                    {"name": "analyst"},
+                    {"unexpected": True},
+                ]
+            }
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+        async def get(self, url, **kw):
+            captured["url"] = url
+            captured["params"] = kw.get("params")
+            captured["headers"] = kw.get("headers")
+            return _FakeResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        result = asyncio.get_event_loop().run_until_complete(
+            _fetch_default_installed_skills(
+                skill_store_url="http://skill-store/api/skills/v1/",
+                service_scopes="skill.read_internal",
+                tenant_id="tnt_test",
+                user_id="usr_test",
+            )
+        )
+
+    assert result == ["poet", "analyst"]
+    assert captured["url"].endswith("/internal/skills/default-installed")
+    assert captured["params"] == {"tenant_id": "tnt_test", "user_id": "usr_test"}
+    assert captured["headers"] == {
+        "X-Tenant-Id": "tnt_test",
+        "X-User-Id": "usr_test",
+        "X-Service-Scopes": "skill.read_internal",
+    }
+
+
+def test_fetch_default_installed_skills_is_failure_open() -> None:
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import (
+        _fetch_default_installed_skills,
+    )
+
+    class _FailClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw): raise httpx.ConnectError("down")
+
+    with patch.object(httpx, "AsyncClient", return_value=_FailClient()):
+        result = asyncio.get_event_loop().run_until_complete(
+            _fetch_default_installed_skills(
+                skill_store_url="http://skill-store/api/skills/v1",
+                service_scopes="skill.read_internal",
+                tenant_id="tnt_test",
+                user_id="usr_test",
+            )
+        )
+
+    assert result == []
+
+
 def test_write_memory_stamps_origin_session_id_and_real_user() -> None:
     """_write_memory sends origin_session_id in the upload data and the real
     user in X-User-Id (never the SYSTEM sentinel, which knowledge-ingest's
@@ -773,6 +852,96 @@ def test_create_run_injects_memory(
     if scheduler_body:
         assert "memory" in scheduler_body[-1]
         assert "张三" in scheduler_body[-1]["memory"]
+
+
+@pytest.mark.parametrize(
+    (
+        "include_skills",
+        "request_skills",
+        "default_skills",
+        "expected_skills",
+        "expected_lookups",
+    ),
+    [
+        (False, None, ["poet", "analyst"], ["poet", "analyst"], 1),
+        (True, ["manual"], ["poet"], ["manual"], 0),
+        (True, [], ["poet"], [], 0),
+        (True, None, ["poet"], [], 0),
+    ],
+    ids=[
+        "omitted-loads-defaults",
+        "explicit-wins",
+        "explicit-empty-wins",
+        "explicit-null-wins",
+    ],
+)
+def test_create_run_applies_default_skills_only_when_key_is_omitted(
+    app_client: TestClient,
+    mock_db: AsyncMock,
+    auth_headers: dict[str, str],
+    include_skills: bool,
+    request_skills: list[str] | None,
+    default_skills: list[str],
+    expected_skills: list[str],
+    expected_lookups: int,
+) -> None:
+    import httpx
+
+    session = Session(
+        id="ses_skills", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+    )
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_skills"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+    scheduler_payloads: list[dict] = []
+
+    class _SchedulerResp:
+        status_code = 201
+
+        def json(self):
+            return {"id": "run_skills", "sandbox_id": "abc123", "status": "RUNNING"}
+
+    class _FakeClient(AuthzAwareClient):
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            scheduler_payloads.append(json or {})
+            return _SchedulerResp()
+
+    body: dict = {"task": "use skills"}
+    if include_skills:
+        body["skills"] = request_skills
+
+    default_lookup = AsyncMock(return_value=default_skills)
+    with (
+        patch.object(httpx, "AsyncClient", return_value=_FakeClient()),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._fetch_memory",
+            new=AsyncMock(return_value=""),
+        ),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._assemble_history",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._fetch_default_installed_skills",
+            new=default_lookup,
+        ),
+    ):
+        response = app_client.post(
+            "/api/session/v1/sessions/ses_skills/runs",
+            headers=auth_headers,
+            json=body,
+        )
+
+    assert response.status_code == 201, response.text
+    assert scheduler_payloads[-1]["skills"] == expected_skills
+    assert default_lookup.await_count == expected_lookups
 
 
 def test_create_run_sums_attachment_bytes_for_memory_tier(
@@ -1014,6 +1183,66 @@ def test_stream_tokens_yields_delta_events_and_stops_on_end() -> None:
         "run_stream_end",
         {"run_id": "run_test_1", "paused": False},
     )
+
+
+def test_stream_tokens_relays_canvas_entry_as_canvas_created() -> None:
+    """A ``canvas`` token-stream entry (written by the inline executor) is relayed
+    as the exact ``canvas_created`` SSE the sandbox path yields, so the frontend is
+    mode-agnostic.  ``message_id`` is passed through when present."""
+    from agent_session_orchestrator.api.v1.messages import _stream_tokens
+
+    fake_entries = [
+        ("1-0", {"type": "delta", "text": "已为你创作。"}),
+        (
+            "2-0",
+            {
+                "type": "canvas",
+                "canvas_id": "cvs_abc",
+                "run_id": "run_cvs",
+                "message_id": "msg_1",
+            },
+        ),
+        ("3-0", {"type": "end", "text": ""}),
+    ]
+
+    class _FakeRedis:
+        _call_count = 0
+
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def xread(self, streams, block=0, count=None):
+            key = list(streams.keys())[0]
+            if self._call_count == 0:
+                self.__class__._call_count += 1
+                return [(key, fake_entries)]
+            return []
+
+        async def aclose(self): pass
+
+    async def _run():
+        with _patch_redis_asyncio(_FakeRedis):
+            _FakeRedis._call_count = 0
+            deadline = asyncio.get_event_loop().time() + 10.0
+            events = []
+            async for ev in _stream_tokens(
+                redis_url="redis://localhost:6379",
+                run_id="run_cvs",
+                deadline=deadline,
+            ):
+                events.append(ev)
+        return events
+
+    events = asyncio.get_event_loop().run_until_complete(_run())
+    parsed = [
+        (event_name, json.loads(data))
+        for event_name, data in _parse_sse_events("".join(events))
+    ]
+    canvas_events = [p for name, p in parsed if name == "canvas_created"]
+    assert canvas_events == [
+        {"canvas_id": "cvs_abc", "run_id": "run_cvs", "message_id": "msg_1"}
+    ]
 
 
 def test_stream_tokens_waits_through_worker_coldstart() -> None:

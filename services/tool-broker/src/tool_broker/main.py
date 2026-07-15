@@ -22,7 +22,11 @@ _LOG = logging.getLogger(__name__)
 # Redis key schema shared with the worker's RunStateClient.  Keys are ALWAYS
 # derived from a run_id taken from the validated lease, never from a value the
 # sandbox can choose freely.
-_STATE_KEY_KINDS = frozenset({"state", "paused"})
+# ``canvas`` (Phase B): the create_canvas tool appends payloads to
+# ``agent:run:{run_id}:canvas`` via this same set/get surface; without it the
+# broker 400s the write, the worker fails open (seq=0) and the canvas is
+# silently never materialized.
+_STATE_KEY_KINDS = frozenset({"state", "paused", "canvas"})
 
 
 def _state_key(run_id: str, kind: str) -> str:

@@ -165,6 +165,7 @@ sessionOrchestrator:
     dbPoolSize: "5"
     dbMaxOverflow: "10"
     dbPoolRecycle: "1800"
+    skillStoreServiceScopes: "skill.read_internal"
   env: []
 
 # ---------------------------------------------------------------------------

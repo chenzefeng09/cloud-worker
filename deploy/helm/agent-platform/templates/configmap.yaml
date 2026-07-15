@@ -100,6 +100,8 @@ data:
   # session-orchestrator is rendered by the generic services.yaml loop with only
   # `envFrom: ap-config`, so the prefixed key must live here for it to take effect.
   SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL: {{ .Values.global.foundation.dlpUrl | quote }}
+  SESSION_ORCHESTRATOR_SKILL_STORE_URL: {{ printf "http://ap-skill-store:%d/api/skills/v1" (int .Values.skillStore.port) | quote }}
+  SESSION_ORCHESTRATOR_SKILL_STORE_SERVICE_SCOPES: {{ .Values.sessionOrchestrator.config.skillStoreServiceScopes | quote }}
 
   # DB pool sizes (per-service env picked up by each service's own config.py)
   SESSION_ORCHESTRATOR_DB_POOL_SIZE:     {{ .Values.sessionOrchestrator.config.dbPoolSize | quote }}

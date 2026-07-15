@@ -10,7 +10,10 @@ import {
   type CanvasTextSelection,
 } from '../lib/canvasObjects';
 import {
+  canvasBlocksToHtml,
+  canvasEditorToBlocks,
   canvasHtmlToMarkdown,
+  getCanvasBlockSelectionsInside,
   getMarkdownSelectionInside,
   markdownToCanvasHtml,
 } from '../lib/canvasRichText';
@@ -19,7 +22,8 @@ import { SuggestionDiffView } from './SuggestionDiffView';
 import { useCanvasStore } from '../stores/canvasStore';
 import { useChatStore } from '../stores/chatStore';
 import { api } from '../api/client';
-import type { CanvasBlock, CanvasVersionSummary } from '../api/types';
+import type { CanvasSelectionSegment, CanvasVersionSummary } from '../api/types';
+import { InlineCanvasSuggestion, isInlineCanvasSuggestion } from './InlineCanvasSuggestion';
 
 interface CanvasMessageCardProps {
   sessionId: string;
@@ -49,23 +53,6 @@ interface CanvasMessageCardProps {
 /** Random 8-char id suffix for newly-split blocks created from manual edits. */
 function randomBlockSuffix(): string {
   return Math.random().toString(36).slice(2, 10);
-}
-
-/** Split edited markdown into blocks, reusing existing block ids positionally. */
-function splitIntoBlocks(content: string, previousBlocks: CanvasBlock[]): CanvasBlock[] {
-  const chunks = content
-    .split(/\n{2,}/)
-    .map((c) => c.trim())
-    .filter(Boolean);
-  return chunks.map((text, index) => {
-    const existing = previousBlocks[index];
-    const type: CanvasBlock['type'] = /^#{1,6}\s/.test(text) ? 'heading' : 'paragraph';
-    return {
-      id: existing?.id ?? `blk_${randomBlockSuffix()}`,
-      type,
-      text,
-    };
-  });
 }
 
 type ToolbarMode = 'menu' | 'input';
@@ -220,6 +207,7 @@ export function CanvasMessageCard({
   const suggestion = canvasId ? derivedSuggestion : suggestionProp;
   const revisingEffective = canvasId ? storeRevising : revising;
   const editErrorEffective = canvasId ? storeError : editError;
+  const [blockSelection, setBlockSelection] = useState<CanvasSelectionSegment[]>([]);
 
   const handleDraftChange = useCallback(
     (next: CanvasDocumentDraft) => {
@@ -240,20 +228,16 @@ export function CanvasMessageCard({
         return;
       }
       const model = useChatStore.getState().selectedModel[sessionId] || undefined;
-      // This PR: character-level selection is no longer sent to the server.
-      // Whole-document requests map to scope.type='document'. Selection-scoped
-      // requests would ideally resolve to the intersecting block ids, but the
-      // rich editor here only tracks character offsets — cleanly mapping those
-      // to block ids is out of scope for this PR, so we fall back to
-      // 'document' scope (acceptable per the PR notes).
-      const scope: { type: 'document' | 'blocks'; block_ids?: string[] } = { type: 'document' };
+      const scope = request.scope === 'selection' && blockSelection.length > 0
+        ? { type: 'selection' as const, segments: blockSelection }
+        : { type: 'document' as const };
       await requestEditAction(canvasId, sessionId, {
         instruction: request.instruction,
         scope,
         model,
       });
     },
-    [canvasId, onRequestEdit, requestEditAction, sessionId],
+    [blockSelection, canvasId, onRequestEdit, requestEditAction, sessionId],
   );
 
   const handleAcceptSuggestion = useCallback(() => {
@@ -290,11 +274,14 @@ export function CanvasMessageCard({
   const localEditContentRef = useRef<string | null>(null);
   const selectedRangeRef = useRef<Range | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
   const object = getCanvasObject(draft.kind);
   const { copied, copy } = useCopied();
   const [selection, setSelection] = useState<CanvasTextSelection | null>(null);
   const [toolbar, setToolbar] = useState<ToolbarState | null>(null);
   const [instruction, setInstruction] = useState('');
+  // 悬浮选区弹框的指令与底部整篇输入框各自独立,避免互相镜像
+  const [popupInstruction, setPopupInstruction] = useState('');
   const [busy, setBusy] = useState(false);
   const [history, setHistory] = useState<string[]>([]);
   const [future, setFuture] = useState<string[]>([]);
@@ -318,6 +305,7 @@ export function CanvasMessageCard({
         setHistory([]);
         setFuture([]);
         setSelection(null);
+        setBlockSelection([]);
         setToolbar(null);
       }
       return;
@@ -326,10 +314,13 @@ export function CanvasMessageCard({
     if (hydratedDraftIdRef.current !== draft.id) {
       hydratedDraftIdRef.current = draft.id;
       localEditContentRef.current = null;
-      el.innerHTML = markdownToCanvasHtml(draft.content);
+      el.innerHTML = canvasId && storeCanvas
+        ? canvasBlocksToHtml(storeCanvas.blocks)
+        : markdownToCanvasHtml(draft.content);
       setHistory([]);
       setFuture([]);
       setSelection(null);
+      setBlockSelection([]);
       setToolbar(null);
       return;
     }
@@ -340,8 +331,11 @@ export function CanvasMessageCard({
     }
 
     if (!el.innerHTML.trim() && draft.content.trim()) {
-      el.innerHTML = markdownToCanvasHtml(draft.content);
+      el.innerHTML = canvasId && storeCanvas
+        ? canvasBlocksToHtml(storeCanvas.blocks)
+        : markdownToCanvasHtml(draft.content);
       setSelection(null);
+      setBlockSelection([]);
       setToolbar(null);
       return;
     }
@@ -350,11 +344,14 @@ export function CanvasMessageCard({
     if (current !== draft.content) {
       setHistory((prev) => trimHistory([...prev, current]));
       setFuture([]);
-      el.innerHTML = markdownToCanvasHtml(draft.content);
+      el.innerHTML = canvasId && storeCanvas
+        ? canvasBlocksToHtml(storeCanvas.blocks)
+        : markdownToCanvasHtml(draft.content);
       setSelection(null);
+      setBlockSelection([]);
       setToolbar(null);
     }
-  }, [draft.content, draft.id, hasInlineSuggestionPreview]);
+  }, [canvasId, draft.content, draft.id, hasInlineSuggestionPreview, storeCanvas]);
 
   useEffect(() => {
     // canvasId mode is server-persisted (saveManual on blur) — the legacy
@@ -369,8 +366,29 @@ export function CanvasMessageCard({
 
   useEffect(() => {
     if (toolbar?.mode !== 'input') return;
+    // 同步聚焦一次:后台/隐藏标签页里 rAF 会被冻结,不能只依赖它
+    inputRef.current?.focus();
     requestAnimationFrame(() => inputRef.current?.focus());
-  }, [toolbar?.mode]);
+  }, [toolbar]);
+
+  useEffect(() => {
+    if (!toolbar) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const popover = popoverRef.current;
+      if (popover && event.target instanceof Node && popover.contains(event.target)) return;
+      setToolbar(null);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // isComposing: Escape 取消输入法组合时不应关闭弹框
+      if (event.key === 'Escape' && !event.isComposing) setToolbar(null);
+    };
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true);
+      document.removeEventListener('keydown', handleKeyDown, true);
+    };
+  }, [toolbar]);
 
   const updateDraft = useCallback(
     (patch: Partial<CanvasDocumentDraft>) => {
@@ -383,15 +401,19 @@ export function CanvasMessageCard({
     [draft, handleDraftChange],
   );
 
-  // Manual-edit save (canvasId mode only): fires on editor blur, mapping the
-  // edited markdown back into blocks via a simple positional split (no
-  // block-level diffing for this PR — see splitIntoBlocks above).
+  // Manual-edit save (canvasId mode only): stable ids are read from the DOM,
+  // so deleting or inserting an earlier paragraph cannot rebind later text to
+  // the wrong block.
   const handleEditorBlur = useCallback(() => {
     if (!canvasId || !storeCanvas || !editorRef.current) return;
     const content = canvasHtmlToMarkdown(editorRef.current);
     const currentContent = storeCanvas.blocks.map((b) => b.text).join('\n\n');
     if (content === currentContent) return;
-    const blocks = splitIntoBlocks(content, storeCanvas.blocks);
+    const blocks = canvasEditorToBlocks(
+      editorRef.current,
+      storeCanvas.blocks,
+      () => `blk_${randomBlockSuffix()}`,
+    );
     void saveManualAction(canvasId, blocks, storeCanvas.current_version);
   }, [canvasId, saveManualAction, storeCanvas]);
 
@@ -482,13 +504,15 @@ export function CanvasMessageCard({
       const next = getMarkdownSelectionInside(el, draft.content);
       if (!next) {
         setSelection(null);
+        setBlockSelection([]);
         if (toolbar?.mode !== 'input') setToolbar(null);
         return;
       }
       setSelection(next);
+      setBlockSelection(canvasId && storeCanvas ? getCanvasBlockSelectionsInside(el, storeCanvas.blocks) : []);
       showToolbarForRange(range, mode, fallback);
     },
-    [draft.content, showToolbarForRange, toolbar?.mode],
+    [canvasId, draft.content, showToolbarForRange, storeCanvas, toolbar?.mode],
   );
 
   const handleInput = useCallback(() => {
@@ -602,10 +626,14 @@ export function CanvasMessageCard({
     });
   };
 
-  const buildRequest = (scope: 'selection' | 'document', intent?: CanvasEditIntent): CanvasEditRequest | null => {
-    const finalInstruction = (intent?.instruction || instruction).trim();
+  const buildRequest = (
+    scope: 'selection' | 'document',
+    intent?: CanvasEditIntent,
+    instructionText?: string,
+  ): CanvasEditRequest | null => {
+    const finalInstruction = (intent?.instruction || (instructionText ?? instruction)).trim();
     if (!finalInstruction) return null;
-    if (scope === 'selection' && !selection) return null;
+    if (scope === 'selection' && (!selection || (canvasId && blockSelection.length === 0))) return null;
     return {
       documentId: draft.id,
       kind: draft.kind,
@@ -617,16 +645,24 @@ export function CanvasMessageCard({
     };
   };
 
-  const requestEdit = async (scope: 'selection' | 'document', intent?: CanvasEditIntent) => {
+  const requestEdit = async (
+    scope: 'selection' | 'document',
+    intent?: CanvasEditIntent,
+    instructionText?: string,
+  ) => {
     if (aiDisabled || busy || revisingEffective) return;
-    const request = buildRequest(scope, intent);
+    const request = buildRequest(scope, intent, instructionText);
     if (!request) return;
     setBusy(true);
     setToolbar(null);
     try {
       await handleRequestEdit(request);
-      setInstruction('');
-      if (intent) setInstruction(intent.instruction);
+      if (instructionText !== undefined) {
+        setPopupInstruction('');
+      } else {
+        setInstruction('');
+        if (intent) setInstruction(intent.instruction);
+      }
     } finally {
       setBusy(false);
     }
@@ -661,6 +697,7 @@ export function CanvasMessageCard({
   const isRevising = Boolean(busy || revisingEffective);
   const canRequestSelection = Boolean(selection && instruction.trim() && !aiDisabled && !isRevising);
   const canRequestDocument = Boolean(instruction.trim() && !aiDisabled && !isRevising);
+  const canRequestPopupEdit = Boolean(selection && popupInstruction.trim() && !aiDisabled && !isRevising);
   const suggestionSource =
     suggestion?.request.scope === 'selection' ? suggestion.request.selection?.text : suggestion?.request.content;
   // canvasId mode renders its own lightweight per-block diff section (below)
@@ -669,6 +706,9 @@ export function CanvasMessageCard({
   // joined current content (no real diff), so it isn't useful there.
   const showDocumentSuggestion = Boolean(suggestion && !inlineSuggestionPreview && !canvasId);
   const showCanvasIdSuggestion = Boolean(canvasId && storeSuggestion);
+  const showInlineCanvasIdSuggestion = Boolean(
+    canvasId && storeCanvas && isInlineCanvasSuggestion(storeSuggestion),
+  );
 
   // canvasId mode before the canvas has loaded into the store (or, in
   // practice never, neither draft nor canvasId supplied): render nothing.
@@ -889,7 +929,7 @@ export function CanvasMessageCard({
               />
             </section>
           )}
-          {showCanvasIdSuggestion && storeSuggestion && (
+          {showCanvasIdSuggestion && !showInlineCanvasIdSuggestion && storeSuggestion && (
             <SuggestionDiffView
               suggestion={storeSuggestion}
               onAccept={handleAcceptSuggestion}
@@ -897,7 +937,15 @@ export function CanvasMessageCard({
               busy={revisingEffective}
             />
           )}
-          {inlineSuggestionPreview && suggestion ? (
+          {showInlineCanvasIdSuggestion && storeCanvas && storeSuggestion ? (
+            <InlineCanvasSuggestion
+              canvas={storeCanvas}
+              suggestion={storeSuggestion}
+              onAccept={handleAcceptSuggestion}
+              onReject={handleRejectSuggestion}
+              busy={revisingEffective}
+            />
+          ) : inlineSuggestionPreview && suggestion ? (
             <div className="canvas-rich-editor canvas-inline-editor canvas-suggestion-preview-document text-ink break-words">
               <div
                 className="canvas-suggestion-preview-segment"
@@ -950,6 +998,8 @@ export function CanvasMessageCard({
               className="canvas-rich-editor canvas-inline-editor outline-none text-ink break-words"
               role="textbox"
               aria-label="页内画布正文"
+              data-writing-block-fullscreen-editor-region="true"
+              data-writing-block-fullscreen-editor-layout="inline"
               onInput={handleInput}
               onBlur={handleEditorBlur}
               onMouseUp={() => refreshSelection('menu')}
@@ -1037,12 +1087,17 @@ export function CanvasMessageCard({
 
       {toolbar && (
         <div
+          ref={popoverRef}
           className="canvas-selection-popover"
           style={{
             left: toolbar.x,
             top: toolbar.y,
           }}
-          onMouseDown={(event) => event.preventDefault()}
+          onMouseDown={(event) => {
+            // 保住编辑器选区（加粗/斜体按钮依赖它），但指令输入框要能点击聚焦
+            if (event.target instanceof HTMLElement && event.target.closest('input')) return;
+            event.preventDefault();
+          }}
         >
           {toolbar.mode === 'menu' ? (
             <>
@@ -1069,13 +1124,13 @@ export function CanvasMessageCard({
               className="canvas-selection-input-form"
               onSubmit={(event) => {
                 event.preventDefault();
-                requestEdit(selection ? 'selection' : 'document');
+                requestEdit('selection', undefined, popupInstruction);
               }}
             >
               <input
                 ref={inputRef}
-                value={instruction}
-                onChange={(event) => setInstruction(event.target.value)}
+                value={popupInstruction}
+                onChange={(event) => setPopupInstruction(event.target.value)}
                 placeholder={isRevising ? '修订中…' : '修改一下'}
                 className="canvas-selection-input"
                 disabled={aiDisabled || isRevising}
@@ -1083,7 +1138,7 @@ export function CanvasMessageCard({
               <button
                 type="submit"
                 className="canvas-selection-send"
-                disabled={!canRequestSelection && !canRequestDocument}
+                disabled={!canRequestPopupEdit}
                 title="发送修改要求"
               >
                 ↑

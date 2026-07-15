@@ -18,8 +18,9 @@ RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl \
  && rm -rf /tmp/wheels
 
 # Install SQLAlchemy + asyncpg + aiosqlite + alembic (not in the base image)
-# 走清华源：同 foundation migration-runner，避开本机 Docker Desktop 损坏 PyPI 元数据的问题
-RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
+# 官方 PyPI：曾因本机 Docker Desktop 损坏 PyPI 元数据改走清华源，该问题已消失；
+# 2026-07 起清华源反而从本机持续 SSL EOF 不可达，切回官方源（CN 云机部署时按需换回镜像源）
+RUN pip install --no-cache-dir \
     "sqlalchemy[asyncio]>=2.0.36,<3" \
     "asyncpg>=0.30.0,<1" \
     "aiosqlite>=0.20.0,<1" \

@@ -239,8 +239,9 @@ def test_stream_maps_delta_and_single_thinking_and_usage() -> None:
             sampling_params={},
         )
 
-    usage, body = asyncio.get_event_loop().run_until_complete(_run())
+    usage, body, tool_calls, finish_reason = asyncio.get_event_loop().run_until_complete(_run())
 
+    assert tool_calls == [] and finish_reason is None
     types_seen = [e[1]["type"] for e in redis_client.entries]
     # Exactly one thinking entry (never fragmented), two deltas, in order.
     assert types_seen == ["thinking", "delta", "delta"]
@@ -1088,3 +1089,1255 @@ def test_sweeper_fails_orphaned_inline_run() -> None:
     assert "orphaned" in (old.error_message or "")
     redis_client = _FakeRedisStream.from_url()
     assert any(e[1]["type"] == "end" for e in redis_client.entries)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# canvas (canvas v2, Phase B) — model-triggered canvas on the inline path
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _tool_call_frames(
+    *, call_id: str, name: str, arguments: str, finish: str = "tool_calls"
+) -> list[str]:
+    """SSE frames streaming one OpenAI tool call across chunks, then a finish.
+
+    Mirrors how DeepSeek/OpenAI stream tool calls: the first fragment carries
+    ``id`` + ``function.name``, subsequent fragments append ``function.arguments``,
+    and a final choice carries ``finish_reason``.
+    """
+    mid = len(arguments) // 2
+    return [
+        _sse(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {"name": name, "arguments": arguments[:mid]},
+                                }
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        _sse(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": arguments[mid:]}}
+                            ]
+                        },
+                    }
+                ]
+            }
+        ),
+        _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}),
+    ]
+
+
+# A canvas body comfortably above the guard (>=200 chars, >=2 blank-line blocks).
+_CANVAS_BODY = (
+    "# 人工智能与就业\n\n"
+    + ("人工智能正在深刻改变各行各业的工作形态与技能需求。" * 6)
+    + "\n\n"
+    + ("劳动者应主动学习新工具，把重复性工作交给自动化。" * 6)
+)
+
+
+class _MultiRoundGatewayClient(_FakeGatewayClient):
+    """Gateway client that returns a different SSE script per /chat/completions call.
+
+    ``sse_scripts`` is a list of line-lists, one per completion round; the Nth
+    round POST returns the Nth script.  Used to drive the tool loop (round 1
+    tool_call → round 2 pointer reply).
+    """
+
+    def __init__(self, *, sse_scripts: list[list[str]], **kw: Any) -> None:
+        super().__init__(sse_lines=sse_scripts[0] if sse_scripts else [], **kw)
+        self._scripts = sse_scripts
+        self._round = 0
+
+    def stream(self, method: str, url: str, json: dict | None = None, **kw: Any):  # type: ignore[no-untyped-def]
+        assert method == "POST" and url.endswith("/chat/completions")
+        self.chat_payloads.append(json or {})
+        script = (
+            self._scripts[self._round]
+            if self._round < len(self._scripts)
+            else ["data: [DONE]"]
+        )
+        self._round += 1
+        return _FakeStreamResponse(script, status_code=self.completion_status)
+
+
+def _canvas_db_and_run(run_id: str = "run_cvs"):
+    """A FakeDB seeded with a session + the inline run, and wiring so the executor
+    materializes the canvas via the real CanvasService and finalizes via a real
+    SessionService — both against the same in-memory FakeDB.
+
+    Returns ``(db, run, install)`` where ``install(monkeypatch)`` patches
+    ``acquire_db_session`` (yields the shared db) and ``SessionService.list_runs``
+    (FakeDB does not model Run queries) on the executor module.
+    """
+    from tests.test_canvas_service import FakeDB, _seed_session
+
+    db = FakeDB()
+    _seed_session(db)
+    run = Run(
+        id=run_id, tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="写一篇《AI 与就业》短文", status="RUNNING",
+        execution_mode="inline", sandbox_id=None,
+        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+
+    def install(monkeypatch) -> None:
+        from agent_session_orchestrator.services import inline_run_executor as ex
+        from agent_session_orchestrator.services.session_service import SessionService
+
+        async def _fake_acquire(*, tenant_id, user_id="SYSTEM", actor="USER"):
+            yield db
+
+        async def _fake_list_runs(self, session_id):
+            return [run]
+
+        monkeypatch.setattr(ex, "acquire_db_session", _fake_acquire)
+        monkeypatch.setattr(SessionService, "list_runs", _fake_list_runs)
+        # Canvas flag ON without a live feature-flag service.
+        monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=True))
+
+    return db, run, install
+
+
+def test_inline_run_advertises_tools_and_materializes_canvas(monkeypatch) -> None:
+    """Round 1: the request advertises tools=[create_canvas] and the model calls
+    it → the canvas is created in-DB, a ``canvas`` token-stream entry is written
+    (relayed as canvas_created), the tool loop closes with a pointer reply, and the
+    assistant message is backfilled with canvas_id at finalize."""
+    from agent_session_orchestrator.config import Settings
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    db, run, install = _canvas_db_and_run()
+    install(monkeypatch)
+
+    settings = Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+    args = json.dumps({"title": "AI 与就业", "content_markdown": _CANVAS_BODY, "kind": "article"})
+    scripts = [
+        # Round 1: the model calls create_canvas.
+        _tool_call_frames(call_id="call_1", name="create_canvas", arguments=args)
+        + [_usage_frame(20, 8, 28)],
+        # Round 2: after the tool result, the model writes its pointer reply.
+        [
+            _sse({"choices": [{"index": 0, "delta": {"content": "已为你创作《AI 与就业》。"}}]}),
+            _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            _usage_frame(30, 6, 36),
+            "data: [DONE]",
+        ],
+    ]
+    fake_client = _MultiRoundGatewayClient(sse_scripts=scripts)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=settings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_cvs", task="写一篇《AI 与就业》短文",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED"
+    # Round-1 request advertised the create_canvas tool.
+    round1 = fake_client.chat_payloads[0]
+    tool_names = [t["function"]["name"] for t in round1.get("tools", [])]
+    assert "create_canvas" in tool_names
+    # A written-creation prompt forced the tool on round 1.
+    assert round1.get("tool_choice", {}).get("function", {}).get("name") == "create_canvas"
+    # Exactly one canvas materialized in-DB, from this run, with the model's title.
+    assert len(db.canvases) == 1
+    assert db.canvases[0].source_run_id == "run_cvs"
+    assert db.canvases[0].title == "AI 与就业"
+    # A ``canvas`` token-stream entry was written (→ canvas_created SSE relay).
+    redis_client = _FakeRedisStream.from_url()
+    canvas_entries = [e[1] for e in redis_client.entries if e[1]["type"] == "canvas"]
+    assert len(canvas_entries) == 1
+    assert canvas_entries[0]["canvas_id"] == db.canvases[0].id
+    # The pointer reply from round 2 streamed as delta tokens.
+    deltas = "".join(e[1]["text"] for e in redis_client.entries if e[1]["type"] == "delta")
+    assert "已为你创作" in deltas
+    # Second round fed the tool result back (assistant tool_calls + tool role).
+    round2_msgs = fake_client.chat_payloads[1]["messages"]
+    assert any(m.get("role") == "tool" for m in round2_msgs)
+    # The assistant message persisted at finalize carries the canvas_id.
+    assistant_msgs = [m for m in db.messages if m.role == "assistant" and m.run_id == "run_cvs"]
+    assert assistant_msgs and assistant_msgs[-1].canvas_id == db.canvases[0].id
+
+
+def test_inline_run_single_canvas_per_run_guard(monkeypatch) -> None:
+    """Two create_canvas tool calls across rounds materialize only ONE canvas
+    (the single-canvas-per-run cap no-ops the repeat)."""
+    from agent_session_orchestrator.config import Settings
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    db, run, install = _canvas_db_and_run(run_id="run_dup")
+    install(monkeypatch)
+
+    settings = Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+    args1 = json.dumps({"title": "First", "content_markdown": _CANVAS_BODY})
+    args2 = json.dumps({"title": "Second", "content_markdown": _CANVAS_BODY})
+    scripts = [
+        _tool_call_frames(call_id="c1", name="create_canvas", arguments=args1)
+        + [_usage_frame(10, 4, 14)],
+        # Round 2 also calls create_canvas — the cap must make it a no-op.
+        _tool_call_frames(call_id="c2", name="create_canvas", arguments=args2)
+        + [_usage_frame(10, 4, 14)],
+    ]
+    fake_client = _MultiRoundGatewayClient(sse_scripts=scripts)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=settings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_dup", task="写一篇文章",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    # Exactly one canvas despite two create_canvas tool calls; it is the first.
+    assert len(db.canvases) == 1
+    assert db.canvases[0].title == "First"
+    # Only one ``canvas`` token-stream entry emitted.
+    redis_client = _FakeRedisStream.from_url()
+    assert len([e for e in redis_client.entries if e[1]["type"] == "canvas"]) == 1
+    # The loop closed as soon as the model stopped calling a known tool: two
+    # create_canvas rounds (from the 2 scripts) + one terminating round (the
+    # client returns [DONE] past its scripts, i.e. no tool call → break).  It
+    # never approaches the cap.
+    assert len(fake_client.chat_payloads) == 3
+    assert len(fake_client.chat_payloads) < ex._INLINE_MAX_TOOL_ROUNDS
+
+
+def test_inline_run_canvas_disabled_sends_no_tools(monkeypatch) -> None:
+    """When the canvas flag is OFF the request advertises no tools and no canvas
+    is created even if the prompt looks like written creation."""
+    from agent_session_orchestrator.config import Settings
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    run = Run(
+        id="run_off", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="写一篇文章", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db(monkeypatch, run)
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=False))
+
+    settings = Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+    lines = [
+        _sse({"choices": [{"index": 0, "delta": {"content": "普通回复"}}]}),
+        _usage_frame(3, 2, 5),
+        "data: [DONE]",
+    ]
+    fake_client = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=settings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_off", task="写一篇文章",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED"
+    # No tools advertised, no tool_choice — a plain completion.
+    assert "tools" not in fake_client.chat_payloads[0]
+    assert "tool_choice" not in fake_client.chat_payloads[0]
+    # No canvas token-stream entry.
+    redis_client = _FakeRedisStream.from_url()
+    assert not any(e[1]["type"] == "canvas" for e in redis_client.entries)
+
+
+# ── written-creation heuristic (tool_choice forcing) ─────────────────────────
+
+
+def test_is_written_creation_prompt_hits_and_misses() -> None:
+    from agent_session_orchestrator.services.canvas_tool_spec import (
+        is_written_creation_prompt,
+    )
+
+    # Hits: write-verb + genre, or a 《书名号》 titled assignment.
+    assert is_written_creation_prompt("写一篇关于AI的短文") is True
+    assert is_written_creation_prompt("帮我创作一封道歉邮件") is True
+    assert is_written_creation_prompt("写一篇《春天的故事》") is True
+    assert is_written_creation_prompt("draft a report on Q3 results") is True
+    # Misses: no write-verb, or a verb without a written-work genre.
+    assert is_written_creation_prompt("今天天气怎么样？") is False
+    assert is_written_creation_prompt("帮我算一下 3+5") is False
+    assert is_written_creation_prompt("写个函数把列表去重") is False
+    assert is_written_creation_prompt("") is False
+
+
+def test_inline_run_forces_tool_choice_only_for_written_creation(monkeypatch) -> None:
+    """A non-written-creation prompt advertises the tool but does NOT force it
+    (tool_choice='auto'); a written-creation prompt forces create_canvas."""
+    from agent_session_orchestrator.config import Settings
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    run = Run(
+        id="run_auto", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="今天几号", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db(monkeypatch, run)
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=True))
+
+    settings = Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+    lines = [
+        _sse({"choices": [{"index": 0, "delta": {"content": "今天是7月14日"}}]}),
+        _usage_frame(3, 2, 5),
+        "data: [DONE]",
+    ]
+    fake_client = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=settings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_auto", task="今天几号？",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    payload = fake_client.chat_payloads[0]
+    # Tool is advertised, but not forced for a non-written-creation prompt.
+    assert any(t["function"]["name"] == "create_canvas" for t in payload["tools"])
+    assert payload.get("tool_choice") == "auto"
+
+
+# ── named tool_choice rejection → same-round auto downgrade ──────────────────
+# deepseek thinking mode 400s a NAMED tool_choice ("Thinking mode does not
+# support this tool_choice").  The pin must degrade to tool_choice='auto' within
+# the same round (once per run) instead of failing the run — but only when
+# nothing has streamed to the frontend yet.
+
+
+def test_inline_run_downgrades_rejected_tool_choice_and_retries(monkeypatch) -> None:
+    """First-round named pin is rejected by the provider (error frame mentions
+    tool_choice, nothing streamed) → same-round retry with tool_choice='auto' →
+    the model calls create_canvas anyway → run COMPLETED, canvas materialized."""
+    from agent_session_orchestrator.config import Settings
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    db, run, install = _canvas_db_and_run(run_id="run_dg")
+    install(monkeypatch)
+
+    settings = Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+    args = json.dumps({"title": "AI 与就业", "content_markdown": _CANVAS_BODY})
+    scripts = [
+        # Attempt 1 (named tool_choice): rejected before any content streams.
+        [
+            _sse(
+                {
+                    "error": {
+                        "message": "Thinking mode does not support this tool_choice",
+                        "type": "invalid_request_error",
+                        "code": "invalid_request_error",
+                    }
+                }
+            ),
+        ],
+        # Attempt 2 (auto): the forcing prompt still triggers the tool call.
+        _tool_call_frames(call_id="c1", name="create_canvas", arguments=args)
+        + [_usage_frame(10, 4, 14)],
+        # Round 2: pointer reply.
+        [
+            _sse({"choices": [{"index": 0, "delta": {"content": "已为你创作《AI 与就业》。"}}]}),
+            _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            _usage_frame(20, 5, 25),
+            "data: [DONE]",
+        ],
+    ]
+    fake_client = _MultiRoundGatewayClient(sse_scripts=scripts)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=settings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_dg", task="写一篇《AI 与就业》短文",
+                model_hint="deepseek-reasoner", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED", run.error_message
+    # Attempt 1 pinned create_canvas; the retry downgraded to auto.
+    assert (
+        fake_client.chat_payloads[0]["tool_choice"]["function"]["name"]
+        == "create_canvas"
+    )
+    assert fake_client.chat_payloads[1]["tool_choice"] == "auto"
+    # Three requests total: rejected pin + auto retry + pointer-reply round.
+    assert len(fake_client.chat_payloads) == 3
+    # Canvas still materialized via the retried round.
+    assert len(db.canvases) == 1
+    assert db.canvases[0].title == "AI 与就业"
+
+
+def test_inline_run_non_tool_choice_error_is_not_retried(monkeypatch) -> None:
+    """A gateway error that does not implicate tool_choice propagates as before:
+    no retry, run FAILED, single request."""
+    from agent_session_orchestrator.config import Settings
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    run = Run(
+        id="run_nr", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="写一篇文章", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db(monkeypatch, run)
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=True))
+
+    settings = Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+    lines = [
+        _sse({"error": {"message": "upstream exploded", "code": "PROVIDER.UPSTREAM_ERROR"}}),
+    ]
+    fake_client = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=settings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+                # Written-creation task → the first round pins tool_choice.
+                session_id="ses_1", run_id="run_nr", task="写一篇文章",
+                model_hint="deepseek-reasoner", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "FAILED"
+    assert "upstream exploded" in (run.error_message or "")
+    # No downgrade retry was attempted for a non-tool_choice error.
+    assert len(fake_client.chat_payloads) == 1
+
+
+def test_inline_run_no_downgrade_retry_after_content_streamed(monkeypatch) -> None:
+    """A tool_choice error arriving AFTER delta tokens already streamed must not
+    retry (a rerun would duplicate frontend content) — the run fails as before."""
+    from agent_session_orchestrator.config import Settings
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    run = Run(
+        id="run_late", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="写一篇文章", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db(monkeypatch, run)
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=True))
+
+    settings = Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+    lines = [
+        # A delta reached the frontend before the provider errored.
+        _sse({"choices": [{"index": 0, "delta": {"content": "部分正文"}}]}),
+        _sse(
+            {
+                "error": {
+                    "message": "Thinking mode does not support this tool_choice",
+                    "type": "invalid_request_error",
+                }
+            }
+        ),
+    ]
+    fake_client = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=settings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_late", task="写一篇文章",
+                model_hint="deepseek-reasoner", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "FAILED"
+    assert "tool_choice" in (run.error_message or "")
+    # Content had streamed → no retry despite the tool_choice error text.
+    assert len(fake_client.chat_payloads) == 1
+
+
+# ── deterministic canvas rescue (forced written-creation, no canvas produced) ─
+# On weak-instruction models the forcing prompt alone is only ~50% reliable; when
+# it misses the model either dumps the whole article into the chat body (hijack) or
+# copies the forcing prompt's example sentence and claims a canvas that never
+# existed.  The rescue closes both so the user never faces a phantom canvas.
+
+
+def _long_body_frames(body: str, *, finish: str = "stop") -> list[str]:
+    """SSE frames streaming ``body`` as a single content delta, then a finish + usage."""
+    return [
+        _sse({"choices": [{"index": 0, "delta": {"content": body}}]}),
+        _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]}),
+        _usage_frame(20, 300, 320),
+        "data: [DONE]",
+    ]
+
+
+def test_inline_rescue_body_as_article_materializes_without_extra_request(monkeypatch) -> None:
+    """Forced written-creation + model never calls the tool + a LONG body (>=rescue
+    threshold) → the streamed body is materialized as the canvas directly, with NO
+    extra gateway request (the reply itself was the article)."""
+    from agent_session_orchestrator.config import Settings
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    db, run, install = _canvas_db_and_run(run_id="run_rescue_body")
+    install(monkeypatch)
+
+    settings = Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+    # Round 1 (named tool_choice pinned): model ignores the tool and writes the
+    # whole article into the body instead.
+    scripts = [_long_body_frames(_CANVAS_BODY)]
+    fake_client = _MultiRoundGatewayClient(sse_scripts=scripts)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=settings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_rescue_body",
+                task="写一篇《AI 与就业》短文",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED", run.error_message
+    # Exactly one gateway request — the rescue did NOT issue a silent completion.
+    assert len(fake_client.chat_payloads) == 1
+    # The body was materialized as the canvas, titled from the 《》 in the task.
+    assert len(db.canvases) == 1
+    assert db.canvases[0].title == "AI 与就业"
+    assert db.canvases[0].source_run_id == "run_rescue_body"
+    # A ``canvas`` token-stream entry was written (relayed as canvas_created).
+    redis_client = _FakeRedisStream.from_url()
+    assert len([e for e in redis_client.entries if e[1]["type"] == "canvas"]) == 1
+    # The article body still streamed to the frontend as delta tokens.
+    deltas = "".join(e[1]["text"] for e in redis_client.entries if e[1]["type"] == "delta")
+    assert "人工智能" in deltas
+
+
+def test_inline_rescue_silent_completion_fetches_full_text(monkeypatch) -> None:
+    """Forced written-creation + model never calls the tool + a SHORT body (a
+    phantom-canvas claim) → a silent extra completion fetches the full text, which
+    is materialized; the silent round NEVER XADDs to the run token stream."""
+    from agent_session_orchestrator.config import Settings
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    db, run, install = _canvas_db_and_run(run_id="run_rescue_lie")
+    install(monkeypatch)
+
+    settings = Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+    scripts = [
+        # Round 1: the model lies — short pointer reply, no tool call.
+        _long_body_frames("已为你创作《AI 与就业》，内容在右侧画布中。", finish="stop"),
+        # Silent rescue completion: returns the real full article.
+        _long_body_frames(_CANVAS_BODY),
+    ]
+    fake_client = _MultiRoundGatewayClient(sse_scripts=scripts)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=settings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_rescue_lie",
+                task="写一篇《AI 与就业》短文",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED", run.error_message
+    # A silent rescue completion WAS issued (2 requests: original + rescue fetch).
+    assert len(fake_client.chat_payloads) == 2
+    # The rescue request carried no tools / tool_choice (a plain completion).
+    rescue_payload = fake_client.chat_payloads[1]
+    assert "tools" not in rescue_payload and "tool_choice" not in rescue_payload
+    # It appended a user instruction asking for the full body.
+    assert rescue_payload["messages"][-1]["role"] == "user"
+    assert "完整正文" in rescue_payload["messages"][-1]["content"]
+    # The fetched full text was materialized as the canvas.
+    assert len(db.canvases) == 1
+    assert db.canvases[0].title == "AI 与就业"
+    # Exactly ONE canvas token-stream entry — the materialization; the silent
+    # completion added no delta/thinking entries to the run stream.
+    redis_client = _FakeRedisStream.from_url()
+    assert len([e for e in redis_client.entries if e[1]["type"] == "canvas"]) == 1
+    # Only the lie reply reached the frontend as deltas — NOT the full article.
+    deltas = "".join(e[1]["text"] for e in redis_client.entries if e[1]["type"] == "delta")
+    assert "内容在右侧画布中" in deltas
+    assert "人工智能正在深刻改变" not in deltas
+
+
+def test_inline_rescue_not_triggered_when_tool_already_called(monkeypatch) -> None:
+    """When the model already produced a canvas via the tool loop, the rescue does
+    NOT fire — no extra gateway request, exactly one canvas."""
+    from agent_session_orchestrator.config import Settings
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    db, run, install = _canvas_db_and_run(run_id="run_rescue_ok")
+    install(monkeypatch)
+
+    settings = Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+    args = json.dumps({"title": "AI 与就业", "content_markdown": _CANVAS_BODY, "kind": "article"})
+    scripts = [
+        _tool_call_frames(call_id="call_1", name="create_canvas", arguments=args)
+        + [_usage_frame(20, 8, 28)],
+        [
+            _sse({"choices": [{"index": 0, "delta": {"content": "已为你创作《AI 与就业》。"}}]}),
+            _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            _usage_frame(30, 6, 36),
+            "data: [DONE]",
+        ],
+    ]
+    fake_client = _MultiRoundGatewayClient(sse_scripts=scripts)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=settings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_rescue_ok",
+                task="写一篇《AI 与就业》短文",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED", run.error_message
+    # Two rounds only (tool call + pointer reply) — no third rescue request.
+    assert len(fake_client.chat_payloads) == 2
+    assert len(db.canvases) == 1
+
+
+def test_inline_rescue_not_triggered_for_ordinary_chat(monkeypatch) -> None:
+    """A non-written-creation prompt (rescue never forced) that produces no canvas
+    and only a short reply is left alone — no rescue, no canvas, no extra request."""
+    from agent_session_orchestrator.config import Settings
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    db, run, install = _canvas_db_and_run(run_id="run_chat")
+    # The task is ordinary chat, so force_canvas_first_round is False.
+    run.task_description = "今天几号？"
+    install(monkeypatch)
+
+    settings = Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+    scripts = [
+        [
+            _sse({"choices": [{"index": 0, "delta": {"content": "今天是7月15日。"}}]}),
+            _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            _usage_frame(3, 2, 5),
+            "data: [DONE]",
+        ],
+    ]
+    fake_client = _MultiRoundGatewayClient(sse_scripts=scripts)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=settings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_chat", task="今天几号？",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED", run.error_message
+    # Single request; no rescue for a non-written-creation prompt.
+    assert len(fake_client.chat_payloads) == 1
+    assert db.canvases == []
+    redis_client = _FakeRedisStream.from_url()
+    assert not any(e[1]["type"] == "canvas" for e in redis_client.entries)
+
+
+def test_inline_rescue_abandons_when_fetched_text_too_short(monkeypatch) -> None:
+    """Forced written-creation + short reply → silent rescue completion, but the
+    fetched text is ALSO too short → materialization is abandoned (no canvas), and
+    the run still completes normally."""
+    from agent_session_orchestrator.config import Settings
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    db, run, install = _canvas_db_and_run(run_id="run_rescue_short")
+    install(monkeypatch)
+
+    settings = Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+    scripts = [
+        # Round 1: short lie reply, no tool call.
+        _long_body_frames("好的，已经写好放在画布里了。", finish="stop"),
+        # Silent rescue completion: still too short to be an article.
+        _long_body_frames("抱歉。", finish="stop"),
+    ]
+    fake_client = _MultiRoundGatewayClient(sse_scripts=scripts)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=settings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_rescue_short",
+                task="写一篇《AI 与就业》短文",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    # Run still completes; the rescue completion was issued but produced nothing
+    # materializable, so no canvas exists and no canvas SSE was emitted.
+    assert run.status == "COMPLETED", run.error_message
+    assert len(fake_client.chat_payloads) == 2  # original + rescue fetch
+    assert db.canvases == []
+    redis_client = _FakeRedisStream.from_url()
+    assert not any(e[1]["type"] == "canvas" for e in redis_client.entries)
+
+
+def test_extract_creation_title_prefers_book_title_then_truncates() -> None:
+    from agent_session_orchestrator.services.canvas_tool_spec import extract_creation_title
+
+    # 《书名号》 wins.
+    assert extract_creation_title("写一篇《AI 与就业》短文，约300字") == "AI 与就业"
+    # No 《》 → whitespace-collapsed prompt, truncated to 30 chars.
+    long_task = "帮我写一篇关于人工智能如何改变现代教育体系与终身学习方式的深度长文章内容要详实"
+    title = extract_creation_title(long_task)
+    assert len(title) == 30 and title == long_task[:30]
+    # Blank → a non-empty placeholder (rescue always has a title).
+    assert extract_creation_title("") == "未命名"
+    assert extract_creation_title("   ") == "未命名"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inline skill support — catalog prompt, read_skill tool + loop, presence semantics
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _skill_settings():
+    """Settings with canvas OFF and a skill-store URL — isolates the skill path."""
+    from agent_session_orchestrator.config import Settings
+
+    return Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+        skill_store_url="http://skill-store/api/skills/v1",
+    )
+
+
+def _mock_resolve(monkeypatch, entries: list[dict]) -> list[list[str]]:
+    """Patch the loader's ``resolve_skills`` to return ``entries``; record calls.
+
+    Returns a list that captures each call's ``names`` argument so a test can
+    assert what the executor asked to resolve (presence semantics).
+    """
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    calls: list[list[str]] = []
+
+    async def _fake_resolve(names, **kw):
+        calls.append(list(names) if names else [])
+        return list(entries)
+
+    monkeypatch.setattr(ex.inline_skill_loader, "resolve_skills", _fake_resolve)
+    return calls
+
+
+def test_inline_skills_explicit_advertises_read_skill_and_catalog(monkeypatch) -> None:
+    """Explicit skills → the resolved catalog appears in the system prompt and the
+    request advertises tools=[read_skill] (canvas OFF, so read_skill is the only
+    tool)."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    run = Run(
+        id="run_sk1", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="用 pandas 分析数据", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db(monkeypatch, run)
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=False))
+    _mock_resolve(
+        monkeypatch,
+        [{"name": "data-analyzer", "version": "1", "sha256": "a" * 64,
+          "description": "分析表格数据并给出洞察"}],
+    )
+
+    lines = [
+        _sse({"choices": [{"index": 0, "delta": {"content": "好的"}}]}),
+        _usage_frame(3, 2, 5),
+        "data: [DONE]",
+    ]
+    fake_client = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=_skill_settings(), tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_sk1", task="用 pandas 分析数据",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={}, skills=["data-analyzer"],
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED"
+    payload = fake_client.chat_payloads[0]
+    # read_skill advertised; create_canvas is NOT (canvas off).
+    tool_names = [t["function"]["name"] for t in payload.get("tools", [])]
+    assert tool_names == ["read_skill"]
+    # The catalog block lists the skill (name + description) in the system prompt.
+    system_msg = payload["messages"][0]
+    assert system_msg["role"] == "system"
+    assert "data-analyzer" in system_msg["content"]
+    assert "分析表格数据并给出洞察" in system_msg["content"]
+    assert "read_skill" in system_msg["content"]
+    # The inline-mode script boundary is stated.
+    assert "无法执行脚本" in system_msg["content"]
+
+
+def test_inline_skills_omitted_uses_defaults_explicit_empty_disables(monkeypatch) -> None:
+    """skills=None (omitted at the endpoint) → whatever resolve returns for the
+    default set; skills=[] (explicit empty) → no catalog, no read_skill tool."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    # Case A: skills omitted (None) — the executor still calls resolve; here the
+    # default set resolves to one skill, so read_skill IS advertised.
+    run_a = Run(
+        id="run_def", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="hi", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db(monkeypatch, run_a)
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=False))
+    calls = _mock_resolve(
+        monkeypatch,
+        [{"name": "default-skill", "version": "1", "sha256": "b" * 64,
+          "description": "默认技能"}],
+    )
+    lines = [
+        _sse({"choices": [{"index": 0, "delta": {"content": "ok"}}]}),
+        _usage_frame(1, 1, 2), "data: [DONE]",
+    ]
+    fake_a = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run_a() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_a):
+            await ex._execute_inline_run(
+                settings=_skill_settings(), tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_def", task="hi",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={}, skills=None,
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run_a())
+    assert [t["function"]["name"] for t in fake_a.chat_payloads[0].get("tools", [])] \
+        == ["read_skill"]
+
+    # Case B: skills=[] (explicit empty) — resolve returns nothing → no read_skill,
+    # no catalog block in the system prompt.
+    run_b = Run(
+        id="run_none", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="hi", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db(monkeypatch, run_b)
+    _mock_resolve(monkeypatch, [])  # empty catalog for any input
+    fake_b = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run_b() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_b):
+            await ex._execute_inline_run(
+                settings=_skill_settings(), tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_none", task="hi",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={}, skills=[],
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run_b())
+    payload_b = fake_b.chat_payloads[0]
+    assert "tools" not in payload_b  # no canvas, no read_skill → plain completion
+    # No catalog block: system message (if any) carries no skill listing.
+    system_b = payload_b["messages"][0]
+    if system_b.get("role") == "system":
+        assert "read_skill" not in system_b["content"]
+    assert calls  # resolve was called in case A (presence semantics honoured)
+
+
+def test_inline_read_skill_tool_call_round_trip(monkeypatch) -> None:
+    """Round 1: model calls read_skill → the tool result frame carries the fetched
+    SKILL.md body; round 2: the model answers normally with the loaded instructions."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    run = Run(
+        id="run_rs", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="做数据分析", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db(monkeypatch, run)
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=False))
+    _mock_resolve(
+        monkeypatch,
+        [{"name": "data-analyzer", "version": "1", "sha256": "c" * 64,
+          "description": "分析数据"}],
+    )
+
+    skill_body = "# Data Analyzer\n\n先加载 CSV，再用 pandas 计算描述性统计，最后给出结论。"
+    fetch_calls: list[dict] = []
+
+    async def _fake_fetch(name, **kw):
+        fetch_calls.append({"name": name, **kw})
+        return skill_body
+
+    monkeypatch.setattr(ex.inline_skill_loader, "fetch_skill_file", _fake_fetch)
+
+    args = json.dumps({"name": "data-analyzer", "path": "SKILL.md"})
+    scripts = [
+        # Round 1: the model calls read_skill.
+        _tool_call_frames(call_id="rs_1", name="read_skill", arguments=args)
+        + [_usage_frame(10, 4, 14)],
+        # Round 2: after the tool result, the model answers using the instructions.
+        [
+            _sse({"choices": [{"index": 0, "delta": {"content": "我已按技能指令完成分析。"}}]}),
+            _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            _usage_frame(20, 6, 26), "data: [DONE]",
+        ],
+    ]
+    fake_client = _MultiRoundGatewayClient(sse_scripts=scripts)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=_skill_settings(), tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_rs", task="做数据分析",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={}, skills=["data-analyzer"],
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED"
+    # The loader was asked for the requested skill, with the resolved sha for caching.
+    assert fetch_calls and fetch_calls[0]["name"] == "data-analyzer"
+    assert fetch_calls[0]["path"] == "SKILL.md"
+    assert fetch_calls[0]["sha256"] == "c" * 64
+    # Round 2 saw the assistant tool_calls frame + a tool result frame whose
+    # content is the fetched SKILL.md body (OpenAI ordering preserved).
+    round2_msgs = fake_client.chat_payloads[1]["messages"]
+    assistant_frame = next(
+        m for m in round2_msgs if m.get("role") == "assistant" and m.get("tool_calls")
+    )
+    tool_frame = next(m for m in round2_msgs if m.get("role") == "tool")
+    assert tool_frame["content"] == skill_body
+    assert tool_frame["tool_call_id"] == "rs_1"
+    # The tool frame follows its assistant tool_calls frame.
+    assert round2_msgs.index(assistant_frame) < round2_msgs.index(tool_frame)
+    # The final reply streamed to the frontend.
+    redis_client = _FakeRedisStream.from_url()
+    deltas = "".join(e[1]["text"] for e in redis_client.entries if e[1]["type"] == "delta")
+    assert "已按技能指令完成分析" in deltas
+
+
+def test_inline_resolve_skips_failed_skill_fail_open() -> None:
+    """resolve_skills drops a skill that fails to resolve and keeps the healthy
+    one — a single bad skill never fails the batch (unit test of the loader)."""
+    from agent_session_orchestrator.services import inline_skill_loader as loader
+
+    class _Resp:
+        def __init__(self, status_code, payload):
+            self.status_code = status_code
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def get(self, url, params=None, headers=None):
+            name = (params or {}).get("names")
+            if name == "good":
+                return _Resp(200, {"items": [{
+                    "name": "good", "version": "1", "sha256": "d" * 64,
+                    "description": "健康技能",
+                }]})
+            # The bad skill 500s — must be skipped, not raised.
+            return _Resp(500, {})
+
+    async def _run():
+        with patch("httpx.AsyncClient", return_value=_Client()):
+            return await loader.resolve_skills(
+                ["good", "bad"],
+                skill_store_url="http://skill-store/api/skills/v1",
+                service_scopes="skill.read_internal",
+                tenant_id=TEST_TENANT, user_id=TEST_USER,
+            )
+
+    entries = asyncio.get_event_loop().run_until_complete(_run())
+    assert [e["name"] for e in entries] == ["good"]
+    assert entries[0]["description"] == "健康技能"
+
+
+def test_inline_fetch_skill_file_truncates_over_64kb() -> None:
+    """A skill file body over 64KB is truncated with the Chinese truncation notice
+    (unit test of the loader)."""
+    from agent_session_orchestrator.services import inline_skill_loader as loader
+
+    big = "字" * 40000  # ~120KB UTF-8, well over the 64KB cap
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"name": "big", "version": "1", "sha256": "e" * 64,
+                    "path": "SKILL.md", "content": big}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def get(self, url, params=None, headers=None):
+            return _Resp()
+
+    async def _run():
+        with patch("httpx.AsyncClient", return_value=_Client()):
+            return await loader.fetch_skill_file(
+                "big",
+                skill_store_url="http://skill-store/api/skills/v1",
+                service_scopes="skill.read_internal",
+                tenant_id=TEST_TENANT, user_id=TEST_USER,
+                sha256="e" * 64, path="SKILL.md",
+            )
+
+    body = asyncio.get_event_loop().run_until_complete(_run())
+    # Truncated below the original length, capped near 64KB, with the notice.
+    assert len(body.encode("utf-8")) <= loader._SKILL_FILE_MAX_BYTES + len(
+        loader._TRUNCATION_NOTICE.encode("utf-8")
+    )
+    assert body.endswith(loader._TRUNCATION_NOTICE)
+    assert len(body) < len(big)
+
+
+def test_inline_fetch_skill_file_wire_contract() -> None:
+    """Pin the skill-store file-endpoint wire contract: the request must carry
+    ``tenant_id``/``user_id``/``path`` as query params (the internal endpoint
+    declares them as required query params — omitting them is a 422 on the real
+    stack, invisible to loader-level mocks)."""
+    from agent_session_orchestrator.services import inline_skill_loader as loader
+
+    seen: dict = {}
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"name": "wire", "version": "1", "sha256": "f" * 64,
+                    "path": "references/notes.md", "content": "ok"}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def get(self, url, params=None, headers=None):
+            seen["url"] = url
+            seen["params"] = params
+            seen["headers"] = headers
+            return _Resp()
+
+    async def _run():
+        with patch("httpx.AsyncClient", return_value=_Client()):
+            return await loader.fetch_skill_file(
+                "wire",
+                skill_store_url="http://skill-store/api/skills/v1",
+                service_scopes="skill.read_internal",
+                tenant_id=TEST_TENANT, user_id=TEST_USER,
+                sha256="f" * 64, path="references/notes.md",
+            )
+
+    body = asyncio.get_event_loop().run_until_complete(_run())
+    assert body == "ok"
+    assert seen["url"].endswith("/internal/skills/wire/file")
+    assert seen["params"] == {
+        "tenant_id": TEST_TENANT,
+        "user_id": TEST_USER,
+        "path": "references/notes.md",
+    }
+    assert seen["headers"]["X-Tenant-Id"] == TEST_TENANT
+    assert seen["headers"]["X-Service-Scopes"] == "skill.read_internal"
+
+
+def test_create_run_inline_branch_threads_skills(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """The create_run inline branch threads the presence-resolved skill list into
+    start_inline_run (explicit selection wins, defaults are not fetched)."""
+    session = Session(id="ses_sk", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_sk"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+
+    started: list[dict] = []
+    default_lookups: list[str] = []
+
+    class _FakeClient(AuthzAwareClient):
+        async def get(self, url, **kw):
+            if "default-installed" in url:
+                default_lookups.append(url)
+                return __import__("httpx").Response(200, json={"items": []})
+            return __import__("httpx").Response(200, json={"hits": []})
+
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if url.endswith("/quota/check"):
+                return __import__("httpx").Response(200, json={"allowed": True})
+            if url.endswith("/quota/usage"):
+                return __import__("httpx").Response(200, json={})
+            return __import__("httpx").Response(201, json={"sandbox_id": "x"})
+
+    def _fake_start(**kw):
+        started.append(kw)
+
+    import httpx
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()), \
+            patch(
+                "agent_session_orchestrator.api.v1.runs.start_inline_run",
+                new=_fake_start,
+            ):
+        resp = app_client.post(
+            "/api/session/v1/sessions/ses_sk/runs",
+            headers=auth_headers,
+            json={"task": "跑技能", "execution_mode": "inline",
+                  "skills": ["data-analyzer", "writer"]},
+        )
+
+    assert resp.status_code == 201, resp.text
+    # Explicit skills threaded verbatim; defaults NOT looked up (presence semantics).
+    assert started and started[0]["skills"] == ["data-analyzer", "writer"]
+    assert default_lookups == []

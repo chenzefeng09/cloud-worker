@@ -47,6 +47,9 @@ class MessageOut(BaseModel):
     sequence: int
     created_at: datetime
     attachments: list[AttachmentMeta] = []
+    # Canvas v2 (Phase B): backfilled by canvas materialization so the SPA can
+    # anchor the canvas card on hydration (docs/canvas-v2-design.md §3.4).
+    canvas_id: str | None = None
 
     model_config = {"from_attributes": True}
 

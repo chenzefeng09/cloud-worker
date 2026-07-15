@@ -1087,6 +1087,60 @@ def test_memory_absent_does_not_break_run(workspace, env, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Tests -- canvas system-prompt injection (canvas v2, Phase B)
+#
+# The prompt block is gated on ``canvas_tool`` in RUNTIME_EXTENSIONS and must
+# carry FORCING language so deepseek reliably calls create_canvas for prose.
+# ---------------------------------------------------------------------------
+
+
+def test_canvas_prompt_injected_with_forcing_language(workspace, env, monkeypatch):
+    """With canvas_tool enabled, the system prompt carries the strong,
+    imperative canvas instruction (mandatory tool call for prose creation)."""
+    ws, worker_mod = workspace
+    _install_fake_agentscope(monkeypatch)
+    env.setenv("RUNTIME_EXTENSIONS", "canvas_tool")
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "写一篇《AI 与就业》短文"}))
+    _FakeAgent.reply_text = "已为你创作《AI 与就业》，内容在右侧画布中。"
+
+    assert worker_mod.main([]) == 0
+
+    inst = _FakeAgent.last_instance
+    assert inst is not None
+    prompt = inst.system_prompt
+
+    # Section header + tool name present.
+    assert "create_canvas" in prompt
+    assert "成文创作" in prompt
+    # Forcing / imperative wording deepseek is meant to obey.
+    assert "必须" in prompt
+    assert "唯一正确" in prompt
+    # The "one sentence only, do not repeat the full text" contract.
+    assert "只能写一句话" in prompt
+    assert "不要先在正文里把文章写出来再调用" in prompt
+    # Book-title (《》) assignment is explicitly covered.
+    assert "《书名号》" in prompt
+    # A concrete few-shot cue is present.
+    assert "示例" in prompt
+
+
+def test_canvas_prompt_absent_when_extension_disabled(workspace, env, monkeypatch):
+    """Without canvas_tool in RUNTIME_EXTENSIONS, the canvas block is not
+    injected (tool + guidance appear/disappear together)."""
+    ws, worker_mod = workspace
+    _install_fake_agentscope(monkeypatch)
+    env.setenv("RUNTIME_EXTENSIONS", "web_fetch,skills_loader")
+    env.setenv("AGENT_TASK_JSON", json.dumps({"task": "hi"}))
+    _FakeAgent.reply_text = "hi"
+
+    assert worker_mod.main([]) == 0
+
+    inst = _FakeAgent.last_instance
+    assert inst is not None
+    assert "create_canvas" not in inst.system_prompt
+
+
+# ---------------------------------------------------------------------------
 # Tests -- history restore: name unification (msg.name == agent name)
 # ---------------------------------------------------------------------------
 

@@ -704,7 +704,7 @@ class DockerRuntime:
 
     # ---------------------------------------------------------------- artifacts
     _EXCLUDED_NAMES: frozenset[str] = frozenset({
-        "task.json", "result.json", "events.jsonl",
+        "task.json", "result.json", "events.jsonl", "canvas.json",
     })
 
     def _upload_artifacts(
@@ -717,8 +717,10 @@ class DockerRuntime:
     ) -> list[dict[str, Any]]:
         """Scan ``workspace`` for output files and upload them to S3.
 
-        Excluded: task.json, result.json, events.jsonl, and everything under
-        inputs/ (user-uploaded originals).  Returns a list of artifact dicts::
+        Excluded: task.json, result.json, events.jsonl, canvas.json (a
+        diagnostic mirror — the canvas is persisted via the Redis→DB canvas
+        API), and everything under inputs/ (user-uploaded originals).  Returns a
+        list of artifact dicts::
 
             [{"filename": str, "s3_key": str, "size": int, "mime": str}, ...]
 

@@ -286,11 +286,27 @@ def test_upload_rejects_description_over_limit(
     app_client: TestClient, tenant_headers: dict[str, str],
 ) -> None:
     skill = _create_skill(app_client, tenant_headers)
-    long_desc = "x" * 201
+    # Ceiling is MAX_DESCRIPTION_LEN (2000, aligned with the varchar column);
+    # 2001 chars must still be rejected as over-limit.
+    long_desc = "x" * 2001
     fm = f"---\nname: too-long-desc\ndescription: {long_desc}\n---\nbody\n"
     tarball = _make_tarball({"SKILL.md": fm.encode("utf-8")})
     resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
     _assert_invalid(resp, contains="description 过长")
+
+
+def test_upload_accepts_description_at_2000_character_limit(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers)
+    description = "x" * 2000
+    fm = f"---\nname: max-description\ndescription: {description}\n---\nbody\n"
+    tarball = _make_tarball({"SKILL.md": fm.encode("utf-8")})
+
+    resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["manifest"]["description"] == description
 
 
 def test_upload_rejects_path_traversal(
@@ -593,6 +609,270 @@ def test_internal_resolve_returns_presigned(
     # this is a real HTTP presigned URL.
     assert item["blob_url"].startswith("memory://tenant/")
     assert "ttl=" in item["blob_url"]
+
+
+_INTERNAL_TENANT = "tnt_01J5TEST00000000000000TNT1"
+_INTERNAL_USER = "usr_01J5TEST0000000000000USER1"
+
+
+def _install_skill(
+    client: TestClient,
+    tenant_headers: dict[str, str],
+    skill_id: str,
+    *,
+    version: str | None = None,
+) -> None:
+    body: dict[str, object] = {"enabled_by_default": True}
+    if version is not None:
+        body["version"] = version
+    resp = client.post(
+        f"/api/skills/v1/skills/{skill_id}/install",
+        headers=tenant_headers,
+        json=body,
+    )
+    assert resp.status_code == 201, resp.text
+
+
+def test_internal_resolve_returns_description(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+) -> None:
+    # The resolved entry carries the manifest description (from SKILL.md
+    # frontmatter — VALID_FRONTMATTER declares ``description: writes poetry``).
+    skill = _create_skill(app_client, tenant_headers, visibility="private")
+    _upload(app_client, tenant_headers, skill["id"], tarball=_valid_skill_tarball())
+    _install_skill(app_client, tenant_headers, skill["id"], version="1.0.0")
+
+    resp = app_client.get(
+        "/api/skills/v1/internal/skills/resolve",
+        params={
+            "tenant_id": _INTERNAL_TENANT,
+            "user_id": _INTERNAL_USER,
+            "names": "poet",
+        },
+        headers=internal_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    item = resp.json()["items"][0]
+    assert item["description"] == "writes poetry"
+
+
+def _file_request(
+    client: TestClient,
+    internal_headers: dict[str, str],
+    name: str,
+    *,
+    path: str | None = None,
+) -> object:
+    params: dict[str, str] = {
+        "tenant_id": _INTERNAL_TENANT,
+        "user_id": _INTERNAL_USER,
+    }
+    if path is not None:
+        params["path"] = path
+    return client.get(
+        f"/api/skills/v1/internal/skills/{name}/file",
+        params=params,
+        headers=internal_headers,
+    )
+
+
+def test_internal_file_requires_scope(app_client: TestClient) -> None:
+    resp = app_client.get(
+        "/api/skills/v1/internal/skills/poet/file",
+        params={"tenant_id": _INTERNAL_TENANT, "user_id": _INTERNAL_USER},
+    )
+    assert resp.status_code == 403
+
+
+def test_internal_file_root_layout_skill_md(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers, visibility="private")
+    _upload(app_client, tenant_headers, skill["id"], tarball=_valid_skill_tarball())
+    _install_skill(app_client, tenant_headers, skill["id"], version="1.0.0")
+
+    resp = _file_request(app_client, internal_headers, "poet")
+    assert resp.status_code == 200, resp.text  # type: ignore[attr-defined]
+    body = resp.json()  # type: ignore[attr-defined]
+    assert body["name"] == "poet"
+    assert body["version"] == "1.0.0"
+    assert body["sha256"]
+    assert body["path"] == "SKILL.md"
+    assert body["content"] == VALID_FRONTMATTER
+
+
+def test_internal_file_subdir_layout_skill_md(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+) -> None:
+    # Single-subdir layout (<dir>/SKILL.md): path="SKILL.md" still resolves
+    # relative to the skill root (the subdir).
+    skill = _create_skill(app_client, tenant_headers, visibility="private")
+    _upload(
+        app_client, tenant_headers, skill["id"],
+        tarball=_valid_skill_tarball(subdir="poet"),
+    )
+    _install_skill(app_client, tenant_headers, skill["id"], version="1.0.0")
+
+    resp = _file_request(app_client, internal_headers, "poet", path="SKILL.md")
+    assert resp.status_code == 200, resp.text  # type: ignore[attr-defined]
+    body = resp.json()  # type: ignore[attr-defined]
+    assert body["path"] == "SKILL.md"
+    assert body["content"] == VALID_FRONTMATTER
+
+
+def test_internal_file_reads_references(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers, visibility="private")
+    _upload(app_client, tenant_headers, skill["id"], tarball=_valid_skill_tarball())
+    _install_skill(app_client, tenant_headers, skill["id"], version="1.0.0")
+
+    resp = _file_request(
+        app_client, internal_headers, "poet", path="references/notes.md",
+    )
+    assert resp.status_code == 200, resp.text  # type: ignore[attr-defined]
+    body = resp.json()  # type: ignore[attr-defined]
+    assert body["path"] == "references/notes.md"
+    # _valid_skill_tarball writes ``see also`` into references/notes.md.
+    assert body["content"] == "see also"
+
+
+def test_internal_file_reads_references_subdir_layout(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+) -> None:
+    # references/ path resolves relative to the skill root even under a
+    # single-subdir layout.
+    skill = _create_skill(app_client, tenant_headers, visibility="private")
+    _upload(
+        app_client, tenant_headers, skill["id"],
+        tarball=_valid_skill_tarball(subdir="poet"),
+    )
+    _install_skill(app_client, tenant_headers, skill["id"], version="1.0.0")
+
+    resp = _file_request(
+        app_client, internal_headers, "poet", path="references/notes.md",
+    )
+    assert resp.status_code == 200, resp.text  # type: ignore[attr-defined]
+    assert resp.json()["content"] == "see also"  # type: ignore[attr-defined]
+
+
+def test_internal_file_unknown_skill_404(
+    app_client: TestClient,
+    internal_headers: dict[str, str],
+) -> None:
+    # Skill name that the user has not installed → 404.
+    resp = _file_request(app_client, internal_headers, "ghost")
+    assert resp.status_code == 404, resp.text  # type: ignore[attr-defined]
+    assert resp.json()["code"] == "SKILL.NOT_FOUND"  # type: ignore[attr-defined]
+
+
+def test_internal_file_unknown_path_404(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers, visibility="private")
+    _upload(app_client, tenant_headers, skill["id"], tarball=_valid_skill_tarball())
+    _install_skill(app_client, tenant_headers, skill["id"], version="1.0.0")
+
+    resp = _file_request(
+        app_client, internal_headers, "poet", path="references/missing.md",
+    )
+    assert resp.status_code == 404, resp.text  # type: ignore[attr-defined]
+    assert resp.json()["code"] == "SKILL.FILE.NOT_FOUND"  # type: ignore[attr-defined]
+
+
+def test_internal_file_rejects_path_traversal(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+) -> None:
+    skill = _create_skill(app_client, tenant_headers, visibility="private")
+    _upload(app_client, tenant_headers, skill["id"], tarball=_valid_skill_tarball())
+    _install_skill(app_client, tenant_headers, skill["id"], version="1.0.0")
+
+    resp = _file_request(
+        app_client, internal_headers, "poet", path="../secret.md",
+    )
+    assert resp.status_code == 400, resp.text  # type: ignore[attr-defined]
+    assert resp.json()["code"] == "SKILL.FILE.PATH_INVALID"  # type: ignore[attr-defined]
+
+
+def test_internal_file_non_utf8_returns_415(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+) -> None:
+    # A binary (non-UTF-8) member is rejected as unservable text (415).
+    skill = _create_skill(app_client, tenant_headers, visibility="private")
+    tarball = _make_tarball(
+        {
+            "SKILL.md": VALID_FRONTMATTER.encode("utf-8"),
+            "assets/logo.bin": b"\xff\xfe\x00\x01binary",
+        }
+    )
+    _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
+    _install_skill(app_client, tenant_headers, skill["id"], version="1.0.0")
+
+    resp = _file_request(
+        app_client, internal_headers, "poet", path="assets/logo.bin",
+    )
+    assert resp.status_code == 415, resp.text  # type: ignore[attr-defined]
+    assert resp.json()["code"] == "SKILL.FILE.NOT_TEXT"  # type: ignore[attr-defined]
+
+
+def test_internal_default_installed_requires_scope(app_client: TestClient) -> None:
+    resp = app_client.get(
+        "/api/skills/v1/internal/skills/default-installed",
+        params={
+            "tenant_id": "tnt_01J5TEST00000000000000TNT1",
+            "user_id": "usr_01J5TEST0000000000000USER1",
+        },
+    )
+    assert resp.status_code == 403
+
+
+def test_internal_default_installed_filters_by_default(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+) -> None:
+    # Two installed skills: one default-enabled, one not.
+    on = _create_skill(app_client, tenant_headers, name="poet", visibility="private")
+    off = _create_skill(app_client, tenant_headers, name="ghost", visibility="private")
+    assert app_client.post(
+        f"/api/skills/v1/skills/{on['id']}/install",
+        headers=tenant_headers,
+        json={"enabled_by_default": True},
+    ).status_code == 201
+    assert app_client.post(
+        f"/api/skills/v1/skills/{off['id']}/install",
+        headers=tenant_headers,
+        json={"enabled_by_default": False},
+    ).status_code == 201
+
+    resp = app_client.get(
+        "/api/skills/v1/internal/skills/default-installed",
+        params={
+            "tenant_id": "tnt_01J5TEST00000000000000TNT1",
+            "user_id": "usr_01J5TEST0000000000000USER1",
+        },
+        headers=internal_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["total"] == 1
+    assert [item["name"] for item in body["items"]] == ["poet"]
 
 
 def test_internal_endpoint_returns_skills_with_versions(

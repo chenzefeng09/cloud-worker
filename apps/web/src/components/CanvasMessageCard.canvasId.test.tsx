@@ -6,7 +6,7 @@
  * versions and reverts. `api.canvas.*` is mocked module-wide so the store's
  * actions resolve without real network I/O.
  */
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CanvasMessageCard } from './CanvasMessageCard';
@@ -17,6 +17,7 @@ const mockVersions = vi.fn();
 const mockRevert = vi.fn();
 const mockAccept = vi.fn();
 const mockReject = vi.fn();
+const mockEdit = vi.fn();
 
 vi.mock('../api/client', () => ({
   api: {
@@ -27,42 +28,46 @@ vi.mock('../api/client', () => ({
       reject: (...a: unknown[]) => mockReject(...a),
       get: vi.fn(),
       create: vi.fn(),
-      edit: vi.fn(),
+      edit: (...a: unknown[]) => mockEdit(...a),
       saveVersion: vi.fn(),
     },
   },
 }));
 
 function seedCanvas(overrides: Partial<CanvasDocument> = {}) {
-  useCanvasStore.getState().setCanvas({
-    id: 'cvs_1',
-    session_id: 'ses_test',
-    kind: 'article',
-    title: '测试',
-    current_version: 3,
-    source_message_id: null,
-    source_run_id: null,
-    blocks: [
-      { id: 'blk_1', type: 'heading', text: '# 标题' },
-      { id: 'blk_2', type: 'paragraph', text: '正文内容' },
-    ],
-    created_at: '2026-07-10T00:00:00Z',
-    updated_at: '2026-07-10T00:00:00Z',
-    ...overrides,
+  act(() => {
+    useCanvasStore.getState().setCanvas({
+      id: 'cvs_1',
+      session_id: 'ses_test',
+      kind: 'article',
+      title: '测试',
+      current_version: 3,
+      source_message_id: null,
+      source_run_id: null,
+      blocks: [
+        { id: 'blk_1', type: 'heading', text: '# 标题' },
+        { id: 'blk_2', type: 'paragraph', text: '正文内容' },
+      ],
+      created_at: '2026-07-10T00:00:00Z',
+      updated_at: '2026-07-10T00:00:00Z',
+      ...overrides,
+    });
   });
 }
 
 function seedSuggestion(diffs: CanvasSuggestion['diffs']) {
-  useCanvasStore.getState().setSuggestion('cvs_1', {
-    id: 'csg_1',
-    canvas_id: 'cvs_1',
-    base_version: 3,
-    status: 'proposed',
-    instruction: '精简正文',
-    diffs,
-    change_summary: '精简了正文',
-    created_at: '2026-07-10T00:00:00Z',
-    resolved_at: null,
+  act(() => {
+    useCanvasStore.getState().setSuggestion('cvs_1', {
+      id: 'csg_1',
+      canvas_id: 'cvs_1',
+      base_version: 3,
+      status: 'proposed',
+      instruction: '精简正文',
+      diffs,
+      change_summary: '精简了正文',
+      created_at: '2026-07-10T00:00:00Z',
+      resolved_at: null,
+    });
   });
 }
 
@@ -74,11 +79,66 @@ beforeEach(() => {
   });
 });
 
+function selectText(root: HTMLElement, value: string): void {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let node = walker.nextNode();
+  while (node && !node.textContent?.includes(value)) node = walker.nextNode();
+  if (!(node instanceof Text)) throw new Error(`Text not found: ${value}`);
+  const start = node.data.indexOf(value);
+  const range = document.createRange();
+  range.setStart(node, start);
+  range.setEnd(node, start + value.length);
+  Object.defineProperty(range, 'getBoundingClientRect', {
+    value: () => ({ left: 100, top: 100, width: 50, height: 20 }),
+  });
+  window.getSelection()?.removeAllRanges();
+  window.getSelection()?.addRange(range);
+}
+
 afterEach(() => {
-  useCanvasStore.getState().reset();
+  act(() => useCanvasStore.getState().reset());
 });
 
 describe('CanvasMessageCard canvasId mode — SuggestionDiffView', () => {
+  it('sends a selected fragment as an explicit block-local scope', async () => {
+    const user = userEvent.setup();
+    seedCanvas();
+    mockEdit.mockResolvedValueOnce({
+      suggestion: {
+        id: 'csg_2',
+        canvas_id: 'cvs_1',
+        base_version: 3,
+        status: 'proposed',
+        instruction: '改得更有力',
+        diffs: [],
+        created_at: '2026-07-10T00:00:00Z',
+      },
+    });
+    render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
+
+    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    await waitFor(() => expect(editor).toHaveTextContent('正文内容'));
+    selectText(editor, '内容');
+    fireEvent.mouseUp(editor);
+    await user.click(await screen.findByText('要求更改'));
+    await user.type(screen.getByPlaceholderText('修改一下'), '改得更有力');
+    await user.click(screen.getByTitle('发送修改要求'));
+
+    await waitFor(() => expect(mockEdit).toHaveBeenCalledTimes(1));
+    expect(mockEdit).toHaveBeenCalledWith(
+      'ses_test',
+      'cvs_1',
+      expect.objectContaining({
+        instruction: '改得更有力',
+        base_version: 3,
+        scope: {
+          type: 'selection',
+          segments: [{ block_id: 'blk_2', start: 2, end: 4, text: '内容' }],
+        },
+      }),
+    );
+  });
+
   it('renders the per-block diff view for an active suggestion', async () => {
     seedCanvas();
     seedSuggestion([
@@ -120,6 +180,32 @@ describe('CanvasMessageCard canvasId mode — SuggestionDiffView', () => {
     await user.click(screen.getByRole('button', { name: '接受' }));
 
     await waitFor(() => expect(mockAccept).toHaveBeenCalledWith('cvs_1', 'csg_1'));
+  });
+
+  it('renders character suggestions inline with orig/sugg scope markers', () => {
+    seedCanvas();
+    seedSuggestion([
+      {
+        block_id: 'blk_2',
+        op: 'replace',
+        orig: '正文内容',
+        sugg: '正文更有力',
+        selection_start: 2,
+        selection_end: 4,
+        selected_orig: '内容',
+        selected_sugg: '更有力',
+      },
+    ]);
+
+    render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
+
+    const review = screen.getByLabelText('选区修改建议');
+    const orig = review.querySelector('[data-magic-edit-block="true"][data-me-role="orig"]');
+    const sugg = review.querySelector('[data-magic-edit-block="true"][data-me-role="sugg"]');
+    expect(orig).toHaveTextContent('内容');
+    expect(orig).toHaveAttribute('data-me-id', 'csg_1');
+    expect(sugg).toHaveTextContent('更有力');
+    expect(screen.queryByLabelText('修改建议')).not.toBeInTheDocument();
   });
 });
 

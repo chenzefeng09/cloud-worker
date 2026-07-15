@@ -123,6 +123,20 @@ class CanvasService:
         result = await self._db.execute(stmt)
         return list(result.scalars().all())
 
+    async def list_canvases_for_run(self, run_id: str) -> list[CanvasDocument]:
+        """Return live canvases materialized from ``run_id`` in creation order."""
+        stmt = (
+            select(CanvasDocument)
+            .where(
+                CanvasDocument.source_run_id == run_id,
+                CanvasDocument.tenant_id == self._tenant_id,
+                CanvasDocument.deleted_at.is_(None),
+            )
+            .order_by(CanvasDocument.created_at.asc())
+        )
+        result = await self._db.execute(stmt)
+        return list(result.scalars().all())
+
     async def count_canvases_for_run(self, run_id: str) -> int:
         """Count live canvases already materialized from ``run_id`` (Phase B).
 
@@ -133,13 +147,7 @@ class CanvasService:
         soft-deleted rows would over-count and drop a re-create, so we count only
         live rows — matching what a fresh materialization would append after.
         """
-        stmt = select(CanvasDocument).where(
-            CanvasDocument.source_run_id == run_id,
-            CanvasDocument.tenant_id == self._tenant_id,
-            CanvasDocument.deleted_at.is_(None),
-        )
-        result = await self._db.execute(stmt)
-        return len(list(result.scalars().all()))
+        return len(await self.list_canvases_for_run(run_id))
 
     async def backfill_message_canvas_id(
         self, *, session_id: str, run_id: str, canvas_id: str
@@ -153,6 +161,25 @@ class CanvasService:
         row may not be persisted at materialization time — the ``canvas_created``
         event still carries ``canvas_id`` so the card renders regardless).
         """
+        # Idempotency guard: reconciliation calls this repeatedly.  If this
+        # canvas is already anchored, return that message instead of assigning
+        # the same canvas to another unlinked assistant row from the run.
+        linked_stmt = (
+            select(Message)
+            .where(
+                Message.session_id == session_id,
+                Message.tenant_id == self._tenant_id,
+                Message.run_id == run_id,
+                Message.role == "assistant",
+                Message.canvas_id == canvas_id,
+            )
+            .order_by(Message.sequence.desc())
+        )
+        linked_result = await self._db.execute(linked_stmt)
+        linked = linked_result.scalars().first()
+        if linked is not None:
+            return linked.id
+
         stmt = (
             select(Message)
             .where(

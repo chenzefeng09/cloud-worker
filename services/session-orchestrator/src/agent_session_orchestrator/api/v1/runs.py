@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
 from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, TUserId
+
 # Reuse the chat path's run-completion reconciler verbatim (poll scheduler,
 # map container status, persist result_summary/status/finished_at/tokens, write
 # the assistant message, failure-open).  It is module-private in messages.py but
@@ -86,20 +87,40 @@ def _serialize_run(r: Run) -> dict[str, Any]:
     }
 
 
-async def _fetch_memory(*, knowledge_ingest_url: str, tenant_id: str, query: str) -> str:
+async def _fetch_memory(
+    *,
+    knowledge_ingest_url: str,
+    tenant_id: str,
+    user_id: str,
+    query: str,
+    session_id: str = "",
+) -> str:
     """Query knowledge-ingest for relevant memories and return a formatted string.
 
-    Uses ``GET /search?q=<query>&k=<K>`` with ``X-Tenant-Id`` header.
-    Returns an empty string on any error (failure-open).
+    Uses ``GET /search?q=<query>&k=<K>`` with ``X-Tenant-Id``/``X-User-Id``
+    headers.  Returns an empty string on any error (failure-open).
+
+    ``user_id`` must be the real originating user (``usr_...``) — knowledge-
+    ingest's authz guard is fail-closed and rejects the ``SYSTEM`` sentinel,
+    which used to make this search silently 403 (memory retrieval always empty).
+    Callers pass the resolved session owner, never the system identity.
+
+    When ``session_id`` is provided it is sent as ``exclude_origin_session_id``
+    so this session's own prior-turn Q&A is excluded from the results — that
+    context is already restored into the agent via conversation history, and
+    re-injecting it as RAG double-feeds the same turns.
     """
     if not query.strip() or not knowledge_ingest_url:
         return ""
+    params: dict[str, Any] = {"q": query[:500], "k": _MEMORY_SEARCH_K}
+    if session_id:
+        params["exclude_origin_session_id"] = session_id
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(
                 f"{knowledge_ingest_url}/search",
-                params={"q": query[:500], "k": _MEMORY_SEARCH_K},
-                headers={"X-Tenant-Id": tenant_id, "X-User-Id": "SYSTEM"},
+                params=params,
+                headers={"X-Tenant-Id": tenant_id, "X-User-Id": user_id},
             )
         if resp.status_code != 200:
             logger.debug(
@@ -119,6 +140,59 @@ async def _fetch_memory(*, knowledge_ingest_url: str, tenant_id: str, query: str
     except Exception as exc:  # noqa: BLE001
         logger.debug("memory pre-fetch failed (failure-open): %s", exc)
         return ""
+
+
+async def _fetch_default_installed_skills(
+    *,
+    skill_store_url: str,
+    service_scopes: str,
+    tenant_id: str,
+    user_id: str,
+) -> list[str]:
+    """Return the user's installed skills that are enabled by default.
+
+    This lookup is used only when the run request omits the ``skills`` key.
+    It is intentionally failure-open: an unavailable or malformed skill-store
+    response must not prevent the run from reaching the scheduler.
+    """
+    if not skill_store_url:
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{skill_store_url.rstrip('/')}/internal/skills/default-installed",
+                params={"tenant_id": tenant_id, "user_id": user_id},
+                headers={
+                    "X-Tenant-Id": tenant_id,
+                    "X-User-Id": user_id,
+                    "X-Service-Scopes": service_scopes,
+                },
+            )
+        if resp.status_code != 200:
+            logger.warning(
+                "default installed skills lookup returned %s; proceeding without skills",
+                resp.status_code,
+            )
+            return []
+
+        items = resp.json().get("items") or []
+        names: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name and name not in seen:
+                names.append(name)
+                seen.add(name)
+        return names
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "default installed skills lookup failed; proceeding without skills: %s",
+            exc,
+        )
+        return []
 
 
 async def _assemble_history(
@@ -305,7 +379,9 @@ async def create_run(
     memory_snippets = await _fetch_memory(
         knowledge_ingest_url=knowledge_ingest_url,
         tenant_id=tenant_id,
+        user_id=user_id,
         query=task,
+        session_id=session_id,
     )
 
     # Assemble prior-turn conversation history so the worker can restore it
@@ -313,6 +389,24 @@ async def create_run(
     # user message *before* triggering this run, so it's already in the table
     # as the latest USER row — we drop it (it's this run's input, not history).
     history = await _assemble_history(svc, session_id, current_task=task)
+
+    # Skill selection has presence semantics, not truthiness semantics:
+    # explicitly sending ``skills`` (including ``[]`` or ``null``) suppresses
+    # automatic defaults.  Only a truly omitted key loads the user's installed
+    # skills whose install relation has ``enabled_by_default=true``.  Resolved
+    # here — BEFORE the inline branch returns — so both the inline and sandbox
+    # branches consume the same result (inline threads the names into the
+    # in-process skill loop; sandbox writes them into task.json).
+    if "skills" in body:
+        run_skills = body.get("skills") or []
+    else:
+        _settings = request.app.state.settings
+        run_skills = await _fetch_default_installed_skills(
+            skill_store_url=_settings.skill_store_url,
+            service_scopes=_settings.skill_store_service_scopes,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
 
     # ── Inline (chat-mode) branch ───────────────────────────────────────────
     # No scheduler, no sandbox: flip the run to RUNNING in THIS transaction so
@@ -352,6 +446,10 @@ async def create_run(
             memory=memory_snippets,
             history=history,
             sampling_params=sampling_params,
+            # Same presence-resolved skill set the sandbox branch relays; the
+            # executor resolves these to a catalog and runs the in-process
+            # read_skill loop (empty/omitted → no skill loop, prior behaviour).
+            skills=run_skills,
         )
 
         # Record inline-run usage against the ``agent_sessions`` quota dimension
@@ -396,9 +494,10 @@ async def create_run(
                     # to a concrete sandbox memory limit (small vs large tier).
                     "total_attachment_bytes": total_attachment_bytes,
                     "memory": memory_snippets,
-                    # Per-message skill selection relayed from BFF; scheduler
-                    # writes these into task.json["skills"] for the worker.
-                    "skills": body.get("skills") or [],
+                    # Explicit per-message selection, or (only when the request
+                    # omitted ``skills``) the user's default-enabled installs.
+                    # The scheduler writes these into task.json["skills"].
+                    "skills": run_skills,
                     # Prior-turn conversation history for multi-turn memory.
                     "history": history,
                     # App-harness fields (empty/absent for chat runs).  The
