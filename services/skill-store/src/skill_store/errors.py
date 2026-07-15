@@ -91,3 +91,51 @@ class InternalScopeRequiredError(SkillStoreError):
             code="SKILL.AUTH.INTERNAL_SCOPE_REQUIRED",
             status=403,
         )
+
+
+class SkillFilePathInvalidError(SkillStoreError):
+    """The requested ``path`` is absolute or contains a ``..`` segment."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(
+            f"Invalid skill file path {path!r}",
+            code="SKILL.FILE.PATH_INVALID",
+            status=400,
+            user_message=f"非法的文件路径：{path}（不允许绝对路径或包含 '..'）",
+        )
+
+
+class SkillFileNotFoundError(SkillStoreError):
+    """No regular-file member at the resolved path inside the package."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(
+            f"Skill file {path!r} not found in package",
+            code="SKILL.FILE.NOT_FOUND",
+            status=404,
+            user_message=f"技能包内不存在该文件：{path}",
+        )
+
+
+class SkillFileTooLargeError(SkillStoreError):
+    """The requested member exceeds the per-member size cap."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(
+            f"Skill file {path!r} exceeds the maximum member size",
+            code="SKILL.FILE.TOO_LARGE",
+            status=413,
+            user_message=f"技能包内该文件过大，超出单文件大小上限：{path}",
+        )
+
+
+class SkillFileNotTextError(SkillStoreError):
+    """The requested member is not valid UTF-8 text."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(
+            f"Skill file {path!r} is not valid UTF-8 text",
+            code="SKILL.FILE.NOT_TEXT",
+            status=415,
+            user_message=f"技能包内该文件不是合法的 UTF-8 文本：{path}",
+        )

@@ -55,11 +55,11 @@ export function LibraryPage() {
   // Skill the user is installing-to-toolbox via the InstallToToolbox modal.
   const [toolboxTarget, setToolboxTarget] = useState<Skill | null>(null);
 
-  // The user's already-installed skills — drives the "已安装" grey state on
-  // each shelf row. refresh() is called after a successful install.
+  // The user's already-installed skills — drives the default/on-demand state
+  // shown on each shelf row. refresh() is called after a successful install.
   const installedSkills = useInstalledSkills();
-  const installedSkillIds = useMemo(
-    () => new Set(installedSkills.map((s) => s.id)),
+  const installedSkillById = useMemo(
+    () => new Map(installedSkills.map((s) => [s.id, s])),
     [installedSkills],
   );
 
@@ -107,7 +107,7 @@ export function LibraryPage() {
       />
 
       <div className="cw-scroll flex-1 px-8 py-5">
-        <div className="max-w-[960px] flex flex-col gap-4">
+        <div className="w-full max-w-[960px] min-w-0 flex flex-col gap-4">
 
           {/* stat tiles */}
           <div className="grid grid-cols-3 gap-px bg-line border border-line rounded-md overflow-hidden">
@@ -169,9 +169,9 @@ export function LibraryPage() {
                   {mcpServers.map((s) => (
                     <div
                       key={s.id}
-                      className="grid grid-cols-[1fr_80px_80px_100px] gap-3 items-center px-3.5 py-2.5 border border-line bg-surface rounded-md hover:border-ink-2 transition-all"
+                      className="grid grid-cols-[minmax(0,1fr)_80px_80px_100px] gap-3 items-center px-3.5 py-2.5 border border-line bg-surface rounded-md hover:border-ink-2 transition-all"
                     >
-                      <div>
+                      <div className="min-w-0">
                         <div className="text-[13.5px] font-medium">{s.name}</div>
                         <div className="font-mono text-[11px] text-dim truncate">
                           {s.transport === 'http' ? s.endpoint : s.command}
@@ -199,19 +199,25 @@ export function LibraryPage() {
               ) : (
                 <div className="flex flex-col gap-1.5">
                   {skills.map((sk) => {
-                    const installed = installedSkillIds.has(sk.id);
+                    const installed = installedSkillById.get(sk.id);
                     return (
                       <div
                         key={sk.id}
-                        className="grid grid-cols-[1fr_80px_100px_72px] gap-3 items-center px-3.5 py-2.5 border border-line bg-surface rounded-md hover:border-ink-2 transition-all"
+                        data-testid={`skill-row-${sk.id}`}
+                        className="grid grid-cols-[minmax(0,1fr)_80px_100px_72px] gap-3 items-center px-3.5 py-2.5 border border-line bg-surface rounded-md hover:border-ink-2 transition-all"
                       >
-                        <div>
+                        <div className="min-w-0">
                           <div className="text-[13.5px] font-medium">{sk.name}</div>
                           {sk.description && (
-                            <div className="font-mono text-[11px] text-dim truncate">{sk.description}</div>
+                            <div
+                              className="font-mono text-[11px] text-dim truncate"
+                              title={sk.description}
+                            >
+                              {sk.description}
+                            </div>
                           )}
                         </div>
-                        <span className="font-mono text-[11px] text-ink-2">
+                        <span className="font-mono text-[11px] text-ink-2 truncate">
                           {sk.owner ?? '—'}
                         </span>
                         <span className="font-mono text-[11px] text-dim">
@@ -219,10 +225,18 @@ export function LibraryPage() {
                         </span>
                         {installed ? (
                           <span
-                            className="font-mono text-[11px] text-dim text-center px-2 py-1 border border-dashed border-line rounded-md cursor-default select-none"
-                            title="该技能已在你的工具箱中"
+                            className={`font-mono text-[11px] text-center px-2 py-1 border rounded-md cursor-default select-none ${
+                              installed.enabled_by_default
+                                ? 'text-accent border-accent-line bg-accent-soft'
+                                : 'text-dim border-dashed border-line'
+                            }`}
+                            title={
+                              installed.enabled_by_default
+                                ? '已安装；新会话默认启用，可在会话内关闭'
+                                : '已安装；新会话不自动启用，可在会话内开启'
+                            }
                           >
-                            已安装
+                            {installed.enabled_by_default ? '默认启用' : '按需启用'}
                           </span>
                         ) : (
                           <button
@@ -250,9 +264,9 @@ export function LibraryPage() {
                   {docs.map((d) => (
                     <div
                       key={d.id}
-                      className="grid grid-cols-[1fr_80px_60px_100px] gap-3 items-center px-3.5 py-2.5 border border-line bg-surface rounded-md hover:border-ink-2 transition-all"
+                      className="grid grid-cols-[minmax(0,1fr)_80px_60px_100px] gap-3 items-center px-3.5 py-2.5 border border-line bg-surface rounded-md hover:border-ink-2 transition-all"
                     >
-                      <div>
+                      <div className="min-w-0">
                         <div className="text-[13.5px] font-medium">{d.title}</div>
                         <div className="font-mono text-[11px] text-dim truncate">{d.mime}</div>
                       </div>
@@ -510,6 +524,7 @@ function InstallModal({
                 <input
                   className={inputCls}
                   value={skDesc}
+                  maxLength={2000}
                   onChange={(e) => setSkDesc(e.target.value)}
                   placeholder="简要说明该技能用途"
                 />
@@ -714,13 +729,19 @@ function InstallToToolboxModal({
             )}
           </Field>
 
-          <label className="flex items-center gap-2">
+          <label className="flex items-start gap-2">
             <input
               type="checkbox"
+              className="mt-0.5"
               checked={enabledByDefault}
               onChange={(e) => setEnabledByDefault(e.target.checked)}
             />
-            <span className={labelCls}>默认启用</span>
+            <span className="flex flex-col gap-0.5">
+              <span className={labelCls}>默认在新会话启用</span>
+              <span className="font-mono text-[10.5px] leading-4 text-dim">
+                之后仍可在每个会话输入框的 ⊕ 菜单中单独开启或关闭
+              </span>
+            </span>
           </label>
 
           {err && (

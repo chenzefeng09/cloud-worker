@@ -160,6 +160,70 @@ describe('CanvasMessageCard', () => {
     expect(request.instruction).toBe('改得更口语');
   });
 
+  it('keeps the floating-toolbar instruction separate from the footer instruction', async () => {
+    const user = userEvent.setup();
+    const draft = makeDraft('第一段文字。\n\n这一句需要修改，保持其他内容不变。');
+
+    render(
+      <CanvasMessageCard
+        sessionId="ses_test"
+        draft={draft}
+        onDraftChange={vi.fn()}
+        onRequestEdit={vi.fn()}
+      />,
+    );
+
+    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    await waitFor(() => expect(editor).toHaveTextContent('这一句需要修改'));
+
+    selectText(editor, '这一句需要修改');
+    fireEvent.mouseUp(editor);
+    await user.click(await screen.findByText('要求更改'));
+
+    const popupInput = screen.getByPlaceholderText('修改一下');
+    await user.type(popupInput, '改得更有力');
+
+    expect(popupInput).toHaveValue('改得更有力');
+    expect(screen.getByPlaceholderText(/已选中 \d+ 字符/)).toHaveValue('');
+  });
+
+  it('dismisses the floating toolbar with Escape or an outside click', async () => {
+    const user = userEvent.setup();
+    const draft = makeDraft('第一段文字。\n\n这一句需要修改，保持其他内容不变。');
+
+    render(
+      <CanvasMessageCard
+        sessionId="ses_test"
+        draft={draft}
+        onDraftChange={vi.fn()}
+        onRequestEdit={vi.fn()}
+      />,
+    );
+
+    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    await waitFor(() => expect(editor).toHaveTextContent('这一句需要修改'));
+
+    selectText(editor, '这一句需要修改');
+    fireEvent.mouseUp(editor);
+    await user.click(await screen.findByText('要求更改'));
+    const input = screen.getByPlaceholderText('修改一下');
+
+    fireEvent.keyDown(input, { key: 'Escape' });
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText('修改一下')).not.toBeInTheDocument(),
+    );
+
+    selectText(editor, '这一句需要修改');
+    fireEvent.mouseUp(editor);
+    await user.click(await screen.findByText('要求更改'));
+    expect(screen.getByPlaceholderText('修改一下')).toBeInTheDocument();
+
+    fireEvent.pointerDown(document.body);
+    await waitFor(() =>
+      expect(screen.queryByPlaceholderText('修改一下')).not.toBeInTheDocument(),
+    );
+  });
+
   it('shows a revising indicator and blocks re-submission while a revision is in flight', async () => {
     const draft = makeDraft('第一段文字。\n\n这一句需要修改。');
     const onRequestEdit = vi.fn<(_: CanvasEditRequest) => Promise<void>>().mockResolvedValue();

@@ -47,6 +47,12 @@ class Settings(BaseSettings):
     # memory write-back (after run completion).
     knowledge_ingest_url: str = "http://knowledge-ingest:8012/api/knowledge/v1"
 
+    # Skill-store — used to resolve the originating user's installed skills
+    # that are enabled by default when a sandbox run omits the ``skills`` key.
+    # The service scope is sent only to skill-store's internal read endpoint.
+    skill_store_url: str = "http://skill-store:8011/api/skills/v1"
+    skill_store_service_scopes: str = "skill.read_internal"
+
     # Foundation authz + billing — RBAC enforcement and quota checks.
     authz_url: str = "http://authz:8002/api/authz/v1"
     foundation_billing_url: str = "http://billing:8007/api/billing/v1"

@@ -274,11 +274,14 @@ export function CanvasMessageCard({
   const localEditContentRef = useRef<string | null>(null);
   const selectedRangeRef = useRef<Range | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
   const object = getCanvasObject(draft.kind);
   const { copied, copy } = useCopied();
   const [selection, setSelection] = useState<CanvasTextSelection | null>(null);
   const [toolbar, setToolbar] = useState<ToolbarState | null>(null);
   const [instruction, setInstruction] = useState('');
+  // 悬浮选区弹框的指令与底部整篇输入框各自独立,避免互相镜像
+  const [popupInstruction, setPopupInstruction] = useState('');
   const [busy, setBusy] = useState(false);
   const [history, setHistory] = useState<string[]>([]);
   const [future, setFuture] = useState<string[]>([]);
@@ -363,8 +366,29 @@ export function CanvasMessageCard({
 
   useEffect(() => {
     if (toolbar?.mode !== 'input') return;
+    // 同步聚焦一次:后台/隐藏标签页里 rAF 会被冻结,不能只依赖它
+    inputRef.current?.focus();
     requestAnimationFrame(() => inputRef.current?.focus());
-  }, [toolbar?.mode]);
+  }, [toolbar]);
+
+  useEffect(() => {
+    if (!toolbar) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const popover = popoverRef.current;
+      if (popover && event.target instanceof Node && popover.contains(event.target)) return;
+      setToolbar(null);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // isComposing: Escape 取消输入法组合时不应关闭弹框
+      if (event.key === 'Escape' && !event.isComposing) setToolbar(null);
+    };
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true);
+      document.removeEventListener('keydown', handleKeyDown, true);
+    };
+  }, [toolbar]);
 
   const updateDraft = useCallback(
     (patch: Partial<CanvasDocumentDraft>) => {
@@ -602,8 +626,12 @@ export function CanvasMessageCard({
     });
   };
 
-  const buildRequest = (scope: 'selection' | 'document', intent?: CanvasEditIntent): CanvasEditRequest | null => {
-    const finalInstruction = (intent?.instruction || instruction).trim();
+  const buildRequest = (
+    scope: 'selection' | 'document',
+    intent?: CanvasEditIntent,
+    instructionText?: string,
+  ): CanvasEditRequest | null => {
+    const finalInstruction = (intent?.instruction || (instructionText ?? instruction)).trim();
     if (!finalInstruction) return null;
     if (scope === 'selection' && (!selection || (canvasId && blockSelection.length === 0))) return null;
     return {
@@ -617,16 +645,24 @@ export function CanvasMessageCard({
     };
   };
 
-  const requestEdit = async (scope: 'selection' | 'document', intent?: CanvasEditIntent) => {
+  const requestEdit = async (
+    scope: 'selection' | 'document',
+    intent?: CanvasEditIntent,
+    instructionText?: string,
+  ) => {
     if (aiDisabled || busy || revisingEffective) return;
-    const request = buildRequest(scope, intent);
+    const request = buildRequest(scope, intent, instructionText);
     if (!request) return;
     setBusy(true);
     setToolbar(null);
     try {
       await handleRequestEdit(request);
-      setInstruction('');
-      if (intent) setInstruction(intent.instruction);
+      if (instructionText !== undefined) {
+        setPopupInstruction('');
+      } else {
+        setInstruction('');
+        if (intent) setInstruction(intent.instruction);
+      }
     } finally {
       setBusy(false);
     }
@@ -661,6 +697,7 @@ export function CanvasMessageCard({
   const isRevising = Boolean(busy || revisingEffective);
   const canRequestSelection = Boolean(selection && instruction.trim() && !aiDisabled && !isRevising);
   const canRequestDocument = Boolean(instruction.trim() && !aiDisabled && !isRevising);
+  const canRequestPopupEdit = Boolean(selection && popupInstruction.trim() && !aiDisabled && !isRevising);
   const suggestionSource =
     suggestion?.request.scope === 'selection' ? suggestion.request.selection?.text : suggestion?.request.content;
   // canvasId mode renders its own lightweight per-block diff section (below)
@@ -1050,12 +1087,17 @@ export function CanvasMessageCard({
 
       {toolbar && (
         <div
+          ref={popoverRef}
           className="canvas-selection-popover"
           style={{
             left: toolbar.x,
             top: toolbar.y,
           }}
-          onMouseDown={(event) => event.preventDefault()}
+          onMouseDown={(event) => {
+            // 保住编辑器选区（加粗/斜体按钮依赖它），但指令输入框要能点击聚焦
+            if (event.target instanceof HTMLElement && event.target.closest('input')) return;
+            event.preventDefault();
+          }}
         >
           {toolbar.mode === 'menu' ? (
             <>
@@ -1082,13 +1124,13 @@ export function CanvasMessageCard({
               className="canvas-selection-input-form"
               onSubmit={(event) => {
                 event.preventDefault();
-                requestEdit(selection ? 'selection' : 'document');
+                requestEdit('selection', undefined, popupInstruction);
               }}
             >
               <input
                 ref={inputRef}
-                value={instruction}
-                onChange={(event) => setInstruction(event.target.value)}
+                value={popupInstruction}
+                onChange={(event) => setPopupInstruction(event.target.value)}
                 placeholder={isRevising ? '修订中…' : '修改一下'}
                 className="canvas-selection-input"
                 disabled={aiDisabled || isRevising}
@@ -1096,7 +1138,7 @@ export function CanvasMessageCard({
               <button
                 type="submit"
                 className="canvas-selection-send"
-                disabled={!canRequestSelection && !canRequestDocument}
+                disabled={!canRequestPopupEdit}
                 title="发送修改要求"
               >
                 ↑

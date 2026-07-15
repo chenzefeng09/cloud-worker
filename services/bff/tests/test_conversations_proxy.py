@@ -257,6 +257,48 @@ def test_chat_execution_mode_defaults_to_sandbox(
     assert fake.runs_body.get("execution_mode") == "sandbox"
 
 
+def test_chat_omits_skills_upstream_when_client_omits_them(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absence must survive the BFF so orchestrator can inject defaults."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello"},
+    )
+
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert "skills" not in fake.runs_body
+
+
+@pytest.mark.parametrize("skills", [[], ["pdf", "xlsx"]])
+def test_chat_preserves_explicit_skill_selection(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    skills: list[str],
+) -> None:
+    """An explicit list, including [], overrides automatic defaults."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello", "skills": skills},
+    )
+
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert fake.runs_body["skills"] == skills
+
+
 def test_chat_execution_mode_inline_passthrough(
     client: TestClient,
     authed_cookie: dict[str, str],

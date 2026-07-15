@@ -115,6 +115,72 @@ def _canvas_payload_passes_guard(payload: dict[str, Any]) -> bool:
     return len(segments) >= _CANVAS_MIN_BLOCKS
 
 
+async def materialize_one_canvas(
+    *,
+    canvas_svc: Any,
+    run: Run,
+    user_id: str,
+    kind: str,
+    title: str | None,
+    content_markdown: str,
+) -> tuple[str, str | None] | None:
+    """Create one canvas document + backfill its assistant message (canvas v2).
+
+    The shared per-payload core of canvas materialization: apply the over-trigger
+    guard, then create the document via ``CanvasService.create_canvas`` (content +
+    ``source_run_id``) and point the run's assistant message ``canvas_id`` at it.
+    Returns ``(canvas_id, message_id)`` where ``message_id`` is ``None`` if no
+    eligible assistant row exists yet (the canvas is still created), or ``None``
+    entirely when the payload fails the guard (skipped, logged at INFO).
+
+    Extracted so both the sandbox run-state loop (``_materialize_pending_canvases``)
+    and the inline in-process tool-call path apply the identical guard + create +
+    backfill semantics against the same over-trigger rule.  Callers own the
+    fail-open boundary and any ``canvas_created`` SSE emission.
+    """
+    if not _canvas_payload_passes_guard(
+        {"content_markdown": content_markdown, "title": title, "kind": kind}
+    ):
+        logger.info(
+            "canvas payload below guard threshold; skipping materialization",
+            extra={
+                "run_id": run.id,
+                "title": str(title or ""),
+                "chars": len(str(content_markdown or "").strip()),
+            },
+        )
+        return None
+
+    canvas = await canvas_svc.create_canvas(
+        run.session_id,
+        user_id=user_id,
+        content=str(content_markdown or ""),
+        kind=str(kind or "article"),
+        title=str(title or "").strip() or None,
+        source_run_id=run.id,
+    )
+    message_id = await canvas_svc.backfill_message_canvas_id(
+        session_id=run.session_id,
+        run_id=run.id,
+        canvas_id=canvas.id,
+    )
+    return canvas.id, message_id
+
+
+def _canvas_created_event(*, canvas_id: str, run_id: str, message_id: str | None) -> str:
+    """Format the ``canvas_created`` SSE the frontend consumes (mode-agnostic).
+
+    Shape ``{canvas_id, run_id, message_id?}`` — ``message_id`` is omitted when no
+    assistant row was anchored yet (the frontend still renders the card from
+    ``canvas_id``).  Shared so the sandbox reconcile path and the inline path emit
+    byte-identical events.
+    """
+    payload: dict[str, Any] = {"canvas_id": canvas_id, "run_id": run_id}
+    if message_id is not None:
+        payload["message_id"] = message_id
+    return _sse("canvas_created", payload)
+
+
 def _sanitize_tool_text(value: Any, *, limit: int = _MAX_TOOL_TEXT_CHARS) -> str:
     text = "" if value is None else str(value)
     text = text.replace("\x00", "")
@@ -317,6 +383,22 @@ async def _stream_tokens(
                             yield _sse(
                                 "thinking",
                                 {"run_id": run_id, "text": text, "offset": last_id},
+                            )
+                    elif entry_type == "canvas":
+                        # Inline path: the executor materialized a canvas in-process
+                        # from a model ``create_canvas`` tool call and wrote a
+                        # ``canvas`` entry here so the live tail relays it.  Emit the
+                        # exact ``canvas_created`` event the sandbox reconcile path
+                        # synthesizes ({canvas_id, run_id, message_id?}) so the
+                        # frontend handler is mode-agnostic.  (The sandbox path never
+                        # writes this entry type — it materializes off the separate
+                        # ``:canvas`` key and yields the event from a buffered list.)
+                        canvas_id = entry.get("canvas_id") or ""
+                        if canvas_id:
+                            yield _canvas_created_event(
+                                canvas_id=str(canvas_id),
+                                run_id=run_id,
+                                message_id=entry.get("message_id") or None,
                             )
                     elif entry_type == "pending_confirmation":
                         # HITL: worker paused waiting for user to confirm a tool call.
@@ -798,51 +880,34 @@ async def _materialize_pending_canvases(
             if seq <= already:
                 continue
 
-            if not _canvas_payload_passes_guard(payload):
-                logger.info(
-                    "canvas payload below guard threshold; skipping "
-                    "materialization",
-                    extra={
-                        "run_id": run.id,
-                        "title": str(payload.get("title") or ""),
-                        "chars": len(str(payload.get("content_markdown") or "").strip()),
-                    },
-                )
-                # Count it as consumed so the seq cursor stays aligned; the next
-                # eligible payload is judged against the same ``already`` base
-                # because no canvas row was created.  We bump ``already`` to this
-                # seq so re-reads on the next poll don't re-log the same skip.
-                already = seq
-                continue
-
-            canvas = await canvas_svc.create_canvas(
-                run.session_id,
+            # Count it as consumed so the seq cursor stays aligned regardless of
+            # outcome: a guard-skipped payload keeps re-reads on the next poll
+            # from re-logging the same skip, and a materialized one advances past
+            # its own seq.
+            result = await materialize_one_canvas(
+                canvas_svc=canvas_svc,
+                run=run,
                 user_id=user_id,
-                content=str(payload.get("content_markdown") or ""),
                 kind=str(payload.get("kind") or "article"),
                 title=str(payload.get("title") or "").strip() or None,
-                source_run_id=run.id,
+                content_markdown=str(payload.get("content_markdown") or ""),
             )
             already = seq
+            if result is None:
+                # Below guard threshold (already logged inside the helper).
+                continue
 
-            message_id = await canvas_svc.backfill_message_canvas_id(
-                session_id=run.session_id,
-                run_id=run.id,
-                canvas_id=canvas.id,
+            canvas_id, message_id = result
+            events.append(
+                _canvas_created_event(
+                    canvas_id=canvas_id, run_id=run.id, message_id=message_id
+                )
             )
-
-            event_payload: dict[str, Any] = {
-                "canvas_id": canvas.id,
-                "run_id": run.id,
-            }
-            if message_id is not None:
-                event_payload["message_id"] = message_id
-            events.append(_sse("canvas_created", event_payload))
             logger.info(
                 "materialized canvas from run-state",
                 extra={
                     "run_id": run.id,
-                    "canvas_id": canvas.id,
+                    "canvas_id": canvas_id,
                     "seq": seq,
                 },
             )

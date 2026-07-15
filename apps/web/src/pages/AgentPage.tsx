@@ -7,31 +7,18 @@ import { useChatStore } from '../stores/chatStore';
 import { useSessions } from '../hooks/useSessions';
 import { sessionStatusZh } from '../lib/format';
 import { FilePreviewPanel } from '../components/FilePreviewPanel';
-import {
-  ArticleCanvasPanel,
-  loadStoredCanvasDraft,
-} from '../components/ArticleCanvasPanel';
-import {
-  applyCanvasReplacement,
-  createCanvasDraft,
-  prepareCanvasOpenSeed,
-  sanitizeCanvasDraft,
-  type CanvasDocumentDraft,
-  type CanvasEditRequest,
-  type CanvasEditSuggestion,
-  type CanvasOpenSeed,
-} from '../lib/canvasObjects';
-import { routeCanvasIntent } from '../lib/canvasIntentRouting';
-import { api } from '../api/client';
 import type { MessageAttachment } from '../api/types';
-import { useFeatureFlag } from '../hooks/useFeatureFlags';
-import { useCanvasStore } from '../stores/canvasStore';
 
 /**
  * Single-task agent view. The URL `/tasks/:id` drives `activeSessionId` in the
  * chat store so the existing `ChatWindow` / `useChat` SSE pipeline (B-M1) keeps
  * working unchanged — this page is essentially a Chinese-labelled shell around
  * those primitives plus a thin context rail.
+ *
+ * Canvas is entirely model-triggered (design §7.1): the worker's `create_canvas`
+ * tool materializes a server canvas, the `canvas_created` SSE handler stamps the
+ * assistant message's `canvas_id`, and ChatWindow renders the anchored
+ * CanvasMessageCard off that id. This page has NO manual canvas entry points.
  *
  * Friendly mode: add `?mode=friendly` to the URL.
  */
@@ -45,40 +32,15 @@ export function AgentPage() {
   const { sessions } = useSessions();
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const setActiveSession = useChatStore((s) => s.setActiveSession);
-  const { sendMessage, isStreaming, messages } = useChat();
-
-  // canvas.v2 — when ON, Phase-A creation binds the card to a real server
-  // canvas object (via canvasStore) instead of the in-memory draft. When OFF,
-  // every existing draft-based code path below runs completely unchanged; all
-  // new logic is gated behind `if (canvasV2)` / `canvasV2 ? … : …` branches.
-  const canvasV2 = useFeatureFlag('canvas.v2');
-  const createCanvasFromMessage = useCanvasStore((s) => s.createFromMessage);
-  const createCanvasFromContent = useCanvasStore((s) => s.createFromContent);
-  const requestCanvasEditAction = useCanvasStore((s) => s.requestEdit);
+  const { sendMessage } = useChat();
 
   const [previewFile, setPreviewFile] = useState<{ id: string; filename: string; mime?: string } | null>(null);
-  const [canvasDraft, setCanvasDraft] = useState<CanvasDocumentDraft | null>(() =>
-    id ? loadStoredCanvasDraft(id) : null,
-  );
-  const [canvasOpen, setCanvasOpen] = useState(false);
-  const [inlineCanvasOpen, setInlineCanvasOpen] = useState(false);
-  const [inlineCanvasAnchorMessageId, setInlineCanvasAnchorMessageId] = useState<string | null>(null);
-  const [canvasSuggestion, setCanvasSuggestion] = useState<CanvasEditSuggestion | null>(null);
-  const [inlineCanvasV2Id, setInlineCanvasV2Id] = useState<string | null>(null);
-  // canvas.v2 three-state routing: when an update-canvas send fails (409 / edit
-  // error), we refill the composer so the user never loses their typed text.
-  const [composerRefill, setComposerRefill] = useState<string | null>(null);
-  // Silent canvas revision: request in flight + last error, both scoped to the
-  // canvas card (never surfaced as chat messages).
-  const [canvasRevising, setCanvasRevising] = useState(false);
-  const [canvasEditError, setCanvasEditError] = useState<string | null>(null);
   // Resizable preview panel width (px). Persisted across opens within a session.
   const [previewWidth, setPreviewWidth] = useState(360);
   const PREVIEW_MIN = 280;
   const PREVIEW_MAX = 760;
   const splitContainerRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
-  const sanitizedCanvasDraftKeyRef = useRef<string | null>(null);
 
   const startPreviewDrag = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -112,147 +74,14 @@ export function AgentPage() {
 
   useEffect(() => {
     if (!id) return;
-    setCanvasDraft(loadStoredCanvasDraft(id));
-    setCanvasOpen(false);
-    setInlineCanvasOpen(false);
-    setInlineCanvasAnchorMessageId(null);
-    setCanvasSuggestion(null);
-    setCanvasRevising(false);
-    setCanvasEditError(null);
     setPreviewFile(null);
-    // canvas.v2 — clear the local anchor id on session switch to avoid
-    // cross-session bleed. We don't reset the whole canvasStore here (other
-    // panels/tabs may still reference cached canvases); clearing the local id
-    // is enough since nothing renders without it.
-    setInlineCanvasV2Id(null);
-    setComposerRefill(null);
   }, [id]);
-
-  useEffect(() => {
-    if (!canvasDraft) {
-      sanitizedCanvasDraftKeyRef.current = null;
-      return;
-    }
-    const draftKey = [
-      canvasDraft.id,
-      canvasDraft.sourceMessageId ?? '',
-      canvasDraft.title,
-      canvasDraft.content,
-    ].join('\u0000');
-    if (sanitizedCanvasDraftKeyRef.current === draftKey) return;
-    sanitizedCanvasDraftKeyRef.current = draftKey;
-    const sanitized = sanitizeCanvasDraft(canvasDraft);
-    if (sanitized !== canvasDraft) setCanvasDraft(sanitized);
-  }, [canvasDraft]);
 
   const session = sessions.find((s) => s.id === id);
 
   const openPreviewFile = useCallback((file: { id: string; filename: string; mime?: string }) => {
     setPreviewFile(file);
-    setCanvasOpen(false);
   }, []);
-
-  const openBlankCanvas = useCallback(() => {
-    setCanvasDraft((current) => current ?? createCanvasDraft('article'));
-    setInlineCanvasOpen(true);
-    setInlineCanvasAnchorMessageId(null);
-    setCanvasOpen(false);
-    setCanvasSuggestion(null);
-    setPreviewFile(null);
-  }, []);
-
-  const openCanvasFromMessage = useCallback(
-    (seed: CanvasOpenSeed) => {
-      const sourceMessageId = seed.sourceMessageId;
-
-      if (canvasV2) {
-        // canvas.v2 ON — materialize a real server canvas object instead of an
-        // in-memory draft. FAIL-OPEN: if creation rejects, warn and leave the
-        // message bubble untouched (do not set an anchor). The card renders
-        // additively below the anchor bubble — the bubble is never hidden.
-        const materialize = sourceMessageId
-          ? createCanvasFromMessage(id!, sourceMessageId, { kind: seed.kind, title: seed.title })
-          : createCanvasFromContent(id!, seed.content, { kind: seed.kind, title: seed.title });
-        materialize
-          .then((canvas) => {
-            setInlineCanvasV2Id(canvas.id);
-            setInlineCanvasAnchorMessageId(sourceMessageId ?? null);
-            setCanvasOpen(false);
-            setPreviewFile(null);
-          })
-          .catch((err) => {
-            console.warn('canvas.v2 materialize failed', err);
-          });
-        return;
-      }
-
-      const extracted = prepareCanvasOpenSeed(seed);
-      setCanvasDraft(
-        createCanvasDraft(extracted.kind, {
-          title: extracted.title,
-          content: extracted.content,
-          sourceMessageId: extracted.sourceMessageId,
-        }),
-      );
-      setInlineCanvasOpen(true);
-      setInlineCanvasAnchorMessageId(sourceMessageId ?? null);
-      setCanvasOpen(false);
-      setCanvasSuggestion(null);
-      setPreviewFile(null);
-    },
-    [canvasV2, createCanvasFromContent, createCanvasFromMessage, id],
-  );
-
-  const openInlineCanvasInPanel = useCallback(() => {
-    if (!canvasDraft) return;
-    setCanvasOpen(true);
-    setInlineCanvasOpen(false);
-    setPreviewFile(null);
-  }, [canvasDraft]);
-
-  const sendMessageWithCanvasDetection = useCallback(
-    (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => {
-      // canvas.v2 three-state routing (design §6.3 Phase A): when the flag is on
-      // and the session has an active canvas, a *modify-intent* message routes to
-      // the silent edit path — no chat message, no run. Attachments force the
-      // normal chat path (an edit request carries no files). The composer has
-      // already cleared its text (InputBar clears on send); on failure we refill
-      // it so the user never loses input (fail-open).
-      //
-      // NOTE: send-time create-intent detection has been retired (design §7.1).
-      // New-content creation is now driven by the model (Phase B): the worker's
-      // `create_canvas` tool fires materialization and the SPA renders the card
-      // off the assistant message's `canvas_id`. The composer no longer guesses.
-      const hasAttachments = Boolean(attachmentIds && attachmentIds.length > 0);
-      if (
-        canvasV2 &&
-        id &&
-        inlineCanvasV2Id &&
-        !hasAttachments &&
-        routeCanvasIntent(text, true) === 'update_canvas'
-      ) {
-        const canvasId = inlineCanvasV2Id;
-        requestCanvasEditAction(canvasId, id, {
-          instruction: text,
-          scope: { type: 'document' },
-        })
-          .then((suggestion) => {
-            if (!suggestion) {
-              // 409 / edit failure — the store recorded a localized error on the
-              // card; refill the composer so nothing is lost.
-              setComposerRefill(text);
-            }
-          })
-          .catch(() => {
-            setComposerRefill(text);
-          });
-        return Promise.resolve();
-      }
-
-      return sendMessage(text, attachmentIds, attachmentsMeta);
-    },
-    [canvasV2, id, inlineCanvasV2Id, requestCanvasEditAction, sendMessage],
-  );
 
   // If HomePage routed us here with an `initialMessage` in state, dispatch it
   // once the chat store has bound to this session. Guard with a ref so React
@@ -269,99 +98,18 @@ export function AgentPage() {
     if (!initial && attachmentIds.length === 0) return;
     if (sentInitialRef.current === id) return;
     sentInitialRef.current = id;
-    sendMessageWithCanvasDetection(initial ?? '', attachmentIds);
+    sendMessage(initial ?? '', attachmentIds);
     // Clear router state so a refresh won't re-send.
     navigate(location.pathname, { replace: true, state: null });
-  }, [id, activeSessionId, location.pathname, location.state, navigate, sendMessageWithCanvasDetection]);
+  }, [id, activeSessionId, location.pathname, location.state, navigate, sendMessage]);
 
-  // Silent canvas revision. Unlike creation, this does NOT go through the chat
-  // pipeline: no user prompt message, no agent run, nothing in the transcript.
-  // We call the dedicated BFF endpoint directly and drop the returned
-  // replacement straight into the existing suggestion / diff / accept flow.
-  const requestCanvasEdit = useCallback(
-    async (request: CanvasEditRequest) => {
-      if (!id) return;
-      setCanvasSuggestion(null);
-      setCanvasEditError(null);
-      setCanvasRevising(true);
-      try {
-        const model = useChatStore.getState().selectedModel[id] || undefined;
-        const result = await api.sessions.canvasEdit(id, {
-          title: request.title,
-          content: request.content,
-          scope: request.scope,
-          selection:
-            request.scope === 'selection' && request.selection
-              ? {
-                  text: request.selection.text,
-                  start: request.selection.start,
-                  end: request.selection.end,
-                }
-              : null,
-          instruction: request.instruction,
-          ...(model ? { model } : {}),
-        });
-        // The BFF may downgrade a selection-scoped request to a whole-document
-        // replacement when it detects the model echoed the full document (or the
-        // selection's surrounding context). In that case we must apply the
-        // replacement as the entire document — splicing it at the selection would
-        // duplicate the surrounding text. Override the suggestion's scope so both
-        // the review card and applyCanvasReplacement take the whole-document path.
-        const suggestionRequest =
-          result.apply_to === 'document' && request.scope === 'selection'
-            ? { ...request, scope: 'document' as const }
-            : request;
-        setCanvasSuggestion({
-          request: suggestionRequest,
-          replacement: result.replacement,
-          summary: result.summary,
-          receivedAt: new Date().toISOString(),
-        });
-        setInlineCanvasOpen(true);
-        setCanvasOpen(false);
-        setPreviewFile(null);
-      } catch (err) {
-        setCanvasEditError(
-          err instanceof Error && err.message ? err.message : '修订失败，请稍后重试。',
-        );
-      } finally {
-        setCanvasRevising(false);
-      }
-    },
-    [id],
+  const handleSendMessage = useCallback(
+    (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) =>
+      sendMessage(text, attachmentIds, attachmentsMeta),
+    [sendMessage],
   );
 
-  // Keep the manual "put in canvas" card anchored to the draft's source message
-  // even as that message's id changes. On the home → task path the assistant
-  // reply's id is swapped when its transient streaming block becomes the durable
-  // DB row (and again on the run_complete re-pull). Without re-binding, the card
-  // would strand on a stale anchor id and fall back to the bottom slot. Hiding
-  // is gone (design §7.1) — the card renders additively below the bubble, so we
-  // only re-pin the anchor and never touch a hidden set.
-  useEffect(() => {
-    const sourceId = canvasDraft?.sourceMessageId;
-    if (!sourceId || !inlineCanvasOpen) return;
-    if (!messages.some((m) => m.id === sourceId)) return;
-    setInlineCanvasAnchorMessageId((current) => (current === sourceId ? current : sourceId));
-  }, [canvasDraft?.sourceMessageId, inlineCanvasOpen, messages]);
-
-  const acceptCanvasSuggestion = useCallback(() => {
-    setCanvasDraft((current) => {
-      if (!current || !canvasSuggestion || current.id !== canvasSuggestion.request.documentId) return current;
-      return applyCanvasReplacement(current, canvasSuggestion.request, canvasSuggestion.replacement);
-    });
-    setCanvasSuggestion(null);
-  }, [canvasSuggestion]);
-
-  const rejectCanvasSuggestion = useCallback(() => {
-    setCanvasSuggestion(null);
-  }, []);
-
-  const dismissCanvasEditError = useCallback(() => {
-    setCanvasEditError(null);
-  }, []);
-
-  const hasSidePanel = previewFile !== null || (canvasOpen && canvasDraft !== null);
+  const hasSidePanel = previewFile !== null;
 
   if (!id) {
     return (
@@ -389,12 +137,6 @@ export function AgentPage() {
         }
         actions={
           <>
-            <button
-              onClick={openBlankCanvas}
-              className="cw-btn cw-btn-ghost cw-btn-sm"
-            >
-              <span className="font-mono">◇</span> 画布
-            </button>
             {!friendly && (
               <button
                 onClick={() => navigate('/files')}
@@ -456,22 +198,7 @@ export function AgentPage() {
               sessionId={id}
               friendly={friendly}
               onPreviewFile={openPreviewFile}
-              onOpenCanvas={openCanvasFromMessage}
-              onSendMessage={sendMessageWithCanvasDetection}
-              inlineCanvasDraft={inlineCanvasOpen ? canvasDraft : null}
-              inlineCanvasRevising={canvasRevising}
-              inlineCanvasEditError={canvasEditError}
-              inlineCanvasSuggestion={canvasSuggestion}
-              inlineCanvasAnchorMessageId={inlineCanvasAnchorMessageId}
-              inlineCanvasV2Id={canvasV2 ? inlineCanvasV2Id : null}
-              externalPrefill={composerRefill}
-              onExternalPrefillConsumed={() => setComposerRefill(null)}
-              onInlineCanvasDraftChange={setCanvasDraft}
-              onInlineCanvasRequestEdit={requestCanvasEdit}
-              onInlineCanvasDismissEditError={dismissCanvasEditError}
-              onInlineCanvasOpenPanel={canvasDraft ? openInlineCanvasInPanel : undefined}
-              onInlineCanvasAcceptSuggestion={canvasSuggestion ? acceptCanvasSuggestion : undefined}
-              onInlineCanvasRejectSuggestion={canvasSuggestion ? rejectCanvasSuggestion : undefined}
+              onSendMessage={handleSendMessage}
             />
             {hasSidePanel && (
               <>
@@ -500,25 +227,13 @@ export function AgentPage() {
                     style={{ width: 1, background: 'var(--line)' }}
                   />
                 </div>
-                {previewFile ? (
+                {previewFile && (
                   <FilePreviewPanel
                     sessionId={id}
                     file={previewFile}
                     onClose={() => setPreviewFile(null)}
                   />
-                ) : canvasDraft ? (
-                  <ArticleCanvasPanel
-                    sessionId={id}
-                    draft={canvasDraft}
-                    aiDisabled={isStreaming}
-                    revising={canvasRevising}
-                    editError={canvasEditError}
-                    onDraftChange={setCanvasDraft}
-                    onClose={() => setCanvasOpen(false)}
-                    onRequestEdit={requestCanvasEdit}
-                    onDismissEditError={dismissCanvasEditError}
-                  />
-                ) : null}
+                )}
               </>
             )}
           </div>

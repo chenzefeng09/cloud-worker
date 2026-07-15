@@ -1040,9 +1040,11 @@ export function useChat() {
       try {
         abortRef.current = new AbortController();
 
-        // Skills enabled for this session in the context rail; forwarded so the
-        // worker loads exactly these (BFF → orchestrator → task.json["skills"]).
-        const skills = useChatStore.getState().selectedSkills[sessionId] || [];
+        // ``undefined`` means this session has not established a selection yet:
+        // omit the field so the orchestrator can inject the user's authoritative
+        // enabled-by-default installs. Once seeded/toggled, send the exact list;
+        // an explicit [] therefore means "disable every skill for this session".
+        const skills = useChatStore.getState().selectedSkills[sessionId];
         // Per-session model + reasoning effort, set via the composer dropdowns.
         const model = useChatStore.getState().selectedModel[sessionId] || undefined;
         const effortSel = useChatStore.getState().selectedEffort[sessionId] || '';
@@ -1057,7 +1059,7 @@ export function useChat() {
           body: JSON.stringify({
             message: text,
             attachment_ids: attachmentIds || [],
-            skills,
+            ...(skills !== undefined ? { skills } : {}),
             ...(model ? { model } : {}),
             ...(effortSel ? { reasoning_effort: effortSel } : {}),
             execution_mode: executionMode,

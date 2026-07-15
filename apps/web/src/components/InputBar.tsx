@@ -35,7 +35,7 @@ interface Props {
 
 // Two-state segmented toggle for chat/agent mode. Styled to match the mono
 // toolbar controls (same paper/line/accent tokens as the surrounding dropdowns).
-function ModeToggle({
+export function ModeToggle({
   value,
   onChange,
   disabled,

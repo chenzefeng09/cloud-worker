@@ -29,7 +29,6 @@ import type {
   CanvasDocumentDraft,
   CanvasEditRequest,
   CanvasEditSuggestion,
-  CanvasOpenSeed,
 } from '../lib/canvasObjects';
 import { hasVisibleCanvasAnchor } from '../lib/canvasAnchoring';
 import {
@@ -295,7 +294,6 @@ export function ChatWindow({
   sessionId,
   friendly,
   onPreviewFile,
-  onOpenCanvas,
   onSendMessage,
   inlineCanvasDraft,
   inlineCanvasPending,
@@ -316,7 +314,6 @@ export function ChatWindow({
   sessionId: string;
   friendly?: boolean;
   onPreviewFile?: (att: { id: string; filename: string; mime?: string }) => void;
-  onOpenCanvas?: (seed: CanvasOpenSeed) => void;
   onSendMessage?: (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => void | Promise<void>;
   inlineCanvasDraft?: CanvasDocumentDraft | null;
   inlineCanvasPending?: boolean;
@@ -676,7 +673,6 @@ export function ChatWindow({
                       message={u.message}
                       friendly={friendly}
                       onPreviewFile={onPreviewFile}
-                      onOpenCanvas={onOpenCanvas}
                       onRewind={rewindTo}
                       showRoundCopy={showRoundCopy}
                       roundCopyText={roundKey != null ? roundCopyText.get(roundKey) : undefined}
