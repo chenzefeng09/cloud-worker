@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     skill_store_url: str = "http://skill-store:8011/api/skills/v1"
     web_fetch_gateway_url: str = "http://web-fetch-gateway:8013/api/web-fetch/v1"
     dlp_url: str = "http://foundation-dlp:80/api/dlp/v1"
+    # Knowledge-ingest (KB v1) - the /knowledge/v1/{path} façade proxies here.
+    # ki needs no bearer/vkey: the broker re-injects X-Tenant-Id / X-User-Id
+    # (from the lease, as for every route) PLUS X-User-Clearance (also from the
+    # signed lease) so a sandbox cannot inflate its clearance to read restricted
+    # documents.  The route allowlists the single ``search`` upstream path.
+    knowledge_ingest_url: str = "http://knowledge-ingest:8012/api/knowledge/v1"
 
     # --- B2: per-route upstream path allowlist -----------------------------
     # Each passthrough proxy route forwards the sandbox-chosen ``{path}`` to an

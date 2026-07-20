@@ -1,4 +1,5 @@
-# syntax=docker/dockerfile:1.7
+# Use BuildKit's bundled Dockerfile frontend.  A remote ``# syntax=`` image
+# lookup makes otherwise-local/offline rebuilds fail before the first layer.
 # See services/bff/Dockerfile for the rationale on the ``foundation_sdk``
 # additional context.
 FROM python:3.12-slim
@@ -18,14 +19,34 @@ COPY --from=feature_flag_client . /ff-client
 RUN pip install --no-cache-dir "/ff-client[fastapi]"
 
 COPY pyproject.toml poetry.lock* ./
+# Pre-install the attachment/S3 runtime from the checked-in wheelhouse before
+# Poetry evaluates the lockfile.  The directory contains both arm64 and x86_64
+# wheels for the binary packages; installing by distribution name lets pip pick
+# the wheel compatible with the current builder instead of trying every *.whl.
+COPY wheels/ /tmp/wheels/
+RUN pip install --no-cache-dir --no-index --find-links=/tmp/wheels --no-deps \
+      "boto3==1.43.20" \
+      "botocore==1.43.20" \
+      "jmespath==1.1.0" \
+      "python-dateutil==2.9.0.post0" \
+      "python-multipart==0.0.30" \
+      "redis==8.0.0" \
+      "s3transfer==0.18.0" \
+      "six==1.17.0" \
+      "urllib3==2.7.0" \
+      "pypdf==6.14.2" \
+      "python-docx==1.2.0" \
+      "openpyxl==3.1.5" \
+      "python-pptx==1.0.2" \
+      "lxml==6.1.1" \
+      "Pillow==12.3.0" \
+      "et-xmlfile==2.0.0" \
+      "typing-extensions==4.15.0" \
+      "XlsxWriter==3.2.9"
 RUN poetry config virtualenvs.create false \
  && poetry install --no-root --without dev --no-interaction --no-ansi
 
-# Install boto3 + python-multipart from pre-fetched wheels (PyPI MITM workaround).
-# These are required for S3 attachment storage and multipart file uploads.
-COPY wheels/ /tmp/wheels/
-RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl \
- && rm -rf /tmp/wheels
+RUN rm -rf /tmp/wheels
 
 COPY src/ ./src/
 COPY migrations/ ./migrations/

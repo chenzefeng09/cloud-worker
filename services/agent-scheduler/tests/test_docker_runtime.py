@@ -270,6 +270,92 @@ def test_spawn_run_env_contains_foundation_service_scopes(
     assert "skill.read_internal" in scopes, "skill.read_internal missing from FOUNDATION_SERVICE_SCOPES"
 
 
+def test_spawn_run_env_injects_knowledge_ingest_url_and_clearance(
+    runtime: DockerRuntime,
+    mock_docker_client: MagicMock,
+) -> None:
+    """``spawn_run`` must inject KNOWLEDGE_INGEST_URL (broker façade in broker
+    mode) + FOUNDATION_USER_CLEARANCE (from the new user_clearance kwarg) into
+    the container env, and RUNTIME_EXTENSIONS must list knowledge_tool so the
+    in-sandbox extension activates."""
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-kb")
+
+    runtime.spawn_run(
+        run_id="run_01J5RUN0000000000000KB0001",
+        session_id="ses_01J5SES0000000000000KB0001",
+        task="kb query",
+        tenant_id="tnt_01J5TNT0000000000000000001",
+        user_id="usr_01J5USR0000000000000000001",
+        foundation_token="tok_kb",
+        llm_virtual_key="vk-test",
+        user_clearance="L3",
+    )
+
+    _, kwargs = mock_docker_client.containers.run.call_args
+    env = kwargs["environment"]
+    # Broker mode (default settings fixture) -> façade URL, not the direct ki.
+    assert "KNOWLEDGE_INGEST_URL" in env, "KNOWLEDGE_INGEST_URL missing from env"
+    assert env["KNOWLEDGE_INGEST_URL"].endswith("/knowledge/v1"), env["KNOWLEDGE_INGEST_URL"]
+    assert "tool-broker" in env["KNOWLEDGE_INGEST_URL"]
+    # Clearance is plain env (not secret) - NOT in the secrets file.
+    assert env["FOUNDATION_USER_CLEARANCE"] == "L3"
+    assert "knowledge_tool" in env["RUNTIME_EXTENSIONS"], (
+        "knowledge_tool missing from RUNTIME_EXTENSIONS default"
+    )
+    # The clearance must NOT leak into the secrets file (it isn't secret).
+    secrets_path = (
+        Path(runtime._settings.workspace_base)  # noqa: SLF001
+        / "tnt_01J5TNT0000000000000000001"
+        / "ses_01J5SES0000000000000KB0001"
+        / "run_01J5RUN0000000000000KB0001"
+        / ".secrets.json"
+    )
+    secrets = json.loads(secrets_path.read_text(encoding="utf-8"))
+    assert "FOUNDATION_USER_CLEARANCE" not in secrets
+    assert "KNOWLEDGE_INGEST_URL" not in secrets
+
+
+def test_spawn_run_foundation_egress_injects_direct_knowledge_url(
+    runtime: DockerRuntime,
+    mock_docker_client: MagicMock,
+) -> None:
+    """Foundation mode injects the DIRECT ki URL (ki is on the foundation net),
+    not the broker façade."""
+    from agent_scheduler.config import Settings
+
+    runtime._settings = Settings(  # noqa: SLF001 - test setup
+        env="test",
+        log_level="WARNING",
+        agent_image="hello-world:latest",
+        workspace_base="/tmp/agent-platform-test",
+        docker_network="none",
+        foundation_identity_url="http://identity-test/api/identity/v1",
+        scheduler_service_token="fake-service-token",
+        otel_enabled=False,
+        sandbox_egress_mode="foundation",
+        knowledge_ingest_url="http://knowledge-ingest:8012/api/knowledge/v1",
+    )
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-ki-foundation")
+
+    runtime.spawn_run(
+        run_id="run_01J5RUN0000000000000KF0001",
+        session_id="ses_01J5SES0000000000000KF0001",
+        task="ki direct",
+        tenant_id="tnt_01J5TNT0000000000000000001",
+        user_id="usr_01J5USR0000000000000000001",
+        foundation_token="tok_kf",
+        llm_virtual_key="vk-test",
+        user_clearance="L2",
+    )
+
+    _, kwargs = mock_docker_client.containers.run.call_args
+    env = kwargs["environment"]
+    assert env["KNOWLEDGE_INGEST_URL"] == (
+        "http://knowledge-ingest:8012/api/knowledge/v1"
+    )
+    assert env["FOUNDATION_USER_CLEARANCE"] == "L2"
+
+
 def test_spawn_run_foundation_egress_uses_configured_network(
     runtime: DockerRuntime,
     mock_docker_client: MagicMock,

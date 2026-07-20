@@ -7,7 +7,12 @@ import { useChatStore } from '../stores/chatStore';
 import { useSessions } from '../hooks/useSessions';
 import { sessionStatusZh } from '../lib/format';
 import { FilePreviewPanel } from '../components/FilePreviewPanel';
-import type { MessageAttachment } from '../api/types';
+import type { FileContentSource } from '../components/filePreview';
+import { FilePreviewProvider } from '../lib/filePreviewContext';
+import { useWorkspace } from '../lib/workspaceContext';
+import { api } from '../api/client';
+import { LevelBadge } from '../lib/sensitivity';
+import type { MessageAttachment, Workspace, WorkspaceFile } from '../api/types';
 
 /**
  * Single-task agent view. The URL `/tasks/:id` drives `activeSessionId` in the
@@ -78,10 +83,25 @@ export function AgentPage() {
   }, [id]);
 
   const session = sessions.find((s) => s.id === id);
+  // Workspace bound to THIS session (not the global active workspace) — sources
+  // the "@" mention workspace files and the wsf_ preview content path.
+  const workspaceId = session?.workspace_id ?? undefined;
 
   const openPreviewFile = useCallback((file: { id: string; filename: string; mime?: string }) => {
     setPreviewFile(file);
   }, []);
+
+  // Content-source override for the preview panel: a `wsf_…` id is a workspace
+  // base file, which lives under /workspaces/{id}/files/{fileId}/content rather
+  // than the session path. Only built when a workspace is known; otherwise the
+  // panel keeps its session-scoped behaviour (attachments, `att_…`).
+  const previewGetSource =
+    previewFile && previewFile.id.startsWith('wsf_') && workspaceId
+      ? (fileId: string): FileContentSource => ({
+          url: api.workspaces.fileContentUrl(workspaceId, fileId),
+          getContent: () => api.workspaces.getContent(workspaceId, fileId),
+        })
+      : undefined;
 
   // If HomePage routed us here with an `initialMessage` in state, dispatch it
   // once the chat store has bound to this session. Guard with a ref so React
@@ -104,8 +124,12 @@ export function AgentPage() {
   }, [id, activeSessionId, location.pathname, location.state, navigate, sendMessage]);
 
   const handleSendMessage = useCallback(
-    (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) =>
-      sendMessage(text, attachmentIds, attachmentsMeta),
+    (
+      text: string,
+      attachmentIds?: string[],
+      attachmentsMeta?: MessageAttachment[],
+      workspaceFileIds?: string[],
+    ) => sendMessage(text, attachmentIds, attachmentsMeta, workspaceFileIds),
     [sendMessage],
   );
 
@@ -129,11 +153,19 @@ export function AgentPage() {
           { label: session?.title || '未命名任务' },
         ]}
         status={
-          session && (
-            <span className="font-mono text-[11px] text-ink-2">
-              · {sessionStatusZh(session.status)}
-            </span>
-          )
+          <span className="flex items-center gap-2">
+            {/* Read-only badge: the workspace bound to THIS session at creation
+                time. It is purely informational — there is no way to re-bind an
+                existing session's workspace, so the badge never switches. */}
+            {workspaceId && (
+              <WorkspaceBadge workspaceId={workspaceId} onPreviewFile={openPreviewFile} />
+            )}
+            {session && (
+              <span className="font-mono text-[11px] text-ink-2">
+                · {sessionStatusZh(session.status)}
+              </span>
+            )}
+          </span>
         }
         actions={
           <>
@@ -194,12 +226,15 @@ export function AgentPage() {
                 : { display: 'flex', flexDirection: 'column', minHeight: 0 }
             }
           >
-            <ChatWindow
-              sessionId={id}
-              friendly={friendly}
-              onPreviewFile={openPreviewFile}
-              onSendMessage={handleSendMessage}
-            />
+            <FilePreviewProvider value={openPreviewFile}>
+              <ChatWindow
+                sessionId={id}
+                workspaceId={workspaceId}
+                friendly={friendly}
+                onPreviewFile={openPreviewFile}
+                onSendMessage={handleSendMessage}
+              />
+            </FilePreviewProvider>
             {hasSidePanel && (
               <>
                 {/* Draggable divider */}
@@ -232,6 +267,7 @@ export function AgentPage() {
                     sessionId={id}
                     file={previewFile}
                     onClose={() => setPreviewFile(null)}
+                    getSource={previewGetSource}
                   />
                 )}
               </>
@@ -239,6 +275,156 @@ export function AgentPage() {
           </div>
         </section>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Read-only workspace badge for the session header. Shows `◇ <工作区名>` and, on
+ * click, a small downward popover describing the workspace the session was bound
+ * to at creation time: a truncated instructions preview and the list of base
+ * files (lazy-loaded once). Clicking a file opens it in the session's preview
+ * panel. There is deliberately NO switching UI here — an existing session's
+ * workspace binding is immutable, so the badge only explains the binding.
+ *
+ * Popover mechanics mirror InputBar's "+" popover (container ref + absolute +
+ * document-mousedown outside-close), but opens DOWNWARD (`top-full`) because the
+ * badge lives in the page header at the top of the viewport.
+ */
+function WorkspaceBadge({
+  workspaceId,
+  onPreviewFile,
+}: {
+  workspaceId: string;
+  onPreviewFile: (file: { id: string; filename: string; mime?: string }) => void;
+}) {
+  const { workspaces } = useWorkspace();
+  // Prefer the already-loaded list; fall back to a direct GET only when the
+  // session's workspace isn't among the user's own (e.g. shared/legacy).
+  const known = workspaces.find((w) => w.id === workspaceId) ?? null;
+  const [fetched, setFetched] = useState<Workspace | null>(null);
+  const ws = known ?? fetched;
+
+  useEffect(() => {
+    if (known) return;
+    let alive = true;
+    api.workspaces
+      .get(workspaceId)
+      .then((w) => {
+        if (alive) setFetched(w);
+      })
+      .catch(() => {
+        /* silent — badge falls back to the generic「工作区」label */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [known, workspaceId]);
+
+  const name = ws?.name ?? '工作区';
+  const instructions = ws?.instructions?.trim() || null;
+  const instructionsPreview =
+    instructions && instructions.length > 200
+      ? `${instructions.slice(0, 200)}…`
+      : instructions;
+
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const [files, setFiles] = useState<WorkspaceFile[] | null>(null);
+  const [filesLoading, setFilesLoading] = useState(false);
+
+  // Close on outside click while open.
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [open]);
+
+  // Lazy-load base files the first time the popover opens.
+  useEffect(() => {
+    if (!open || files !== null || filesLoading) return;
+    setFilesLoading(true);
+    api.workspaces
+      .listFiles(workspaceId)
+      .then((items) => setFiles(items))
+      .catch(() => setFiles([]))
+      .finally(() => setFilesLoading(false));
+  }, [open, files, filesLoading, workspaceId]);
+
+  return (
+    <div ref={ref} className="relative inline-flex">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        title="此会话绑定的工作区（只读）"
+        className="inline-flex items-center gap-1.5 px-2 py-0.5 border border-line rounded-full bg-surface font-mono text-[11px] text-ink-2 hover:border-ink-2 hover:text-ink hover:bg-paper-2 transition-colors cursor-pointer max-w-[220px]"
+      >
+        <span aria-hidden className="text-accent">◇</span>
+        <span className="truncate">{name}</span>
+        <LevelBadge level={ws?.sensitivity_level} small />
+      </button>
+
+      {open && (
+        <div
+          role="dialog"
+          className="absolute top-full left-0 mt-1.5 z-40 w-[300px] bg-surface border border-line rounded-lg shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-2.5"
+        >
+          <div className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim mb-1.5">
+            工作区 · 只读
+          </div>
+          <div className="flex items-center gap-1.5 mb-2">
+            <span className="text-[13px] font-semibold tracking-[-0.01em] text-ink truncate">
+              {name}
+            </span>
+            <LevelBadge level={ws?.sensitivity_level} />
+          </div>
+
+          {instructionsPreview && (
+            <div className="mb-2.5 pb-2.5 border-b border-line-2">
+              <div className="cw-label mb-1">工作区指令</div>
+              <div className="text-[12px] leading-[1.5] text-ink-2 whitespace-pre-wrap break-words">
+                {instructionsPreview}
+              </div>
+            </div>
+          )}
+
+          <div className="cw-label mb-1">基础文件</div>
+          <div className="max-h-[220px] overflow-auto cw-scroll -mx-0.5">
+            {filesLoading ? (
+              <div className="px-1 py-1.5 font-mono text-[11px] text-dim animate-pulse">
+                加载中…
+              </div>
+            ) : files && files.length > 0 ? (
+              files.map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  onClick={() => {
+                    onPreviewFile({ id: f.id, filename: f.filename, mime: f.mime });
+                    setOpen(false);
+                  }}
+                  className="w-full flex items-center gap-1.5 px-1.5 py-1.5 rounded-md text-left hover:bg-paper-2 transition-colors"
+                  title={f.filename}
+                >
+                  <span aria-hidden className="font-mono text-[11px] text-dim shrink-0">
+                    ·
+                  </span>
+                  <span className="font-mono text-[12px] text-ink truncate">{f.filename}</span>
+                </button>
+              ))
+            ) : (
+              <div className="px-1 py-1.5 font-mono text-[11px] italic text-dim">
+                暂无基础文件
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

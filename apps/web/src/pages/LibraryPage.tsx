@@ -5,10 +5,15 @@ import { Chip } from '../components/shell/Chip';
 import { Dropdown } from '../components/shell/Dropdown';
 import { api } from '../api/client';
 import { ApiError } from '../api/client';
-import type { KnowledgeDocument, McpServer, Skill, SkillVersion } from '../api/types';
+import type {
+  McpServer,
+  Skill,
+  SkillVersion,
+} from '../api/types';
 import { formatRelativeTimeZh } from '../lib/format';
 import { sha256Hex } from '../lib/sha256';
 import { useInstalledSkills } from '../hooks/useInstalledSkills';
+import { KnowledgeSourceTab } from '../components/KnowledgeSourceTab';
 
 // Skill tarball upload limits — kept in lockstep with the BFF (20 MiB) and the
 // skill-store backend, which also enforces the SKILL.md / gzip checks.
@@ -35,19 +40,15 @@ const TAB_LABELS: Record<Tab, string> = {
   docs: '知识源',
 };
 
-const DOC_STATUS_ZH: Record<string, string> = {
-  PENDING: '待处理',
-  INGESTING: '摄入中',
-  READY: '就绪',
-  FAILED: '失败',
-};
-
 export function LibraryPage() {
   const [tab, setTab] = useState<Tab>('mcp');
 
   const [mcpServers, setMcpServers] = useState<McpServer[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
-  const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
+  // Knowledge-source docs are owned by the self-contained KnowledgeSourceTab
+  // (folder navigation + admin mutations); it reports its document count up so
+  // the stat tile / tab badge stay in sync.
+  const [docsCount, setDocsCount] = useState<number | null>(null);
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -67,14 +68,12 @@ export function LibraryPage() {
     setLoading(true);
     setError(null);
     try {
-      const [mcpRes, skillRes, docRes] = await Promise.all([
+      const [mcpRes, skillRes] = await Promise.all([
         api.library.listMcpServers(),
         api.library.listSkills(),
-        api.library.listDocuments(),
       ]);
       setMcpServers(mcpRes.items);
       setSkills(skillRes.items);
-      setDocs(docRes.items);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : '加载资源库失败，请稍后重试。');
     } finally {
@@ -86,24 +85,18 @@ export function LibraryPage() {
     void fetchAll();
   }, [fetchAll]);
 
-  const counts: Record<Tab, number> = {
-    mcp: mcpServers.length,
-    skills: skills.length,
-    docs: docs.length,
+  // Count shown on tiles / tab badges. Docs come from KnowledgeSourceTab and
+  // may still be loading (null → "…"); mcp/skills follow the fetchAll loader.
+  const countLabel = (t: Tab): string => {
+    if (t === 'docs') return docsCount == null ? '…' : String(docsCount);
+    if (loading) return '…';
+    return String(t === 'mcp' ? mcpServers.length : skills.length);
   };
 
   return (
     <div className="flex flex-col h-full min-w-0 bg-paper">
       <PageHead
         crumbs={[{ label: '首页', to: '/home' }, { label: '资源库' }]}
-        actions={
-          <button
-            className="cw-btn cw-btn-accent cw-btn-sm"
-            onClick={() => setInstallOpen(true)}
-          >
-            + 安装
-          </button>
-        }
       />
 
       <div className="cw-scroll flex-1 px-8 py-5">
@@ -121,7 +114,7 @@ export function LibraryPage() {
                   {TAB_LABELS[t]}
                 </div>
                 <div className="font-mono text-[24px] font-semibold tracking-[-0.01em]">
-                  {loading ? '…' : counts[t]}
+                  {countLabel(t)}
                 </div>
               </div>
             ))}
@@ -135,7 +128,7 @@ export function LibraryPage() {
           )}
 
           {/* tab nav */}
-          <div className="flex gap-0.5 border-b border-line">
+          <div className="flex items-center gap-0.5 border-b border-line">
             {(['mcp', 'skills', 'docs'] as Tab[]).map((t) => (
               <button
                 key={t}
@@ -148,14 +141,26 @@ export function LibraryPage() {
               >
                 {TAB_LABELS[t]}
                 <span className="ml-1.5 text-[10px] text-dim">
-                  {loading ? '…' : counts[t]}
+                  {countLabel(t)}
                 </span>
               </button>
             ))}
+            {/* Docs manage their own toolbar (folder-aware) inside
+                KnowledgeSourceTab; the generic "+" only drives mcp/skills. */}
+            {tab !== 'docs' && (
+              <button
+                onClick={() => setInstallOpen(true)}
+                title={`添加${TAB_LABELS[tab]}`}
+                aria-label={`添加${TAB_LABELS[tab]}`}
+                className="ml-auto shrink-0 px-2.5 py-1.5 font-mono text-[15px] leading-none text-ink-2 hover:text-accent transition-colors"
+              >
+                +
+              </button>
+            )}
           </div>
 
-          {/* loading */}
-          {loading && (
+          {/* loading (mcp/skills only; docs tab self-loads) */}
+          {loading && tab !== 'docs' && (
             <div className="font-mono text-[11px] text-dim">加载中…</div>
           )}
 
@@ -254,40 +259,8 @@ export function LibraryPage() {
             </>
           )}
 
-          {/* Knowledge documents */}
-          {!loading && tab === 'docs' && (
-            <>
-              {docs.length === 0 ? (
-                <div className="font-mono italic text-dim text-[12px]">暂无知识源</div>
-              ) : (
-                <div className="flex flex-col gap-1.5">
-                  {docs.map((d) => (
-                    <div
-                      key={d.id}
-                      className="grid grid-cols-[minmax(0,1fr)_80px_60px_100px] gap-3 items-center px-3.5 py-2.5 border border-line bg-surface rounded-md hover:border-ink-2 transition-all"
-                    >
-                      <div className="min-w-0">
-                        <div className="text-[13.5px] font-medium">{d.title}</div>
-                        <div className="font-mono text-[11px] text-dim truncate">{d.mime}</div>
-                      </div>
-                      <Chip
-                        accent={d.status === 'FAILED'}
-                        dashed={d.status !== 'READY' && d.status !== 'FAILED'}
-                      >
-                        {DOC_STATUS_ZH[d.status] ?? d.status}
-                      </Chip>
-                      <span className="font-mono text-[11px] text-dim text-center">
-                        {d.chunk_count} 块
-                      </span>
-                      <span className="font-mono text-[11px] text-dim text-right">
-                        {formatRelativeTimeZh(d.uploaded_at)}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </>
-          )}
+          {/* Knowledge source — folder-navigable, admin-managed */}
+          {tab === 'docs' && <KnowledgeSourceTab onCount={setDocsCount} />}
 
         </div>
       </div>
@@ -352,7 +325,6 @@ function InstallModal({
 }) {
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [note, setNote] = useState<string | null>(null);
 
   // MCP fields
   const [mcpName, setMcpName] = useState('');
@@ -368,17 +340,11 @@ function InstallModal({
   const [skVersion, setSkVersion] = useState('0.1.0');
   const [skFile, setSkFile] = useState<File | null>(null);
 
-  // Document fields
-  const [docTitle, setDocTitle] = useState('');
-  const [docMime, setDocMime] = useState('');
-  const [docFile, setDocFile] = useState<File | null>(null);
-
   const errMsg = (e: unknown) =>
     e instanceof ApiError ? e.message : '安装失败，请稍后重试。';
 
   const submit = async () => {
     setErr(null);
-    setNote(null);
     setSubmitting(true);
     try {
       if (tab === 'mcp') {
@@ -417,22 +383,10 @@ function InstallModal({
         if (sha) fd.append('expected_sha256', sha);
         await api.library.uploadSkillVersion(skill.id, fd);
         onInstalled();
-      } else {
-        if (!docFile) throw new ApiError(400, 'VALIDATION', '请选择文件');
-        const title = docTitle.trim() || docFile.name;
-        const mime = docMime.trim() || docFile.type || 'text/plain';
-        const fd = new FormData();
-        fd.append('title', title);
-        fd.append('mime', mime);
-        fd.append('file', docFile, docFile.name);
-        const doc = await api.library.uploadDocument(fd);
-        // Trigger ingestion so the document gets chunked and becomes READY.
-        const result = await api.library.ingestDocument(doc.id);
-        setNote(`已摄入，生成 ${result.chunks_created} 个分块`);
-        // Give the user a moment to read the result, then refresh.
-        setTimeout(onInstalled, 700);
-        return;
       }
+      // Knowledge-source uploads are admin-only and live on /admin/knowledge;
+      // the docs tab here is a read-only browser (KnowledgeSourceTab), so the
+      // install modal never handles `tab === 'docs'`.
     } catch (e) {
       setErr(errMsg(e));
     } finally {
@@ -559,46 +513,9 @@ function InstallModal({
             </>
           )}
 
-          {tab === 'docs' && (
-            <>
-              <Field label="标题（可选，默认取文件名）">
-                <input
-                  className={inputCls}
-                  value={docTitle}
-                  onChange={(e) => setDocTitle(e.target.value)}
-                  placeholder="文档标题"
-                />
-              </Field>
-              <Field label="文件">
-                <input
-                  type="file"
-                  className="text-[12px] text-ink-2 file:mr-2 file:px-2 file:py-1 file:text-[11px] file:font-mono file:border file:border-line file:rounded-md file:bg-paper file:cursor-pointer"
-                  onChange={(e) => {
-                    const f = e.target.files?.[0] ?? null;
-                    setDocFile(f);
-                    if (f && !docMime) setDocMime(f.type || 'text/plain');
-                  }}
-                />
-              </Field>
-              <Field label="MIME 类型">
-                <input
-                  className={inputCls}
-                  value={docMime}
-                  onChange={(e) => setDocMime(e.target.value)}
-                  placeholder="text/plain"
-                />
-              </Field>
-            </>
-          )}
-
           {err && (
             <div className="px-2.5 py-1.5 border border-accent-line bg-accent-soft rounded-md text-[12px] text-accent">
               {err}
-            </div>
-          )}
-          {note && (
-            <div className="px-2.5 py-1.5 border border-line bg-paper rounded-md text-[12px] text-ink-2 font-mono">
-              {note}
             </div>
           )}
         </div>

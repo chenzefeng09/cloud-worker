@@ -14,12 +14,16 @@ Two flavours of tests:
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
+from contextvars import ContextVar
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
+from fastapi import Request, Response
 from fastapi.testclient import TestClient
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 
 # ── foundation_sdk compatibility shim (test env only) ───────────────────────
 # The real container image builds ``foundation_sdk`` fresh at image-build time,
@@ -30,11 +34,16 @@ from fastapi.testclient import TestClient
 # module imports it. No-op when the installed SDK already has it.
 from foundation_sdk import fastapi as _fsdk_fastapi  # noqa: E402
 
-if not hasattr(_fsdk_fastapi, "get_clearance"):
-    from contextvars import ContextVar as _ContextVar
+# Module-level clearance contextvar + shim flag. The real container's SDK
+# exposes ``get_clearance`` AND its ``RequestContextMiddleware`` reads
+# ``X-User-Clearance`` into the clearance var. A locally-installed SDK can
+# lag that build and lack both; we bridge the getter here and bridge the
+# header->var wiring via ``_ClearanceHeaderMiddleware`` (installed in
+# ``app_client``). In a real-SDK env this var is simply unused.
+_clearance_var: ContextVar[str] = ContextVar("foundation.clearance", default="")
+_CLEARANCE_SHIMMED: bool = not hasattr(_fsdk_fastapi, "get_clearance")
 
-    _clearance_var: _ContextVar[str] = _ContextVar("foundation.clearance", default="")
-
+if _CLEARANCE_SHIMMED:
     def _get_clearance() -> str:
         return _clearance_var.get()
 
@@ -44,8 +53,25 @@ if not hasattr(_fsdk_fastapi, "get_clearance"):
 
         if not hasattr(_fsdk_internal, "get_clearance"):
             _fsdk_internal.get_clearance = _get_clearance  # type: ignore[attr-defined]
-    except Exception:  # noqa: BLE001 — internal module is best-effort
+    except Exception:  # noqa: BLE001 - internal module is best-effort
         pass
+
+
+class _ClearanceHeaderMiddleware(BaseHTTPMiddleware):
+    """Test-only: read ``X-User-Clearance`` into ``_clearance_var``.
+
+    Mirrors what the real ``RequestContextMiddleware`` does in the container
+    for the tenant/user vars. Only installed when the shim is active.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        super().__init__(app)
+
+    async def dispatch(
+        self, request: Request, call_next: Any,
+    ) -> Response:
+        _clearance_var.set(request.headers.get("X-User-Clearance", ""))
+        return await call_next(request)
 
 from agent_session_orchestrator.config import Settings  # noqa: E402
 from agent_session_orchestrator.main import create_app  # noqa: E402
@@ -132,6 +158,13 @@ def app_client(
 
     app = create_app(settings)
 
+    # When the local foundation_sdk lacks its own X-User-Clearance wiring, bridge
+    # the header into the shim's clearance contextvar so ``TClearance`` resolves
+    # the caller's real tier (tests override the header per-case). Must be added
+    # before the TestClient builds the middleware stack.
+    if _CLEARANCE_SHIMMED:
+        app.add_middleware(_ClearanceHeaderMiddleware)
+
     from agent_session_orchestrator.api.dependencies import db_session
 
     async def _override_db() -> AsyncIterator[AsyncMock]:
@@ -145,4 +178,11 @@ def app_client(
 
 @pytest.fixture
 def auth_headers() -> dict[str, str]:
-    return {"X-Tenant-Id": TEST_TENANT, "X-User-Id": TEST_USER}
+    # ``X-User-Clearance: L2`` bakes in the conservative non-privileged tier so
+    # every test exercises the clearance path deterministically; tests that need
+    # a higher tier override the header explicitly.
+    return {
+        "X-Tenant-Id": TEST_TENANT,
+        "X-User-Id": TEST_USER,
+        "X-User-Clearance": "L2",
+    }

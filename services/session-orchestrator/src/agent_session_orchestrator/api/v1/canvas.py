@@ -23,7 +23,7 @@ cross-tenant sessions raise NOT_FOUND).  Errors are RFC 9457 problem+json with
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
@@ -126,6 +126,27 @@ async def get_canvas(
     svc = CanvasService(db, tenant_id=tenant_id)
     canvas = await svc.get_canvas(canvas_id)
     return await _canvas_out(svc, canvas)
+
+
+@router.delete(
+    "/canvases/{canvas_id}",
+    status_code=204,
+    dependencies=[Depends(require_permission("session.message.create", "session"))],
+)
+async def delete_canvas(
+    canvas_id: str,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+) -> Response:
+    """Soft-delete a canvas (Artifacts panel delete).
+
+    Sets ``deleted_at``; the row + versions stay for the retention sweep's
+    physical purge.  Raises ``404 CanvasNotFoundError`` via ``_get_canvas`` for
+    a missing / soft-deleted / cross-tenant canvas.
+    """
+    svc = CanvasService(db, tenant_id=tenant_id)
+    await svc.soft_delete(canvas_id)
+    return Response(status_code=204)
 
 
 @router.get(

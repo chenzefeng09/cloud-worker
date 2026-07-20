@@ -6,13 +6,20 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge_ingest.blob.memory import InMemoryBlobStore
+from knowledge_ingest.domain.models import Document
 from knowledge_ingest.errors import (
     DocumentNotFoundError,
     EmbeddingDimensionError,
     UnsupportedMimeError,
 )
 from knowledge_ingest.services.ingest_service import IngestService
-from tests.conftest import TEST_TENANT, TEST_TENANT_OTHER, FakeEmbeddings
+from tests.conftest import (
+    TEST_TENANT,
+    TEST_TENANT_OTHER,
+    TEST_USER,
+    TEST_USER_OTHER,
+    FakeEmbeddings,
+)
 
 
 @pytest.fixture
@@ -250,3 +257,188 @@ async def test_tenant_isolation_on_listing(
     rows_b = await b.list_documents()
     assert len(rows_a) == 1
     assert len(rows_b) == 0
+
+
+@pytest.mark.asyncio
+async def test_list_documents_excludes_memory_by_default(
+    session: AsyncSession,
+    blob_store: InMemoryBlobStore,
+    embeddings: FakeEmbeddings,
+) -> None:
+    """The default listing hides session-memory docs (origin_session_id set),
+    keeping ordinary uploads."""
+    svc = IngestService(
+        session, blob_store, embeddings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+    )
+    plain = await svc.create_document(
+        title="plain", filename="plain.txt", mime="text/plain", data=b"hello",
+    )
+    mem = await svc.create_document(
+        title="[memory] hi",
+        filename="memory.txt",
+        mime="text/plain",
+        data=b"hi there",
+        origin_session_id="ses_mem",
+    )
+
+    ids = {doc.id for doc, _ in await svc.list_documents()}
+    assert plain.id in ids
+    assert mem.id not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_documents_include_memory_returns_all_users(
+    session: AsyncSession,
+    blob_store: InMemoryBlobStore,
+    embeddings: FakeEmbeddings,
+) -> None:
+    """include_memory=True returns the full tenant set — ordinary uploads plus
+    every user's memory docs, not just the caller's (audit semantics)."""
+    a = IngestService(
+        session, blob_store, embeddings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+    )
+    b = IngestService(
+        session, blob_store, embeddings, tenant_id=TEST_TENANT, user_id=TEST_USER_OTHER,
+    )
+    plain = await a.create_document(
+        title="plain", filename="plain.txt", mime="text/plain", data=b"hello",
+    )
+    a_mem = await a.create_document(
+        title="[memory] a", filename="a.txt", mime="text/plain",
+        data=b"mine", origin_session_id="ses_a",
+    )
+    b_mem = await b.create_document(
+        title="[memory] b", filename="b.txt", mime="text/plain",
+        data=b"theirs", origin_session_id="ses_b",
+    )
+
+    # User A's audit listing sees everything, including user B's memory doc.
+    all_ids = {doc.id for doc, _ in await a.list_documents(include_memory=True)}
+    assert plain.id in all_ids
+    assert a_mem.id in all_ids
+    assert b_mem.id in all_ids
+
+    # The default listing hides both memory docs but keeps the ordinary upload.
+    default_ids = {doc.id for doc, _ in await a.list_documents()}
+    assert plain.id in default_ids
+    assert a_mem.id not in default_ids
+    assert b_mem.id not in default_ids
+
+
+# --------------------------------------------------------- per-user memory scope
+
+
+@pytest.mark.asyncio
+async def test_create_document_stamps_origin_user_id_for_memory(
+    session: AsyncSession,
+    blob_store: InMemoryBlobStore,
+    embeddings: FakeEmbeddings,
+) -> None:
+    """A memory doc (origin_session_id set) is owned by the requesting user."""
+    svc = IngestService(
+        session, blob_store, embeddings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+    )
+    doc = await svc.create_document(
+        title="[memory] hi",
+        filename="memory.txt",
+        mime="text/plain",
+        data="用户任务：hi\n\n助理回答：hello".encode(),
+        origin_session_id="ses_abc123",
+    )
+    refreshed, _ = await svc.get_document(doc.id)
+    assert refreshed.origin_user_id == TEST_USER
+
+
+@pytest.mark.asyncio
+async def test_create_document_ordinary_upload_leaves_origin_user_id_null(
+    session: AsyncSession,
+    blob_store: InMemoryBlobStore,
+    embeddings: FakeEmbeddings,
+) -> None:
+    """An ordinary upload (no origin_session_id) stays tenant-shared: NULL owner."""
+    svc = IngestService(
+        session, blob_store, embeddings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+    )
+    doc = await svc.create_document(
+        title="plain", filename="plain.txt", mime="text/plain", data=b"hello",
+    )
+    refreshed, _ = await svc.get_document(doc.id)
+    assert refreshed.origin_user_id is None
+
+
+@pytest.mark.asyncio
+async def test_search_isolates_memory_by_user(
+    session: AsyncSession,
+    blob_store: InMemoryBlobStore,
+    embeddings: FakeEmbeddings,
+) -> None:
+    """User B must not retrieve user A's memory docs, but sees its own memory
+    plus tenant-shared ordinary uploads."""
+    marker = "uniquely-identifiable-marker " * 8
+    a = IngestService(
+        session, blob_store, embeddings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+    )
+    b = IngestService(
+        session, blob_store, embeddings, tenant_id=TEST_TENANT, user_id=TEST_USER_OTHER,
+    )
+
+    a_mem = await a.create_document(
+        title="[memory] a", filename="a.txt", mime="text/plain",
+        data=marker.encode(), origin_session_id="ses_a",
+    )
+    await a.ingest_document(a_mem.id)
+    b_mem = await b.create_document(
+        title="[memory] b", filename="b.txt", mime="text/plain",
+        data=marker.encode(), origin_session_id="ses_b",
+    )
+    await b.ingest_document(b_mem.id)
+    shared = await a.create_document(
+        title="plain", filename="plain.txt", mime="text/plain", data=marker.encode(),
+    )
+    await a.ingest_document(shared.id)
+
+    # User B's search sees its own memory + the shared upload, never A's memory.
+    hits_b = {h.document_id for h in await b.search("uniquely-identifiable-marker", k=10)}
+    assert a_mem.id not in hits_b
+    assert b_mem.id in hits_b
+    assert shared.id in hits_b
+
+    # Symmetric: user A never sees B's memory.
+    hits_a = {h.document_id for h in await a.search("uniquely-identifiable-marker", k=10)}
+    assert b_mem.id not in hits_a
+    assert a_mem.id in hits_a
+    assert shared.id in hits_a
+
+
+@pytest.mark.asyncio
+async def test_search_excludes_unowned_memory_doc(
+    session: AsyncSession,
+    blob_store: InMemoryBlobStore,
+    embeddings: FakeEmbeddings,
+) -> None:
+    """A memory doc with NULL origin_user_id (pre-migration, un-backfilled) is
+    fail-closed: excluded from every user's search."""
+    marker = "uniquely-identifiable-marker " * 8
+    svc = IngestService(
+        session, blob_store, embeddings, tenant_id=TEST_TENANT, user_id=TEST_USER,
+    )
+    # Simulate a legacy row: origin_session_id set but origin_user_id NULL.
+    legacy = Document(
+        tenant_id=TEST_TENANT,
+        title="[memory] legacy",
+        mime="text/plain",
+        status="PENDING",
+        origin_session_id="ses_legacy",
+        origin_user_id=None,
+    )
+    session.add(legacy)
+    await session.flush()
+    # Give it a blob + chunks via the normal ingest path.
+    from knowledge_ingest.blob.base import make_key
+    key = make_key(TEST_TENANT, legacy.id, "legacy.txt")
+    legacy.source_uri = blob_store.put(key, marker.encode(), content_type="text/plain")
+    await session.flush()
+    await svc.ingest_document(legacy.id)
+
+    hits = {h.document_id for h in await svc.search("uniquely-identifiable-marker", k=10)}
+    assert legacy.id not in hits

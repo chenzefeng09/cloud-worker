@@ -11,18 +11,35 @@ interface Props {
   onChange: (id: string) => void;
   disabled?: boolean;
   title?: string;
+  ariaLabel?: string;
   /** Which edge the popover aligns to. Defaults to 'right'. */
   align?: 'left' | 'right';
   /** Render as a full-width bordered input-like trigger. */
   fullWidth?: boolean;
+  /** Which direction the popover opens. Defaults to 'up' (bottom toolbar). */
+  dropDirection?: 'up' | 'down';
+  /** Optional visual override for the trigger while preserving dropdown behavior. */
+  triggerClassName?: string;
 }
 
 /**
  * Small composer dropdown matching the design system's mono toolbar controls.
- * Opens UPWARD (it lives in a bottom toolbar). Closes on outside click and on
+ * Opens upward by default (it lives in a bottom toolbar); pass
+ * `dropDirection="down"` for mid-page or in-dialog placement. Closes on outside click and on
  * selection — same pattern as InputBar's "+" popover.
  */
-export function Dropdown({ value, options, onChange, disabled, title, align = 'right', fullWidth }: Props) {
+export function Dropdown({
+  value,
+  options,
+  onChange,
+  disabled,
+  title,
+  ariaLabel,
+  align = 'right',
+  fullWidth,
+  dropDirection = 'up',
+  triggerClassName = '',
+}: Props) {
   const [open, setOpen] = useState(false);
   const ref = useRef<HTMLDivElement>(null);
 
@@ -44,13 +61,14 @@ export function Dropdown({ value, options, onChange, disabled, title, align = 'r
         disabled={disabled}
         onClick={() => setOpen((o) => !o)}
         title={title}
+        aria-label={ariaLabel}
         aria-haspopup="menu"
         aria-expanded={open}
-        className={
+        className={`${
           fullWidth
             ? 'w-full border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper text-left flex items-center justify-between gap-1 hover:border-ink-2 focus:outline-none focus:border-accent'
-            : 'font-mono text-[10.5px] text-dim hover:text-ink disabled:opacity-50 leading-none inline-flex items-center gap-0.5'
-        }
+            : 'font-mono text-[10.5px] text-dim hover:text-ink disabled:opacity-50 leading-none inline-flex items-center gap-0.5 whitespace-nowrap'
+        } ${triggerClassName}`}
       >
         {current}
         <span aria-hidden className="text-[8px]">▾</span>
@@ -58,7 +76,7 @@ export function Dropdown({ value, options, onChange, disabled, title, align = 'r
       {open && (
         <div
           role="menu"
-          className={`absolute bottom-full mb-1 ${align === 'right' ? 'right-0' : 'left-0'} min-w-[112px] z-30 bg-surface border border-line rounded-lg shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-1`}
+          className={`absolute ${dropDirection === 'down' ? 'top-full mt-1' : 'bottom-full mb-1'} ${align === 'right' ? 'right-0' : 'left-0'} w-max min-w-[112px] max-w-[320px] z-30 bg-surface border border-line rounded-lg shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-1`}
         >
           {options.map((o) => {
             const on = o.id === value;
@@ -72,7 +90,7 @@ export function Dropdown({ value, options, onChange, disabled, title, align = 'r
                   onChange(o.id);
                   setOpen(false);
                 }}
-                className={`w-full text-left px-2 py-1.5 rounded-md font-mono text-[11.5px] hover:bg-paper ${
+                className={`w-full text-left px-2 py-1.5 rounded-md font-mono text-[11.5px] whitespace-nowrap overflow-hidden text-ellipsis hover:bg-paper ${
                   on ? 'text-ink font-medium' : 'text-ink-2'
                 }`}
               >

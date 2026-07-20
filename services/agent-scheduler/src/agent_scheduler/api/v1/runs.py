@@ -479,6 +479,13 @@ async def create_run(
         resume_raw if isinstance(resume_raw, dict) else None
     )
 
+    # Effective clearance (min(user, workspace)) for the run, forwarded by the
+    # orchestrator.  Injected into the sandbox env as FOUNDATION_USER_CLEARANCE
+    # and signed into the broker lease so knowledge-ingest can enforce the
+    # document-visibility gate.  Not secret -> plain env.  Empty string is the
+    # fail-open sentinel: ki treats a missing X-User-Clearance as L1.
+    user_clearance: str = str(body.get("effective_clearance") or "")
+
     # Optional per-message LLM selection (model + reasoning effort), nested in
     # agent_config by the orchestrator. Falls back to top-level for direct callers.
     agent_config: dict[str, Any] = body.get("agent_config") or {}
@@ -595,6 +602,7 @@ async def create_run(
                 sampling_params=sampling_params,
                 hitl=hitl,
                 resume=resume,
+                user_clearance=user_clearance,
             )
         )
     except SandboxSpawnError as exc:

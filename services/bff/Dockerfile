@@ -1,4 +1,8 @@
-# syntax=docker/dockerfile:1.7
+# Use BuildKit's bundled Dockerfile frontend (no remote `# syntax=` lookup):
+# a remote frontend image fetch makes otherwise-local rebuilds stall before the
+# first layer on this host (Docker Hub unreachable/flaky). Mirrors the
+# session-orchestrator Dockerfile.overlay stance. The directives used below are
+# all standard and supported by the bundled frontend.
 # BFF is now built on top of agent-platform-dev-session-orchestrator because
 # Docker Desktop on this host corrupts pypi metadata (bm2-bm3 fix-report) and
 # the base already carries all the deps BFF needs (FastAPI + httpx +

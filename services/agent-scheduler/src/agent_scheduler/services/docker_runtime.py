@@ -210,6 +210,7 @@ class DockerRuntime:
         sampling_params: dict[str, Any] | None = None,
         hitl: bool = True,
         resume: dict[str, Any] | None = None,
+        user_clearance: str = "",
     ) -> str:
         """Spawn a sandbox container for one agent run.
 
@@ -235,6 +236,13 @@ class DockerRuntime:
             llm_virtual_key: tenant virtual key from the gateway.  Required
                 when ``llm_gateway_enforcer`` is active; omitted only for an
                 explicit local direct-connect configuration.
+            user_clearance: the run's effective clearance (``min(user,
+                workspace)``), forwarded by the orchestrator.  Injected into
+                the sandbox env as ``FOUNDATION_USER_CLEARANCE`` so the
+                ``knowledge_tool`` extension can send ``X-User-Clearance`` to
+                knowledge-ingest (foundation mode) and signed into the broker
+                lease so the broker re-injects it for the ki façade (broker
+                mode).  Not secret -> plain env, like tenant/user id.
         """
         _check_ids(
             run_id=run_id,
@@ -300,6 +308,7 @@ class DockerRuntime:
                 user_id=user_id,
                 run_id=run_id,
                 ttl_seconds=self._settings.sandbox_timeout,
+                clearance=user_clearance,
             )
         except ValueError as exc:
             raise SandboxSpawnError(str(exc)) from exc
@@ -340,6 +349,13 @@ class DockerRuntime:
             "FOUNDATION_API_TOKEN": foundation_token,
             "FOUNDATION_TENANT_ID": tenant_id,
             "FOUNDATION_USER_ID": user_id,
+            # Effective clearance (min(user, workspace)) for the run.  The
+            # ``knowledge_tool`` extension sends this as X-User-Clearance to
+            # knowledge-ingest so ki enforces the visibility gate; in broker
+            # mode the same value is signed into the lease and the broker
+            # re-injects it (trusted) for the ki façade.  Not secret -> plain
+            # env, consistent with FOUNDATION_TENANT_ID / FOUNDATION_USER_ID.
+            "FOUNDATION_USER_CLEARANCE": user_clearance,
             "OTEL_EXPORTER_OTLP_ENDPOINT": self._settings.otel_exporter_endpoint,
             "SANDBOX_EGRESS_MODE": service_env["SANDBOX_EGRESS_MODE"],
             "TOOL_BROKER_URL": service_env["TOOL_BROKER_URL"],
@@ -380,6 +396,12 @@ class DockerRuntime:
             # ${DLP_URL}/core/scan for scanning.  Reached directly (foundation
             # mode) or through the tool-broker /dlp façade (broker mode).
             "DLP_URL": service_env["DLP_URL"],
+            # Knowledge-ingest (KB v1) - the knowledge_tool extension GETs
+            # ${KNOWLEDGE_INGEST_URL}/search?scope=knowledge.  Reached directly
+            # (foundation mode) or through the tool-broker /knowledge/v1
+            # facade (broker mode, which re-injects X-User-Clearance from the
+            # signed lease).  Blank in none mode -> tool self-gates off.
+            "KNOWLEDGE_INGEST_URL": service_env["KNOWLEDGE_INGEST_URL"],
         }
         if tool_broker_lease:
             env_vars["TOOL_BROKER_LEASE"] = tool_broker_lease

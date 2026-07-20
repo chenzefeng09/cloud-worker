@@ -49,6 +49,8 @@ async def _proxy(
         try:
             if method == "GET":
                 resp = await client.get(url, headers=headers)
+            elif method == "DELETE":
+                resp = await client.delete(url, headers=headers)
             else:
                 resp = await client.post(url, json=json_body, headers=headers)
         except httpx.HTTPError as exc:
@@ -63,6 +65,12 @@ async def _proxy(
     try:
         body = resp.json()
     except Exception:  # noqa: BLE001
+        # 204 (or any empty body) — faithfully relay the status with empty JSON.
+        if not resp.content:
+            return JSONResponse(
+                status_code=resp.status_code if resp.status_code < 600 else 502,
+                content=None,
+            )
         body = {"detail": "Upstream returned non-JSON response", "status": resp.status_code}
 
     return JSONResponse(
@@ -126,6 +134,30 @@ async def get_canvas(
     orch_url = request.app.state.settings.session_orchestrator_url
     return await _proxy(
         method="GET",
+        orch_url=orch_url,
+        orch_path=f"/canvases/{canvas_id}",
+        tenant_id=tenant_id,
+        user_id=user_id,
+        access_token=access_token,
+    )
+
+
+@router.delete("/canvases/{canvas_id}", status_code=204)
+async def delete_canvas(
+    canvas_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> JSONResponse:
+    """软删除画布（Artifacts 专区删除）—— 代理到 orchestrator。
+
+    转发 DELETE，状态码原样中继（成功为 204）。orchestrator 的
+    ``CanvasService.soft_delete`` 只翻 ``deleted_at``，行与版本留待保留期
+    清理统一物理删除。
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = request.app.state.settings.session_orchestrator_url
+    return await _proxy(
+        method="DELETE",
         orch_url=orch_url,
         orch_path=f"/canvases/{canvas_id}",
         tenant_id=tenant_id,

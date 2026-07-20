@@ -166,6 +166,8 @@ sessionOrchestrator:
     dbMaxOverflow: "10"
     dbPoolRecycle: "1800"
     skillStoreServiceScopes: "skill.read_internal"
+    mcpRegistryServiceScopes: "mcp.read_internal"
+    inlineMcpTimeout: "20"
   env: []
 
 # ---------------------------------------------------------------------------

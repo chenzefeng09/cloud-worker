@@ -854,6 +854,61 @@ def test_create_run_injects_memory(
         assert "张三" in scheduler_body[-1]["memory"]
 
 
+def test_create_run_forwards_effective_clearance_to_scheduler(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """The sandbox branch must forward the run's effective clearance to the
+    scheduler so it can inject FOUNDATION_USER_CLEARANCE into the sandbox env
+    (and sign it into the broker lease for the ki façade).
+
+    With no workspace bound to the session, effective_clearance == the caller's
+    own clearance (L2 from the auth_headers fixture).  The scheduler POST body
+    must carry ``effective_clearance`` == "L2".
+    """
+    import httpx
+
+    session = Session(
+        id="ses_clr", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+    )
+    mock_db.execute.return_value = make_scalar_result(session)
+    mock_db.refresh = AsyncMock(side_effect=[None])
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_clr"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+
+    scheduler_body: list[dict] = []
+
+    class _SchResp:
+        status_code = 201
+        def json(self):
+            return {"id": "run_clr", "sandbox_id": "abc123", "status": "RUNNING"}
+
+    class _FakeClient(AuthzAwareClient):
+        async def get(self, url, **kw):
+            # Memory pre-fetch / workspace lookups -> empty / not found.
+            return httpx.Response(404, json={"detail": "not found"})
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if json:
+                scheduler_body.append(json)
+            return _SchResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        app_client.post(
+            "/api/session/v1/sessions/ses_clr/runs",
+            headers=auth_headers,
+            json={"task": "查一下知识库"},
+        )
+
+    assert scheduler_body, "scheduler was not called"
+    assert scheduler_body[-1]["effective_clearance"] == "L2"
+
+
 @pytest.mark.parametrize(
     (
         "include_skills",
@@ -2967,3 +3022,166 @@ def test_reconcile_503_keeps_running_unchanged() -> None:
     assert run.status == "RUNNING"  # unchanged
     assert run.finished_at is None
     svc.create_message.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Knowledge library v1 — memory scope + knowledge prefetch + effective clearance
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_fetch_memory_sends_scope_memory_and_clearance_header() -> None:
+    """_fetch_memory now scopes to memory and forwards the effective clearance."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_memory
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {"hits": []}
+
+    class _FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, url, **kw):
+            captured["params"] = kw.get("params") or {}
+            captured["headers"] = kw.get("headers") or {}
+            return _FakeResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        asyncio.get_event_loop().run_until_complete(
+            _fetch_memory(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
+                query="hi",
+                clearance="L3",
+            )
+        )
+    assert captured["params"].get("scope") == "memory"
+    assert captured["headers"].get("X-User-Clearance") == "L3"
+
+
+def test_fetch_knowledge_formats_with_provenance_and_scope() -> None:
+    """_fetch_knowledge hits ki with scope=knowledge + clearance and formats
+    each hit with a 【文档名 | 文件夹路径】 provenance header."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_knowledge
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "hits": [
+                    {"document_name": "报销规定", "folder_path": "行政", "text": "差旅报销标准…"},
+                ]
+            }
+
+    class _FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, url, **kw):
+            captured["params"] = kw.get("params") or {}
+            captured["headers"] = kw.get("headers") or {}
+            return _FakeResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        result = asyncio.get_event_loop().run_until_complete(
+            _fetch_knowledge(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
+                query="报销",
+                clearance="L2",
+            )
+        )
+    assert captured["params"].get("scope") == "knowledge"
+    assert captured["headers"].get("X-User-Clearance") == "L2"
+    assert "【报销规定 | 行政】" in result
+    assert "差旅报销标准" in result
+
+
+def test_fetch_knowledge_failure_open() -> None:
+    """A knowledge-search error yields an empty block (retrieval never blocks)."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_knowledge
+
+    class _FailClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, url, **kw):
+            raise httpx.ConnectError("down")
+
+    with patch.object(httpx, "AsyncClient", return_value=_FailClient()):
+        result = asyncio.get_event_loop().run_until_complete(
+            _fetch_knowledge(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_1",
+                query="hi",
+                clearance="L1",
+            )
+        )
+    assert result == ""
+
+
+def test_effective_clearance_is_min_of_user_and_workspace() -> None:
+    from agent_session_orchestrator.api.v1.runs import _effective_clearance
+
+    # No workspace → the user's own clearance.
+    assert _effective_clearance("L4", None) == "L4"
+    # Workspace lower than user → capped at the workspace level.
+    assert _effective_clearance("L4", "L2") == "L2"
+    # User lower than workspace → capped at the user level.
+    assert _effective_clearance("L1", "L3") == "L1"
+    # Equal → that level.
+    assert _effective_clearance("L3", "L3") == "L3"
+    # Malformed workspace level → fail-open to user clearance.
+    assert _effective_clearance("L2", "bogus") == "L2"
+
+
+def test_resolve_workspace_sensitivity() -> None:
+    from agent_session_orchestrator.services.workspace_context import (
+        resolve_workspace_sensitivity,
+    )
+
+    # No workspace bound → None (no DB call).
+    ses_none = Session(id="s0", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
+    db = AsyncMock()
+    got = asyncio.get_event_loop().run_until_complete(
+        resolve_workspace_sensitivity(db, ses_none)
+    )
+    assert got is None
+    db.execute.assert_not_called()
+
+    # Workspace bound → the queried level string.
+    ses_ws = Session(
+        id="s1", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+        workspace_id="wsp_1",
+    )
+    db2 = AsyncMock()
+    db2.execute.return_value = make_scalar_result("L2")
+    got2 = asyncio.get_event_loop().run_until_complete(
+        resolve_workspace_sensitivity(db2, ses_ws)
+    )
+    assert got2 == "L2"

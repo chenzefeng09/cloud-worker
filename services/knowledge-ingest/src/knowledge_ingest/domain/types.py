@@ -14,6 +14,7 @@ import json
 from typing import Any
 
 from sqlalchemy import String
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.types import TypeDecorator, UserDefinedType
 
 
@@ -24,6 +25,19 @@ class _VectorType(UserDefinedType):  # type: ignore[type-arg]
 
     def get_col_spec(self, **kw: Any) -> str:  # noqa: ANN401
         return "vector"
+
+
+@compiles(_VectorType, "sqlite")
+def _compile_vector_sqlite(type_: Any, compiler: Any, **kw: Any) -> str:  # noqa: ANN401
+    """Render the CAST target as ``TEXT`` on SQLite (unit-test path).
+
+    SQLite has no ``vector`` type and assigns unknown type names NUMERIC
+    affinity, so ``CAST('[0.1,…]' AS vector)`` would silently coerce the JSON
+    vector literal to ``0``.  Rendering ``TEXT`` keeps the JSON string intact
+    for ``process_result_value`` to parse back into a list.  Postgres keeps the
+    real ``vector`` type via ``get_col_spec``.
+    """
+    return "TEXT"
 
 
 class VectorColumn(TypeDecorator):  # type: ignore[type-arg]

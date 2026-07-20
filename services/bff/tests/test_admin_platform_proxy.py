@@ -120,6 +120,9 @@ class FakePlatform:
         self.allowed_actions = allowed_actions
         self.checked_actions: list[str] = []
         self.requests: list[tuple[str, str, dict[str, str]]] = []
+        # (method, url, forwarded query params) — separate from ``requests`` so
+        # existing 3-tuple unpacking stays intact.
+        self.param_calls: list[tuple[str, str, dict[str, str]]] = []
         # method, url-substring → (status, body)
         self.routes: dict[tuple[str, str], tuple[int, Any]] = {
             ("GET", "/skills/"): (200, {"id": "skl_1", "name": "demo"}),
@@ -144,6 +147,7 @@ class FakePlatform:
 
     def route(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         self.requests.append((method, url, dict(kwargs.get("headers") or {})))
+        self.param_calls.append((method, url, dict(kwargs.get("params") or {})))
 
         # authz /check — the BFF guard.
         if "/check" in url:
@@ -326,6 +330,23 @@ def test_reingest_maps_to_ingest(client, authed_cookie, fake_allowed) -> None:
         u == f"{KNOW_URL}/documents/doc_1/ingest"
         for (_, u, _) in fake_allowed.requests
     ), "reingest did not map to /ingest"
+
+
+def test_admin_documents_list_forces_include_memory(
+    client, authed_cookie, fake_allowed,
+) -> None:
+    """The admin audit listing must ask knowledge-ingest for the full set,
+    memory docs included, by forwarding include_memory=true."""
+    resp = client.get(
+        "/api/bff/v1/admin/knowledge/documents", cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    doc_params = [
+        p for (m, u, p) in fake_allowed.param_calls
+        if m == "GET" and u == f"{KNOW_URL}/documents"
+    ]
+    assert doc_params, "admin documents list did not hit knowledge-ingest /documents"
+    assert doc_params[0].get("include_memory") == "true"
 
 
 def test_delete_document_hits_knowledge_ingest(client, authed_cookie, fake_allowed) -> None:

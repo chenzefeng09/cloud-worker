@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Integer,
@@ -41,6 +42,9 @@ class Session(Base):
     title: Mapped[str | None] = mapped_column(String(200), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="ACTIVE")
     current_run_id: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    # Soft reference (no FK, like ``current_run_id``) to the Workspace this
+    # session was created against.  NULL for sessions not scoped to a workspace.
+    workspace_id: Mapped[str | None] = mapped_column(String(30), nullable=True, index=True)
     # ``metadata`` is reserved on SQLAlchemy's DeclarativeBase (it points at
     # the MetaData registry).  Map our column to a differently-named Python
     # attribute so the ORM stays happy; the SQL column name in
@@ -251,3 +255,75 @@ class CanvasSuggestion(Base):
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
     )
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Workspace(Base):
+    """A user-owned workspace — a reusable bundle of instructions, skills, and
+    files that a session can be created against.
+
+    Scoped to a tenant + user with the same RLS discipline as ``session``.  At
+    most one workspace per user may be ``is_default`` (enforced by a partial
+    unique index in the migration).  Soft-deletes via ``deleted_at``.
+    """
+
+    __tablename__ = "workspace"
+    __table_args__ = {"schema": "session_orchestrator"}
+
+    id: Mapped[str] = mapped_column(String(30), primary_key=True, default=lambda: new_id("wsp"))
+    tenant_id: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    user_id: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    instructions: Mapped[str | None] = mapped_column(Text, nullable=True)
+    skills: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    meta: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # Sensitivity tier L1..L5 (L1 < L2 < L3 < L4 < L5), server-authoritative.
+    # A file's level may not exceed its workspace's level; a caller whose
+    # clearance is below the workspace level gets no workspace context at all.
+    sensitivity_level: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="L2", server_default="L2",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=utcnow, onupdate=utcnow, server_default=func.now(),
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WorkspaceFile(Base):
+    """A file attached to a :class:`Workspace`.
+
+    The raw bytes live in S3 under ``blob_key``; this row is the authoritative
+    metadata record (same pattern as :class:`Attachment`).  RLS is enabled on
+    this table.
+    """
+
+    __tablename__ = "workspace_file"
+    __table_args__ = {"schema": "session_orchestrator"}
+
+    id: Mapped[str] = mapped_column(String(30), primary_key=True, default=lambda: new_id("wsf"))
+    tenant_id: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    workspace_id: Mapped[str] = mapped_column(
+        String(30), ForeignKey("session_orchestrator.workspace.id"), nullable=False, index=True,
+    )
+    user_id: Mapped[str] = mapped_column(String(30), nullable=False)
+    filename: Mapped[str] = mapped_column(String(500), nullable=False)
+    mime: Mapped[str] = mapped_column(
+        String(200), nullable=False, default="application/octet-stream",
+    )
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    blob_key: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Sensitivity tier L1..L5; must be <= the parent workspace's level (enforced
+    # in workspace_service.create_file).  Filtered out of run context when above
+    # the caller's clearance.
+    sensitivity_level: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="L2", server_default="L2",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
+    )

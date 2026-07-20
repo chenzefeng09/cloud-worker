@@ -89,6 +89,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from agent_bff.api.v1.sessions import router as sessions_router
     app.include_router(sessions_router, prefix=settings.api_prefix)
 
+    # Workspaces — persistent user-scoped instructions/skills/files pinned to a
+    # session; transparent proxy to the orchestrator's /workspaces surface.
+    from agent_bff.api.v1.workspaces import router as workspaces_router
+    app.include_router(workspaces_router, prefix=settings.api_prefix)
+
     from agent_bff.api.v1.conversations import router as chat_router
     app.include_router(chat_router, prefix=settings.api_prefix)
 
@@ -106,6 +111,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from agent_bff.api.v1.library import router as library_router
     app.include_router(library_router, prefix=settings.api_prefix)
+
+    # Artifacts 专区 — merged cross-session canvas + output-file timeline.
+    from agent_bff.api.v1.artifacts import router as artifacts_router
+    app.include_router(artifacts_router, prefix=settings.api_prefix)
 
     from agent_bff.api.v1.apps import router as apps_router
     app.include_router(apps_router, prefix=settings.api_prefix)

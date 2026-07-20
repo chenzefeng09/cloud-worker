@@ -15,6 +15,7 @@ import { QuestionCard } from './hitl/QuestionCard';
 import { CanvasMessageCard } from './CanvasMessageCard';
 import { api } from '../api/client';
 import type { Attachment, MessageAttachment } from '../api/types';
+import type { MentionCandidate } from '../lib/mentionTrigger';
 import { groupSteps } from '../lib/groupSteps';
 import { DEFAULT_EFFORT, SYSTEM_FALLBACK_MODEL } from '../lib/modelOptions';
 import { useDefaultModel } from '../hooks/useDefaultModel';
@@ -292,6 +293,7 @@ const DATA_NOTICE_ACK_KEY = 'data-notice-ack-v1';
 
 export function ChatWindow({
   sessionId,
+  workspaceId,
   friendly,
   onPreviewFile,
   onSendMessage,
@@ -312,9 +314,11 @@ export function ChatWindow({
   onExternalPrefillConsumed,
 }: {
   sessionId: string;
+  /** Workspace bound to this session — sources the "@" mention workspace files. */
+  workspaceId?: string;
   friendly?: boolean;
   onPreviewFile?: (att: { id: string; filename: string; mime?: string }) => void;
-  onSendMessage?: (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => void | Promise<void>;
+  onSendMessage?: (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[], workspaceFileIds?: string[]) => void | Promise<void>;
   inlineCanvasDraft?: CanvasDocumentDraft | null;
   inlineCanvasPending?: boolean;
   inlineCanvasRevising?: boolean;
@@ -349,6 +353,42 @@ export function ChatWindow({
     rewindError,
   } = useChat();
   const { byRunId, refresh: refreshOutputs } = useOutputAttachments(sessionId);
+
+  // "@ file" mention candidates: workspace base files (labelled 工作区) + this
+  // session's input attachments (labelled 附件). Best-effort — any fetch that
+  // fails degrades silently to whatever loaded. Refreshed on a run-completion
+  // edge so files uploaded/added earlier in the session surface without a page
+  // reload.
+  const [mentionCandidates, setMentionCandidates] = useState<MentionCandidate[]>([]);
+  const loadMentionCandidates = useCallback(async () => {
+    const [wsFiles, inputAtts] = await Promise.all([
+      workspaceId
+        ? api.workspaces.listFiles(workspaceId).catch(() => [])
+        : Promise.resolve([]),
+      api.attachments
+        .list(sessionId, 'input')
+        .then((r) => (Array.isArray(r?.items) ? r.items : []))
+        .catch(() => []),
+    ]);
+    setMentionCandidates([
+      ...wsFiles.map((f) => ({
+        id: f.id,
+        filename: f.filename,
+        kind: 'workspace' as const,
+        mime: f.mime,
+      })),
+      ...inputAtts.map((a) => ({
+        id: a.id,
+        filename: a.filename,
+        kind: 'attachment' as const,
+        mime: a.mime,
+      })),
+    ]);
+  }, [sessionId, workspaceId]);
+  useEffect(() => {
+    void loadMentionCandidates();
+  }, [loadMentionCandidates]);
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const shouldStickToBottomRef = useRef(true);
@@ -505,15 +545,21 @@ export function ChatWindow({
   useEffect(() => {
     if (prevStreamingRef.current && !isStreaming) {
       refreshOutputs();
+      void loadMentionCandidates();
     }
     prevStreamingRef.current = isStreaming;
-  }, [isStreaming, refreshOutputs]);
+  }, [isStreaming, refreshOutputs, loadMentionCandidates]);
 
   const handleUpload = async (file: File): Promise<Attachment> => {
     return api.attachments.upload(sessionId, file);
   };
 
-  const handleSend = (text: string, attachmentIds?: string[], attachments?: Attachment[]) => {
+  const handleSend = (
+    text: string,
+    attachmentIds?: string[],
+    attachments?: Attachment[],
+    workspaceFileIds?: string[],
+  ) => {
     const attMeta: MessageAttachment[] | undefined = attachments?.map((a) => ({
       id: a.id,
       filename: a.filename,
@@ -523,10 +569,10 @@ export function ChatWindow({
     shouldStickToBottomRef.current = true;
     scrollToBottom('smooth');
     if (onSendMessage) {
-      onSendMessage(text, attachmentIds, attMeta);
+      onSendMessage(text, attachmentIds, attMeta, workspaceFileIds);
       return;
     }
-    sendMessage(text, attachmentIds, attMeta);
+    sendMessage(text, attachmentIds, attMeta, workspaceFileIds);
   };
 
   const handleTranscriptWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
@@ -797,6 +843,7 @@ export function ChatWindow({
         onEffortChange={showThinkingUi ? (e) => setSessionEffort(sessionId, e) : undefined}
         executionMode={executionMode ?? 'sandbox'}
         onExecutionModeChange={(mode) => setSessionExecutionMode(sessionId, mode)}
+        mentionCandidates={mentionCandidates}
       />
       {showDataNotice && <DataNoticeModal onAck={ackDataNotice} />}
       {pendingRewind && (

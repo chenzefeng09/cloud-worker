@@ -12,39 +12,46 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 from agent_bff.api._http import foundation_headers
-from agent_bff.api.dependencies import require_auth
+from agent_bff.api.dependencies import require_auth, TClearance
 
 router = APIRouter(tags=["Conversations"])
 logger = logging.getLogger(__name__)
 
 
-class _ExecutionModeEnvelope(BaseModel):
-    """Validates only the optional ``execution_mode`` field of a chat request.
+class _ChatBodyEnvelope(BaseModel):
+    """Validates the strictly-typed optional fields of a chat request body.
 
     The chat endpoint reads the rest of its body as a loose dict (message,
-    attachment_ids, skills, model, reasoning_effort), but ``execution_mode``
-    must be strictly one of ``inline`` / ``sandbox`` — an unknown value is a
-    422, not a silent fallthrough.  Defaults to ``sandbox`` when omitted so
-    existing clients keep the current agent-mode behaviour with zero change.
+    attachment_ids, skills, model, reasoning_effort), but a couple of fields must
+    be strictly validated so an illegal value is a 422 rather than a silent
+    fallthrough:
 
-    * ``inline``  — chat mode: the orchestrator answers in-process via the LLM
-                    gateway, no sandbox is dispatched.
-    * ``sandbox`` — agent mode (default): the existing sandboxed-run behaviour.
+    * ``execution_mode``     — must be one of ``inline`` / ``sandbox`` (defaults
+                               to ``sandbox`` when omitted so existing clients
+                               keep the current agent-mode behaviour with zero
+                               change).  ``inline`` = chat mode (orchestrator
+                               answers in-process via the LLM gateway, no sandbox);
+                               ``sandbox`` = agent mode (existing sandboxed run).
+    * ``workspace_file_ids`` — optional list of workspace-file ids (``wsf_…``) the
+                               user @-referenced in this message.  A non-list value
+                               or a non-string element is a 422; omitted → ``None``.
     """
 
     execution_mode: Literal["inline", "sandbox"] = "sandbox"
+    workspace_file_ids: list[str] | None = None
 
 
-def _validate_execution_mode(body: dict) -> str:
-    """Return the validated execution_mode, raising 422 on an illegal value.
+def _validate_chat_body(body: dict) -> _ChatBodyEnvelope:
+    """Return the validated chat-body envelope, raising 422 on an illegal value.
 
-    Only the ``execution_mode`` key is inspected; anything else in ``body`` is
+    Only the strictly-typed keys are inspected; anything else in ``body`` is
     ignored here (the endpoint reads those fields separately).
     """
     try:
-        return _ExecutionModeEnvelope(
-            execution_mode=body.get("execution_mode", "sandbox")
-        ).execution_mode
+        return _ChatBodyEnvelope(
+            execution_mode=body.get("execution_mode", "sandbox"),
+            workspace_file_ids=body.get("workspace_file_ids"),
+        )
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
@@ -97,19 +104,24 @@ async def chat(
     session_id: str,
     request: Request,
     _auth: tuple = Depends(require_auth()),
+    clearance: str = TClearance,
 ) -> JSONResponse:
     """Persist user message, trigger run, return run_id + message_id.
 
     Body fields:
-    * ``message``          — required, user text
-    * ``attachment_ids``   — optional list of attachment ids already uploaded to
-                             this session
-    * ``skills``           — optional list of skill names
-    * ``model``            — optional model name
-    * ``reasoning_effort`` — optional reasoning effort string
-    * ``execution_mode``   — optional ``"inline"`` | ``"sandbox"`` (default
-                             ``"sandbox"``); ``inline`` = chat mode (no sandbox),
-                             ``sandbox`` = agent mode.  An illegal value → 422.
+    * ``message``            — required, user text
+    * ``attachment_ids``     — optional list of attachment ids already uploaded to
+                               this session
+    * ``workspace_file_ids`` — optional list of workspace-file ids (``wsf_…``) the
+                               user @-referenced; forwarded verbatim so the
+                               orchestrator can prioritise those files in the
+                               injected workspace context.
+    * ``skills``             — optional list of skill names
+    * ``model``              — optional model name
+    * ``reasoning_effort``   — optional reasoning effort string
+    * ``execution_mode``     — optional ``"inline"`` | ``"sandbox"`` (default
+                               ``"sandbox"``); ``inline`` = chat mode (no sandbox),
+                               ``sandbox`` = agent mode.  An illegal value → 422.
 
     Returns JSON ``{"run_id": "...", "message_id": "...", "run": {...}}``.
     On upstream failure returns a JSON error with the upstream status code.
@@ -123,12 +135,15 @@ async def chat(
     skills: list[str] = body.get("skills") or []
     model: str | None = body.get("model") or None
     reasoning_effort: str | None = body.get("reasoning_effort") or None
-    # Strictly validated (inline/sandbox); defaults to sandbox for existing
-    # clients so agent mode remains the zero-change default.
-    execution_mode = _validate_execution_mode(body)
+    # Strictly validated: execution_mode (inline/sandbox; defaults to sandbox for
+    # existing clients so agent mode stays the zero-change default) and
+    # workspace_file_ids (optional list of strings; illegal types → pydantic 422).
+    envelope = _validate_chat_body(body)
+    execution_mode = envelope.execution_mode
+    workspace_file_ids = envelope.workspace_file_ids
 
     async with httpx.AsyncClient(timeout=30) as client:
-        headers = foundation_headers(tenant_id, user_id, access_token)
+        headers = foundation_headers(tenant_id, user_id, access_token, clearance=clearance)
 
         # 1. Persist user message
         resp = await client.post(
@@ -161,6 +176,10 @@ async def chat(
             "reasoning_effort": reasoning_effort,
             "execution_mode": execution_mode,
         }
+        # Forward @-referenced workspace file ids verbatim (only when the client
+        # sent the field) so the orchestrator can prioritise those files.
+        if workspace_file_ids is not None:
+            run_body["workspace_file_ids"] = workspace_file_ids
         # Presence is meaningful: omitted lets orchestrator inject the user's
         # enabled-by-default installs; explicit [] disables all skills for this
         # session/run and must not be replaced with defaults.

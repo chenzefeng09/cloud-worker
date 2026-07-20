@@ -1,15 +1,17 @@
 # =============================================================================
 # Agent Platform — Knowledge Ingest OpenAPI 3.1
 #
-# Document → embedding → pgvector chunks.  Search returns ranked chunks
-# scoped to the requesting tenant.
+# Document → embedding → pgvector chunks.  Documents live in a tenant-scoped
+# folder tree and carry an L1..L5 sensitivity.  Search / list apply two gates:
+# reachability (tenant knowledge vs. per-user memory) and visibility
+# (document sensitivity <= caller clearance, via X-User-Clearance).
 # =============================================================================
 openapi: 3.1.0
 
 info:
   title: Agent Platform — Knowledge Ingest
-  description: Upload, parse, embed, and search knowledge documents.
-  version: 0.1.0
+  description: Upload, organise, embed, and search knowledge documents.
+  version: 0.2.0
 
 servers:
   - url: http://localhost:8012
@@ -19,14 +21,100 @@ security:
   - bearerAuth: []
 
 paths:
+  # ------------------------------------------------------------------ folders
+  /api/knowledge/v1/folders:
+    get:
+      operationId: folders_list
+      tags: [Folders]
+      summary: Flat list of the tenant's folders (client assembles the tree)
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/FolderList' }
+    post:
+      operationId: folders_create
+      tags: [Folders]
+      summary: Create a folder (409 on same-parent name collision)
+      parameters:
+        - $ref: '#/components/parameters/TenantIdHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FolderCreate' }
+      responses:
+        '201':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Folder' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/knowledge/v1/folders/{folder_id}:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - name: folder_id
+        in: path
+        required: true
+        schema: { type: string }
+    patch:
+      operationId: folders_patch
+      tags: [Folders]
+      summary: Rename / move / re-classify a folder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FolderUpdate' }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Folder' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      operationId: folders_delete
+      tags: [Folders]
+      summary: Delete a folder (409 if it holds sub-folders or documents)
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  # ---------------------------------------------------------------- documents
   /api/knowledge/v1/documents:
     get:
       operationId: docs_list
       tags: [Documents]
       parameters:
         - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/UserClearanceHeader'
+        - name: include_memory
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: >
+            Session-memory documents (rows stamped with an origin_session_id,
+            titled "[memory] …") are excluded from the listing by default. Set
+            true to include the full tenant set — every user's memory docs —
+            for the admin audit path.
+        - name: folder_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: >
+            Filter to one folder. Omit for all folders; pass "" or "root" for
+            the root layer (documents with no folder).
       responses:
         '200':
+          description: >
+            When X-User-Clearance is present, documents whose sensitivity
+            exceeds it are dropped. When absent, no visibility filtering is
+            applied (management / audit listing stays complete).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ListPage' }
@@ -45,6 +133,18 @@ paths:
               properties:
                 title: { type: string }
                 mime: { type: string, enum: [text/plain, text/markdown, application/pdf] }
+                origin_session_id:
+                  type: string
+                  description: Set by the orchestrator when writing a memory doc.
+                folder_id:
+                  type: string
+                  description: Target folder (omit for the root layer).
+                sensitivity:
+                  type: string
+                  enum: [L1, L2, L3, L4, L5]
+                  description: >
+                    Explicit sensitivity. Omitted → inherits the folder's
+                    default_sensitivity (or L1 at the root).
                 file:
                   type: string
                   format: binary
@@ -53,6 +153,8 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Document' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
         '415': { $ref: '#/components/responses/Unsupported' }
 
   /api/knowledge/v1/documents/{document_id}:
@@ -70,6 +172,33 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Document' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      operationId: docs_patch
+      tags: [Documents]
+      summary: Move a document and/or change its sensitivity
+      description: >
+        Only fields present in the body are applied. Moving into a folder
+        without an explicit sensitivity elevates only (sensitivity =
+        max(current, folder.default_sensitivity)); an explicit sensitivity is
+        applied verbatim and is the sole way to lower a level.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DocumentPatch' }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Document' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: docs_delete
+      tags: [Documents]
+      responses:
+        '204': { description: Deleted }
         '404': { $ref: '#/components/responses/NotFound' }
 
   /api/knowledge/v1/documents/{document_id}/ingest:
@@ -90,12 +219,63 @@ paths:
               schema: { $ref: '#/components/schemas/IngestResult' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /api/knowledge/v1/documents/{document_id}/content:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdHeader'
+      - $ref: '#/components/parameters/UserClearanceHeader'
+      - name: document_id
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      operationId: docs_content
+      tags: [Documents]
+      summary: Download the source blob bytes for a document
+      description: >
+        Streams the raw source blob. Applies a fail-closed visibility gate
+        (default L1): when the caller's X-User-Clearance ranks below the
+        document's sensitivity the response is 403, closing the gap that
+        single-doc ops (get/patch/delete) only enforce RBAC + RLS. 404 when
+        the document has no source blob. The response carries an RFC 6266
+        Content-Disposition header (filename + filename*) so non-ASCII
+        filenames survive.
+      responses:
+        '200':
+          description: Raw source bytes (Content-Disposition RFC 6266).
+          headers:
+            Content-Type:
+              description: Document MIME type (or application/octet-stream).
+              schema: { type: string }
+            Content-Disposition:
+              description: RFC 6266 attachment header with filename / filename*.
+              schema: { type: string }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '403':
+          description: Document sensitivity exceeds caller clearance.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: Document or source blob not found.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+
+  # ------------------------------------------------------------------- search
   /api/knowledge/v1/search:
     get:
       operationId: docs_search
       tags: [Search]
+      description: >
+        Vector search with reachability + visibility gates. Hits whose cosine
+        distance exceeds KNOWLEDGE_INGEST_KNOWLEDGE_SEARCH_MAX_DISTANCE
+        (default 0.6) are discarded.
       parameters:
         - $ref: '#/components/parameters/TenantIdHeader'
+        - $ref: '#/components/parameters/UserClearanceHeader'
         - name: q
           in: query
           required: true
@@ -103,6 +283,29 @@ paths:
         - name: k
           in: query
           schema: { type: integer, minimum: 1, maximum: 50, default: 5 }
+        - name: scope
+          in: query
+          schema:
+            type: string
+            enum: [knowledge, memory, all]
+            default: all
+          description: >
+            knowledge = tenant uploads (visibility-gated); memory = the caller's
+            own session memory (owner-gated, not visibility-gated); all = both
+            (default, backward-compatible). For search, a missing
+            X-User-Clearance is treated as L1 (fail-closed retrieval).
+        - name: workspace_id
+          in: query
+          schema: { type: string }
+          description: >
+            Reserved. Effective clearance is computed upstream (session-
+            orchestrator, as min(user, workspace)) and passed via
+            X-User-Clearance; this parameter is accepted for forward
+            compatibility and currently unused for filtering.
+        - name: exclude_origin_session_id
+          in: query
+          schema: { type: string }
+          description: Drop chunks from documents produced by this session.
       responses:
         '200':
           content:
@@ -141,20 +344,78 @@ components:
       in: header
       required: true
       schema: { type: string }
+    UserClearanceHeader:
+      name: X-User-Clearance
+      in: header
+      required: false
+      schema: { type: string, enum: [L1, L2, L3, L4, L5] }
+      description: >
+        Caller data clearance. Absent → L1 (conservative) for /search; absent →
+        no visibility filter for /documents listing.
 
   schemas:
+    Sensitivity:
+      type: string
+      enum: [L1, L2, L3, L4, L5]
+
+    Folder:
+      type: object
+      required: [id, tenant_id, name, default_sensitivity, created_at, updated_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        parent_id: { type: string, nullable: true }
+        name: { type: string }
+        default_sensitivity: { $ref: '#/components/schemas/Sensitivity' }
+        created_by_user_id: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    FolderCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 500 }
+        parent_id: { type: string, nullable: true }
+        default_sensitivity: { $ref: '#/components/schemas/Sensitivity' }
+
+    FolderUpdate:
+      type: object
+      properties:
+        name: { type: string, minLength: 1, maxLength: 500 }
+        parent_id: { type: string, nullable: true, description: "null moves to root" }
+        default_sensitivity: { $ref: '#/components/schemas/Sensitivity' }
+
+    FolderList:
+      type: object
+      required: [items, total]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/Folder' } }
+        total: { type: integer, minimum: 0 }
+
     Document:
       type: object
-      required: [id, tenant_id, title, mime, status, uploaded_at, chunk_count]
+      required: [id, tenant_id, title, mime, status, sensitivity, uploaded_at, chunk_count]
       properties:
         id: { type: string }
         tenant_id: { type: string }
         title: { type: string }
         mime: { type: string }
         source_uri: { type: string, nullable: true }
+        folder_id: { type: string, nullable: true }
+        sensitivity: { $ref: '#/components/schemas/Sensitivity' }
+        uploaded_by_user_id: { type: string, nullable: true }
+        origin_session_id: { type: string, nullable: true }
+        origin_user_id: { type: string, nullable: true }
         status: { type: string, enum: [PENDING, INGESTING, READY, FAILED] }
         uploaded_at: { type: string, format: date-time }
         chunk_count: { type: integer, minimum: 0 }
+
+    DocumentPatch:
+      type: object
+      properties:
+        folder_id: { type: string, nullable: true, description: "null moves to root" }
+        sensitivity: { $ref: '#/components/schemas/Sensitivity' }
 
     IngestResult:
       type: object
@@ -166,13 +427,18 @@ components:
 
     SearchHit:
       type: object
-      required: [document_id, chunk_id, ord, text, score]
+      required: [document_id, document_name, folder_path, chunk_id, ord, text, score, scope]
       properties:
         document_id: { type: string }
+        document_name: { type: string }
+        folder_path:
+          type: string
+          description: 'Slash-joined folder path, e.g. "产品/合同模板"; empty for root.'
         chunk_id: { type: string }
         ord: { type: integer }
         text: { type: string }
         score: { type: number }
+        scope: { type: string, enum: [knowledge, memory] }
 
     SearchResponse:
       type: object
@@ -209,8 +475,18 @@ components:
         code: { type: string }
 
   responses:
+    BadRequest:
+      description: Invalid input (e.g. unknown sensitivity)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
     NotFound:
       description: Resource not found
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Conflict:
+      description: Name collision or non-empty folder delete
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Error' }

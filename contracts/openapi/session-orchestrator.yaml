@@ -52,6 +52,9 @@ paths:
                   maxLength: 200
                 agent_config:
                   type: object
+                workspace_id:
+                  type: string
+                  nullable: true
       responses:
         '201':
           description: Session created
@@ -223,6 +226,19 @@ paths:
                   description: Task description for the agent
                 agent_config:
                   type: object
+                workspace_file_ids:
+                  type: array
+                  items:
+                    type: string
+                  description: >-
+                    Optional workspace-file ids (wsf_…) the user @-referenced in
+                    this message. The referenced files are hoisted to the front of
+                    the injected workspace-file context (each group keeps its
+                    original relative order) so the MAX_WORKSPACE_FILES / character
+                    budget truncation falls on the un-referenced tail first. Ids
+                    not in the session's workspace file set are silently ignored;
+                    a non-list value or non-string elements are ignored (never a
+                    400).
       responses:
         '201':
           description: Run created and started
@@ -361,6 +377,220 @@ paths:
                 type: string
 
   # ---------------------------------------------------------------------------
+  # Workspaces
+  # ---------------------------------------------------------------------------
+  /api/session/v1/workspaces:
+    get:
+      operationId: orchestrator_workspaces_list
+      summary: List workspaces for the current user (lazy-creates the default)
+      tags: [Workspaces]
+      responses:
+        '200':
+          description: Workspace list (ascending by created_at)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspacePage'
+
+    post:
+      operationId: orchestrator_workspaces_create
+      summary: Create a workspace
+      tags: [Workspaces]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, maxLength: 200 }
+                description: { type: string, maxLength: 500, nullable: true }
+                instructions: { type: string, nullable: true }
+                skills:
+                  type: array
+                  items: { type: string }
+                meta: { type: object }
+                sensitivity_level: { type: string, enum: [L1, L2, L3, L4, L5], default: L2 }
+      responses:
+        '201':
+          description: Workspace created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+
+  /api/session/v1/workspaces/{workspace_id}:
+    get:
+      operationId: orchestrator_workspaces_get
+      summary: Get workspace detail
+      tags: [Workspaces]
+      parameters:
+        - name: workspace_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Workspace detail
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      operationId: orchestrator_workspaces_update
+      summary: Update workspace
+      tags: [Workspaces]
+      parameters:
+        - name: workspace_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, maxLength: 200 }
+                description: { type: string, maxLength: 500, nullable: true }
+                instructions: { type: string, nullable: true }
+                skills:
+                  type: array
+                  items: { type: string }
+                meta: { type: object }
+                sensitivity_level: { type: string, enum: [L1, L2, L3, L4, L5] }
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      operationId: orchestrator_workspaces_delete
+      summary: Soft-delete workspace (409 for the default workspace)
+      tags: [Workspaces]
+      parameters:
+        - name: workspace_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Default workspace cannot be deleted
+
+  /api/session/v1/workspaces/{workspace_id}/files:
+    get:
+      operationId: orchestrator_workspace_files_list
+      summary: List workspace base files
+      tags: [Workspaces]
+      parameters:
+        - name: workspace_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Workspace file list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceFilePage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    post:
+      operationId: orchestrator_workspace_files_upload
+      summary: Upload a base file into the workspace
+      tags: [Workspaces]
+      parameters:
+        - name: workspace_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                description:
+                  type: string
+                  maxLength: 500
+                sensitivity_level:
+                  type: string
+                  enum: [L1, L2, L3, L4, L5]
+                  default: L2
+      responses:
+        '201':
+          description: File uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceFile'
+        '413':
+          description: File exceeds the workspace file size limit
+
+  /api/session/v1/workspaces/{workspace_id}/files/{file_id}:
+    delete:
+      operationId: orchestrator_workspace_files_delete
+      summary: Delete a workspace file (row + best-effort blob)
+      tags: [Workspaces]
+      parameters:
+        - name: workspace_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: file_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/session/v1/workspaces/{workspace_id}/files/{file_id}/content:
+    get:
+      operationId: orchestrator_workspace_files_content
+      summary: Download workspace file bytes (RFC 6266 Content-Disposition)
+      tags: [Workspaces]
+      parameters:
+        - name: workspace_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: file_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Raw file bytes with original Content-Type
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------------------
   # Health
   # ---------------------------------------------------------------------------
   /api/session/v1/healthz:
@@ -448,6 +678,7 @@ components:
         title: { type: string, nullable: true }
         status: { $ref: '#/components/schemas/SessionStatus' }
         current_run_id: { type: string, nullable: true }
+        workspace_id: { type: string, nullable: true }
         metadata: { type: object }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
@@ -477,6 +708,53 @@ components:
         started_at: { type: string, format: date-time, nullable: true }
         finished_at: { type: string, format: date-time, nullable: true }
         created_at: { type: string, format: date-time }
+
+    Workspace:
+      type: object
+      properties:
+        id: { type: string }
+        tenant_id: { type: string }
+        user_id: { type: string }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        instructions: { type: string, nullable: true }
+        skills:
+          type: array
+          items: { type: string }
+        is_default: { type: boolean }
+        meta: { type: object }
+        sensitivity_level: { type: string, enum: [L1, L2, L3, L4, L5], default: L2 }
+        file_count: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    WorkspaceFile:
+      type: object
+      properties:
+        id: { type: string }
+        workspace_id: { type: string }
+        filename: { type: string }
+        mime: { type: string }
+        size_bytes: { type: integer }
+        description: { type: string, nullable: true }
+        sensitivity_level: { type: string, enum: [L1, L2, L3, L4, L5], default: L2 }
+        created_at: { type: string, format: date-time }
+
+    WorkspacePage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Workspace'
+
+    WorkspaceFilePage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkspaceFile'
 
     SessionPage:
       type: object

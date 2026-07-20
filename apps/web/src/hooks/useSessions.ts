@@ -59,9 +59,9 @@ export function useSessions() {
     }
   }, [sessionsCursor, sessionsLoadingMore, sessions, setSessions, setSessionsCursor, setSessionsLoadingMore]);
 
-  const createSession = useCallback(async (title?: string) => {
+  const createSession = useCallback(async (title?: string, workspaceId?: string) => {
     try {
-      const session = await api.sessions.create(title);
+      const session = await api.sessions.create(title, undefined, workspaceId);
       addSession(session);
       setActiveSession(session.id);
       return session;

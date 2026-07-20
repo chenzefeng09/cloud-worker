@@ -100,6 +100,7 @@ def _client(require_auth: bool = True) -> TestClient:
         mcp_registry_url="http://mcp-registry:8010/api/mcp/v1",
         skill_store_url="http://skill-store:8011/api/skills/v1",
         web_fetch_gateway_url="http://web-fetch-gateway:8013/api/web-fetch/v1",
+        knowledge_ingest_url="http://knowledge-ingest:8012/api/knowledge/v1",
     )
     return TestClient(create_app(settings))
 
@@ -110,6 +111,7 @@ def _lease(
     tenant_id: str = "tnt_123",
     user_id: str = "usr_123",
     run_id: str = "run_123",
+    clearance: str = "",
 ) -> str:
     payload = {
         "v": 1,
@@ -120,6 +122,8 @@ def _lease(
         "iat": int(time.time()),
         "exp": int(time.time()) + 600,
     }
+    if clearance:
+        payload["clearance"] = clearance
     body = base64.urlsafe_b64encode(
         json.dumps(
             payload,
@@ -308,6 +312,118 @@ def test_dlp_proxy_blocks_unlisted_path(monkeypatch) -> None:
             "Authorization": "Bearer sandbox-token",
             "X-Tenant-Id": "tnt_123",
             "X-Tool-Broker-Lease": _lease(["dlp.scan"]),
+        },
+    )
+
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == "tool-broker: upstream path not allowed"
+    assert _FakeAsyncClient.calls == []
+
+
+# ---------------------------------------------------------------------------
+# /knowledge/v1 façade (knowledge-ingest /search)
+# ---------------------------------------------------------------------------
+
+
+def test_knowledge_proxy_forwards_search_and_identity(monkeypatch) -> None:
+    """A leased knowledge.search GET /search proxies to ki with the three
+    identity headers re-injected from the signed lease (X-Tenant-Id /
+    X-User-Id / X-User-Clearance), and the query string is preserved."""
+    _FakeAsyncClient.calls = []
+    monkeypatch.setattr("tool_broker.main.httpx.AsyncClient", _FakeAsyncClient)
+    client = _client(require_auth=True)
+
+    resp = client.get(
+        "/api/tool-broker/v1/knowledge/v1/search?q=contract&k=5&scope=knowledge",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-User-Id": "usr_123",
+            "X-Tool-Broker-Lease": _lease(["knowledge.search"], clearance="L3"),
+        },
+    )
+
+    assert resp.status_code == 200
+    assert len(_FakeAsyncClient.calls) == 1
+    call = _FakeAsyncClient.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == (
+        "http://knowledge-ingest:8012/api/knowledge/v1/search"
+        "?q=contract&k=5&scope=knowledge"
+    )
+    forwarded = {k.lower(): v for k, v in call["headers"].items()}
+    # All three identity headers are re-injected from the validated lease.
+    assert forwarded["x-tenant-id"] == "tnt_123"
+    assert forwarded["x-user-id"] == "usr_123"
+    assert forwarded["x-user-clearance"] == "L3"
+    assert forwarded["authorization"] == "Bearer sandbox-token"
+    # The lease header itself never reaches the upstream.
+    assert "x-tool-broker-lease" not in forwarded
+
+
+def test_knowledge_proxy_clearance_from_lease_not_request(monkeypatch) -> None:
+    """X-User-Clearance must come from the SIGNED lease, not the sandbox request.
+
+    A compromised sandbox sends X-User-Clearance: L5 to try to read restricted
+    documents; the broker MUST overwrite it with the lease's L2 (the run's
+    real effective clearance) so ki enforces the correct visibility gate.
+    """
+    _FakeAsyncClient.calls = []
+    monkeypatch.setattr("tool_broker.main.httpx.AsyncClient", _FakeAsyncClient)
+    client = _client(require_auth=True)
+
+    resp = client.get(
+        "/api/tool-broker/v1/knowledge/v1/search?q=x",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-User-Id": "usr_123",
+            "X-User-Clearance": "L5",  # spoofed - must be overwritten
+            "X-Tool-Broker-Lease": _lease(["knowledge.search"], clearance="L2"),
+        },
+    )
+
+    assert resp.status_code == 200
+    forwarded = {k.lower(): v for k, v in _FakeAsyncClient.calls[0]["headers"].items()}
+    assert forwarded["x-user-clearance"] == "L2"  # lease value wins
+
+
+def test_knowledge_proxy_wrong_scope_is_rejected(monkeypatch) -> None:
+    """A lease WITHOUT knowledge.search must be rejected before any upstream call."""
+    _FakeAsyncClient.calls = []
+    monkeypatch.setattr("tool_broker.main.httpx.AsyncClient", _FakeAsyncClient)
+    client = _client(require_auth=True)
+
+    resp = client.get(
+        "/api/tool-broker/v1/knowledge/v1/search?q=x",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-User-Id": "usr_123",
+            "X-Tool-Broker-Lease": _lease(["web_fetch.invoke"]),  # missing knowledge.search
+        },
+    )
+
+    assert resp.status_code == 403
+    assert _FakeAsyncClient.calls == []
+
+
+def test_knowledge_proxy_blocks_unlisted_path(monkeypatch) -> None:
+    """Only /search is allowlisted on the ki upstream; /documents -> 403.
+
+    list_knowledge is inline-only by design (the sandbox tool surfaces just
+    search_knowledge), so /documents must not be reachable through the broker.
+    """
+    _FakeAsyncClient.calls = []
+    monkeypatch.setattr("tool_broker.main.httpx.AsyncClient", _FakeAsyncClient)
+    client = _client(require_auth=True)
+
+    resp = client.get(
+        "/api/tool-broker/v1/knowledge/v1/documents",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-Tool-Broker-Lease": _lease(["knowledge.search"]),
         },
     )
 

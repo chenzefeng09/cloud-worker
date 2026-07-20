@@ -61,6 +61,39 @@ class RunNotFoundError(OrchestratorError):
         )
 
 
+# ── Workspace errors (AGENT.WORKSPACE.*) ────────────────────────────────────
+
+
+class WorkspaceNotFoundError(OrchestratorError):
+    def __init__(self, workspace_id: str) -> None:
+        super().__init__(
+            f"Workspace {workspace_id} not found",
+            code="AGENT.WORKSPACE.NOT_FOUND",
+            status=404,
+            user_message="工作区不存在或已被删除。",
+        )
+
+
+class WorkspaceFileNotFoundError(OrchestratorError):
+    def __init__(self, file_id: str) -> None:
+        super().__init__(
+            f"Workspace file {file_id} not found",
+            code="AGENT.WORKSPACE.FILE_NOT_FOUND",
+            status=404,
+            user_message="工作区文件不存在或已被删除。",
+        )
+
+
+class WorkspaceDefaultDeleteError(OrchestratorError):
+    def __init__(self, workspace_id: str) -> None:
+        super().__init__(
+            f"Workspace {workspace_id} is the default workspace and cannot be deleted",
+            code="AGENT.WORKSPACE.DEFAULT_DELETE",
+            status=409,
+            user_message="默认工作区不可删除。",
+        )
+
+
 # ── Canvas v2 errors (AGENT.SESSION.CANVAS.*) ───────────────────────────────
 
 

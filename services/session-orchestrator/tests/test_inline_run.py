@@ -644,6 +644,88 @@ def test_create_run_inline_branch_no_scheduler(
     assert started[0]["task"] == "你好"
 
 
+def test_create_run_inline_workspace_file_ids_reorder(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers, monkeypatch,
+) -> None:
+    """workspace_file_ids in the body hoists the referenced workspace files to the
+    front of the list handed to start_inline_run; an unknown id is ignored."""
+    from agent_session_orchestrator.services import workspace_context as wc
+
+    session = Session(
+        id="ses_wsref", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+        workspace_id="ws_1",
+    )
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_wsref"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+
+    # Fake workspace context: three files in workspace (created) order.
+    class _WF:
+        def __init__(self, id: str, filename: str) -> None:
+            self.id = id
+            self.blob_key = f"k/{id}"
+            self.filename = filename
+            self.mime = "text/plain"
+            self.size_bytes = 10
+
+    ctx = wc.WorkspaceContext(
+        instructions=None,
+        files=[_WF("wsf_1", "a.txt"), _WF("wsf_2", "b.txt"), _WF("wsf_3", "c.txt")],
+        skills=[],
+    )
+    monkeypatch.setattr(
+        wc, "workspace_context_injection_enabled", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(wc, "load_workspace_context", AsyncMock(return_value=ctx))
+
+    started: list[dict] = []
+
+    class _FakeClient(AuthzAwareClient):
+        async def get(self, url, **kw):
+            return __import__("httpx").Response(200, json={"hits": []})
+
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if url.endswith("/quota/check"):
+                return __import__("httpx").Response(200, json={"allowed": True})
+            if url.endswith("/quota/usage"):
+                return __import__("httpx").Response(200, json={})
+            raise AssertionError(f"unexpected POST {url}")
+
+    def _fake_start(**kw):
+        started.append(kw)
+
+    import httpx
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()), \
+            patch(
+                "agent_session_orchestrator.api.v1.runs.start_inline_run",
+                new=_fake_start,
+            ):
+        resp = app_client.post(
+            "/api/session/v1/sessions/ses_wsref/runs",
+            headers={**auth_headers, "X-User-Clearance": "L3"},
+            json={
+                "task": "hi",
+                "execution_mode": "inline",
+                "workspace_file_ids": ["wsf_3", "wsf_unknown"],
+            },
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert started
+    ws_files = started[0]["workspace_files"]
+    # wsf_3 hoisted to the front; unknown id dropped; the rest keep workspace order.
+    assert [f["id"] for f in ws_files] == ["wsf_3", "wsf_1", "wsf_2"]
+    # Each dict carries the id so downstream can render the file-link convention.
+    assert all("id" in f for f in ws_files)
+
+
 def test_create_run_invalid_execution_mode_400(
     app_client: TestClient, mock_db: AsyncMock, auth_headers,
 ) -> None:
@@ -2149,6 +2231,136 @@ def test_inline_read_skill_tool_call_round_trip(monkeypatch) -> None:
     assert "已按技能指令完成分析" in deltas
 
 
+def test_inline_mcp_tool_call_round_trip(monkeypatch) -> None:
+    """Inline chat advertises discovered MCP tools, executes tools/call, emits
+    visible tool events, and feeds the result into the next completion round."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    exposed_name = "mcp__echo__echo"
+    run = Run(
+        id="run_mcp", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="用 MCP 回显你好", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db(monkeypatch, run)
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=False))
+    monkeypatch.setattr(ex.inline_skill_loader, "resolve_skills", AsyncMock(return_value=[]))
+
+    class _FakeMcpCatalog:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+            self.closed = False
+
+        @property
+        def openai_tools(self):
+            return [{
+                "type": "function",
+                "function": {
+                    "name": exposed_name,
+                    "description": "[echo] Echo input text",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                },
+            }]
+
+        def has(self, name):
+            return name == exposed_name
+
+        async def call(self, name, args):
+            self.calls.append((name, args))
+            return "ECHO: 你好"
+
+        async def close(self):
+            self.closed = True
+
+    catalog = _FakeMcpCatalog()
+    load_catalog = AsyncMock(return_value=catalog)
+    monkeypatch.setattr(ex.inline_mcp_client, "load_inline_mcp_catalog", load_catalog)
+
+    scripts = [
+        _tool_call_frames(
+            call_id="mcp_1",
+            name=exposed_name,
+            arguments=json.dumps({"text": "你好"}, ensure_ascii=False),
+        ) + [_usage_frame(10, 4, 14)],
+        [
+            _sse({"choices": [{"index": 0, "delta": {"content": "MCP 返回了：你好。"}}]}),
+            _sse({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}),
+            _usage_frame(20, 6, 26), "data: [DONE]",
+        ],
+    ]
+    fake_client = _MultiRoundGatewayClient(sse_scripts=scripts)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=_skill_settings(), tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_mcp", task="用 MCP 回显你好",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={},
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED"
+    assert catalog.calls == [(exposed_name, {"text": "你好"})]
+    assert catalog.closed is True
+    assert load_catalog.await_args.kwargs["tenant_id"] == TEST_TENANT
+    assert fake_client.chat_payloads[0]["tools"][-1]["function"]["name"] == exposed_name
+    round2_tool = next(
+        message for message in fake_client.chat_payloads[1]["messages"]
+        if message.get("role") == "tool"
+    )
+    assert round2_tool["content"] == "ECHO: 你好"
+
+    entries = [entry for _eid, entry in _FakeRedisStream.from_url().entries]
+    call_entry = next(entry for entry in entries if entry["type"] == "tool_call")
+    result_entry = next(entry for entry in entries if entry["type"] == "tool_result")
+    assert call_entry["name"] == exposed_name
+    assert result_entry["result"] == "ECHO: 你好"
+    assert result_entry["state"] == "success"
+
+
+def test_inline_mcp_tool_call_respects_explicit_dlp_deny(monkeypatch) -> None:
+    """A successful non-ALLOW DLP verdict blocks MCP execution; outages remain
+    fail-open in the helper and are covered by its implementation contract."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    class _DlpClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, **kwargs):
+            assert url.endswith("/core/scan")
+            return _JsonResp(200, {"action": "BLOCK", "max_sensitivity": "L4"})
+
+    async def _run():
+        with patch("httpx.AsyncClient", return_value=_DlpClient()):
+            return await ex._inline_tool_call_dlp_decision(
+                dlp_url="http://dlp/api/dlp/v1",
+                tenant_id=TEST_TENANT,
+                user_id=TEST_USER,
+                run_id="run_mcp",
+                tool_call_id="call_1",
+                tool_name="mcp__crm__delete_customer",
+                arguments={"customer_id": "secret"},
+            )
+
+    allowed, reason = asyncio.get_event_loop().run_until_complete(_run())
+    assert allowed is False
+    assert "DLP 已阻止" in reason
+    assert "L4" in reason
+
+
 def test_inline_resolve_skips_failed_skill_fail_open() -> None:
     """resolve_skills drops a skill that fails to resolve and keeps the healthy
     one — a single bad skill never fails the batch (unit test of the loader)."""
@@ -2341,3 +2553,481 @@ def test_create_run_inline_branch_threads_skills(
     # Explicit skills threaded verbatim; defaults NOT looked up (presence semantics).
     assert started and started[0]["skills"] == ["data-analyzer", "writer"]
     assert default_lookups == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inline attachment reading — DB-queried input files injected into extra_system
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class _FakeAttachment:
+    def __init__(
+        self, *, filename: str, mime: str, blob_key: str, id: str = "",
+    ) -> None:
+        self.id = id
+        self.filename = filename
+        self.mime = mime
+        self.blob_key = blob_key
+
+
+def _install_fake_db_with_attachments(monkeypatch, run, attachments):
+    """Like ``_install_fake_db`` but the fake svc also serves ``list_attachments``.
+
+    ``attachments`` maps to the ``kind='input'`` rows the executor queries.
+    """
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    async def _fake_acquire(*, tenant_id, user_id="SYSTEM", actor="USER"):
+        yield object()
+
+    class _FakeSvc:
+        def __init__(self, db, *, tenant_id):
+            pass
+
+        async def list_runs(self, session_id):
+            return [run]
+
+        async def list_messages(self, session_id, *, cursor=None, limit=200):
+            return [], None
+
+        async def create_message(self, *, session_id, role, content, tool_calls=None, run_id=None):
+            m = MagicMock()
+            m.id = "msg_1"
+            return m
+
+        async def list_attachments(self, session_id, *, kind=None):
+            assert kind == "input"
+            return list(attachments)
+
+    monkeypatch.setattr(ex, "acquire_db_session", _fake_acquire)
+    monkeypatch.setattr(ex, "SessionService", _FakeSvc)
+
+
+class _FakeBlobStore:
+    def __init__(self, blobs: dict[str, bytes]) -> None:
+        self._blobs = blobs
+
+    def get(self, key: str) -> bytes:
+        return self._blobs[key]
+
+
+def _attachment_settings():
+    from agent_session_orchestrator.config import Settings
+
+    return Settings(
+        env="test", otel_enabled=False, redis_url="redis://x",
+        llm_gateway_url="http://gw/api/llm-gateway/v1",
+        knowledge_ingest_url="", foundation_dlp_url="",
+    )
+
+
+def test_inline_attachments_injected_into_system_prompt(monkeypatch) -> None:
+    """A session with an input attachment → its extracted text lands in the
+    system message as an ``<attachment>`` block (canvas + skills off)."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    run = Run(
+        id="run_att", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="总结上传的文件", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db_with_attachments(
+        monkeypatch, run,
+        [_FakeAttachment(
+            id="att_notes", filename="notes.txt", mime="text/plain", blob_key="k/notes",
+        )],
+    )
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        ex, "_inline_attachments_enabled_for_tenant", AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(ex.inline_skill_loader, "resolve_skills", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        ex, "_make_blob_store",
+        lambda settings: _FakeBlobStore({"k/notes": "报告要点：营收增长20%".encode()}),
+    )
+
+    lines = [
+        _sse({"choices": [{"index": 0, "delta": {"content": "好的"}}]}),
+        _usage_frame(3, 2, 5), "data: [DONE]",
+    ]
+    fake_client = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=_attachment_settings(), tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_att", task="总结上传的文件",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={}, skills=[],
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED"
+    system_msg = fake_client.chat_payloads[0]["messages"][0]
+    assert system_msg["role"] == "system"
+    assert "用户在本会话上传了以下文件" in system_msg["content"]
+    # The attachment id is surfaced as an id attribute on the tag.
+    assert '<attachment id="att_notes" filename="notes.txt">' in system_msg["content"]
+    assert "报告要点：营收增长20%" in system_msg["content"]
+    # A file block was injected → the file-link convention rides along once.
+    assert "#file:文件id" in system_msg["content"]
+    assert system_msg["content"].count("[文件名](#file:文件id)") == 1
+
+
+def test_inline_no_attachments_no_injection(monkeypatch) -> None:
+    """No input attachments → no system message at all (behaviour unchanged from
+    before the feature: canvas + skills off means no extra_system)."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    run = Run(
+        id="run_noa", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="你好", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db_with_attachments(monkeypatch, run, [])  # zero attachments
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        ex, "_inline_attachments_enabled_for_tenant", AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(ex.inline_skill_loader, "resolve_skills", AsyncMock(return_value=[]))
+
+    lines = [
+        _sse({"choices": [{"index": 0, "delta": {"content": "你好"}}]}),
+        _usage_frame(1, 1, 2), "data: [DONE]",
+    ]
+    fake_client = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=_attachment_settings(), tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_noa", task="你好",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={}, skills=[],
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED"
+    messages = fake_client.chat_payloads[0]["messages"]
+    # No system message injected (first message is the user task).
+    assert all(m["role"] != "system" for m in messages)
+
+
+def test_inline_attachments_flag_off_skips_injection(monkeypatch) -> None:
+    """Flag OFF → the attachment reading path is skipped entirely: no DB lookup,
+    no blob fetch, no system block (even though an attachment exists)."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    run = Run(
+        id="run_off", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="总结文件", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+
+    listed: list[str] = []
+
+    async def _fake_acquire(*, tenant_id, user_id="SYSTEM", actor="USER"):
+        yield object()
+
+    class _FakeSvc:
+        def __init__(self, db, *, tenant_id):
+            pass
+
+        async def list_runs(self, session_id):
+            return [run]
+
+        async def list_messages(self, session_id, *, cursor=None, limit=200):
+            return [], None
+
+        async def create_message(self, **kw):
+            m = MagicMock()
+            m.id = "m1"
+            return m
+
+        async def list_attachments(self, session_id, *, kind=None):
+            listed.append(session_id)  # must NOT be called when flag is off
+            return []
+
+    monkeypatch.setattr(ex, "acquire_db_session", _fake_acquire)
+    monkeypatch.setattr(ex, "SessionService", _FakeSvc)
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        ex, "_inline_attachments_enabled_for_tenant", AsyncMock(return_value=False),
+    )
+    monkeypatch.setattr(ex.inline_skill_loader, "resolve_skills", AsyncMock(return_value=[]))
+
+    lines = [
+        _sse({"choices": [{"index": 0, "delta": {"content": "ok"}}]}),
+        _usage_frame(1, 1, 2), "data: [DONE]",
+    ]
+    fake_client = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=_attachment_settings(), tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_off", task="总结文件",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={}, skills=[],
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED"
+    # The attachment-listing path was never entered.
+    assert listed == []
+    messages = fake_client.chat_payloads[0]["messages"]
+    assert all(m["role"] != "system" for m in messages)
+
+
+def test_rich_converter_is_used_for_word_attachments(monkeypatch) -> None:
+    """Configured Word/PDF files use structure-preserving Markdown conversion."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    attachment = _FakeAttachment(
+        filename="report.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        blob_key="k/report",
+    )
+    _install_fake_db_with_attachments(monkeypatch, MagicMock(), [attachment])
+    monkeypatch.setattr(
+        ex, "_make_blob_store", lambda settings: _FakeBlobStore({"k/report": b"docx"})
+    )
+    converted = AsyncMock(return_value="# 报告\n\n公式：$E=mc^2$\n\n| A | B |")
+    monkeypatch.setattr(ex.doc_to_markdown_client, "convert", converted)
+    settings = _attachment_settings().model_copy(
+        update={"doc_to_md_url": "http://doc-to-md:8000", "doc_to_md_timeout": 45.0}
+    )
+
+    block = asyncio.get_event_loop().run_until_complete(
+        ex._build_inline_attachments_prompt(
+            settings=settings,
+            tenant_id=TEST_TENANT,
+            user_id=TEST_USER,
+            session_id="ses_1",
+        )
+    )
+
+    assert block is not None
+    assert "公式：$E=mc^2$" in block
+    assert "| A | B |" in block
+    converted.assert_awaited_once_with(
+        base_url="http://doc-to-md:8000",
+        filename="report.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        data=b"docx",
+        timeout=45.0,
+    )
+
+
+def test_rich_converter_failure_falls_back_to_local_extractor(monkeypatch) -> None:
+    """Converter downtime does not fail the run or discard readable content."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    attachment = _FakeAttachment(
+        filename="report.pdf", mime="application/pdf", blob_key="k/report"
+    )
+    _install_fake_db_with_attachments(monkeypatch, MagicMock(), [attachment])
+    monkeypatch.setattr(
+        ex, "_make_blob_store", lambda settings: _FakeBlobStore({"k/report": b"pdf"})
+    )
+    monkeypatch.setattr(
+        ex.doc_to_markdown_client,
+        "convert",
+        AsyncMock(side_effect=ex.doc_to_markdown_client.ConversionError("offline")),
+    )
+    local_extract = MagicMock(return_value="本地回退文本")
+    monkeypatch.setattr(ex.attachment_text_extractor, "extract_text", local_extract)
+    settings = _attachment_settings().model_copy(
+        update={"doc_to_md_url": "http://doc-to-md:8000"}
+    )
+
+    block = asyncio.get_event_loop().run_until_complete(
+        ex._build_inline_attachments_prompt(
+            settings=settings,
+            tenant_id=TEST_TENANT,
+            user_id=TEST_USER,
+            session_id="ses_1",
+        )
+    )
+
+    assert block is not None
+    assert "本地回退文本" in block
+    local_extract.assert_called_once_with("report.pdf", "application/pdf", b"pdf")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Workspace context injection — instructions + base files into extra_system
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_inline_workspace_instructions_injected(monkeypatch) -> None:
+    """``workspace_instructions`` lands in the system message as a
+    ``# 工作区指令`` block (canvas + skills + attachments all off)."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    run = Run(
+        id="run_wsi", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="写周报", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db_with_attachments(monkeypatch, run, [])
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        ex, "_inline_attachments_enabled_for_tenant", AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(ex.inline_skill_loader, "resolve_skills", AsyncMock(return_value=[]))
+
+    lines = [
+        _sse({"choices": [{"index": 0, "delta": {"content": "好的"}}]}),
+        _usage_frame(3, 2, 5), "data: [DONE]",
+    ]
+    fake_client = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=_attachment_settings(), tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_wsi", task="写周报",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={}, skills=[],
+                workspace_instructions="所有回复必须使用正式书面语。",
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED"
+    system_msg = fake_client.chat_payloads[0]["messages"][0]
+    assert system_msg["role"] == "system"
+    assert "# 工作区指令" in system_msg["content"]
+    assert "所有回复必须使用正式书面语。" in system_msg["content"]
+
+
+def test_inline_workspace_files_injected_before_attachments(monkeypatch) -> None:
+    """Workspace base files are injected as ``<workspace_file>`` blocks, placed
+    before the session ``<attachment>`` block; instructions precede both."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    run = Run(
+        id="run_wsf", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="总结", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db_with_attachments(
+        monkeypatch, run,
+        [_FakeAttachment(filename="notes.txt", mime="text/plain", blob_key="k/notes")],
+    )
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        ex, "_inline_attachments_enabled_for_tenant", AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(ex.inline_skill_loader, "resolve_skills", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        ex, "_make_blob_store",
+        lambda settings: _FakeBlobStore({
+            "k/notes": "会话附件内容".encode(),
+            "ws/handbook": "工作区手册内容".encode(),
+        }),
+    )
+
+    lines = [
+        _sse({"choices": [{"index": 0, "delta": {"content": "好的"}}]}),
+        _usage_frame(3, 2, 5), "data: [DONE]",
+    ]
+    fake_client = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=_attachment_settings(), tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_wsf", task="总结",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={}, skills=[],
+                workspace_instructions="遵守团队规范。",
+                workspace_files=[
+                    {
+                        "id": "wsf_handbook",
+                        "filename": "handbook.txt",
+                        "mime": "text/plain",
+                        "key": "ws/handbook",
+                    },
+                ],
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED"
+    system_msg = fake_client.chat_payloads[0]["messages"][0]
+    content = system_msg["content"]
+    # The workspace-file id is surfaced as an id attribute on the tag.
+    assert '<workspace_file id="wsf_handbook" filename="handbook.txt">' in content
+    assert "工作区手册内容" in content
+    assert '<attachment filename="notes.txt">' in content
+    # Ordering: instructions → workspace files → session attachments → link convention.
+    idx_instructions = content.index("# 工作区指令")
+    idx_ws_file = content.index("<workspace_file")
+    idx_attachment = content.index("<attachment")
+    idx_convention = content.index("[文件名](#file:文件id)")
+    assert idx_instructions < idx_ws_file < idx_attachment < idx_convention
+    # The link convention appears exactly once even with two file blocks present.
+    assert content.count("[文件名](#file:文件id)") == 1
+
+
+def test_inline_no_workspace_params_behaviour_unchanged(monkeypatch) -> None:
+    """Omitting the workspace params keeps the pre-feature behaviour: no
+    workspace blocks, no system message when nothing else injects one."""
+    from agent_session_orchestrator.services import inline_run_executor as ex
+
+    run = Run(
+        id="run_wsn", tenant_id=TEST_TENANT, session_id="ses_1",
+        task_description="你好", status="RUNNING", execution_mode="inline",
+        sandbox_id=None, started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+    _install_fake_db_with_attachments(monkeypatch, run, [])
+    monkeypatch.setattr(ex, "_canvas_enabled_for_tenant", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        ex, "_inline_attachments_enabled_for_tenant", AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(ex.inline_skill_loader, "resolve_skills", AsyncMock(return_value=[]))
+
+    lines = [
+        _sse({"choices": [{"index": 0, "delta": {"content": "你好"}}]}),
+        _usage_frame(1, 1, 2), "data: [DONE]",
+    ]
+    fake_client = _FakeGatewayClient(sse_lines=lines)
+    _FakeRedisStream.reset()
+
+    async def _run() -> None:
+        with _patch_redis(_FakeRedisStream), \
+                patch("httpx.AsyncClient", return_value=fake_client):
+            await ex._execute_inline_run(
+                settings=_attachment_settings(), tenant_id=TEST_TENANT, user_id=TEST_USER,
+                session_id="ses_1", run_id="run_wsn", task="你好",
+                model_hint="deepseek-chat", sys_prompt=None, memory="", history=[],
+                sampling_params={}, skills=[],
+            )
+
+    asyncio.get_event_loop().run_until_complete(_run())
+
+    assert run.status == "COMPLETED"
+    messages = fake_client.chat_payloads[0]["messages"]
+    assert all(m["role"] != "system" for m in messages)

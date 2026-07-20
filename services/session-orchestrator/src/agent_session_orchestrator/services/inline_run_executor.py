@@ -8,10 +8,10 @@ The platform distinguishes two ``execution_mode`` values on a run:
   agent-scheduler, which spawns an agent worker container that streams tokens
   into the Redis Stream ``agent:run:{run_id}:tokens`` and writes a
   ``result.json`` the orchestrator later reconciles.
-* ``inline`` — a pure conversation turn.  There is no sandbox and no
-  scheduler.  The orchestrator streams a plain OpenAI chat completion directly
-  from the LLM gateway *in-process* and writes the very same Redis Stream
-  entries the sandbox worker would have.  The SSE consumer
+* ``inline`` — a no-sandbox conversation turn.  There is no scheduler, but the
+  trusted orchestrator can still discover and call tenant HTTP MCP tools.  It
+  drives the OpenAI completion/tool loop *in-process* and writes the same Redis
+  Stream entries the sandbox worker would have.  The SSE consumer
   (``api.v1.messages._stream_tokens``) and the frontend are therefore
   identical for both modes — inline is invisible on the wire.
 
@@ -62,7 +62,13 @@ import httpx
 
 from agent_session_orchestrator.config import Settings
 from agent_session_orchestrator.domain.db import get_session as acquire_db_session
-from agent_session_orchestrator.services import inline_skill_loader
+from agent_session_orchestrator.services import (
+    attachment_text_extractor,
+    doc_to_markdown_client,
+    inline_knowledge_client,
+    inline_mcp_client,
+    inline_skill_loader,
+)
 from agent_session_orchestrator.services.canvas_tool_spec import (
     CANVAS_FORCING_PROMPT,
     CREATE_CANVAS_TOOL,
@@ -70,6 +76,13 @@ from agent_session_orchestrator.services.canvas_tool_spec import (
     canvas_confirmation_reply,
     extract_creation_title,
     is_written_creation_prompt,
+)
+from agent_session_orchestrator.services.knowledge_tool_spec import (
+    KNOWLEDGE_SYSTEM_PROMPT,
+    LIST_KNOWLEDGE_TOOL,
+    LIST_KNOWLEDGE_TOOL_NAME,
+    SEARCH_KNOWLEDGE_TOOL,
+    SEARCH_KNOWLEDGE_TOOL_NAME,
 )
 from agent_session_orchestrator.services.session_service import SessionService
 from agent_session_orchestrator.services.skill_tool_spec import (
@@ -328,6 +341,7 @@ def build_openai_messages(
     history: list[dict[str, Any]],
     task: str,
     extra_system: str | None = None,
+    knowledge: str = "",
 ) -> list[dict[str, Any]]:
     """Assemble the OpenAI ``messages`` array for an inline completion.
 
@@ -336,13 +350,19 @@ def build_openai_messages(
     OpenAI roles so multi-turn context is first-class:
 
     * an optional ``system`` message combining ``sys_prompt`` + ``memory`` +
-      ``extra_system`` (the canvas forcing block, when the tool is enabled);
+      ``knowledge`` + ``extra_system`` (the canvas forcing block, when the tool
+      is enabled);
     * one message per history item — ``user`` / ``assistant`` text turns and
       ``tool`` turns flattened to a readable ``assistant`` note (prior tool
       activity is surfaced as context rather than as OpenAI ``tool`` role frames,
       which would require matching ``tool_calls`` on a preceding assistant
       message; the live create_canvas tool loop appends its own native frames);
     * the current ``user`` task as the final message.
+
+    The prefetch splits into two distinct blocks: ``memory`` ("相关记忆（供参考）"
+    — this user's own recalled facts, wording unchanged) and ``knowledge``
+    ("知识库资料" — tenant knowledge-base hits, each already carrying its
+    【文档名 | 文件夹路径】 provenance from ``inline_knowledge_client``).
     """
     messages: list[dict[str, Any]] = []
 
@@ -351,6 +371,8 @@ def build_openai_messages(
         system_parts.append(sys_prompt.strip())
     if memory and memory.strip():
         system_parts.append("相关记忆（供参考）：\n" + memory.strip())
+    if knowledge and knowledge.strip():
+        system_parts.append("知识库资料：\n" + knowledge.strip())
     if extra_system and extra_system.strip():
         system_parts.append(extra_system.strip())
     if system_parts:
@@ -684,6 +706,75 @@ def _parse_tool_arguments(raw: str) -> dict[str, Any]:
         return {}
 
 
+async def _inline_tool_call_dlp_decision(
+    *,
+    dlp_url: str,
+    tenant_id: str,
+    user_id: str,
+    run_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> tuple[bool, str]:
+    """Apply the same fail-open pre-tool DLP posture as sandbox workers.
+
+    Only an explicit, successfully parsed non-ALLOW verdict blocks the call;
+    configuration, network and response errors all log and allow so a DLP
+    outage cannot disable chat.  The result text is returned to the model when
+    denied, keeping the OpenAI tool-call frame valid without executing MCP.
+    """
+    if not dlp_url:
+        return True, ""
+    resource_id = f"{tool_name}:{tool_call_id or run_id}"
+    try:
+        async with httpx.AsyncClient(timeout=2.0) as client:
+            response = await client.post(
+                f"{dlp_url.rstrip('/')}/core/scan",
+                json={
+                    "content": json.dumps(arguments, ensure_ascii=False, default=str),
+                    "resource_type": "tool_call",
+                    "resource_id": resource_id,
+                },
+                headers=_mesh_headers(tenant_id, user_id),
+            )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "inline tool DLP unreachable (fail-open): %s",
+            exc,
+            extra={"run_id": run_id, "tool": tool_name},
+        )
+        return True, ""
+    if response.status_code != 200:
+        logger.warning(
+            "inline tool DLP returned HTTP %s (fail-open)",
+            response.status_code,
+            extra={"run_id": run_id, "tool": tool_name},
+        )
+        return True, ""
+    try:
+        body = response.json()
+    except ValueError:
+        logger.warning(
+            "inline tool DLP response unparseable (fail-open)",
+            extra={"run_id": run_id, "tool": tool_name},
+        )
+        return True, ""
+    action = str(body.get("action") or "") if isinstance(body, dict) else ""
+    if action == "ALLOW":
+        return True, ""
+    sensitivity = (
+        str(body.get("max_sensitivity") or "unknown")
+        if isinstance(body, dict)
+        else "unknown"
+    )
+    reason = f"DLP 已阻止该工具调用（action={action or '?'}, sensitivity={sensitivity}）"
+    logger.warning(
+        "inline tool DLP denied call",
+        extra={"run_id": run_id, "tool": tool_name, "action": action},
+    )
+    return False, reason
+
+
 async def _materialize_inline_canvas(
     *,
     settings: Settings,
@@ -852,7 +943,9 @@ async def _canvas_enabled_for_tenant(tenant_id: str) -> bool:
     try:
         from feature_flag_client import get_ff_client  # noqa: PLC0415
 
-        return await get_ff_client().is_enabled("enable_canvas_tool", tenant_id)
+        return await get_ff_client().is_enabled(
+            "enable_canvas_tool", tenant_id, default=True
+        )
     except RuntimeError:
         # Client not initialised (e.g. a unit context) — default ON.
         return True
@@ -862,6 +955,231 @@ async def _canvas_enabled_for_tenant(tenant_id: str) -> bool:
             extra={"tenant_id": tenant_id},
         )
         return True
+
+
+async def _inline_attachments_enabled_for_tenant(tenant_id: str) -> bool:
+    """Whether the ``inline_attachment_reading`` flag is on for ``tenant_id``.
+
+    Mirrors :func:`_canvas_enabled_for_tenant`: reads the foundation feature-flag
+    source of truth via the shared client and fail-OPENs to enabled.  Reading
+    uploaded files is opportunistic — a model that ignores the injected block
+    costs nothing — so a flag-service outage should not silently strip attachment
+    context from chat mode.  A tenant that has explicitly turned the flag OFF is
+    still respected (the client returns ``False`` for a present-but-off flag).
+    """
+    try:
+        from feature_flag_client import get_ff_client  # noqa: PLC0415
+
+        return await get_ff_client().is_enabled(
+            "inline_attachment_reading", tenant_id, default=True
+        )
+    except RuntimeError:
+        # Client not initialised (e.g. a unit context) — default ON.
+        return True
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "inline attachment flag check failed; defaulting attachment reading ON",
+            extra={"tenant_id": tenant_id},
+        )
+        return True
+
+
+# Maximum number of input attachments read into the prompt per run (oldest
+# first).  Bounds the download + extraction cost for a session that has
+# accumulated many uploads over many turns.
+_MAX_INLINE_ATTACHMENTS = 10
+
+
+def _make_blob_store(settings: Settings):  # type: ignore[no-untyped-def]
+    """Build an S3BlobStore from settings; return None if unavailable.
+
+    A background inline task has no ``request.app.state.blob_store`` (that lives
+    on the FastAPI app the request built), so it constructs its own store from
+    settings — mirroring :func:`agent_session_orchestrator.main._make_blob_store`
+    but kept local to avoid importing the FastAPI app module from a service.
+    """
+    try:
+        from agent_session_orchestrator.blob.s3 import S3BlobStore  # noqa: PLC0415
+
+        return S3BlobStore(
+            bucket=settings.s3_bucket,
+            region=settings.s3_region,
+            endpoint_url=settings.s3_endpoint_url,
+            access_key_id=settings.s3_access_key_id,
+            secret_access_key=settings.s3_secret_access_key,
+        )
+    except Exception:  # noqa: BLE001 — no boto3 / creds → no attachment reading
+        logger.debug("inline attachment reading: S3BlobStore unavailable")
+        return None
+
+
+async def _build_inline_attachments_prompt(
+    *,
+    settings: Settings,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+) -> str | None:
+    """Read the session's input attachments and build the injection block.
+
+    Queries ALL ``kind='input'`` attachments for the session (oldest first,
+    capped at :data:`_MAX_INLINE_ATTACHMENTS`) — not just this run's body files —
+    so a file uploaded in an earlier turn can still be referenced later.  Each
+    file's bytes are fetched from S3 and extracted to text on every run (no
+    cache).  Returns the assembled Chinese block, or ``None`` when there is
+    nothing to inject.  Fail-open throughout: any error yields ``None`` (or drops
+    the offending file) and never raises.
+    """
+    # 1. List input attachments (buffer the result — the async-for body must not
+    #    return/break, which would trigger GeneratorExit and roll the txn back).
+    attachments: list[Any] = []
+    try:
+        async for db in acquire_db_session(
+            tenant_id=tenant_id, user_id=user_id or "SYSTEM", actor="USER"
+        ):
+            svc = SessionService(db, tenant_id=tenant_id)
+            rows = await svc.list_attachments(session_id, kind="input")
+            attachments = list(rows)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "inline attachment listing failed (fail-open, no injection)",
+            extra={"session_id": session_id},
+        )
+        return None
+
+    if not attachments:
+        return None
+
+    # Oldest-first (list_attachments already orders by created_at asc); cap count.
+    attachments = attachments[:_MAX_INLINE_ATTACHMENTS]
+
+    blob_store = _make_blob_store(settings)
+    if blob_store is None:
+        return None
+
+    # 2. Fetch bytes + extract text per file (fail-open per file).  Each entry is
+    #    an ``(attachment_id, filename, text)`` triple so the block builder can
+    #    surface the id for the ``[文件名](#file:<id>)`` link convention.
+    extracted: list[tuple[str, str, str]] = []
+    for att in attachments:
+        att_id = str(getattr(att, "id", "") or "")
+        filename = getattr(att, "filename", "") or "未命名文件"
+        mime = getattr(att, "mime", "") or "application/octet-stream"
+        blob_key = getattr(att, "blob_key", None)
+        if not blob_key:
+            continue
+        try:
+            data = await asyncio.to_thread(blob_store.get, blob_key)
+        except Exception:  # noqa: BLE001 — a missing blob shouldn't fail the run
+            logger.warning(
+                "inline attachment blob fetch failed (fail-open, skipping file)",
+                extra={"session_id": session_id, "att_filename": filename},
+            )
+            extracted.append((att_id, filename, "（文件读取失败，已跳过）"))
+            continue
+        text: str
+        if (
+            settings.doc_to_md_url
+            and len(data) <= attachment_text_extractor.MAX_BYTES_PER_FILE
+            and doc_to_markdown_client.supports(filename, mime)
+        ):
+            try:
+                text = await doc_to_markdown_client.convert(
+                    base_url=settings.doc_to_md_url,
+                    filename=filename,
+                    mime=mime,
+                    data=data,
+                    timeout=settings.doc_to_md_timeout,
+                )
+            except doc_to_markdown_client.ConversionError as exc:
+                logger.warning(
+                    "rich document conversion failed (using local fallback): %s",
+                    exc,
+                    extra={"session_id": session_id, "att_filename": filename},
+                )
+                text = attachment_text_extractor.extract_text(filename, mime, data)
+        else:
+            text = attachment_text_extractor.extract_text(filename, mime, data)
+        extracted.append((att_id, filename, text))
+
+    return attachment_text_extractor.build_attachments_block(extracted)
+
+
+async def _build_workspace_files_prompt(
+    *,
+    settings: Settings,
+    tenant_id: str,
+    user_id: str,
+    session_id: str,
+    files: list[dict[str, Any]],
+) -> str | None:
+    """Build the workspace base-files injection block from pre-resolved files.
+
+    ``files`` is the plain-dict form the create_run endpoint extracted from the
+    workspace context inside its request transaction (``{"id", "filename",
+    "mime", "key"}`` — never ORM rows, which must not cross the transaction
+    boundary into this background task).  Bytes are fetched from S3 and extracted
+    with the exact same rich-document-or-local pipeline as session attachments.
+    Fail-open throughout: any error drops the file or the whole block, never
+    the run.
+    """
+    if not files:
+        return None
+
+    blob_store = _make_blob_store(settings)
+    if blob_store is None:
+        return None
+
+    # Each entry is an ``(workspace_file_id, filename, text)`` triple so the block
+    # builder can surface the id for the ``[文件名](#file:<id>)`` link convention.
+    extracted: list[tuple[str, str, str]] = []
+    for index, item in enumerate(files):
+        file_id = str(item.get("id") or "")
+        filename = str(item.get("filename") or "") or "未命名文件"
+        mime = str(item.get("mime") or "") or "application/octet-stream"
+        blob_key = item.get("key") or item.get("blob_key")
+        if not blob_key:
+            continue
+        if index >= attachment_text_extractor.MAX_WORKSPACE_FILES:
+            # Beyond the injection cap: skip the download entirely but keep the
+            # entry so the block builder lists the filename as omitted.
+            extracted.append((file_id, filename, ""))
+            continue
+        try:
+            data = await asyncio.to_thread(blob_store.get, blob_key)
+        except Exception:  # noqa: BLE001 — a missing blob shouldn't fail the run
+            logger.warning(
+                "workspace file blob fetch failed (fail-open, skipping file)",
+                extra={"session_id": session_id, "ws_filename": filename},
+            )
+            extracted.append((file_id, filename, "（文件读取失败，已跳过）"))
+            continue
+        text: str
+        if (
+            settings.doc_to_md_url
+            and len(data) <= attachment_text_extractor.MAX_BYTES_PER_FILE
+            and doc_to_markdown_client.supports(filename, mime)
+        ):
+            try:
+                text = await doc_to_markdown_client.convert(
+                    base_url=settings.doc_to_md_url,
+                    filename=filename,
+                    mime=mime,
+                    data=data,
+                    timeout=settings.doc_to_md_timeout,
+                )
+            except doc_to_markdown_client.ConversionError as exc:
+                logger.warning(
+                    "rich document conversion failed (using local fallback): %s",
+                    exc,
+                    extra={"session_id": session_id, "ws_filename": filename},
+                )
+                text = attachment_text_extractor.extract_text(filename, mime, data)
+        else:
+            text = attachment_text_extractor.extract_text(filename, mime, data)
+        extracted.append((file_id, filename, text))
+
+    return attachment_text_extractor.build_workspace_files_block(extracted)
 
 
 def _last_user_task(messages: list[dict[str, Any]]) -> str:
@@ -894,6 +1212,10 @@ async def _run_completion_with_tools(
     skills_catalog: list[dict[str, Any]] | None = None,
     skill_store_url: str = "",
     skill_service_scopes: str = "",
+    mcp_catalog: inline_mcp_client.InlineMcpCatalog | None = None,
+    knowledge_enabled: bool = False,
+    knowledge_base_url: str = "",
+    effective_clearance: str = "L1",
 ) -> tuple[dict[str, int], str]:
     """Drive up to ``_INLINE_MAX_TOOL_ROUNDS`` completion rounds, closing the tool loop.
 
@@ -929,8 +1251,9 @@ async def _run_completion_with_tools(
     round has streamed to the frontend (``InlineGatewayError.streamed_entries``).
     """
     # Assemble the advertised tools list.  ``create_canvas`` is gated on the
-    # canvas flag; ``read_skill`` is gated on a non-empty resolved skill catalog.
-    # Either, both, or neither may be present — with an empty list we send no
+    # canvas flag; ``read_skill`` is gated on a non-empty resolved skill catalog;
+    # tenant MCP tools come from the healthy inline MCP catalog. Any combination
+    # may be present — with an empty list we send no
     # ``tools`` at all (a plain completion, identical to the pre-skill behaviour).
     catalog = skills_catalog or []
     tool_list: list[dict[str, Any]] = []
@@ -938,6 +1261,13 @@ async def _run_completion_with_tools(
         tool_list.append(CREATE_CANVAS_TOOL)
     if catalog:
         tool_list.append(READ_SKILL_TOOL)
+    if mcp_catalog is not None:
+        tool_list.extend(mcp_catalog.openai_tools)
+    if knowledge_enabled:
+        # Tenant knowledge-base retrieval tools (search + list); dispatched
+        # in-process against knowledge-ingest with the run's effective clearance.
+        tool_list.append(SEARCH_KNOWLEDGE_TOOL)
+        tool_list.append(LIST_KNOWLEDGE_TOOL)
     tools = tool_list or None
 
     # ``name -> sha256`` for the catalog, so a read_skill call keys the loader's
@@ -1025,11 +1355,20 @@ async def _run_completion_with_tools(
         # tool result.  Preserve the original "stop when no KNOWN tool call this
         # round" semantics — an empty tool_calls list, or one containing only
         # unknown tools, still breaks the loop rather than looping on junk.
-        known_calls = [
-            tc for tc in tool_calls
-            if (tc.get("function") or {}).get("name")
-            in (CREATE_CANVAS_TOOL_NAME, READ_SKILL_TOOL_NAME)
-        ]
+        known_calls = []
+        for tc in tool_calls:
+            called_name = str((tc.get("function") or {}).get("name") or "")
+            if (
+                called_name in (CREATE_CANVAS_TOOL_NAME, READ_SKILL_TOOL_NAME)
+                or (
+                    knowledge_enabled
+                    and called_name
+                    in (SEARCH_KNOWLEDGE_TOOL_NAME, LIST_KNOWLEDGE_TOOL_NAME)
+                )
+                or mcp_catalog is not None
+                and mcp_catalog.has(called_name)
+            ):
+                known_calls.append(tc)
         if not known_calls:
             break
 
@@ -1088,6 +1427,109 @@ async def _run_completion_with_tools(
                         result_content = (
                             f"（读取技能「{skill_name}」的 {read_path} 时发生内部错误）"
                         )
+            elif knowledge_enabled and fn_name in (
+                SEARCH_KNOWLEDGE_TOOL_NAME,
+                LIST_KNOWLEDGE_TOOL_NAME,
+            ):
+                # Tenant knowledge base: surface the call/result through the same
+                # Redis tool events as MCP tools so the frontend shows the
+                # activity, then feed the textual result back into the loop.  The
+                # ki client is fail-open (returns a note, never raises), so a
+                # retrieval outage never breaks the conversation.
+                await _xadd(
+                    redis_client,
+                    run_id,
+                    {
+                        "type": "tool_call",
+                        "tool_call_id": tool_call_id,
+                        "name": str(fn_name),
+                        "args": json.dumps(args, ensure_ascii=False),
+                    },
+                )
+                if fn_name == SEARCH_KNOWLEDGE_TOOL_NAME:
+                    query = str(args.get("query") or "").strip()
+                    try:
+                        k = int(args.get("k") or 5)
+                    except (TypeError, ValueError):
+                        k = 5
+                    if not query:
+                        result_content = "（search_knowledge 缺少 query 参数，无法检索。）"
+                    else:
+                        result_content = await inline_knowledge_client.search_knowledge(
+                            base_url=knowledge_base_url,
+                            tenant_id=tenant_id,
+                            user_id=user_id,
+                            clearance=effective_clearance,
+                            query=query,
+                            k=k,
+                        )
+                else:  # LIST_KNOWLEDGE_TOOL_NAME
+                    result_content = await inline_knowledge_client.list_knowledge(
+                        base_url=knowledge_base_url,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        clearance=effective_clearance,
+                    )
+                await _xadd(
+                    redis_client,
+                    run_id,
+                    {
+                        "type": "tool_result",
+                        "tool_call_id": tool_call_id,
+                        "name": str(fn_name),
+                        "result": result_content,
+                        "state": "success",
+                    },
+                )
+            elif mcp_catalog is not None and mcp_catalog.has(str(fn_name or "")):
+                # Tenant MCP: surface the call/result through the same Redis
+                # tool events as sandbox workers, then feed the textual result
+                # back into the OpenAI tool loop. A single broken call is
+                # failure-isolated and the model can still finish the reply.
+                await _xadd(
+                    redis_client,
+                    run_id,
+                    {
+                        "type": "tool_call",
+                        "tool_call_id": tool_call_id,
+                        "name": str(fn_name),
+                        "args": json.dumps(args, ensure_ascii=False),
+                    },
+                )
+                allowed, deny_reason = await _inline_tool_call_dlp_decision(
+                    dlp_url=settings.foundation_dlp_url,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    run_id=run_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=str(fn_name),
+                    arguments=args,
+                )
+                tool_state = "success" if allowed else "denied"
+                if not allowed:
+                    result_content = deny_reason
+                else:
+                    try:
+                        result_content = await mcp_catalog.call(str(fn_name), args)
+                    except Exception as exc:  # noqa: BLE001 — isolate one MCP call
+                        tool_state = "error"
+                        logger.warning(
+                            "inline MCP tool call failed (fail-open): %s",
+                            exc,
+                            extra={"run_id": run_id, "tool": fn_name},
+                        )
+                        result_content = f"MCP 工具调用失败：{exc}"
+                await _xadd(
+                    redis_client,
+                    run_id,
+                    {
+                        "type": "tool_result",
+                        "tool_call_id": tool_call_id,
+                        "name": str(fn_name),
+                        "result": result_content,
+                        "state": tool_state,
+                    },
+                )
             else:
                 # Unknown tool — feed a note back so the frame stays OpenAI-valid.
                 result_content = f"（不支持的工具调用：{fn_name}）"
@@ -1238,6 +1680,10 @@ async def _execute_inline_run(
     sampling_params: dict[str, Any],
     reasoning_effort: str | None = None,
     skills: list[str] | None = None,
+    workspace_instructions: str | None = None,
+    workspace_files: list[dict[str, Any]] | None = None,
+    knowledge: str = "",
+    effective_clearance: str = "L1",
 ) -> None:
     """Run one inline chat completion to terminal state.
 
@@ -1246,6 +1692,12 @@ async def _execute_inline_run(
     the run FAILED, pushes ``end`` and returns.  The gateway error body is NEVER
     written as an assistant message (a 402 quota error must not look like a
     reply).
+
+    ``workspace_instructions`` / ``workspace_files`` carry the session's
+    workspace context, pre-resolved by the create_run endpoint into plain
+    values (never ORM rows — this task runs outside the request transaction).
+    Both are injected into the system prompt; a workspace failure never fails
+    the run.
     """
     gateway_url = settings.llm_gateway_url
     redis_url = settings.redis_url
@@ -1258,6 +1710,7 @@ async def _execute_inline_run(
     final_status = "FAILED"
     usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     body_text = ""
+    mcp_catalog: inline_mcp_client.InlineMcpCatalog | None = None
 
     try:
         async with httpx.AsyncClient(timeout=settings.inline_completion_timeout) as client:
@@ -1296,6 +1749,12 @@ async def _execute_inline_run(
                 canvas_enabled and is_written_creation_prompt(task)
             )
 
+            # Knowledge base: the search_knowledge / list_knowledge tools are
+            # advertised whenever knowledge-ingest is reachable.  Gating on the
+            # URL keeps unit contexts (which set knowledge_ingest_url="") on the
+            # pre-knowledge behaviour — no extra tools, no knowledge section.
+            knowledge_enabled = bool(knowledge_ingest_url)
+
             # 3b. Skills: resolve the run's skill names into a catalog (once per
             #     run, never cached — a skill upgraded between turns must surface
             #     its new sha immediately).  Failure-open: a bad skill is dropped,
@@ -1309,22 +1768,105 @@ async def _execute_inline_run(
                 user_id=user_id,
             )
 
+            # 3c. MCP: discover and initialize the tenant's enabled HTTP MCP
+            #     servers. The trusted inline executor calls registry-vetted
+            #     endpoints directly; stdio remains sandbox-only. Discovery and
+            #     handshake are fail-open per server, so a stale library entry
+            #     never breaks an otherwise normal conversation.
+            mcp_catalog = await inline_mcp_client.load_inline_mcp_catalog(
+                base_url=settings.mcp_registry_url,
+                service_scopes=settings.mcp_registry_service_scopes,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                timeout=settings.inline_mcp_timeout,
+            )
+
+            # 3d. Attachments: read the session's uploaded input files and build a
+            #     Chinese context block so the model can answer questions about
+            #     them.  Gated by the ``inline_attachment_reading`` flag (fail-open
+            #     ON).  Fail-open throughout — a parse/fetch error drops the file or
+            #     the whole block, never the run.  No attachments → None → no
+            #     injection (behaviour identical to before this feature).
+            attachments_block: str | None = None
+            if await _inline_attachments_enabled_for_tenant(tenant_id):
+                attachments_block = await _build_inline_attachments_prompt(
+                    settings=settings,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+
+            # 3e. Workspace base files: resolve the pre-extracted file dicts into
+            #     the injection block.  Fail-open — any error yields None and the
+            #     run proceeds without the block.
+            workspace_files_block: str | None = None
+            # Workspace bound but zero base files (``[]`` sentinel from create_run,
+            # vs ``None`` = not workspace-bound): tell the model the workspace is
+            # empty so it answers truthfully instead of inventing a missing tool.
+            workspace_empty_notice: str | None = None
+            if workspace_files is not None and not workspace_files:
+                workspace_empty_notice = (
+                    "当前会话所属的工作区没有配置任何基础文件。"
+                    "如果用户询问工作区文件，如实说明该工作区暂无基础文件即可，"
+                    "不要声称缺少查看文件的工具。"
+                )
+            if workspace_files:
+                try:
+                    workspace_files_block = await _build_workspace_files_prompt(
+                        settings=settings,
+                        tenant_id=tenant_id,
+                        user_id=user_id,
+                        session_id=session_id,
+                        files=workspace_files,
+                    )
+                except Exception:  # noqa: BLE001 — never fail the run on workspace files
+                    logger.warning(
+                        "workspace files prompt build failed (fail-open)",
+                        extra={"run_id": run_id},
+                        exc_info=True,
+                    )
+
             # 4. Assemble OpenAI messages (native roles, not folded into system);
             #    append the canvas forcing block AND/OR the skills catalog block to
             #    the system message so each instruction rides with its tool (canvas
-            #    block ↔ create_canvas, catalog block ↔ read_skill).
+            #    block ↔ create_canvas, catalog block ↔ read_skill).  Workspace
+            #    context slots in deterministically: instructions right after the
+            #    canvas block (before the skills catalog), the workspace files
+            #    block before the session-attachments block.
             extra_system_parts: list[str] = []
             if canvas_enabled:
                 extra_system_parts.append(CANVAS_FORCING_PROMPT)
+            if workspace_instructions and workspace_instructions.strip():
+                extra_system_parts.append(
+                    "# 工作区指令\n" + workspace_instructions.strip()
+                )
             if skills_catalog:
                 extra_system_parts.append(build_skills_catalog_prompt(skills_catalog))
+            # Knowledge-base section — kept EXPLICITLY separate from the workspace
+            # base-files notice below so the model never conflates "工作区没有基础
+            # 文件" with "没有知识库".  Appears iff the two knowledge tools do.
+            if knowledge_enabled:
+                extra_system_parts.append(KNOWLEDGE_SYSTEM_PROMPT)
+            if workspace_files_block:
+                extra_system_parts.append(workspace_files_block)
+            elif workspace_empty_notice:
+                extra_system_parts.append(workspace_empty_notice)
+            if attachments_block:
+                extra_system_parts.append(attachments_block)
+            # Whenever any file block was injected, append the file-reference link
+            # convention ONCE (after all file blocks) so the model references those
+            # files via [文件名](#file:<id>) using the ids given in the blocks.
+            if attachments_block or workspace_files_block:
+                extra_system_parts.append(
+                    attachment_text_extractor.FILE_LINK_CONVENTION_PROMPT
+                )
             extra_system = (
                 "\n\n".join(p for p in extra_system_parts if p and p.strip())
                 or None
             )
             messages = build_openai_messages(
                 sys_prompt=sys_prompt, memory=memory, history=history, task=task,
-                extra_system=extra_system,
+                extra_system=extra_system, knowledge=knowledge,
             )
 
             # 5. Drive the completion (+ tool loop) into Redis.  With canvas off
@@ -1348,6 +1890,10 @@ async def _execute_inline_run(
                 skills_catalog=skills_catalog,
                 skill_store_url=settings.skill_store_url,
                 skill_service_scopes=settings.skill_store_service_scopes,
+                mcp_catalog=mcp_catalog,
+                knowledge_enabled=knowledge_enabled,
+                knowledge_base_url=knowledge_ingest_url,
+                effective_clearance=effective_clearance,
             )
             final_status = "COMPLETED"
     except asyncio.CancelledError:
@@ -1371,6 +1917,9 @@ async def _execute_inline_run(
         if redis_client is not None:
             with contextlib.suppress(Exception):
                 await redis_client.aclose()
+        if mcp_catalog is not None:
+            with contextlib.suppress(Exception):
+                await mcp_catalog.close()
 
     # ── Finalize the run row + persist messages in a fresh tenant-bound txn ──
     # (The request transaction that created the run is long gone.)  Failure-open
@@ -1507,6 +2056,10 @@ def start_inline_run(
     sampling_params: dict[str, Any],
     reasoning_effort: str | None = None,
     skills: list[str] | None = None,
+    workspace_instructions: str | None = None,
+    workspace_files: list[dict[str, Any]] | None = None,
+    knowledge: str = "",
+    effective_clearance: str = "L1",
 ) -> None:
     """Launch the background inline-run task and register it for cancel.
 
@@ -1520,8 +2073,19 @@ def start_inline_run(
 
     ``skills`` is the resolved-presence skill name list from the create_run
     endpoint (explicit selection, or the user's default-enabled installs when the
-    request omitted the key).  Empty/None means no skill loop for this run — the
-    executor then behaves exactly as before skills were supported.
+    request omitted the key), already unioned with the workspace's skill set.
+    Empty/None means no skill loop for this run — the executor then behaves
+    exactly as before skills were supported.
+
+    ``workspace_instructions`` / ``workspace_files`` are the session workspace's
+    context, extracted into PLAIN values (str / list of dicts with
+    filename/mime/key) inside the request transaction — never ORM rows, which
+    must not cross into this background task.
+
+    ``knowledge`` is the prefetched tenant-knowledge "知识库资料" block (top-k
+    ``scope=knowledge`` hits, each with its 【文档名 | 文件夹路径】 provenance);
+    ``effective_clearance`` (``min(user, workspace)``) is the level the in-process
+    search_knowledge / list_knowledge tools carry on every knowledge-ingest call.
     """
     task_obj = asyncio.create_task(
         _execute_inline_run(
@@ -1538,6 +2102,10 @@ def start_inline_run(
             sampling_params=sampling_params,
             reasoning_effort=reasoning_effort,
             skills=skills,
+            workspace_instructions=workspace_instructions,
+            workspace_files=workspace_files,
+            knowledge=knowledge,
+            effective_clearance=effective_clearance,
         ),
         name=f"inline-run-{run_id}",
     )

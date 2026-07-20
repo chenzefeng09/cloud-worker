@@ -171,6 +171,34 @@ async def list_attachments(
     }
 
 
+@router.delete(
+    "/sessions/{session_id}/attachments/{attachment_id}",
+    status_code=204,
+    dependencies=[Depends(require_permission("session.attachment.create", "session"))],
+)
+async def delete_attachment(
+    session_id: str,
+    attachment_id: str,
+    request: Request,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+) -> Response:
+    """Delete an attachment (Artifacts panel delete) — hard delete row + blob.
+
+    Ownership + soft-deleted-session guards ride ``SessionService.get_attachment``
+    (raises ``SessionNotFoundError`` → 404 for a missing / cross-tenant /
+    soft-deleted-session attachment).  The S3 blob is removed best-effort before
+    the row delete — a missing blob is not a blocker; the row is authoritative.
+    """
+    # ``_get_blob_store`` raises 503 when the blob store is unconfigured.  For a
+    # delete the row is the system of record, so we fall back to ``None`` (skip
+    # the blob step) rather than fail the whole request — the row still deletes.
+    blob_store = getattr(request.app.state, "blob_store", None)
+    svc = SessionService(db, tenant_id=tenant_id)
+    await svc.delete_attachment(session_id, attachment_id, blob_store=blob_store)
+    return Response(status_code=204)
+
+
 @router.get("/sessions/{session_id}/files/{file_id}/content",
             dependencies=[Depends(require_permission("session.attachment.read", "session"))])
 async def get_file_content(

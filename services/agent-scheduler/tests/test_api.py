@@ -103,6 +103,46 @@ def test_create_run_mints_token_then_spawns(
     assert secrets["LLM_API_KEY"] == ""
 
 
+def test_create_run_forwards_effective_clearance_to_sandbox_env(
+    app_client: TestClient,
+    mock_docker_client: MagicMock,
+    fake_identity,
+    auth_headers,
+) -> None:
+    """``effective_clearance`` in the request body must land in the sandbox env
+    as FOUNDATION_USER_CLEARANCE (plain env, not the secrets file) so the
+    in-sandbox knowledge_tool can send X-User-Clearance to knowledge-ingest."""
+    spawned = MagicMock()
+    spawned.id = "container-clearance"
+    mock_docker_client.containers.run.return_value = spawned
+
+    resp = app_client.post(
+        "/api/scheduler/v1/runs",
+        headers=auth_headers,
+        json={
+            "session_id": "ses_01J5SES000000000000CLR0001",
+            "run_id": "run_01J5RUN000000000000CLR0001",
+            "task": "clearance flow",
+            "effective_clearance": "L3",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    spawn_env = mock_docker_client.containers.run.call_args.kwargs["environment"]
+    assert spawn_env["FOUNDATION_USER_CLEARANCE"] == "L3"
+    # Also wired: the ki URL + the knowledge_tool extension name.
+    assert "KNOWLEDGE_INGEST_URL" in spawn_env
+    assert "knowledge_tool" in spawn_env["RUNTIME_EXTENSIONS"]
+    # Clearance is NOT secret -> must not ride in the secrets file.
+    secrets = _read_run_secrets(
+        "/tmp/agent-platform-test",
+        tenant_id=_TENANT,
+        session_id="ses_01J5SES000000000000CLR0001",
+        run_id="run_01J5RUN000000000000CLR0001",
+    )
+    assert "FOUNDATION_USER_CLEARANCE" not in secrets
+
+
 def test_create_run_large_attachment_uses_large_memory_tier(
     app_client: TestClient,
     mock_docker_client: MagicMock,

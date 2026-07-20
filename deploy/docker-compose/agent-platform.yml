@@ -56,8 +56,40 @@ networks:
     #  service's `networks: [foundation, sandbox_broker]`. sandbox->broker is
     #  container-to-container traffic on this bridge, which enable_icc:false would
     #  also block. So ICC-off is intentionally NOT applied here.)
+  # Converter-only network. doc-to-md has no authentication, so expose it only
+  # to session-orchestrator instead of every service on the foundation mesh.
+  document_internal:
+    driver: bridge
+    internal: true
 
 services:
+  # ===========================================================================
+  # doc-to-md — rich Word/PDF -> Markdown conversion (internal only)
+  #
+  # Build/publish this image from git@github.com:chenzefeng09/doc_to_markdown.git.
+  # It intentionally has no host port and lives on a converter-only network.
+  # The orchestrator treats it as optional and falls back to local extraction.
+  # ===========================================================================
+  doc-to-md:
+    image: ${DOC_TO_MD_IMAGE:-doc-to-md:latest}
+    platform: ${DOC_TO_MD_PLATFORM:-linux/amd64}
+    container_name: agent-doc-to-md
+    restart: unless-stopped
+    environment:
+      DOC_TO_MD_HOST: 0.0.0.0
+      DOC_TO_MD_PORT: "8000"
+      DOC_TO_MD_DATA_DIR: /data
+      DOC_TO_MD_RESULTS_MAX_BYTES: ${DOC_TO_MD_RESULTS_MAX_BYTES:-2147483648}
+      DOC_TO_MD_RESULT_TTL_SECONDS: ${DOC_TO_MD_RESULT_TTL_SECONDS:-86400}
+    volumes:
+      - doc_to_md_data:/data
+    networks: [document_internal]
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz').read()\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   # ===========================================================================
   # migrate — Alembic 迁移 sidecar(一次性 job,镜像复用各服务自身镜像)
   #
@@ -278,9 +310,18 @@ services:
       # user's installed skills whose enabled_by_default flag is true.
       SESSION_ORCHESTRATOR_SKILL_STORE_URL: ${SKILL_STORE_URL:-http://skill-store:8011/api/skills/v1}
       SESSION_ORCHESTRATOR_SKILL_STORE_SERVICE_SCOPES: ${SESSION_ORCHESTRATOR_SKILL_STORE_SERVICE_SCOPES:-skill.read_internal}
+      # Inline chat discovers enabled HTTP MCP tools directly from the registry.
+      # stdio MCP remains sandbox-only because it requires a process boundary.
+      SESSION_ORCHESTRATOR_MCP_REGISTRY_URL: ${MCP_REGISTRY_URL:-http://mcp-registry:8010/api/mcp/v1}
+      SESSION_ORCHESTRATOR_MCP_REGISTRY_SERVICE_SCOPES: ${SESSION_ORCHESTRATOR_MCP_REGISTRY_SERVICE_SCOPES:-mcp.read_internal}
+      SESSION_ORCHESTRATOR_INLINE_MCP_TIMEOUT: ${SESSION_ORCHESTRATOR_INLINE_MCP_TIMEOUT:-20}
       SESSION_ORCHESTRATOR_AUTHZ_URL: http://authz:8002/api/authz/v1
       SESSION_ORCHESTRATOR_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
       SESSION_ORCHESTRATOR_FEATURE_FLAG_URL: http://feature-flag:8012/api/feature-flag/v1
+      # Rich Word/PDF conversion. No hard depends_on: if this optional service
+      # is down, inline runs fall back to the bundled lightweight extractors.
+      SESSION_ORCHESTRATOR_DOC_TO_MD_URL: ${DOC_TO_MD_URL:-http://doc-to-md:8000}
+      SESSION_ORCHESTRATOR_DOC_TO_MD_TIMEOUT: ${DOC_TO_MD_TIMEOUT:-120}
       # Foundation DLP — attachment download check + upload scan/tag (fail-open).
       # Shared FOUNDATION_DLP_URL override aligns with scheduler/tool-broker; dev
       # DLP is the `dlp` service on the foundation network at :8007.
@@ -296,7 +337,7 @@ services:
       SESSION_ORCHESTRATOR_LLM_GATEWAY_URL: ${LLM_GATEWAY_URL:-http://llm-gateway:8011/api/llm-gateway/v1}
     ports:
       - "${PORT_SESSION_ORCHESTRATOR:-8006}:8006"
-    networks: [foundation]
+    networks: [foundation, document_internal]
     depends_on:
       session-orchestrator-migrate:
         condition: service_completed_successfully
@@ -478,16 +519,20 @@ services:
       SCHEDULER_SKILLS_CACHE_BASE: ${AGENT_SKILLS_CACHE_BASE:-/tmp/agent-platform/skills_cache}
       # Service scopes the scheduler sends to skill-store /internal/skills/resolve.
       SCHEDULER_SKILL_STORE_SERVICE_SCOPES: ${SCHEDULER_SKILL_STORE_SERVICE_SCOPES:-skill.read_internal}
-      # Activate B-M3 extensions + web_fetch inside every sandbox container.
-      # Order matters: mcp_tenant_injector first, skills_loader second,
-      # web_fetch third, llm_gateway_enforcer last.
+      # Activate B-M3 extensions + web_fetch + knowledge_tool inside every
+      # sandbox container.  Order matters: mcp_tenant_injector first,
+      # skills_loader second, web_fetch third, knowledge_tool fourth
+      # (after all built-in tools / MCP / Skills are present so it can append
+      # search_knowledge to the assembled toolkit), llm_gateway_enforcer last.
+      # knowledge_tool is fail-open: it self-gates on KNOWLEDGE_INGEST_URL, so
+      # a deployment without knowledge-ingest simply doesn't register the tool.
       # M1-P4: llm_gateway_enforcer routes all sandbox LLM traffic through the
       # foundation llm-gateway (tenant virtual key + quota + audit).  With it
       # present, the scheduler stops injecting the direct LLM_API_KEY into the
       # sandbox (see docker_runtime.py).  One-line rollback: drop
       # ``,llm_gateway_enforcer`` from this default (or set the RUNTIME_EXTENSIONS
       # env) and restart the scheduler — direct-connect resumes.
-      SCHEDULER_RUNTIME_EXTENSIONS: ${RUNTIME_EXTENSIONS:-mcp_tenant_injector,skills_loader,web_fetch,event_audit_sink,llm_gateway_enforcer}
+      SCHEDULER_RUNTIME_EXTENSIONS: ${RUNTIME_EXTENSIONS:-mcp_tenant_injector,skills_loader,web_fetch,knowledge_tool,event_audit_sink,llm_gateway_enforcer}
       # Web-fetch gateway — forwarded into sandbox as WEB_FETCH_GATEWAY_URL.
       SCHEDULER_WEB_FETCH_GATEWAY_URL: ${WEB_FETCH_GATEWAY_URL:-http://web-fetch-gateway:8013}
       # Foundation DLP — distributed to the sandbox worker as DLP_URL via
@@ -495,6 +540,11 @@ services:
       # egress mode the scheduler rewrites this to the tool-broker /dlp façade;
       # the value here is the direct foundation DLP base used otherwise.
       SCHEDULER_DLP_URL: ${FOUNDATION_DLP_URL:-http://dlp:8007/api/dlp/v1}
+      # Knowledge-ingest (KB v1) - forwarded into the sandbox as
+      # KNOWLEDGE_INGEST_URL so the in-sandbox knowledge_tool can GET /search.
+      # Direct URL in foundation mode; tool-broker /knowledge/v1 façade in
+      # broker mode (egress_policy rewrites it).
+      SCHEDULER_KNOWLEDGE_INGEST_URL: ${KNOWLEDGE_INGEST_URL:-http://knowledge-ingest:8012/api/knowledge/v1}
       # S3 credentials forwarded into sandbox for attachment download
       SCHEDULER_S3_ENDPOINT_URL: http://foundation-minio:9000
       SCHEDULER_S3_BUCKET: agent-platform
@@ -698,6 +748,29 @@ services:
       timeout: 5s
       retries: 10
 
+  # Local development MCP used by the seeded `echo` resource-library entry.
+  # It is intentionally stateless and exposes one harmless echo tool so both
+  # inline conversations and broker-isolated agent sandboxes have a real MCP
+  # endpoint for connection/call regression tests.
+  echo-mcp:
+    build:
+      context: ../../services/echo-mcp
+      dockerfile: Dockerfile
+      additional_contexts:
+        session_orchestrator: service:session-orchestrator
+    container_name: agent-echo-mcp
+    restart: unless-stopped
+    networks: [foundation]
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - >
+          python -c "import urllib.request;
+          urllib.request.urlopen('http://127.0.0.1:9000/healthz').read()"
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
   # ===========================================================================
   # Skill Store — versioned skill package registry (B-M3)
   # ===========================================================================
@@ -895,6 +968,11 @@ services:
       # proxies to (allowlists /core/scan).  Sandboxes never reach DLP directly;
       # they POST to the broker /dlp façade, which forwards here.
       TOOL_BROKER_DLP_URL: ${FOUNDATION_DLP_URL:-http://dlp:8007/api/dlp/v1}
+      # Upstream knowledge-ingest base the broker's /knowledge/v1/{path} route
+      # proxies to (allowlists /search).  ki needs no bearer/vkey - the broker
+      # re-injects X-Tenant-Id / X-User-Id / X-User-Clearance from the signed
+      # per-run lease, so a sandbox cannot inflate its clearance.
+      TOOL_BROKER_KNOWLEDGE_INGEST_URL: ${KNOWLEDGE_INGEST_URL:-http://knowledge-ingest:8012/api/knowledge/v1}
       # /state/v1 (Redis) and /s3/v1 (object-store) façades. The broker holds
       # the REAL backend creds here; sandboxes get none and reach Redis/S3 only
       # through the narrow lease-scoped HTTP façades. Reuse the SAME env vars /
@@ -974,3 +1052,4 @@ services:
 
 volumes:
   agent_workspaces:
+  doc_to_md_data:

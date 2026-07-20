@@ -1,7 +1,6 @@
 import { NavLink } from 'react-router-dom';
 import { useChatStore } from '../../stores/chatStore';
 import { useSessions } from '../../hooks/useSessions';
-import { WorkspaceSwitcher } from './WorkspaceSwitcher';
 import { AccountMenu } from './AccountMenu';
 import { canAccessAdmin } from '../../admin/AdminLayout';
 import {
@@ -21,8 +20,12 @@ interface NavSpec {
 const NAV: NavSpec[] = [
   { to: '/home', label: '新任务', glyph: '◇' },
   { to: '/schedules', label: '定时任务', glyph: '◷' },
-  { to: '/files', label: '基础文件', glyph: '⌗' },
-  { to: '/library', label: '资源库', glyph: '✦', count: '13' },
+  // The workspace management page (base files + instructions + skills). This is
+  // where the retired top-of-sidebar WorkspaceSwitcher's "管理工作区" link used
+  // to lead; the base-files nav now owns that entry point.
+  { to: '/workspace', label: '基础文件', glyph: '⌗' },
+  { to: '/library', label: '资源库', glyph: '✦' },
+  { to: '/artifacts', label: '产物', glyph: '◈' },
 ];
 
 export function Sidebar() {
@@ -53,8 +56,6 @@ export function Sidebar() {
           cloud<em className="not-italic text-accent font-medium">·</em>worker
         </div>
       </NavLink>
-
-      <WorkspaceSwitcher />
 
       <nav className="flex-1 min-h-0 flex flex-col gap-0.5">
         <div className="flex flex-col gap-0.5 shrink-0">

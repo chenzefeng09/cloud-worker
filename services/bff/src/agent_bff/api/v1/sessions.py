@@ -598,6 +598,34 @@ async def get_file_content(
     )
 
 
+@router.delete("/sessions/{session_id}/attachments/{attachment_id}", status_code=204)
+async def delete_attachment(
+    session_id: str,
+    attachment_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> Response:
+    """Delete a session attachment (Artifacts 专区删除) — proxy to orchestrator.
+
+    Orchestrator does a hard delete of both the S3 blob (best-effort) and the
+    attachment row.  Owner-scoping lives in the orchestrator's
+    ``SessionService.get_attachment`` (raises 404 for a missing / cross-tenant /
+    soft-deleted-session attachment).  Forwards the DELETE and returns 204 on
+    success; upstream non-2xx is relayed via ``_proxy_json``.
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = await _orchestrator_url(request)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.delete(
+            f"{orch_url}/sessions/{session_id}/attachments/{attachment_id}",
+            headers=foundation_headers(tenant_id, user_id, access_token),
+        )
+    # 204 → empty body; ``_proxy_json`` handles that case safely.
+    if resp.status_code == 204 or not resp.content:
+        return Response(status_code=resp.status_code)
+    return _proxy_json(resp)
+
+
 # --------------------------------------------------------------------------- #
 # Runs proxy
 # --------------------------------------------------------------------------- #

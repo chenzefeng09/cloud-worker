@@ -2,6 +2,58 @@ import { useState, useRef } from 'react';
 import type { ToolCallEntry } from '../api/types';
 import ReactMarkdown from 'react-markdown';
 import { useCopied, CopyIcon } from './CopyButton';
+import { useFilePreview } from '../lib/filePreviewContext';
+
+// ── File-link interception (assistant replies) ───────────────────────────────
+//
+// The backend has the model emit `[filename](#file:<id>)` links, where `<id>`
+// is an attachment (`att_…`) or workspace file (`wsf_…`). When a preview opener
+// is available in context, we render these as in-app preview triggers instead
+// of new-tab links; everything else stays a normal external link.
+const FILE_LINK_RE = /^#file:((?:att_|wsf_)[A-Za-z0-9]+)$/;
+
+/** Best-effort plain-text extraction from arbitrary markdown children. */
+function nodeText(children: React.ReactNode): string {
+  if (children == null || children === false) return '';
+  if (typeof children === 'string' || typeof children === 'number') return String(children);
+  if (Array.isArray(children)) return children.map(nodeText).join('');
+  if (typeof children === 'object' && 'props' in (children as { props?: unknown })) {
+    return nodeText((children as { props?: { children?: React.ReactNode } }).props?.children);
+  }
+  return '';
+}
+
+function MarkdownLink({ href, children }: { href?: string; children?: React.ReactNode }) {
+  const openPreview = useFilePreview();
+  const match = href ? FILE_LINK_RE.exec(href) : null;
+  if (match && openPreview) {
+    const id = match[1];
+    const filename = nodeText(children) || id;
+    return (
+      <a
+        href={href}
+        onClick={(e) => {
+          e.preventDefault();
+          openPreview({ id, filename });
+        }}
+        className="text-accent underline underline-offset-2 hover:opacity-80 cursor-pointer"
+      >
+        <span aria-hidden className="mr-0.5">📄</span>
+        {children}
+      </a>
+    );
+  }
+  return (
+    <a
+      href={href}
+      className="text-accent underline underline-offset-2 hover:opacity-80"
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      {children}
+    </a>
+  );
+}
 
 // ── Code-block copy button component ─────────────────────────────────────────
 
@@ -229,16 +281,7 @@ export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>['com
       {children}
     </blockquote>
   ),
-  a: ({ href, children }) => (
-    <a
-      href={href}
-      className="text-accent underline underline-offset-2 hover:opacity-80"
-      target="_blank"
-      rel="noopener noreferrer"
-    >
-      {children}
-    </a>
-  ),
+  a: MarkdownLink,
   table: ({ children }) => <TableBlock>{children}</TableBlock>,
   thead: ({ children }) => (
     <thead style={{ background: 'var(--paper-2)' }}>{children}</thead>

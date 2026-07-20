@@ -66,6 +66,36 @@ def authed_cookie(settings: Settings) -> dict[str, str]:
     return {settings.cookie_name: token}
 
 
+@pytest.fixture
+def authed_cookie_with_clearance(settings: Settings) -> dict[str, str]:
+    """Signed session cookie that bakes a ``clearance`` claim into the payload.
+
+    Mirrors the ``authed_cookie`` fixture above but adds ``clearance: "L3"`` so
+    the BFF middleware populates the ``current_clearance`` contextvar
+    non-empty, which is what drives the ``X-User-Clearance`` header on the
+    orchestrator-bound call.  Shared by the workspace-proxy and
+    conversations-proxy clearance tests.
+    """
+    from foundation_sdk import CookieSigner, CookieSignerSettings
+
+    signer = CookieSigner(
+        CookieSignerSettings(
+            secret_key=settings.cookie_secret,
+            salt="agent-bff-session",
+            max_age_seconds=settings.cookie_max_age,
+        ),
+    )
+    token = signer.sign(
+        {
+            "user_id": "usr_01J5TEST0000000000000USER1",
+            "tenant_id": "tnt_01J5TEST00000000000000TNT1",
+            "access_token": "fake-jwt-for-test",
+            "clearance": "L3",
+        },
+    )
+    return {settings.cookie_name: token}
+
+
 class FakeFoundation:
     """Minimal stub of foundation identity / orchestrator HTTP API.
 

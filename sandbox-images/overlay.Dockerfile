@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 # Source-only overlay rebuild: reuses the base image's already-installed
 # Python deps and only swaps the in-repo agentscope_ext source files.
 # Also installs boto3 (S3 attachments) and redis-py (hot-state checkpoints)
@@ -12,7 +11,8 @@
 #     --build-context agentscope_ext=./agentscope-ext \
 #     sandbox-images/
 
-FROM ghcr.io/agent-platform/agentscope-sandbox:0.1
+ARG BASE_IMAGE=ghcr.io/agent-platform/agentscope-sandbox:0.1
+FROM ${BASE_IMAGE}
 
 USER root
 COPY --from=agentscope_ext . /opt/agentscope-ext

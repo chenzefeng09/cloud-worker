@@ -60,10 +60,10 @@ import logging
 from collections.abc import Awaitable, Callable
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from agent_bff.api._http import foundation_headers
-from agent_bff.api.dependencies import require_auth
+from agent_bff.api.dependencies import TClearance, require_auth
 
 # Reuse the admin guard + upstream-error helper verbatim so the platform
 # proxies share exactly one super_admin enforcement + error-surfacing path.
@@ -235,9 +235,14 @@ async def _proxy_get(
     forward_params: bool = False,
     timeout: float = 15,
     admin_actor: bool = True,
+    extra_params: dict[str, str] | None = None,
 ) -> dict:
     headers = _scope_headers(auth, tenant_id=tenant_id, admin_actor=admin_actor)
     params = _forward_params(request) if forward_params else None
+    # ``extra_params`` are BFF-injected query args (e.g. ``include_memory`` for
+    # the knowledge audit view). They take precedence over any forwarded param.
+    if extra_params:
+        params = {**(params or {}), **extra_params}
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url, params=params, headers=headers)
@@ -431,6 +436,12 @@ async def admin_delete_mcp_server(
 #   GET /documents, GET /documents/{document_id},
 #   POST /documents/{document_id}/ingest   (= "reingest" — re-runs chunk+embed)
 #   DELETE /documents/{document_id}        (removes the doc row + chunks + blob)
+#
+# knowledge-ingest's GET /documents hides session-memory docs (those stamped
+# with an ``origin_session_id``, titled "[memory] …") by default. The admin
+# audit listing below forces ``include_memory=true`` so governance sees the
+# full tenant set — every user's memory rows included. The ordinary tenant
+# library (BFF library.py) omits the flag and stays memory-free.
 
 @router.get("/admin/knowledge/documents")
 async def admin_list_documents(
@@ -441,6 +452,7 @@ async def admin_list_documents(
     url = f"{request.app.state.settings.knowledge_ingest_url}/documents"
     return await _proxy_get(
         request, url, _auth, tenant_id, forward_params=True, admin_actor=False,
+        extra_params={"include_memory": "true"},
     )
 
 
@@ -456,6 +468,52 @@ async def admin_get_document(
         f"/documents/{document_id}"
     )
     return await _proxy_get(request, url, _auth, tenant_id, admin_actor=False)
+
+
+@router.get("/admin/knowledge/documents/{document_id}/content")
+async def admin_get_document_content(
+    document_id: str,
+    request: Request,
+    tenant_id: str | None = None,
+    _auth: tuple = Depends(require_admin_module_bff("document.create")),
+    clearance: str = TClearance,
+) -> Response:
+    """Cross-tenant audit preview — stream a knowledge document's source bytes.
+
+    Fetches the raw blob for governance / audit preview of any tenant's
+    documents via ``?tenant_id=``.  Deliberately does NOT use
+    ``_scope_headers``: that helper calls ``foundation_headers(...)`` without
+    forwarding ``X-User-Clearance``, so knowledge-ingest's fail-closed L1
+    default would block a platform super_admin from previewing any L2+
+    document.  Instead we build the headers inline, forwarding the caller's
+    clearance (super_admin typically L5 sees all; tenant audit carries its own
+    clearance) so the service's sensitivity gate holds without spuriously
+    locking out audit.
+    """
+    caller_tenant, user_id, access_token = _auth
+    effective = tenant_id or caller_tenant
+    headers = foundation_headers(effective, user_id, access_token, clearance=clearance)
+    url = (
+        f"{request.app.state.settings.knowledge_ingest_url}"
+        f"/documents/{document_id}/content"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(url, headers=headers)
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"knowledge-ingest unreachable ({exc})",
+        ) from exc
+    content_type = resp.headers.get("content-type", "application/octet-stream")
+    content_disp = resp.headers.get("content-disposition", "")
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=content_type,
+        headers={"Content-Disposition": content_disp} if content_disp else {},
+    )
+
 
 
 @router.post("/admin/knowledge/documents/{document_id}/reingest")

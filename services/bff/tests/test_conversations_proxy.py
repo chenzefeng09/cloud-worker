@@ -81,6 +81,10 @@ class FakeChatFoundation:
         # Captures the JSON body of the POST /runs call so tests can assert what
         # the BFF forwarded to the orchestrator (e.g. execution_mode passthrough).
         self.runs_body: dict | None = None
+        # Captures the headers of the POST /runs call so tests can assert
+        # forwarding of X-User-Clearance (and other foundation_headers output)
+        # onto the orchestrator-bound run-injection call.
+        self.runs_headers: dict | None = None
 
     def route(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         self.calls.append((method, url))
@@ -94,6 +98,7 @@ class FakeChatFoundation:
             return httpx.Response(200, json={"items": items})
         if "runs" in url and method == "POST":
             self.runs_body = kwargs.get("json")
+            self.runs_headers = dict(kwargs.get("headers") or {})
             return httpx.Response(
                 self.run_status,
                 json={"id": "run_01", "status": "QUEUED", "execution_mode": (
@@ -356,6 +361,125 @@ def test_chat_execution_mode_invalid_returns_422(
     assert resp.status_code == 422
     # Validation happens before any orchestrator call → no runs POST attempted.
     assert not any("runs" in u and m == "POST" for m, u in fake.calls)
+
+
+# ---------------------------------------------------------------------------
+# Tests: POST /sessions/{id}/chat — workspace_file_ids (@-referenced files)
+# ---------------------------------------------------------------------------
+
+def test_chat_forwards_workspace_file_ids(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """workspace_file_ids in the body is forwarded verbatim to the runs body."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "看看这个", "workspace_file_ids": ["wsf_1", "wsf_2"]},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert fake.runs_body.get("workspace_file_ids") == ["wsf_1", "wsf_2"]
+
+
+def test_chat_omits_workspace_file_ids_when_absent(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No workspace_file_ids in the body → the key is not added to the runs body."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello"},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert "workspace_file_ids" not in fake.runs_body
+
+
+def test_chat_workspace_file_ids_invalid_type_422(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An illegal workspace_file_ids type (non-array) → 422, no runs POST."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello", "workspace_file_ids": "wsf_1"},
+    )
+    assert resp.status_code == 422
+    # Validation happens before any orchestrator call → no runs POST attempted.
+    assert not any("runs" in u and m == "POST" for m, u in fake.calls)
+
+
+# ---------------------------------------------------------------------------
+# Tests: POST /sessions/{id}/chat - clearance forwarding (X-User-Clearance)
+# ---------------------------------------------------------------------------
+
+def test_chat_forwards_clearance_on_runs_call(
+    client: TestClient,
+    authed_cookie_with_clearance: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller's clearance is forwarded as X-User-Clearance on the /runs POST.
+
+    Regression guard: the ``chat`` signature must carry ``clearance`` through
+    to ``foundation_headers`` so the orchestrator's run-injection
+    (load_workspace_context) honours the caller's level instead of falling
+    back to L2 and skipping L3+ workspaces entirely.
+    """
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie_with_clearance,
+        json={"message": "hello"},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_headers is not None, "expected a POST /runs call"
+    assert fake.runs_headers.get("X-User-Clearance") == "L3", (
+        f"expected X-User-Clearance: L3 forwarded on /runs, got {fake.runs_headers}"
+    )
+
+
+def test_chat_omits_clearance_when_cookie_lacks_claim(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No clearance claim in the cookie -> no X-User-Clearance header.
+
+    Service-token parity: the base ``authed_cookie`` bakes no ``clearance``
+    field, so the ``current_clearance`` contextvar resolves to "" and
+    ``foundation_headers`` omits the header entirely.  Guards against the BFF
+    inventing a default level on the caller's behalf.
+    """
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello"},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_headers is not None, "expected a POST /runs call"
+    assert "X-User-Clearance" not in fake.runs_headers, (
+        f"X-User-Clearance must not be sent without a claim, got {fake.runs_headers}"
+    )
 
 
 # ---------------------------------------------------------------------------

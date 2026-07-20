@@ -210,6 +210,92 @@ def test_search_empty_query_returns_no_hits(
     assert resp.json()["hits"] == []
 
 
+def test_upload_memory_stamps_origin_user_id(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    """A memory upload (origin_session_id present) records the caller as owner."""
+    resp = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=tenant_headers,
+        data={
+            "title": "[memory] hi",
+            "mime": "text/plain",
+            "origin_session_id": "ses_owner1",
+        },
+        files={"file": ("memory.txt", b"hello world", "text/plain")},
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    # tenant_headers carries X-User-Id == TEST_USER.
+    from tests.conftest import TEST_USER
+    assert body["origin_user_id"] == TEST_USER
+
+
+def test_upload_ordinary_leaves_origin_user_id_null(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    """An ordinary upload (no origin_session_id) has no owner → tenant-shared."""
+    resp = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=tenant_headers,
+        data={"title": "plain", "mime": "text/plain"},
+        files={"file": ("plain.txt", b"hello", "text/plain")},
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["origin_user_id"] is None
+
+
+def test_search_isolates_memory_across_users(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    other_user_headers: dict[str, str],
+) -> None:
+    """A user's session memory must not leak to another user in the same tenant,
+    while ordinary (tenant-shared) uploads remain visible to both."""
+    marker = ("uniquely-identifiable-marker " * 8).encode()
+
+    # User A writes a memory doc (owned) + an ordinary upload (shared).
+    a_mem = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=tenant_headers,
+        data={"title": "[memory] a", "mime": "text/plain",
+              "origin_session_id": "ses_a"},
+        files={"file": ("a.txt", marker, "text/plain")},
+    ).json()
+    app_client.post(
+        f"/api/knowledge/v1/documents/{a_mem['id']}/ingest", headers=tenant_headers,
+    )
+    a_shared = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=tenant_headers,
+        data={"title": "shared", "mime": "text/plain"},
+        files={"file": ("shared.txt", marker, "text/plain")},
+    ).json()
+    app_client.post(
+        f"/api/knowledge/v1/documents/{a_shared['id']}/ingest", headers=tenant_headers,
+    )
+
+    # User B (same tenant) searches: sees the shared upload, not A's memory.
+    resp = app_client.get(
+        "/api/knowledge/v1/search",
+        params={"q": "uniquely-identifiable-marker", "k": 10},
+        headers=other_user_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    ids_b = {h["document_id"] for h in resp.json()["hits"]}
+    assert a_mem["id"] not in ids_b
+    assert a_shared["id"] in ids_b
+
+    # User A still retrieves its own memory.
+    resp_a = app_client.get(
+        "/api/knowledge/v1/search",
+        params={"q": "uniquely-identifiable-marker", "k": 10},
+        headers=tenant_headers,
+    )
+    ids_a = {h["document_id"] for h in resp_a.json()["hits"]}
+    assert a_mem["id"] in ids_a
+
+
 def test_list_documents_tenant_isolated(
     app_client: TestClient,
     tenant_headers: dict[str, str],
@@ -225,3 +311,67 @@ def test_list_documents_tenant_isolated(
         "/api/knowledge/v1/documents", headers=other_tenant_headers,
     ).json()
     assert other["total"] == 0
+
+
+def test_list_documents_excludes_memory_by_default(
+    app_client: TestClient, tenant_headers: dict[str, str],
+) -> None:
+    """The default GET /documents omits session-memory docs, keeps uploads."""
+    plain = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=tenant_headers,
+        data={"title": "plain", "mime": "text/plain"},
+        files={"file": ("plain.txt", b"hello", "text/plain")},
+    ).json()
+    mem = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=tenant_headers,
+        data={"title": "[memory] hi", "mime": "text/plain",
+              "origin_session_id": "ses_mem"},
+        files={"file": ("memory.txt", b"hi there", "text/plain")},
+    ).json()
+
+    listing = app_client.get(
+        "/api/knowledge/v1/documents", headers=tenant_headers,
+    ).json()
+    ids = {it["id"] for it in listing["items"]}
+    assert plain["id"] in ids
+    assert mem["id"] not in ids
+
+
+def test_list_documents_include_memory_returns_all_users(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    other_user_headers: dict[str, str],
+) -> None:
+    """include_memory=true returns ordinary uploads plus every user's memory
+    docs (the admin audit view), not just the caller's."""
+    plain = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=tenant_headers,
+        data={"title": "plain", "mime": "text/plain"},
+        files={"file": ("plain.txt", b"hello", "text/plain")},
+    ).json()
+    mine = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=tenant_headers,
+        data={"title": "[memory] mine", "mime": "text/plain",
+              "origin_session_id": "ses_mine"},
+        files={"file": ("mine.txt", b"mine", "text/plain")},
+    ).json()
+    # A memory doc owned by a different user in the same tenant.
+    theirs = app_client.post(
+        "/api/knowledge/v1/documents",
+        headers=other_user_headers,
+        data={"title": "[memory] theirs", "mime": "text/plain",
+              "origin_session_id": "ses_theirs"},
+        files={"file": ("theirs.txt", b"theirs", "text/plain")},
+    ).json()
+
+    listing = app_client.get(
+        "/api/knowledge/v1/documents?include_memory=true", headers=tenant_headers,
+    ).json()
+    ids = {it["id"] for it in listing["items"]}
+    assert plain["id"] in ids
+    assert mine["id"] in ids
+    assert theirs["id"] in ids

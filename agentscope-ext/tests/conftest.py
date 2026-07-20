@@ -37,6 +37,7 @@ def _restore_hooks():
         for name in (
             "agentscope_ext.canvas_tool",
             "agentscope_ext.event_audit_sink",
+            "agentscope_ext.knowledge_tool",
             "agentscope_ext.llm_gateway_enforcer",
             "agentscope_ext.mcp_tenant_injector",
             "agentscope_ext.skills_loader",

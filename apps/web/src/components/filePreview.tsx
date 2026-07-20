@@ -9,6 +9,7 @@ import { useCopied, CopyIcon } from './CopyButton';
 const PdfPreview = lazy(() => import('./previews/PdfPreview'));
 const ExcelPreview = lazy(() => import('./previews/ExcelPreview'));
 const DocxPreview = lazy(() => import('./previews/DocxPreview'));
+const PptxPreview = lazy(() => import('./previews/PptxPreview'));
 
 // ── Kind / glyph helpers ─────────────────────────────────────────────────────
 
@@ -110,6 +111,14 @@ const EXT_TO_LANG: Record<string, string> = {
   ini: 'ini',
   dockerfile: 'dockerfile',
 };
+
+// Text-like extensions — the extension-level counterpart of isTextLikeMime.
+// Needed because some entry points (e.g. a `#file:<id>` link in an assistant
+// reply) carry only id+filename, no MIME; without an ext fallback those files
+// wrongly land on the "unsupported type" card.
+const TEXT_LIKE_EXTS = new Set(['txt', 'text', 'log', 'csv', 'tsv', ...Object.keys(EXT_TO_LANG)]);
+
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'webp', 'svg', 'bmp', 'ico']);
 
 /** Returns an hljs language for code files, or undefined for plain text (.txt, .csv…). */
 function extToHljsLang(filename: string): string | undefined {
@@ -370,17 +379,39 @@ function ImagePreview({ src, alt }: { src: string; alt: string }) {
 
 // ── FilePreviewBody ───────────────────────────────────────────────────────────
 
+/**
+ * Optional content-source override. When provided (e.g. by the workspace file
+ * list, which has no session), FilePreviewBody builds the content URL and
+ * fetches bytes from this source instead of the session-scoped BFF paths. When
+ * absent, the body falls back to the session-scoped path exactly as before, so
+ * the chat / session page (AgentPage / AppResultPage / FilesPage) is unchanged.
+ */
+export type FileContentSource = {
+  /** Cookie-auth content URL (for PDF / image). */
+  url: string;
+  /** Fetcher for blob-based types (docx / excel / text / html). */
+  getContent: () => Promise<{ text: string | null; blob: Blob; mime: string }>;
+};
+
 export interface FilePreviewBodyProps {
-  sessionId: string;
+  /** Session id for the session-scoped content path. Optional when `source` is
+   *  provided (the workspace path has no session). */
+  sessionId?: string;
   fileId: string;
   filename: string;
   mime?: string;
+  /** Override the session-scoped content URL + blob fetcher. */
+  source?: FileContentSource;
 }
 
-export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePreviewBodyProps) {
-  const contentUrl = `/api/bff/v1/sessions/${sessionId}/files/${fileId}/content`;
+export function FilePreviewBody({ sessionId, fileId, filename, mime, source }: FilePreviewBodyProps) {
+  const contentUrl = source?.url ?? (sessionId ? `/api/bff/v1/sessions/${sessionId}/files/${fileId}/content` : '');
+  // Blob fetcher: prefer the override (workspace path); otherwise fall back to
+  // the session-scoped attachments endpoint. The non-null assertion is safe - the
+  // fallback is only reached on the chat path, where sessionId is always set.
+  const getContent = source?.getContent ?? (() => api.attachments.getContent(sessionId!, fileId));
   const ext = filename.split('.').pop()?.toLowerCase() ?? '';
-  const isImage = mime?.startsWith('image/') ?? false;
+  const isImage = (mime?.startsWith('image/') ?? false) || IMAGE_EXTS.has(ext);
   const isPdf = mime === 'application/pdf' || ext === 'pdf';
   // Office 文件的 mime 常不准(有时是 octet-stream),用扩展名兜底。
   const isExcel =
@@ -391,13 +422,17 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
     ['docx', 'doc'].includes(ext) ||
     (mime?.includes('officedocument.wordprocessing') ?? false) ||
     (mime?.includes('msword') ?? false);
-  const needsBlob = isExcel || isWord;
+  const isPptx =
+    ['pptx', 'ppt'].includes(ext) ||
+    (mime?.includes('officedocument.presentationml') ?? false) ||
+    (mime?.includes('ms-powerpoint') ?? false);
+  const needsBlob = isExcel || isWord || isPptx;
   // HTML renders as a webpage (iframe) by default, with a source-code toggle —
   // so it must NOT fall into TextPreview. Detect it before the text gate.
   const isHtml = mime === 'text/html' || ext === 'html' || ext === 'htm';
   // Office docs take precedence: never treat them as text even if MIME/ext is
   // ambiguous, otherwise the binary zip renders as garbled bytes.
-  const isText = !isWord && !isExcel && !isHtml && isTextLikeMime(mime);
+  const isText = !isWord && !isExcel && !isPptx && !isHtml && (isTextLikeMime(mime) || TEXT_LIKE_EXTS.has(ext));
 
   const [contentText, setContentText] = useState<string | null>(null);
   const [contentBlob, setContentBlob] = useState<Blob | null>(null);
@@ -419,7 +454,7 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
     setContentText(null);
     setContentBlob(null);
 
-    api.attachments.getContent(sessionId, fileId)
+    getContent()
       .then((res) => {
         if (cancelled) return;
         if (isText || isHtml) setContentText(res.text);
@@ -440,6 +475,12 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
       setContentBlob(null);
       setContentText(null);
     };
+    // `getContent` is intentionally excluded: it is recreated every render
+    // (the workspace page rebuilds `source` each render, and drag-resize changes
+    // `previewWidth` every mousemove). Adding it would cancel+refetch the file on
+    // every mousemove. It only closes over `sessionId`/`fileId` (both in deps)
+    // and `source` (a workspace switch unmounts this body before it can go stale).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId, fileId, isText, isHtml, needsBlob]);
 
   // Image preview
@@ -471,8 +512,8 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
     );
   }
 
-  // PDF / Excel / Word — 懒加载预览器
-  if (isPdf || isExcel || isWord) {
+  // PDF / Excel / Word / PPT — 懒加载预览器
+  if (isPdf || isExcel || isWord || isPptx) {
     return (
       <Suspense fallback={<div className="font-mono text-[11px] text-dim">加载预览组件…</div>}>
         {contentError ? (
@@ -480,10 +521,10 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime }: FilePrevi
         ) : isPdf ? (
           <PdfPreview url={contentUrl} />
         ) : contentBlob ? (
-          isExcel ? <ExcelPreview blob={contentBlob} /> : <DocxPreview blob={contentBlob} />
+          isExcel ? <ExcelPreview blob={contentBlob} /> : isPptx ? <PptxPreview blob={contentBlob} /> : <DocxPreview blob={contentBlob} />
         ) : (
           <div className="font-mono text-[11px] text-dim">
-            {isExcel ? '加载表格…' : '加载文档…'}
+            {isExcel ? '加载表格…' : isPptx ? '加载演示文稿…' : '加载文档…'}
           </div>
         )}
       </Suspense>

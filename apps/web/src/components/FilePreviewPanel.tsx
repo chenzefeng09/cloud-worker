@@ -1,4 +1,5 @@
 import { FilePreviewBody, kindGlyph } from './filePreview';
+import type { FileContentSource } from './filePreview';
 
 export interface FilePreviewPanelFile {
   id: string;
@@ -7,13 +8,21 @@ export interface FilePreviewPanelFile {
 }
 
 export interface FilePreviewPanelProps {
-  sessionId: string;
+  /** Session id for the session-scoped content path. Optional when `getSource`
+   *  is provided (the workspace path has no session). */
+  sessionId?: string;
   file: FilePreviewPanelFile | null;
   onClose: () => void;
+  /** Per-file content-source override. When provided, the body fetches from this
+   *  source instead of the session-scoped path. Absent on the chat page, so the
+   *  session-scoped behaviour is preserved exactly. */
+  getSource?: (fileId: string) => FileContentSource;
 }
 
-export function FilePreviewPanel({ sessionId, file, onClose }: FilePreviewPanelProps) {
+export function FilePreviewPanel({ sessionId, file, onClose, getSource }: FilePreviewPanelProps) {
   if (!file) return null;
+
+  const source = getSource?.(file.id);
 
   return (
     <div
@@ -22,6 +31,16 @@ export function FilePreviewPanel({ sessionId, file, onClose }: FilePreviewPanelP
     >
       {/* Header */}
       <div className="flex items-center gap-2 px-3 py-2.5 border-b border-line shrink-0">
+        <button
+          onClick={onClose}
+          aria-label="返回"
+          title="返回"
+          className="h-8 inline-flex items-center gap-1.5 px-2.5 rounded-md border border-line bg-paper text-ink-2 hover:text-ink hover:bg-paper-2 hover:border-ink-2 transition-colors shrink-0 font-mono text-[12px]"
+        >
+          <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M7 2 L3 6 L7 10 M3 6 L11 6" />
+          </svg>
+        </button>
         <span className="font-mono text-[11px] text-dim w-4 text-center">
           {kindGlyph(file.mime)}
         </span>
@@ -31,19 +50,13 @@ export function FilePreviewPanel({ sessionId, file, onClose }: FilePreviewPanelP
         >
           {file.filename}
         </span>
-        <button
-          onClick={onClose}
-          aria-label="关闭预览"
-          className="cw-btn cw-btn-ghost cw-btn-sm font-mono text-[12px] text-dim leading-none px-1.5 py-0.5"
-        >
-          ✕
-        </button>
       </div>
 
       {/* Body */}
       <div className="cw-scroll flex-1 px-3 py-3">
         <FilePreviewBody
           sessionId={sessionId}
+          source={source}
           fileId={file.id}
           filename={file.filename}
           mime={file.mime}

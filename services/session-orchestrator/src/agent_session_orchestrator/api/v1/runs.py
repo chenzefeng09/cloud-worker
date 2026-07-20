@@ -38,7 +38,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
-from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, TUserId
+from agent_session_orchestrator.api.dependencies import TClearance, TDbSession, TTenantId, TUserId
 
 # Reuse the chat path's run-completion reconciler verbatim (poll scheduler,
 # map container status, persist result_summary/status/finished_at/tokens, write
@@ -48,6 +48,8 @@ from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, T
 # duplicating any of its logic.
 from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
 from agent_session_orchestrator.domain.models import Run
+from agent_session_orchestrator.services import inline_knowledge_client
+from agent_session_orchestrator.services.clearance import clearance_rank
 from agent_session_orchestrator.services.inline_run_executor import (
     cancel_inline_run,
     has_inline_task,
@@ -59,10 +61,67 @@ router = APIRouter(tags=["Runs"])
 logger = logging.getLogger(__name__)
 
 _MEMORY_SEARCH_K = 5  # top-K memory hits to inject
+_KNOWLEDGE_SEARCH_K = 5  # top-K tenant-knowledge hits to inject
+
+
+def _effective_clearance(user_clearance: str, workspace_sensitivity: str | None) -> str:
+    """The run's effective clearance = ``min(user, workspace)`` by level rank.
+
+    No workspace (or an unreadable/soft-deleted one → ``workspace_sensitivity``
+    is ``None``) means the effective clearance is just the user's own.  This is
+    the file≤workspace≤user matrix landing on the retrieval side: a session bound
+    to an L2 workspace caps knowledge/memory visibility at L2 even for an L5 user.
+    Fail-open to ``user_clearance`` on any malformed level so retrieval is never
+    hard-blocked by a bad value.
+    """
+    if not workspace_sensitivity:
+        return user_clearance
+    try:
+        if clearance_rank(workspace_sensitivity) < clearance_rank(user_clearance):
+            return workspace_sensitivity
+        return user_clearance
+    except ValueError:
+        return user_clearance
 
 
 def _now() -> dt.datetime:
     return dt.datetime.now(tz=dt.UTC)
+
+
+def _merge_skills(base: list[str], extra: list[str]) -> list[str]:
+    """Order-preserving union of two skill-name lists.
+
+    ``base`` (the run's explicit/default skills) keeps its order and wins on
+    duplicates; ``extra`` (the workspace's skill set) is appended in its own
+    order, deduped.  Pure function so the workspace-skills merge is unit-testable.
+    """
+    merged = list(base)
+    seen = set(merged)
+    for name in extra:
+        if name not in seen:
+            merged.append(name)
+            seen.add(name)
+    return merged
+
+
+def _prioritize_workspace_files(
+    files: list[dict[str, Any]], referenced_ids: list[str]
+) -> list[dict[str, Any]]:
+    """Hoist @-referenced workspace files to the front, order-preserving.
+
+    ``files`` is the workspace's file list (dicts carrying an ``id``);
+    ``referenced_ids`` are the ids the message @-referenced.  Files whose id is in
+    ``referenced_ids`` come first in their original relative order, then the
+    un-referenced tail in its original order.  Ids not present in ``files`` are
+    ignored.  Pure function so the priority ordering is unit-testable, and a
+    no-op (returns a shallow copy) when nothing was referenced.
+    """
+    if not referenced_ids:
+        return list(files)
+    ref = set(referenced_ids)
+    referenced = [f for f in files if f.get("id") in ref]
+    unreferenced = [f for f in files if f.get("id") not in ref]
+    return referenced + unreferenced
 
 
 def _serialize_run(r: Run) -> dict[str, Any]:
@@ -94,11 +153,15 @@ async def _fetch_memory(
     user_id: str,
     query: str,
     session_id: str = "",
+    clearance: str = "L1",
 ) -> str:
     """Query knowledge-ingest for relevant memories and return a formatted string.
 
-    Uses ``GET /search?q=<query>&k=<K>`` with ``X-Tenant-Id``/``X-User-Id``
-    headers.  Returns an empty string on any error (failure-open).
+    Uses ``GET /search?q=<query>&k=<K>&scope=memory`` with ``X-Tenant-Id`` /
+    ``X-User-Id`` / ``X-User-Clearance`` headers.  ``scope=memory`` restricts the
+    search to this user's own ``[memory]`` documents (the knowledge base is a
+    separate ``scope=knowledge`` prefetch — see ``_fetch_knowledge``).  Returns an
+    empty string on any error (failure-open).
 
     ``user_id`` must be the real originating user (``usr_...``) — knowledge-
     ingest's authz guard is fail-closed and rejects the ``SYSTEM`` sentinel,
@@ -112,7 +175,11 @@ async def _fetch_memory(
     """
     if not query.strip() or not knowledge_ingest_url:
         return ""
-    params: dict[str, Any] = {"q": query[:500], "k": _MEMORY_SEARCH_K}
+    params: dict[str, Any] = {
+        "q": query[:500],
+        "k": _MEMORY_SEARCH_K,
+        "scope": "memory",
+    }
     if session_id:
         params["exclude_origin_session_id"] = session_id
     try:
@@ -120,7 +187,11 @@ async def _fetch_memory(
             resp = await client.get(
                 f"{knowledge_ingest_url}/search",
                 params=params,
-                headers={"X-Tenant-Id": tenant_id, "X-User-Id": user_id},
+                headers={
+                    "X-Tenant-Id": tenant_id,
+                    "X-User-Id": user_id,
+                    "X-User-Clearance": clearance or "L1",
+                },
             )
         if resp.status_code != 200:
             logger.debug(
@@ -140,6 +211,34 @@ async def _fetch_memory(
     except Exception as exc:  # noqa: BLE001
         logger.debug("memory pre-fetch failed (failure-open): %s", exc)
         return ""
+
+
+async def _fetch_knowledge(
+    *,
+    knowledge_ingest_url: str,
+    tenant_id: str,
+    user_id: str,
+    query: str,
+    clearance: str,
+) -> str:
+    """Prefetch top-K tenant-knowledge hits → the "知识库资料" injection block.
+
+    Delegates the ``GET /search?scope=knowledge`` call + 【文档名 | 文件夹路径】
+    provenance formatting to :mod:`inline_knowledge_client` (the same code the
+    inline ``search_knowledge`` tool uses, so prefetch and tool stay consistent).
+    Carries the run's **effective clearance** in ``X-User-Clearance`` so ki
+    enforces the visibility gate.  Failure-open: any error → ``""``.
+    """
+    if not query.strip() or not knowledge_ingest_url:
+        return ""
+    return await inline_knowledge_client.fetch_knowledge_prefetch(
+        base_url=knowledge_ingest_url,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        clearance=clearance,
+        query=query,
+        k=_KNOWLEDGE_SEARCH_K,
+    )
 
 
 async def _fetch_default_installed_skills(
@@ -265,11 +364,25 @@ async def create_run(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     user_id: str = TUserId,
+    clearance: str = TClearance,
 ) -> dict[str, Any]:
     svc = SessionService(db, tenant_id=tenant_id)
     session = await svc.get_session(session_id)
 
     task = body.get("task", "")
+
+    # Workspace files the user @-referenced in this message (``wsf_…`` ids).
+    # Optional and best-effort: a non-list body value, or non-string elements,
+    # are silently ignored (never a 400 — an over-eager client should still get a
+    # working run).  Referenced files are hoisted to the front of the injected
+    # workspace-file list below so the MAX_WORKSPACE_FILES / char-budget cuts fall
+    # on the un-referenced tail first.
+    raw_ws_file_ids = body.get("workspace_file_ids")
+    workspace_file_ids: list[str] = (
+        [x for x in raw_ws_file_ids if isinstance(x, str)]
+        if isinstance(raw_ws_file_ids, list)
+        else []
+    )
 
     # App-harness fields (optional; only App runs send these — chat runs omit
     # them and keep working unchanged).  ``sys_prompt`` is appended to the
@@ -374,7 +487,31 @@ async def create_run(
             )
             total_attachment_bytes = 0
 
-    # Pre-fetch relevant memory from knowledge-ingest; failure-open.
+    # ── Effective clearance (file≤workspace≤user, retrieval side) ───────────
+    # The run's effective clearance caps knowledge/memory visibility at
+    # ``min(user_clearance, workspace_sensitivity)``.  Resolved with a light PK
+    # lookup — NOT gated on the workspace_context_injection flag (clearance is a
+    # security control, not opportunistic context).  Fail-open to the user's own
+    # clearance so a lookup hiccup never hard-blocks retrieval.
+    from agent_session_orchestrator.services.workspace_context import (
+        resolve_workspace_sensitivity,
+    )
+
+    try:
+        workspace_sensitivity = await resolve_workspace_sensitivity(db, session)
+    except Exception:  # noqa: BLE001 — fail-open: retrieval still runs at user clearance
+        logger.debug(
+            "workspace sensitivity lookup failed (fail-open to user clearance)",
+            extra={"session_id": session_id},
+        )
+        workspace_sensitivity = None
+    effective_clearance = _effective_clearance(clearance, workspace_sensitivity)
+
+    # Pre-fetch relevant memory from knowledge-ingest; failure-open.  ``scope``
+    # splits the two sources: memory (this user's own [memory] docs) is fetched
+    # here for both execution modes; the tenant knowledge base (scope=knowledge)
+    # is prefetched inside the inline branch below (the knowledge tools are
+    # inline-only, so a sandbox run would fetch it only to discard it).
     knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
     memory_snippets = await _fetch_memory(
         knowledge_ingest_url=knowledge_ingest_url,
@@ -382,6 +519,7 @@ async def create_run(
         user_id=user_id,
         query=task,
         session_id=session_id,
+        clearance=effective_clearance,
     )
 
     # Assemble prior-turn conversation history so the worker can restore it
@@ -408,6 +546,58 @@ async def create_run(
             user_id=user_id,
         )
 
+    # ── Workspace context (both execution modes) ────────────────────────────
+    # A session created against a workspace inherits its instructions / base
+    # files / skills on every run.  Loaded here — before the inline branch
+    # returns — so both branches consume the same resolution.  Values are
+    # extracted into plain str/dicts immediately: the inline executor runs as a
+    # background task outside this request transaction and must never receive
+    # ORM rows.  Gated on the ``workspace_context_injection`` flag (fail-open
+    # ON) and fail-open throughout — a workspace hiccup never blocks a run.
+    from agent_session_orchestrator.services.workspace_context import (
+        load_workspace_context,
+        workspace_context_injection_enabled,
+    )
+
+    # ``None`` = session not workspace-bound (or context injection unavailable);
+    # ``[]`` = workspace bound but it has no base files.  The inline executor
+    # uses the distinction to tell the model the workspace is empty instead of
+    # letting it hallucinate a missing tool.
+    ws_instructions: str | None = None
+    ws_files: list[dict[str, Any]] | None = None
+    if session.workspace_id and await workspace_context_injection_enabled(tenant_id):
+        try:
+            ws_ctx = await load_workspace_context(
+                db, session, user_clearance=clearance
+            )
+        except Exception:  # noqa: BLE001 — fail-open: run proceeds without workspace context
+            logger.warning(
+                "workspace context load failed (fail-open)",
+                extra={"session_id": session_id, "run_id": run.id},
+                exc_info=True,
+            )
+            ws_ctx = None
+        if ws_ctx is not None:
+            ws_instructions = ws_ctx.instructions
+            ws_files = [
+                {
+                    "id": f.id,
+                    "key": f.blob_key,
+                    "filename": f.filename,
+                    "mime": f.mime,
+                    "size_bytes": int(f.size_bytes or 0),
+                }
+                for f in ws_ctx.files
+            ]
+            # @-reference priority: hoist any workspace file the message referenced
+            # to the front (preserving each group's original relative order) so the
+            # downstream MAX_WORKSPACE_FILES + char-budget truncation naturally
+            # favours the @-referenced files.  Unknown ids are silently ignored.
+            ws_files = _prioritize_workspace_files(ws_files, workspace_file_ids)
+            # Union the workspace's skill set into the run's (order-preserving
+            # dedupe: explicit/default skills first, then workspace additions).
+            run_skills = _merge_skills(list(run_skills), ws_ctx.skills)
+
     # ── Inline (chat-mode) branch ───────────────────────────────────────────
     # No scheduler, no sandbox: flip the run to RUNNING in THIS transaction so
     # the session SSE multiplex poll can select it the instant the response
@@ -423,6 +613,18 @@ async def create_run(
         # ``sandbox_id`` stays NULL — the sentinel for an inline run everywhere
         # downstream (reconcile short-circuit, sweeper orphan branch, cancel).
         await db.flush()
+
+        # Prefetch the tenant knowledge base (scope=knowledge) for the "知识库资料"
+        # system block.  Inline-only: the knowledge tools live in the in-process
+        # loop, so a sandbox run would never consume this.  Carries the effective
+        # clearance; failure-open (empty block).
+        knowledge_snippets = await _fetch_knowledge(
+            knowledge_ingest_url=knowledge_ingest_url,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            query=task,
+            clearance=effective_clearance,
+        )
 
         settings = request.app.state.settings
         start_inline_run(
@@ -444,12 +646,21 @@ async def create_run(
             reasoning_effort=body.get("reasoning_effort"),
             sys_prompt=sys_prompt,
             memory=memory_snippets,
+            # Tenant knowledge prefetch ("知识库资料" block) + the effective
+            # clearance the in-process knowledge tools carry on every ki call.
+            knowledge=knowledge_snippets,
+            effective_clearance=effective_clearance,
             history=history,
             sampling_params=sampling_params,
-            # Same presence-resolved skill set the sandbox branch relays; the
-            # executor resolves these to a catalog and runs the in-process
-            # read_skill loop (empty/omitted → no skill loop, prior behaviour).
+            # Same presence-resolved skill set the sandbox branch relays (already
+            # unioned with the workspace's skills); the executor resolves these
+            # to a catalog and runs the in-process read_skill loop
+            # (empty/omitted → no skill loop, prior behaviour).
             skills=run_skills,
+            # Workspace context as plain values (str / dicts) — the executor
+            # builds the "# 工作区指令" block and the base-files block itself.
+            workspace_instructions=ws_instructions,
+            workspace_files=ws_files,
         )
 
         # Record inline-run usage against the ``agent_sessions`` quota dimension
@@ -475,6 +686,37 @@ async def create_run(
             "execution_mode": run.execution_mode,
             "created_at": run.created_at.isoformat(),
         }
+
+    # ── Workspace context, sandbox shape ────────────────────────────────────
+    # Base files ride the ordinary files[] channel (the worker lands each entry
+    # at /workspace/inputs/<filename>); a workspace file whose name collides
+    # with a session attachment already in files[] is skipped — same-name
+    # writes would overwrite each other in the sandbox, and the session-scoped
+    # upload wins.  Sizes count toward the memory-tier total.  Instructions
+    # are folded into sys_prompt (the worker appends it to the system prompt);
+    # skills were already unioned into run_skills above.
+    if ws_files:
+        existing_names = {
+            str(f.get("filename") or "") for f in files if isinstance(f, dict)
+        }
+        for wf in ws_files:
+            if wf["filename"] in existing_names:
+                logger.info(
+                    "skipping workspace file shadowed by a session attachment",
+                    extra={"run_id": run.id, "ws_filename": wf["filename"]},
+                )
+                continue
+            files.append(
+                {"key": wf["key"], "filename": wf["filename"], "mime": wf["mime"]}
+            )
+            existing_names.add(wf["filename"])
+            total_attachment_bytes += int(wf.get("size_bytes") or 0)
+    if ws_instructions:
+        sys_prompt = (
+            (sys_prompt + "\n\n" if sys_prompt else "")
+            + "# 工作区指令\n"
+            + ws_instructions
+        )
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -510,6 +752,12 @@ async def create_run(
                     # so the worker can pause for confirmation / free-text questions.
                     # Scheduled/batch runs will override to False (future).
                     "hitl": True,
+                    # Effective clearance (min(user, workspace)) so the sandbox
+                    # worker's knowledge_tool can send X-User-Clearance to
+                    # knowledge-ingest and the scheduler can sign it into the
+                    # broker lease (broker mode re-injects it from the lease).
+                    # Empty/absent -> ki treats the caller as L1.
+                    "effective_clearance": effective_clearance,
                 },
                 headers=headers,
             )

@@ -103,12 +103,18 @@ _TOOL_ENV_SCRUB_KEYS: tuple[str, ...] = (
     "FOUNDATION_API_URL",
     "FOUNDATION_TENANT_ID",
     "FOUNDATION_USER_ID",
+    # Effective clearance for the run - the knowledge_tool reads it from the
+    # pre-scrub snapshot to send X-User-Clearance to ki; scrub it from
+    # os.environ so Bash/MCP subprocesses can't read or relay it.
+    "FOUNDATION_USER_CLEARANCE",
     "RUN_ID",
     "WORKSPACE_BASE",
     # Internal service topology.
     "MCP_REGISTRY_URL",
     "SKILL_STORE_URL",
     "WEB_FETCH_GATEWAY_URL",
+    # Knowledge-ingest endpoint (direct URL or tool-broker facade).
+    "KNOWLEDGE_INGEST_URL",
     "TOOL_BROKER_URL",
     "TOOL_BROKER_LEASE",
     "SANDBOX_EGRESS_MODE",

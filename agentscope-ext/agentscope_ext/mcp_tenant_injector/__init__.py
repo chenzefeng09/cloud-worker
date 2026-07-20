@@ -74,7 +74,10 @@ def install() -> None:
 
         for server in servers:
             try:
-                _register_one(toolkit, server)
+                prepared = _prepare_server_for_egress(server, env)
+                if prepared is None:
+                    continue
+                _register_one(toolkit, prepared)
             except Exception as exc:  # noqa: BLE001 -- skip the bad one
                 _LOG.warning(
                     "mcp_tenant_injector: register failed for %r: %r",
@@ -84,6 +87,60 @@ def install() -> None:
         return toolkit
 
     _hooks.build_toolkit = _build_with_mcp
+
+
+def _prepare_server_for_egress(
+    server: Mapping[str, Any], env: Mapping[str, str]
+) -> dict[str, Any] | None:
+    """Return a server manifest reachable from the sandbox's egress mode.
+
+    Broker-only sandboxes cannot resolve or connect to registry-supplied HTTP
+    endpoints directly.  Route those MCP sessions through the tool-broker's
+    tenant-scoped passthrough and attach the per-run capability headers.  Stdio
+    servers remain local to the sandbox and need no rewrite.
+
+    Missing broker routing information drops just this server (failure-open)
+    instead of handing AgentScope an endpoint that is guaranteed to fail.
+    """
+    prepared = dict(server)
+    transport = str(prepared.get("transport") or "stdio").lower()
+    if env.get("SANDBOX_EGRESS_MODE") != "broker" or transport == "stdio":
+        return prepared
+
+    server_id = str(prepared.get("id") or "").strip()
+    broker_base = str(env.get("TOOL_BROKER_URL") or "").rstrip("/")
+    if not server_id or not broker_base:
+        _LOG.warning(
+            "mcp_tenant_injector: broker mode dropping MCP %r "
+            "(missing server id / tool-broker url)",
+            prepared.get("name"),
+        )
+        return None
+
+    api_token = str(env.get("FOUNDATION_API_TOKEN") or "").strip()
+    tenant_id = str(env.get("FOUNDATION_TENANT_ID") or "").strip()
+    broker_lease = str(env.get("TOOL_BROKER_LEASE") or "").strip()
+    if not api_token or not tenant_id or not broker_lease:
+        _LOG.warning(
+            "mcp_tenant_injector: broker mode dropping MCP %r "
+            "(missing broker authentication context)",
+            prepared.get("name"),
+        )
+        return None
+
+    headers = dict(prepared.get("headers") or {})
+    # Broker authority always wins over untrusted registry/header values.
+    headers.update(
+        {
+            "Authorization": f"Bearer {api_token}",
+            "X-Tenant-Id": tenant_id,
+            "X-Tool-Broker-Lease": broker_lease,
+        }
+    )
+    prepared["endpoint"] = f"{broker_base}/mcp-tenant/v1/{server_id}"
+    prepared.pop("url", None)
+    prepared["headers"] = headers
+    return prepared
 
 
 def _build_mcp_client(name: str, server: Mapping[str, Any]) -> Any:

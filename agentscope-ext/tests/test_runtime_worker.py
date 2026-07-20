@@ -1703,8 +1703,8 @@ def test_broker_s3_read_text_failure_open_on_missing(monkeypatch):
     assert worker_mod._s3_read_text(client, "agent-platform", "missing.md") is None
 
 
-def test_snapshot_env_includes_tool_broker_url(monkeypatch):
-    """Regression: snapshot_env() must carry TOOL_BROKER_URL, not just the lease.
+def test_snapshot_env_includes_tool_broker_context(monkeypatch):
+    """Regression: snapshot_env() must carry the complete broker context.
 
     The S3 attachment-download path goes through snapshot_env() (unlike
     redis_state, which reads os.environ directly).  _s3_client keys broker
@@ -1716,10 +1716,12 @@ def test_snapshot_env_includes_tool_broker_url(monkeypatch):
 
     monkeypatch.setenv("TOOL_BROKER_URL", "http://tool-broker:8024/api/tool-broker/v1")
     monkeypatch.setenv("TOOL_BROKER_LEASE", "v1.payload.signature")
+    monkeypatch.setenv("SANDBOX_EGRESS_MODE", "broker")
 
     snap = hooks_mod.snapshot_env()
     assert snap.get("TOOL_BROKER_URL") == "http://tool-broker:8024/api/tool-broker/v1"
     assert snap.get("TOOL_BROKER_LEASE") == "v1.payload.signature"
+    assert snap.get("SANDBOX_EGRESS_MODE") == "broker"
 
 
 def test_snapshot_env_drives_broker_s3_shim(monkeypatch):

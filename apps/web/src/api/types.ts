@@ -6,8 +6,81 @@ export interface Session {
   status: 'ACTIVE' | 'PAUSED' | 'COMPLETED' | 'ERROR' | 'ARCHIVED';
   current_run_id: string | null;
   metadata?: Record<string, unknown> | null;
+  /**
+   * Workspace this session was started in. Set at creation time (POST /sessions
+   * body). The workspace's instructions / base files / skills are injected
+   * server-side; the frontend only records the ownership.
+   */
+  workspace_id?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+// ─── Workspace (→ session-orchestrator, proxied via BFF /workspaces) ──────────
+//
+// A workspace is a reusable, cross-session container of an instruction preamble,
+// a set of base files, and a default skill selection. Sessions started inside a
+// workspace inherit that context (injection happens server-side). The backend
+// lazily creates a `default` workspace per user, so the list always has >= 1
+// entry with `is_default: true`.
+
+/** Presentation hints stored on a workspace (optional). */
+export interface WorkspaceMeta {
+  /** A short mono/symbol glyph shown in the switcher chip. */
+  glyph?: string;
+  /** Accent colour (hex) driving the theme stripe. */
+  accent?: string;
+}
+
+export interface Workspace {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  name: string;
+  description: string | null;
+  /** Instruction preamble injected at the start of every task in this workspace. */
+  instructions: string | null;
+  /** Skill ids enabled by default for tasks in this workspace. */
+  skills: string[];
+  /** The lazily-created fallback workspace — cannot be deleted. */
+  is_default: boolean;
+  meta: WorkspaceMeta;
+  sensitivity_level?: DlpSensitivity;
+  file_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One base file attached to a workspace. */
+export interface WorkspaceFile {
+  id: string;
+  workspace_id: string;
+  filename: string;
+  mime: string;
+  size_bytes: number;
+  description: string;
+  sensitivity_level?: DlpSensitivity;
+  created_at: string;
+}
+
+/** Body for POST /workspaces — only `name` is required. */
+export interface WorkspaceCreate {
+  name: string;
+  description?: string;
+  instructions?: string;
+  skills?: string[];
+  meta?: WorkspaceMeta;
+  sensitivity_level?: DlpSensitivity;
+}
+
+/** Body for PATCH /workspaces/{id} — every field optional. */
+export interface WorkspaceUpdate {
+  name?: string;
+  description?: string;
+  instructions?: string;
+  skills?: string[];
+  meta?: WorkspaceMeta;
+  sensitivity_level?: DlpSensitivity;
 }
 
 /** One entry in a TOOL message's tool_calls array. */
@@ -99,6 +172,7 @@ export interface UserProfile {
    *  by the BFF via authz /my-permissions). Optional for backward-compat when
    *  authz is unreachable — the BFF attaches `[]` in that case. */
   permissions?: string[];
+  clearance?: DlpSensitivity;
 }
 
 export interface SSEEvent {
@@ -166,6 +240,26 @@ export interface KnowledgeDocument {
   status: DocumentStatus;
   uploaded_at: string;
   chunk_count: number;
+  /** Owning folder; null/absent = root. (knowledge-library-v1) */
+  folder_id?: string | null;
+  /** Document sensitivity (L1..L5); defaults to L1 when absent. */
+  sensitivity?: DlpSensitivity;
+  /** Uploader — reserved for a future personal-knowledge-source feature. */
+  uploaded_by_user_id?: string | null;
+}
+
+/** A tenant knowledge folder (self-referential parent_id tree). */
+export interface KnowledgeFolder {
+  id: string;
+  tenant_id: string;
+  /** null = root layer. */
+  parent_id: string | null;
+  name: string;
+  /** Default sensitivity applied to uploads that omit one. */
+  default_sensitivity: DlpSensitivity;
+  created_by_user_id?: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface ListPage<T> {
@@ -340,6 +434,31 @@ export interface Attachment {
 
 export interface SessionFile extends Attachment {
   // Alias for clarity in UI contexts
+}
+
+// ─── Artifacts (产物) ─────────────────────────────────────────────────────────
+//
+// Cross-session listing of the calling user's session-generated artifacts
+// (canvas documents + run output files). Union view assembled by the BFF; the
+// frontend dispatches preview/delete per `kind`. Fields are optional where the
+// underlying source may not carry them (files have filename/mime/size, canvases
+// carry canvas_kind/current_version).
+
+export type ArtifactKind = 'canvas' | 'file';
+
+export interface Artifact {
+  id: string;
+  kind: ArtifactKind;
+  title: string;
+  filename?: string;
+  mime?: string;
+  size_bytes?: number;
+  session_id: string;
+  run_id?: string | null;
+  canvas_kind?: string;
+  current_version?: number;
+  created_at: string;
+  updated_at?: string;
 }
 
 // ─── Admin ───────────────────────────────────────────────────────────────────

@@ -1020,7 +1020,12 @@ export function useChat() {
   // The `res.body.getReader()` SSE loop that was previously here is GONE — the
   // persistent stream effect handles all events.
   const sendMessage = useCallback(
-    async (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => {
+    async (
+      text: string,
+      attachmentIds?: string[],
+      attachmentsMeta?: MessageAttachment[],
+      workspaceFileIds?: string[],
+    ) => {
       if (!activeSessionId || isStreaming) return;
       const sessionId = activeSessionId;
 
@@ -1063,6 +1068,11 @@ export function useChat() {
             ...(model ? { model } : {}),
             ...(effortSel ? { reasoning_effort: effortSel } : {}),
             execution_mode: executionMode,
+            // Workspace files referenced via "@" in the composer. Only sent when
+            // non-empty; the backend contract field is `workspace_file_ids`.
+            ...(workspaceFileIds && workspaceFileIds.length > 0
+              ? { workspace_file_ids: workspaceFileIds }
+              : {}),
           }),
           credentials: 'include',
           signal: abortRef.current.signal,
@@ -1177,7 +1187,7 @@ export function useChat() {
   }, [activeSessionId, pendingRewind]);
 
   return {
-    sendMessage: sendMessage as (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => Promise<void>,
+    sendMessage: sendMessage as (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[], workspaceFileIds?: string[]) => Promise<void>,
     cancel,
     isStreaming,
     messages: activeSessionId ? messages[activeSessionId] || [] : [],

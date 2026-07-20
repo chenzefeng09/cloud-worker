@@ -275,8 +275,10 @@ class Settings(BaseSettings):
     # audit + LLM gateway hooks so every tool call and model call is captured.
     # The enterprise default is fail-closed: no direct provider keys in the
     # sandbox, and every model call must route through foundation llm-gateway.
+    # ``knowledge_tool`` is fail-open: it self-gates on KNOWLEDGE_INGEST_URL
+    # being set, so deployments without ki simply don't register the tool.
     runtime_extensions: str = (
-        "mcp_tenant_injector,skills_loader,web_fetch,"
+        "mcp_tenant_injector,skills_loader,web_fetch,knowledge_tool,"
         "event_audit_sink,llm_gateway_enforcer"
     )
 
@@ -301,6 +303,17 @@ class Settings(BaseSettings):
     # The enforcer is enabled by default.  A missing tenant virtual key is a
     # spawn-time error; direct-connect is reserved for explicit local dev only.
     llm_gateway_url: str = "http://llm-gateway:8011/api/llm-gateway/v1"
+
+    # Knowledge-ingest (KB v1) - base URL *with* API version prefix.
+    # Forwarded into the sandbox as KNOWLEDGE_INGEST_URL so the in-sandbox
+    # ``knowledge_tool`` extension can GET {base}/search?scope=knowledge on
+    # behalf of the agent.  In foundation egress mode this is the direct ki
+    # URL (ki is on the foundation net); in broker mode ``egress_policy``
+    # rewrites it to the tool-broker ``/knowledge/v1`` façade.  ki needs no
+    # bearer/vkey - only X-Tenant-Id / X-User-Id / X-User-Clearance, which the
+    # worker derives from FOUNDATION_* env vars (and the broker re-injects
+    # from the signed lease in broker mode).
+    knowledge_ingest_url: str = "http://knowledge-ingest:8012/api/knowledge/v1"
 
     otel_enabled: bool = True
     otel_exporter_endpoint: str = "http://localhost:4317"

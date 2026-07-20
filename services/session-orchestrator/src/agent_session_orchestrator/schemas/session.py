@@ -19,6 +19,7 @@ class SessionStatus(str, Enum):
 class SessionCreate(BaseModel):
     title: str | None = Field(None, max_length=200)
     agent_config: dict[str, Any] | None = None
+    workspace_id: str | None = None
 
 
 class SessionUpdate(BaseModel):
@@ -33,6 +34,7 @@ class SessionOut(BaseModel):
     title: str | None = None
     status: SessionStatus
     current_run_id: str | None = None
+    workspace_id: str | None = None
     # Wire name stays ``metadata`` for backwards compatibility with the
     # OpenAPI contract; the underlying ORM attribute is ``agent_metadata``
     # because ``metadata`` is reserved by SQLAlchemy's DeclarativeBase.

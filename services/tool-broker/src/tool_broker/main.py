@@ -190,6 +190,14 @@ _UPSTREAM_ALLOWLISTS: dict[str, _UpstreamAllowlist] = {
     "dlp.scan": _UpstreamAllowlist(
         exact=frozenset({"core/scan"}),
     ),
+    # knowledge-ingest: the in-sandbox knowledge_tool GETs a single
+    # ``/search`` endpoint (knowledge_tool/tool.py; ki contract:
+    # GET {ki_base}/search?q=&k=&scope=knowledge).  The worker never calls
+    # /documents or any other ki path from the sandbox, so the tightest
+    # correct rule is the single exact path ``search``.
+    "knowledge.search": _UpstreamAllowlist(
+        exact=frozenset({"search"}),
+    ),
 }
 
 
@@ -313,6 +321,16 @@ def _forward_headers(
         headers["X-Tenant-Id"] = str(lease_payload.get("tenant_id") or "")
         if lease_payload.get("user_id"):
             headers["X-User-Id"] = str(lease_payload["user_id"])
+        # X-User-Clearance: knowledge-ingest enforces the document-visibility
+        # gate on this header, so it MUST come from the trusted, signed lease
+        # (the scheduler threads the run's effective clearance into it) - never
+        # from the sandbox-supplied request header, which a compromised sandbox
+        # could inflate to read higher-sensitivity documents.  Only re-inject
+        # when the lease actually carries it (older leases / non-ki runs have
+        # none); upstreams that don't consume the header simply ignore it.
+        clearance = lease_payload.get("clearance")
+        if clearance:
+            headers["X-User-Clearance"] = str(clearance)
     if inject_service_scope:
         headers["X-Service-Scopes"] = inject_service_scope
     return headers
@@ -950,6 +968,24 @@ async def proxy_dlp(path: str, request: Request) -> Response:
         # X-Tenant-Id header (re-injected from the validated lease by
         # _forward_headers) and does NOT consume X-Service-Scopes, so the
         # broker injects nothing for this route.
+        upstream_service_scope=None,
+    )
+
+
+@router.api_route("/knowledge/v1/{path:path}", methods=["GET", "POST", "HEAD"])
+async def proxy_knowledge_ingest(path: str, request: Request) -> Response:
+    settings: Settings = request.app.state.settings
+    return await _proxy(
+        request,
+        upstream_base_url=settings.knowledge_ingest_url,
+        path=path,
+        required_scope="knowledge.search",
+        # knowledge-ingest needs no bearer/vkey and no X-Service-Scopes: it
+        # authorises retrieval purely on X-Tenant-Id / X-User-Id /
+        # X-User-Clearance, all three re-injected from the validated lease by
+        # _forward_headers (X-User-Clearance from the signed ``clearance``
+        # field, so a sandbox cannot inflate it).  The allowlist pins the
+        # upstream path to the single ``search`` endpoint.
         upstream_service_scope=None,
     )
 

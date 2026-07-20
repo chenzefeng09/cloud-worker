@@ -102,6 +102,9 @@ data:
   SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL: {{ .Values.global.foundation.dlpUrl | quote }}
   SESSION_ORCHESTRATOR_SKILL_STORE_URL: {{ printf "http://ap-skill-store:%d/api/skills/v1" (int .Values.skillStore.port) | quote }}
   SESSION_ORCHESTRATOR_SKILL_STORE_SERVICE_SCOPES: {{ .Values.sessionOrchestrator.config.skillStoreServiceScopes | quote }}
+  SESSION_ORCHESTRATOR_MCP_REGISTRY_URL: {{ printf "http://ap-mcp-registry:%d/api/mcp/v1" (int .Values.mcpRegistry.port) | quote }}
+  SESSION_ORCHESTRATOR_MCP_REGISTRY_SERVICE_SCOPES: {{ .Values.sessionOrchestrator.config.mcpRegistryServiceScopes | quote }}
+  SESSION_ORCHESTRATOR_INLINE_MCP_TIMEOUT: {{ .Values.sessionOrchestrator.config.inlineMcpTimeout | quote }}
 
   # DB pool sizes (per-service env picked up by each service's own config.py)
   SESSION_ORCHESTRATOR_DB_POOL_SIZE:     {{ .Values.sessionOrchestrator.config.dbPoolSize | quote }}

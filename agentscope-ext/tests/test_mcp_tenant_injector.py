@@ -347,6 +347,92 @@ def test_http_server_uses_url_field(fresh):
     injector.set_client(None)
 
 
+def test_broker_mode_rewrites_http_server_to_tenant_passthrough(fresh):
+    """Broker-only sandboxes must never connect to the raw MCP endpoint."""
+    hooks_mod, ext = fresh
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": "mcp_ABC123",
+                        "name": "echo",
+                        "transport": "http",
+                        "endpoint": "http://echo-mcp:9000/mcp",
+                    },
+                ]
+            },
+        )
+
+    from agentscope_ext.mcp_tenant_injector import injector
+
+    injector.set_client(httpx.Client(transport=httpx.MockTransport(_handler)))
+    ext.install()
+    env = _env()
+    env.update(
+        {
+            "SANDBOX_EGRESS_MODE": "broker",
+            "TOOL_BROKER_URL": "http://tool-broker:8024/api/tool-broker/v1/",
+            "FOUNDATION_TENANT_ID": "tnt-abc",
+        }
+    )
+    toolkit = hooks_mod.build_toolkit({}, "tnt-abc", env)
+
+    assert len(toolkit.basic_mcps) == 1
+    config = toolkit.basic_mcps[0].mcp_config
+    assert config.url == (
+        "http://tool-broker:8024/api/tool-broker/v1/"
+        "mcp-tenant/v1/mcp_ABC123"
+    )
+    assert config.headers == {
+        "Authorization": "Bearer tok-xyz",
+        "X-Tenant-Id": "tnt-abc",
+        "X-Tool-Broker-Lease": "v1.payload.signature",
+    }
+
+    injector.set_client(None)
+
+
+def test_broker_mode_drops_http_server_without_routing_context(fresh, caplog):
+    hooks_mod, ext = fresh
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "id": "mcp_ABC123",
+                        "name": "echo",
+                        "transport": "http",
+                        "endpoint": "http://echo-mcp:9000/mcp",
+                    },
+                ]
+            },
+        )
+
+    from agentscope_ext.mcp_tenant_injector import injector
+
+    injector.set_client(httpx.Client(transport=httpx.MockTransport(_handler)))
+    ext.install()
+    env = _env()
+    env.update(
+        {
+            "SANDBOX_EGRESS_MODE": "broker",
+            "FOUNDATION_TENANT_ID": "tnt-abc",
+        }
+    )
+    with caplog.at_level("WARNING"):
+        toolkit = hooks_mod.build_toolkit({}, "tnt-abc", env)
+
+    assert toolkit.basic_mcps == []
+    assert any("missing server id / tool-broker url" in r.message for r in caplog.records)
+
+    injector.set_client(None)
+
+
 def test_stdio_server_missing_command_skipped(fresh, caplog):
     """A stdio server with no 'command' field is skipped with a warning."""
     hooks_mod, ext = fresh

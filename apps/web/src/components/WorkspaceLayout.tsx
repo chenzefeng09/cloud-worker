@@ -13,6 +13,7 @@ import { FilesPage } from '../pages/FilesPage';
 import { LibraryPage } from '../pages/LibraryPage';
 import { SchedulesPage } from '../pages/SchedulesPage';
 import { WorkspacePage } from '../pages/WorkspacePage';
+import { ArtifactsPage } from '../pages/ArtifactsPage';
 import { ProfilePage } from '../pages/ProfilePage';
 import { AdminLayout, canAccessAdmin } from '../admin/AdminLayout';
 
@@ -69,6 +70,7 @@ export function WorkspaceLayout() {
                     <Route path="/files" element={<FilesPage />} />
                     <Route path="/library" element={<LibraryPage />} />
                     <Route path="/workspace" element={<WorkspacePage />} />
+                    <Route path="/artifacts" element={<ArtifactsPage />} />
                     <Route path="/profile" element={<ProfilePage />} />
                     <Route path="*" element={<Navigate to="/home" replace />} />
                   </Routes>

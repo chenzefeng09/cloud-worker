@@ -123,6 +123,40 @@ class CanvasService:
         result = await self._db.execute(stmt)
         return list(result.scalars().all())
 
+    async def list_canvases_for_user(self, user_id: str) -> list[CanvasDocument]:
+        """Return every live canvas owned by ``user_id`` in this tenant.
+
+        Cross-session listing for the Artifacts panel (design §artifacts): no
+        session ownership to validate, just a tenant + owner + not-soft-deleted
+        predicate.  Tenant RLS already scopes to ``tenant_id``; the ``user_id``
+        predicate is a strictly tighter filter on top (never crosses tenants).
+        Ordered newest-first so the UI shows recent artifacts first.
+        """
+        stmt = (
+            select(CanvasDocument)
+            .where(
+                CanvasDocument.tenant_id == self._tenant_id,
+                CanvasDocument.user_id == user_id,
+                CanvasDocument.deleted_at.is_(None),
+            )
+            .order_by(CanvasDocument.created_at.desc())
+        )
+        result = await self._db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def soft_delete(self, canvas_id: str) -> CanvasDocument:
+        """Soft-delete a canvas (set ``deleted_at``); leaves versions in place.
+
+        Used by the Artifacts panel's per-canvas delete.  Versions and
+        suggestions are pruned on physical purge (retention sweep), not here —
+        the soft-delete only flips the parent's ``deleted_at`` so subsequent
+        reads (list / get / materialize) skip it.
+        """
+        canvas = await self._get_canvas(canvas_id)
+        canvas.deleted_at = _now()
+        await self._db.flush()
+        return canvas
+
     async def list_canvases_for_run(self, run_id: str) -> list[CanvasDocument]:
         """Return live canvases materialized from ``run_id`` in creation order."""
         stmt = (
