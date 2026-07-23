@@ -45,6 +45,17 @@ def _create_app(client: TestClient, headers: dict) -> dict:
     return resp.json()
 
 
+def _create_named_app(
+    client: TestClient, headers: dict, name: str, tags: list[str] | None = None,
+) -> dict:
+    body: dict = {"name": name, "version": _version_body()}
+    if tags is not None:
+        body["tags"] = tags
+    resp = client.post(f"{PREFIX}/apps", json=body, headers=headers)
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
 def test_healthz(app_client: TestClient) -> None:
     resp = app_client.get(f"{PREFIX}/healthz")
     assert resp.status_code == 200
@@ -62,6 +73,34 @@ def test_create_app_with_initial_draft(app_client: TestClient, tenant_headers: d
     assert ver["version"] == "1"
     assert ver["id"].startswith("appv_")
     assert ver["tenant_id"]
+
+
+def test_create_app_accepts_empty_prompts(app_client: TestClient, tenant_headers: dict) -> None:
+    """The "new App" modal creates an initial draft with both prompts empty.
+
+    ``system_prompt`` stays optional forever (a published App may rely on the
+    worker's default persona); ``user_prompt_template`` is only enforced by the
+    editor before publish, so the storage layer must accept "" as well.
+    """
+    body = {
+        "name": "Empty Prompts",
+        "version": {**_version_body(), "system_prompt": "", "user_prompt_template": ""},
+    }
+    r = app_client.post(f"{PREFIX}/apps", json=body, headers=tenant_headers)
+    assert r.status_code == 201, r.text
+    ver = r.json()["versions"][0]
+    assert ver["system_prompt"] == ""
+    assert ver["user_prompt_template"] == ""
+
+    # …and the same holds when editing the draft in place.
+    app_id, vid = r.json()["id"], ver["id"]
+    r2 = app_client.put(
+        f"{PREFIX}/apps/{app_id}/versions/{vid}",
+        json={**_version_body(), "system_prompt": "", "user_prompt_template": "Do it."},
+        headers=tenant_headers,
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["system_prompt"] == ""
 
 
 def test_versions_are_auto_incremented(app_client: TestClient, tenant_headers: dict) -> None:
@@ -333,3 +372,158 @@ def test_internal_resolve_no_published_version(app_client: TestClient, tenant_he
     )
     assert r.status_code == 404
     assert r.json()["code"] == "APP.NO_PUBLISHED_VERSION"
+
+
+# ---------------------------------------------------------------------------
+# tags
+# ---------------------------------------------------------------------------
+def test_create_app_with_tags(app_client: TestClient, tenant_headers: dict) -> None:
+    app = _create_named_app(
+        app_client, tenant_headers, "Tagged App", tags=["legal", "contract"]
+    )
+    assert app["tags"] == ["legal", "contract"]
+
+
+def test_create_app_defaults_to_empty_tags(
+    app_client: TestClient, tenant_headers: dict,
+) -> None:
+    app = _create_named_app(app_client, tenant_headers, "Untagged App")
+    assert app["tags"] == []
+
+
+def test_create_app_tags_dedup_and_strip(
+    app_client: TestClient, tenant_headers: dict,
+) -> None:
+    app = _create_named_app(
+        app_client, tenant_headers, "Dedup App",
+        tags=["  legal  ", "legal", "contract"],
+    )
+    # Duplicates removed (case-sensitive), surrounding whitespace stripped.
+    assert app["tags"] == ["legal", "contract"]
+
+
+def test_update_app_tags(app_client: TestClient, tenant_headers: dict) -> None:
+    app = _create_named_app(app_client, tenant_headers, "Update Tags", tags=["a"])
+    resp = app_client.put(
+        f"{PREFIX}/apps/{app['id']}",
+        json={"tags": ["a", "b"]},
+        headers=tenant_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["tags"] == ["a", "b"]
+
+
+def test_update_app_tags_clear_with_empty_list(
+    app_client: TestClient, tenant_headers: dict,
+) -> None:
+    app = _create_named_app(app_client, tenant_headers, "Clear Tags", tags=["a"])
+    resp = app_client.put(
+        f"{PREFIX}/apps/{app['id']}",
+        json={"tags": []},
+        headers=tenant_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["tags"] == []
+
+
+def test_update_app_omitting_tags_leaves_unchanged(
+    app_client: TestClient, tenant_headers: dict,
+) -> None:
+    app = _create_named_app(app_client, tenant_headers, "Keep Tags", tags=["a", "b"])
+    # PATCH-style update touching only name; tags must be preserved.
+    resp = app_client.put(
+        f"{PREFIX}/apps/{app['id']}",
+        json={"name": "Keep Tags Renamed"},
+        headers=tenant_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["name"] == "Keep Tags Renamed"
+    assert body["tags"] == ["a", "b"]
+
+
+def test_list_apps_filter_by_single_tag(
+    app_client: TestClient, tenant_headers: dict,
+) -> None:
+    a = _create_named_app(app_client, tenant_headers, "App A", tags=["foo", "bar"])
+    _create_named_app(app_client, tenant_headers, "App B", tags=["baz"])
+    _create_named_app(app_client, tenant_headers, "App C")  # no tags
+
+    resp = app_client.get(
+        f"{PREFIX}/apps?scope=mine&tag=foo", headers=tenant_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    ids = [item["id"] for item in resp.json()["items"]]
+    assert ids == [a["id"]]
+
+
+def test_list_apps_filter_by_multiple_tags_or(
+    app_client: TestClient, tenant_headers: dict,
+) -> None:
+    a = _create_named_app(app_client, tenant_headers, "App A", tags=["foo"])
+    b = _create_named_app(app_client, tenant_headers, "App B", tags=["bar", "baz"])
+    _create_named_app(app_client, tenant_headers, "App C")  # no tags
+
+    # ?tag=foo&tag=baz -> OR: App A (foo) and App B (baz), ordered by name asc.
+    resp = app_client.get(
+        f"{PREFIX}/apps?scope=mine&tag=foo&tag=baz", headers=tenant_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    ids = [item["id"] for item in resp.json()["items"]]
+    assert ids == [a["id"], b["id"]]
+
+
+def test_list_apps_tag_filter_no_match(
+    app_client: TestClient, tenant_headers: dict,
+) -> None:
+    _create_named_app(app_client, tenant_headers, "App A", tags=["foo"])
+    resp = app_client.get(
+        f"{PREFIX}/apps?scope=mine&tag=missing", headers=tenant_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["items"] == []
+
+
+def test_list_apps_no_tag_filter_returns_all(
+    app_client: TestClient, tenant_headers: dict,
+) -> None:
+    _create_named_app(app_client, tenant_headers, "App A", tags=["foo"])
+    _create_named_app(app_client, tenant_headers, "App B")
+    resp = app_client.get(f"{PREFIX}/apps?scope=mine", headers=tenant_headers)
+    assert resp.status_code == 200, resp.text
+    assert len(resp.json()["items"]) == 2
+
+
+def test_create_app_empty_tag_rejected(app_client: TestClient, tenant_headers: dict) -> None:
+    r = _create_named_app_raw(
+        app_client, tenant_headers, "Bad Empty", tags=["ok", "   "],
+    )
+    assert r.status_code == 422
+
+
+def test_create_app_tag_too_long_rejected(
+    app_client: TestClient, tenant_headers: dict,
+) -> None:
+    r = _create_named_app_raw(
+        app_client, tenant_headers, "Bad Long", tags=["x" * 33],
+    )
+    assert r.status_code == 422
+
+
+def test_create_app_too_many_tags_rejected(
+    app_client: TestClient, tenant_headers: dict,
+) -> None:
+    # 21 distinct tags exceeds the max of 20.
+    r = _create_named_app_raw(
+        app_client, tenant_headers, "Bad Many",
+        tags=[f"t{i}" for i in range(21)],
+    )
+    assert r.status_code == 422
+
+
+def _create_named_app_raw(
+    client: TestClient, headers: dict, name: str, tags: list[str],
+):
+    """Like _create_named_app but returns the raw response (for 422 assertions)."""
+    body = {"name": name, "version": _version_body(), "tags": tags}
+    return client.post(f"{PREFIX}/apps", json=body, headers=headers)

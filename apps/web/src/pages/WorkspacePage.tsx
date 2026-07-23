@@ -3,10 +3,10 @@ import { PageHead } from '../components/shell/PageHead';
 import { Chip } from '../components/shell/Chip';
 import { Dropdown } from '../components/shell/Dropdown';
 import { Dialog } from '../admin/components/Dialog';
+import { useConfirm, useToast } from '../admin/components/dialogs';
 import { FilePreviewPanel } from '../components/FilePreviewPanel';
 import type { FileContentSource } from '../components/filePreview';
 import { useWorkspace } from '../lib/workspaceContext';
-import { useInstalledSkills } from '../hooks/useInstalledSkills';
 import { api, ApiError } from '../api/client';
 import { toWorkspaceView } from '../lib/workspaceData';
 import { formatRelativeTimeZh } from '../lib/format';
@@ -152,7 +152,7 @@ function saveEmptyFolders(wsId: string, folders: string[]): void {
 }
 
 /** Which editor dialog (if any) is currently open from the 设置 menu. */
-type DialogKind = 'detail' | 'instructions' | 'skills' | 'delete' | null;
+type DialogKind = 'detail' | 'instructions' | 'delete' | null;
 
 export function WorkspacePage() {
   const {
@@ -167,7 +167,8 @@ export function WorkspacePage() {
     uploadFile,
     deleteFile,
   } = useWorkspace();
-  const installedSkills = useInstalledSkills();
+  const confirm = useConfirm();
+  const toast = useToast();
 
   // ── New-workspace dialog ────────────────────────────────────────────────
   const [showCreate, setShowCreate] = useState(false);
@@ -182,6 +183,10 @@ export function WorkspacePage() {
   const [menuOpen, setMenuOpen] = useState(false);
   const [dialog, setDialog] = useState<DialogKind>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  // ── Workspace switcher dropdown (replaces the old left list column) ──────
+  const [wsMenuOpen, setWsMenuOpen] = useState(false);
+  const wsMenuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!menuOpen) return;
@@ -198,6 +203,22 @@ export function WorkspacePage() {
       document.removeEventListener('keydown', onKey);
     };
   }, [menuOpen]);
+
+  useEffect(() => {
+    if (!wsMenuOpen) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (wsMenuRef.current && !wsMenuRef.current.contains(e.target as Node)) setWsMenuOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setWsMenuOpen(false);
+    };
+    document.addEventListener('mousedown', onDocClick);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDocClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [wsMenuOpen]);
 
   const openDialog = (kind: Exclude<DialogKind, null>) => {
     setMenuOpen(false);
@@ -417,7 +438,13 @@ export function WorkspacePage() {
   };
 
   const handleDelete = async (file: WorkspaceFile) => {
-    if (!window.confirm(`确定删除「${file.filename}」？此操作不可撤销。`)) return;
+    const ok = await confirm({
+      title: '删除文件',
+      message: `确定删除「${file.filename}」？此操作不可撤销。`,
+      tone: 'danger',
+      confirmText: '删除',
+    });
+    if (!ok) return;
     setFileError(null);
     if (previewFile?.id === file.id) setPreviewFile(null);
     try {
@@ -556,85 +583,14 @@ export function WorkspacePage() {
         style={{
           gridTemplateColumns:
             previewFile && activeWorkspace
-              ? `260px 1fr 6px ${previewWidth}px`
-              : '260px 1fr',
+              ? `1fr 6px ${previewWidth}px`
+              : '1fr',
           // Explicit row size so the preview panel's `h-full` resolves to the
           // full grid height (a stretched `auto` row isn't definite enough for
           // percentage heights, so the panel would otherwise collapse to content).
           gridTemplateRows: 'minmax(0, 1fr)',
         }}
       >
-        {/* ── LEFT: workspace list ─────────────────────────────────────── */}
-        <aside className="border-r border-line flex flex-col bg-paper overflow-hidden">
-          <div className="px-3.5 py-3 border-b border-line-2 flex items-center justify-between">
-            <div className="cw-label">工作区</div>
-            {loading && (
-              <span className="font-mono text-[10px] text-dim animate-pulse">加载中…</span>
-            )}
-          </div>
-
-          <div className="flex-1 overflow-auto cw-scroll px-2.5 py-2 flex flex-col gap-1">
-            {workspaces.map((w) => {
-              const view = toWorkspaceView(w);
-              const active = w.id === activeWorkspace?.id;
-              return (
-                <button
-                  key={w.id}
-                  type="button"
-                  onClick={() => setActiveWorkspaceId(w.id)}
-                  className="relative w-full flex items-center gap-2.5 px-2 py-[7px] rounded-[var(--r-sm)] cursor-pointer transition-colors text-left"
-                  style={{
-                    border: `1px solid ${active ? view.accent + '55' : 'transparent'}`,
-                    background: active ? view.accent + '12' : 'transparent',
-                  }}
-                >
-                  {active && (
-                    <span
-                      className="absolute left-[-1px] top-[6px] bottom-[6px] w-[2px] rounded-[1px]"
-                      style={{ background: view.accent }}
-                    />
-                  )}
-                  <span
-                    className="inline-flex w-[24px] h-[24px] items-center justify-center rounded-sm font-mono text-[12px] shrink-0 border"
-                    style={{
-                      background: view.accent + '14',
-                      borderColor: view.accent + '55',
-                      color: view.accent,
-                    }}
-                  >
-                    {view.glyph}
-                  </span>
-                  <div className="flex-1 min-w-0">
-                    <div
-                      className="text-[13px] tracking-[-0.01em] truncate flex items-center gap-1.5"
-                      style={{ fontWeight: active ? 600 : 500 }}
-                    >
-                      <span className="truncate">{w.name}</span>
-                      {w.is_default && (
-                        <span className="font-mono text-[9px] text-dim shrink-0">默认</span>
-                      )}
-                      <LevelBadge level={w.sensitivity_level} small />
-                    </div>
-                    <div className="font-mono text-[10px] text-dim truncate">
-                      {w.file_count} 个文件
-                    </div>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="px-2.5 py-2.5 border-t border-line-2">
-            <button
-              type="button"
-              onClick={() => setShowCreate(true)}
-              className="w-full flex items-center justify-center gap-2 px-2 py-2 rounded-[var(--r-sm)] border border-dashed border-line text-ink-2 hover:border-ink-2 hover:text-ink hover:bg-paper-2 transition-colors cursor-pointer text-[13px]"
-            >
-              <span className="font-mono">+</span> 新建工作区
-            </button>
-          </div>
-        </aside>
-
         {/* ── CENTER: header + base files ─────────────────────────────── */}
         <section className="flex flex-col min-w-0 overflow-hidden">
           {/* Workspace header bar with 设置 dropdown */}
@@ -657,8 +613,100 @@ export function WorkspacePage() {
             )}
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
-                <div className="font-display text-[18px] font-normal tracking-[-0.02em] truncate">
-                  {activeWorkspace?.name ?? '工作区'}
+                <div ref={wsMenuRef} className="relative min-w-0">
+                  <button
+                    type="button"
+                    onClick={() => setWsMenuOpen((o) => !o)}
+                    aria-haspopup="menu"
+                    aria-expanded={wsMenuOpen}
+                    title="切换工作区"
+                    className="group inline-flex items-center gap-1.5 min-w-0 max-w-full -mx-1 px-1 py-0.5 rounded-sm hover:bg-paper-2 transition-colors cursor-pointer"
+                  >
+                    <span className="font-display text-[18px] font-normal tracking-[-0.02em] truncate">
+                      {activeWorkspace?.name ?? '工作区'}
+                    </span>
+                    <span
+                      aria-hidden
+                      className="font-mono text-[10px] text-dim shrink-0 group-hover:text-ink-2"
+                    >
+                      ▾
+                    </span>
+                  </button>
+
+                  {wsMenuOpen && (
+                    <div
+                      role="menu"
+                      className="absolute top-full left-0 mt-1 z-40 bg-surface border border-line rounded-md shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-1 w-[280px] max-h-[60vh] overflow-auto cw-scroll"
+                    >
+                      {workspaces.map((w) => {
+                        const view = toWorkspaceView(w);
+                        const active = w.id === activeWorkspace?.id;
+                        return (
+                          <button
+                            key={w.id}
+                            type="button"
+                            role="menuitemradio"
+                            aria-checked={active}
+                            onClick={() => {
+                              setActiveWorkspaceId(w.id);
+                              setWsMenuOpen(false);
+                            }}
+                            className={`w-full flex items-center gap-2.5 px-2 py-1.5 rounded-md text-left transition-colors ${
+                              active ? 'bg-paper-2' : 'hover:bg-paper-2'
+                            }`}
+                          >
+                            <span
+                              className="inline-flex w-[22px] h-[22px] items-center justify-center rounded-sm font-mono text-[11px] shrink-0 border"
+                              style={{
+                                background: view.accent + '14',
+                                borderColor: view.accent + '55',
+                                color: view.accent,
+                              }}
+                            >
+                              {view.glyph}
+                            </span>
+                            <div className="flex-1 min-w-0">
+                              <div
+                                className="text-[12.5px] tracking-[-0.01em] truncate flex items-center gap-1.5"
+                                style={{ fontWeight: active ? 600 : 500 }}
+                              >
+                                <span className="truncate">{w.name}</span>
+                                {w.is_default && (
+                                  <span className="font-mono text-[9px] text-dim shrink-0">
+                                    默认
+                                  </span>
+                                )}
+                                <LevelBadge level={w.sensitivity_level} small />
+                              </div>
+                              <div className="font-mono text-[10px] text-dim truncate">
+                                {w.file_count} 个文件
+                              </div>
+                            </div>
+                            {active && (
+                              <span
+                                aria-hidden
+                                className="font-mono text-[10px] text-accent shrink-0"
+                              >
+                                ✓
+                              </span>
+                            )}
+                          </button>
+                        );
+                      })}
+                      <div className="my-1 border-t border-line-2" />
+                      <button
+                        type="button"
+                        role="menuitem"
+                        onClick={() => {
+                          setWsMenuOpen(false);
+                          setShowCreate(true);
+                        }}
+                        className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left text-[12.5px] text-ink-2 hover:bg-paper-2 hover:text-ink transition-colors"
+                      >
+                        <span className="font-mono">+</span> 新建工作区
+                      </button>
+                    </div>
+                  )}
                 </div>
                 {activeWorkspace?.is_default && (
                   <span className="font-mono text-[9.5px] tracking-[0.06em] px-1.5 py-0.5 rounded border border-line-2 text-dim shrink-0">
@@ -666,6 +714,11 @@ export function WorkspacePage() {
                   </span>
                 )}
                 <LevelBadge level={activeWorkspace?.sensitivity_level} />
+                {loading && (
+                  <span className="font-mono text-[10px] text-dim animate-pulse shrink-0">
+                    加载中…
+                  </span>
+                )}
               </div>
               <div className="font-mono text-[11px] text-dim">
                 共 {activeWorkspace?.file_count ?? 0} 个基础文件
@@ -706,14 +759,6 @@ export function WorkspacePage() {
                     className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left text-[12.5px] text-ink-2 hover:bg-paper-2 hover:text-ink transition-colors"
                   >
                     工作区指令
-                  </button>
-                  <button
-                    type="button"
-                    role="menuitem"
-                    onClick={() => openDialog('skills')}
-                    className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left text-[12.5px] text-ink-2 hover:bg-paper-2 hover:text-ink transition-colors"
-                  >
-                    技能
                   </button>
                   <div className="my-1 border-t border-line-2" />
                   <button
@@ -930,7 +975,10 @@ export function WorkspacePage() {
             accent={toWorkspaceView(activeWorkspace).accent}
             glyph={toWorkspaceView(activeWorkspace).glyph}
             sensitivityLevel={activeWorkspace.sensitivity_level}
-            onSave={(body) => updateWorkspace(activeWorkspace.id, body)}
+            onSave={async (body) => {
+              await updateWorkspace(activeWorkspace.id, body);
+              setDialog(null);
+            }}
           />
         </Dialog>
       )}
@@ -940,19 +988,10 @@ export function WorkspacePage() {
           <InstructionsCard
             key={activeWorkspace.id}
             initial={activeWorkspace.instructions ?? ''}
-            onSave={(instructions) => updateWorkspace(activeWorkspace.id, { instructions })}
-          />
-        </Dialog>
-      )}
-
-      {dialog === 'skills' && activeWorkspace && (
-        <Dialog title="技能" onClose={() => setDialog(null)} className="w-full max-w-[520px]">
-          <SkillsCard
-            key={activeWorkspace.id}
-            selected={activeWorkspace.skills}
-            // 后端按技能名解析（inline resolve / sandbox skills 通道），存 name 而非 id
-            available={installedSkills.map((s) => ({ id: s.name, name: s.name }))}
-            onSave={(skills) => updateWorkspace(activeWorkspace.id, { skills })}
+            onSave={async (instructions) => {
+              await updateWorkspace(activeWorkspace.id, { instructions });
+              setDialog(null);
+            }}
           />
         </Dialog>
       )}
@@ -967,7 +1006,7 @@ export function WorkspacePage() {
               await deleteWorkspace(activeWorkspace.id);
               return true;
             } catch (err) {
-              window.alert(
+              toast.error(
                 err instanceof ApiError ? err.message : '删除工作区失败，请稍后重试。',
               );
               return false;
@@ -1064,87 +1103,6 @@ function InstructionsCard({
         </button>
         {saved && <span className="font-mono text-[11px] text-dim">已保存 ✓</span>}
       </div>
-    </div>
-  );
-}
-
-// ─── 技能 selector (dialog body) ───────────────────────────────────────────
-function SkillsCard({
-  selected,
-  available,
-  onSave,
-}: {
-  selected: string[];
-  available: { id: string; name: string }[];
-  onSave: (skills: string[]) => Promise<unknown>;
-}) {
-  const [sel, setSel] = useState<string[]>(selected);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-
-  const dirty = useMemo(() => {
-    if (sel.length !== selected.length) return true;
-    const a = new Set(sel);
-    return selected.some((s) => !a.has(s));
-  }, [sel, selected]);
-
-  const toggle = (id: string) =>
-    setSel((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
-
-  const save = async () => {
-    setSaving(true);
-    setSaved(false);
-    try {
-      await onSave(sel);
-      setSaved(true);
-      setTimeout(() => setSaved(false), 1800);
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div className="flex flex-col gap-3">
-      <Chip dashed>此工作区任务默认启用</Chip>
-      {available.length === 0 ? (
-        <div className="font-mono italic text-dim text-[12px]">
-          暂无已安装技能 - 前往资源库安装后可在此选择。
-        </div>
-      ) : (
-        <>
-          <div className="flex flex-wrap gap-1.5">
-            {available.map((s) => {
-              const on = sel.includes(s.id);
-              return (
-                <button
-                  key={s.id}
-                  type="button"
-                  onClick={() => toggle(s.id)}
-                  className={`px-2.5 py-1 rounded-full text-[12px] border transition-colors ${
-                    on
-                      ? 'border-accent-line bg-accent-soft text-accent'
-                      : 'border-line text-ink-2 hover:border-ink-2 hover:text-ink'
-                  }`}
-                >
-                  {on && <span className="mr-1">✓</span>}
-                  {s.name}
-                </button>
-              );
-            })}
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={save}
-              disabled={saving || !dirty}
-              className="cw-btn cw-btn-primary cw-btn-sm disabled:opacity-50"
-            >
-              {saving ? '保存中…' : '保存技能'}
-            </button>
-            {saved && <span className="font-mono text-[11px] text-dim">已保存 ✓</span>}
-          </div>
-        </>
-      )}
     </div>
   );
 }

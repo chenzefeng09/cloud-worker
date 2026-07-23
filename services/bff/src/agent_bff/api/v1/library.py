@@ -75,12 +75,63 @@ def _raise_for_upstream(resp: httpx.Response) -> None:
 # MCP servers
 # --------------------------------------------------------------------------- #
 
+def _scrub_mcp_server_secrets(server: dict) -> dict:
+    """Strip connection credentials from an MCP server record for the
+    normal-user library surface.
+
+    The library list/create responses are served to any authenticated tenant
+    user (``require_auth``), so they must not carry the secret material that
+    mcp-registry stores for connecting to the upstream MCP server:
+
+      * ``auth`` is reduced to ``{"type": ...}`` - the scheme
+        (none/bearer/api_key/oauth) is useful metadata, but the credentials
+        are dropped: ``token`` / ``api_key`` / ``header_name`` for the
+        bearer/api_key schemes, and ``client_id`` / ``client_secret`` /
+        ``token_url`` / ``scopes`` for the oauth scheme.
+      * ``headers`` is removed entirely - HTTP headers routinely carry
+        ``Authorization`` / ``X-API-Key`` / cookies, and distinguishing secret
+        from non-secret entries at the BFF edge is unreliable, so the whole
+        map is withheld from the library surface.
+
+    Everything else (name/transport/endpoint/command/env/enabled/
+    timeout_seconds/tool_filter/args/timestamps) is passed through unchanged -
+    these are the metadata a tenant user needs to browse and select servers.
+    The admin console (admin_platform.py) now sees masked auth: the registry
+    replaces secret fields (``token`` / ``api_key`` / ``client_secret``) with a
+    redacted sentinel on its tenant-facing read paths, so plaintext credentials
+    never reach the browser.  Only the internal consumer endpoint
+    (``/internal/mcp-servers``) still returns plaintext secrets.
+
+    Note: ``env`` and ``args`` can also carry secrets (API keys as env vars,
+    tokens in CLI args).  They are left intact here to preserve the existing
+    library contract (the SPA types and renders ``env``); masking their values
+    is a follow-up if the registry starts returning secret material in them.
+    """
+    if not isinstance(server, dict):
+        return server
+    scrubbed = dict(server)
+    auth = scrubbed.get("auth")
+    if isinstance(auth, dict):
+        # Keep only the auth scheme; drop all credentials - token / api_key /
+        # header_name (bearer/api_key) and client_id / client_secret /
+        # token_url / scopes (oauth).
+        scrubbed["auth"] = {"type": auth.get("type")}
+    scrubbed.pop("headers", None)
+    return scrubbed
+
+
 @router.get("/library/mcp-servers")
 async def list_mcp_servers(
     request: Request,
     _auth: tuple = Depends(require_auth()),
 ) -> dict:
-    """List tenant MCP servers from mcp-registry."""
+    """List tenant MCP servers from mcp-registry (secret-scrubbed).
+
+    Returns the mcp-registry ``{items, total}`` envelope with each server's
+    connection credentials stripped - ``auth`` reduced to its ``type`` and
+    ``headers`` dropped (see ``_scrub_mcp_server_secrets``).  Tenant users see
+    the metadata they need to pick a server, never the stored secrets.
+    """
     tenant_id, user_id, access_token = _auth
     url = request.app.state.settings.mcp_registry_url
     async with httpx.AsyncClient(timeout=15) as client:
@@ -89,7 +140,16 @@ async def list_mcp_servers(
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
         resp.raise_for_status()
-        return resp.json()
+        body = resp.json()
+    if isinstance(body, dict) and isinstance(body.get("items"), list):
+        body = {
+            **body,
+            "items": [_scrub_mcp_server_secrets(s) for s in body["items"]],
+        }
+    elif isinstance(body, list):
+        # Defensive: if the registry ever returns a bare array, scrub in place.
+        body = [_scrub_mcp_server_secrets(s) for s in body]
+    return body
 
 
 @router.post("/library/mcp-servers", status_code=201)
@@ -97,7 +157,13 @@ async def create_mcp_server(
     request: Request,
     _auth: tuple = Depends(require_auth()),
 ) -> dict:
-    """Register a tenant MCP server in mcp-registry."""
+    """Register a tenant MCP server in mcp-registry (response secret-scrubbed).
+
+    The created record is returned with connection credentials stripped (see
+    ``_scrub_mcp_server_secrets``) so the library surface never echoes
+    ``auth.token`` / ``auth.api_key`` / ``headers`` back to a normal user; the
+    caller already supplied them and does not need them returned.
+    """
     tenant_id, user_id, access_token = _auth
     url = request.app.state.settings.mcp_registry_url
     body = await request.json()
@@ -108,7 +174,8 @@ async def create_mcp_server(
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
         _raise_for_upstream(resp)
-        return resp.json()
+        created = resp.json()
+    return _scrub_mcp_server_secrets(created) if isinstance(created, dict) else created
 
 
 # --------------------------------------------------------------------------- #
@@ -120,12 +187,18 @@ async def list_skills(
     request: Request,
     _auth: tuple = Depends(require_auth()),
 ) -> dict:
-    """List tenant skills published to the shelf (browse list)."""
+    """List tenant skills published to the shelf (browse list).
+
+    Requests ``include_platform=true`` so the user-facing library also surfaces
+    the platform-global default built-ins (read-only, every org has them). The
+    admin skill-management proxy deliberately omits this flag.
+    """
     tenant_id, user_id, access_token = _auth
     url = request.app.state.settings.skill_store_url
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             f"{url}/skills",
+            params={"include_platform": "true"},
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
         resp.raise_for_status()

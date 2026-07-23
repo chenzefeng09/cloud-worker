@@ -21,6 +21,7 @@ import type {
   App,
   AppCreate,
   AppReviewItem,
+  AppRunHistoryResponse,
   AppRunResult,
   AppUpdate,
   AppVersion,
@@ -83,6 +84,7 @@ import type {
   ListPage,
   LoginResponse,
   McpServer,
+  McpTestResult,
   Message,
   MfaMethod,
   ModelCatalogProvider,
@@ -100,6 +102,7 @@ import type {
   PatchTenantRequest,
   PermissionDefinition,
   PoolSnapshot,
+  ProbeMcpServerRequest,
   ProbeReport,
   ProbeRequest,
   QuotaInfo,
@@ -170,7 +173,9 @@ import type {
   BucketPurpose,
   CronJob,
   CronJobCreate,
+  CronJobCreated,
   CronJobUpdate,
+  WebhookSecret,
   Workspace,
   WorkspaceFile,
   WorkspaceCreate,
@@ -616,13 +621,8 @@ export const api = {
     deleteDocument: (docId: string) =>
       request<void>('DELETE', `/library/documents/${docId}`),
 
-    installMcpServer: (body: {
-      name: string;
-      transport: McpServer['transport'];
-      endpoint?: string | null;
-      command?: string | null;
-      enabled?: boolean;
-    }) => request<McpServer>('POST', '/library/mcp-servers', body),
+    installMcpServer: (body: RegisterMcpServerRequest) =>
+      request<McpServer>('POST', '/library/mcp-servers', body),
 
     createSkill: (body: {
       name: string;
@@ -741,6 +741,11 @@ export const api = {
         session_id?: string;
       },
     ) => request<AppRunResult>('POST', `/apps/${id}/run`, body),
+    listRuns: (id: string, opts?: { limit?: number; offset?: number }) =>
+      request<AppRunHistoryResponse>(
+        'GET',
+        `/apps/${id}/runs${qs({ limit: opts?.limit, offset: opts?.offset })}`,
+      ),
   },
 
   billing: {
@@ -950,6 +955,16 @@ export const api = {
         request<McpServer>('PATCH', `/admin/mcp/servers/${id}`, body),
       delete: (id: string) =>
         request<void>('DELETE', `/admin/mcp/servers/${id}`),
+      // Probe a server's /test endpoint (mcp-registry). Returns ok + discovered
+      // tools / server_info; stdio servers are not testable remotely and the
+      // caller should disable the affordance for them.
+      test: (id: string, body?: Record<string, unknown>) =>
+        request<McpTestResult>('POST', `/admin/mcp/servers/${id}/test`, body),
+      // Id-less probe: same result shape as test(), but the connection config is
+      // supplied inline so a not-yet-created server can still be inspected (the
+      // register form uses this to fill its tool checklist).
+      probe: (body: ProbeMcpServerRequest, tenantId?: string) =>
+        request<McpTestResult>('POST', `/admin/mcp/servers/probe${qs({ tenant_id: tenantId })}`, body),
     },
     // Knowledge base governance (→ knowledge-ingest). documents.list unwraps {items:[...]}.
     knowledge: {
@@ -1473,10 +1488,14 @@ export const api = {
 
   schedules: {
     list: () => request<CronJob[]>('GET', '/schedules'),
-    create: (body: CronJobCreate) => request<CronJob>('POST', '/schedules', body),
+    // Webhook creates return the plaintext secret + path exactly once.
+    create: (body: CronJobCreate) => request<CronJobCreated>('POST', '/schedules', body),
     update: (id: string, body: CronJobUpdate) =>
       request<CronJob>('PATCH', `/schedules/${id}`, body),
     remove: (id: string) => request<void>('DELETE', `/schedules/${id}`),
+    // Regenerate a webhook trigger's secret; the new plaintext is returned once.
+    rotateSecret: (id: string) =>
+      request<WebhookSecret>('POST', `/schedules/${id}/rotate-secret`),
   },
 
   chat: {

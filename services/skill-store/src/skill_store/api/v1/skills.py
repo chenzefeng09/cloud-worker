@@ -16,6 +16,7 @@ from skill_store.api.dependencies import (
     internal_db_session,
 )
 from skill_store.blob.base import BlobStore, make_key
+from skill_store.constants import PLATFORM_TENANT_ID
 from skill_store.schemas.common import ListPage
 from skill_store.schemas.skill import (
     DefaultInstalledSkillOut,
@@ -37,12 +38,26 @@ router = APIRouter(tags=["Skills"])
 async def list_skills(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
+    include_platform: bool = False,
 ) -> ListPage:
-    """Browse list — skills published to the tenant shelf (tenant/public)."""
+    """Browse list — skills published to the tenant shelf (tenant/public).
+
+    ``include_platform=true`` (the user-facing library) also returns the
+    platform-global default built-ins; the tenant admin view omits it so those
+    read-only built-ins don't appear alongside tenant-managed skills.
+    """
     svc = SkillService(db, blob=_no_blob(), tenant_id=tenant_id)
-    items = await svc.list_skills()
+    items = await svc.list_skills(include_platform=include_platform)
+
+    def _to_out(s: object) -> dict[str, object]:
+        out = SkillOut.model_validate(s).model_dump(mode="json")
+        # Flag platform-global defaults so the library renders them as read-only
+        # built-ins (no per-tenant install/uninstall).
+        out["is_platform_default"] = getattr(s, "tenant_id", None) == PLATFORM_TENANT_ID
+        return out
+
     return ListPage(
-        items=[SkillOut.model_validate(s).model_dump(mode="json") for s in items],
+        items=[_to_out(s) for s in items],
         total=len(items),
     )
 
@@ -129,8 +144,15 @@ async def create_skill(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
 ) -> SkillOut:
+    # The synthetic platform tenant that owns the platform-global default skills
+    # is NOT a billable customer — its id doesn't even satisfy foundation
+    # billing's tenant-id format (the quota check would 400 → fail-closed 502).
+    # Skip the quota check/record entirely for platform seed writes; ordinary
+    # tenant skill creation is unchanged.
+    is_platform = tenant_id == PLATFORM_TENANT_ID
     quota_guard = request.app.state.quota_guard
-    await quota_guard.check(tenant_id=tenant_id, dimension="skills", requested=1)
+    if not is_platform:
+        await quota_guard.check(tenant_id=tenant_id, dimension="skills", requested=1)
 
     svc = SkillService(db, blob=_no_blob(), tenant_id=tenant_id)
     skill = await svc.create_skill(
@@ -138,14 +160,16 @@ async def create_skill(
         description=body.description,
         owner=body.owner,
         visibility=body.visibility.value,
+        default_enabled=body.default_enabled,
     )
 
-    await quota_guard.record(
-        tenant_id=tenant_id,
-        dimension="skills",
-        amount=1.0,
-        description=f"create skill {skill.id}",
-    )
+    if not is_platform:
+        await quota_guard.record(
+            tenant_id=tenant_id,
+            dimension="skills",
+            amount=1.0,
+            description=f"create skill {skill.id}",
+        )
     return SkillOut.model_validate(skill)
 
 
@@ -286,7 +310,10 @@ async def internal_list(
         for v in versions:
             vd = SkillVersionOut.model_validate(v).model_dump(mode="json")
             try:
-                key = make_key(tenant_id, v.skill_id, v.version)
+                # Presign against the OWNING skill's tenant — a platform-default
+                # skill's blob lives under PLATFORM_TENANT_ID's prefix, not the
+                # requesting tenant's.
+                key = make_key(skill.tenant_id, v.skill_id, v.version)
                 vd["blob_url"] = blob.presign_get(
                     key, ttl_seconds=settings.presign_ttl_seconds,
                 )
@@ -406,6 +433,39 @@ async def internal_default_installed(
         DefaultInstalledSkillOut(name=skill.name).model_dump(mode="json")
         for skill, install in pairs
         if install.enabled_by_default
+    ]
+    return ListPage(items=items, total=len(items))
+
+
+@router.get(
+    "/internal/skills/platform-defaults",
+    response_model=ListPage,
+    dependencies=[TInternalAuth],
+)
+async def internal_platform_defaults(
+    tenant_id: str,
+    db: AsyncSession = Depends(internal_db_session),
+    blob: BlobStore = TBlobStore,
+) -> ListPage:
+    """List the platform-global default skill names (names only).
+
+    These are the skills every organization — including brand-new tenants with
+    no skills of their own — gets by default with zero per-user install rows.
+    The list is tenant-agnostic: any caller (identified by their own
+    ``tenant_id``, which the internal-auth guard still requires) gets the SAME
+    names, because the broadened ``skills_tenant_select`` RLS policy makes the
+    platform-owned rows readable regardless of ``app.tenant_id``.
+
+    The orchestrator calls this on every run and unions the names into the run's
+    skill set (they are always injected and cannot be disabled per session).
+
+    The response reuses ``DefaultInstalledSkillOut`` (``{"name": ...}``) so it
+    shares the wire shape with the other ``/internal/*`` listings.
+    """
+    svc = SkillService(db, blob=blob, tenant_id=tenant_id)
+    names = await svc.list_platform_default_names()
+    items = [
+        DefaultInstalledSkillOut(name=n).model_dump(mode="json") for n in names
     ]
     return ListPage(items=items, total=len(items))
 

@@ -9,13 +9,16 @@ import { AgentPage } from '../pages/AgentPage';
 import { AppRunPage } from '../pages/AppRunPage';
 import { AppResultPage } from '../pages/AppResultPage';
 import { AppEditorPage } from '../pages/AppEditorPage';
+import { AppListPage } from '../pages/AppListPage';
+import { AppDetailPage } from '../pages/AppDetailPage';
+import { AppHistoryPage } from '../pages/AppHistoryPage';
 import { FilesPage } from '../pages/FilesPage';
 import { LibraryPage } from '../pages/LibraryPage';
-import { SchedulesPage } from '../pages/SchedulesPage';
 import { WorkspacePage } from '../pages/WorkspacePage';
 import { ArtifactsPage } from '../pages/ArtifactsPage';
 import { ProfilePage } from '../pages/ProfilePage';
 import { AdminLayout, canAccessAdmin } from '../admin/AdminLayout';
+import { DialogProvider } from '../admin/components/dialogs';
 
 /**
  * Authenticated app shell: sidebar + routed main view. WorkspaceProvider lives
@@ -50,32 +53,40 @@ export function WorkspaceLayout() {
               )
             }
           />
-          {/* Standard workspace shell */}
+          {/* Standard workspace shell. DialogProvider is mounted here (the admin
+              shell mounts its own) so workspace pages get in-app confirm/toast
+              instead of the unstyled, thread-blocking native dialogs. */}
           <Route
             path="*"
             element={
-              <div className="flex-1 flex min-w-0 h-full">
-                <Sidebar />
-                <main className="flex-1 flex flex-col min-w-0">
-                  <Routes>
-                    <Route path="/home" element={<HomePage />} />
-                    <Route path="/tasks/:id" element={<AgentPage />} />
-                    {/* App routes — static/longer paths first so react-router v6
-                        ranking never lets `/apps/:id` shadow `/apps/new` etc. */}
-                    <Route path="/apps/new" element={<Navigate to="/home" replace />} />
-                    <Route path="/apps/runs/:sessionId/:runId" element={<AppResultPage />} />
-                    <Route path="/apps/:id/edit" element={<AppEditorPage />} />
-                    <Route path="/apps/:id" element={<AppRunPage />} />
-                    <Route path="/schedules" element={<SchedulesPage />} />
-                    <Route path="/files" element={<FilesPage />} />
-                    <Route path="/library" element={<LibraryPage />} />
-                    <Route path="/workspace" element={<WorkspacePage />} />
-                    <Route path="/artifacts" element={<ArtifactsPage />} />
-                    <Route path="/profile" element={<ProfilePage />} />
-                    <Route path="*" element={<Navigate to="/home" replace />} />
-                  </Routes>
-                </main>
-              </div>
+              <DialogProvider>
+                <div className="flex-1 flex min-w-0 h-full">
+                  <Sidebar />
+                  <main className="flex-1 flex flex-col min-w-0">
+                    <Routes>
+                      <Route path="/home" element={<HomePage />} />
+                      <Route path="/tasks/:id" element={<AgentPage />} />
+                      {/* App routes — static/longer paths first so react-router v6
+                          ranking never lets `/apps/:id` shadow `/apps/new` etc. */}
+                      <Route path="/apps/new" element={<Navigate to="/home" replace />} />
+                      <Route path="/apps/runs/:sessionId/:runId" element={<AppResultPage />} />
+                      <Route path="/apps/:id/edit" element={<AppEditorPage />} />
+                      <Route path="/apps/:id/run" element={<AppRunPage />} />
+                      <Route path="/apps/:id/history" element={<AppHistoryPage />} />
+                      <Route path="/apps/:id" element={<AppDetailPage />} />
+                      <Route path="/apps" element={<AppListPage />} />
+                      {/* 定时任务 folded into the app surface as a tab. */}
+                      <Route path="/schedules" element={<Navigate to="/apps?tab=schedules" replace />} />
+                      <Route path="/files" element={<FilesPage />} />
+                      <Route path="/library" element={<LibraryPage />} />
+                      <Route path="/workspace" element={<WorkspacePage />} />
+                      <Route path="/artifacts" element={<ArtifactsPage />} />
+                      <Route path="/profile" element={<ProfilePage />} />
+                      <Route path="*" element={<Navigate to="/home" replace />} />
+                    </Routes>
+                  </main>
+                </div>
+              </DialogProvider>
             }
           />
         </Routes>

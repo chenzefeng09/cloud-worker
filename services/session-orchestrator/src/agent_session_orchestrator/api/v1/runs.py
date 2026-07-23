@@ -294,6 +294,64 @@ async def _fetch_default_installed_skills(
         return []
 
 
+async def _fetch_platform_default_skills(
+    *,
+    skill_store_url: str,
+    service_scopes: str,
+    tenant_id: str,
+    user_id: str,
+) -> list[str]:
+    """Return the platform-global default skill names.
+
+    These are the skills EVERY organization (including brand-new tenants) gets by
+    default with zero per-user install rows — owned by skill-store's reserved
+    platform tenant.  The endpoint is tenant-agnostic (any caller gets the same
+    names); we still pass the run's tenant/user/scope headers for consistency
+    with the other ``/internal/*`` calls and to satisfy the internal-auth guard.
+
+    Intentionally failure-open, exactly like ``_fetch_default_installed_skills``:
+    an unavailable or malformed skill-store response must never block a run.
+    """
+    if not skill_store_url:
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{skill_store_url.rstrip('/')}/internal/skills/platform-defaults",
+                params={"tenant_id": tenant_id, "user_id": user_id},
+                headers={
+                    "X-Tenant-Id": tenant_id,
+                    "X-User-Id": user_id,
+                    "X-Service-Scopes": service_scopes,
+                },
+            )
+        if resp.status_code != 200:
+            logger.warning(
+                "platform default skills lookup returned %s; proceeding without them",
+                resp.status_code,
+            )
+            return []
+
+        items = resp.json().get("items") or []
+        names: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name and name not in seen:
+                names.append(name)
+                seen.add(name)
+        return names
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "platform default skills lookup failed; proceeding without them: %s",
+            exc,
+        )
+        return []
+
+
 async def _assemble_history(
     svc: SessionService, session_id: str, *, current_task: str
 ) -> list[dict[str, Any]]:
@@ -393,8 +451,8 @@ async def create_run(
     app_snapshot = body.get("app_snapshot")
 
     # Run origin — "user" (default) for interactive runs, "schedule" for
-    # cron-runner-triggered runs.
-    _VALID_SOURCES = {"user", "schedule"}
+    # cron-runner-triggered runs, "webhook" for inbound-webhook-triggered runs.
+    _VALID_SOURCES = {"user", "schedule", "webhook"}
     source: str = body.get("source") or "user"
     if source not in _VALID_SOURCES:
         raise HTTPException(
@@ -546,6 +604,20 @@ async def create_run(
             user_id=user_id,
         )
 
+    # MCP server selection has the SAME presence semantics as skills, and for
+    # the same reason: ``[]`` and "key absent" are different requests.
+    #   * key absent      -> ``None`` -> consumers fall back to the tenant's
+    #                        enabled-by-default server set (the historical
+    #                        auto-inject-everything behaviour).
+    #   * explicit ``[]`` -> ``[]``   -> no MCP servers at all for this run.
+    #   * non-empty list  -> only those server ids.
+    # Never use a truthiness test here — ``if body.get("mcp_server_ids")``
+    # would silently turn "disable all" back into "inject all".
+    run_mcp_server_ids: list[str] | None = None
+    if "mcp_server_ids" in body:
+        _raw_mcp_ids = body.get("mcp_server_ids") or []
+        run_mcp_server_ids = [str(s) for s in _raw_mcp_ids if s]
+
     # ── Workspace context (both execution modes) ────────────────────────────
     # A session created against a workspace inherits its instructions / base
     # files / skills on every run.  Loaded here — before the inline branch
@@ -597,6 +669,28 @@ async def create_run(
             # Union the workspace's skill set into the run's (order-preserving
             # dedupe: explicit/default skills first, then workspace additions).
             run_skills = _merge_skills(list(run_skills), ws_ctx.skills)
+
+    # ── Platform-global default skills ──────────────────────────────────────
+    # Union the platform default skill names on top of whatever run_skills
+    # resolved to (explicit selection, user defaults, or workspace additions),
+    # so every organization gets them by default with zero per-user install
+    # rows.  They are appended last (deduped, order-preserving) so
+    # explicit/default/workspace skills keep priority.
+    #
+    # Per-session opt-out: a request may set ``include_platform_defaults: false``
+    # to suppress the platform defaults for THIS run only (e.g. a focused session
+    # where the extra skill catalog is noise).  Presence-tolerant — only a literal
+    # ``false`` disables; absent / null / true all keep the defaults on, so the
+    # "自带" behaviour stays the default.  Failure-open — a skill-store hiccup
+    # never blocks the run.
+    if body.get("include_platform_defaults") is not False:
+        _platform_defaults = await _fetch_platform_default_skills(
+            skill_store_url=request.app.state.settings.skill_store_url,
+            service_scopes=request.app.state.settings.skill_store_service_scopes,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        run_skills = _merge_skills(list(run_skills), _platform_defaults)
 
     # ── Inline (chat-mode) branch ───────────────────────────────────────────
     # No scheduler, no sandbox: flip the run to RUNNING in THIS transaction so
@@ -657,6 +751,9 @@ async def create_run(
             # to a catalog and runs the in-process read_skill loop
             # (empty/omitted → no skill loop, prior behaviour).
             skills=run_skills,
+            # Presence-resolved MCP selection: ``None`` = use the tenant's
+            # enabled set, ``[]`` = no MCP for this run, list = only these ids.
+            mcp_server_ids=run_mcp_server_ids,
             # Workspace context as plain values (str / dicts) — the executor
             # builds the "# 工作区指令" block and the base-files block itself.
             workspace_instructions=ws_instructions,
@@ -718,47 +815,56 @@ async def create_run(
             + ws_instructions
         )
 
+    scheduler_body: dict[str, Any] = {
+        "session_id": session_id,
+        "run_id": run.id,
+        "task": task,
+        "agent_config": {
+            **(body.get("agent_config") or {}),
+            "model": body.get("model"),
+            "reasoning_effort": body.get("reasoning_effort"),
+        },
+        "files": files,
+        # Total attachment bytes for this run; the scheduler maps it
+        # to a concrete sandbox memory limit (small vs large tier).
+        "total_attachment_bytes": total_attachment_bytes,
+        "memory": memory_snippets,
+        # Explicit per-message selection, or (only when the request
+        # omitted ``skills``) the user's default-enabled installs.
+        # The scheduler writes these into task.json["skills"].
+        "skills": run_skills,
+        # Prior-turn conversation history for multi-turn memory.
+        "history": history,
+        # App-harness fields (empty/absent for chat runs).  The
+        # scheduler writes these into task.json for the worker:
+        # ``sys_prompt`` is appended to the system prompt;
+        # ``sampling_params`` is applied per-run by the gateway model.
+        "sys_prompt": sys_prompt,
+        "sampling_params": sampling_params,
+        # HITL gating: normal session runs always enable human-in-the-loop
+        # so the worker can pause for confirmation / free-text questions.
+        # Scheduled/batch runs will override to False (future).
+        "hitl": True,
+        # Effective clearance (min(user, workspace)) so the sandbox
+        # worker's knowledge_tool can send X-User-Clearance to
+        # knowledge-ingest and the scheduler can sign it into the
+        # broker lease (broker mode re-injects it from the lease).
+        # Empty/absent -> ki treats the caller as L1.
+        "effective_clearance": effective_clearance,
+    }
+    # MCP selection is presence-carried all the way down: the key is only put
+    # on the wire when the caller expressed a choice.  ``None`` (= caller said
+    # nothing) must NOT be serialized as ``null`` — the scheduler and the
+    # in-sandbox injector distinguish "absent -> tenant default" from
+    # "[] -> disable all", and a null would collapse that distinction.
+    if run_mcp_server_ids is not None:
+        scheduler_body["mcp_server_ids"] = run_mcp_server_ids
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{scheduler_url}/runs",
-                json={
-                    "session_id": session_id,
-                    "run_id": run.id,
-                    "task": task,
-                    "agent_config": {
-                        **(body.get("agent_config") or {}),
-                        "model": body.get("model"),
-                        "reasoning_effort": body.get("reasoning_effort"),
-                    },
-                    "files": files,
-                    # Total attachment bytes for this run; the scheduler maps it
-                    # to a concrete sandbox memory limit (small vs large tier).
-                    "total_attachment_bytes": total_attachment_bytes,
-                    "memory": memory_snippets,
-                    # Explicit per-message selection, or (only when the request
-                    # omitted ``skills``) the user's default-enabled installs.
-                    # The scheduler writes these into task.json["skills"].
-                    "skills": run_skills,
-                    # Prior-turn conversation history for multi-turn memory.
-                    "history": history,
-                    # App-harness fields (empty/absent for chat runs).  The
-                    # scheduler writes these into task.json for the worker:
-                    # ``sys_prompt`` is appended to the system prompt;
-                    # ``sampling_params`` is applied per-run by the gateway model.
-                    "sys_prompt": sys_prompt,
-                    "sampling_params": sampling_params,
-                    # HITL gating: normal session runs always enable human-in-the-loop
-                    # so the worker can pause for confirmation / free-text questions.
-                    # Scheduled/batch runs will override to False (future).
-                    "hitl": True,
-                    # Effective clearance (min(user, workspace)) so the sandbox
-                    # worker's knowledge_tool can send X-User-Clearance to
-                    # knowledge-ingest and the scheduler can sign it into the
-                    # broker lease (broker mode re-injects it from the lease).
-                    # Empty/absent -> ki treats the caller as L1.
-                    "effective_clearance": effective_clearance,
-                },
+                json=scheduler_body,
                 headers=headers,
             )
     except httpx.HTTPError as exc:
@@ -825,17 +931,25 @@ async def list_tenant_runs(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     status: str | None = None,
+    app_id: str | None = None,
     limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     """List runs for the current tenant across all sessions.
 
     Tenant is scoped from the X-Tenant-Id middleware (same as every other
     endpoint here).  ``status`` is normalised to upper-case before filtering;
-    ``limit`` is capped at 200.  Response shape matches the session-level list.
+    ``app_id`` narrows the result to a single App's execution history (NULL
+    ``app_id`` chat runs never match - the App history view stays chat-free);
+    ``limit`` is capped at 200 and ``offset`` pages past the newest rows.  Both
+    ``app_id`` and ``offset`` default to off so the existing tenant-wide
+    behaviour is preserved.  Response shape matches the session-level list.
     """
     svc = SessionService(db, tenant_id=tenant_id)
     status_norm = status.upper() if status else None
-    runs = await svc.list_tenant_runs(status=status_norm, limit=limit)
+    runs = await svc.list_tenant_runs(
+        status=status_norm, limit=limit, app_id=app_id, offset=offset,
+    )
     return {"items": [_serialize_run(r) for r in runs]}
 
 

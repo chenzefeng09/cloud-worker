@@ -649,6 +649,107 @@ def test_spawn_run_task_json_contains_skills(
 
 
 # ---------------------------------------------------------------------------
+# mcp_server_ids: per-run MCP selection, presence-carried into task.json
+#
+# task.json is an EXPLICIT field manifest, not a dict passthrough — a new field
+# that isn't listed in ``_write_task_file`` is silently dropped after surviving
+# every layer above.  These tests assert on the serialized file, not on the
+# call args, so the manifest itself is what's under test.
+# ---------------------------------------------------------------------------
+
+
+def _spawn_and_read_task_json(
+    runtime: DockerRuntime, tmpdir: str, **spawn_kwargs
+) -> dict:
+    """Spawn once into ``tmpdir`` and return the parsed task.json."""
+    runtime._settings.workspace_base = tmpdir
+    runtime.spawn_run(
+        run_id="run_01J5RUN0000000000000000009",
+        session_id="ses_01J5SES0000000000000000009",
+        task="use mcp",
+        tenant_id="tnt_01J5TNT0000000000000000001",
+        user_id="usr_01J5USR0000000000000000001",
+        foundation_token="tok_mcp",
+        llm_virtual_key="vk-test",
+        **spawn_kwargs,
+    )
+    task_path = (
+        Path(tmpdir)
+        / "tnt_01J5TNT0000000000000000001"
+        / "ses_01J5SES0000000000000000009"
+        / "run_01J5RUN0000000000000000009"
+        / "task.json"
+    )
+    return json.loads(task_path.read_text(encoding="utf-8"))
+
+
+def test_task_json_omits_mcp_server_ids_when_not_selected(
+    runtime: DockerRuntime, mock_docker_client: MagicMock,
+) -> None:
+    """No selection → the key is ABSENT (not ``null``) so defaults apply.
+
+    ``null`` would be indistinguishable from "disable all" once the worker
+    reads it back, which is exactly the distinction this field exists to carry.
+    """
+    mock_docker_client.containers.run.return_value = MagicMock(id="c1")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        payload = _spawn_and_read_task_json(runtime, tmpdir)
+
+    assert "mcp_server_ids" not in payload
+    raw = json.dumps(payload)
+    assert "mcp_server_ids" not in raw
+    # The legacy key must be untouched — the injector still fetches live.
+    assert payload["mcp_servers"] == []
+
+
+def test_task_json_writes_empty_mcp_server_ids_to_disable_all(
+    runtime: DockerRuntime, mock_docker_client: MagicMock,
+) -> None:
+    """Explicit ``[]`` → the key is PRESENT and empty = no MCP for this run."""
+    mock_docker_client.containers.run.return_value = MagicMock(id="c2")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        payload = _spawn_and_read_task_json(runtime, tmpdir, mcp_server_ids=[])
+
+    assert "mcp_server_ids" in payload
+    assert payload["mcp_server_ids"] == []
+    assert payload["mcp_servers"] == []
+
+
+def test_task_json_writes_selected_mcp_server_ids(
+    runtime: DockerRuntime, mock_docker_client: MagicMock,
+) -> None:
+    """A non-empty selection lands verbatim, in order, as strings."""
+    mock_docker_client.containers.run.return_value = MagicMock(id="c3")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        payload = _spawn_and_read_task_json(
+            runtime, tmpdir, mcp_server_ids=["mcp_b", "mcp_a"]
+        )
+
+    assert payload["mcp_server_ids"] == ["mcp_b", "mcp_a"]
+    assert payload["mcp_servers"] == []
+
+
+def test_write_task_file_mcp_server_ids_presence_matrix(
+    runtime: DockerRuntime,
+) -> None:
+    """Direct writer test for the three states, no docker involved."""
+    cases: list[tuple[list[str] | None, bool, list[str] | None]] = [
+        (None, False, None),
+        ([], True, []),
+        (["srv_1"], True, ["srv_1"]),
+    ]
+    for selection, key_expected, expected in cases:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = runtime._write_task_file(
+                Path(tmpdir), task="t", mcp_server_ids=selection,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        assert ("mcp_server_ids" in payload) is key_expected, selection
+        if key_expected:
+            assert payload["mcp_server_ids"] == expected, selection
+
+
+# ---------------------------------------------------------------------------
 # M1-P3: LLM gateway env injection
 # ---------------------------------------------------------------------------
 

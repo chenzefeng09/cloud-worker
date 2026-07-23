@@ -80,7 +80,23 @@ export interface ResumePayload {
 /** The full task payload the worker executes. */
 export interface Task {
   task: string;
+  /**
+   * LEGACY / UNUSED. The scheduler hardcodes `[]` here (docker_runtime.py:929)
+   * because MCP servers are fetched live from the registry at run time. Do NOT
+   * read this to decide which servers to enable — use `mcp_server_ids`.
+   */
   mcp_servers: unknown[];
+  /**
+   * Run-level MCP server selection, by registry server id. THREE-STATE, and the
+   * distinction is load-bearing — always test with `=== undefined`, never for
+   * truthiness (`[]` is falsy but means something entirely different):
+   *
+   * * `undefined` (key absent)  → use the tenant's default enabled set, i.e. the
+   *   historical "register every enabled server" behaviour.
+   * * `[]` (explicit empty)     → MCP is disabled for this run; register nothing.
+   * * non-empty list            → register ONLY the servers with these ids.
+   */
+  mcp_server_ids?: string[];
   skills: string[];
   files: FileSpec[];
   memory: string;
@@ -151,6 +167,10 @@ function normalizeTask(o: Record<string, unknown>): Task {
   return {
     task: typeof o.task === "string" ? o.task : "",
     mcp_servers: Array.isArray(o.mcp_servers) ? o.mcp_servers : [],
+    // NOT the `?? []` default the sibling fields use: for mcp_server_ids the
+    // absent key and `[]` are DIFFERENT instructions (tenant-default vs
+    // disable-all), so absence must survive normalization as `undefined`.
+    mcp_server_ids: normalizeMcpServerIds(o.mcp_server_ids),
     skills: Array.isArray(o.skills) ? (o.skills as string[]) : [],
     files: Array.isArray(o.files) ? (o.files as FileSpec[]) : [],
     memory: typeof o.memory === "string" ? o.memory : "",
@@ -170,6 +190,25 @@ function normalizeTask(o: Record<string, unknown>): Task {
     hitl: o.hitl === false ? false : true,
     resume: normalizeResume(o.resume),
   };
+}
+
+/**
+ * Normalize the run-level MCP selection while PRESERVING the absent/`[]`
+ * distinction (see `Task.mcp_server_ids`).
+ *
+ * * absent / `null` / not an array → `undefined` (fall back to tenant default).
+ *   A malformed value is deliberately treated as "absent" rather than as
+ *   "disable everything": a scheduler that ships a bad shape degrades to the
+ *   pre-existing behaviour instead of silently stripping the user's tools.
+ * * an array → the string ids in it (non-strings and blanks dropped). An empty
+ *   array stays an empty array, which downstream means "register nothing".
+ */
+function normalizeMcpServerIds(raw: unknown): string[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  return raw
+    .filter((v): v is string => typeof v === "string")
+    .map((v) => v.trim())
+    .filter((v) => v !== "");
 }
 
 /**

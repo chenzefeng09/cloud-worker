@@ -10,6 +10,15 @@ const PdfPreview = lazy(() => import('./previews/PdfPreview'));
 const ExcelPreview = lazy(() => import('./previews/ExcelPreview'));
 const DocxPreview = lazy(() => import('./previews/DocxPreview'));
 const PptxPreview = lazy(() => import('./previews/PptxPreview'));
+const ArchivePreview = lazy(() => import('./previews/ArchivePreview'));
+
+// Archive extensions that list their contents (no extraction) via libarchive.js.
+// `extOf`/`split('.')` yields the LAST segment, so ``a.tar.gz`` → ``gz`` and
+// ``a.tar`` → ``tar``; both are covered here.
+const ARCHIVE_EXTS = new Set([
+  'zip', 'tar', 'gz', 'tgz', 'bz2', 'tbz', 'tbz2', 'xz', 'txz',
+  '7z', 'rar', 'zst', 'lz4', 'cpio', 'iso', 'ar',
+]);
 
 // ── Kind / glyph helpers ─────────────────────────────────────────────────────
 
@@ -426,13 +435,19 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime, source }: F
     ['pptx', 'ppt'].includes(ext) ||
     (mime?.includes('officedocument.presentationml') ?? false) ||
     (mime?.includes('ms-powerpoint') ?? false);
-  const needsBlob = isExcel || isWord || isPptx;
+  // Compressed archives — list the internal file tree without extracting. Only
+  // by extension: Office docs (also zip containers) are already caught above and
+  // their extensions are not in ARCHIVE_EXTS, so they never fall here.
+  const isArchive = !isExcel && !isWord && !isPptx && ARCHIVE_EXTS.has(ext);
+  const needsBlob = isExcel || isWord || isPptx || isArchive;
   // HTML renders as a webpage (iframe) by default, with a source-code toggle —
   // so it must NOT fall into TextPreview. Detect it before the text gate.
   const isHtml = mime === 'text/html' || ext === 'html' || ext === 'htm';
-  // Office docs take precedence: never treat them as text even if MIME/ext is
-  // ambiguous, otherwise the binary zip renders as garbled bytes.
-  const isText = !isWord && !isExcel && !isPptx && !isHtml && (isTextLikeMime(mime) || TEXT_LIKE_EXTS.has(ext));
+  // Office docs / archives take precedence: never treat them as text even if
+  // MIME/ext is ambiguous, otherwise binary bytes render as garbled text.
+  const isText =
+    !isWord && !isExcel && !isPptx && !isArchive && !isHtml &&
+    (isTextLikeMime(mime) || TEXT_LIKE_EXTS.has(ext));
 
   const [contentText, setContentText] = useState<string | null>(null);
   const [contentBlob, setContentBlob] = useState<Blob | null>(null);
@@ -526,6 +541,21 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime, source }: F
           <div className="font-mono text-[11px] text-dim">
             {isExcel ? '加载表格…' : isPptx ? '加载演示文稿…' : '加载文档…'}
           </div>
+        )}
+      </Suspense>
+    );
+  }
+
+  // Archive — list the internal file tree without extracting (libarchive.js)
+  if (isArchive) {
+    return (
+      <Suspense fallback={<div className="font-mono text-[11px] text-dim">加载预览组件…</div>}>
+        {contentError ? (
+          <div className="font-mono text-[11px] text-accent">{contentError}</div>
+        ) : contentBlob ? (
+          <ArchivePreview blob={contentBlob} filename={filename} />
+        ) : (
+          <div className="font-mono text-[11px] text-dim">读取压缩包…</div>
         )}
       </Suspense>
     );

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
 # Mirrors conftest._TENANT / _USER (the headers the gateway injects).
@@ -20,6 +21,14 @@ def _read_run_secrets(
     path = (
         Path(workspace_base) / tenant_id / session_id / run_id / ".secrets.json"
     )
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_task_json(
+    workspace_base: str, *, tenant_id: str, session_id: str, run_id: str
+) -> dict:
+    """Read the task.json the scheduler wrote for a run."""
+    path = Path(workspace_base) / tenant_id / session_id / run_id / "task.json"
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -141,6 +150,76 @@ def test_create_run_forwards_effective_clearance_to_sandbox_env(
         run_id="run_01J5RUN000000000000CLR0001",
     )
     assert "FOUNDATION_USER_CLEARANCE" not in secrets
+
+
+# ---------------------------------------------------------------------------
+# mcp_server_ids: request body -> task.json, end to end through the endpoint.
+#
+# This is the layer that historically loses new fields: task.json is built from
+# an explicit field manifest, so a field can pass API parsing and spawn_run and
+# still never reach the sandbox.  These assert on the written file.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("body_extra", "key_expected", "expected_value", "run_suffix"),
+    [
+        ({}, False, None, "OMIT"),
+        ({"mcp_server_ids": []}, True, [], "EMPT"),
+        ({"mcp_server_ids": ["mcp_a", "mcp_b"]}, True, ["mcp_a", "mcp_b"], "LIST"),
+    ],
+    ids=["omitted-absent", "explicit-empty-disables-all", "explicit-list-narrows"],
+)
+def test_create_run_writes_mcp_server_ids_into_task_json(
+    app_client: TestClient,
+    mock_docker_client: MagicMock,
+    fake_identity,
+    auth_headers,
+    body_extra: dict,
+    key_expected: bool,
+    expected_value: list[str] | None,
+    run_suffix: str,
+) -> None:
+    """Three-state MCP selection must survive the endpoint into task.json.
+
+    Omitted → key absent (the in-sandbox injector keeps injecting the tenant's
+    enabled servers).  Explicit ``[]`` → key present and empty (no MCP at all).
+    Non-empty → exactly those ids.  ``[]`` and "absent" are NOT the same
+    request and a truthiness check anywhere in the chain would merge them.
+    """
+    spawned = MagicMock()
+    spawned.id = f"container-mcp-{run_suffix.lower()}"
+    mock_docker_client.containers.run.return_value = spawned
+
+    session_id = f"ses_01J5SES00000000000MCP{run_suffix}"
+    run_id = f"run_01J5RUN00000000000MCP{run_suffix}"
+
+    resp = app_client.post(
+        "/api/scheduler/v1/runs",
+        headers=auth_headers,
+        json={
+            "session_id": session_id,
+            "run_id": run_id,
+            "task": "mcp selection",
+            **body_extra,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+
+    payload = _read_task_json(
+        "/tmp/agent-platform-test",
+        tenant_id=_TENANT,
+        session_id=session_id,
+        run_id=run_id,
+    )
+    assert ("mcp_server_ids" in payload) is key_expected
+    if key_expected:
+        assert payload["mcp_server_ids"] == expected_value
+    else:
+        # Never a JSON null — that would be indistinguishable from "disable all".
+        assert "mcp_server_ids" not in json.dumps(payload)
+    # The pre-existing key is deliberately untouched by this feature.
+    assert payload["mcp_servers"] == []
 
 
 def test_create_run_large_attachment_uses_large_memory_tier(

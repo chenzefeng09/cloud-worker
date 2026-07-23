@@ -252,7 +252,14 @@ export async function main(deps: MainDeps = {}): Promise<number> {
     // Mark the run RUNNING before dispatch (first checkpoint write).
     await redis.writeStep({ cursor: "start", status: "RUNNING" });
     const downloaded = await downloadAttachments(task, env);
-    const mcpServers = await loadMcpServers(env);
+    // task.mcp_server_ids is three-state: undefined => tenant default (every
+    // enabled server, the historical behaviour), [] => MCP off for this run,
+    // non-empty => only those ids. Forwarded as-is so loadMcpServers can tell
+    // "absent" from "empty" — collapsing them here would break the contract.
+    const { servers: mcpServers, filters: mcpFilters } = await loadMcpServers(
+      env,
+      task.mcp_server_ids,
+    );
     // resumeNote is passed to runQuery (prepended to the user prompt) rather
     // than into the system prompt, so the static system prefix stays stable
     // across runs and remains hittable by DeepSeek's automatic prefix cache.
@@ -262,6 +269,7 @@ export async function main(deps: MainDeps = {}): Promise<number> {
     const result: RunResult = await runQuery(task, env, {
       systemPrompt,
       mcpServers,
+      mcpFilters,
       redis,
       resumeNote,
       deps: deps.queryFn ? { queryFn: deps.queryFn } : undefined,

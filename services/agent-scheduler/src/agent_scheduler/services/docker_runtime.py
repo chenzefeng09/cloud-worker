@@ -198,6 +198,7 @@ class DockerRuntime:
         user_id: str,
         foundation_token: str,
         skills: list[str] | None = None,
+        mcp_server_ids: list[str] | None = None,
         files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
         memory_limit: str | None = None,
@@ -225,6 +226,13 @@ class DockerRuntime:
                 purpose of per-run tokens, so we reject it outright.
             skills: optional list of skill names to activate in the sandbox.
                 Embedded in task.json; consumed by ``skills_loader`` extension.
+            mcp_server_ids: optional per-run MCP server selection, carried with
+                PRESENCE semantics.  ``None`` -> the ``mcp_server_ids`` key is
+                OMITTED from task.json and the in-sandbox ``mcp_tenant_injector``
+                keeps injecting every enabled tenant server; ``[]`` -> the key is
+                written as ``[]``, meaning no MCP servers for this run; a
+                non-empty list -> only those server ids.  ``None`` is never
+                serialized as ``null``.
             files: optional list of ``{"key": s3key, "filename": name, "mime": mime}``
                 dicts describing user-uploaded attachments.  Written to task.json
                 ``files`` field; the runtime_worker downloads them to
@@ -268,6 +276,9 @@ class DockerRuntime:
             workspace_dir,
             task=task,
             skills=skills or [],
+            # Pass through UNCHANGED (no ``or []``): ``None`` and ``[]`` are
+            # different instructions and the writer distinguishes them.
+            mcp_server_ids=mcp_server_ids,
             files=files or [],
             memory=memory or "",
             history=history or [],
@@ -910,6 +921,7 @@ class DockerRuntime:
         *,
         task: str,
         skills: list[str] | None = None,
+        mcp_server_ids: list[str] | None = None,
         files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
         history: list[dict[str, Any]] | None = None,
@@ -927,6 +939,7 @@ class DockerRuntime:
             {
               "task": str,
               "mcp_servers": [],   # always empty — mcp_tenant_injector fetches live
+              "mcp_server_ids": [str, ...]  # OPTIONAL key — see below
               "skills": [str, ...] # skill names; skills_loader fetches manifests
               "files": [{"key": s3key, "filename": name, "mime": mime}, ...]
               "memory": str        # pre-fetched memory snippets (may be empty)
@@ -943,6 +956,19 @@ class DockerRuntime:
         ``mcp_servers`` stays empty because the in-sandbox ``mcp_tenant_injector``
         extension fetches the enabled server list directly from ``mcp-registry``
         at runtime using ``MCP_REGISTRY_URL`` + ``FOUNDATION_TENANT_ID``.
+
+        ``mcp_server_ids`` is the per-run narrowing of that live fetch, and it
+        is the one key in this payload whose PRESENCE is load-bearing:
+
+        * key ABSENT  — the run expressed no MCP choice; the injector keeps its
+          historical behaviour and injects every enabled tenant server.
+        * key ``[]``  — the run explicitly disabled MCP; the injector must
+          inject nothing.
+        * non-empty   — the injector keeps only the listed server ids.
+
+        A ``None`` selection therefore omits the key rather than writing
+        ``null``; ``json.dumps`` would otherwise erase the distinction between
+        "no choice" and "disable everything".
 
         ``skills`` carries the caller-supplied list of skill names; the
         ``skills_loader`` extension uses them to resolve manifests from
@@ -983,6 +1009,11 @@ class DockerRuntime:
             "hitl": bool(hitl),
             "resume": resume,
         }
+        # Presence-carried: only write the key when the run made a choice.
+        # ``is not None`` — NOT truthiness — because ``[]`` ("disable all MCP")
+        # is a real selection that must reach the sandbox.
+        if mcp_server_ids is not None:
+            payload["mcp_server_ids"] = [str(s) for s in mcp_server_ids]
         task_path = workspace_dir / "task.json"
         task_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return task_path

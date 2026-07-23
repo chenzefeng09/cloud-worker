@@ -28,6 +28,7 @@ import unittest.mock as mock
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_session_orchestrator.domain.models import Run, Session
@@ -850,6 +851,41 @@ def test_app_snapshot_inline_run_forced_to_sandbox(
     assert quota_checks == []
 
 
+def test_webhook_source_accepted_and_forced_to_sandbox(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """source='webhook' is a valid run origin; like 'schedule' it is a
+    non-interactive run, so an inline request is forced back to sandbox and the
+    scheduler is called.  A 201 (asserted inside the helper) proves the source
+    passed the create_run allowlist; the persisted row records source='webhook'.
+    """
+    scheduler_urls, created_runs, started, quota_checks = _drive_guard_case(
+        app_client, mock_db, auth_headers,
+        body={"task": "hook work", "execution_mode": "inline", "source": "webhook"},
+    )
+    assert created_runs and created_runs[0].execution_mode == "sandbox"
+    assert created_runs[0].source == "webhook"
+    assert scheduler_urls and scheduler_urls[0].endswith("/runs")
+    assert started == [], "inline executor must not run for a webhook run"
+    assert quota_checks == []
+
+
+def test_create_run_invalid_source_400(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """An unknown source is rejected before any run row is created."""
+    session = Session(id="ses_s", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    resp = app_client.post(
+        "/api/session/v1/sessions/ses_s/runs",
+        headers=auth_headers,
+        json={"task": "hi", "source": "bot"},
+    )
+    assert resp.status_code == 400
+    assert "source" in resp.json()["detail"]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # create_run endpoint — inline quota (fail-closed)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1008,6 +1044,85 @@ def test_create_run_inline_threads_reasoning_effort(
 
     assert resp.status_code == 201, resp.text
     assert started and started[0]["reasoning_effort"] == "high"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# mcp_server_ids presence semantics (inline branch)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("include_key", "request_ids", "expected_arg"),
+    [
+        (False, None, None),
+        (True, [], []),
+        (True, ["mcp_a", "mcp_b"], ["mcp_a", "mcp_b"]),
+    ],
+    ids=["omitted-none", "explicit-empty-disables-all", "explicit-list-narrows"],
+)
+def test_create_run_inline_threads_mcp_server_ids(
+    app_client: TestClient,
+    mock_db: AsyncMock,
+    auth_headers,
+    include_key: bool,
+    request_ids: list[str] | None,
+    expected_arg: list[str] | None,
+) -> None:
+    """Inline branch hands the presence-resolved MCP selection to the executor.
+
+    ``None`` (key omitted → tenant default set) and ``[]`` (explicitly disable
+    all MCP) must arrive at ``start_inline_run`` as DISTINCT values — the
+    inline catalog loader keys off exactly that difference.
+    """
+    session = Session(
+        id="ses_mcp", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+    )
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_mcp"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+
+    started: list[dict] = []
+
+    class _FakeClient(AuthzAwareClient):
+        async def get(self, url, **kw):
+            return __import__("httpx").Response(200, json={"hits": []})
+
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if url.endswith("/quota/check"):
+                return __import__("httpx").Response(200, json={"allowed": True})
+            if url.endswith("/quota/usage"):
+                return __import__("httpx").Response(200, json={})
+            raise AssertionError(f"unexpected POST {url}")
+
+    def _fake_start(**kw):
+        started.append(kw)
+
+    body: dict = {"task": "hi", "execution_mode": "inline"}
+    if include_key:
+        body["mcp_server_ids"] = request_ids
+
+    import httpx
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()), \
+            patch(
+                "agent_session_orchestrator.api.v1.runs.start_inline_run",
+                new=_fake_start,
+            ):
+        resp = app_client.post(
+            "/api/session/v1/sessions/ses_mcp/runs",
+            headers=auth_headers,
+            json=body,
+        )
+
+    assert resp.status_code == 201, resp.text
+    assert started, "inline executor was not started"
+    assert started[0]["mcp_server_ids"] == expected_arg
 
 
 def test_stream_payload_includes_reasoning_effort_when_set() -> None:

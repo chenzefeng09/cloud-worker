@@ -304,6 +304,54 @@ def test_chat_preserves_explicit_skill_selection(
     assert fake.runs_body["skills"] == skills
 
 
+def test_chat_omits_mcp_server_ids_upstream_when_client_omits_them(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absence must survive the BFF so the tenant's enabled set is used."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello"},
+    )
+
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert "mcp_server_ids" not in fake.runs_body
+
+
+@pytest.mark.parametrize(
+    "mcp_server_ids", [[], ["mcp_a"], ["mcp_a", "mcp_b"]]
+)
+def test_chat_preserves_explicit_mcp_server_selection(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    mcp_server_ids: list[str],
+) -> None:
+    """An explicit list, including [] (= disable all MCP), must be forwarded.
+
+    ``[]`` is the regression this locks: a truthiness check in the BFF would
+    drop the key and silently restore the auto-inject-everything behaviour.
+    """
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello", "mcp_server_ids": mcp_server_ids},
+    )
+
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert fake.runs_body["mcp_server_ids"] == mcp_server_ids
+
+
 def test_chat_execution_mode_inline_passthrough(
     client: TestClient,
     authed_cookie: dict[str, str],

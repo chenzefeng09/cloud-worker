@@ -17,10 +17,12 @@ tool error never removes healthy servers and never fails the surrounding chat.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -304,9 +306,30 @@ async def asyncio_gather_safely(*awaitables: Any) -> None:
 
 
 async def _fetch_registry_servers(
-    *, base_url: str, service_scopes: str, tenant_id: str, user_id: str, timeout: float
+    *,
+    base_url: str,
+    service_scopes: str,
+    tenant_id: str,
+    user_id: str,
+    timeout: float,
+    server_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
+    """Return the tenant's enabled MCP server records, optionally narrowed.
+
+    ``server_ids`` carries the run's presence-resolved selection:
+
+    * ``None``      — the caller expressed no choice: return every
+      enabled-by-default server (the historical behaviour).
+    * ``[]``        — the caller explicitly disabled MCP for this run: return
+      nothing, and skip the registry round-trip entirely.
+    * non-empty     — return only the enabled servers whose ``id`` is listed.
+
+    The ``[]`` case is checked with ``is not None`` rather than truthiness on
+    purpose: an empty selection is a real instruction, not a missing one.
+    """
     if not base_url:
+        return []
+    if server_ids is not None and not server_ids:
         return []
     headers = {
         "X-Tenant-Id": tenant_id,
@@ -327,7 +350,208 @@ async def _fetch_registry_servers(
     items = body.get("items", []) if isinstance(body, dict) else body
     if not isinstance(items, list):
         return []
-    return [item for item in items if isinstance(item, dict) and item.get("enabled", True)]
+    enabled = [
+        item for item in items if isinstance(item, dict) and item.get("enabled", True)
+    ]
+    if server_ids is None:
+        return enabled
+    wanted = {str(sid) for sid in server_ids}
+    return [item for item in enabled if str(item.get("id") or "") in wanted]
+
+
+def _auth_to_headers(auth: Any) -> dict[str, str]:
+    """Convert a registry ``auth`` record into HTTP headers for the upstream.
+
+    Handles the I/O-free auth types (``bearer`` / ``api_key``).  ``oauth`` is
+    handled separately by :func:`_build_inline_headers` because it requires an
+    async token fetch.
+
+    ``auth`` shape: ``{type: "none"|"bearer"|"api_key", token?, header_name?,
+    api_key?}``. ``header_name`` defaults to ``X-API-Key`` for ``api_key``.
+    """
+    if not isinstance(auth, dict):
+        return {}
+    out: dict[str, str] = {}
+    auth_type = str(auth.get("type") or "none").lower()
+    if auth_type == "bearer":
+        token = str(auth.get("token") or "").strip()
+        if token:
+            out["Authorization"] = f"Bearer {token}"
+    elif auth_type == "api_key":
+        api_key = str(auth.get("api_key") or "").strip()
+        if api_key:
+            header_name = str(auth.get("header_name") or "").strip() or "X-API-Key"
+            out[header_name] = api_key
+    return out
+
+
+# ---------------------------------------------------------------------------
+# OAuth client-credentials token cache (inline MCP servers)
+# ---------------------------------------------------------------------------
+#
+# Inline runs connect DIRECTLY to the upstream (no broker), so the orchestrator
+# injects upstream auth itself.  For ``auth.type == "oauth"`` it performs the
+# client-credentials flow (POST to the registry-supplied ``token_url``), caches
+# the access_token keyed by ``server_id``, and injects
+# ``Authorization: Bearer {access_token}``.
+#
+# Cache: module-level ``{server_id: {access_token, expires_at}}``.  A token is
+# refreshed when within ``_OAUTH_REFRESH_MARGIN_SECONDS`` of expiry.  Single-
+# flight: a per-``server_id`` ``asyncio.Lock`` ensures concurrent inline runs
+# for the same server share one token fetch (no duplicate POSTs).
+_OAUTH_TOKEN_CACHE: dict[str, dict[str, object]] = {}
+_OAUTH_LOCKS: dict[str, asyncio.Lock] = {}
+_OAUTH_REFRESH_MARGIN_SECONDS = 60
+_OAUTH_TOKEN_TIMEOUT_SECONDS = 10.0
+
+
+def _oauth_lock(server_id: str) -> asyncio.Lock:
+    """Return the per-``server_id`` single-flight lock, creating it lazily."""
+    lock = _OAUTH_LOCKS.get(server_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _OAUTH_LOCKS[server_id] = lock
+    return lock
+
+
+async def _fetch_oauth_token(auth: Any) -> tuple[str, float]:
+    """POST ``client_credentials`` to ``auth.token_url`` -> (access_token, expires_at).
+
+    ``expires_at`` is a unix-epoch seconds timestamp.  ``expires_in`` defaults to
+    3600s when the token endpoint omits it or returns a non-numeric value.
+    Raises on any transport / HTTP / shape error so the caller can fail-open.
+    """
+    if not isinstance(auth, dict):
+        raise ValueError("oauth auth must be a mapping")
+    token_url = str(auth.get("token_url") or "").strip()
+    client_id = str(auth.get("client_id") or "").strip()
+    client_secret = str(auth.get("client_secret") or "").strip()
+    if not token_url or not client_id or not client_secret:
+        raise ValueError("oauth auth requires token_url, client_id, client_secret")
+    scopes_raw = auth.get("scopes")
+    scopes = (
+        [str(s) for s in scopes_raw if str(s)]
+        if isinstance(scopes_raw, list)
+        else []
+    )
+    form = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    if scopes:
+        form["scope"] = " ".join(scopes)
+    async with httpx.AsyncClient(timeout=_OAUTH_TOKEN_TIMEOUT_SECONDS) as client:
+        resp = await client.post(token_url, data=form)
+        resp.raise_for_status()
+        body = resp.json()
+    access_token = str(body.get("access_token") or "").strip()
+    if not access_token:
+        raise ValueError("oauth token endpoint returned no access_token")
+    try:
+        expires_in = float(body.get("expires_in"))
+    except (TypeError, ValueError):
+        expires_in = 3600.0
+    return access_token, time.time() + expires_in
+
+
+async def _get_oauth_token(server_id: str, auth: Any) -> str:
+    """Return a cached oauth access_token for ``server_id``, refreshing on expiry.
+
+    Single-flight: concurrent callers for the same ``server_id`` share one fetch
+    via a per-``server_id`` ``asyncio.Lock`` so the token endpoint is hit once.
+    """
+    async with _oauth_lock(server_id):
+        cached = _OAUTH_TOKEN_CACHE.get(server_id)
+        now = time.time()
+        if (
+            cached
+            and float(cached.get("expires_at", 0.0)) - now
+            > _OAUTH_REFRESH_MARGIN_SECONDS
+        ):
+            return str(cached["access_token"])
+        access_token, expires_at = await _fetch_oauth_token(auth)
+        _OAUTH_TOKEN_CACHE[server_id] = {
+            "access_token": access_token,
+            "expires_at": expires_at,
+        }
+        return access_token
+
+
+async def _build_inline_headers(server: dict[str, Any]) -> dict[str, str]:
+    """Merge a server's custom ``headers`` + ``auth`` into the upstream header set.
+
+    Inline runs connect DIRECTLY to the upstream (no broker), so the
+    orchestrator injects upstream auth itself - unlike broker-routed workers,
+    which leave this to the tool-broker.  For ``oauth`` the orchestrator
+    performs the client-credentials flow (cached + single-flight by server_id)
+    and injects ``Authorization: Bearer {access_token}``; a fetch failure is
+    fail-open (logged + no Authorization header) so the MCP handshake surfaces
+    the upstream's own 401 and the server is skipped (failure-isolated).  Auth
+    headers win over colliding custom ``headers`` keys.
+    """
+    headers: dict[str, str] = {}
+    custom = server.get("headers")
+    if isinstance(custom, dict):
+        headers.update({str(k): str(v) for k, v in custom.items()})
+    auth = server.get("auth")
+    if isinstance(auth, dict):
+        auth_type = str(auth.get("type") or "none").lower()
+        if auth_type == "oauth":
+            server_id = str(server.get("id") or "").strip()
+            if server_id:
+                try:
+                    access_token = await _get_oauth_token(server_id, auth)
+                    headers["Authorization"] = f"Bearer {access_token}"
+                except Exception as exc:  # noqa: BLE001 - fail-open
+                    logger.warning(
+                        "inline MCP oauth token fetch failed for %s: %s",
+                        server_id,
+                        exc,
+                    )
+            else:
+                logger.warning(
+                    "inline MCP oauth auth missing server id; skipping token fetch"
+                )
+        else:
+            headers.update(_auth_to_headers(auth))
+    return headers
+
+
+def _resolve_inline_timeout(server: dict[str, Any], default: float) -> float:
+    """Per-server ``timeout_seconds`` when valid, else the catalog default."""
+    raw = server.get("timeout_seconds")
+    if isinstance(raw, (int, float)) and raw > 0:
+        return float(raw)
+    return default
+
+
+def _filter_inline_tools(
+    raw_tools: list[dict[str, Any]], tool_filter: Any
+) -> list[dict[str, Any]]:
+    """Apply a registry ``tool_filter`` {allow, block} to a tools/list result.
+
+    allow non-empty -> keep only allow; block non-empty -> drop block. allow is
+    applied first (whitelist) then block, matching the other consumers.
+    """
+    if not isinstance(tool_filter, dict):
+        return raw_tools
+    allow_raw = (
+        tool_filter.get("allow") if isinstance(tool_filter.get("allow"), list) else []
+    )
+    block_raw = (
+        tool_filter.get("block") if isinstance(tool_filter.get("block"), list) else []
+    )
+    allow = {str(t) for t in allow_raw if str(t)}
+    block = {str(t) for t in block_raw if str(t)}
+    if not allow and not block:
+        return raw_tools
+    out = raw_tools
+    if allow:
+        out = [t for t in out if str(t.get("name") or "") in allow]
+    if block:
+        out = [t for t in out if str(t.get("name") or "") not in block]
+    return out
 
 
 async def load_inline_mcp_catalog(
@@ -337,14 +561,21 @@ async def load_inline_mcp_catalog(
     tenant_id: str,
     user_id: str,
     timeout: float,
+    server_ids: list[str] | None = None,
 ) -> InlineMcpCatalog:
-    """Discover and initialize all healthy tenant HTTP MCP servers."""
+    """Discover and initialize the run's healthy tenant HTTP MCP servers.
+
+    ``server_ids`` is the run's presence-resolved MCP selection: ``None`` =
+    every enabled-by-default tenant server, ``[]`` = none at all for this run,
+    non-empty = only those ids.  See :func:`_fetch_registry_servers`.
+    """
     servers = await _fetch_registry_servers(
         base_url=base_url,
         service_scopes=service_scopes,
         tenant_id=tenant_id,
         user_id=user_id,
         timeout=timeout,
+        server_ids=server_ids,
     )
     tools: dict[str, InlineMcpTool] = {}
     sessions: list[InlineMcpSession] = []
@@ -354,6 +585,16 @@ async def load_inline_mcp_catalog(
         transport = str(server.get("transport") or "").lower()
         endpoint = str(server.get("endpoint") or "").strip()
         server_name = str(server.get("name") or "MCP").strip() or "MCP"
+        if transport == "sse":
+            # Legacy SSE (dual-endpoint GET /sse + POST) is not supported by the
+            # inline Streamable HTTP client. Only the SDK worker direct path
+            # supports it natively; skip here so the inline run stays healthy.
+            logger.warning(
+                "inline MCP skipping SSE server (legacy SSE not supported in "
+                "inline mode; use worker direct mode)",
+                extra={"server": server_name, "transport": transport},
+            )
+            continue
         if transport != "http" or not endpoint:
             logger.info(
                 "inline MCP skipping non-HTTP server",
@@ -361,16 +602,19 @@ async def load_inline_mcp_catalog(
             )
             continue
 
-        manifest_headers = server.get("headers")
-        headers = (
-            {str(k): str(v) for k, v in manifest_headers.items()}
-            if isinstance(manifest_headers, dict)
-            else {}
-        )
+        # Inline runs connect DIRECTLY to the upstream (no broker), so the
+        # orchestrator injects the registry-supplied upstream auth + custom
+        # headers itself (broker-routed workers leave this to the tool-broker).
+        # For ``auth.type == "oauth"`` the orchestrator fetches a client-
+        # credentials token (cached + single-flight by server_id) and injects
+        # the bearer here too.
+        headers = await _build_inline_headers(server)
+        # Per-server timeout_seconds overrides the catalog-wide default.
+        session_timeout = _resolve_inline_timeout(server, timeout)
         session = InlineMcpSession(
             name=server_name,
             endpoint=endpoint,
-            timeout=timeout,
+            timeout=session_timeout,
             headers=headers,
         )
         try:
@@ -384,6 +628,11 @@ async def load_inline_mcp_catalog(
             )
             await session.close()
             continue
+
+        # tool_filter: allow non-empty -> keep only allow; block non-empty ->
+        # drop block. Applied AFTER list_tools as an exposure filter so the
+        # model never sees filtered tools. allow first (whitelist), then block.
+        raw_tools = _filter_inline_tools(raw_tools, server.get("tool_filter"))
 
         sessions.append(session)
         for raw in raw_tools:

@@ -19,7 +19,7 @@ interface NavSpec {
 
 const NAV: NavSpec[] = [
   { to: '/home', label: '新任务', glyph: '◇' },
-  { to: '/schedules', label: '定时任务', glyph: '◷' },
+  { to: '/apps', label: '应用', glyph: '▦' },
   // The workspace management page (base files + instructions + skills). This is
   // where the retired top-of-sidebar WorkspaceSwitcher's "管理工作区" link used
   // to lead; the base-files nav now owns that entry point.
@@ -73,7 +73,7 @@ export function Sidebar() {
                     : 'text-ink-2 border-transparent hover:bg-paper-2 hover:text-ink',
                 ].join(' ')
               }
-              end={n.to === '/home'}
+              end={n.to === '/home' || n.to === '/apps'}
             >
               {({ isActive }) => (
                 <>

@@ -313,7 +313,7 @@ describe("worker", () => {
 
   it("loadMcpServers returns {} when registry is unconfigured (failure-open)", async () => {
     const out = await worker.loadMcpServers(baseEnv());
-    expect(out).toEqual({});
+    expect(out.servers).toEqual({});
   });
 
   it("loadMcpServers parses the registry ListPage envelope (items + transport/endpoint)", async () => {
@@ -349,7 +349,7 @@ describe("worker", () => {
           MCP_REGISTRY_URL: "http://tool-broker:8024/api/tool-broker/v1/mcp/v1",
         }),
       );
-      expect(out).toEqual({
+      expect(out.servers).toEqual({
         echo: { type: "http", url: "http://echo-mcp:9000/mcp" },
       });
     } finally {
@@ -380,7 +380,7 @@ describe("worker", () => {
       });
     }) as unknown as typeof fetch;
     try {
-      return (await worker.loadMcpServers(withRegistry)) as Record<string, unknown>;
+      return (await worker.loadMcpServers(withRegistry)).servers as Record<string, unknown>;
     } finally {
       global.fetch = realFetch;
     }
@@ -534,7 +534,7 @@ describe("worker", () => {
         }),
       );
 
-      expect(out).toEqual({});
+      expect(out.servers).toEqual({});
       // The registry's internal-auth guard requires tenant_id in the query to
       // match the x-tenant-id header, and the broker forwards the query verbatim.
       expect(capturedUrl).toContain("tenant_id=tnt-broker");
@@ -608,6 +608,371 @@ describe("worker", () => {
     } finally {
       global.fetch = realFetch;
     }
+  });
+
+  it("broker mode does NOT forward registry upstream auth/headers (broker injects them) but applies timeout_seconds", async () => {
+    const out = await loadWithRegistryItems(
+      [
+        {
+          id: "mcp_ABC",
+          name: "echo",
+          transport: "http",
+          endpoint: "http://echo-mcp:9000/mcp",
+          headers: { "X-Custom": "reg" },
+          auth: { type: "bearer", token: "upstream-tok" },
+          timeout_seconds: 12,
+        },
+      ],
+      baseEnv({
+        FOUNDATION_API_TOKEN: "tok-broker",
+        FOUNDATION_TENANT_ID: "tnt-broker",
+        SANDBOX_EGRESS_MODE: "broker",
+        TOOL_BROKER_URL: "http://tool-broker:8024/api/tool-broker/v1",
+        TOOL_BROKER_LEASE: "v1.body.sig",
+      }),
+    );
+    // Only broker-auth headers survive (the broker re-injects upstream auth/
+    // headers toward the real upstream from the registry record). The phantom
+    // registry headers/auth MUST NOT be forwarded. timeout_seconds is attached
+    // for forward-compat (the current SDK/CLI ignores the unknown `timeout`).
+    expect(out).toEqual({
+      echo: {
+        type: "http",
+        url: "http://tool-broker:8024/api/tool-broker/v1/mcp-tenant/v1/mcp_ABC",
+        headers: {
+          authorization: "Bearer tok-broker",
+          "x-tenant-id": "tnt-broker",
+          "x-tool-broker-lease": "v1.body.sig",
+        },
+        timeout: 12,
+      },
+    });
+  });
+
+  it("direct (non-broker) mode injects registry auth + headers toward the upstream", async () => {
+    const out = await loadWithRegistryItems(
+      [
+        {
+          id: "mcp_ABC",
+          name: "echo",
+          transport: "http",
+          endpoint: "http://echo-mcp:9000/mcp",
+          headers: { "X-Custom": "reg" },
+          auth: { type: "api_key", api_key: "k", header_name: "X-Api-Key" },
+        },
+      ],
+      baseEnv({ SANDBOX_EGRESS_MODE: "foundation" }),
+    );
+    expect(out).toEqual({
+      echo: {
+        type: "http",
+        url: "http://echo-mcp:9000/mcp",
+        headers: { "X-Custom": "reg", "X-Api-Key": "k" },
+      },
+    });
+  });
+
+  it("stdio server carries args + timeout_seconds", async () => {
+    const out = await loadWithRegistryItems(
+      [
+        {
+          id: "mcp_ABC",
+          name: "local",
+          transport: "stdio",
+          command: "run-local",
+          args: ["--x", "--y"],
+          timeout_seconds: 30,
+        },
+      ],
+      baseEnv({}),
+    );
+    expect(out).toEqual({
+      local: {
+        type: "stdio",
+        command: "run-local",
+        args: ["--x", "--y"],
+        timeout: 30,
+      },
+    });
+  });
+
+  it("loadMcpServers returns tool_filter in the filters map", async () => {
+    const realFetch = global.fetch;
+    global.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          items: [
+            {
+              id: "mcp_ABC",
+              name: "echo",
+              transport: "http",
+              endpoint: "http://echo-mcp:9000/mcp",
+              tool_filter: { allow: ["echo"], block: ["secret"] },
+            },
+          ],
+          total: 1,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }) as unknown as typeof fetch;
+    try {
+      const out = await worker.loadMcpServers(
+        baseEnv({
+          MCP_REGISTRY_URL: "http://mcp-registry:8000",
+          FOUNDATION_TENANT_ID: "tnt",
+        }),
+      );
+      expect(out.filters).toEqual({
+        echo: { allow: ["echo"], block: ["secret"] },
+      });
+    } finally {
+      global.fetch = realFetch;
+    }
+  });
+
+  // ── run-level MCP selection (task.json mcp_server_ids) ────────────────────
+  // Three-state contract: undefined = tenant default (all enabled servers),
+  // [] = MCP off for this run, non-empty = only those ids. `[]` is falsy, so a
+  // truthiness-based check would collapse "disable all" into "enable all".
+  describe("loadMcpServers run-level selection", () => {
+    /** Stub the registry with two http servers and return {fetchCalls, out}. */
+    async function loadWithSelection(selectedIds?: readonly string[]) {
+      const realFetch = global.fetch;
+      let fetchCalls = 0;
+      global.fetch = vi.fn(async () => {
+        fetchCalls += 1;
+        return new Response(
+          JSON.stringify({
+            items: [
+              { id: "mcp_AAA", name: "alpha", transport: "http", endpoint: "http://alpha:9000/mcp" },
+              { id: "mcp_BBB", name: "beta", transport: "http", endpoint: "http://beta:9000/mcp" },
+            ],
+            total: 2,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as unknown as typeof fetch;
+      try {
+        const out = await worker.loadMcpServers(
+          baseEnv({ MCP_REGISTRY_URL: "http://mcp-registry:8000", FOUNDATION_TENANT_ID: "tnt" }),
+          selectedIds,
+        );
+        return { out, fetchCalls };
+      } finally {
+        global.fetch = realFetch;
+      }
+    }
+
+    it("registers every tenant server when the selection is absent (regression guard)", async () => {
+      const { out } = await loadWithSelection(undefined);
+      expect(Object.keys(out.servers).sort()).toEqual(["alpha", "beta"]);
+    });
+
+    it("registers nothing — and skips the registry call — on an explicit []", async () => {
+      const { out, fetchCalls } = await loadWithSelection([]);
+      expect(out.servers).toEqual({});
+      expect(out.filters).toEqual({});
+      // Nothing could survive the filter, so the fetch is pure waste.
+      expect(fetchCalls).toBe(0);
+    });
+
+    it("registers only the selected ids on a non-empty selection", async () => {
+      const { out } = await loadWithSelection(["mcp_BBB"]);
+      expect(Object.keys(out.servers)).toEqual(["beta"]);
+    });
+
+    it("registers nothing when the selected id matches no registry record", async () => {
+      const { out } = await loadWithSelection(["mcp_NOPE"]);
+      expect(out.servers).toEqual({});
+    });
+
+    it("selects before the transport/broker drop, not after", async () => {
+      // In broker mode a server with no broker URL is DROPPED by
+      // mapRegistryServer. Selecting the OTHER server must not depend on that
+      // drop happening first: selection is by identity, the drop is by
+      // capability, and the selected server is stdio (never rewritten).
+      const realFetch = global.fetch;
+      global.fetch = vi.fn(async () => {
+        return new Response(
+          JSON.stringify({
+            items: [
+              { id: "mcp_HTTP", name: "needs-broker", transport: "http", endpoint: "http://x:9000/mcp" },
+              { id: "mcp_STDIO", name: "local", transport: "stdio", command: "/bin/local-mcp" },
+            ],
+            total: 2,
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }) as unknown as typeof fetch;
+      try {
+        const out = await worker.loadMcpServers(
+          baseEnv({
+            MCP_REGISTRY_URL: "http://mcp-registry:8000",
+            FOUNDATION_TENANT_ID: "tnt",
+            SANDBOX_EGRESS_MODE: "broker",
+            TOOL_BROKER_URL: "",
+          }),
+          ["mcp_STDIO"],
+        );
+        expect(Object.keys(out.servers)).toEqual(["local"]);
+      } finally {
+        global.fetch = realFetch;
+      }
+    });
+  });
+
+  it("runQuery adds tool_filter block list to disallowedTools (exposure filter)", async () => {
+    let captured: { disallowedTools: string[] } | undefined;
+    const queryFn = (args: AnyMsg) => {
+      captured = (args as AnyMsg).options as { disallowedTools: string[] };
+      return (async function* () {
+        yield {
+          type: "assistant",
+          message: {
+            content: [{ type: "text", text: "done" }],
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        } as AnyMsg;
+        yield { type: "result", subtype: "success" } as AnyMsg;
+      })() as AnyMsg;
+    };
+    await worker.runQuery(baseTask(), baseEnv(), {
+      systemPrompt: "sys",
+      mcpServers: {},
+      mcpFilters: { echo: { allow: ["echo"], block: ["secret"] } },
+      redis: noopRedis(),
+      deps: { queryFn },
+    });
+    expect(captured).toBeDefined();
+    // block -> exposure filter via disallowedTools.
+    expect(captured!.disallowedTools).toContain("mcp__echo__secret");
+    // allow is enforced by the PreToolUse gate, NOT disallowedTools.
+    expect(captured!.disallowedTools).not.toContain("mcp__echo__echo");
+  });
+
+  // ── MCP timeout env (MCP_TIMEOUT / MCP_TOOL_TIMEOUT) ──────────────────────
+  // A capturing queryFn that records the options object and yields a clean
+  // success result. Reused across the env-aggregation tests below.
+  function capturingQueryForEnv(): {
+    queryFn: (args: AnyMsg) => AnyMsg;
+    getOptions: () => AnyMsg;
+  } {
+    let seenOptions: AnyMsg;
+    const queryFn = (args: AnyMsg) => {
+      seenOptions = args.options;
+      return (async function* () {
+        yield {
+          type: "assistant",
+          message: {
+            content: [{ type: "text", text: "ok" }],
+            usage: { input_tokens: 1, output_tokens: 1 },
+          },
+        } as AnyMsg;
+        yield { type: "result", subtype: "success" } as AnyMsg;
+      })() as AnyMsg;
+    };
+    return { queryFn, getOptions: () => seenOptions };
+  }
+
+  it("runQuery sets options.env MCP_TIMEOUT/MCP_TOOL_TIMEOUT (ms) from the MIN of per-server timeouts", async () => {
+    // Two registry-backed servers carrying `timeout` (seconds, attached by
+    // withTimeout in mapRegistryServer). The MIN (8s) wins and propagates as ms.
+    const { queryFn, getOptions } = capturingQueryForEnv();
+    await worker.runQuery(baseTask(), baseEnv(), {
+      systemPrompt: "sys",
+      mcpServers: {
+        slow: { type: "http", url: "http://slow:9000/mcp", timeout: 30 },
+        fast: { type: "http", url: "http://fast:9000/mcp", timeout: 8 },
+      } as never,
+      redis: noopRedis(),
+      deps: { queryFn },
+    });
+
+    const env = getOptions().env;
+    expect(env).toBeDefined();
+    // CLI parses both as parseInt(_, 10) ms; 8s -> 8000ms (not 30000).
+    expect(env.MCP_TIMEOUT).toBe("8000");
+    expect(env.MCP_TOOL_TIMEOUT).toBe("8000");
+    // process.env is inherited (the SDK uses options.env as the CLI subprocess env).
+    expect(env.WORKER_WORKSPACE_DIR).toBe(process.env.WORKER_WORKSPACE_DIR);
+  });
+
+  it("runQuery leaves options.env unset when no MCP server carries a timeout", async () => {
+    // A server without `timeout` (e.g. a registry server with no timeout_seconds,
+    // or the in-process webfetch/hitl). No env override -> CLI defaults apply.
+    const { queryFn, getOptions } = capturingQueryForEnv();
+    await worker.runQuery(baseTask(), baseEnv(), {
+      systemPrompt: "sys",
+      mcpServers: {
+        echo: { type: "http", url: "http://echo:9000/mcp" },
+      } as never,
+      redis: noopRedis(),
+      deps: { queryFn },
+    });
+
+    expect(getOptions().env).toBeUndefined();
+  });
+
+  it("runQuery leaves options.env unset when there are no MCP servers", async () => {
+    const { queryFn, getOptions } = capturingQueryForEnv();
+    await worker.runQuery(baseTask(), baseEnv(), {
+      systemPrompt: "sys",
+      mcpServers: {},
+      redis: noopRedis(),
+      deps: { queryFn },
+    });
+
+    expect(getOptions().env).toBeUndefined();
+  });
+
+  it("runQuery MIN-aggregation ignores 0 / negative / non-number timeout values", async () => {
+    // 0 and -5 are dropped by withTimeout's guard, so they never reach the config;
+    // only the 20s entry is valid -> 20000ms. (Mirrors withTimeout's positive-only
+    // filter, so the min sees exactly the same set the per-server config carries.)
+    const { queryFn, getOptions } = capturingQueryForEnv();
+    await worker.runQuery(baseTask(), baseEnv(), {
+      systemPrompt: "sys",
+      mcpServers: {
+        a: { type: "http", url: "http://a:9000/mcp" },
+        b: { type: "http", url: "http://b:9000/mcp" },
+        c: { type: "http", url: "http://c:9000/mcp", timeout: 20 },
+      } as never,
+      redis: noopRedis(),
+      deps: { queryFn },
+    });
+
+    const env = getOptions().env;
+    expect(env).toBeDefined();
+    expect(env.MCP_TIMEOUT).toBe("20000");
+    expect(env.MCP_TOOL_TIMEOUT).toBe("20000");
+  });
+
+  it("runQuery does NOT regress round-1 oauth: a timeout-bearing server still gets env + config", async () => {
+    // Regression guard for the round-1 oauth change (mapRegistryServer async +
+    // token cache): the env path is orthogonal to config headers, so a server
+    // mapped with a timeout should produce BOTH the `timeout` field on the
+    // config AND the MCP_TIMEOUT env on the query options.
+    const { queryFn, getOptions } = capturingQueryForEnv();
+    await worker.runQuery(baseTask(), baseEnv(), {
+      systemPrompt: "sys",
+      mcpServers: {
+        echo: {
+          type: "http",
+          url: "http://echo:9000/mcp",
+          headers: { Authorization: "Bearer tok-direct" },
+          timeout: 15,
+        },
+      } as never,
+      redis: noopRedis(),
+      deps: { queryFn },
+    });
+
+    // Config headers (oauth-injected in real flow) survive untouched.
+    const echoCfg = getOptions().mcpServers.echo;
+    expect(echoCfg.headers.Authorization).toBe("Bearer tok-direct");
+    // And the env timeout is derived from the same per-server `timeout`.
+    expect(getOptions().env.MCP_TIMEOUT).toBe("15000");
+    expect(getOptions().env.MCP_TOOL_TIMEOUT).toBe("15000");
   });
 
   it("buildResumeContext returns '' when no checkpoint / terminal checkpoint", async () => {
@@ -1229,6 +1594,312 @@ describe("worker", () => {
       expect(worker.extractStructuredOutputSchema({ response_format: { type: "json_object" } })).toBeUndefined();
       expect(worker.extractStructuredOutputSchema({})).toBeUndefined();
       expect(worker.extractStructuredOutputSchema(undefined)).toBeUndefined();
+    });
+  });
+
+  // ── OAuth client-credentials (direct-mode MCP servers) ─────────────────────
+  describe("oauth client-credentials", () => {
+    const TOKEN_URL = "https://idp.example/oauth/token";
+    const OAUTH_AUTH = {
+      type: "oauth",
+      client_id: "cid",
+      client_secret: "csec",
+      token_url: TOKEN_URL,
+      scopes: ["a", "b"],
+    };
+
+    /** Stub global.fetch with a per-URL handler map (url -> () => Response).
+     * Lookup strips the query string so the registry fetch (which carries
+     * ``?tenant_id=``) matches the bare handler key. A handler may return a
+     * Promise to simulate token-endpoint latency (single-flight test). */
+    function stubFetch(
+      handlers: Record<string, (init?: RequestInit) => Response | Promise<Response>>,
+    ): { calls: Record<string, RequestInit[]>; restore: () => void } {
+      const realFetch = global.fetch;
+      const calls: Record<string, RequestInit[]> = {};
+      global.fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+        const u = String(url);
+        const key = u.split("?")[0];
+        calls[key] = calls[key] ?? [];
+        calls[key].push(init ?? ({} as RequestInit));
+        const handler = handlers[key];
+        if (!handler) {
+          return new Response("not found", { status: 404 });
+        }
+        return await handler(init);
+      }) as unknown as typeof fetch;
+      return { calls, restore: () => { global.fetch = realFetch; } };
+    }
+
+    it("fetchOauthToken posts client_credentials form with space-joined scopes", async () => {
+      const { calls, restore } = stubFetch({
+        [TOKEN_URL]: () =>
+          new Response(JSON.stringify({ access_token: "tok", expires_in: 7200 }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      });
+      try {
+        const out = await worker.fetchOauthToken(OAUTH_AUTH);
+        expect(out.access_token).toBe("tok");
+        const init = calls[TOKEN_URL][0];
+        expect(init.method).toBe("POST");
+        const body = String(init.body);
+        expect(body).toContain("grant_type=client_credentials");
+        expect(body).toContain("client_id=cid");
+        expect(body).toContain("client_secret=csec");
+        // scopes are space-joined; URLSearchParams encodes the space as "+".
+        expect(body).toContain("scope=a+b");
+        const headers = init.headers as Record<string, string>;
+        expect(headers["content-type"]).toBe("application/x-www-form-urlencoded");
+        expect(out.expires_at).toBeGreaterThan(Date.now() + 7000);
+      } finally {
+        restore();
+      }
+    });
+
+    it("fetchOauthToken throws when the token endpoint returns non-200", async () => {
+      const { restore } = stubFetch({
+        [TOKEN_URL]: () => new Response("denied", { status: 500 }),
+      });
+      try {
+        await expect(worker.fetchOauthToken(OAUTH_AUTH)).rejects.toThrow(
+          /HTTP 500/,
+        );
+      } finally {
+        restore();
+      }
+    });
+
+    it("fetchOauthToken throws when access_token is missing", async () => {
+      const { restore } = stubFetch({
+        [TOKEN_URL]: () =>
+          new Response(JSON.stringify({ error: "denied" }), { status: 200 }),
+      });
+      try {
+        await expect(worker.fetchOauthToken(OAUTH_AUTH)).rejects.toThrow(
+          /no access_token/,
+        );
+      } finally {
+        restore();
+      }
+    });
+
+    it("getOauthToken caches a valid token (no refetch on second call)", async () => {
+      worker._resetOauthTokenCacheForTest();
+      const { calls, restore } = stubFetch({
+        [TOKEN_URL]: () =>
+          new Response(JSON.stringify({ access_token: "tok", expires_in: 3600 }), {
+            status: 200,
+          }),
+      });
+      try {
+        const a = await worker.getOauthToken("srv_cache", OAUTH_AUTH);
+        const b = await worker.getOauthToken("srv_cache", OAUTH_AUTH);
+        expect(a).toBe("tok");
+        expect(b).toBe("tok");
+        expect(calls[TOKEN_URL]).toHaveLength(1);
+      } finally {
+        restore();
+        worker._resetOauthTokenCacheForTest();
+      }
+    });
+
+    it("getOauthToken refreshes after expiry", async () => {
+      worker._resetOauthTokenCacheForTest();
+      const { calls, restore } = stubFetch({
+        [TOKEN_URL]: () =>
+          // expires_in=0 -> immediately past the refresh margin.
+          new Response(JSON.stringify({ access_token: "tok", expires_in: 0 }), {
+            status: 200,
+          }),
+      });
+      try {
+        await worker.getOauthToken("srv_refresh", OAUTH_AUTH);
+        await worker.getOauthToken("srv_refresh", OAUTH_AUTH);
+        expect(calls[TOKEN_URL]).toHaveLength(2);
+      } finally {
+        restore();
+        worker._resetOauthTokenCacheForTest();
+      }
+    });
+
+    it("getOauthToken single-flight: concurrent calls share ONE fetch", async () => {
+      worker._resetOauthTokenCacheForTest();
+      const { calls, restore } = stubFetch({
+        [TOKEN_URL]: () =>
+          // Delay the response so concurrent callers arrive while the first is
+          // still in flight.
+          new Promise<Response>((resolve) => {
+            setTimeout(
+              () =>
+                resolve(
+                  new Response(JSON.stringify({ access_token: "tok", expires_in: 3600 }), {
+                    status: 200,
+                  }),
+                ),
+              30,
+            );
+          }),
+      });
+      try {
+        const results = await Promise.all([
+          worker.getOauthToken("srv_sf", OAUTH_AUTH),
+          worker.getOauthToken("srv_sf", OAUTH_AUTH),
+          worker.getOauthToken("srv_sf", OAUTH_AUTH),
+        ]);
+        expect(results).toEqual(["tok", "tok", "tok"]);
+        expect(calls[TOKEN_URL]).toHaveLength(1);
+      } finally {
+        restore();
+        worker._resetOauthTokenCacheForTest();
+      }
+    });
+
+    it("direct mode fetches an oauth token and injects Bearer into config headers", async () => {
+      worker._resetOauthTokenCacheForTest();
+      const registryUrl = "http://mcp-registry:8000";
+      const { calls, restore } = stubFetch({
+        [`${registryUrl}/internal/mcp-servers`]: () =>
+          new Response(
+            JSON.stringify({
+              items: [
+                {
+                  id: "mcp_OAUTH",
+                  name: "echo",
+                  transport: "http",
+                  endpoint: "http://echo-mcp:9000/mcp",
+                  auth: OAUTH_AUTH,
+                },
+              ],
+              total: 1,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        [TOKEN_URL]: () =>
+          new Response(JSON.stringify({ access_token: "tok-direct", expires_in: 3600 }), {
+            status: 200,
+          }),
+      });
+      try {
+        const out = await worker.loadMcpServers(
+          baseEnv({
+            FOUNDATION_TENANT_ID: "tnt",
+            MCP_REGISTRY_URL: registryUrl,
+            SANDBOX_EGRESS_MODE: "foundation",
+          }),
+        );
+        expect(out.servers).toEqual({
+          echo: {
+            type: "http",
+            url: "http://echo-mcp:9000/mcp",
+            headers: { Authorization: "Bearer tok-direct" },
+          },
+        });
+        // The token endpoint was hit exactly once.
+        expect(calls[TOKEN_URL]).toHaveLength(1);
+      } finally {
+        restore();
+        worker._resetOauthTokenCacheForTest();
+      }
+    });
+
+    it("direct mode oauth fetch failure is fail-open (no Authorization header)", async () => {
+      worker._resetOauthTokenCacheForTest();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const registryUrl = "http://mcp-registry:8000";
+      const { restore } = stubFetch({
+        [`${registryUrl}/internal/mcp-servers`]: () =>
+          new Response(
+            JSON.stringify({
+              items: [
+                {
+                  id: "mcp_OAUTH2",
+                  name: "echo",
+                  transport: "http",
+                  endpoint: "http://echo-mcp:9000/mcp",
+                  auth: OAUTH_AUTH,
+                },
+              ],
+              total: 1,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+        [TOKEN_URL]: () => new Response("denied", { status: 500 }),
+      });
+      try {
+        const out = await worker.loadMcpServers(
+          baseEnv({
+            FOUNDATION_TENANT_ID: "tnt",
+            MCP_REGISTRY_URL: registryUrl,
+            SANDBOX_EGRESS_MODE: "foundation",
+          }),
+        );
+        // Fail-open: the server is still mapped, just without an Authorization header.
+        expect(out.servers).toEqual({
+          echo: { type: "http", url: "http://echo-mcp:9000/mcp" },
+        });
+        expect(warn).toHaveBeenCalledWith(
+          expect.stringContaining("oauth token fetch failed"),
+        );
+      } finally {
+        restore();
+        warn.mockRestore();
+        worker._resetOauthTokenCacheForTest();
+      }
+    });
+
+    it("broker mode does NOT fetch an oauth token (broker injects it)", async () => {
+      worker._resetOauthTokenCacheForTest();
+      const registryUrl = "http://tool-broker:8024/api/tool-broker/v1/mcp/v1";
+      const { calls, restore } = stubFetch({
+        [`${registryUrl}/internal/mcp-servers`]: () =>
+          new Response(
+            JSON.stringify({
+              items: [
+                {
+                  id: "mcp_OAUTH3",
+                  name: "echo",
+                  transport: "http",
+                  endpoint: "http://echo-mcp:9000/mcp",
+                  auth: OAUTH_AUTH,
+                },
+              ],
+              total: 1,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          ),
+      });
+      try {
+        const out = await worker.loadMcpServers(
+          baseEnv({
+            FOUNDATION_API_TOKEN: "tok-broker",
+            FOUNDATION_TENANT_ID: "tnt-broker",
+            MCP_REGISTRY_URL: registryUrl,
+            SANDBOX_EGRESS_MODE: "broker",
+            TOOL_BROKER_URL: "http://tool-broker:8024/api/tool-broker/v1",
+            TOOL_BROKER_LEASE: "v1.body.sig",
+          }),
+        );
+        // Broker mode rewrites to the passthrough + broker-auth headers; the
+        // oauth token is NOT fetched here (the broker does it from the registry
+        // record). Only the registry fetch happened - no token-endpoint call.
+        expect(out.servers).toEqual({
+          echo: {
+            type: "http",
+            url: "http://tool-broker:8024/api/tool-broker/v1/mcp-tenant/v1/mcp_OAUTH3",
+            headers: {
+              authorization: "Bearer tok-broker",
+              "x-tenant-id": "tnt-broker",
+              "x-tool-broker-lease": "v1.body.sig",
+            },
+          },
+        });
+        expect(calls[TOKEN_URL]).toBeUndefined();
+      } finally {
+        restore();
+        worker._resetOauthTokenCacheForTest();
+      }
     });
   });
 });

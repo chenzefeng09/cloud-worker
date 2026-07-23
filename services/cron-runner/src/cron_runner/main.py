@@ -38,11 +38,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Cron Runner", version="0.1.0a1", lifespan=lifespan)
     app.state.settings = settings
 
-    from cron_runner.api.v1.health import router as health_router
+    from cron_runner.api.exception_handlers import register_exception_handlers
+
+    register_exception_handlers(app)
+
     from cron_runner.api.v1.cron_jobs import router as cron_jobs_router
+    from cron_runner.api.v1.health import router as health_router
+    from cron_runner.api.v1.internal import router as internal_router
 
     app.include_router(health_router, prefix=settings.api_prefix)
     app.include_router(cron_jobs_router, prefix=settings.api_prefix)
+    # Service-to-service only (webhook secret verification) — never proxied by
+    # the BFF's public /schedules surface.
+    app.include_router(internal_router, prefix=settings.api_prefix)
     return app
 
 

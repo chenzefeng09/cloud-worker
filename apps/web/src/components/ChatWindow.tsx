@@ -2,17 +2,23 @@ import { useCallback, useEffect, useMemo, useRef, useState, type WheelEvent } fr
 import { useChat } from '../hooks/useChat';
 import { useOutputAttachments } from '../hooks/useOutputAttachments';
 import { useInstalledSkills } from '../hooks/useInstalledSkills';
+import { useMcpServers } from '../hooks/useMcpServers';
 import { useChatStore, hasPendingInteraction } from '../stores/chatStore';
 import { MessageBubble, WorkingOnItPill } from './MessageBubble';
 import { StepGroup } from './StepGroup';
 import { OutputFileCards } from './OutputFileCards';
-import { InputBar } from './InputBar';
+import { Composer } from './composer/Composer';
 import { PlanBlock } from './PlanBlock';
 import { RewindConfirmModal } from './RewindConfirmModal';
 import { DataNoticeModal } from './DataNoticeModal';
 import { ConfirmCard } from './hitl/ConfirmCard';
 import { QuestionCard } from './hitl/QuestionCard';
 import { CanvasMessageCard } from './CanvasMessageCard';
+import {
+  MarkdownAssetsProvider,
+  makeAttachmentImageResolver,
+  type MarkdownAssets,
+} from './markdownAssets';
 import { api } from '../api/client';
 import type { Attachment, MessageAttachment } from '../api/types';
 import type { MentionCandidate } from '../lib/mentionTrigger';
@@ -354,6 +360,29 @@ export function ChatWindow({
   } = useChat();
   const { byRunId, refresh: refreshOutputs } = useOutputAttachments(sessionId);
 
+  // Resolve sandbox-relative markdown image paths in assistant replies against
+  // this session's output attachments — reusing the list `OutputFileCards`
+  // already fetched, so no extra request. Scoped to the whole session rather
+  // than one run: the markdown renderer has no run context, and filenames are
+  // what the model wrote anyway.
+  // `byRunId` is rebuilt every render, so the memo keys off the flattened id
+  // list; returning a fresh context value each render would re-render every
+  // markdown tree in the transcript.
+  const outputAttachments = useMemo(
+    () => Array.from(byRunId.values()).flat(),
+    [byRunId],
+  );
+  const outputAttachmentsKey = outputAttachments.map((a) => a.id).join(',');
+  const markdownAssets = useMemo<MarkdownAssets>(
+    () => ({
+      resolveImage: makeAttachmentImageResolver(outputAttachments, sessionId),
+      onOpen: (t) =>
+        t.id ? onPreviewFile?.({ id: t.id, filename: t.filename, mime: t.mime }) : undefined,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- outputAttachmentsKey is the stable identity of outputAttachments
+    [outputAttachmentsKey, sessionId, onPreviewFile],
+  );
+
   // "@ file" mention candidates: workspace base files (labelled 工作区) + this
   // session's input attachments (labelled 附件). Best-effort — any fetch that
   // fails degrades silently to whatever loaded. Refreshed on a run-completion
@@ -398,13 +427,21 @@ export function ChatWindow({
   const prevStreamingRef = useRef(isStreaming);
   const [isAwayFromBottom, setIsAwayFromBottom] = useState(false);
 
-  // Per-session skill toggles, surfaced in the InputBar "+" popover.
+  // Per-session skill toggles, surfaced in the composer "+" menu.
   const skills = useInstalledSkills();
   const selectedSkills = useChatStore((s) => s.selectedSkills[sessionId]);
   const toggleSkill = useChatStore((s) => s.toggleSkill);
   const seedSkills = useChatStore((s) => s.seedSkills);
 
-  // Per-session model + reasoning effort, surfaced in the InputBar toolbar.
+  // Per-session MCP server toggles, same "+" menu. `selectedMcpServerIds` is
+  // intentionally left `undefined` until the user actually toggles something —
+  // see the onToggle comment at the <Composer> call site.
+  const { servers: mcpServers } = useMcpServers();
+  const selectedMcpServerIds = useChatStore((s) => s.selectedMcpServerIds[sessionId]);
+  const toggleMcpServer = useChatStore((s) => s.toggleMcpServer);
+  const seedMcpServerIds = useChatStore((s) => s.seedMcpServerIds);
+
+  // Per-session model + reasoning effort, surfaced in the composer toolbar.
   const showThinkingUi = useFeatureFlag('ai.thinking_ui');
   // canvas.v2 Phase B: gate the message-anchored canvas card (rendered under an
   // assistant bubble whose row carries a materialized canvas_id).
@@ -417,6 +454,10 @@ export function ChatWindow({
   // stays reference-stable; defaults applied at render, not in the selector.
   const executionMode = useChatStore((s) => s.executionMode[sessionId]);
   const setSessionExecutionMode = useChatStore((s) => s.setSessionExecutionMode);
+  // Per-session opt-out of the platform-global default skills (default on).
+  const platformDefaultsEnabled =
+    useChatStore((s) => s.platformDefaultsEnabled[sessionId]) !== false;
+  const setPlatformDefaultsEnabled = useChatStore((s) => s.setPlatformDefaultsEnabled);
   const { modelId: defaultModelId } = useDefaultModel('llm');
 
   // Live plan steps for this session — rendered at the bottom of the transcript.
@@ -626,235 +667,256 @@ export function ChatWindow({
   };
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 relative">
-      <div
-        ref={scrollRef}
-        onScroll={updateScrollStickiness}
-        onWheel={handleTranscriptWheel}
-        className="cw-scroll flex-1 px-8 py-5 flex flex-col gap-[8px]"
-      >
-        <div style={{ maxWidth: 780, margin: '0 auto', width: '100%', display: 'flex', flexDirection: 'column', gap: 8 }}>
-          {/* ── Real messages ── */}
-          {(() => {
-            const units = groupSteps(messages, isStreaming);
-
-            // Pre-compute: for each run_id that has output files, find the
-            // index of the LAST assistant message unit with that run_id.
-            // We only attach file cards to that final unit to avoid duplication.
-            const lastAssistantUnitIdx = new Map<string, number>();
-            units.forEach((u, idx) => {
-              if (u.kind === 'message') {
-                const role = (u.message.role || '').toUpperCase();
-                const runId = u.message.run_id;
-                if (role === 'ASSISTANT' && runId && byRunId.has(runId)) {
-                  lastAssistantUnitIdx.set(runId, idx);
-                }
-              }
-            });
-
-            // Per-run copy support: for each run, find the LAST assistant TEXT
-            // message unit (so the copy button appears only there), and build
-            // the concatenated text of ALL assistant messages in that round.
-            const isAssistantText = (u: typeof units[number]) =>
-              u.kind === 'message' &&
-              (u.message.role || '').toUpperCase() === 'ASSISTANT' &&
-              u.message.blockKind !== 'tool' &&
-              u.message.blockKind !== 'thinking';
-            const roundKeyOf = (m: { run_id: string | null; streamRunId?: string }) =>
-              m.run_id ?? m.streamRunId ?? null;
-
-            const lastAssistantTextUnitIdx = new Map<string, number>();
-            const roundCopyText = new Map<string, string>();
-            units.forEach((u, idx) => {
-              if (!isAssistantText(u) || u.kind !== 'message') return;
-              const key = roundKeyOf(u.message);
-              if (!key) return;
-              lastAssistantTextUnitIdx.set(key, idx);
-              const prev = roundCopyText.get(key);
-              roundCopyText.set(
-                key,
-                prev ? `${prev}\n\n${u.message.content}` : u.message.content,
-              );
-            });
-
-            return units.map((u, idx) => {
-              if (u.kind === 'message') {
-                const role = (u.message.role || '').toUpperCase();
-                const runId = u.message.run_id;
-                // Manual "put in canvas": the card renders ADDITIVELY below its
-                // anchor bubble (design §7.1 — no more hiding, card + bubble
-                // coexist). Covers both draft mode (flag off) and the v2
-                // inlineCanvasV2Id path (flag on).
-                const isInlineCanvasAnchor =
-                  canRenderInlineCanvas && inlineCanvasAnchorMessageId === u.message.id;
-                // Show output file cards only under the last assistant message
-                // for a given run_id (prevents duplicate cards if a run has
-                // multiple assistant text blocks).
-                const showCards =
-                  role === 'ASSISTANT' &&
-                  runId != null &&
-                  byRunId.has(runId) &&
-                  lastAssistantUnitIdx.get(runId) === idx;
-
-                const roundKey = u.message.run_id ?? u.message.streamRunId ?? null;
-                const showRoundCopy =
-                  roundKey != null && lastAssistantTextUnitIdx.get(roundKey) === idx;
-
-                // canvas.v2 Phase B: anchor a materialized canvas card under
-                // this assistant bubble when the row carries a canvas_id.  The
-                // card is ADDITIVE — the bubble always renders (a Phase B
-                // assistant turn writes one explanatory sentence as normal
-                // text), so the model's content is never hidden behind the
-                // card.  Skip when the Phase A inlineCanvasV2Id path already
-                // renders THIS canvas, so the same canvas never draws twice.
-                const showCanvasCard =
-                  canvasV2 &&
-                  role === 'ASSISTANT' &&
-                  Boolean(u.message.canvas_id) &&
-                  u.message.canvas_id !== inlineCanvasV2Id;
-
-                return (
-                  <div key={u.message.id}>
-                    <MessageBubble
-                      message={u.message}
-                      friendly={friendly}
-                      onPreviewFile={onPreviewFile}
-                      onRewind={rewindTo}
-                      showRoundCopy={showRoundCopy}
-                      roundCopyText={roundKey != null ? roundCopyText.get(roundKey) : undefined}
-                    />
-                    {isInlineCanvasAnchor && renderInlineCanvasCard()}
-                    {showCanvasCard && (
-                      <CanvasMessageCard
-                        sessionId={sessionId}
-                        canvasId={u.message.canvas_id!}
-                        aiDisabled={isStreaming}
-                        onOpenPanel={onInlineCanvasOpenPanel}
-                      />
-                    )}
-                    {showCards && (
-                      <OutputFileCards
-                        files={byRunId.get(runId!)!}
-                        sessionId={sessionId}
-                        onPreviewFile={onPreviewFile}
-                      />
-                    )}
-                  </div>
-                );
-              }
-              return (
-                <StepGroup
-                  key={`steps_${u.runId}_${u.steps[0]?.id ?? '0'}`}
-                  group={u}
-                  friendly={friendly}
-                  onPreviewFile={onPreviewFile}
-                />
-              );
-            });
-          })()}
-
-          {/* ── Design fixture fallback (no real messages yet) ── */}
-          {/* DESIGN FIXTURE — remove when backend provides transcript data */}
-          {showFixture &&
-            AGENT_TRANSCRIPT_FIXTURE.map((m) => (
-              <FixtureMessage key={m.id} m={m} friendly={friendly} />
-            ))}
-
-          {/* ── Empty state (fixtures off, no messages) ── */}
-          {!showFixture &&
-            messages.length === 0 &&
-            !isStreaming &&
-            !inlineCanvasDraft &&
-            !inlineCanvasV2Id && (
-            <div className="flex-1 flex items-center justify-center py-16">
-              <span className="font-mono italic text-dim text-[12px]">
-                开始与 AI Agent 对话
-              </span>
-            </div>
-          )}
-
-          {canRenderInlineCanvas && !anchoredInlineCanvasVisible && renderInlineCanvasCard()}
-
-          {/* ── Current plan steps (live from agent TaskCreate/TaskUpdate) ── */}
-          {planSteps && planSteps.length > 0 && <PlanBlock steps={planSteps} />}
-
-          {/* ── Live "Working on it…" pill — shown while streaming, regardless of mode ── */}
-          {isStreaming && <WorkingOnItPill />}
-
-          {/* ── HITL cards — confirm / question ──────────────────────────────
-              Pinned at the bottom of the message list when the agent pauses.
-              The composer is DISABLED while cards are present (hasPending) to
-              prevent the user from forking the paused run with a new message.
-
-              Survives refresh/reconnect: useChat hydrates these on mount via
-              GET /sessions/{sid}/pending (api.sessions.pending) so a run that
-              paused while the page was closed still shows its card. */}
-          {pendingInteractions.map((interaction) =>
-            interaction.kind === 'confirm' ? (
-              <ConfirmCard
-                key={interaction.toolCallId}
-                sessionId={sessionId}
-                interaction={interaction}
-              />
-            ) : (
-              <QuestionCard
-                key={interaction.toolCallId}
-                sessionId={sessionId}
-                interaction={interaction}
-              />
-            ),
-          )}
-
-          <div ref={bottomRef} />
-        </div>
-      </div>
-      {isAwayFromBottom && (
-        <button
-          type="button"
-          className="chat-scroll-to-bottom"
-          onClick={() => scrollToBottom('smooth')}
-          aria-label="滚动到最新消息"
-          title="滚动到最新消息"
+    <MarkdownAssetsProvider value={markdownAssets}>
+      <div className="flex-1 flex flex-col min-h-0 relative">
+        <div
+          ref={scrollRef}
+          onScroll={updateScrollStickiness}
+          onWheel={handleTranscriptWheel}
+          className="cw-scroll flex-1 px-8 py-5 flex flex-col gap-[8px]"
         >
-          ↓
-        </button>
-      )}
-      <InputBar
-        onSend={handleSend}
-        disabled={isStreaming || hasPending}
-        isStreaming={isStreaming}
-        onStop={cancel}
-        onUpload={handleUpload}
-        prefill={externalPrefill || prefillText}
-        onPrefillConsumed={() => {
-          if (externalPrefill) {
-            onExternalPrefillConsumed?.();
-          } else {
-            clearPrefill();
-          }
-        }}
-        sessionId={sessionId}
-        skills={skills}
-        selectedSkills={selectedSkills}
-        onToggleSkill={(name) => toggleSkill(sessionId, name)}
-        model={selectedModel ?? defaultModelId ?? SYSTEM_FALLBACK_MODEL}
-        effort={selectedEffort ?? DEFAULT_EFFORT}
-        onModelChange={showThinkingUi ? (m) => setSessionModel(sessionId, m) : undefined}
-        onEffortChange={showThinkingUi ? (e) => setSessionEffort(sessionId, e) : undefined}
-        executionMode={executionMode ?? 'sandbox'}
-        onExecutionModeChange={(mode) => setSessionExecutionMode(sessionId, mode)}
-        mentionCandidates={mentionCandidates}
-      />
-      {showDataNotice && <DataNoticeModal onAck={ackDataNotice} />}
-      {pendingRewind && (
-        <RewindConfirmModal
-          message={pendingRewind}
-          busy={rewindBusy}
-          error={rewindError}
-          onConfirm={confirmRewind}
-          onCancel={cancelRewind}
+          <div style={{ maxWidth: 780, margin: '0 auto', width: '100%', display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {/* ── Real messages ── */}
+            {(() => {
+              const units = groupSteps(messages, isStreaming);
+
+              // Pre-compute: for each run_id that has output files, find the
+              // index of the LAST assistant message unit with that run_id.
+              // We only attach file cards to that final unit to avoid duplication.
+              const lastAssistantUnitIdx = new Map<string, number>();
+              units.forEach((u, idx) => {
+                if (u.kind === 'message') {
+                  const role = (u.message.role || '').toUpperCase();
+                  const runId = u.message.run_id;
+                  if (role === 'ASSISTANT' && runId && byRunId.has(runId)) {
+                    lastAssistantUnitIdx.set(runId, idx);
+                  }
+                }
+              });
+
+              // Per-run copy support: for each run, find the LAST assistant TEXT
+              // message unit (so the copy button appears only there), and build
+              // the concatenated text of ALL assistant messages in that round.
+              const isAssistantText = (u: typeof units[number]) =>
+                u.kind === 'message' &&
+                (u.message.role || '').toUpperCase() === 'ASSISTANT' &&
+                u.message.blockKind !== 'tool' &&
+                u.message.blockKind !== 'thinking';
+              const roundKeyOf = (m: { run_id: string | null; streamRunId?: string }) =>
+                m.run_id ?? m.streamRunId ?? null;
+
+              const lastAssistantTextUnitIdx = new Map<string, number>();
+              const roundCopyText = new Map<string, string>();
+              units.forEach((u, idx) => {
+                if (!isAssistantText(u) || u.kind !== 'message') return;
+                const key = roundKeyOf(u.message);
+                if (!key) return;
+                lastAssistantTextUnitIdx.set(key, idx);
+                const prev = roundCopyText.get(key);
+                roundCopyText.set(
+                  key,
+                  prev ? `${prev}\n\n${u.message.content}` : u.message.content,
+                );
+              });
+
+              return units.map((u, idx) => {
+                if (u.kind === 'message') {
+                  const role = (u.message.role || '').toUpperCase();
+                  const runId = u.message.run_id;
+                  // Manual "put in canvas": the card renders ADDITIVELY below its
+                  // anchor bubble (design §7.1 — no more hiding, card + bubble
+                  // coexist). Covers both draft mode (flag off) and the v2
+                  // inlineCanvasV2Id path (flag on).
+                  const isInlineCanvasAnchor =
+                    canRenderInlineCanvas && inlineCanvasAnchorMessageId === u.message.id;
+                  // Show output file cards only under the last assistant message
+                  // for a given run_id (prevents duplicate cards if a run has
+                  // multiple assistant text blocks).
+                  const showCards =
+                    role === 'ASSISTANT' &&
+                    runId != null &&
+                    byRunId.has(runId) &&
+                    lastAssistantUnitIdx.get(runId) === idx;
+
+                  const roundKey = u.message.run_id ?? u.message.streamRunId ?? null;
+                  const showRoundCopy =
+                    roundKey != null && lastAssistantTextUnitIdx.get(roundKey) === idx;
+
+                  // canvas.v2 Phase B: anchor a materialized canvas card under
+                  // this assistant bubble when the row carries a canvas_id.  The
+                  // card is ADDITIVE — the bubble always renders (a Phase B
+                  // assistant turn writes one explanatory sentence as normal
+                  // text), so the model's content is never hidden behind the
+                  // card.  Skip when the Phase A inlineCanvasV2Id path already
+                  // renders THIS canvas, so the same canvas never draws twice.
+                  const showCanvasCard =
+                    canvasV2 &&
+                    role === 'ASSISTANT' &&
+                    Boolean(u.message.canvas_id) &&
+                    u.message.canvas_id !== inlineCanvasV2Id;
+
+                  return (
+                    <div key={u.message.id}>
+                      <MessageBubble
+                        message={u.message}
+                        friendly={friendly}
+                        onPreviewFile={onPreviewFile}
+                        onRewind={rewindTo}
+                        showRoundCopy={showRoundCopy}
+                        roundCopyText={roundKey != null ? roundCopyText.get(roundKey) : undefined}
+                      />
+                      {isInlineCanvasAnchor && renderInlineCanvasCard()}
+                      {showCanvasCard && (
+                        <CanvasMessageCard
+                          sessionId={sessionId}
+                          canvasId={u.message.canvas_id!}
+                          aiDisabled={isStreaming}
+                          onOpenPanel={onInlineCanvasOpenPanel}
+                        />
+                      )}
+                      {showCards && (
+                        <OutputFileCards
+                          files={byRunId.get(runId!)!}
+                          sessionId={sessionId}
+                          onPreviewFile={onPreviewFile}
+                        />
+                      )}
+                    </div>
+                  );
+                }
+                return (
+                  <StepGroup
+                    key={`steps_${u.runId}_${u.steps[0]?.id ?? '0'}`}
+                    group={u}
+                    friendly={friendly}
+                    onPreviewFile={onPreviewFile}
+                  />
+                );
+              });
+            })()}
+
+            {/* ── Design fixture fallback (no real messages yet) ── */}
+            {/* DESIGN FIXTURE — remove when backend provides transcript data */}
+            {showFixture &&
+              AGENT_TRANSCRIPT_FIXTURE.map((m) => (
+                <FixtureMessage key={m.id} m={m} friendly={friendly} />
+              ))}
+
+            {/* ── Empty state (fixtures off, no messages) ── */}
+            {!showFixture &&
+              messages.length === 0 &&
+              !isStreaming &&
+              !inlineCanvasDraft &&
+              !inlineCanvasV2Id && (
+              <div className="flex-1 flex items-center justify-center py-16">
+                <span className="font-mono italic text-dim text-[12px]">
+                  开始与 AI Agent 对话
+                </span>
+              </div>
+            )}
+
+            {canRenderInlineCanvas && !anchoredInlineCanvasVisible && renderInlineCanvasCard()}
+
+            {/* ── Current plan steps (live from agent TaskCreate/TaskUpdate) ── */}
+            {planSteps && planSteps.length > 0 && <PlanBlock steps={planSteps} />}
+
+            {/* ── Live "Working on it…" pill — shown while streaming, regardless of mode ── */}
+            {isStreaming && <WorkingOnItPill />}
+
+            {/* ── HITL cards — confirm / question ──────────────────────────────
+                Pinned at the bottom of the message list when the agent pauses.
+                The composer is DISABLED while cards are present (hasPending) to
+                prevent the user from forking the paused run with a new message.
+
+                Survives refresh/reconnect: useChat hydrates these on mount via
+                GET /sessions/{sid}/pending (api.sessions.pending) so a run that
+                paused while the page was closed still shows its card. */}
+            {pendingInteractions.map((interaction) =>
+              interaction.kind === 'confirm' ? (
+                <ConfirmCard
+                  key={interaction.toolCallId}
+                  sessionId={sessionId}
+                  interaction={interaction}
+                />
+              ) : (
+                <QuestionCard
+                  key={interaction.toolCallId}
+                  sessionId={sessionId}
+                  interaction={interaction}
+                />
+              ),
+            )}
+
+            <div ref={bottomRef} />
+          </div>
+        </div>
+        {isAwayFromBottom && (
+          <button
+            type="button"
+            className="chat-scroll-to-bottom"
+            onClick={() => scrollToBottom('smooth')}
+            aria-label="滚动到最新消息"
+            title="滚动到最新消息"
+          >
+            ↓
+          </button>
+        )}
+        <Composer
+          onSend={handleSend}
+          disabled={isStreaming || hasPending}
+          isStreaming={isStreaming}
+          onStop={cancel}
+          onUpload={handleUpload}
+          prefill={externalPrefill || prefillText}
+          onPrefillConsumed={() => {
+            if (externalPrefill) {
+              onExternalPrefillConsumed?.();
+            } else {
+              clearPrefill();
+            }
+          }}
+          skills={{
+            skills,
+            selected: selectedSkills,
+            onToggle: (name) => toggleSkill(sessionId, name),
+          }}
+          mcp={{
+            servers: mcpServers,
+            selected: selectedMcpServerIds,
+            // Seed-then-toggle: the first toggle materialises the tenant's
+            // enabled-by-default set for this session, then flips one entry in
+            // it. Until that happens the key stays `undefined` so /chat omits
+            // `mcp_server_ids` entirely and the backend applies its own
+            // defaults — unchecking the last server yields an explicit [],
+            // which is a different thing (everything off).
+            onToggle: (id) => {
+              seedMcpServerIds(sessionId, mcpServers.filter((s) => s.enabled).map((s) => s.id));
+              toggleMcpServer(sessionId, id);
+            },
+          }}
+          model={selectedModel ?? defaultModelId ?? SYSTEM_FALLBACK_MODEL}
+          effort={selectedEffort ?? DEFAULT_EFFORT}
+          onModelChange={showThinkingUi ? (m) => setSessionModel(sessionId, m) : undefined}
+          onEffortChange={showThinkingUi ? (e) => setSessionEffort(sessionId, e) : undefined}
+          executionMode={executionMode ?? 'sandbox'}
+          onExecutionModeChange={(mode) => setSessionExecutionMode(sessionId, mode)}
+          platformDefaults={{
+            enabled: platformDefaultsEnabled,
+            onToggle: () => setPlatformDefaultsEnabled(sessionId, !platformDefaultsEnabled),
+          }}
+          mentionCandidates={mentionCandidates}
         />
-      )}
-    </div>
+        {showDataNotice && <DataNoticeModal onAck={ackDataNotice} />}
+        {pendingRewind && (
+          <RewindConfirmModal
+            message={pendingRewind}
+            busy={rewindBusy}
+            error={rewindError}
+            onConfirm={confirmRewind}
+            onCancel={cancelRewind}
+          />
+        )}
+      </div>
+    </MarkdownAssetsProvider>
   );
 }

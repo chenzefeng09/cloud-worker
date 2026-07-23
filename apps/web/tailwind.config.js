@@ -53,9 +53,14 @@ export default {
           '0%, 100%': { opacity: '1', transform: 'scale(1)' },
           '50%': { opacity: '0.45', transform: 'scale(0.85)' },
         },
+        popIn: {
+          '0%': { opacity: '0', transform: 'scale(0.96)' },
+          '100%': { opacity: '1', transform: 'scale(1)' },
+        },
       },
       animation: {
         blip: 'blip 1.4s ease-in-out infinite',
+        'pop-in': 'popIn 120ms ease-out',
       },
     },
   },

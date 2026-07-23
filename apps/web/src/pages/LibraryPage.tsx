@@ -7,6 +7,7 @@ import { api } from '../api/client';
 import { ApiError } from '../api/client';
 import type {
   McpServer,
+  RegisterMcpServerRequest,
   Skill,
   SkillVersion,
 } from '../api/types';
@@ -14,6 +15,7 @@ import { formatRelativeTimeZh } from '../lib/format';
 import { sha256Hex } from '../lib/sha256';
 import { useInstalledSkills } from '../hooks/useInstalledSkills';
 import { KnowledgeSourceTab } from '../components/KnowledgeSourceTab';
+import { McpServerFormDialog } from '../components/McpServerFormDialog';
 
 // Skill tarball upload limits — kept in lockstep with the BFF (20 MiB) and the
 // skill-store backend, which also enforces the SKILL.md / gzip checks.
@@ -228,7 +230,14 @@ export function LibraryPage() {
                         <span className="font-mono text-[11px] text-dim">
                           {formatRelativeTimeZh(sk.created_at)}
                         </span>
-                        {installed ? (
+                        {sk.is_platform_default ? (
+                          <span
+                            className="font-mono text-[11px] text-center px-2 py-1 border rounded-md cursor-default select-none text-accent border-accent-line bg-accent-soft"
+                            title="平台内置默认技能：随部署自带，每个组织和用户默认启用，无需安装（可在会话内关闭）"
+                          >
+                            平台内置
+                          </span>
+                        ) : installed ? (
                           <span
                             className={`font-mono text-[11px] text-center px-2 py-1 border rounded-md cursor-default select-none ${
                               installed.enabled_by_default
@@ -265,9 +274,30 @@ export function LibraryPage() {
         </div>
       </div>
 
-      {installOpen && (
+      {installOpen && tab === 'mcp' && (
+        <McpServerFormDialog
+          mode="create"
+          title="安装 MCP 工具"
+          submitLabel="安装"
+          // The library install path has no id-less probe endpoint (that is an
+          // admin-governance surface); disable the tool-list fetch so the
+          // filter editor falls back to a manual tag input.
+          probe={{
+            fetchTools: async () => ({ ok: false }),
+            canFetch: false,
+            disabledTitle: '资源库安装暂不支持探测工具列表，请手动输入工具名',
+          }}
+          onSubmit={(body) => api.library.installMcpServer(body as RegisterMcpServerRequest)}
+          onClose={() => setInstallOpen(false)}
+          onSaved={() => {
+            setInstallOpen(false);
+            void fetchAll();
+          }}
+        />
+      )}
+
+      {installOpen && tab === 'skills' && (
         <InstallModal
-          tab={tab}
           onClose={() => setInstallOpen(false)}
           onInstalled={() => {
             setInstallOpen(false);
@@ -291,14 +321,10 @@ export function LibraryPage() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Install modal
+// Install modal (skills only). MCP install is handled by the shared
+// McpServerFormDialog, rendered directly at the call site so its own Dialog
+// frame is not nested inside this modal's overlay.
 // ─────────────────────────────────────────────────────────────────────────────
-
-const INSTALL_TITLE: Record<Tab, string> = {
-  mcp: '安装 MCP 工具',
-  skills: '安装技能',
-  docs: '添加知识源',
-};
 
 const inputCls =
   'w-full px-2.5 py-1.5 text-[12.5px] border border-line bg-paper rounded-md ' +
@@ -315,23 +341,14 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 }
 
 function InstallModal({
-  tab,
   onClose,
   onInstalled,
 }: {
-  tab: Tab;
   onClose: () => void;
   onInstalled: () => void;
 }) {
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-
-  // MCP fields
-  const [mcpName, setMcpName] = useState('');
-  const [mcpTransport, setMcpTransport] = useState<McpServer['transport']>('http');
-  const [mcpEndpoint, setMcpEndpoint] = useState('');
-  const [mcpCommand, setMcpCommand] = useState('');
-  const [mcpEnabled, setMcpEnabled] = useState(true);
 
   // Skill fields
   const [skName, setSkName] = useState('');
@@ -347,46 +364,27 @@ function InstallModal({
     setErr(null);
     setSubmitting(true);
     try {
-      if (tab === 'mcp') {
-        if (!mcpName.trim()) throw new ApiError(400, 'VALIDATION', '请填写名称');
-        if (mcpTransport === 'http' && !mcpEndpoint.trim())
-          throw new ApiError(400, 'VALIDATION', '请填写 endpoint');
-        if (mcpTransport === 'stdio' && !mcpCommand.trim())
-          throw new ApiError(400, 'VALIDATION', '请填写 command');
-        await api.library.installMcpServer({
-          name: mcpName.trim(),
-          transport: mcpTransport,
-          endpoint: mcpTransport === 'http' ? mcpEndpoint.trim() : null,
-          command: mcpTransport === 'stdio' ? mcpCommand.trim() : null,
-          enabled: mcpEnabled,
-        });
-        onInstalled();
-      } else if (tab === 'skills') {
-        if (!skName.trim()) throw new ApiError(400, 'VALIDATION', '请填写名称');
-        if (!skVersion.trim()) throw new ApiError(400, 'VALIDATION', '请填写版本号');
-        if (!skFile) throw new ApiError(400, 'VALIDATION', '请选择技能包文件 (tarball)');
-        // Local preflight: catch wrong format / oversized packages before any
-        // network round-trip (and before we create the skill record).
-        const preflightErr = preflightSkillFile(skFile);
-        if (preflightErr) throw new ApiError(400, 'VALIDATION', preflightErr);
-        // sha256 of the compressed bytes — the backend re-verifies integrity
-        // against this. Optional: if Web Crypto is unavailable we skip it.
-        const sha = await sha256Hex(skFile);
-        const skill = await api.library.createSkill({
-          name: skName.trim(),
-          description: skDesc.trim() || null,
-          visibility: skVisibility,
-        });
-        const fd = new FormData();
-        fd.append('version', skVersion.trim());
-        fd.append('file', skFile, skFile.name);
-        if (sha) fd.append('expected_sha256', sha);
-        await api.library.uploadSkillVersion(skill.id, fd);
-        onInstalled();
-      }
-      // Knowledge-source uploads are admin-only and live on /admin/knowledge;
-      // the docs tab here is a read-only browser (KnowledgeSourceTab), so the
-      // install modal never handles `tab === 'docs'`.
+      if (!skName.trim()) throw new ApiError(400, 'VALIDATION', '请填写名称');
+      if (!skVersion.trim()) throw new ApiError(400, 'VALIDATION', '请填写版本号');
+      if (!skFile) throw new ApiError(400, 'VALIDATION', '请选择技能包文件 (tarball)');
+      // Local preflight: catch wrong format / oversized packages before any
+      // network round-trip (and before we create the skill record).
+      const preflightErr = preflightSkillFile(skFile);
+      if (preflightErr) throw new ApiError(400, 'VALIDATION', preflightErr);
+      // sha256 of the compressed bytes — the backend re-verifies integrity
+      // against this. Optional: if Web Crypto is unavailable we skip it.
+      const sha = await sha256Hex(skFile);
+      const skill = await api.library.createSkill({
+        name: skName.trim(),
+        description: skDesc.trim() || null,
+        visibility: skVisibility,
+      });
+      const fd = new FormData();
+      fd.append('version', skVersion.trim());
+      fd.append('file', skFile, skFile.name);
+      if (sha) fd.append('expected_sha256', sha);
+      await api.library.uploadSkillVersion(skill.id, fd);
+      onInstalled();
     } catch (e) {
       setErr(errMsg(e));
     } finally {
@@ -404,7 +402,7 @@ function InstallModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-line">
-          <div className="text-[13.5px] font-medium">{INSTALL_TITLE[tab]}</div>
+          <div className="text-[13.5px] font-medium">安装技能</div>
           <button
             className="font-mono text-[12px] text-dim hover:text-ink transition-colors"
             onClick={onClose}
@@ -414,104 +412,50 @@ function InstallModal({
         </div>
 
         <div className="flex flex-col gap-3 px-4 py-4">
-          {tab === 'mcp' && (
-            <>
-              <Field label="名称">
-                <input
-                  className={inputCls}
-                  value={mcpName}
-                  onChange={(e) => setMcpName(e.target.value)}
-                  placeholder="例如 github-mcp"
-                />
-              </Field>
-              <Field label="传输方式">
-                <select
-                  className={inputCls}
-                  value={mcpTransport}
-                  onChange={(e) => setMcpTransport(e.target.value as McpServer['transport'])}
-                >
-                  <option value="http">http</option>
-                  <option value="stdio">stdio</option>
-                </select>
-              </Field>
-              {mcpTransport === 'http' ? (
-                <Field label="Endpoint">
-                  <input
-                    className={inputCls}
-                    value={mcpEndpoint}
-                    onChange={(e) => setMcpEndpoint(e.target.value)}
-                    placeholder="https://example.com/mcp"
-                  />
-                </Field>
-              ) : (
-                <Field label="Command">
-                  <input
-                    className={inputCls}
-                    value={mcpCommand}
-                    onChange={(e) => setMcpCommand(e.target.value)}
-                    placeholder="npx -y @scope/server"
-                  />
-                </Field>
-              )}
-              <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={mcpEnabled}
-                  onChange={(e) => setMcpEnabled(e.target.checked)}
-                />
-                <span className={labelCls}>安装后启用</span>
-              </label>
-            </>
-          )}
-
-          {tab === 'skills' && (
-            <>
-              <Field label="名称">
-                <input
-                  className={inputCls}
-                  value={skName}
-                  onChange={(e) => setSkName(e.target.value)}
-                  placeholder="例如 pdf-summarizer"
-                />
-              </Field>
-              <Field label="描述（可选）">
-                <input
-                  className={inputCls}
-                  value={skDesc}
-                  maxLength={2000}
-                  onChange={(e) => setSkDesc(e.target.value)}
-                  placeholder="简要说明该技能用途"
-                />
-              </Field>
-              <Field label="可见性">
-                <select
-                  className={inputCls}
-                  value={skVisibility}
-                  onChange={(e) => setSkVisibility(e.target.value as Skill['visibility'])}
-                >
-                  <option value="private">私有</option>
-                  <option value="tenant">租户</option>
-                  <option value="public">公开</option>
-                </select>
-              </Field>
-              <Field label="版本号">
-                <input
-                  className={inputCls}
-                  value={skVersion}
-                  onChange={(e) => setSkVersion(e.target.value)}
-                  placeholder="0.1.0"
-                />
-              </Field>
-              <Field label="技能包 (tarball)">
-                <input
-                  type="file"
-                  className="text-[12px] text-ink-2 file:mr-2 file:px-2 file:py-1 file:text-[11px] file:font-mono file:border file:border-line file:rounded-md file:bg-paper file:cursor-pointer"
-                  accept={SKILL_ACCEPT}
-                  onChange={(e) => setSkFile(e.target.files?.[0] ?? null)}
-                />
-              </Field>
-            </>
-          )}
+          <Field label="名称">
+            <input
+              className={inputCls}
+              value={skName}
+              onChange={(e) => setSkName(e.target.value)}
+              placeholder="例如 pdf-summarizer"
+            />
+          </Field>
+          <Field label="描述（可选）">
+            <input
+              className={inputCls}
+              value={skDesc}
+              maxLength={2000}
+              onChange={(e) => setSkDesc(e.target.value)}
+              placeholder="简要说明该技能用途"
+            />
+          </Field>
+          <Field label="可见性">
+            <select
+              className={inputCls}
+              value={skVisibility}
+              onChange={(e) => setSkVisibility(e.target.value as Skill['visibility'])}
+            >
+              <option value="private">私有</option>
+              <option value="tenant">租户</option>
+              <option value="public">公开</option>
+            </select>
+          </Field>
+          <Field label="版本号">
+            <input
+              className={inputCls}
+              value={skVersion}
+              onChange={(e) => setSkVersion(e.target.value)}
+              placeholder="0.1.0"
+            />
+          </Field>
+          <Field label="技能包 (tarball)">
+            <input
+              type="file"
+              className="text-[12px] text-ink-2 file:mr-2 file:px-2 file:py-1 file:text-[11px] file:font-mono file:border file:border-line file:rounded-md file:bg-paper file:cursor-pointer"
+              accept={SKILL_ACCEPT}
+              onChange={(e) => setSkFile(e.target.files?.[0] ?? null)}
+            />
+          </Field>
 
           {err && (
             <div className="px-2.5 py-1.5 border border-accent-line bg-accent-soft rounded-md text-[12px] text-accent">

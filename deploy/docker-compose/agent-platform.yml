@@ -674,6 +674,9 @@ services:
       BFF_SERVICE_TOKEN: ${BFF_SERVICE_TOKEN:-dev_service_token_change_me}
       # Cron-runner proxy target.
       BFF_CRON_RUNNER_URL: http://cron-runner:8013/api/cron/v1
+      # Inbound-webhook receiver re-enters this same process's /apps/{id}/run
+      # over HTTP (machine path); localhost reaches this uvicorn in-container.
+      BFF_SELF_URL: http://localhost:8005
     ports:
       - "${PORT_BFF:-8005}:8005"
     networks: [foundation]
@@ -736,6 +739,7 @@ services:
       MCP_REGISTRY_DB_MAX_OVERFLOW: "10"
       MCP_REGISTRY_DB_POOL_RECYCLE: "1800"
       MCP_REGISTRY_AUTHZ_URL: http://authz:8002/api/authz/v1
+      MCP_REGISTRY_CRYPTO_URL: http://crypto:8004/api/crypto/v1
     ports:
       - "${PORT_MCP_REGISTRY:-8010}:8010"
     networks: [foundation]
@@ -816,6 +820,27 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+
+  # skill-store-seed — one-shot, idempotent seed of the PLATFORM-GLOBAL default
+  # skill set into the reserved platform tenant. The seed script + vendored skill
+  # tarballs are baked into the skill-store image (see its Dockerfile). Because
+  # platform skills are owned by PLATFORM_TENANT_ID and resolved server-side
+  # (broadened RLS SELECT + resolve/read_skill/platform-defaults fallbacks), a
+  # single seed makes every organization — including future tenants — and every
+  # user get them by default with ZERO per-user install rows. Runs after
+  # skill-store is healthy; safe to re-run on every `docker compose up` (409-safe).
+  skill-store-seed:
+    image: agent-platform-dev-skill-store
+    container_name: agent-skill-store-seed
+    restart: "no"
+    working_dir: /app
+    environment:
+      SKILL_STORE_BASE_URL: http://skill-store:8011/api/skills/v1
+    entrypoint: ["python", "scripts/seed_default_skills.py"]
+    depends_on:
+      skill-store:
+        condition: service_healthy
+    networks: [foundation]
 
   # ===========================================================================
   # App Registry — templatized agent tasks (Apps): versioned harness + review

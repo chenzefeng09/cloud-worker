@@ -56,6 +56,10 @@ vi.mock('../hooks/useInstalledSkills', () => ({
   useInstalledSkills: () => Object.assign([], { refresh: vi.fn() }),
 }));
 
+vi.mock('../hooks/useMcpServers', () => ({
+  useMcpServers: () => ({ servers: [], refresh: vi.fn() }),
+}));
+
 vi.mock('../hooks/useDefaultModel', () => ({
   useDefaultModel: () => ({ modelId: 'm1', loading: false, refetch: vi.fn() }),
 }));
@@ -75,7 +79,7 @@ vi.mock('./CanvasMessageCard', () => ({
 }));
 
 vi.mock('./OutputFileCards', () => ({ OutputFileCards: () => null }));
-vi.mock('./InputBar', () => ({ InputBar: () => <div data-testid="input-bar" /> }));
+vi.mock('./composer/Composer', () => ({ Composer: () => <div data-testid="input-bar" /> }));
 vi.mock('./PlanBlock', () => ({ PlanBlock: () => null }));
 vi.mock('./RewindConfirmModal', () => ({ RewindConfirmModal: () => null }));
 vi.mock('./DataNoticeModal', () => ({ DataNoticeModal: () => null }));

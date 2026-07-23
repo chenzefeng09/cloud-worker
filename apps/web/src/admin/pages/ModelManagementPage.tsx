@@ -177,14 +177,18 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
       if (modelsFromProbe && modelsFromProbe.length > 0) {
         setFetchedModels(modelsFromProbe);
         if (selectedModels.length === 0) {
-          setSelectedModels(modelsFromProbe.slice(0, 5).map(id => ({
-            id,
-            model_type: 'llm',
-            context_length: '',
-            max_tokens: '',
-            vision_support: false,
-            structured_output: false,
-          })));
+          const modelDetails = report.results.model_details;
+          setSelectedModels(modelsFromProbe.slice(0, 5).map(id => {
+            const details = modelDetails?.[id];
+            return {
+              id,
+              model_type: 'llm',
+              context_length: details?.context_length != null ? String(details.context_length) : '',
+              max_tokens: details?.max_tokens != null ? String(details.max_tokens) : '',
+              vision_support: false,
+              structured_output: false,
+            };
+          }));
         }
       }
     } catch (err) {

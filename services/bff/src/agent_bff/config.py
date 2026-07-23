@@ -130,5 +130,20 @@ class Settings(BaseSettings):
     # unauthenticated request.
     service_token: str = ""
 
-    # ── Cron runner — schedules proxy ────────────────────────────────────────
+    # ── Cron runner — schedules proxy + webhook secret verification ─────────
     cron_runner_url: str = "http://localhost:8013/api/cron/v1"
+
+    # ── Inbound webhook receiver ─────────────────────────────────────────────
+    # The public webhook receiver re-enters the BFF's own ``/apps/{id}/run``
+    # endpoint over HTTP (machine/service-token path) to reuse the App run
+    # resolver.  ``localhost`` reaches this same uvicorn process in-container.
+    bff_self_url: str = "http://localhost:8005"
+    # Machine identity the receiver acts as when launching webhook-triggered
+    # runs.  Must match the cron-runner service account (``usr_[0-9A-Z]{26}``)
+    # that is bound to the tenant ``member`` role in authz — it already carries
+    # session.create / session.attachment.create / run.create.
+    cron_service_user_id: str = "usr_01SVCCRON00000000000000000"
+    # Hard cap on the inbound webhook request body (bytes) — rejects oversized
+    # payloads before any parsing / upload.  25 MiB mirrors typical attachment
+    # upload limits.
+    webhook_max_body_bytes: int = 25 * 1024 * 1024

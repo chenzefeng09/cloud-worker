@@ -190,6 +190,60 @@ def test_update_schedule_surfaces_upstream_404(
 
 
 # ---------------------------------------------------------------------------
+# POST /schedules/{id}/rotate-secret
+# ---------------------------------------------------------------------------
+
+def test_rotate_secret_requires_auth(client: TestClient) -> None:
+    resp = client.post("/api/bff/v1/schedules/cron_ABC/rotate-secret")
+    assert resp.status_code == 401
+
+
+def test_rotate_secret_proxied(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeCronRunnerUpstream(
+        body={
+            "id": "cron_ABC",
+            "webhook_secret": "s3cr3t-plaintext",
+            "webhook_path": "/api/bff/v1/triggers/cron_ABC/webhook",
+        }
+    )
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/schedules/cron_ABC/rotate-secret",
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["webhook_secret"] == "s3cr3t-plaintext"
+    assert body["webhook_path"] == "/api/bff/v1/triggers/cron_ABC/webhook"
+    assert any(
+        "cron_ABC/rotate-secret" in c[1] and c[0] == "POST" for c in fake.calls
+    )
+
+
+def test_rotate_secret_surfaces_upstream_400(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rotating a non-webhook (schedule) trigger 4xxs from cron-runner."""
+    fake = FakeCronRunnerUpstream(
+        status=400, body={"detail": "rotate-secret is only valid for a webhook trigger"}
+    )
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/schedules/cron_SCHED/rotate-secret",
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
 # DELETE /schedules/{id}
 # ---------------------------------------------------------------------------
 

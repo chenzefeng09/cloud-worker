@@ -21,6 +21,7 @@ import { CopyIcon, useCopied } from './CopyButton';
 import { SuggestionDiffView } from './SuggestionDiffView';
 import { useCanvasStore } from '../stores/canvasStore';
 import { useChatStore } from '../stores/chatStore';
+import { useConfirm } from '../admin/components/dialogs';
 import { api } from '../api/client';
 import type { CanvasSelectionSegment, CanvasVersionSummary } from '../api/types';
 import { InlineCanvasSuggestion, isInlineCanvasSuggestion } from './InlineCanvasSuggestion';
@@ -163,6 +164,7 @@ export function CanvasMessageCard({
   const saveManualAction = useCanvasStore((s) => s.saveManual);
   const revertAction = useCanvasStore((s) => s.revert);
   const clearErrorAction = useCanvasStore((s) => s.clearError);
+  const confirm = useConfirm();
 
   // Derive a CanvasDocumentDraft-shaped view from the server canvas so the
   // existing rich-editor JSX (below) can render either mode unmodified.
@@ -444,7 +446,11 @@ export function CanvasMessageCard({
   const handleRevert = useCallback(
     async (toVersion: number) => {
       if (!canvasId) return;
-      const ok = window.confirm(`确定回退到版本 ${toVersion}？将基于该版本创建一个新版本。`);
+      const ok = await confirm({
+        title: '回退版本',
+        message: `确定回退到版本 ${toVersion}？将基于该版本创建一个新版本。`,
+        confirmText: '回退',
+      });
       if (!ok) return;
       const reverted = await revertAction(canvasId, toVersion);
       if (reverted) {
@@ -452,7 +458,7 @@ export function CanvasMessageCard({
         setVersions(null);
       }
     },
-    [canvasId, revertAction],
+    [canvasId, revertAction, confirm],
   );
 
   const commitContent = useCallback(

@@ -1,99 +1,15 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, ApiError } from '../../api/client';
-import { Dropdown } from '../shell/Dropdown';
 import type { App, AppVisibility } from '../../api/types';
 import {
   DEFAULT_MODEL,
   DEFAULT_EFFORT,
 } from '../../lib/modelOptions';
-
-// ─── Emoji picker presets ─────────────────────────────────────────────────────
-
-const EMOJI_PRESETS = [
-  '📝', '📊', '📋', '📁', '📎', '📌',
-  '🔍', '🔧', '🛠', '⚙️', '🧩', '🧪',
-  '🤖', '🧠', '💡', '🎯', '🚀', '✨',
-  '📈', '📉', '💬', '📣', '🔔', '📅',
-  '🏷', '🗂', '📦', '🔗', '🌐', '🛡',
-  '💼', '🎨', '🖊', '📐', '🧮', '⚡',
-];
-
-function EmojiPicker({
-  value,
-  onChange,
-}: {
-  value: string;
-  onChange: (emoji: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const onClick = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
-    };
-    document.addEventListener('mousedown', onClick);
-    return () => document.removeEventListener('mousedown', onClick);
-  }, [open]);
-
-  return (
-    <div ref={ref} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="w-10 h-10 border border-line rounded-md flex items-center justify-center text-[18px] bg-paper hover:border-ink-2 transition-colors cursor-pointer"
-        title="选择图标"
-      >
-        {value || '◐'}
-      </button>
-      {open && (
-        <div className="absolute top-full left-0 mt-1 z-50 border border-line rounded-lg bg-surface shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-2 w-[240px]">
-          <div className="grid grid-cols-6 gap-1">
-            {EMOJI_PRESETS.map((emoji) => (
-              <button
-                key={emoji}
-                type="button"
-                onClick={() => {
-                  onChange(emoji);
-                  setOpen(false);
-                }}
-                className={`w-8 h-8 flex items-center justify-center rounded-md text-[16px] hover:bg-paper transition-colors ${
-                  value === emoji ? 'bg-paper ring-1 ring-ink-2' : ''
-                }`}
-              >
-                {emoji}
-              </button>
-            ))}
-          </div>
-          <div className="mt-2 pt-2 border-t border-line">
-            <input
-              type="text"
-              className="w-full border border-line rounded-sm px-2 py-1 text-[12px] bg-paper focus:outline-none focus:border-accent font-mono"
-              value={value}
-              onChange={(e) => onChange(e.target.value)}
-              placeholder="自定义输入"
-              maxLength={4}
-            />
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// ─── Visibility options ───────────────────────────────────────────────────────
-
-const VISIBILITY_OPTIONS: { id: AppVisibility; label: string }[] = [
-  { id: 'private', label: '私有（仅自己）' },
-  { id: 'tenant', label: '租户（提交发布后可见）' },
-];
+import { EmojiPicker, VisibilitySelect, appInputCls as inputCls } from './AppMetaFields';
+import { TagInput } from './TagInput';
 
 // ─── Modal ────────────────────────────────────────────────────────────────────
-
-const inputCls =
-  'border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent';
 
 interface CreateAppModalProps {
   open: boolean;
@@ -107,6 +23,7 @@ export function CreateAppModal({ open, onClose, onCreated }: CreateAppModalProps
   const [icon, setIcon] = useState('');
   const [description, setDescription] = useState('');
   const [visibility, setVisibility] = useState<AppVisibility>('private');
+  const [tags, setTags] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -117,6 +34,7 @@ export function CreateAppModal({ open, onClose, onCreated }: CreateAppModalProps
       setIcon('');
       setDescription('');
       setVisibility('private');
+      setTags([]);
       setError(null);
     }
   }, [open]);
@@ -144,10 +62,11 @@ export function CreateAppModal({ open, onClose, onCreated }: CreateAppModalProps
         description: description.trim() || null,
         icon: icon.trim() || null,
         visibility,
+        tags,
         version: {
           version: '1',
-          system_prompt: ' ',
-          user_prompt_template: ' ',
+          system_prompt: '',
+          user_prompt_template: '',
           model: DEFAULT_MODEL,
           reasoning_effort: DEFAULT_EFFORT,
           sampling_params: {},
@@ -232,15 +151,13 @@ export function CreateAppModal({ open, onClose, onCreated }: CreateAppModalProps
           {/* Visibility */}
           <div className="flex flex-col gap-1">
             <label className="cw-label">可见性</label>
-            <div className="border border-line rounded-sm px-2 py-1.5 bg-paper inline-flex items-center w-fit">
-              <Dropdown
-                value={visibility}
-                options={VISIBILITY_OPTIONS}
-                onChange={(v) => setVisibility(v as AppVisibility)}
-                align="left"
-                title="可见性"
-              />
-            </div>
+            <VisibilitySelect value={visibility} onChange={setVisibility} />
+          </div>
+
+          {/* Tags */}
+          <div className="flex flex-col gap-1">
+            <label className="cw-label">标签</label>
+            <TagInput value={tags} onChange={setTags} />
           </div>
         </div>
 

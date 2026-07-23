@@ -1605,6 +1605,45 @@ def test_mcp_tenant_happy_path_forwards_jsonrpc(monkeypatch) -> None:
     assert "authorization" not in fwd
 
 
+def test_mcp_tenant_injects_registry_auth_and_headers_toward_upstream(
+    monkeypatch,
+) -> None:
+    """The broker is the single upstream-auth injection point for broker-routed
+    sessions: registry-supplied ``auth`` + ``headers`` reach the real upstream,
+    while the sandbox's foundation Bearer is replaced (not leaked).
+    """
+    upstream: list[dict[str, Any]] = []
+    item = _registry_item()
+    item["headers"] = {"X-Custom": "reg"}
+    item["auth"] = {"type": "bearer", "token": "upstream-tok"}
+    handler = _tenant_mcp_handler(items=[item], upstream_recorder=upstream)
+    client = _mcp_tenant_client(handler, monkeypatch)
+
+    resp = client.post(
+        f"/api/tool-broker/v1/mcp-tenant/v1/{_TENANT_MCP_SERVER_ID}/",
+        headers={
+            "Authorization": "Bearer sandbox-token",
+            "X-Tenant-Id": "tnt_123",
+            "X-User-Id": "usr_123",
+            "X-Tool-Broker-Lease": _lease(["mcp.tenant_invoke"]),
+        },
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+
+    assert resp.status_code == 200
+    assert len(upstream) == 1
+    fwd = upstream[0]["headers"]
+    # Registry custom header + bearer auth injected toward the real upstream.
+    assert fwd["x-custom"] == "reg"
+    assert fwd["authorization"] == "Bearer upstream-tok"
+    # The sandbox's foundation Bearer is replaced by the registry's upstream
+    # bearer (the ONLY Authorization on the upstream call). No sandbox identity
+    # / lease headers reach the third-party upstream.
+    assert "x-tenant-id" not in fwd
+    assert "x-tool-broker-lease" not in fwd
+    assert "x-user-id" not in fwd
+
+
 def test_mcp_tenant_no_trailing_path_matches_worker_target(monkeypatch) -> None:
     """The real worker target has NO trailing path: ``.../{server_id}``.
 
@@ -1863,3 +1902,346 @@ def test_proxy_upstream_connection_error_returns_502(monkeypatch) -> None:
 
     assert resp.status_code == 502
     assert resp.json()["detail"] == "tool-broker upstream unavailable"
+
+
+# ---------------------------------------------------------------------------
+# OAuth client-credentials auth (tenant MCP servers)
+# ---------------------------------------------------------------------------
+#
+# When a tenant MCP server's ``auth.type == "oauth"`` the broker performs the
+# client-credentials flow itself (POST to the registry-supplied ``token_url``),
+# caches the access_token by server_id, and injects ``Authorization: Bearer
+# {access_token}`` toward the real upstream.  These tests exercise the full
+# /mcp-tenant passthrough (registry lookup -> token fetch -> upstream forward)
+# via a single MockTransport handler that dispatches on the request URL, plus
+# direct unit tests for the cache / single-flight / refresh logic.
+
+_OAUTH_TOKEN_URL = "https://idp.example/oauth/token"
+
+
+def _reset_oauth_cache() -> None:
+    """Clear the module-level oauth token cache + single-flight locks."""
+    from tool_broker.main import _OAUTH_LOCKS, _OAUTH_TOKEN_CACHE
+
+    _OAUTH_TOKEN_CACHE.clear()
+    _OAUTH_LOCKS.clear()
+
+
+def _oauth_registry_item(
+    *,
+    server_id: str = _TENANT_MCP_SERVER_ID,
+    scopes: list[str] | None = None,
+) -> dict[str, Any]:
+    item = _registry_item(server_id=server_id)
+    auth: dict[str, Any] = {
+        "type": "oauth",
+        "client_id": "cid",
+        "client_secret": "csec",
+        "token_url": _OAUTH_TOKEN_URL,
+    }
+    if scopes is not None:
+        auth["scopes"] = scopes
+    item["auth"] = auth
+    return item
+
+
+def _oauth_dispatch_handler(
+    *,
+    item: dict[str, Any],
+    token_calls: list[dict[str, Any]],
+    upstream: list[dict[str, Any]],
+    token_status: int = 200,
+    token_body: dict[str, Any] | None = None,
+):
+    """MockTransport handler dispatching registry / token-endpoint / upstream."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if url == _OAUTH_TOKEN_URL:
+            from urllib.parse import parse_qs
+
+            form = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
+            token_calls.append({"url": url, "form": form})
+            if token_status != 200:
+                return httpx.Response(
+                    token_status, json={"error": "denied"}, headers={"content-type": "application/json"}
+                )
+            body = token_body or {"access_token": "tok-abc", "expires_in": 3600}
+            return httpx.Response(
+                200, json=body, headers={"content-type": "application/json"}
+            )
+        if url.startswith(_MCP_REGISTRY_INTERNAL_PREFIX):
+            return httpx.Response(
+                200,
+                json={"items": [item], "total": 1},
+                headers={"content-type": "application/json"},
+            )
+        upstream.append(
+            {
+                "method": request.method,
+                "url": url,
+                "headers": {k.lower(): v for k, v in request.headers.items()},
+            }
+        )
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": 1, "result": {"ok": True}},
+            headers={"content-type": "application/json"},
+        )
+
+    return handler
+
+
+def _mcp_tenant_headers() -> dict[str, str]:
+    return {
+        "Authorization": "Bearer sandbox-token",
+        "X-Tenant-Id": "tnt_123",
+        "X-User-Id": "usr_123",
+        "X-Tool-Broker-Lease": _lease(["mcp.tenant_invoke"]),
+    }
+
+
+def test_mcp_tenant_oauth_fetches_token_and_injects_bearer(monkeypatch) -> None:
+    """oauth auth: broker POSTs client_credentials to token_url and injects the
+    resulting bearer toward the real upstream."""
+    _reset_oauth_cache()
+    token_calls: list[dict[str, Any]] = []
+    upstream: list[dict[str, Any]] = []
+    handler = _oauth_dispatch_handler(
+        item=_oauth_registry_item(scopes=["a", "b"]),
+        token_calls=token_calls,
+        upstream=upstream,
+    )
+    client = _mcp_tenant_client(handler, monkeypatch)
+
+    resp = client.post(
+        f"/api/tool-broker/v1/mcp-tenant/v1/{_TENANT_MCP_SERVER_ID}/",
+        headers=_mcp_tenant_headers(),
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+
+    assert resp.status_code == 200
+    # The client_credentials form was POSTed to the token endpoint once.
+    assert len(token_calls) == 1
+    form = token_calls[0]["form"]
+    assert form["grant_type"] == "client_credentials"
+    assert form["client_id"] == "cid"
+    assert form["client_secret"] == "csec"
+    # scopes are space-joined into a single ``scope`` form field.
+    assert form["scope"] == "a b"
+    # The resulting access_token reaches the real upstream as a Bearer.
+    assert len(upstream) == 1
+    assert upstream[0]["headers"]["authorization"] == "Bearer tok-abc"
+
+
+def test_mcp_tenant_oauth_omits_scope_when_empty(monkeypatch) -> None:
+    """No ``scope`` form field when the registry auth carries no scopes."""
+    _reset_oauth_cache()
+    token_calls: list[dict[str, Any]] = []
+    upstream: list[dict[str, Any]] = []
+    handler = _oauth_dispatch_handler(
+        item=_oauth_registry_item(scopes=None),
+        token_calls=token_calls,
+        upstream=upstream,
+    )
+    client = _mcp_tenant_client(handler, monkeypatch)
+
+    resp = client.post(
+        f"/api/tool-broker/v1/mcp-tenant/v1/{_TENANT_MCP_SERVER_ID}/",
+        headers=_mcp_tenant_headers(),
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+
+    assert resp.status_code == 200
+    assert "scope" not in token_calls[0]["form"]
+    assert upstream[0]["headers"]["authorization"] == "Bearer tok-abc"
+
+
+def test_mcp_tenant_oauth_caches_token_across_requests(monkeypatch) -> None:
+    """Two requests for the same server_id hit the token endpoint ONCE."""
+    _reset_oauth_cache()
+    token_calls: list[dict[str, Any]] = []
+    upstream: list[dict[str, Any]] = []
+    handler = _oauth_dispatch_handler(
+        item=_oauth_registry_item(),
+        token_calls=token_calls,
+        upstream=upstream,
+    )
+    client = _mcp_tenant_client(handler, monkeypatch)
+
+    for _ in range(2):
+        resp = client.post(
+            f"/api/tool-broker/v1/mcp-tenant/v1/{_TENANT_MCP_SERVER_ID}/",
+            headers=_mcp_tenant_headers(),
+            json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        )
+        assert resp.status_code == 200
+
+    # The token was fetched once and reused for the second request.
+    assert len(token_calls) == 1
+    assert len(upstream) == 2
+    assert all(call["headers"]["authorization"] == "Bearer tok-abc" for call in upstream)
+
+
+def test_mcp_tenant_oauth_fetch_failure_is_fail_open(monkeypatch) -> None:
+    """A token-endpoint error is fail-open: no Authorization toward upstream."""
+    _reset_oauth_cache()
+    token_calls: list[dict[str, Any]] = []
+    upstream: list[dict[str, Any]] = []
+    handler = _oauth_dispatch_handler(
+        item=_oauth_registry_item(),
+        token_calls=token_calls,
+        upstream=upstream,
+        token_status=500,
+    )
+    client = _mcp_tenant_client(handler, monkeypatch)
+
+    resp = client.post(
+        f"/api/tool-broker/v1/mcp-tenant/v1/{_TENANT_MCP_SERVER_ID}/",
+        headers=_mcp_tenant_headers(),
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+    )
+
+    # The broker still proxies the request (fail-open), just without the bearer.
+    assert resp.status_code == 200
+    assert len(token_calls) == 1
+    assert len(upstream) == 1
+    assert "authorization" not in upstream[0]["headers"]
+
+
+def test_oauth_get_token_single_flight(monkeypatch) -> None:
+    """Concurrent _get_oauth_token calls for one server_id share ONE fetch."""
+    import asyncio
+
+    from tool_broker.main import _get_oauth_token
+
+    _reset_oauth_cache()
+    calls = 0
+
+    async def fake_fetch(auth):  # noqa: ANN001
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0.05)  # simulate token-endpoint latency
+        return "tok", time.time() + 3600
+
+    monkeypatch.setattr("tool_broker.main._fetch_oauth_token", fake_fetch)
+
+    auth = {"type": "oauth", "client_id": "c", "client_secret": "s", "token_url": "u"}
+
+    async def run() -> list[str]:
+        return await asyncio.gather(
+            _get_oauth_token("srv_sf", auth),
+            _get_oauth_token("srv_sf", auth),
+            _get_oauth_token("srv_sf", auth),
+        )
+
+    results = asyncio.run(run())
+    assert calls == 1  # single-flight: one fetch shared across three callers
+    assert results == ["tok", "tok", "tok"]
+
+
+def test_oauth_get_token_refreshes_after_expiry(monkeypatch) -> None:
+    """A cached token past its refresh margin is refetched."""
+    import asyncio
+
+    from tool_broker.main import _get_oauth_token
+
+    _reset_oauth_cache()
+    calls = 0
+
+    async def fake_fetch(auth):  # noqa: ANN001
+        nonlocal calls
+        calls += 1
+        # Expires in the past -> always past the refresh margin.
+        return f"tok-{calls}", time.time() - 1
+
+    monkeypatch.setattr("tool_broker.main._fetch_oauth_token", fake_fetch)
+
+    auth = {"type": "oauth", "client_id": "c", "client_secret": "s", "token_url": "u"}
+
+    async def run() -> tuple[str, str]:
+        first = await _get_oauth_token("srv_refresh", auth)
+        second = await _get_oauth_token("srv_refresh", auth)
+        return first, second
+
+    first, second = asyncio.run(run())
+    assert calls == 2  # second call refetched because the cached token expired
+    assert first == "tok-1"
+    assert second == "tok-2"
+
+
+def test_oauth_get_token_uses_cached_valid_token(monkeypatch) -> None:
+    """A cached token within its refresh margin is reused without refetch."""
+    import asyncio
+
+    from tool_broker.main import _get_oauth_token
+
+    _reset_oauth_cache()
+    calls = 0
+
+    async def fake_fetch(auth):  # noqa: ANN001
+        nonlocal calls
+        calls += 1
+        return f"tok-{calls}", time.time() + 3600
+
+    monkeypatch.setattr("tool_broker.main._fetch_oauth_token", fake_fetch)
+
+    auth = {"type": "oauth", "client_id": "c", "client_secret": "s", "token_url": "u"}
+
+    async def run() -> tuple[str, str]:
+        first = await _get_oauth_token("srv_cache", auth)
+        second = await _get_oauth_token("srv_cache", auth)
+        return first, second
+
+    first, second = asyncio.run(run())
+    assert calls == 1  # second call reused the cached token
+    assert first == second == "tok-1"
+
+
+def test_oauth_fetch_token_defaults_expires_in(monkeypatch) -> None:
+    """A missing/non-numeric ``expires_in`` defaults to 3600s (no crash)."""
+    import asyncio
+
+    from tool_broker.main import _fetch_oauth_token
+
+    captured: dict[str, Any] = {}
+
+    class _FakeResp:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict[str, Any]:
+            return {"access_token": "tok"}  # no expires_in
+
+    class _FakeClient:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+        async def __aenter__(self) -> "_FakeClient":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def post(self, url: str, *, data: dict[str, str]) -> _FakeResp:
+            captured["url"] = url
+            captured["data"] = data
+            return _FakeResp()
+
+    monkeypatch.setattr("tool_broker.main.httpx.AsyncClient", _FakeClient)
+
+    auth = {
+        "type": "oauth",
+        "client_id": "c",
+        "client_secret": "s",
+        "token_url": "https://idp.example/token",
+    }
+    token, expires_at = asyncio.run(_fetch_oauth_token(auth))
+    assert token == "tok"
+    assert captured["url"] == "https://idp.example/token"
+    assert captured["data"]["grant_type"] == "client_credentials"
+    assert captured["data"]["client_id"] == "c"
+    assert captured["data"]["client_secret"] == "s"
+    # expires_at is finite (default 3600s from now) even with no expires_in.
+    assert expires_at > time.time()
+

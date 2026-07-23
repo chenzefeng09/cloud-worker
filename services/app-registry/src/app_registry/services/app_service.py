@@ -97,10 +97,18 @@ class AppService:
 
     # ----------------------------------------------------------------- apps
 
-    async def list_apps(self, *, scope: str) -> list[App]:
-        """``scope='mine'`` → caller's own Apps (any status);
-        ``scope='published'`` → tenant-shelf Apps with a published current
-        version (the homepage list)."""
+    async def list_apps(self, *, scope: str, tags: list[str] | None = None) -> list[App]:
+        """``scope='mine'`` -> caller's own Apps (any status);
+        ``scope='published'`` -> tenant-shelf Apps with a published current
+        version (the homepage list).
+
+        ``tags`` (optional, OR semantics): only return Apps whose ``tags``
+        array contains at least one of the given values.  Filtering happens
+        in Python rather than via a JSONB operator (``?|`` / ``@>``) so the
+        same code path works against the SQLite test DB and Postgres prod -
+        the list is already unpaginated + tenant-scoped, so an in-memory
+        filter is consistent with the existing read pattern.
+        """
         stmt = (
             select(App)
             .where(App.tenant_id == self._tenant_id)
@@ -115,10 +123,16 @@ class AppService:
                 App.current_version_id.is_not(None),
             )
         result = await self._db.execute(stmt)
-        return list(result.scalars().all())
+        apps = list(result.scalars().all())
+        if tags:
+            wanted = {t for t in tags if t}
+            if wanted:
+                apps = [a for a in apps if wanted.intersection(a.tags)]
+        return apps
 
     async def create_app(self, *, name: str, description: str | None, icon: str | None,
-                         visibility: str, version: AppVersionCreate) -> App:
+                         visibility: str, version: AppVersionCreate,
+                         tags: list[str] | None = None) -> App:
         """Create an App and its initial draft version atomically."""
         user_id = self._require_user()
         app = App(
@@ -128,6 +142,7 @@ class AppService:
             icon=icon,
             author_id=user_id,
             visibility=visibility,
+            tags=list(tags) if tags is not None else [],
         )
         self._db.add(app)
         try:
@@ -162,7 +177,8 @@ class AppService:
 
     async def update_app(self, app_id: str, *, is_reviewer: bool, name: str | None,
                          description: str | None, icon: str | None,
-                         visibility: str | None) -> App:
+                         visibility: str | None,
+                         tags: list[str] | None = None) -> App:
         app = await self.get_app(app_id)
         self._assert_owner_or_reviewer(app, is_reviewer=is_reviewer)
         if name is not None:
@@ -173,6 +189,9 @@ class AppService:
             app.icon = icon
         if visibility is not None:
             app.visibility = visibility
+        if tags is not None:
+            # None = leave unchanged; an explicit list (incl. []) replaces.
+            app.tags = list(tags)
         try:
             await self._db.flush()
         except IntegrityError as exc:

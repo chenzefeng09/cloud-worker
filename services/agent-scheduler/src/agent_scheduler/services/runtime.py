@@ -78,6 +78,7 @@ class SandboxRuntime(Protocol):
         user_id: str,
         foundation_token: str,
         skills: list[str] | None = None,
+        mcp_server_ids: list[str] | None = None,
         files: list[dict] | None = None,
         memory: str | None = None,
         history: list[dict[str, Any]] | None = None,
@@ -98,6 +99,13 @@ class SandboxRuntime(Protocol):
         the short-lived per-run JWT minted via
         ``IdentityResource.issue_service_account_token`` — never the
         scheduler's own service-account token.
+
+        ``mcp_server_ids`` carries the run's MCP selection with PRESENCE
+        semantics: ``None`` = the caller expressed no choice (task.json omits
+        the key and the in-sandbox injector uses the tenant's enabled set),
+        ``[]`` = disable MCP for this run, non-empty = only those server ids.
+        Implementations must serialize ``None`` as an ABSENT key, never
+        ``null`` — the two are not interchangeable downstream.
         """
 
     def get_run_status(self, container_id: str) -> dict[str, Any]:

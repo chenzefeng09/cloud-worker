@@ -347,12 +347,20 @@ class SessionService:
         execution_mode: str = "sandbox",
     ) -> Run:
         await self.get_session(session_id)
+        # Pull ``app_id`` out of the snapshot onto a first-class indexed column
+        # so the run history of an App is queryable without unpacking the JSONB
+        # (migration 0014).  NULL for ordinary chat runs (no snapshot).  The
+        # value is a string id (``app_<hex>``); guard against a malformed
+        # non-string snapshot value so a bad payload never 500s the run.
+        snap_app_id = app_snapshot.get("app_id") if app_snapshot else None
+        app_id: str | None = snap_app_id if isinstance(snap_app_id, str) else None
         run = Run(
             tenant_id=self._tenant_id,
             session_id=session_id,
             task_description=task,
             status="PENDING",
             app_snapshot=app_snapshot,
+            app_id=app_id,
             source=source,
             execution_mode=execution_mode,
         )
@@ -503,19 +511,31 @@ class SessionService:
         return list(result.scalars().all())
 
     async def list_tenant_runs(
-        self, status: str | None = None, limit: int = 50
+        self,
+        status: str | None = None,
+        limit: int = 50,
+        app_id: str | None = None,
+        offset: int = 0,
     ) -> list[Run]:
         """List all runs for the current tenant (across every session).
 
         Tenant-scoped via ``self._tenant_id`` (sourced from the X-Tenant-Id
         middleware, same as every other method here).  ``status`` filters on an
-        exact match when provided; callers normalise casing.  Ordered newest
-        first and capped by ``limit``.
+        exact match when provided; callers normalise casing.  ``app_id`` narrows
+        to a single App's execution history when provided - NULL ``app_id``
+        rows (ordinary chat runs) never match an app filter, so the App history
+        view is naturally free of chat noise.  Both ``app_id`` and ``status``
+        default to ``None`` (no filter) so existing callers are unchanged.
+        Ordered newest first, paged by ``limit`` + ``offset``.
         """
         stmt = select(Run).where(Run.tenant_id == self._tenant_id)
         if status is not None:
             stmt = stmt.where(Run.status == status)
+        if app_id is not None:
+            stmt = stmt.where(Run.app_id == app_id)
         stmt = stmt.order_by(Run.created_at.desc()).limit(limit)
+        if offset:
+            stmt = stmt.offset(offset)
         result = await self._db.execute(stmt)
         return list(result.scalars().all())
 

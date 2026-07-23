@@ -20,7 +20,8 @@ cube: `cube_runtime.spawn_run` 的 `task_json`,经 `AGENT_TASK_JSON` env)。
 ```jsonc
 {
   "task": "string",              // 用户指令(>32KiB 截断带哨兵后缀)
-  "mcp_servers": [],             // 恒空;mcp_tenant_injector 沙箱内实时拉取
+  "mcp_servers": [],             // 【历史遗留,恒空,不是选择器】见 §1a
+  "mcp_server_ids": [...],       // 【三态,按"键是否存在"判定】见 §1a
   "skills": ["name", ...],       // skills_loader 据此解析 manifest
   "files": [{"key","filename","mime"}, ...],   // worker 下载到 /workspace/inputs/
   "memory": "string",            // 预取记忆片段,worker 前置进 system prompt
@@ -35,6 +36,48 @@ cube: `cube_runtime.spawn_run` 的 `task_json`,经 `AGENT_TASK_JSON` env)。
                                  //     "agent_state":{...}}   ← 见 §4
 }
 ```
+
+## 1a. MCP 选择:`mcp_server_ids`(三态)与 `mcp_servers`(遗留空键)
+
+**`mcp_server_ids` 是 run 级"本次启用哪些 MCserver"的唯一选择器**,取值为
+mcp-registry 的 server `id`(形如 `mcp_<26HEX>`)。它是**三态**的,三态的区分靠
+**键是否存在**,不是靠真值:
+
+| task.json 里的样子 | 语义 |
+| --- | --- |
+| **键不存在** | 用租户默认启用集——即注册该租户**全部** enabled 的 server(历史全注入行为) |
+| `[]`(显式空表) | 本次 run **全部禁用** MCP,一个都不注册 |
+| 非空列表 | **只**注册 id 命中列表的 server |
+
+> ⚠️ **必须用 presence 判定(`"mcp_server_ids" in task` / `!== undefined`),
+> 绝不能用真值判定。** `[]` 在 Python 和 JS 里都是 falsy,一个
+> `if not task.get("mcp_server_ids")` 或 `if (task.mcp_server_ids)` 会把
+> "全部禁用"和"键不存在"两种**相反**的意图折叠成同一个分支,结果是用户按了
+> "全关"却拿到了全租户的 MCP。同一份契约里的 `skills` 没有这个陷阱(它的 `[]`
+> 和缺省同义),**不要照抄 `skills` 的 `?? []` 兜底写法**。
+
+**容错**:键存在但形状非法(例如给了字符串而不是列表)一律**降级为"键不存在"**
+(走租户默认),而不是降级为"全部禁用"——scheduler 发错形状时应退回既有行为,
+而不是静默剥光用户的工具。
+
+**与 `mcp_servers` 的关系:没有关系。`mcp_servers` 不是选择器,永远不要读它来做启用判断。**
+它是早期设计的残留,scheduler 在两个 runtime 里都把它**硬编码写成 `[]`**
+(`docker_runtime.py:929/966`,注释 "mcp_tenant_injector fetches live"),因为 server
+清单是 worker 在沙箱内实时向 mcp-registry 拉的,不经 task.json 下发。
+**若有人把 `mcp_servers` 当成选择器读,由于它恒为 `[]`,每个 run 的 MCP 都会被全部禁用。**
+两侧 worker 均有回归测试钉住这一点(`test_legacy_mcp_servers_key_is_not_the_selector` /
+`"is unaffected by the legacy mcp_servers key"`),改动时不要绕过。
+
+**消费端**(两个 worker 实现都在**注册前**过滤,且**先按选择过滤、再做 transport 过滤**——
+选择是"用户选没选中"的身份判断,transport 是"本运行时支不支持"的能力判断,两者不得混淆;
+先过滤保证未选中的 server **完全不被连接/探测**,也保证 transport 的丢弃告警只对用户真正
+选中的 server 报出):
+
+* Claude SDK worker:`worker-claude-sdk/src/task.ts`(解析,保留 `undefined`)→
+  `src/worker.ts` `loadMcpServers(env, selectedIds)`。显式 `[]` 直接短路,连 registry 都不请求。
+* AgentScope worker:`agentscope_ext/mcp_tenant_injector/__init__.py` 的
+  `_selected_server_ids(task)`;task.json 由 `hooks.build_toolkit(task, ...)` 的首参直接送达
+  (`runtime_worker/__main__.py:1231`),**不走 env**。
 
 ## 1b. 输入:`/workspace/.secrets.json`(scheduler 写,worker 读后即删)
 

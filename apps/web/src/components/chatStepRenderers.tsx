@@ -3,6 +3,7 @@ import type { ToolCallEntry } from '../api/types';
 import ReactMarkdown from 'react-markdown';
 import { useCopied, CopyIcon } from './CopyButton';
 import { useFilePreview } from '../lib/filePreviewContext';
+import { assetBasename, isDirectImageSrc, useMarkdownAssets } from './markdownAssets';
 
 // ── File-link interception (assistant replies) ───────────────────────────────
 //
@@ -233,6 +234,52 @@ function DownloadIcon() {
   );
 }
 
+// ── Image resolution (assistant replies) ─────────────────────────────────────
+//
+// Models reference images by their sandbox path (`![图](outputs/chart.png)`),
+// which the browser would resolve against the page URL and 404 on. Anything
+// that isn't already a fetchable URL is therefore looked up by filename against
+// the session's attachments (see markdownAssets.tsx). A miss renders a labelled
+// placeholder rather than leaving the browser's broken-image glyph on screen.
+
+const IMG_CLS = 'max-w-full h-auto rounded-md border border-line';
+
+function MarkdownImage({ src, alt, title }: { src?: string; alt?: string; title?: string }) {
+  const assets = useMarkdownAssets();
+  const raw = typeof src === 'string' ? src.trim() : '';
+  if (!raw) return null;
+
+  // Already fetchable (remote, inline data, object URL) — render as-is.
+  if (isDirectImageSrc(raw)) {
+    return <img src={raw} alt={alt ?? ''} title={title} className={IMG_CLS} />;
+  }
+
+  const hit = assets?.resolveImage(raw) ?? null;
+  if (!hit) {
+    // Inline (phrasing) element: markdown puts images inside a <p>.
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2 py-1 border border-line rounded-sm bg-paper font-mono text-[11.5px] text-dim align-middle">
+        <span aria-hidden>📎</span>
+        图片未找到：{assetBasename(raw) || raw}
+      </span>
+    );
+  }
+
+  const label = alt || hit.filename;
+  const open = assets?.onOpen;
+  return (
+    <button
+      type="button"
+      onClick={() => (open ? open(hit) : window.open(hit.url, '_blank', 'noopener'))}
+      title={title ?? `查看 ${hit.filename}`}
+      aria-label={`查看 ${hit.filename}`}
+      className="block max-w-full p-0 bg-transparent border-0 cursor-zoom-in"
+    >
+      <img src={hit.url} alt={label} className={IMG_CLS} />
+    </button>
+  );
+}
+
 // ── Shared markdown components (used by ASSISTANT messages) ──────────────────
 export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] = {
   // Custom <pre> wrapper: applies the box styling and attaches a hover copy button.
@@ -282,6 +329,7 @@ export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>['com
     </blockquote>
   ),
   a: MarkdownLink,
+  img: MarkdownImage,
   table: ({ children }) => <TableBlock>{children}</TableBlock>,
   thead: ({ children }) => (
     <thead style={{ background: 'var(--paper-2)' }}>{children}</thead>

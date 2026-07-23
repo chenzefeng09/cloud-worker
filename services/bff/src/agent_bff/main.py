@@ -222,6 +222,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from agent_bff.api.v1.schedules import router as schedules_router
     app.include_router(schedules_router, prefix=settings.api_prefix)
 
+    # Public inbound-webhook receiver — auth is the per-webhook secret only
+    # (deliberately NOT behind require_auth); verifies via cron-runner then
+    # launches an App run as the cron service account.
+    from agent_bff.api.v1.triggers import router as triggers_router
+    app.include_router(triggers_router, prefix=settings.api_prefix)
+
     return app
 
 

@@ -1,8 +1,9 @@
-import { useState } from 'react';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { useState, type ReactElement } from 'react';
+import { fireEvent, render as rtlRender, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CanvasMessageCard } from './CanvasMessageCard';
+import { DialogProvider } from '../admin/components/dialogs';
 import {
   applyCanvasReplacement,
   type CanvasDocumentDraft,
@@ -10,6 +11,9 @@ import {
   type CanvasEditSuggestion,
 } from '../lib/canvasObjects';
 import { useCanvasStore } from '../stores/canvasStore';
+
+/** The card calls useConfirm() (version revert), which needs the shell provider. */
+const render = (ui: ReactElement) => rtlRender(<DialogProvider>{ui}</DialogProvider>);
 
 function makeDraft(content: string): CanvasDocumentDraft {
   return {

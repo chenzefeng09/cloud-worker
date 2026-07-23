@@ -58,6 +58,59 @@ describe("readTask", () => {
     expect(task.memory).toBe("prior");
   });
 
+  // ── mcp_server_ids: three-state run-level MCP selection ──────────────────
+  // The scheduler writes this key into task.json. Presence is load-bearing:
+  // absent = tenant default, [] = disable all, non-empty = only those ids.
+  // `[]` is falsy, so a truthiness-based reader would collapse the first two
+  // cases and silently re-enable every tenant server on a "disable all" run.
+  describe("mcp_server_ids (three-state)", () => {
+    it("is undefined when the key is absent (=> tenant default)", () => {
+      process.env.AGENT_TASK_JSON = JSON.stringify({ task: "x" });
+      expect(readTask().mcp_server_ids).toBeUndefined();
+    });
+
+    it("stays [] when explicitly empty (=> MCP disabled for this run)", () => {
+      process.env.AGENT_TASK_JSON = JSON.stringify({ task: "x", mcp_server_ids: [] });
+      const ids = readTask().mcp_server_ids;
+      expect(ids).toEqual([]);
+      // The distinction that matters: empty is NOT absent.
+      expect(ids).not.toBeUndefined();
+    });
+
+    it("keeps the ids when non-empty (=> only those servers)", () => {
+      process.env.AGENT_TASK_JSON = JSON.stringify({
+        task: "x",
+        mcp_server_ids: ["mcp_AAA", "mcp_BBB"],
+      });
+      expect(readTask().mcp_server_ids).toEqual(["mcp_AAA", "mcp_BBB"]);
+    });
+
+    it("drops blanks and non-strings but keeps the list a list", () => {
+      process.env.AGENT_TASK_JSON = JSON.stringify({
+        task: "x",
+        mcp_server_ids: [" mcp_AAA ", "", 7, null, "mcp_BBB"],
+      });
+      expect(readTask().mcp_server_ids).toEqual(["mcp_AAA", "mcp_BBB"]);
+    });
+
+    it("falls back to undefined (tenant default) on a malformed value", () => {
+      // A bad shape must degrade to the pre-existing behaviour, not to
+      // "strip every tool the user has".
+      process.env.AGENT_TASK_JSON = JSON.stringify({
+        task: "x",
+        mcp_server_ids: "mcp_AAA",
+      });
+      expect(readTask().mcp_server_ids).toBeUndefined();
+    });
+
+    it("is unaffected by the legacy mcp_servers key", () => {
+      // The scheduler hardcodes mcp_servers:[] on every run; mistaking it for
+      // the selection would disable MCP everywhere.
+      process.env.AGENT_TASK_JSON = JSON.stringify({ task: "x", mcp_servers: [] });
+      expect(readTask().mcp_server_ids).toBeUndefined();
+    });
+  });
+
   it("throws when AGENT_TASK_JSON is malformed", () => {
     process.env.AGENT_TASK_JSON = "{not valid json";
     expect(() => readTask()).toThrow();

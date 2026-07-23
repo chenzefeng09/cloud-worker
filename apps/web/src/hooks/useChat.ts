@@ -909,6 +909,55 @@ export function applyPendingInteractions(
   }
 }
 
+/**
+ * Build the POST /chat body from the per-session composer selections held in
+ * the chat store. Exported (and pure apart from the store read) so the
+ * three-state contract below can be locked down by tests.
+ *
+ * The two optional-key spreads are NOT truthiness checks, on purpose:
+ *   - key ABSENT (store value `undefined`) → this session never expressed a
+ *     choice; the backend injects the user's / tenant's enabled-by-default set.
+ *   - explicit `[]`                        → disable all of them for this
+ *     session.
+ *   - non-empty list                       → exactly these.
+ * `skills` and `mcp_server_ids` share this contract; collapsing `undefined`
+ * into `[]` (or vice versa) silently changes what the agent can reach.
+ */
+export function buildChatRequestBody(
+  sessionId: string,
+  opts: { text: string; attachmentIds?: string[]; workspaceFileIds?: string[] },
+): Record<string, unknown> {
+  const state = useChatStore.getState();
+  const skills = state.selectedSkills[sessionId];
+  const mcpServerIds = state.selectedMcpServerIds[sessionId];
+  // Platform-global default skills are on by default; only a per-session opt-out
+  // (stored as `false`) is forwarded, as `include_platform_defaults: false`.
+  const platformDefaultsDisabled = state.platformDefaultsEnabled[sessionId] === false;
+  // Per-session model + reasoning effort, set via the composer dropdowns.
+  const model = state.selectedModel[sessionId] || undefined;
+  const effortSel = state.selectedEffort[sessionId] || '';
+  // Per-session execution mode (chat/inline vs agent/sandbox). Default to
+  // agent mode ('sandbox') so a session the user never toggled behaves exactly
+  // as before. Always sent explicitly so the choice is unambiguous.
+  const executionMode = state.executionMode[sessionId] || 'sandbox';
+
+  return {
+    message: opts.text,
+    attachment_ids: opts.attachmentIds || [],
+    ...(skills !== undefined ? { skills } : {}),
+    ...(mcpServerIds !== undefined ? { mcp_server_ids: mcpServerIds } : {}),
+    ...(platformDefaultsDisabled ? { include_platform_defaults: false } : {}),
+    ...(model ? { model } : {}),
+    ...(effortSel ? { reasoning_effort: effortSel } : {}),
+    execution_mode: executionMode,
+    // Workspace files referenced via "@" in the composer. Only sent when
+    // non-empty; the backend contract field is `workspace_file_ids`.
+    ...(opts.workspaceFileIds && opts.workspaceFileIds.length > 0
+      ? { workspace_file_ids: opts.workspaceFileIds }
+      : {}),
+  };
+}
+
 export function useChat() {
   const { activeSessionId, messages, setIsStreaming, isStreaming } = useChatStore();
   // abortRef is used by cancel() to abort an in-flight POST (rare — the POST is
@@ -1045,35 +1094,12 @@ export function useChat() {
       try {
         abortRef.current = new AbortController();
 
-        // ``undefined`` means this session has not established a selection yet:
-        // omit the field so the orchestrator can inject the user's authoritative
-        // enabled-by-default installs. Once seeded/toggled, send the exact list;
-        // an explicit [] therefore means "disable every skill for this session".
-        const skills = useChatStore.getState().selectedSkills[sessionId];
-        // Per-session model + reasoning effort, set via the composer dropdowns.
-        const model = useChatStore.getState().selectedModel[sessionId] || undefined;
-        const effortSel = useChatStore.getState().selectedEffort[sessionId] || '';
-        // Per-session execution mode (chat/inline vs agent/sandbox). Default to
-        // agent mode ('sandbox') so a session the user never toggled behaves
-        // exactly as before. Always sent explicitly so the choice is unambiguous.
-        const executionMode = useChatStore.getState().executionMode[sessionId] || 'sandbox';
-
         const res = await fetch(`/api/bff/v1/sessions/${sessionId}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: text,
-            attachment_ids: attachmentIds || [],
-            ...(skills !== undefined ? { skills } : {}),
-            ...(model ? { model } : {}),
-            ...(effortSel ? { reasoning_effort: effortSel } : {}),
-            execution_mode: executionMode,
-            // Workspace files referenced via "@" in the composer. Only sent when
-            // non-empty; the backend contract field is `workspace_file_ids`.
-            ...(workspaceFileIds && workspaceFileIds.length > 0
-              ? { workspace_file_ids: workspaceFileIds }
-              : {}),
-          }),
+          body: JSON.stringify(
+            buildChatRequestBody(sessionId, { text, attachmentIds, workspaceFileIds }),
+          ),
           credentials: 'include',
           signal: abortRef.current.signal,
         });

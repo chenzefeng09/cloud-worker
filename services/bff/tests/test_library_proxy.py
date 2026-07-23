@@ -170,6 +170,168 @@ def test_create_mcp_server_surfaces_upstream_error(
     assert resp.status_code == 422
 
 
+def test_list_mcp_servers_scrubs_secrets(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Library list never leaks auth credentials or connection headers.
+
+    ``auth`` is reduced to ``{type}`` (token dropped) and ``headers`` is
+    withheld entirely; metadata (timeout_seconds / tool_filter / args) is kept.
+    """
+    fake = FakeLibraryUpstream(body={"items": [{
+        "id": "mcp_01",
+        "name": "GitHub",
+        "transport": "http",
+        "auth": {"type": "bearer", "token": "sk-secret"},
+        "headers": {"Authorization": "Bearer sk-secret", "X-Trace": "1"},
+        "timeout_seconds": 30,
+        "tool_filter": {"allow": ["search"], "block": []},
+        "args": ["--verbose"],
+    }]})
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.get("/api/bff/v1/library/mcp-servers", cookies=authed_cookie)
+    assert resp.status_code == 200
+    server = resp.json()["items"][0]
+    # auth reduced to its scheme only - token dropped.
+    assert server["auth"] == {"type": "bearer"}
+    # headers withheld entirely.
+    assert "headers" not in server
+    # metadata still present end-to-end.
+    assert server["timeout_seconds"] == 30
+    assert server["tool_filter"] == {"allow": ["search"], "block": []}
+    assert server["args"] == ["--verbose"]
+
+
+def test_create_mcp_server_scrubs_secrets(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Library create response never echoes auth credentials or headers."""
+    fake = FakeLibraryUpstream(
+        status=201,
+        body={
+            "id": "mcp_01",
+            "name": "GitHub",
+            "auth": {
+                "type": "api_key",
+                "api_key": "sk-secret",
+                "header_name": "X-API-Key",
+            },
+            "headers": {"X-API-Key": "sk-secret"},
+        },
+    )
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/library/mcp-servers",
+        cookies=authed_cookie,
+        json={"name": "GitHub", "transport": "http", "endpoint": "https://x"},
+    )
+    assert resp.status_code == 201
+    server = resp.json()
+    # auth reduced to its scheme only - api_key / header_name dropped.
+    assert server["auth"] == {"type": "api_key"}
+    # headers withheld entirely.
+    assert "headers" not in server
+    assert server["id"] == "mcp_01"
+
+
+def test_list_mcp_servers_scrubs_oauth_secrets(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Library list never leaks oauth credentials.
+
+    The oauth scheme carries ``client_id`` / ``client_secret`` / ``token_url``
+    / ``scopes`` inside ``auth``; all of them are dropped and ``auth`` is
+    reduced to ``{type: "oauth"}``.  ``headers`` is withheld entirely.
+    """
+    fake = FakeLibraryUpstream(body={"items": [{
+        "id": "mcp_02",
+        "name": "OAuthGateway",
+        "transport": "http",
+        "auth": {
+            "type": "oauth",
+            "client_id": "cid-secret",
+            "client_secret": "cs-secret",
+            "token_url": "https://auth.example.com/token",
+            "scopes": ["read", "write"],
+        },
+        "headers": {"Authorization": "Bearer from-oauth"},
+    }]})
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.get("/api/bff/v1/library/mcp-servers", cookies=authed_cookie)
+    assert resp.status_code == 200
+    server = resp.json()["items"][0]
+    # auth reduced to its scheme only - all oauth credentials dropped.
+    assert server["auth"] == {"type": "oauth"}
+    assert "client_id" not in server["auth"]
+    assert "client_secret" not in server["auth"]
+    assert "token_url" not in server["auth"]
+    assert "scopes" not in server["auth"]
+    # headers withheld entirely.
+    assert "headers" not in server
+    assert server["id"] == "mcp_02"
+
+
+def test_create_mcp_server_scrubs_oauth_secrets(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Library create response never echoes oauth credentials or headers."""
+    fake = FakeLibraryUpstream(
+        status=201,
+        body={
+            "id": "mcp_02",
+            "name": "OAuthGateway",
+            "auth": {
+                "type": "oauth",
+                "client_id": "cid-secret",
+                "client_secret": "cs-secret",
+                "token_url": "https://auth.example.com/token",
+                "scopes": ["read", "write"],
+            },
+            "headers": {"Authorization": "Bearer from-oauth"},
+        },
+    )
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/library/mcp-servers",
+        cookies=authed_cookie,
+        json={
+            "name": "OAuthGateway",
+            "transport": "http",
+            "endpoint": "https://x",
+            "auth": {
+                "type": "oauth",
+                "client_id": "cid-secret",
+                "client_secret": "cs-secret",
+                "token_url": "https://auth.example.com/token",
+                "scopes": ["read", "write"],
+            },
+        },
+    )
+    assert resp.status_code == 201
+    server = resp.json()
+    # auth reduced to its scheme only - all oauth credentials dropped.
+    assert server["auth"] == {"type": "oauth"}
+    assert "client_id" not in server["auth"]
+    assert "client_secret" not in server["auth"]
+    assert "token_url" not in server["auth"]
+    assert "scopes" not in server["auth"]
+    # headers withheld entirely.
+    assert "headers" not in server
+    assert server["id"] == "mcp_02"
+
+
 # ---------------------------------------------------------------------------
 # Skills
 # ---------------------------------------------------------------------------

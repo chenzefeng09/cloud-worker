@@ -6,10 +6,12 @@
  * versions and reverts. `api.canvas.*` is mocked module-wide so the store's
  * actions resolve without real network I/O.
  */
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import type { ReactElement } from 'react';
+import { act, fireEvent, render as rtlRender, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CanvasMessageCard } from './CanvasMessageCard';
+import { DialogProvider } from '../admin/components/dialogs';
 import { useCanvasStore } from '../stores/canvasStore';
 import type { CanvasDocument, CanvasSuggestion, CanvasVersionSummary } from '../api/types';
 
@@ -33,6 +35,9 @@ vi.mock('../api/client', () => ({
     },
   },
 }));
+
+/** Revert confirmation goes through the shell's in-app dialog, not window.confirm. */
+const render = (ui: ReactElement) => rtlRender(<DialogProvider>{ui}</DialogProvider>);
 
 function seedCanvas(overrides: Partial<CanvasDocument> = {}) {
   act(() => {
@@ -263,7 +268,6 @@ describe('CanvasMessageCard canvasId mode — version history', () => {
       created_at: '2026-07-10T00:00:00Z',
       updated_at: '2026-07-10T00:03:00Z',
     } satisfies CanvasDocument);
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
 
     render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
     await user.click(screen.getByRole('button', { name: '版本历史' }));
@@ -271,16 +275,15 @@ describe('CanvasMessageCard canvasId mode — version history', () => {
 
     await user.click(screen.getByTitle('回退到版本 1'));
 
-    expect(confirmSpy).toHaveBeenCalled();
+    await screen.findByText('回退版本');
+    await user.click(screen.getByRole('button', { name: '回退' }));
     await waitFor(() => expect(mockRevert).toHaveBeenCalledWith('cvs_1', 1));
-    confirmSpy.mockRestore();
   });
 
   it('does NOT revert when the user cancels the confirmation', async () => {
     const user = userEvent.setup();
     seedCanvas();
     mockVersions.mockResolvedValueOnce({ items: versionList, next_cursor: null });
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
 
     render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
     await user.click(screen.getByRole('button', { name: '版本历史' }));
@@ -288,8 +291,8 @@ describe('CanvasMessageCard canvasId mode — version history', () => {
 
     await user.click(screen.getByTitle('回退到版本 3'));
 
-    expect(confirmSpy).toHaveBeenCalled();
+    await screen.findByText('回退版本');
+    await user.click(screen.getByRole('button', { name: '取消' }));
     expect(mockRevert).not.toHaveBeenCalled();
-    confirmSpy.mockRestore();
   });
 });

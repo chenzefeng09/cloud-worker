@@ -1680,6 +1680,7 @@ async def _execute_inline_run(
     sampling_params: dict[str, Any],
     reasoning_effort: str | None = None,
     skills: list[str] | None = None,
+    mcp_server_ids: list[str] | None = None,
     workspace_instructions: str | None = None,
     workspace_files: list[dict[str, Any]] | None = None,
     knowledge: str = "",
@@ -1779,6 +1780,10 @@ async def _execute_inline_run(
                 tenant_id=tenant_id,
                 user_id=user_id,
                 timeout=settings.inline_mcp_timeout,
+                # Presence-resolved per-run selection: None = the tenant's
+                # enabled set (historical behaviour), [] = no MCP this run,
+                # non-empty = only those server ids.
+                server_ids=mcp_server_ids,
             )
 
             # 3d. Attachments: read the session's uploaded input files and build a
@@ -2056,6 +2061,7 @@ def start_inline_run(
     sampling_params: dict[str, Any],
     reasoning_effort: str | None = None,
     skills: list[str] | None = None,
+    mcp_server_ids: list[str] | None = None,
     workspace_instructions: str | None = None,
     workspace_files: list[dict[str, Any]] | None = None,
     knowledge: str = "",
@@ -2076,6 +2082,12 @@ def start_inline_run(
     request omitted the key), already unioned with the workspace's skill set.
     Empty/None means no skill loop for this run — the executor then behaves
     exactly as before skills were supported.
+
+    ``mcp_server_ids`` is the presence-resolved MCP selection from create_run:
+    ``None`` (request omitted the key) → discover every enabled tenant server,
+    ``[]`` (explicitly sent empty) → no MCP tools at all for this run,
+    non-empty → only those server ids.  ``None`` and ``[]`` are NOT
+    interchangeable.
 
     ``workspace_instructions`` / ``workspace_files`` are the session workspace's
     context, extracted into PLAIN values (str / list of dicts with
@@ -2102,6 +2114,7 @@ def start_inline_run(
             sampling_params=sampling_params,
             reasoning_effort=reasoning_effort,
             skills=skills,
+            mcp_server_ids=mcp_server_ids,
             workspace_instructions=workspace_instructions,
             workspace_files=workspace_files,
             knowledge=knowledge,

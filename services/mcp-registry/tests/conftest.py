@@ -8,6 +8,8 @@ skipped in tests; the service code is dialect-aware (see
 
 from __future__ import annotations
 
+import base64
+import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Any
 from unittest.mock import MagicMock
@@ -26,6 +28,60 @@ from mcp_registry.main import create_app
 TEST_TENANT = "tnt_01J5TEST00000000000000TNT1"
 TEST_TENANT_OTHER = "tnt_01J5TEST00000000000000TNT2"
 TEST_USER = "usr_01J5TEST0000000000000USER1"
+
+# Secret fields encrypted/decrypted by the API layer.  Mirrors the table in
+# ``services/secret_crypto.py`` so the reversible test fake stays in sync.
+_SECRET_FIELDS = ("token", "api_key", "client_secret")
+
+
+def _is_envelope(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        obj = json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(obj, dict) and "ciphertext_b64" in obj
+
+
+async def _reversible_encrypt_auth(
+    auth: dict[str, Any] | None,
+    *,
+    crypto_url: str,
+    timeout: float,
+    tenant_id: str,
+) -> dict[str, Any] | None:
+    """Test-only reversible encrypt: envelope = {"ciphertext_b64": b64(pt)}."""
+    if not auth:
+        return auth
+    out = dict(auth)
+    for field in _SECRET_FIELDS:
+        v = out.get(field)
+        if isinstance(v, str) and v and not _is_envelope(v):
+            out[field] = json.dumps(
+                {"ciphertext_b64": base64.b64encode(v.encode()).decode()}
+            )
+    return out
+
+
+async def _reversible_decrypt_auth(
+    auth: dict[str, Any] | None,
+    *,
+    crypto_url: str,
+    timeout: float,
+    tenant_id: str,
+) -> dict[str, Any] | None:
+    """Test-only reversible decrypt - inverse of ``_reversible_encrypt_auth``."""
+    if not auth:
+        return auth
+    out = dict(auth)
+    for field in _SECRET_FIELDS:
+        v = out.get(field)
+        if isinstance(v, str) and v and _is_envelope(v):
+            obj = json.loads(v)
+            out[field] = base64.b64decode(obj["ciphertext_b64"]).decode()
+    return out
+
 
 
 @pytest.fixture
@@ -92,10 +148,27 @@ def mock_authz_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def mock_crypto_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch the API-layer crypto helpers with a reversible in-memory transform.
+
+    This avoids real HTTP calls to the foundation crypto service in every
+    test while still exercising the full encrypt-on-write / decrypt-on-read
+    round-trip: the DB row holds an envelope (``ciphertext_b64``) and every
+    API/internal response returns plaintext.  Tests that need to assert on
+    ciphertext-at-rest read the ORM row directly (bypassing the API decrypt).
+    """
+    import mcp_registry.api.v1.mcp_servers as api_module
+
+    monkeypatch.setattr(api_module, "encrypt_auth", _reversible_encrypt_auth)
+    monkeypatch.setattr(api_module, "decrypt_auth", _reversible_decrypt_auth)
+
+
+@pytest.fixture
 def app_client(
     settings: Settings,
     db_engine_and_factory: tuple[object, async_sessionmaker[AsyncSession]],
     mock_authz_allowed: None,
+    mock_crypto_roundtrip: None,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[TestClient]:
     """API client backed by the in-memory SQLite engine, authz always-allow.

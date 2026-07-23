@@ -162,7 +162,7 @@ def _build_openai_gateway_model(
 
         async def _call_api(
             self,
-            model_name_: str,
+            model_name: str,
             messages: list,
             tools: list[dict] | None = None,
             tool_choice: Any | None = None,
@@ -184,7 +184,7 @@ def _build_openai_gateway_model(
             formatted_messages = await self.formatter.format(messages)
 
             kwargs: dict[str, Any] = {
-                "model": model_name_,
+                "model": model_name,
                 "messages": formatted_messages,
                 "stream": self.stream,
             }

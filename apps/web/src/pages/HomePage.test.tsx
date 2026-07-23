@@ -38,16 +38,36 @@ vi.mock('../hooks/useCanUploadAttachment', () => ({
   useCanUploadAttachment: () => ({ checkFile: vi.fn().mockResolvedValue({ allowed: true }) }),
 }));
 vi.mock('../hooks/useFeatureFlags', () => ({ useFeatureFlag: () => true }));
+vi.mock('../hooks/useInstalledSkills', () => ({
+  useInstalledSkills: () => Object.assign([], { refresh: vi.fn() }),
+}));
+vi.mock('../hooks/useMcpServers', () => ({
+  useMcpServers: () => ({ servers: [], refresh: vi.fn() }),
+}));
 vi.mock('../stores/chatStore', () => ({
+  DRAFT_SESSION_ID: '__draft__',
   useChatStore: (selector: (state: Record<string, unknown>) => unknown) =>
     selector({
+      selectedSkills: {},
+      selectedMcpServerIds: {},
+      toggleSkill: vi.fn(),
+      seedSkills: vi.fn(),
+      toggleMcpServer: vi.fn(),
+      seedMcpServerIds: vi.fn(),
+      commitDraftSelections: vi.fn(),
       setSessionModel: mocks.setSessionModel,
       setSessionEffort: mocks.setSessionEffort,
       setSessionExecutionMode: mocks.setSessionExecutionMode,
     }),
 }));
 vi.mock('../api/client', () => ({
-  api: { attachments: { upload: vi.fn(), remove: vi.fn() } },
+  api: {
+    attachments: { upload: vi.fn(), remove: vi.fn() },
+    // Composer fetches the model catalogue via useModelOptions; resolve empty
+    // so it falls back to MODEL_OPTIONS (the useDefaultModel mock returns
+    // 'deepseek-v4-flash', which is a MODEL_OPTIONS entry) - no auto-correct.
+    modelPreferences: { listModels: vi.fn().mockResolvedValue([]) },
+  },
 }));
 
 describe('HomePage composer toolbar', () => {
@@ -58,7 +78,7 @@ describe('HomePage composer toolbar', () => {
     const toolbar = screen.getByTestId('home-composer-toolbar');
     expect(toolbar).not.toHaveClass('border-t', 'bg-paper');
 
-    const addButton = screen.getByRole('button', { name: '添加文件' });
+    const addButton = screen.getByRole('button', { name: '添加文件、技能或工具' });
     expect(addButton).toHaveClass('rounded-full', 'w-9', 'h-9');
 
     expect(screen.queryByRole('radiogroup', { name: '运行模式' })).not.toBeInTheDocument();

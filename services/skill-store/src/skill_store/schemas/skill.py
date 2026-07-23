@@ -20,6 +20,10 @@ class SkillCreate(BaseModel):
     description: str | None = Field(None, max_length=2000)
     owner: str | None = Field(None, max_length=120)
     visibility: Visibility = Visibility.PRIVATE
+    # Platform-global default flag.  Only honoured when the skill is created
+    # under ``PLATFORM_TENANT_ID`` (the seed) — an ordinary tenant creating a
+    # skill leaves this false and it has no effect on resolution.
+    default_enabled: bool = False
 
 
 class SkillOut(BaseModel):
@@ -30,6 +34,10 @@ class SkillOut(BaseModel):
     owner: str | None = None
     visibility: Visibility
     created_at: datetime
+    # True for platform-global default skills (owned by PLATFORM_TENANT_ID). The
+    # library surfaces these as read-only built-ins — every org has them, no
+    # per-tenant install/uninstall applies. Not a DB column: set by the endpoint.
+    is_platform_default: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 

@@ -50,6 +50,11 @@ async def _do_fire(job_id: str, settings: Settings) -> None:
         logger.info("cron job %s not found at fire time — skipping", job_id)
         return
 
+    if job.trigger_type != "schedule":
+        # Webhook triggers are fired by an external HTTP call, never scheduled.
+        logger.info("cron job %s is not a schedule trigger — skipping", job_id)
+        return
+
     if not job.enabled:
         logger.info("cron job %s is disabled — skipping", job_id)
         await _persist_result(job_id, job.tenant_id, "skipped", None, settings)
@@ -194,7 +199,14 @@ async def load_all_jobs(scheduler: AsyncIOScheduler, settings: Settings) -> None
     loaded = 0
     try:
         async for session in get_session(tenant_id="SYSTEM", user_id="svc-cron", actor="SYSTEM"):
-            result = await session.execute(select(CronJob).where(CronJob.enabled == True))  # noqa: E712
+            # Only schedule triggers are loaded into APScheduler; webhook
+            # triggers are fired by an external HTTP call in a later phase.
+            result = await session.execute(
+                select(CronJob).where(
+                    CronJob.enabled == True,  # noqa: E712
+                    CronJob.trigger_type == "schedule",
+                )
+            )
             jobs = result.scalars().all()
             for job in jobs:
                 try:

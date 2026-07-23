@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from agent_bff.api._http import foundation_headers
@@ -72,14 +72,26 @@ def _orchestrator_url(request: Request) -> str:
 async def list_apps(
     request: Request,
     scope: str | None = None,
+    tag: list[str] | None = Query(
+        default=None,
+        description="Filter by tag (repeatable; OR semantics). Forwarded to app-registry.",
+    ),
     _auth: tuple = Depends(require_auth()),
 ) -> JSONResponse:
-    """List visible Apps (``?scope=mine|published``; app-registry defaults to published)."""
+    """List visible Apps (``?scope=mine|published``; app-registry defaults to published).
+
+    ``?tag=foo&tag=bar`` is forwarded as repeated query params (OR filter).
+    """
     tenant_id, user_id, access_token = _auth
     url = _registry_url(request)
-    params: dict[str, str] = {}
+    # Use a list of tuples (not a dict) so repeated ``tag`` params survive
+    # forwarding as ``?tag=foo&tag=bar`` rather than collapsing to one value.
+    params: list[tuple[str, str]] = []
     if scope:
-        params["scope"] = scope
+        params.append(("scope", scope))
+    if tag:
+        for t in tag:
+            params.append(("tag", t))
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             f"{url}/apps",
@@ -543,8 +555,9 @@ async def run_app(
     session_id: str | None = body.get("session_id") or None
 
     # Run origin forwarded from the caller ("user" by default; cron-runner
-    # sends "schedule").  Validate early so the caller gets a clear 400.
-    _VALID_SOURCES = {"user", "schedule"}
+    # sends "schedule"; the inbound-webhook receiver sends "webhook").  Validate
+    # early so the caller gets a clear 400.
+    _VALID_SOURCES = {"user", "schedule", "webhook"}
     source: str = body.get("source") or "user"
     if source not in _VALID_SOURCES:
         raise HTTPException(
@@ -567,6 +580,10 @@ async def run_app(
         reasoning_effort = version.get("reasoning_effort")
         sampling_params = version.get("sampling_params") or {}
         forced_skills = version.get("forced_skills") or []
+        # NOTE: this ``or []`` is the point where "not configured" and
+        # "explicitly no servers" collapse into one value.  See the run-body
+        # assembly in step 9 for why that is tolerated and what unblocking it
+        # would take.
         forced_mcp_server_ids = version.get("forced_mcp_server_ids") or []
         input_schema: list[dict] = version.get("input_schema") or []
         app_version = version.get("version")
@@ -677,21 +694,45 @@ async def run_app(
         }
 
         # 9. Trigger the run carrying the fixed harness.
+        app_run_body: dict[str, Any] = {
+            "task": task_text,
+            "files": files,
+            "skills": forced_skills,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "sys_prompt": system_prompt,
+            "sampling_params": sampling_params,
+            "app_snapshot": app_snapshot,
+            # Forwarded origin — "user" for interactive runs, "schedule" for
+            # cron-runner-triggered runs.
+            "source": source,
+        }
+        # ── Deliberate asymmetry with ``skills`` — do NOT "fix" this ──────────
+        # ``skills`` is always sent (so an App with no forced skills runs with
+        # none).  ``mcp_server_ids`` is sent ONLY when the App actually forces
+        # servers.  This is a conscious choice of backward compatibility over
+        # symmetry: Apps were published long before this field was consumed by
+        # any execution layer, and they currently inherit the tenant's enabled
+        # MCP set at runtime.  Always sending the key would send ``[]`` for
+        # every existing App and silently strip its MCP tools on the next run.
+        # Sending nothing preserves that inheritance.
+        #
+        # KNOWN LIMITATION (accepted): an App therefore cannot express "disable
+        # all MCP".  ``forced_mcp_server_ids`` collapses "not configured" and
+        # "explicitly none" into the same value — the ``or []`` where it is read
+        # (see the version unpacking above) is that collapse point.  Supporting
+        # explicit disable requires app-registry to make the column genuinely
+        # tri-state first (``None`` = inherit / ``[]`` = disable all / non-empty
+        # = narrow); once it is, this branch just relays all three states and
+        # the downstream chain already handles them — orchestrator and scheduler
+        # are pure presence passthroughs and need no change.
+        if forced_mcp_server_ids:
+            app_run_body["mcp_server_ids"] = forced_mcp_server_ids
+
+        # 9. Trigger the run carrying the fixed harness.
         run_resp = await client.post(
             f"{orch_url}/sessions/{session_id}/runs",
-            json={
-                "task": task_text,
-                "files": files,
-                "skills": forced_skills,
-                "model": model,
-                "reasoning_effort": reasoning_effort,
-                "sys_prompt": system_prompt,
-                "sampling_params": sampling_params,
-                "app_snapshot": app_snapshot,
-                # Forwarded origin — "user" for interactive runs, "schedule" for
-                # cron-runner-triggered runs.
-                "source": source,
-            },
+            json=app_run_body,
             headers=headers,
         )
         _raise_for_upstream(run_resp)
@@ -705,3 +746,94 @@ async def run_app(
         },
         status_code=201,
     )
+
+
+# --------------------------------------------------------------------------- #
+# App execution history - GET /apps/{id}/runs
+# --------------------------------------------------------------------------- #
+
+
+def _trim_run_for_app_history(item: dict) -> dict:
+    """Reduce a full run row to the fields an App history view needs.
+
+    The orchestrator returns the whole ``app_snapshot`` (system_prompt,
+    rendered_task_preview, sampling_params, ...).  For a list view we keep only
+    a short ``inputs`` summary - each value was already truncated to
+    ``_SNAPSHOT_VALUE_MAX`` bytes when ``run_app`` built the snapshot - plus a
+    compact app-context block.  ``result_summary`` is included so a finished
+    run's outcome is visible without a follow-up fetch.
+    """
+    snap = item.get("app_snapshot") or {}
+    inputs = snap.get("inputs") or []
+    return {
+        "id": item.get("id"),
+        "session_id": item.get("session_id"),
+        "status": item.get("status"),
+        "created_at": item.get("created_at"),
+        "started_at": item.get("started_at"),
+        "finished_at": item.get("finished_at"),
+        "result_summary": item.get("result_summary"),
+        "error_message": item.get("error_message"),
+        "source": item.get("source"),
+        "execution_mode": item.get("execution_mode"),
+        "app": {
+            "app_id": snap.get("app_id"),
+            "app_name": snap.get("app_name"),
+            "app_version": snap.get("app_version"),
+            "app_version_id": snap.get("app_version_id"),
+            "model": snap.get("model"),
+        },
+        "inputs": [
+            {
+                "key": i.get("key"),
+                "label": i.get("label"),
+                "type": i.get("type"),
+                "value": i.get("value"),
+            }
+            for i in inputs
+            if isinstance(i, dict)
+        ],
+    }
+
+
+@router.get("/apps/{app_id}/runs")
+async def list_app_runs(
+    app_id: str,
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    _auth: tuple = Depends(require_auth()),
+) -> JSONResponse:
+    """List an App's execution history (runs carrying ``app_snapshot.app_id``).
+
+    Light validation: confirms the App exists + is visible to the caller via
+    app-registry (404/403 propagates).  Tenant isolation is still RLS-enforced
+    on the orchestrator side - the ``app_id`` filter only narrows within-tenant,
+    so a foreign or spoofed app_id returns an empty list, never another
+    tenant's runs.
+
+    Forwards to ``GET /runs?app_id=<id>`` on the orchestrator and trims each
+    run via :func:`_trim_run_for_app_history`.  Paginated by ``limit`` /
+    ``offset`` (mirrors the orchestrator's ``list_tenant_runs``).
+    """
+    tenant_id, user_id, access_token = _auth
+    registry_url = _registry_url(request)
+    orch_url = _orchestrator_url(request)
+    headers = foundation_headers(tenant_id, user_id, access_token)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        # Existence / visibility check.  A 404 from the registry means there is
+        # nothing to list - surface it rather than returning an empty history
+        # that hides a bad app_id.  RLS still does the real tenant scoping.
+        resp = await client.get(f"{registry_url}/apps/{app_id}", headers=headers)
+        _raise_for_upstream(resp)
+
+        runs_resp = await client.get(
+            f"{orch_url}/runs",
+            params={"app_id": app_id, "limit": limit, "offset": offset},
+            headers=headers,
+        )
+        _raise_for_upstream(runs_resp)
+
+    items = [_trim_run_for_app_history(it) for it in runs_resp.json().get("items", [])]
+    return JSONResponse(content={"items": items, "limit": limit, "offset": offset})

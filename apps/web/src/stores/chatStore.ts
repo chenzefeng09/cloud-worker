@@ -60,6 +60,17 @@ interface ChatState {
    * time and forwards them in the /chat body → task.json["skills"]).
    */
   selectedSkills: Record<string, string[]>;
+  /**
+   * Per-session set of enabled MCP server ids. Same three-state contract as
+   * `selectedSkills` — and the reason this is `Record<string, string[]>` and
+   * NOT a truthy-checked list:
+   *   - key ABSENT (undefined) → the session never expressed a choice, so the
+   *     backend falls back to the tenant's enabled-by-default servers;
+   *   - explicit []            → every MCP server disabled for this session;
+   *   - non-empty list         → exactly these servers.
+   * `undefined` and `[]` must never collapse into one another.
+   */
+  selectedMcpServerIds: Record<string, string[]>;
   /** Per-session selected model id (gateway routing key). Read at send time. */
   selectedModel: Record<string, string>;
   /** Per-session reasoning effort ('' = off). Read at send time. */
@@ -72,6 +83,16 @@ interface ChatState {
    * unchanged.
    */
   executionMode: Record<string, ExecutionMode>;
+  /**
+   * Per-session opt-out of the platform-global default skills. Two-state:
+   *   - key ABSENT (undefined) → default = enabled; the run injects the
+   *     platform default skills (the "自带" behaviour).
+   *   - explicit `false`       → suppress platform defaults for this session;
+   *     `useChat.sendMessage` forwards `include_platform_defaults: false`.
+   * We never store `true` (absence already means enabled), so a session the
+   * user never touched sends nothing and keeps the default.
+   */
+  platformDefaultsEnabled: Record<string, boolean>;
 
   // ── HITL — human-in-the-loop ─────────────────────────────────────────────
   //
@@ -342,12 +363,36 @@ interface ChatState {
    * the user already made this session).
    */
   seedSkills: (sessionId: string, names: string[]) => void;
+  /** Toggle an MCP server on/off for a session (composer "+" menu). */
+  toggleMcpServer: (sessionId: string, serverId: string) => void;
+  /**
+   * Seed a session's enabled MCP servers from the tenant defaults — but only
+   * if no selection exists yet for that session, so a user who already
+   * unchecked everything (explicit []) is never re-seeded back on.
+   */
+  seedMcpServerIds: (sessionId: string, serverIds: string[]) => void;
+  /**
+   * Hand the pre-session draft selections (see `DRAFT_SESSION_ID`) to a freshly
+   * created session, then clear the draft so the next new session starts from
+   * the defaults again instead of inheriting this one's choices.
+   *
+   * Copies the value VERBATIM — an explicit `[]` (everything off) stays `[]`
+   * and an untouched `undefined` stays absent. Collapsing those two here would
+   * silently re-enable everything the user just switched off.
+   */
+  commitDraftSelections: (sessionId: string) => void;
   /** Set the model for a session (composer dropdown). */
   setSessionModel: (sessionId: string, model: string) => void;
   /** Set the reasoning effort for a session ('' = off). */
   setSessionEffort: (sessionId: string, effort: string) => void;
   /** Set the execution mode for a session ('inline' = chat, 'sandbox' = agent). */
   setSessionExecutionMode: (sessionId: string, mode: ExecutionMode) => void;
+  /**
+   * Toggle the platform-global default skills for a session. `enabled=true`
+   * clears the opt-out (back to default behaviour); `enabled=false` stores the
+   * opt-out so the next run sends `include_platform_defaults: false`.
+   */
+  setPlatformDefaultsEnabled: (sessionId: string, enabled: boolean) => void;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -409,6 +454,19 @@ function pendingInteractionKey(runId: string, toolCallId: string): string {
 // Persist the chat/agent mode toggle per session so a refresh keeps the user's
 // choice. Best-effort: any storage failure (privacy mode, quota) is swallowed
 // and the mode simply falls back to the agent-mode default.
+/**
+ * Slot for composer selections made BEFORE a session exists — the home page's
+ * "+" menu. `selectedSkills` / `selectedMcpServerIds` are keyed by session id,
+ * but the home composer has no session: one is created lazily on the first
+ * upload or on send. Toggling a skill must NOT create a session (the user may
+ * toggle and walk away, leaving an empty session in the sidebar), so the home
+ * page writes under this reserved key and `commitDraftSelections` hands the
+ * choice over to the real session id once `startChat` creates it.
+ *
+ * Reserved, never a real session id (those are `ses_…`).
+ */
+export const DRAFT_SESSION_ID = '__draft__';
+
 const EXECUTION_MODE_STORAGE_KEY = 'chat-execution-mode-v1';
 
 function loadPersistedExecutionModes(): Record<string, ExecutionMode> {
@@ -523,9 +581,11 @@ export const useChatStore = create<ChatState>((set) => ({
   userProfile: null,
   bootstrapped: false,
   selectedSkills: {},
+  selectedMcpServerIds: {},
   selectedModel: {},
   selectedEffort: {},
   executionMode: loadPersistedExecutionModes(),
+  platformDefaultsEnabled: {},
   pendingInteractions: {},
   acknowledgedPendingInteractions: {},
 
@@ -986,10 +1046,14 @@ export const useChatStore = create<ChatState>((set) => ({
       closedStreamRuns: {},
       activeSessionId: null,
       bootstrapped: true,
+      // Wipes the per-session entries AND the pre-session draft slot
+      // (DRAFT_SESSION_ID lives in these same two records).
       selectedSkills: {},
+      selectedMcpServerIds: {},
       selectedModel: {},
       selectedEffort: {},
       executionMode: {},
+      platformDefaultsEnabled: {},
       pendingInteractions: {},
       acknowledgedPendingInteractions: {},
     }),
@@ -1009,6 +1073,47 @@ export const useChatStore = create<ChatState>((set) => ({
       if (s.selectedSkills[sessionId] !== undefined) return {};
       return { selectedSkills: { ...s.selectedSkills, [sessionId]: names } };
     }),
+  toggleMcpServer: (sessionId, serverId) =>
+    set((s) => {
+      // `|| []` only decides where the toggle STARTS from; the seed below (and
+      // the composer, which seeds the tenant defaults when the menu opens)
+      // is what makes "first toggle" behave sensibly. Writing the key here is
+      // deliberate: from now on this session sends an explicit list.
+      const current = s.selectedMcpServerIds[sessionId] || [];
+      const next = current.includes(serverId)
+        ? current.filter((id) => id !== serverId)
+        : [...current, serverId];
+      return { selectedMcpServerIds: { ...s.selectedMcpServerIds, [sessionId]: next } };
+    }),
+  seedMcpServerIds: (sessionId, serverIds) =>
+    set((s) => {
+      // Don't clobber an existing selection — including an explicit [].
+      if (s.selectedMcpServerIds[sessionId] !== undefined) return {};
+      return { selectedMcpServerIds: { ...s.selectedMcpServerIds, [sessionId]: serverIds } };
+    }),
+  commitDraftSelections: (sessionId) =>
+    set((s) => {
+      const draftSkills = s.selectedSkills[DRAFT_SESSION_ID];
+      const draftMcp = s.selectedMcpServerIds[DRAFT_SESSION_ID];
+      if (draftSkills === undefined && draftMcp === undefined) return {};
+
+      const nextSkills = { ...s.selectedSkills };
+      const nextMcp = { ...s.selectedMcpServerIds };
+      // Always drop the draft, even if only one of the two was touched —
+      // otherwise the NEXT new session inherits this one's selection.
+      delete nextSkills[DRAFT_SESSION_ID];
+      delete nextMcp[DRAFT_SESSION_ID];
+      // `!== undefined`, not truthiness: `[]` is a real choice ("all off") and
+      // must survive the handover. Never clobber a selection the session
+      // already has.
+      if (draftSkills !== undefined && nextSkills[sessionId] === undefined) {
+        nextSkills[sessionId] = draftSkills;
+      }
+      if (draftMcp !== undefined && nextMcp[sessionId] === undefined) {
+        nextMcp[sessionId] = draftMcp;
+      }
+      return { selectedSkills: nextSkills, selectedMcpServerIds: nextMcp };
+    }),
   setSessionModel: (sessionId, model) =>
     set((s) => ({ selectedModel: { ...s.selectedModel, [sessionId]: model } })),
   setSessionEffort: (sessionId, effort) =>
@@ -1018,5 +1123,17 @@ export const useChatStore = create<ChatState>((set) => ({
       const next = { ...s.executionMode, [sessionId]: mode };
       persistExecutionModes(next);
       return { executionMode: next };
+    }),
+  setPlatformDefaultsEnabled: (sessionId, enabled) =>
+    set((s) => {
+      const next = { ...s.platformDefaultsEnabled };
+      if (enabled) {
+        // Enabled is the default — clear the opt-out so we send nothing and the
+        // run keeps the platform defaults (never store `true`).
+        delete next[sessionId];
+      } else {
+        next[sessionId] = false;
+      }
+      return { platformDefaultsEnabled: next };
     }),
 }));

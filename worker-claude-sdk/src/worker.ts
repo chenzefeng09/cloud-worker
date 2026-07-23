@@ -338,20 +338,42 @@ export function buildSystemPrompt(
 
 /**
  * Resolve the tenant's MCP servers from the registry. failure-open: when
- * MCP_REGISTRY_URL is unset or the call fails, returns {} and logs a warning.
+ * MCP_REGISTRY_URL is unset or the call fails, returns empty servers + filters
+ * and logs a warning.
  *
  * B.5/F.5: the registry's server records are mapped onto the SDK's
  * Record<string, McpServerConfig>. The registry is expected to return
- * `{servers: [{name, type, url|command, headers?, args?, env?}]}`. If the real
- * registry shape diverges, extend `mapRegistryServer` below.
+ * `{servers: [{name, type, url|command, headers?, args?, env?, auth?,
+ * timeout_seconds?, tool_filter?}]}`. If the real registry shape diverges,
+ * extend `mapRegistryServer` below.
+ *
+ * Returns the SDK server map PLUS a per-server `filters` map (from the
+ * registry `tool_filter` field) so runQuery can hide blocked tools via
+ * `disallowedTools` (exposure) and enforce per-server allow-lists via a
+ * PreToolUse gate (the SDK has no per-server allowedTools, so allow is enforced
+ * at execution; block is a true exposure filter).
+ *
+ * `selectedIds` is the run-level selection from `task.json.mcp_server_ids` and
+ * is THREE-STATE (see `Task.mcp_server_ids`): `undefined` = tenant default (all
+ * enabled servers), `[]` = MCP off for this run, non-empty = only those ids.
  */
 export async function loadMcpServers(
   env: Env,
-): Promise<Record<string, McpServerConfig>> {
+  selectedIds?: readonly string[],
+): Promise<{ servers: Record<string, McpServerConfig>; filters: McpToolFilters }> {
+  // Explicit empty selection = MCP is off for this run. Short-circuit before the
+  // registry call: there is no server we could possibly keep, so the fetch would
+  // be pure waste. Note `selectedIds !== undefined` — `[]` is falsy and a
+  // truthiness test here would silently mean "tenant default" instead.
+  if (selectedIds !== undefined && selectedIds.length === 0) {
+    console.log("[worker] MCP disabled for this run (mcp_server_ids=[])");
+    return { servers: {}, filters: {} };
+  }
+
   const base = env.MCP_REGISTRY_URL;
   if (!base) {
     console.warn("[worker] MCP_REGISTRY_URL unset; no MCP servers loaded");
-    return {};
+    return { servers: {}, filters: {} };
   }
 
   // The registry's internal-auth guard requires the tenant_id query param to
@@ -378,7 +400,7 @@ export async function loadMcpServers(
       console.warn(
         `[worker] mcp-registry returned ${resp.status}; no MCP servers loaded`,
       );
-      return {};
+      return { servers: {}, filters: {} };
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry JSON
     const body: any = await resp.json();
@@ -393,18 +415,41 @@ export async function loadMcpServers(
           ? body.servers
           : [];
 
+    // Run-level selection is applied HERE — before mapRegistryServer, i.e.
+    // BEFORE the transport mapping / broker rewrite / drop logic. The two
+    // filters answer different questions and must not be interleaved:
+    //   selection  = "did the user pick this server for this run?" (identity)
+    //   transport  = "can this runtime actually speak to it?"      (capability)
+    // Selecting first means an unpicked server is never mapped, never rewritten
+    // to a broker endpoint, and never contacted — a deselected server must not
+    // be touched at all. It also keeps the "dropping MCP server X" warnings
+    // meaningful: they now only fire for servers the user actually asked for.
+    const selected =
+      selectedIds === undefined
+        ? servers
+        : servers.filter((raw) => selectedIds.includes(String(raw?.id ?? "").trim()));
+    if (selectedIds !== undefined) {
+      console.log(
+        `[worker] mcp_server_ids selection: ${selected.length}/${servers.length} server(s) kept`,
+      );
+    }
+
     const out: Record<string, McpServerConfig> = {};
-    for (const raw of servers) {
-      const mapped = mapRegistryServer(raw, env);
-      if (mapped) out[mapped.name] = mapped.config;
+    const filters: McpToolFilters = {};
+    for (const raw of selected) {
+      const mapped = await mapRegistryServer(raw, env);
+      if (mapped) {
+        out[mapped.name] = mapped.config;
+        if (mapped.filter) filters[mapped.name] = mapped.filter;
+      }
     }
     console.log(`[worker] loaded ${Object.keys(out).length} MCP server(s) from registry`);
-    return out;
+    return { servers: out, filters };
   } catch (err) {
     console.warn(
       `[worker] mcp-registry fetch failed; no MCP servers loaded: ${(err as Error).message}`,
     );
-    return {};
+    return { servers: {}, filters: {} };
   }
 }
 
@@ -422,11 +467,11 @@ export async function loadMcpServers(
  * missing, the server is DROPPED rather than handed an unreachable raw endpoint.
  * stdio servers run locally in the sandbox and are never rewritten or dropped.
  */
-function mapRegistryServer(
+async function mapRegistryServer(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry JSON
   raw: any,
   env: Env,
-): { name: string; config: McpServerConfig } | null {
+): Promise<{ name: string; config: McpServerConfig; filter?: { allow?: string[]; block?: string[] } } | null> {
   const name = String(raw?.name ?? "").trim();
   if (!name) return null;
   // The mcp-registry returns `id` (e.g. "mcp_<26HEX>") on every record; needed to
@@ -437,6 +482,12 @@ function mapRegistryServer(
   const type = String(
     raw?.type ?? raw?.transport ?? (url ? "http" : ""),
   ).toLowerCase();
+  // tool_filter is transport-agnostic; capture it once for the caller to apply.
+  const filter = parseToolFilter(raw?.tool_filter);
+  // timeout_seconds applies to every transport (forwarded to the SDK config;
+  // the current SDK/CLI ignores an unknown `timeout` field, but strictMcpConfig
+  // defaults to false so it passes through harmlessly - see withTimeout).
+  const timeoutSeconds = raw?.timeout_seconds;
 
   if ((type === "http" || type === "sse") && url) {
     if (env.SANDBOX_EGRESS_MODE === "broker") {
@@ -449,53 +500,314 @@ function mapRegistryServer(
         );
         return null;
       }
+      // The SDK re-sends these configured headers on EVERY MCP request. The
+      // broker's auth runs in two gates: `_require_auth` (needs an
+      // Authorization bearer + X-Tenant-Id, exactly like the registry fetch
+      // above) THEN `_require_lease` (needs `x-tool-broker-lease` carrying
+      // `mcp.tenant_invoke`). Both must be present on every tool call or the
+      // broker 401s before the lease is even checked, so we attach all three
+      // (mirroring loadMcpServers' registry-fetch header set).
+      //
+      // Registry-supplied upstream `auth`/`headers` are intentionally NOT
+      // attached here: the broker is the single upstream-auth injection point
+      // for broker-routed sessions (it reads them from the registry record and
+      // injects them toward the real upstream). Sending them here would only
+      // hand them to the broker, which already has them, risking duplication.
       return {
         name,
-        config: {
-          type: type as "http" | "sse",
-          url: `${brokerBase}/mcp-tenant/v1/${encodeURIComponent(id)}`,
-          // The SDK re-sends these configured headers on EVERY MCP request. The
-          // broker's auth runs in two gates: `_require_auth` (needs an
-          // Authorization bearer + X-Tenant-Id, exactly like the registry fetch
-          // above) THEN `_require_lease` (needs `x-tool-broker-lease` carrying
-          // `mcp.tenant_invoke`). Both must be present on every tool call or the
-          // broker 401s before the lease is even checked, so we attach all three
-          // (mirroring loadMcpServers' registry-fetch header set). Any
-          // manifest-supplied headers are preserved and take lowest precedence.
-          headers: {
-            ...((raw.headers as Record<string, string>) ?? {}),
-            authorization: `Bearer ${env.FOUNDATION_API_TOKEN}`,
-            "x-tenant-id": env.FOUNDATION_TENANT_ID,
-            ...(env.TOOL_BROKER_LEASE
-              ? { "x-tool-broker-lease": env.TOOL_BROKER_LEASE }
-              : {}),
+        config: withTimeout(
+          {
+            type: type as "http" | "sse",
+            url: `${brokerBase}/mcp-tenant/v1/${encodeURIComponent(id)}`,
+            headers: {
+              authorization: `Bearer ${env.FOUNDATION_API_TOKEN}`,
+              "x-tenant-id": env.FOUNDATION_TENANT_ID,
+              ...(env.TOOL_BROKER_LEASE
+                ? { "x-tool-broker-lease": env.TOOL_BROKER_LEASE }
+                : {}),
+            },
           },
-        },
+          timeoutSeconds,
+        ),
+        filter,
       };
     }
-    // Non-broker mode (foundation/none/unset): keep current behavior exactly.
+    // Non-broker mode (foundation/none/unset): the sandbox reaches the upstream
+    // directly, so the worker injects the registry-supplied upstream auth +
+    // custom headers itself (mirroring the inline orchestrator). Broker auth
+    // headers are NOT attached - there is no broker in this path.
+    const directHeaders: Record<string, string> = {
+      ...((raw.headers as Record<string, string>) ?? {}),
+      ...buildUpstreamAuthHeaders(raw?.auth),
+    };
+    // oauth: in direct mode the worker performs the client-credentials flow
+    // itself (cached + single-flight by server_id) and injects the bearer.
+    // Broker mode does NOT fetch a token here - the broker is the single
+    // upstream-auth injection point for broker-routed sessions. A fetch failure
+    // is fail-open (logged + no Authorization header) so the MCP handshake
+    // surfaces the upstream's own 401. The SDK re-sends these configured
+    // headers on every MCP request, so the token is baked in at config time;
+    // sandbox runs are short-lived, so mid-run expiry is not a concern.
+    if (String(raw?.auth?.type ?? "none").toLowerCase() === "oauth") {
+      const oauthServerId = String(raw?.id ?? "").trim();
+      if (oauthServerId) {
+        try {
+          directHeaders["Authorization"] = `Bearer ${await getOauthToken(oauthServerId, raw?.auth)}`;
+        } catch (err) {
+          console.warn(
+            `[worker] oauth token fetch failed for ${name}: ${(err as Error).message}`,
+          );
+        }
+      } else {
+        console.warn(
+          `[worker] oauth auth missing server id for ${name}; skipping token fetch`,
+        );
+      }
+    }
     return {
       name,
-      config: {
-        type: type as "http" | "sse",
-        url: String(url),
-        ...(raw.headers ? { headers: raw.headers as Record<string, string> } : {}),
-      },
+      config: withTimeout(
+        {
+          type: type as "http" | "sse",
+          url: String(url),
+          ...(Object.keys(directHeaders).length
+            ? { headers: directHeaders }
+            : {}),
+        },
+        timeoutSeconds,
+      ),
+      filter,
     };
   }
   if (type === "stdio" && raw?.command) {
+    // stdio: command + args[] + env. args is now a real registry field (it was
+    // a phantom read before the registry exposed it). No HTTP auth/headers.
     return {
       name,
-      config: {
-        type: "stdio",
-        command: String(raw.command),
-        ...(Array.isArray(raw.args) ? { args: raw.args as string[] } : {}),
-        ...(raw.env ? { env: raw.env as Record<string, string> } : {}),
-      },
+      config: withTimeout(
+        {
+          type: "stdio",
+          command: String(raw.command),
+          ...(Array.isArray(raw.args) ? { args: raw.args as string[] } : {}),
+          ...(raw.env ? { env: raw.env as Record<string, string> } : {}),
+        },
+        timeoutSeconds,
+      ),
+      filter,
     };
   }
   console.warn(`[worker] skipping unmappable MCP server record: ${name} (type=${type || "?"})`);
   return null;
+}
+
+/**
+ * Per-server tool_filter from the registry, keyed by the SDK server name.
+ * `allow` non-empty -> only those tools are exposed; `block` non-empty ->
+ * those tools are removed. allow is applied first (whitelist) then block.
+ */
+export type McpToolFilters = Record<string, { allow?: string[]; block?: string[] }>;
+
+/**
+ * Build upstream auth headers (bearer / api_key) from a registry `auth` record.
+ * Used ONLY in direct (non-broker) HTTP mode: broker-routed sessions have the
+ * broker inject upstream auth, so the worker carries only broker-auth headers.
+ * `auth` shape: `{type: "none"|"bearer"|"api_key", token?, header_name?, api_key?}`;
+ * `header_name` defaults to `X-API-Key` for `api_key`.
+ */
+function buildUpstreamAuthHeaders(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry JSON
+  auth: any,
+): Record<string, string> {
+  if (!auth || typeof auth !== "object") return {};
+  const out: Record<string, string> = {};
+  const type = String(auth.type ?? "none").toLowerCase();
+  if (type === "bearer") {
+    const token = String(auth.token ?? "").trim();
+    if (token) out["Authorization"] = `Bearer ${token}`;
+  } else if (type === "api_key") {
+    const apiKey = String(auth.api_key ?? "").trim();
+    if (apiKey) {
+      const headerName = String(auth.header_name ?? "").trim() || "X-API-Key";
+      out[headerName] = apiKey;
+    }
+  }
+  return out;
+}
+
+// ── OAuth client-credentials token cache (direct-mode MCP servers) ──────────
+//
+// Direct (non-broker) mode: the sandbox reaches the upstream directly, so the
+// worker injects registry-supplied upstream auth itself. For `auth.type ===
+// "oauth"` it performs the client-credentials flow (POST to the registry-
+// supplied `token_url`), caches the access_token keyed by server_id, and
+// injects `Authorization: Bearer {access_token}` into the SDK config headers.
+// Broker-routed sessions do NOT fetch tokens here (the broker does it).
+//
+// Cache: module-level Map<server_id, {access_token, expires_at}>. A token is
+// refreshed when within OAUTH_REFRESH_MARGIN_MS of expiry. Single-flight: a
+// per-server_id in-flight Promise ensures concurrent calls share one fetch
+// (the check-and-set is synchronous, so a concurrent caller always sees the
+// stored Promise).
+const _oauthTokenCache = new Map<string, { access_token: string; expires_at: number }>();
+const _oauthInflight = new Map<string, Promise<string>>();
+const OAUTH_REFRESH_MARGIN_MS = 60_000;
+const OAUTH_TOKEN_TIMEOUT_MS = 10_000;
+
+/**
+ * POST `client_credentials` to `auth.token_url` -> {access_token, expires_at}.
+ * `expires_at` is a ms-epoch timestamp. `expires_in` defaults to 3600s when the
+ * token endpoint omits it or returns a non-numeric value. Throws on any
+ * transport / HTTP / shape error so the caller can fail-open.
+ */
+export async function fetchOauthToken(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry JSON
+  auth: any,
+): Promise<{ access_token: string; expires_at: number }> {
+  const tokenUrl = String(auth?.token_url ?? "").trim();
+  const clientId = String(auth?.client_id ?? "").trim();
+  const clientSecret = String(auth?.client_secret ?? "").trim();
+  if (!tokenUrl || !clientId || !clientSecret) {
+    throw new Error("oauth auth requires token_url, client_id, client_secret");
+  }
+  const scopesRaw = Array.isArray(auth?.scopes) ? auth.scopes : [];
+  const scopes = scopesRaw.map((s: unknown) => String(s)).filter(Boolean);
+  const form = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+    ...(scopes.length ? { scope: scopes.join(" ") } : {}),
+  });
+  const resp = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: form.toString(),
+    signal: AbortSignal.timeout(OAUTH_TOKEN_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    throw new Error(`oauth token endpoint returned HTTP ${resp.status}`);
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- token JSON
+  const data: any = await resp.json();
+  const accessToken = String(data?.access_token ?? "").trim();
+  if (!accessToken) {
+    throw new Error("oauth token endpoint returned no access_token");
+  }
+  const expiresIn = typeof data?.expires_in === "number" ? data.expires_in : 3600;
+  return { access_token: accessToken, expires_at: Date.now() + expiresIn * 1000 };
+}
+
+/**
+ * Return a cached oauth access_token for `serverId`, refreshing on expiry.
+ * Single-flight: concurrent callers for the same `serverId` share one fetch via
+ * a per-`serverId` in-flight Promise (the check-and-set is synchronous, so a
+ * concurrent caller always sees the stored Promise).
+ */
+export async function getOauthToken(
+  serverId: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry JSON
+  auth: any,
+): Promise<string> {
+  const now = Date.now();
+  const cached = _oauthTokenCache.get(serverId);
+  if (cached && cached.expires_at - now > OAUTH_REFRESH_MARGIN_MS) {
+    return cached.access_token;
+  }
+  let inflight = _oauthInflight.get(serverId);
+  if (!inflight) {
+    inflight = (async () => {
+      const { access_token, expires_at } = await fetchOauthToken(auth);
+      _oauthTokenCache.set(serverId, { access_token, expires_at });
+      return access_token;
+    })().finally(() => {
+      _oauthInflight.delete(serverId);
+    });
+    _oauthInflight.set(serverId, inflight);
+  }
+  return inflight;
+}
+
+/**
+ * Test-only: clear the oauth token cache + in-flight promises so tests start
+ * from a clean slate. Not part of the runtime contract.
+ */
+export function _resetOauthTokenCacheForTest(): void {
+  _oauthTokenCache.clear();
+  _oauthInflight.clear();
+}
+
+/**
+ * Attach `timeout_seconds` to an SDK MCP config as a `timeout` field. The
+ * installed SDK (0.1.77) McpServerConfig type has no `timeout` and the CLI's
+ * MCP transport does not consume one, so this is forward-compatible only:
+ * `strictMcpConfig` defaults to false so the extra field passes through to the
+ * CLI unchanged (never rejected). A future SDK that honours a per-server
+ * `timeout` will pick it up with no further change here. Only positive numbers
+ * are attached so absent/invalid values leave the config untouched.
+ */
+function withTimeout(
+  config: McpServerConfig,
+  timeoutSeconds: unknown,
+): McpServerConfig {
+  if (typeof timeoutSeconds === "number" && timeoutSeconds > 0) {
+    return { ...config, timeout: timeoutSeconds } as unknown as McpServerConfig;
+  }
+  return config;
+}
+
+/**
+ * Reduce the per-server `timeout` (seconds, attached by {@link withTimeout})
+ * across the MCP server map to a single minimum value. Returns `undefined`
+ * when no server carries a positive `timeout` - the caller then leaves the
+ * SDK `options.env` untouched so the CLI defaults apply (30s connect, no
+ * tool-call cap).
+ *
+ * MIN-aggregation rationale: the SDK spawns ONE CLI subprocess per run that
+ * hosts every MCP server together, so the CLI's process-global `MCP_TIMEOUT`
+ * (connect/init) and `MCP_TOOL_TIMEOUT` (per tool-call) cannot be set
+ * per-server. Taking the MIN ensures the most conservative (fastest-timeout)
+ * server's bound is the one enforced across the whole run - a MAX or average
+ * would let a tight server hang past its configured bound. This is a
+ * deliberate downgrade from true per-server semantics: a future SDK that
+ * honours the per-server `timeout` field (already attached by withTimeout,
+ * forward-compatible) would let each value apply independently and this
+ * global aggregation could be dropped. In-process SDK servers (hitl /
+ * webfetch) never carry a `timeout` and are naturally skipped.
+ */
+function minMcpTimeoutSeconds(
+  servers: Record<string, McpServerConfig>,
+): number | undefined {
+  let min: number | undefined;
+  for (const cfg of Object.values(servers)) {
+    // withTimeout attaches `timeout` (seconds) as an extra field; the SDK
+    // McpServerConfig union does not declare it, so narrow defensively.
+    const t = (cfg as { timeout?: unknown }).timeout;
+    if (typeof t === "number" && t > 0 && (min === undefined || t < min)) {
+      min = t;
+    }
+  }
+  return min;
+}
+
+/**
+ * Parse a registry `tool_filter` into the {allow, block} shape. Returns
+ * undefined when no non-empty list is present so callers can skip storing it.
+ */
+function parseToolFilter(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry JSON
+  raw: any,
+): { allow?: string[]; block?: string[] } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const allow = Array.isArray(raw.allow)
+    ? raw.allow.map((x: unknown) => String(x)).filter(Boolean)
+    : undefined;
+  const block = Array.isArray(raw.block)
+    ? raw.block.map((x: unknown) => String(x)).filter(Boolean)
+    : undefined;
+  if (!allow?.length && !block?.length) return undefined;
+  const out: { allow?: string[]; block?: string[] } = {};
+  if (allow?.length) out.allow = allow;
+  if (block?.length) out.block = block;
+  return out;
 }
 
 // ── resume context ──────────────────────────────────────────────────────────
@@ -600,6 +912,66 @@ export function makeDlpPreToolUse(
       // hook error doesn't accidentally bypass the HITL canUseTool gate.
       console.warn(
         `[worker] DLP PreToolUse hook threw (fail-open, allowing): ${(err as Error).message}`,
+      );
+      return { continue: true };
+    }
+  };
+}
+
+/**
+ * Build a PreToolUse hook that enforces per-server MCP `tool_filter` ALLOW lists
+ * at execution time. The SDK has no per-server allowedTools, so a registry
+ * allow list (only expose these tools from this server) cannot be applied as an
+ * exposure filter without enumerating every tool name up front. Instead this
+ * hook DENIES any `mcp__<server>__<tool>` call whose `<tool>` is not in that
+ * server's allow list. Block lists are handled separately as `disallowedTools`
+ * (true exposure), so this hook only needs to reason about allow.
+ *
+ * Returns `null` when no server has an allow list, so runQuery can skip wiring
+ * an extra hook in the common case. Like the DLP hook, it is fail-OPEN: any
+ * unexpected throw returns `{continue:true}` so a hook bug can never hard-block
+ * the agent, and an allowed/non-MCP tool stays silent (`{continue:true}`) so the
+ * HITL canUseTool gate and DLP hook still run (never returns
+ * `permissionDecision:"allow"`, which would short-circuit them).
+ */
+export function makeMcpAllowGate(
+  filters: McpToolFilters,
+): ((input: HookInput) => Promise<HookJSONOutput>) | null {
+  // serverName -> Set(allowed tool names), only for servers with a non-empty allow.
+  const allowSets = new Map<string, Set<string>>();
+  for (const [serverName, f] of Object.entries(filters)) {
+    if (f?.allow?.length) allowSets.set(serverName, new Set(f.allow));
+  }
+  if (allowSets.size === 0) return null;
+
+  return async function mcpAllowGate(
+    input: HookInput,
+  ): Promise<HookJSONOutput> {
+    try {
+      const toolName =
+        "tool_name" in input ? String(input.tool_name ?? "") : "";
+      // MCP tools are named `mcp__<server>__<tool>` (verified against the CLI).
+      // Non-greedy server match: a server name containing `__` would mis-split
+      // and fail to find the allow set -> fail-OPEN (no deny), an acceptable
+      // edge case since registry server names are simple identifiers.
+      const m = toolName.match(/^mcp__(.+?)__(.+)$/);
+      if (!m) return { continue: true };
+      const [, server, tool] = m;
+      const allow = allowSets.get(server);
+      if (allow && !allow.has(tool)) {
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason: `MCP tool '${tool}' is not in the allow list for server '${server}'`,
+          },
+        };
+      }
+      return { continue: true };
+    } catch (err) {
+      // fail-OPEN: never block the agent on a hook bug.
+      console.warn(
+        `[worker] MCP allow-gate hook threw (fail-open, allowing): ${(err as Error).message}`,
       );
       return { continue: true };
     }
@@ -821,6 +1193,14 @@ export async function runQuery(
   opts: {
     systemPrompt: string;
     mcpServers: Record<string, McpServerConfig>;
+    /**
+     * Per-server tool_filter (allow/block) from the registry, keyed by the SDK
+     * server name. block entries become global `disallowedTools` (true exposure
+     * filter - the model never sees them); allow lists are enforced by a
+     * PreToolUse gate because the SDK has no per-server allowedTools. Optional:
+     * tests / headless callers that pass `mcpServers` directly omit it.
+     */
+    mcpFilters?: McpToolFilters;
     redis: RedisStateClient;
     /**
      * Resume note for a checkpoint-resumed run (see buildResumeContext); "" for
@@ -853,6 +1233,16 @@ export async function runQuery(
   // the gate as a question-pause).
   const mcpServers: Record<string, McpServerConfig> = { ...opts.mcpServers };
 
+  // Mutable copy of the per-server tool_filter map. In-process SDK tools
+  // (hitl / webfetch) are added below and OVERWRITE any same-named tenant
+  // server in `mcpServers`; drop their filter entries here so the tenant's
+  // tool_filter is never applied to the in-process tools (e.g. a tenant server
+  // named "hitl" with a block list would otherwise add `mcp__hitl__ask_user`
+  // to disallowedTools and break HITL, or the allow-gate would deny ask_user).
+  const mcpFilters: McpToolFilters = { ...(opts.mcpFilters ?? {}) };
+  if (hitl) delete mcpFilters.hitl;
+  if (env.WEB_FETCH_GATEWAY_URL) delete mcpFilters.webfetch;
+
   // web_fetch: the sandbox's only sanctioned network egress for page content.
   // Mounted in BOTH headless and HITL modes (the model needs it regardless of a
   // human gate), but only when the scheduler injected a gateway URL — matching
@@ -860,6 +1250,32 @@ export async function runQuery(
   if (env.WEB_FETCH_GATEWAY_URL) {
     mcpServers.webfetch = buildWebFetchServer(env);
   }
+
+  // tool_filter: the SDK has no per-server allowedTools, so we split the filter
+  // across the two mechanisms the SDK does expose:
+  //   * block -> global `disallowedTools` with `mcp__<server>__<tool>` names.
+  //     This is a TRUE EXPOSURE filter: blocked tools are removed from the
+  //     model's context and can never be requested (works in both HITL and
+  //     headless modes).
+  //   * allow -> a PreToolUse gate that DENIES any `mcp__<server>__<tool>` whose
+  //     tool is not in that server's allow list. The SDK can't hide non-allowed
+  //     tools at exposure time without enumerating every tool name, so allow is
+  //     enforced at execution. A deny here is final (canUseTool can't override
+  //     it); an allowed tool returns `{continue:true}` so the HITL canUseTool
+  //     gate and the DLP hook still run untouched (returning
+  //     `permissionDecision:"allow"` would short-circuit them - see
+  //     makeDlpPreToolUse).
+  const blockedToolNames: string[] = [];
+  for (const [serverName, f] of Object.entries(mcpFilters)) {
+    if (f?.block?.length) {
+      for (const tool of f.block) {
+        blockedToolNames.push(`mcp__${serverName}__${tool}`);
+      }
+    }
+  }
+  const allowGate = makeMcpAllowGate(mcpFilters);
+  const preUseHooks = [makeDlpPreToolUse(env)];
+  if (allowGate) preUseHooks.push(allowGate);
 
   const options: Options = {
     cwd: ws,
@@ -869,19 +1285,23 @@ export async function runQuery(
       : opts.systemPrompt,
     mcpServers,
     // Remove Anthropic server-side tools that can't execute against the
-    // OpenAI-compatible (deepseek) gateway. This only narrows the available tool
-    // set; it is orthogonal to permissionMode / canUseTool (HITL) / the DLP
-    // PreToolUse hook / mcpServers, which all keep operating on the remaining
-    // (client-side + MCP) tools. Applied in both HITL and headless modes since
-    // it sits on the shared `options` built before the per-mode branch below.
-    disallowedTools: SERVER_SIDE_TOOLS_UNAVAILABLE_ON_GATEWAY,
+    // OpenAI-compatible (deepseek) gateway, PLUS per-server tool_filter block
+    // lists (as `mcp__<server>__<tool>` names). Both are exposure filters: the
+    // model never sees these tools. This only narrows the available tool set;
+    // it is orthogonal to permissionMode / canUseTool (HITL) / the DLP +
+    // allow-gate PreToolUse hooks / mcpServers, which all keep operating on the
+    // remaining (client-side + MCP) tools.
+    disallowedTools: [
+      ...SERVER_SIDE_TOOLS_UNAVAILABLE_ON_GATEWAY,
+      ...blockedToolNames,
+    ],
     // True per-token streaming: emit SDKPartialAssistantMessage (`stream_event`)
     // partials so event_translator can produce incremental TextBlockDeltaEvents
     // (one per text_delta) instead of one whole-text delta. The translator
     // de-duplicates against the final consolidated `assistant` message.
     includePartialMessages: true,
     hooks: {
-      PreToolUse: [{ hooks: [makeDlpPreToolUse(env)] }],
+      PreToolUse: [{ hooks: preUseHooks }],
     },
   };
   if (hitl) {
@@ -920,6 +1340,29 @@ export async function runQuery(
     console.log(
       "[worker] sampling temperature/top_p are not exposed by the SDK Options; ignoring",
     );
+  }
+
+  // ── MCP timeout (CLI subprocess env) ──
+  // The SDK query() has no timeout option and McpServerConfig has no timeout
+  // field the CLI consumes (the per-server `timeout` attached by withTimeout
+  // is forward-compatible only today). The CLI subprocess DOES honour two env
+  // vars, though: MCP_TIMEOUT (connect/init, default 30000ms) and
+  // MCP_TOOL_TIMEOUT (per tool-call, default unlimited). The SDK uses
+  // `options.env` as the CLI's process.env (sdk.mjs: `options.env ?? process.env`),
+  // so we aggregate the per-server `timeout_seconds` (carried on each config as
+  // `timeout`, in seconds) down to a global MIN and inject both vars in ms.
+  // See minMcpTimeoutSeconds for the MIN-aggregation rationale. When no server
+  // carries a positive timeout, options.env is left unset so the CLI defaults
+  // apply. This only affects worker-direct http/stdio MCP paths; broker egress
+  // is bounded at the broker.
+  const mcpTimeoutSeconds = minMcpTimeoutSeconds(mcpServers);
+  if (mcpTimeoutSeconds !== undefined) {
+    const ms = String(mcpTimeoutSeconds * 1000);
+    options.env = {
+      ...process.env,
+      MCP_TIMEOUT: ms,
+      MCP_TOOL_TIMEOUT: ms,
+    };
   }
 
   let summary = "";

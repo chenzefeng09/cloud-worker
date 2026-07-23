@@ -117,6 +117,12 @@ async def chat(
                                orchestrator can prioritise those files in the
                                injected workspace context.
     * ``skills``             — optional list of skill names
+    * ``mcp_server_ids``     — optional list of MCP server ids to enable for
+                               this run.  Presence-aware, exactly like
+                               ``skills``: key omitted → the tenant's
+                               enabled-by-default servers; explicit ``[]`` →
+                               no MCP at all for this run; non-empty list →
+                               only those servers.
     * ``model``              — optional model name
     * ``reasoning_effort``   — optional reasoning effort string
     * ``execution_mode``     — optional ``"inline"`` | ``"sandbox"`` (default
@@ -133,6 +139,9 @@ async def chat(
     attachment_ids: list[str] = body.get("attachment_ids") or []
     skills_provided = "skills" in body
     skills: list[str] = body.get("skills") or []
+    # Same presence semantics as ``skills`` — see the forwarding block below.
+    mcp_server_ids_provided = "mcp_server_ids" in body
+    mcp_server_ids: list[str] = body.get("mcp_server_ids") or []
     model: str | None = body.get("model") or None
     reasoning_effort: str | None = body.get("reasoning_effort") or None
     # Strictly validated: execution_mode (inline/sandbox; defaults to sandbox for
@@ -185,6 +194,22 @@ async def chat(
         # session/run and must not be replaced with defaults.
         if skills_provided:
             run_body["skills"] = skills
+        # Presence is meaningful (mirrors ``skills``): omitted lets the
+        # orchestrator fall back to the tenant's enabled-by-default MCP
+        # servers (today's auto-inject-everything behaviour); explicit []
+        # disables MCP entirely for this run and must NOT be dropped by a
+        # truthiness check.
+        if mcp_server_ids_provided:
+            run_body["mcp_server_ids"] = mcp_server_ids
+        # Per-session opt-out of the platform-global default skills. Presence-
+        # tolerant: forward verbatim only when the client sent it. Omitted keeps
+        # the default (platform defaults injected); explicit ``false`` suppresses
+        # them for this run. The orchestrator treats only a literal ``false`` as
+        # disable, so forwarding the raw value is safe.
+        if "include_platform_defaults" in body:
+            run_body["include_platform_defaults"] = body.get(
+                "include_platform_defaults"
+            )
 
         resp = await client.post(
             f"{orch_url}/sessions/{session_id}/runs",

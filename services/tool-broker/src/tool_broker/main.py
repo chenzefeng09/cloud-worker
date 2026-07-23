@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
 import logging
 import time
+from typing import Any, Mapping
 from urllib.parse import urlencode
 
 import httpx
@@ -469,6 +471,7 @@ async def _forward_to_upstream(
     *,
     absolute_url: str,
     forward_headers: dict[str, str],
+    upstream_timeout: float | None = None,
 ) -> Response:
     """Forward the inbound request to a fully-resolved absolute upstream URL.
 
@@ -483,6 +486,13 @@ async def _forward_to_upstream(
     Caller is responsible for auth/lease validation, method gating, the
     upstream path allowlist (when applicable), and computing both the absolute
     URL and the upstream header set.  ``forward_headers`` is forwarded verbatim.
+
+    ``upstream_timeout`` (seconds), when supplied by the caller (tenant-MCP
+    passthrough only, from the registry ``timeout_seconds`` field), bounds
+    connect/read/write/pool to the tenant-configured value.  When ``None`` the
+    streaming-friendly default is used: connect/write/pool bounded by
+    ``proxy_timeout_seconds`` but ``read=None`` so a legitimately long-lived
+    SSE stream (per-token LLM streaming) is never aborted mid-flight.
     """
     settings: Settings = request.app.state.settings
     body = await request.body()
@@ -491,13 +501,24 @@ async def _forward_to_upstream(
     # drains the body, so it needs a separate timeout: the read timeout must NOT
     # abort a legitimately long-lived SSE stream (per-token LLM streaming can run
     # far longer than the 30s proxy timeout).  We still bound connect/write/pool
-    # by ``proxy_timeout_seconds`` so a dead upstream still fails fast.
-    stream_timeout = httpx.Timeout(
-        connect=settings.proxy_timeout_seconds,
-        read=None,
-        write=settings.proxy_timeout_seconds,
-        pool=settings.proxy_timeout_seconds,
-    )
+    # by ``proxy_timeout_seconds`` so a dead upstream still fails fast.  The
+    # tenant-MCP passthrough overrides this with the registry-configured
+    # ``timeout_seconds`` (connect+read+write+pool) so a tenant can bound a
+    # slow/stuck third-party MCP server.
+    if upstream_timeout is not None:
+        stream_timeout = httpx.Timeout(
+            connect=upstream_timeout,
+            read=upstream_timeout,
+            write=upstream_timeout,
+            pool=upstream_timeout,
+        )
+    else:
+        stream_timeout = httpx.Timeout(
+            connect=settings.proxy_timeout_seconds,
+            read=None,
+            write=settings.proxy_timeout_seconds,
+            pool=settings.proxy_timeout_seconds,
+        )
 
     # We must inspect the upstream Content-Type BEFORE deciding whether to buffer
     # or stream, which means we need the response object before its body is read.
@@ -995,16 +1016,20 @@ async def proxy_knowledge_ingest(path: str, request: Request) -> Response:
 # ---------------------------------------------------------------------------
 
 
-async def _resolve_tenant_mcp_endpoint(
+async def _resolve_tenant_mcp_record(
     request: Request, *, tenant_id: str, server_id: str
-) -> str:
+) -> dict[str, Any]:
     """Resolve ``server_id`` to its real upstream endpoint via the mcp-registry.
 
     Makes a trusted internal GET to ``{mcp_registry_url}/internal/mcp-servers?
     tenant_id=<tenant>`` (the registry returns ENABLED servers only) presenting
     the fixed ``mcp.read_internal`` service scope + the matching ``X-Tenant-Id``
     that its internal guard requires, plus the inbound Authorization bearer.
-    Returns the matched item's ``endpoint``.
+    Returns the matched item dict, which always carries a non-empty HTTP
+    ``endpoint``; the registry's ``auth`` / ``headers`` / ``timeout_seconds``
+    fields are passed through so the broker can inject them toward the upstream
+    (broker-routed clients carry only broker-auth headers, so the broker is the
+    single upstream-auth injection point).
 
     Raises 404 (not 403/502) for every "cannot reach this server" outcome —
     registry unreachable, non-200, empty list, no id match, or an item with no
@@ -1077,7 +1102,153 @@ async def _resolve_tenant_mcp_endpoint(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="tool-broker: mcp server not found",
         )
-    return endpoint
+    return item
+
+
+# ---------------------------------------------------------------------------
+# OAuth client-credentials token cache (tenant MCP servers)
+# ---------------------------------------------------------------------------
+#
+# The broker is the single upstream-auth injection point for broker-routed
+# sessions.  When a tenant MCP server's ``auth.type`` is ``oauth`` the broker
+# performs the client-credentials flow itself (POST to the registry-supplied
+# ``token_url``), caches the resulting access_token keyed by ``server_id``, and
+# injects ``Authorization: Bearer {access_token}`` toward the real upstream.
+#
+# Cache: module-level ``{server_id: {access_token, expires_at}}``.  A token is
+# refreshed when it is within ``_OAUTH_REFRESH_MARGIN_SECONDS`` of expiry.
+# Single-flight: a per-``server_id`` ``asyncio.Lock`` ensures concurrent broker
+# requests for the same server share one token fetch (no duplicate POSTs).
+_OAUTH_TOKEN_CACHE: dict[str, dict[str, object]] = {}
+_OAUTH_LOCKS: dict[str, asyncio.Lock] = {}
+_OAUTH_REFRESH_MARGIN_SECONDS = 60
+_OAUTH_TOKEN_TIMEOUT_SECONDS = 10.0
+
+
+def _oauth_lock(server_id: str) -> asyncio.Lock:
+    """Return the per-``server_id`` single-flight lock, creating it lazily."""
+    lock = _OAUTH_LOCKS.get(server_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _OAUTH_LOCKS[server_id] = lock
+    return lock
+
+
+async def _fetch_oauth_token(auth: Mapping[str, Any]) -> tuple[str, float]:
+    """POST ``client_credentials`` to ``auth.token_url`` -> (access_token, expires_at).
+
+    ``expires_at`` is a unix-epoch seconds timestamp.  ``expires_in`` defaults to
+    3600s when the token endpoint omits it or returns a non-numeric value.
+    Raises on any transport / HTTP / shape error so the caller can fail-open.
+    """
+    token_url = str(auth.get("token_url") or "").strip()
+    client_id = str(auth.get("client_id") or "").strip()
+    client_secret = str(auth.get("client_secret") or "").strip()
+    if not token_url or not client_id or not client_secret:
+        raise ValueError("oauth auth requires token_url, client_id, client_secret")
+    scopes_raw = auth.get("scopes")
+    scopes = (
+        [str(s) for s in scopes_raw if str(s)]
+        if isinstance(scopes_raw, list)
+        else []
+    )
+    form = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    if scopes:
+        form["scope"] = " ".join(scopes)
+    async with httpx.AsyncClient(timeout=_OAUTH_TOKEN_TIMEOUT_SECONDS) as client:
+        resp = await client.post(token_url, data=form)
+        resp.raise_for_status()
+        body = resp.json()
+    access_token = str(body.get("access_token") or "").strip()
+    if not access_token:
+        raise ValueError("oauth token endpoint returned no access_token")
+    try:
+        expires_in = float(body.get("expires_in"))
+    except (TypeError, ValueError):
+        expires_in = 3600.0
+    return access_token, time.time() + expires_in
+
+
+async def _get_oauth_token(server_id: str, auth: Mapping[str, Any]) -> str:
+    """Return a cached oauth access_token for ``server_id``, refreshing on expiry.
+
+    Single-flight: concurrent callers for the same ``server_id`` share one fetch
+    via a per-``server_id`` ``asyncio.Lock`` so the token endpoint is hit once.
+    """
+    async with _oauth_lock(server_id):
+        cached = _OAUTH_TOKEN_CACHE.get(server_id)
+        now = time.time()
+        if (
+            cached
+            and float(cached.get("expires_at", 0.0)) - now
+            > _OAUTH_REFRESH_MARGIN_SECONDS
+        ):
+            return str(cached["access_token"])
+        access_token, expires_at = await _fetch_oauth_token(auth)
+        _OAUTH_TOKEN_CACHE[server_id] = {
+            "access_token": access_token,
+            "expires_at": expires_at,
+        }
+        return access_token
+
+
+async def _mcp_upstream_auth_headers(record: Mapping[str, Any]) -> dict[str, str]:
+    """Build the UPSTREAM auth + custom headers for a tenant MCP server.
+
+    The broker is the ONLY injection point for registry-supplied upstream
+    auth/headers on broker-routed sessions: the claude-sdk worker and the
+    agentscope injector point their MCP clients at the broker and carry only
+    broker-auth headers (Authorization / X-Tenant-Id / X-Tool-Broker-Lease), so
+    the registry's ``auth`` / ``headers`` fields for the real upstream must be
+    applied here.  Auth headers win over colliding custom ``headers`` keys.
+
+    ``auth`` shape: ``{type: "none"|"bearer"|"api_key"|"oauth", token?,
+    header_name?, api_key?, client_id?, client_secret?, token_url?, scopes?}``.
+    ``header_name`` defaults to ``X-API-Key`` for ``api_key``.  ``oauth``
+    performs the client-credentials flow (cached + single-flight by server_id)
+    and injects ``Authorization: Bearer {access_token}``; a fetch failure is
+    fail-open (logged + no Authorization header) so the upstream decides.
+    """
+    headers: dict[str, str] = {}
+    custom = record.get("headers")
+    if isinstance(custom, dict):
+        headers.update({str(k): str(v) for k, v in custom.items()})
+    auth = record.get("auth")
+    if isinstance(auth, dict):
+        auth_type = str(auth.get("type") or "none").lower()
+        if auth_type == "bearer":
+            token = str(auth.get("token") or "").strip()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        elif auth_type == "api_key":
+            api_key = str(auth.get("api_key") or "").strip()
+            if api_key:
+                header_name = (
+                    str(auth.get("header_name") or "").strip() or "X-API-Key"
+                )
+                headers[header_name] = api_key
+        elif auth_type == "oauth":
+            server_id = str(record.get("id") or "").strip()
+            if server_id:
+                try:
+                    access_token = await _get_oauth_token(server_id, auth)
+                    headers["Authorization"] = f"Bearer {access_token}"
+                except Exception as exc:  # noqa: BLE001 - fail-open, upstream 401s
+                    _LOG.warning(
+                        "tool-broker oauth token fetch failed for %s: %s",
+                        server_id,
+                        exc,
+                    )
+            else:
+                _LOG.warning(
+                    "tool-broker oauth auth missing server id; skipping token fetch"
+                )
+        # "none" -> no auth header injected
+    return headers
 
 
 # Register BOTH the bare ``/mcp-tenant/v1/{server_id}`` form and the
@@ -1152,9 +1323,10 @@ async def proxy_mcp_tenant(
             detail="tool-broker: mcp-tenant tenant unknown",
         )
 
-    endpoint = await _resolve_tenant_mcp_endpoint(
+    record = await _resolve_tenant_mcp_record(
         request, tenant_id=resolved_tenant, server_id=server_id
     )
+    endpoint = str(record.get("endpoint") or "").strip()
 
     # Path-join: the SDK's streamable-http transport POSTs to the base URL with
     # no sub-path, so ``path`` is usually empty → forward to ``endpoint``
@@ -1191,10 +1363,26 @@ async def proxy_mcp_tenant(
         for key, value in forward_headers.items()
         if key.lower() != "authorization"
     }
+    # Inject the registry-supplied UPSTREAM auth + custom headers. The sandbox's
+    # foundation Bearer was just stripped above; the registry's ``auth`` (a
+    # bearer/api_key for the third-party MCP server) and ``headers`` are added
+    # here so they reach the real upstream and ONLY the real upstream. This is
+    # the single injection point for broker-routed sessions: the worker /
+    # agentscope clients carry only broker-auth headers, never upstream auth.
+    # For ``auth.type == "oauth"`` the broker performs the client-credentials
+    # flow itself (cached + single-flight by server_id) and injects the bearer.
+    forward_headers.update(await _mcp_upstream_auth_headers(record))
+    # Apply the tenant-configured per-server timeout (connect+read+write+pool).
+    # ``None`` preserves the streaming-friendly default in ``_forward_to_upstream``.
+    raw_timeout = record.get("timeout_seconds")
+    upstream_timeout = (
+        float(raw_timeout) if isinstance(raw_timeout, (int, float)) else None
+    )
     return await _forward_to_upstream(
         request,
         absolute_url=absolute_url,
         forward_headers=forward_headers,
+        upstream_timeout=upstream_timeout,
     )
 
 

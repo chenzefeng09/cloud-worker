@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint, func
+from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint, false, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -32,6 +32,13 @@ class Skill(Base):
     description: Mapped[str | None] = mapped_column(String(2000), nullable=True)
     owner: Mapped[str | None] = mapped_column(String(120), nullable=True)
     visibility: Mapped[str] = mapped_column(String(20), nullable=False, default="private")
+    # Platform-global default flag.  Meaningful only on rows owned by
+    # ``PLATFORM_TENANT_ID``: when true the skill is auto-injected into every
+    # tenant/user's runs (no per-user install row).  Default false so ordinary
+    # tenant skills are unaffected.
+    default_enabled: Mapped[bool] = mapped_column(
+        nullable=False, default=False, server_default=false(),
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now(),

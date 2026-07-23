@@ -109,6 +109,12 @@ class Run(Base):
     # Immutable App-run harness snapshot (model/version/inputs/etc.) captured
     # at run creation.  NULL for ordinary chat runs.
     app_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Denormalised ``app_snapshot->>'app_id'`` on a first-class indexed column
+    # so an App's execution history is queryable without unpacking the JSONB.
+    # NULL for ordinary chat runs.  Set in ``create_run`` from the snapshot;
+    # type matches ``app_registry.apps.id`` (``String(40)``, prefixed ids like
+    # ``app_<hex>``) so foreign values stay valid.  See migration 0014.
+    app_id: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
     # Origin of the run: "user" for interactive chat/app runs, "schedule" for
     # cron-triggered runs dispatched by the cron-runner service.
     source: Mapped[str] = mapped_column(String(16), nullable=False, default="user", server_default="user")

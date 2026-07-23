@@ -112,13 +112,21 @@ async def review_reject(
 )
 async def list_apps(
     scope: str = Query("published", pattern="^(mine|published)$"),
+    tag: list[str] | None = Query(
+        default=None,
+        description="Filter by tag (repeatable; OR semantics - Apps with any match returned).",
+    ),
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     user_id: str = TUserId,
 ) -> ListPage:
-    """List visible Apps — ``published`` (tenant shelf, default) or ``mine``."""
+    """List visible Apps - ``published`` (tenant shelf, default) or ``mine``.
+
+    ``?tag=foo&tag=bar`` filters to Apps whose ``tags`` contain any of the
+    given values (OR).  Omitted -> no tag filter.
+    """
     svc = AppService(db, tenant_id=tenant_id, user_id=user_id)
-    apps = await svc.list_apps(scope=scope)
+    apps = await svc.list_apps(scope=scope, tags=tag)
     items = [AppOut.model_validate(a).model_dump(mode="json") for a in apps]
     return ListPage(items=items, total=len(items))
 
@@ -142,6 +150,7 @@ async def create_app(
         description=body.description,
         icon=body.icon,
         visibility=body.visibility.value,
+        tags=body.tags,
         version=body.version,
     )
     return AppOut.model_validate(app)
@@ -193,6 +202,7 @@ async def update_app(
         description=body.description,
         icon=body.icon,
         visibility=body.visibility.value if body.visibility is not None else None,
+        tags=body.tags,
     )
     return AppOut.model_validate(app)
 

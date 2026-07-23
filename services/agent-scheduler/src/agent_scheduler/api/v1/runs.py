@@ -434,6 +434,19 @@ async def create_run(
         if isinstance(skills_raw, list)
         else []
     )
+    # Optional: per-run MCP server selection, carried with PRESENCE semantics
+    # (never truthiness — ``[]`` and "absent" are different instructions):
+    #   * key absent      -> None -> task.json omits the key -> the in-sandbox
+    #     mcp_tenant_injector keeps its historical "inject every enabled
+    #     tenant server" behaviour.
+    #   * explicit ``[]`` -> []   -> task.json carries [] -> no MCP servers.
+    #   * non-empty list  -> only those server ids.
+    mcp_server_ids: list[str] | None = None
+    if "mcp_server_ids" in body:
+        _mcp_raw = body.get("mcp_server_ids")
+        mcp_server_ids = (
+            [str(s) for s in _mcp_raw if s] if isinstance(_mcp_raw, list) else []
+        )
     # Optional: list of attachment file dicts {"key", "filename", "mime"}.
     # Written to task.json; the runtime_worker downloads them to /workspace/inputs/.
     files_raw = body.get("files")
@@ -590,6 +603,7 @@ async def create_run(
                 user_id=user_id,
                 foundation_token=foundation_token,
                 skills=skills,
+                mcp_server_ids=mcp_server_ids,
                 files=files,
                 memory=memory,
                 memory_limit=memory_limit,

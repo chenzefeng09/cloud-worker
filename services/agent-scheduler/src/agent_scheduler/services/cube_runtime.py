@@ -315,6 +315,7 @@ class CubeSandboxRuntime:
         user_id: str,
         foundation_token: str,
         skills: list[str] | None = None,
+        mcp_server_ids: list[str] | None = None,
         files: list[dict] | None = None,
         memory: str | None = None,
         memory_limit: str | None = None,
@@ -422,6 +423,11 @@ class CubeSandboxRuntime:
             "hitl": bool(hitl),
             "resume": resume,
         }
+        # Per-run MCP selection, presence-carried exactly as in the docker
+        # runtime: key absent = tenant default set, [] = disable all, list =
+        # only those ids.  ``is not None`` guard, never truthiness.
+        if mcp_server_ids is not None:
+            task_json["mcp_server_ids"] = [str(s) for s in mcp_server_ids]
         # Cube-specific URL rewrite: the worker reaches the host's gateways over
         # the PUBLIC IP (CubeVS only forwards public egress; container names /
         # private IPs are unresolvable inside the microVM). Take the gateway

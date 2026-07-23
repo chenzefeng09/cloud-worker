@@ -123,6 +123,9 @@ class FakePlatform:
         # (method, url, forwarded query params) — separate from ``requests`` so
         # existing 3-tuple unpacking stays intact.
         self.param_calls: list[tuple[str, str, dict[str, str]]] = []
+        # (method, url, forwarded json body) - for body-passthrough assertions
+        # (e.g. admin POST/PATCH forwards oauth client_secret verbatim).
+        self.body_calls: list[tuple[str, str, Any]] = []
         # method, url-substring → (status, body)
         self.routes: dict[tuple[str, str], tuple[int, Any]] = {
             ("GET", "/skills/"): (200, {"id": "skl_1", "name": "demo"}),
@@ -131,6 +134,16 @@ class FakePlatform:
             ("GET", "/mcp-servers/"): (200, {"id": "mcp_1", "name": "srv"}),
             ("GET", "/mcp-servers"): (200, {"items": [], "total": 0}),
             ("POST", "/mcp-servers"): (201, {"id": "mcp_new"}),
+            # POST /mcp-servers/{id}/test - live probe response (verbatim pass-through).
+            ("POST", "/mcp-servers/"): (
+                200,
+                {
+                    "ok": True,
+                    "server_info": {"name": "demo"},
+                    "tools": [{"name": "search", "description": "Search the web"}],
+                    "error": None,
+                },
+            ),
             ("PATCH", "/mcp-servers/"): (200, {"id": "mcp_1", "enabled": False}),
             ("DELETE", "/mcp-servers/"): (204, None),
             ("GET", "/documents/"): (200, {"id": "doc_1", "title": "t"}),
@@ -148,6 +161,7 @@ class FakePlatform:
     def route(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         self.requests.append((method, url, dict(kwargs.get("headers") or {})))
         self.param_calls.append((method, url, dict(kwargs.get("params") or {})))
+        self.body_calls.append((method, url, kwargs.get("json")))
 
         # authz /check — the BFF guard.
         if "/check" in url:
@@ -260,6 +274,8 @@ ALL_ENDPOINTS = [
     ("/admin/mcp/servers/mcp_1", "GET", None),
     ("/admin/mcp/servers/mcp_1", "PATCH", {"enabled": False}),
     ("/admin/mcp/servers/mcp_1", "DELETE", None),
+    ("/admin/mcp/servers/mcp_1/test", "POST", None),
+    ("/admin/mcp/servers/probe", "POST", {"transport": "http", "endpoint": "https://x"}),
     ("/admin/knowledge/documents", "GET", None),
     ("/admin/knowledge/documents/doc_1", "GET", None),
     ("/admin/knowledge/documents/doc_1/reingest", "POST", None),
@@ -317,6 +333,157 @@ def test_mcp_create_hits_registry(client, authed_cookie, fake_allowed) -> None:
     assert resp.status_code == 201
     assert resp.json()["id"] == "mcp_new"
     assert any(f"{MCP_URL}/mcp-servers" in u for (_, u, _) in fake_allowed.requests)
+
+
+def test_mcp_test_hits_registry_test_endpoint(client, authed_cookie, fake_allowed) -> None:
+    """POST /admin/mcp/servers/{id}/test proxies to the registry's /test path
+    and returns the {ok, server_info, tools, error} body verbatim."""
+    resp = client.post(
+        "/api/bff/v1/admin/mcp/servers/mcp_1/test",
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["tools"] == [{"name": "search", "description": "Search the web"}]
+    assert body["error"] is None
+    # The BFF must hit the registry's /mcp-servers/{id}/test path exactly.
+    assert any(
+        u == f"{MCP_URL}/mcp-servers/mcp_1/test"
+        for (_, u, _) in fake_allowed.requests
+    ), "test endpoint did not hit registry /mcp-servers/{id}/test"
+
+
+def test_mcp_probe_hits_registry_probe_endpoint(client, authed_cookie, monkeypatch) -> None:
+    """POST /admin/mcp/servers/probe forwards the unsaved config verbatim to the
+    registry's id-less ``/mcp-servers/probe`` path and returns
+    ``{ok, server_info, tools, error}`` unchanged.
+
+    Also pins the route ordering: ``probe`` must not be swallowed by
+    ``/admin/mcp/servers/{server_id}``.
+    """
+    fake = FakePlatform(authz_allowed=True)
+    _install(monkeypatch, fake)
+    probe_body = {
+        "transport": "http",
+        "endpoint": "https://probe.example.com/mcp",
+        "headers": {"X-Custom": "v"},
+        "auth": {"type": "bearer", "token": "plain-tok"},
+        "timeout_seconds": 7,
+    }
+    resp = client.post(
+        "/api/bff/v1/admin/mcp/servers/probe",
+        cookies=authed_cookie,
+        json=probe_body,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["tools"] == [{"name": "search", "description": "Search the web"}]
+    assert body["error"] is None
+
+    # Exact upstream path — not /mcp-servers/probe/test, not /mcp-servers.
+    probes = [
+        (m, u, b) for (m, u, b) in fake.body_calls
+        if m == "POST" and u == f"{MCP_URL}/mcp-servers/probe"
+    ]
+    assert probes, "probe did not hit registry /mcp-servers/probe"
+    # Body forwarded verbatim, including the plaintext auth the admin typed.
+    assert probes[0][2] == probe_body
+
+    # Forwarding conventions: caller's tenant/user forwarded, no X-Actor: ADMIN
+    # (the registry re-authorizes the real caller itself).
+    hdrs = [h for (m, u, h) in fake.requests if u == f"{MCP_URL}/mcp-servers/probe"][0]
+    assert hdrs["X-Tenant-Id"] == CALLER_TENANT
+    assert "X-Actor" not in hdrs
+
+
+def test_admin_get_mcp_server_preserves_oauth_secret(
+    client, authed_cookie, monkeypatch,
+) -> None:
+    """Admin GET returns the full MCP server record unscrubbed - including the
+    oauth ``client_secret`` in plaintext.  The registry decrypts auth for the
+    admin surface and the BFF passes it through verbatim (no scrubbing on the
+    admin path, unlike the library surface in library.py)."""
+    fake = FakePlatform(authz_allowed=True)
+    oauth_auth = {
+        "type": "oauth",
+        "client_id": "cid-secret",
+        "client_secret": "cs-secret",
+        "token_url": "https://auth.example.com/token",
+        "scopes": ["read", "write"],
+    }
+    fake.routes[("GET", "/mcp-servers/")] = (
+        200,
+        {
+            "id": "mcp_1",
+            "name": "OAuthGateway",
+            "transport": "http",
+            "auth": oauth_auth,
+            "headers": {"Authorization": "Bearer from-oauth"},
+        },
+    )
+    _install(monkeypatch, fake)
+    resp = client.get(
+        "/api/bff/v1/admin/mcp/servers/mcp_1", cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    # Full oauth auth preserved end-to-end, including the client_secret.
+    assert body["auth"] == oauth_auth
+    assert body["auth"]["client_secret"] == "cs-secret"
+    # Headers preserved too (admin sees everything, no scrubbing).
+    assert body["headers"] == {"Authorization": "Bearer from-oauth"}
+
+
+def test_admin_create_mcp_server_forwards_oauth_verbatim(
+    client, authed_cookie, monkeypatch,
+) -> None:
+    """Admin POST forwards the oauth body verbatim (``client_secret`` included)
+    and returns the registry response unscrubbed.  Confirms the admin path does
+    not strip oauth fields in either direction."""
+    fake = FakePlatform(authz_allowed=True)
+    fake.routes[("POST", "/mcp-servers")] = (
+        201,
+        {
+            "id": "mcp_new",
+            "name": "OAuthGateway",
+            "auth": {
+                "type": "oauth",
+                "client_id": "cid-secret",
+                "client_secret": "cs-secret",
+                "token_url": "https://auth.example.com/token",
+                "scopes": ["read"],
+            },
+        },
+    )
+    _install(monkeypatch, fake)
+    oauth_body = {
+        "name": "OAuthGateway",
+        "transport": "http",
+        "endpoint": "https://x",
+        "auth": {
+            "type": "oauth",
+            "client_id": "cid-secret",
+            "client_secret": "cs-secret",
+            "token_url": "https://auth.example.com/token",
+            "scopes": ["read"],
+        },
+    }
+    resp = client.post(
+        "/api/bff/v1/admin/mcp/servers", cookies=authed_cookie, json=oauth_body,
+    )
+    assert resp.status_code == 201
+    # Response unscrubbed: oauth client_secret preserved.
+    assert resp.json()["auth"]["client_secret"] == "cs-secret"
+    # Request body forwarded verbatim, including oauth client_secret.
+    posts = [
+        (m, u, b) for (m, u, b) in fake.body_calls
+        if m == "POST" and f"{MCP_URL}/mcp-servers" in u and "/check" not in u
+    ]
+    assert posts, "admin create did not hit registry /mcp-servers"
+    assert posts[0][2] == oauth_body
+    assert posts[0][2]["auth"]["client_secret"] == "cs-secret"
 
 
 def test_reingest_maps_to_ingest(client, authed_cookie, fake_allowed) -> None:

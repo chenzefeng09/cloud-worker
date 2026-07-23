@@ -769,14 +769,14 @@ function ManageDocRow({
             移动
           </button>
           <button
-            onClick={(e) => { e.stopPropagation(); reingest(); }}
+            onClick={reingest}
             disabled={reingesting || deleting}
             className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-dim hover:text-ink transition-opacity disabled:opacity-50"
           >
             {reingesting ? '摄取中…' : '重新摄取'}
           </button>
           <button
-            onClick={(e) => { e.stopPropagation(); remove(); }}
+            onClick={remove}
             disabled={reingesting || deleting}
             className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-red-600 hover:text-red-700 transition-opacity disabled:opacity-50"
           >
@@ -1174,7 +1174,7 @@ export function KnowledgeAdminPage() {
             </div>
 
             {/* Right: doc list */}
-            <div className={`flex-1 min-w-0 flex flex-col gap-2 ${previewDoc ? 'max-w-[50%]' : ''}`}>
+            <div className="flex-1 min-w-0 flex flex-col gap-2">
               {/* Breadcrumb + upload */}
               <div className="flex items-center gap-2 flex-wrap">
                 <div className="flex items-center gap-1 font-mono text-[11px] text-dim flex-wrap">
@@ -1244,11 +1244,12 @@ export function KnowledgeAdminPage() {
               </div>
             </div>
             {previewDoc && (
-              <div className="w-[440px] shrink-0 border border-line rounded-md overflow-hidden max-h-[70vh]">
+              <div className="fixed top-0 right-0 bottom-0 z-50 w-[480px] border-l border-line bg-paper shadow-[-4px_0_16px_-4px_rgba(15,17,20,0.12)]">
                 <FilePreviewPanel
                   getSource={getPreviewSource}
                   file={previewDoc}
                   onClose={() => setPreviewDoc(null)}
+                  closeVariant="x"
                 />
               </div>
             )}
@@ -1319,6 +1320,7 @@ export function KnowledgeAdminPage() {
                 getSource={getPreviewSource}
                 file={previewDoc}
                 onClose={() => setPreviewDoc(null)}
+                closeVariant="x"
               />
             </div>
           )}

@@ -54,7 +54,7 @@ export function AccountMenu() {
       {open && (
         <div
           role="menu"
-          className="absolute bottom-full mb-1.5 left-0 right-0 z-30 bg-surface border border-line rounded-lg shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-1"
+          className="absolute bottom-full mb-1.5 left-0 right-0 z-30 bg-surface border border-line rounded-lg shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-1 animate-pop-in origin-bottom"
         >
           <button
             type="button"

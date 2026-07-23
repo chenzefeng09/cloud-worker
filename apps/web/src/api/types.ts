@@ -182,7 +182,44 @@ export interface SSEEvent {
 
 // ─── Library ────────────────────────────────────────────────────────────────
 
-export type McpTransport = 'http' | 'stdio';
+export type McpTransport = 'http' | 'sse' | 'stdio';
+
+export type McpAuthType = 'none' | 'bearer' | 'api_key' | 'oauth';
+
+/** Auth configuration for an HTTP MCP server. Secrets (token / api_key /
+ *  client_secret) are write-only: the backend may redact them on read, so
+ *  callers should not assume a round-tripped value equals the one they
+ *  submitted. */
+export interface McpAuth {
+  type: McpAuthType;
+  token?: string | null;
+  /** Header carrying the api key (api_key auth); defaults to "X-API-Key". */
+  header_name?: string | null;
+  api_key?: string | null;
+  /** OAuth 2.0 client id (oauth auth). */
+  client_id?: string | null;
+  /** OAuth 2.0 client secret (oauth auth) - write-only, may be redacted on read. */
+  client_secret?: string | null;
+  /** OAuth 2.0 token endpoint URL (oauth auth). */
+  token_url?: string | null;
+  /** OAuth 2.0 scopes to request (oauth auth). */
+  scopes?: string[];
+  /** True when a bearer token is stored (field value is masked on read). */
+  has_token?: boolean;
+  /** True when an api_key is stored (field value is masked on read). */
+  has_api_key?: boolean;
+  /** True when an OAuth client_secret is stored (field value is masked on read). */
+  has_client_secret?: boolean;
+}
+
+/** Input shape for the auth field on register/patch requests. */
+export type McpAuthInput = McpAuth;
+
+/** Tool allow/block filter applied at MCP invocation time. */
+export interface ToolFilter {
+  allow: string[];
+  block: string[];
+}
 
 export interface McpServer {
   id: string;
@@ -192,8 +229,20 @@ export interface McpServer {
   endpoint: string | null;
   command: string | null;
   env: Record<string, string>;
-  scopes: string[];
   enabled: boolean;
+  /** HTTP custom headers (http transport only). */
+  headers?: Record<string, string>;
+  /** Auth scheme for HTTP transport. */
+  auth?: McpAuth;
+  /** Per-call timeout in seconds; null = backend default. */
+  timeout_seconds?: number | null;
+  /** Tool allow/block list applied at invocation. */
+  tool_filter?: ToolFilter;
+  /** Extra argv for stdio transport (command is the executable). */
+  args?: string[];
+  /** Tools discovered by the last connectivity test. null/empty when the
+   *  server has not been probed yet. Same shape as the test/probe result. */
+  discovered_tools?: McpTestTool[] | null;
   created_at: string;
   updated_at: string;
 }
@@ -206,6 +255,13 @@ export interface Skill {
   owner: string | null;
   visibility: 'private' | 'tenant' | 'public';
   created_at: string;
+  /**
+   * True for platform-global default skills (built into the deployment, owned by
+   * the reserved platform tenant). Every org has them and every user gets them
+   * by default; they are read-only in the library — no per-tenant install/
+   * uninstall/delete applies. Absent/false for a tenant's own skills.
+   */
+  is_platform_default?: boolean;
 }
 
 /** A skill in the user's toolbox — Skill fields + install metadata. */
@@ -353,6 +409,8 @@ export interface App {
   author_id: string;
   visibility: AppVisibility;
   current_version_id?: string | null;
+  /** Free-form tags shown on the app card and used for OR-filtering in the app center. */
+  tags: string[];
   created_at: string;
   updated_at: string;
   versions?: AppVersion[];
@@ -364,6 +422,7 @@ export interface AppCreate {
   description?: string | null;
   icon?: string | null;
   visibility: AppVisibility;
+  tags?: string[];
   version: AppVersionCreate;
 }
 
@@ -373,6 +432,8 @@ export interface AppUpdate {
   description?: string | null;
   icon?: string | null;
   visibility?: AppVisibility;
+  /** Omit (undefined) to leave tags unchanged; send an array to overwrite. */
+  tags?: string[];
 }
 
 /** One row in the admin review queue: a pending version + its App context. */
@@ -414,6 +475,56 @@ export interface AppRunResult {
   session_id: string;
   run_id: string;
   status: string;
+}
+
+// ─── App execution history (GET /apps/{id}/runs) ──────────────────────────────
+//
+// Trimmed run rows for an App's history view. The BFF forwards to the
+// orchestrator's `GET /runs?app_id=<id>` and reduces each row to the fields a
+// list card needs (full `app_snapshot` is dropped in favour of a compact
+// `app` block + truncated `inputs`). `status` reuses the shared RunStatus
+// union; `source` is "user" (manual) or "schedule" (cron-triggered).
+
+/** Compact App context embedded in an App run history item. */
+export interface AppRunHistoryApp {
+  app_id: string;
+  app_name: string;
+  /** Version label as stored on the published snapshot (string, e.g. "1"). */
+  app_version: string;
+  app_version_id: string;
+  model: string;
+}
+
+/** One resolved input value recorded in an App run history item. */
+export interface AppRunHistoryInput {
+  key: string;
+  label: string;
+  type: string;
+  /** string for text/textarea/select; string[] for multiselect; file ref array for file. */
+  value: unknown;
+}
+
+/** One run row in an App's execution history. */
+export interface AppRunHistoryItem {
+  id: string;
+  session_id: string;
+  status: RunStatus;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  result_summary: string | null;
+  error_message: string | null;
+  source: string | null;
+  execution_mode: string | null;
+  app: AppRunHistoryApp;
+  inputs: AppRunHistoryInput[];
+}
+
+/** Response envelope for GET /apps/{id}/runs (limit/offset pagination, no total). */
+export interface AppRunHistoryResponse {
+  items: AppRunHistoryItem[];
+  limit: number;
+  offset: number;
 }
 
 // ─── Attachments ────────────────────────────────────────────────────────────
@@ -629,6 +740,11 @@ export interface ProbeResults {
   /** Raw context window value as string, or "unknown" if not advertised. */
   context_window_value: string;
   parallel_tool_calls: ProbeCapabilityResult;
+  /** Per-model details keyed by model id; null fields mean "not detected". */
+  model_details?: Record<string, {
+    context_length?: number | null;
+    max_tokens?: number | null;
+  }>;
 }
 
 export interface ProbeReport {
@@ -676,7 +792,18 @@ export interface TokenUsageBreakdown {
   by_source: SourceTokenUsage[];
 }
 
-export type RunStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+/**
+ * Run lifecycle status.  `PAUSED` is the HITL pause state — the run is waiting
+ * for a human confirm/answer and is NOT terminal: it resumes to `RUNNING` once
+ * the pending interaction is responded to.
+ */
+export type RunStatus =
+  | 'PENDING'
+  | 'RUNNING'
+  | 'PAUSED'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'CANCELLED';
 
 /**
  * How a run executes:
@@ -1275,16 +1402,50 @@ export interface RegisterMcpServerRequest {
   endpoint?: string | null;
   command?: string | null;
   env?: Record<string, string>;
-  scopes?: string[];
   enabled?: boolean;
+  headers?: Record<string, string>;
+  auth?: McpAuthInput;
+  timeout_seconds?: number | null;
+  tool_filter?: ToolFilter;
+  args?: string[];
 }
 
 export interface PatchMcpServerRequest {
   endpoint?: string | null;
   command?: string | null;
   env?: Record<string, string> | null;
-  scopes?: string[] | null;
   enabled?: boolean | null;
+  headers?: Record<string, string> | null;
+  auth?: McpAuthInput | null;
+  timeout_seconds?: number | null;
+  tool_filter?: ToolFilter | null;
+  args?: string[] | null;
+}
+
+/** Body for the id-less probe endpoint (POST /admin/mcp/servers/probe): the
+ *  connection fields as currently typed in the admin form, so a server that has
+ *  not been created yet can still have its tool list discovered. */
+export interface ProbeMcpServerRequest {
+  transport: McpTransport;
+  endpoint?: string | null;
+  headers?: Record<string, string>;
+  auth?: McpAuthInput;
+  timeout_seconds?: number | null;
+}
+
+/** One tool discovered by an MCP "test connection" probe. */
+export interface McpTestTool {
+  name: string;
+  description?: string | null;
+}
+
+/** Result of POST /admin/mcp/servers/{id}/test and of POST
+ *  /admin/mcp/servers/probe (same shape). */
+export interface McpTestResult {
+  ok: boolean;
+  server_info?: Record<string, unknown>;
+  tools?: McpTestTool[];
+  error?: string | null;
 }
 
 // ─── Platform governance: Ops / runs / sandboxes ──────────────────────────────
@@ -2036,14 +2197,23 @@ export interface OrphanReportListResponse {
 
 export type CronJobStatus = 'ok' | 'error' | 'skipped';
 
+/** How a CronJob row is fired: on a cron schedule, or by an inbound webhook. */
+export type TriggerType = 'schedule' | 'webhook';
+
 export interface CronJob {
   id: string;
   tenant_id: string;
   app_id: string;
   name: string;
-  cron_expression: string;
+  trigger_type: TriggerType;
+  // Null for webhook triggers (they carry no cron schedule).
+  cron_expression: string | null;
   timezone: string;
   input_values: Record<string, unknown>;
+  // incoming payload key → App input_schema field key (webhook triggers only).
+  field_mapping?: Record<string, string> | null;
+  // Whether a webhook secret exists; the plaintext is NEVER returned by list/get.
+  has_webhook_secret: boolean;
   enabled: boolean;
   source: string;
   last_run_at: string | null;
@@ -2057,11 +2227,32 @@ export interface CronJob {
 export interface CronJobCreate {
   app_id: string;
   name: string;
-  cron_expression: string;
+  trigger_type?: TriggerType;
+  // Required for schedule triggers; omitted for webhook triggers.
+  cron_expression?: string;
   timezone?: string;
   input_values?: { text?: Record<string, string>; multi?: Record<string, string[]> };
+  // Required for webhook triggers: incoming payload key → App field key.
+  field_mapping?: Record<string, string>;
   enabled?: boolean;
   source?: string;
+}
+
+/**
+ * Create response — a CronJob plus, exactly once for a freshly-created webhook
+ * trigger, the plaintext `webhook_secret` and full `webhook_path`. Both are null
+ * for schedule creates.
+ */
+export interface CronJobCreated extends CronJob {
+  webhook_secret?: string | null;
+  webhook_path?: string | null;
+}
+
+/** Secret-rotation response — the new plaintext secret, returned exactly once. */
+export interface WebhookSecret {
+  id: string;
+  webhook_secret: string;
+  webhook_path: string;
 }
 
 export interface CronJobUpdate {

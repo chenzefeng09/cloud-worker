@@ -999,6 +999,96 @@ def test_create_run_applies_default_skills_only_when_key_is_omitted(
     assert default_lookup.await_count == expected_lookups
 
 
+@pytest.mark.parametrize(
+    ("include_key", "request_ids", "key_expected", "expected_payload"),
+    [
+        (False, None, False, None),
+        (True, [], True, []),
+        (True, ["mcp_a", "mcp_b"], True, ["mcp_a", "mcp_b"]),
+        (True, None, True, []),
+    ],
+    ids=[
+        "omitted-key-absent-downstream",
+        "explicit-empty-disables-all",
+        "explicit-list-narrows",
+        "explicit-null-disables-all",
+    ],
+)
+def test_create_run_forwards_mcp_server_ids_with_presence_semantics(
+    app_client: TestClient,
+    mock_db: AsyncMock,
+    auth_headers: dict[str, str],
+    include_key: bool,
+    request_ids: list[str] | None,
+    key_expected: bool,
+    expected_payload: list[str] | None,
+) -> None:
+    """Sandbox branch: ``mcp_server_ids`` is presence-carried, not truthy.
+
+    Omitting the key must leave it OFF the scheduler payload entirely (so the
+    in-sandbox injector keeps the tenant-default behaviour); an explicit ``[]``
+    must be forwarded as ``[]`` and must NOT collapse into "absent".
+    """
+    import httpx
+
+    session = Session(
+        id="ses_mcp", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+    )
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_mcp"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+    scheduler_payloads: list[dict] = []
+
+    class _SchedulerResp:
+        status_code = 201
+
+        def json(self):
+            return {"id": "run_mcp", "sandbox_id": "abc123", "status": "RUNNING"}
+
+    class _FakeClient(AuthzAwareClient):
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            scheduler_payloads.append(json or {})
+            return _SchedulerResp()
+
+    body: dict = {"task": "use mcp"}
+    if include_key:
+        body["mcp_server_ids"] = request_ids
+
+    with (
+        patch.object(httpx, "AsyncClient", return_value=_FakeClient()),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._fetch_memory",
+            new=AsyncMock(return_value=""),
+        ),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._assemble_history",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._fetch_default_installed_skills",
+            new=AsyncMock(return_value=[]),
+        ),
+    ):
+        response = app_client.post(
+            "/api/session/v1/sessions/ses_mcp/runs",
+            headers=auth_headers,
+            json=body,
+        )
+
+    assert response.status_code == 201, response.text
+    payload = scheduler_payloads[-1]
+    assert ("mcp_server_ids" in payload) is key_expected
+    if key_expected:
+        assert payload["mcp_server_ids"] == expected_payload
+
+
 def test_create_run_sums_attachment_bytes_for_memory_tier(
     app_client: TestClient, mock_db: AsyncMock, auth_headers,
 ) -> None:
