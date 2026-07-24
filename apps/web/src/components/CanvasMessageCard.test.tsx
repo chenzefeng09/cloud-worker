@@ -188,7 +188,8 @@ describe('CanvasMessageCard', () => {
     await user.type(popupInput, '改得更有力');
 
     expect(popupInput).toHaveValue('改得更有力');
-    expect(screen.getByPlaceholderText(/已选中 \d+ 字符/)).toHaveValue('');
+    // The footer instruction input (separate from the popup) stays empty.
+    expect(screen.getByPlaceholderText('输入修改要求…')).toHaveValue('');
   });
 
   it('dismisses the floating toolbar with Escape or an outside click', async () => {
@@ -246,8 +247,8 @@ describe('CanvasMessageCard', () => {
     expect(screen.getByRole('status')).toHaveTextContent('修订中…');
     expect(screen.getByPlaceholderText('修订中…')).toBeDisabled();
 
-    // The document / selection request buttons are disabled — no double submit.
-    expect(screen.getByRole('button', { name: '整篇' })).toBeDisabled();
+    // The whole-document request button is disabled — no double submit.
+    expect(screen.getByRole('button', { name: '修改' })).toBeDisabled();
     expect(onRequestEdit).not.toHaveBeenCalled();
   });
 

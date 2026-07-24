@@ -48,6 +48,50 @@ function glyphFor(filename: string): string {
   return FILE_GLYPH[ext] ?? '·';
 }
 
+// ─── Row-action icons (14px, stroke = currentColor) ──────────────────────────
+const iconProps = {
+  width: 15,
+  height: 15,
+  viewBox: '0 0 24 24',
+  fill: 'none',
+  stroke: 'currentColor',
+  strokeWidth: 1.9,
+  strokeLinecap: 'round' as const,
+  strokeLinejoin: 'round' as const,
+  'aria-hidden': true,
+};
+
+function DownloadIcon() {
+  return (
+    <svg {...iconProps}>
+      <path d="M12 3.5v11" />
+      <path d="m7.5 10.5 4.5 4.5 4.5-4.5" />
+      <path d="M5 20h14" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg {...iconProps}>
+      <path d="M4 6.5h16" />
+      <path d="M9.5 6.5V4.5h5v2" />
+      <path d="M6.5 6.5 7.4 19a1.8 1.8 0 0 0 1.8 1.7h5.6a1.8 1.8 0 0 0 1.8-1.7l.9-12.5" />
+      <path d="M10 10v6.5M14 10v6.5" />
+    </svg>
+  );
+}
+
+function EnterFolderIcon() {
+  return (
+    <svg {...iconProps}>
+      <path d="M4 8.5h16v9a1.5 1.5 0 0 1-1.5 1.5h-13A1.5 1.5 0 0 1 4 17.5z" />
+      <path d="M4 8.5V6.5A1.5 1.5 0 0 1 5.5 5h4l2 2.5" />
+      <path d="M9.5 14h5m0 0-2-2m2 2-2 2" />
+    </svg>
+  );
+}
+
 // ─── Virtual-folder tree (frontend-only; folders are implied by '/' in filename) ──
 
 interface FolderNode {
@@ -490,17 +534,18 @@ export function WorkspacePage() {
       <span className="font-mono text-[11px] text-dim text-right">
         {formatRelativeTimeZh(f.created_at)}
       </span>
-      <div className="flex items-center justify-end gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+      <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
         <button
           type="button"
           onClick={(e) => {
             e.stopPropagation();
             handleDownload(f);
           }}
-          className="font-mono text-[11px] text-dim hover:text-ink"
+          className="inline-flex items-center justify-center w-[26px] h-[26px] rounded-md text-dim hover:text-ink hover:bg-line-2 transition-colors"
           title="下载"
+          aria-label="下载"
         >
-          ↓
+          <DownloadIcon />
         </button>
         <button
           type="button"
@@ -508,10 +553,11 @@ export function WorkspacePage() {
             e.stopPropagation();
             handleDelete(f);
           }}
-          className="font-mono text-[11px] text-dim hover:text-accent"
+          className="inline-flex items-center justify-center w-[26px] h-[26px] rounded-md text-dim hover:text-accent hover:bg-accent-soft transition-colors"
           title="删除"
+          aria-label="删除"
         >
-          ✕
+          <TrashIcon />
         </button>
       </div>
     </div>
@@ -542,17 +588,18 @@ export function WorkspacePage() {
             <span aria-hidden />
             <span aria-hidden />
             <span aria-hidden />
-            <div className="flex items-center justify-end gap-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+            <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
               <button
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
                   navigateInto(node.path);
                 }}
-                className="font-mono text-[11px] text-dim hover:text-ink"
+                className="inline-flex items-center justify-center w-[26px] h-[26px] rounded-md text-dim hover:text-ink hover:bg-line-2 transition-colors"
                 title="设为上传目录"
+                aria-label="设为上传目录"
               >
-                -&gt;
+                <EnterFolderIcon />
               </button>
             </div>
           </div>

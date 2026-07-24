@@ -309,6 +309,44 @@ def test_create_on_soft_deleted_session_rejected() -> None:
         _run(svc.create_canvas("ses_1", user_id=TEST_USER, content="hi"))
 
 
+def test_create_html_stores_verbatim_single_block() -> None:
+    db = FakeDB()
+    _seed_session(db)
+    svc = _svc(db)
+    html = "<!doctype html><html><body><canvas id='g'></canvas>\n<script>x=1</script></body></html>"
+    canvas = _run(
+        svc.create_canvas(
+            "ses_1", user_id=TEST_USER, content=html, content_type="html"
+        )
+    )
+    # Exactly one block, of type html, holding the HTML byte-for-byte (never
+    # split on newlines, never markdown-escaped).
+    blocks = db.versions[0].blocks
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "html"
+    assert blocks[0]["text"] == html
+    # No title supplied → generic executable-canvas label (not derived from the
+    # HTML source, which has no heading).
+    assert canvas.title == "网页应用"
+
+
+def test_create_html_keeps_supplied_title() -> None:
+    db = FakeDB()
+    _seed_session(db)
+    svc = _svc(db)
+    canvas = _run(
+        svc.create_canvas(
+            "ses_1",
+            user_id=TEST_USER,
+            content="<html><body>hi there world</body></html>",
+            title="打砖块",
+            content_type="html",
+        )
+    )
+    assert canvas.title == "打砖块"
+    assert db.versions[0].blocks[0]["type"] == "html"
+
+
 def test_create_records_source_run_id() -> None:
     db = FakeDB()
     _seed_session(db)

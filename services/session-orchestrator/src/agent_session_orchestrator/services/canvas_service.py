@@ -37,6 +37,7 @@ from agent_session_orchestrator.errors import (
 )
 from agent_session_orchestrator.services.canvas_blocks import (
     materialize_blocks,
+    single_html_block,
     split_blocks,
 )
 from agent_session_orchestrator.services.session_service import SessionService
@@ -275,6 +276,7 @@ class CanvasService:
         kind: str = "article",
         title: str | None = None,
         source_run_id: str | None = None,
+        content_type: str = "markdown",
     ) -> CanvasDocument:
         """Materialize a canvas from a source message or supplied content.
 
@@ -306,6 +308,10 @@ class CanvasService:
             source_message = await self._get_message(session_id, source_message_id)
             raw = source_message.content or ""
             blocks = materialize_blocks(raw)
+        elif content_type == "html":
+            # Executable canvas: store the HTML document verbatim as one block —
+            # never split into prose blocks and never markdown-escaped.
+            blocks = single_html_block(content or "")
         else:
             blocks = split_blocks(content or "")
 
@@ -315,7 +321,12 @@ class CanvasService:
                 user_message="内容为空，无法创建画布。",
             )
 
-        resolved_title = (title or "").strip() or _default_title(blocks)
+        if content_type == "html":
+            # An HTML block carries no heading/first-line to derive a name from,
+            # so fall back to a generic label when the model omitted the title.
+            resolved_title = (title or "").strip() or "网页应用"
+        else:
+            resolved_title = (title or "").strip() or _default_title(blocks)
 
         canvas = CanvasDocument(
             tenant_id=self._tenant_id,

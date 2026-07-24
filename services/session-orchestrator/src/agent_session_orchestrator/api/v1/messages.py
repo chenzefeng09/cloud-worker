@@ -97,21 +97,26 @@ def _run_canvas_key(run_id: str) -> str:
 # easy to tune.
 _CANVAS_MIN_CHARS = 200  # min whitespace-stripped content_markdown length
 _CANVAS_MIN_BLOCKS = 2    # min paragraphs (split on blank lines)
+_CANVAS_MIN_HTML_CHARS = 40  # min length for an executable HTML canvas
 
 
 def _canvas_payload_passes_guard(payload: dict[str, Any]) -> bool:
     """True when a run-state canvas payload is substantial enough to materialize.
 
-    Rejects payloads whose ``content_markdown`` is shorter than
-    ``_CANVAS_MIN_CHARS`` (whitespace-stripped) or splits into fewer than
-    ``_CANVAS_MIN_BLOCKS`` blank-line-separated segments.  Shared by the
-    streaming and reconcile materialization paths so both apply the identical
-    rule.
+    Prose (content_type="markdown") must clear ``_CANVAS_MIN_CHARS`` and split
+    into at least ``_CANVAS_MIN_BLOCKS`` blank-line-separated segments.  An
+    executable HTML canvas (content_type="html") is stored as one verbatim block,
+    so the blank-line-segment rule does not apply — it only needs a non-trivial
+    document (``_CANVAS_MIN_HTML_CHARS``).  Shared by the streaming and reconcile
+    materialization paths so both apply the identical rule.
     """
     content = str(payload.get("content_markdown") or "")
-    if len(content.strip()) < _CANVAS_MIN_CHARS:
+    stripped = content.strip()
+    if str(payload.get("content_type") or "markdown") == "html":
+        return len(stripped) >= _CANVAS_MIN_HTML_CHARS
+    if len(stripped) < _CANVAS_MIN_CHARS:
         return False
-    segments = [seg for seg in re.split(r"\n{2,}", content.strip()) if seg.strip()]
+    segments = [seg for seg in re.split(r"\n{2,}", stripped) if seg.strip()]
     return len(segments) >= _CANVAS_MIN_BLOCKS
 
 
@@ -123,6 +128,7 @@ async def materialize_one_canvas(
     kind: str,
     title: str | None,
     content_markdown: str,
+    content_type: str = "markdown",
 ) -> tuple[str, str | None] | None:
     """Create one canvas document + backfill its assistant message (canvas v2).
 
@@ -139,7 +145,12 @@ async def materialize_one_canvas(
     fail-open boundary and any ``canvas_created`` SSE emission.
     """
     if not _canvas_payload_passes_guard(
-        {"content_markdown": content_markdown, "title": title, "kind": kind}
+        {
+            "content_markdown": content_markdown,
+            "title": title,
+            "kind": kind,
+            "content_type": content_type,
+        }
     ):
         logger.info(
             "canvas payload below guard threshold; skipping materialization",
@@ -158,6 +169,7 @@ async def materialize_one_canvas(
         kind=str(kind or "article"),
         title=str(title or "").strip() or None,
         source_run_id=run.id,
+        content_type=str(content_type or "markdown"),
     )
     message_id = await canvas_svc.backfill_message_canvas_id(
         session_id=run.session_id,
@@ -891,6 +903,7 @@ async def _materialize_pending_canvases(
                 kind=str(payload.get("kind") or "article"),
                 title=str(payload.get("title") or "").strip() or None,
                 content_markdown=str(payload.get("content_markdown") or ""),
+                content_type=str(payload.get("content_type") or "markdown"),
             )
             already = seq
             if result is None:

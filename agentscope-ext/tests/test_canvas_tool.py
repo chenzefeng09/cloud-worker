@@ -86,11 +86,21 @@ class TestCreateCanvasTool:
                 "kind": "article",
                 "title": "AI 与就业",
                 "content_markdown": "# AI 与就业\n\n人工智能正在改变世界。",
+                "content_type": "markdown",
             }
         ]
         # Confirmation names the canvas by title (so the model can echo it).
         text = result if isinstance(result, str) else result.content[0].text
         assert "AI 与就业" in text
+
+    def test_records_html_content_type(self, tmp_path, monkeypatch):
+        sc = _FakeStateClient()
+        tool = self._make_tool(sc, tmp_path, monkeypatch)
+        html = "<!doctype html><html><body>hi</body></html>"
+        tool(title="打砖块", content_markdown=html, kind="code_note",
+             content_type="html")
+        assert sc.calls[0]["content_type"] == "html"
+        assert sc.calls[0]["content_markdown"] == html
 
     def test_defaults_kind_to_article(self, tmp_path, monkeypatch):
         sc = _FakeStateClient()
@@ -154,10 +164,14 @@ class TestCreateCanvasToolSchema:
         ]
         # title description tells the model to extract from the assignment/《》.
         assert "《书名号》" in props["title"]["description"]
-        # content_markdown must be the COMPLETE finished piece, not a summary.
+        # content_markdown must be the COMPLETE finished piece and cover the
+        # executable-HTML path.
         assert "COMPLETE" in props["content_markdown"]["description"]
-        assert "not a summary" in props["content_markdown"]["description"]
-        # Required fields unchanged.
+        assert "self-contained HTML" in props["content_markdown"]["description"]
+        # content_type gates the executable-canvas branch (markdown | html).
+        assert props["content_type"]["enum"] == ["markdown", "html"]
+        assert props["content_type"]["default"] == "markdown"
+        # Required fields unchanged (content_type is optional, defaults markdown).
         assert CreateCanvasTool.input_schema["required"] == [
             "title",
             "content_markdown",

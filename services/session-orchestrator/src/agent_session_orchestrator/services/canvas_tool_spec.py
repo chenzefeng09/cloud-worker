@@ -68,7 +68,12 @@ CREATE_CANVAS_TOOL: dict[str, Any] = {
             "such content; do not write the article in the reply body instead of, "
             "or in addition to, calling this tool. After calling it, reply with "
             "just ONE short sentence saying the document is in the canvas — never "
-            "repeat the content. Do NOT call for ordinary conversation: short "
+            "repeat the content. You may ALSO use this tool to deliver a RUNNABLE "
+            "web page/app — a small game, interactive widget, animation, or data "
+            "visualization: set content_type='html' and put a COMPLETE "
+            "self-contained HTML document (inline <style>/<script>, no external "
+            "CDN or network) into content_markdown; the canvas runs it live in a "
+            "sandboxed preview. Do NOT call for ordinary conversation: short "
             "answers, explanations, lists, calculations, code debugging, or code "
             "snippets shown for reading — i.e. when the user is not asking for a "
             "written work. If for ANY reason you do not call this tool, you MUST "
@@ -99,11 +104,27 @@ CREATE_CANVAS_TOOL: dict[str, Any] = {
                 "content_markdown": {
                     "type": "string",
                     "description": (
-                        "The COMPLETE finished document body in Markdown — the "
-                        "whole piece, not a summary or outline. Use '#'/'##' "
-                        "headings and blank-line-separated paragraphs; the server "
-                        "splits this into editable blocks."
+                        "The COMPLETE finished document body. For prose "
+                        "(content_type='markdown') use '#'/'##' headings and "
+                        "blank-line-separated paragraphs; the server splits it into "
+                        "editable blocks. For content_type='html', put a COMPLETE "
+                        "self-contained HTML document here instead (inline "
+                        "<style>/<script>, no external resources) — it is stored "
+                        "and run verbatim, never split."
                     ),
+                },
+                "content_type": {
+                    "type": "string",
+                    "description": (
+                        "Content format. 'markdown' (default) for written prose. "
+                        "Use 'html' when the user asks for a RUNNABLE / INTERACTIVE "
+                        "web thing — a small game, widget, animation, data "
+                        "visualization, or web page they can actually use — and put "
+                        "a complete self-contained HTML document into "
+                        "content_markdown; the canvas runs it in a sandboxed preview."
+                    ),
+                    "enum": ["markdown", "html"],
+                    "default": "markdown",
                 },
             },
             "required": ["title", "content_markdown"],
@@ -137,7 +158,12 @@ CANVAS_FORCING_PROMPT = (
     "那会让用户面对一个不存在的画布。\n"
     "示例：用户说「写一篇《AI 与就业》短文，约300字」"
     "→ 立即调用 create_canvas（title=「AI 与就业」，"
-    "content_markdown=完整300字正文），正文只回一句说明。"
+    "content_markdown=完整300字正文），正文只回一句说明。\n"
+    "可运行网页/小游戏：当用户要「可玩、可交互的网页、小游戏、"
+    "可视化、小动画、小工具」时，同样调用 create_canvas，但设 "
+    "content_type='html'，并把一份**完整自包含 HTML 文档**"
+    "（内联 <style>/<script>，禁止外部 CDN/联网）放进 content_markdown，"
+    "画布会在沙箱里把它跑起来。"
 )
 
 
@@ -170,6 +196,10 @@ _WRITTEN_GENRES = (
     "演讲稿", "故事", "小说", "散文", "诗", "作文", "社媒", "笔记",
     "article", "essay", "report", "brief", "proposal", "email",
     "story", "post", "speech",
+    # Runnable-app genres → force the tool so the model delivers an HTML canvas
+    # (content_type='html') rather than dumping code in the reply body.
+    "游戏", "小游戏", "网页", "可视化", "动画", "小工具", "网页应用",
+    "game", "webpage", "web page", "visualization", "widget", "animation",
 )
 
 

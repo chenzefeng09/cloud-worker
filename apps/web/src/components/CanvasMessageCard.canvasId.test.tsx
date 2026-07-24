@@ -1,10 +1,11 @@
 /**
  * CanvasMessageCard — canvas.v2 (canvasId mode) suggestion + version history.
  *
- * The card, when bound to a server canvas via `canvasId`, renders the
- * SuggestionDiffView for an active suggestion and a "历史" dropdown that lists
- * versions and reverts. `api.canvas.*` is mocked module-wide so the store's
- * actions resolve without real network I/O.
+ * The card, when bound to a server canvas via `canvasId`, renders an active
+ * suggestion in place (InlineCanvasSuggestion — the full document with the
+ * changed blocks highlighted) and a "历史" dropdown that lists versions and
+ * reverts. `api.canvas.*` is mocked module-wide so the store's actions resolve
+ * without real network I/O.
  */
 import type { ReactElement } from 'react';
 import { act, fireEvent, render as rtlRender, screen, waitFor, within } from '@testing-library/react';
@@ -104,7 +105,7 @@ afterEach(() => {
   act(() => useCanvasStore.getState().reset());
 });
 
-describe('CanvasMessageCard canvasId mode — SuggestionDiffView', () => {
+describe('CanvasMessageCard canvasId mode — inline suggestion', () => {
   it('sends a selected fragment as an explicit block-local scope', async () => {
     const user = userEvent.setup();
     seedCanvas();
@@ -144,7 +145,7 @@ describe('CanvasMessageCard canvasId mode — SuggestionDiffView', () => {
     );
   });
 
-  it('renders the per-block diff view for an active suggestion', async () => {
+  it('renders block-level diffs in place inside the full document', async () => {
     seedCanvas();
     seedSuggestion([
       { block_id: 'blk_2', op: 'replace', orig: '正文内容', sugg: '精简后的正文' },
@@ -152,13 +153,19 @@ describe('CanvasMessageCard canvasId mode — SuggestionDiffView', () => {
     ]);
     render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
 
-    const diff = screen.getByLabelText('修改建议');
-    expect(diff).toBeInTheDocument();
-    expect(within(diff).getByText('精简了正文')).toBeInTheDocument();
-    // "正文内容" also appears in the editor body, so scope to the diff region.
-    expect(within(diff).getByText('正文内容')).toHaveClass('canvas-suggestion-diff-old');
-    expect(within(diff).getByText('精简后的正文')).toHaveClass('canvas-suggestion-diff-new');
-    expect(within(diff).getByText('新增的一段')).toHaveClass('canvas-suggestion-diff-new');
+    const review = screen.getByLabelText('修改建议');
+    expect(review).toBeInTheDocument();
+    expect(within(review).getByText('精简了正文')).toBeInTheDocument();
+    // The suggestion renders the WHOLE document in context — the unchanged
+    // heading block is still shown, not just the changed blocks.
+    expect(within(review).getByText('标题')).toBeInTheDocument();
+    // The replaced block shows its original struck through and the suggested
+    // text highlighted; the inserted block is marked 新增.
+    expect(within(review).getByText('正文内容')).toHaveClass('canvas-magic-edit-orig');
+    const suggs = Array.from(review.querySelectorAll('.canvas-magic-edit-sugg'));
+    expect(suggs.some((el) => el.textContent === '精简后的正文')).toBe(true);
+    expect(suggs.some((el) => el.textContent === '新增的一段')).toBe(true);
+    expect(within(review).getByText('新增')).toBeInTheDocument();
   });
 
   it('accepts the whole suggestion via the store', async () => {
@@ -211,6 +218,46 @@ describe('CanvasMessageCard canvasId mode — SuggestionDiffView', () => {
     expect(orig).toHaveAttribute('data-me-id', 'csg_1');
     expect(sugg).toHaveTextContent('更有力');
     expect(screen.queryByLabelText('修改建议')).not.toBeInTheDocument();
+  });
+});
+
+describe('CanvasMessageCard canvasId mode — executable HTML canvas', () => {
+  const HTML = '<!DOCTYPE html><html><body><canvas id="g"></canvas><script>1</script></body></html>';
+
+  it('renders a sandboxed iframe (not the prose editor) for an html canvas', () => {
+    seedCanvas({
+      content_type: 'html',
+      title: '打砖块游戏',
+      blocks: [{ id: 'blk_h', type: 'html', text: HTML }],
+    });
+    const { container } = render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
+
+    // The executable branch renders an iframe with the HTML as srcDoc, sandboxed
+    // WITHOUT allow-same-origin.
+    const iframe = container.querySelector('iframe');
+    expect(iframe).not.toBeNull();
+    expect(iframe?.getAttribute('sandbox')).toBe('allow-scripts');
+    expect(iframe?.getAttribute('sandbox')).not.toContain('allow-same-origin');
+    expect(iframe?.getAttribute('srcdoc')).toBe(HTML);
+
+    // 预览 / 代码 toggle present; the prose editor is NOT rendered.
+    expect(screen.getByText('预览')).toBeInTheDocument();
+    expect(screen.getByText('代码')).toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: '页内画布正文' })).not.toBeInTheDocument();
+  });
+
+  it('shows the raw source (not an iframe) in code mode', async () => {
+    const user = userEvent.setup();
+    seedCanvas({
+      content_type: 'html',
+      title: '打砖块游戏',
+      blocks: [{ id: 'blk_h', type: 'html', text: HTML }],
+    });
+    const { container } = render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
+
+    await user.click(screen.getByText('代码'));
+    expect(container.querySelector('iframe')).toBeNull();
+    expect(container.querySelector('pre code')?.textContent).toBe(HTML);
   });
 });
 

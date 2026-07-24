@@ -45,6 +45,17 @@ from agent_session_orchestrator.services.canvas_service import CanvasService
 router = APIRouter(tags=["Canvas"])
 
 
+def _content_type_of(blocks: list) -> str:
+    """Derive the wire ``content_type`` from a canvas' current blocks.
+
+    An executable canvas is exactly one ``html`` block (see
+    ``canvas_blocks.single_html_block``); everything else is prose markdown.
+    """
+    if len(blocks) == 1 and isinstance(blocks[0], dict) and blocks[0].get("type") == "html":
+        return "html"
+    return "markdown"
+
+
 async def _canvas_out(svc: CanvasService, canvas) -> CanvasOut:  # type: ignore[no-untyped-def]
     """Serialise a canvas with its current version's blocks inline."""
     blocks = await svc.get_current_blocks(canvas)
@@ -52,6 +63,7 @@ async def _canvas_out(svc: CanvasService, canvas) -> CanvasOut:  # type: ignore[
         id=canvas.id,
         session_id=canvas.session_id,
         kind=canvas.kind,
+        content_type=_content_type_of(blocks),
         title=canvas.title,
         current_version=canvas.current_version,
         source_message_id=canvas.source_message_id,
@@ -86,6 +98,7 @@ async def create_canvas(
         content=body.content,
         kind=body.kind,
         title=body.title,
+        content_type=body.content_type,
     )
     return await _canvas_out(svc, canvas)
 

@@ -18,13 +18,14 @@ import {
   markdownToCanvasHtml,
 } from '../lib/canvasRichText';
 import { CopyIcon, useCopied } from './CopyButton';
-import { SuggestionDiffView } from './SuggestionDiffView';
 import { useCanvasStore } from '../stores/canvasStore';
 import { useChatStore } from '../stores/chatStore';
 import { useConfirm } from '../admin/components/dialogs';
 import { api } from '../api/client';
 import type { CanvasSelectionSegment, CanvasVersionSummary } from '../api/types';
-import { InlineCanvasSuggestion, isInlineCanvasSuggestion } from './InlineCanvasSuggestion';
+import { InlineCanvasSuggestion } from './InlineCanvasSuggestion';
+import { CanvasHtmlPreview } from './CanvasHtmlPreview';
+import { canvasHtmlSource } from '../lib/canvasHtml';
 
 interface CanvasMessageCardProps {
   sessionId: string;
@@ -73,6 +74,8 @@ interface InlineSuggestionPreview {
 
 const HISTORY_LIMIT = 80;
 const STORAGE_PREFIX = 'article-canvas-draft-v1';
+// CSS Custom Highlight API 的注册名:进入「要求更改」输入态后用它给选区打持久高亮。
+const PENDING_EDIT_HIGHLIGHT = 'canvas-pending-edit';
 
 function storageKey(sessionId: string): string {
   return `${STORAGE_PREFIX}:${sessionId}`;
@@ -392,6 +395,23 @@ export function CanvasMessageCard({
     };
   }, [toolbar]);
 
+  useEffect(() => {
+    // 进入「要求更改」输入态后,焦点移入指令输入框会清掉 contenteditable 的原生选区高亮。
+    // 用 CSS Custom Highlight API 给选中的 Range 打一层持久高亮,让用户始终看得到要改的是哪一段;
+    // 该高亮不改动 DOM,不会污染 markdown 序列化。旧浏览器无此 API 时静默降级。
+    const registry = typeof CSS !== 'undefined' ? CSS.highlights : undefined;
+    if (!registry || typeof Highlight === 'undefined') return;
+    const range = selectedRangeRef.current;
+    if (toolbar?.mode !== 'input' || !range) {
+      registry.delete(PENDING_EDIT_HIGHLIGHT);
+      return;
+    }
+    registry.set(PENDING_EDIT_HIGHLIGHT, new Highlight(range));
+    return () => {
+      registry.delete(PENDING_EDIT_HIGHLIGHT);
+    };
+  }, [toolbar?.mode]);
+
   const updateDraft = useCallback(
     (patch: Partial<CanvasDocumentDraft>) => {
       handleDraftChange({
@@ -699,22 +719,17 @@ export function CanvasMessageCard({
     onAcceptSuggestion();
   };
 
-  const selectedChars = selection ? selection.end - selection.start : 0;
   const isRevising = Boolean(busy || revisingEffective);
-  const canRequestSelection = Boolean(selection && instruction.trim() && !aiDisabled && !isRevising);
   const canRequestDocument = Boolean(instruction.trim() && !aiDisabled && !isRevising);
   const canRequestPopupEdit = Boolean(selection && popupInstruction.trim() && !aiDisabled && !isRevising);
   const suggestionSource =
     suggestion?.request.scope === 'selection' ? suggestion.request.selection?.text : suggestion?.request.content;
-  // canvasId mode renders its own lightweight per-block diff section (below)
-  // instead of the legacy whole-document/selection review card — the legacy
-  // card previews `suggestion.replacement`, which in canvasId mode is just the
-  // joined current content (no real diff), so it isn't useful there.
+  // canvasId mode renders every active suggestion (selection- or block-level)
+  // in place via InlineCanvasSuggestion — the full document with the changed
+  // blocks highlighted — so the legacy whole-document review card below is only
+  // used by the draft (non-canvasId) path.
   const showDocumentSuggestion = Boolean(suggestion && !inlineSuggestionPreview && !canvasId);
-  const showCanvasIdSuggestion = Boolean(canvasId && storeSuggestion);
-  const showInlineCanvasIdSuggestion = Boolean(
-    canvasId && storeCanvas && isInlineCanvasSuggestion(storeSuggestion),
-  );
+  const showCanvasIdSuggestion = Boolean(canvasId && storeCanvas && storeSuggestion);
 
   // canvasId mode before the canvas has loaded into the store (or, in
   // practice never, neither draft nor canvasId supplied): render nothing.
@@ -723,6 +738,63 @@ export function CanvasMessageCard({
   // rendering on the canvas being present in the store, so this is a
   // defensive no-op in normal operation.
   if (missingCanvas) return null;
+
+  // Executable canvas (content_type="html"): render a sandboxed live preview
+  // instead of the prose editor. Detected from the server canvas' single html
+  // block; prose canvases return null here and fall through to the editor below.
+  // (All hooks above have already run, so this early return keeps hook order
+  // stable.) Editing is intentionally disabled for html canvases in MVP — they
+  // are runnable artifacts, viewed/copied, not inline-edited.
+  const htmlSource = canvasId ? canvasHtmlSource(storeCanvas) : null;
+  if (htmlSource !== null) {
+    return (
+      <div className="canvas-message-shell">
+        <article className="canvas-message-card">
+          <header className="canvas-message-card-head">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="canvas-card-edit-chip" title="可运行网页">
+                <span className="font-mono">▶</span>
+                <span>网页</span>
+              </span>
+              <span
+                className="truncate text-[13px] font-medium text-ink"
+                title={draft.title}
+              >
+                {draft.title}
+              </span>
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                className="cw-btn cw-btn-ghost cw-btn-sm"
+                onClick={() => copy(htmlSource)}
+                title="复制源码"
+                aria-label="复制源码"
+              >
+                {copied ? <span className="font-mono text-[10px]">已复制</span> : <CopyIcon />}
+              </button>
+              {onOpenPanel && (
+                <button
+                  type="button"
+                  className="cw-btn cw-btn-ghost cw-btn-sm"
+                  onClick={onOpenPanel}
+                  title="在侧栏打开"
+                  aria-label="在侧栏打开"
+                >
+                  ⛶
+                </button>
+              )}
+            </div>
+          </header>
+          <CanvasHtmlPreview
+            html={htmlSource}
+            title={draft.title}
+            reloadKey={storeCanvas?.current_version}
+          />
+        </article>
+      </div>
+    );
+  }
 
   return (
     <div className="canvas-message-shell">
@@ -935,15 +1007,7 @@ export function CanvasMessageCard({
               />
             </section>
           )}
-          {showCanvasIdSuggestion && !showInlineCanvasIdSuggestion && storeSuggestion && (
-            <SuggestionDiffView
-              suggestion={storeSuggestion}
-              onAccept={handleAcceptSuggestion}
-              onReject={handleRejectSuggestion}
-              busy={revisingEffective}
-            />
-          )}
-          {showInlineCanvasIdSuggestion && storeCanvas && storeSuggestion ? (
+          {showCanvasIdSuggestion && storeCanvas && storeSuggestion ? (
             <InlineCanvasSuggestion
               canvas={storeCanvas}
               suggestion={storeSuggestion}
@@ -1051,7 +1115,7 @@ export function CanvasMessageCard({
                 type="button"
                 className="cw-btn cw-btn-ghost cw-btn-sm"
                 disabled={aiDisabled || isRevising}
-                onClick={() => requestEdit(selection ? 'selection' : 'document', intent)}
+                onClick={() => requestEdit('document', intent)}
               >
                 {intent.label}
               </button>
@@ -1062,13 +1126,7 @@ export function CanvasMessageCard({
               value={instruction}
               onChange={(event) => setInstruction(event.target.value)}
               className="canvas-card-request-input"
-              placeholder={
-                isRevising
-                  ? '修订中…'
-                  : selection
-                    ? `已选中 ${selectedChars} 字符，输入修改要求…`
-                    : '输入整篇修改要求…'
-              }
+              placeholder={isRevising ? '修订中…' : '输入修改要求…'}
               disabled={aiDisabled || isRevising}
             />
             <button
@@ -1077,15 +1135,7 @@ export function CanvasMessageCard({
               disabled={!canRequestDocument}
               onClick={() => requestEdit('document')}
             >
-              整篇
-            </button>
-            <button
-              type="button"
-              className="cw-btn cw-btn-ghost cw-btn-sm"
-              disabled={!canRequestSelection}
-              onClick={() => requestEdit('selection')}
-            >
-              选区
+              修改
             </button>
           </div>
         </footer>

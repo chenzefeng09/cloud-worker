@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react';
 import { api, ApiError } from '../api/client';
 import type { CanvasDocument } from '../api/types';
 import { canvasBlocksToHtml } from '../lib/canvasRichText';
+import { canvasHtmlSource } from '../lib/canvasHtml';
+import { CanvasHtmlPreview } from './CanvasHtmlPreview';
 
 interface CanvasReadonlyViewProps {
   canvasId: string | null;
@@ -53,7 +55,11 @@ export function CanvasReadonlyView({ canvasId, onClose }: CanvasReadonlyViewProp
   if (!canvasId) return null;
 
   const title = canvas?.title || '画布';
-  const html = canvas ? canvasBlocksToHtml(canvas.blocks) : '';
+  // Executable canvas → live sandbox preview; prose → rich-text render. Only
+  // build the prose HTML for prose canvases (canvasBlocksToHtml would escape an
+  // html block into unusable text).
+  const htmlSource = canvasHtmlSource(canvas);
+  const html = canvas && htmlSource === null ? canvasBlocksToHtml(canvas.blocks) : '';
 
   return (
     <div
@@ -91,10 +97,18 @@ export function CanvasReadonlyView({ canvasId, onClose }: CanvasReadonlyViewProp
           </div>
         )}
         {!loading && !error && canvas && (
-          <article
-            className="canvas-rich-editor text-ink break-words"
-            dangerouslySetInnerHTML={{ __html: html }}
-          />
+          htmlSource !== null ? (
+            <CanvasHtmlPreview
+              html={htmlSource}
+              title={title}
+              reloadKey={canvas.current_version}
+            />
+          ) : (
+            <article
+              className="canvas-rich-editor text-ink break-words"
+              dangerouslySetInnerHTML={{ __html: html }}
+            />
+          )
         )}
       </div>
     </div>

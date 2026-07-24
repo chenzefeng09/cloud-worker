@@ -2054,7 +2054,9 @@ export interface PendingInteractionsResponse {
 
 export interface CanvasBlock {
   id: string;
-  type: 'heading' | 'paragraph';
+  // 'html' is an executable-canvas block: one self-contained HTML document
+  // stored verbatim, rendered in a sandboxed iframe instead of the prose editor.
+  type: 'heading' | 'paragraph' | 'html';
   text: string;
 }
 
@@ -2063,6 +2065,10 @@ export interface CanvasDocument {
   id: string;
   session_id: string;
   kind: string;
+  // Derived server-side from the current blocks: 'html' when the canvas is a
+  // single executable HTML block, else 'markdown'. Lets the UI branch to the
+  // sandboxed-iframe preview. Optional so older payloads default to markdown.
+  content_type?: 'markdown' | 'html';
   title: string;
   current_version: number;
   source_message_id?: string | null;

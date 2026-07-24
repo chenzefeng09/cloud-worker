@@ -5,9 +5,28 @@ from __future__ import annotations
 
 from agent_session_orchestrator.services.canvas_blocks import (
     materialize_blocks,
+    single_html_block,
     split_blocks,
 )
 from agent_session_orchestrator.services.canvas_service import apply_diffs
+
+# ── single_html_block ────────────────────────────────────────────────────────
+
+
+def test_single_html_block_wraps_verbatim() -> None:
+    html = "<html>\n<body>\n<h1>hi</h1>\n</body>\n</html>"
+    blocks = single_html_block(html)
+    assert len(blocks) == 1
+    assert blocks[0]["type"] == "html"
+    # Stored byte-for-byte — not split on the embedded newlines.
+    assert blocks[0]["text"] == html
+    assert blocks[0]["id"].startswith("blk_")
+
+
+def test_single_html_block_blank_is_empty() -> None:
+    assert single_html_block("") == []
+    assert single_html_block("   \n  ") == []
+
 
 # ── split_blocks ─────────────────────────────────────────────────────────────
 

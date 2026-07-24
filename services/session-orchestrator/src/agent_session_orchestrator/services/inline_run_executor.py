@@ -808,6 +808,7 @@ async def _materialize_inline_canvas(
     content_markdown = str(args.get("content_markdown") or "")
     title = args.get("title")
     kind = str(args.get("kind") or "article")
+    content_type = str(args.get("content_type") or "markdown")
 
     # ``get_session`` commits in its post-``yield`` teardown, so the loop body
     # must run to completion — an early ``return``/``break`` abandons the
@@ -859,6 +860,7 @@ async def _materialize_inline_canvas(
                     kind=kind,
                     title=str(title or "").strip() or None,
                     content_markdown=content_markdown,
+                    content_type=content_type,
                 )
                 if result is not None:
                     canvas_id, message_id = result

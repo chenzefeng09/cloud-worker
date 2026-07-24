@@ -53,6 +53,19 @@ def _blk_id() -> str:
     return f"blk_{uuid.uuid4().hex[:8]}"
 
 
+def single_html_block(html: str) -> list[dict[str, str]]:
+    """Wrap a self-contained HTML document as ONE verbatim ``html`` block.
+
+    Executable-canvas content (content_type="html") is never split or escaped —
+    the exact source is preserved so the frontend can hand it straight to a
+    sandboxed iframe.  Empty/blank input yields an empty list (the caller rejects
+    an empty canvas), otherwise the original text is stored byte-for-byte.
+    """
+    if not (html or "").strip():
+        return []
+    return [{"id": _blk_id(), "type": "html", "text": html}]
+
+
 def split_blocks(markdown: str) -> list[dict[str, str]]:
     """Split ``markdown`` into ordered ``{id, type, text}`` blocks.
 

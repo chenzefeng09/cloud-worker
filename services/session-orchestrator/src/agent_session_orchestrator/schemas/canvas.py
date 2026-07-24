@@ -9,10 +9,15 @@ from pydantic import BaseModel, Field
 
 
 class Block(BaseModel):
-    """One canvas block: ``{id, type, text}`` (design §4)."""
+    """One canvas block: ``{id, type, text}`` (design §4).
+
+    ``html`` is an executable-canvas block: an entire self-contained HTML
+    document stored verbatim as a single block (content_type="html"), rendered
+    live in a sandboxed iframe instead of the prose editor.
+    """
 
     id: str
-    type: Literal["heading", "paragraph"]
+    type: Literal["heading", "paragraph", "html"]
     text: str
 
 
@@ -27,6 +32,9 @@ class CanvasCreate(BaseModel):
     content: str | None = None
     kind: str = "article"
     title: str | None = None
+    # "markdown" (default) → split into editable blocks; "html" → store the
+    # supplied ``content`` verbatim as one executable block (sandbox preview).
+    content_type: Literal["markdown", "html"] = "markdown"
 
 
 class ManualVersionCreate(BaseModel):
@@ -87,6 +95,10 @@ class CanvasOut(BaseModel):
     id: str
     session_id: str
     kind: str
+    # Derived from the current blocks: "html" when the canvas is a single
+    # executable HTML block, else "markdown". Lets the frontend branch to the
+    # sandboxed-iframe preview without re-inspecting blocks.
+    content_type: Literal["markdown", "html"] = "markdown"
     title: str
     current_version: int
     source_message_id: str | None = None

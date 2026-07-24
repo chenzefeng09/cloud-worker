@@ -115,7 +115,12 @@ class CreateCanvasTool(_ToolBase):
         "do not write the article in the reply body instead of, or in addition "
         "to, calling this tool. After calling it, reply with just ONE short "
         "sentence saying the document is in the canvas — never repeat the "
-        "content. Do NOT call for ordinary conversation: short answers, "
+        "content. You may ALSO use this tool to deliver a RUNNABLE web page/app "
+        "— a small game, interactive widget, animation, or data visualization: "
+        "set content_type='html' and put a COMPLETE self-contained HTML document "
+        "(inline <style>/<script>, no external CDN or network) into "
+        "content_markdown; the canvas runs it live in a sandboxed preview. "
+        "Do NOT call for ordinary conversation: short answers, "
         "explanations, lists, calculations, code debugging, or code snippets "
         "shown for reading — i.e. when the user is not asking for a written work."
     )
@@ -152,11 +157,27 @@ class CreateCanvasTool(_ToolBase):
             "content_markdown": {
                 "type": "string",
                 "description": (
-                    "The COMPLETE finished document body in Markdown — the whole "
-                    "piece, not a summary or outline. Use '#'/'##' headings and "
-                    "blank-line-separated paragraphs; the server splits this into "
-                    "editable blocks."
+                    "The COMPLETE finished document body. For prose "
+                    "(content_type='markdown') use '#'/'##' headings and "
+                    "blank-line-separated paragraphs; the server splits it into "
+                    "editable blocks. For content_type='html', put a COMPLETE "
+                    "self-contained HTML document here instead (inline "
+                    "<style>/<script>, no external resources) — it is stored and "
+                    "run verbatim, never split."
                 ),
+            },
+            "content_type": {
+                "type": "string",
+                "description": (
+                    "Content format. 'markdown' (default) for written prose. Use "
+                    "'html' when the user asks for a RUNNABLE / INTERACTIVE web "
+                    "thing — a small game, widget, animation, data visualization, "
+                    "or web page they can actually use — and put a complete "
+                    "self-contained HTML document into content_markdown; the "
+                    "canvas runs it in a sandboxed preview."
+                ),
+                "enum": ["markdown", "html"],
+                "default": "markdown",
             },
         },
         "required": ["title", "content_markdown"],
@@ -192,8 +213,14 @@ class CreateCanvasTool(_ToolBase):
         title: str,
         content_markdown: str,
         kind: Optional[str] = "article",
+        content_type: Optional[str] = "markdown",
     ) -> Any:
-        text = self._create(title=title, content_markdown=content_markdown, kind=kind)
+        text = self._create(
+            title=title,
+            content_markdown=content_markdown,
+            kind=kind,
+            content_type=content_type,
+        )
         if _AGENTSCOPE_TOOLS and _ToolChunk is not None:
             return _ToolChunk(
                 content=[_TextBlock(type="text", text=text)],
@@ -208,11 +235,13 @@ class CreateCanvasTool(_ToolBase):
         title: str,
         content_markdown: str,
         kind: Optional[str],
+        content_type: Optional[str] = "markdown",
     ) -> str:
         payload = {
             "kind": (kind or "article"),
             "title": title or "未命名画布",
             "content_markdown": content_markdown or "",
+            "content_type": (content_type or "markdown"),
         }
 
         # Primary channel: Redis hot-state (read by the orchestrator).
