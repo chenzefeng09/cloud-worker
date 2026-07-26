@@ -11,8 +11,10 @@ An enterprise-grade platform for running AI agents: multi-tenant chat sessions, 
 runs executed inside isolated sandboxes (Docker or microVM), reusable **Apps**, skill
 packages, tenant-scoped MCP servers, a knowledge pipeline, and a 28-page admin console.
 
-> **cloud·worker** is the product name; **`agent-platform`** is this repository, and the
-> name used throughout for services, directories and images.
+> **cloud·worker** is the product; the repository is
+> [`cloud-worker`](https://github.com/chenzefeng09/cloud-worker). A number of internal
+> identifiers still carry the earlier `agent-platform` name — the compose file, the Helm
+> chart, image prefixes — and are referred to by their real names below.
 
 cloud·worker is the **business layer**. It runs on top of
 [**saas-foundation**](https://github.com/chenzefeng09/saas-foundation) — a separate,
@@ -117,7 +119,7 @@ management, and platform governance (App review, skills, MCP, knowledge, sandbox
 The two repositories split along a single line: **saas-foundation is generic enterprise
 plumbing, cloud·worker is everything agent-shaped.**
 
-| | [saas-foundation](https://github.com/chenzefeng09/saas-foundation) | cloud·worker (`agent-platform`, this repo) |
+| | [saas-foundation](https://github.com/chenzefeng09/saas-foundation) | cloud·worker (`cloud-worker`, this repo) |
 |---|---|---|
 | **Role** | Reusable SaaS base, independently deliverable | Business layer built on that base |
 | **Owns** | identity, authz, org, billing, audit, compliance, notification, search, api-platform, llm-gateway, storage, crypto, dlp, data-protection, feature-flag, lifecycle, pam, security-ops | sessions, messages, runs, sandboxes, agent workers, skills, MCP, knowledge, Apps, canvas, artifacts |
@@ -154,7 +156,7 @@ The SDK reaches your services by one of two paths, documented in
 ```
 Development/
 ├── saas-foundation/     # must be running first
-└── agent-platform/      # this repo
+└── cloud-worker/        # this repo
 ```
 
 If your layout differs, override `FOUNDATION_DIR` (Makefile) and `FOUNDATION_SDK_PATH`
@@ -233,7 +235,7 @@ browser.
 ## Repository layout
 
 ```
-agent-platform/
+cloud-worker/
 ├── apps/web/              React 19 SPA (Vite, Zustand, Tailwind)
 │   └── src/admin/         28-page admin console
 ├── services/              FastAPI services (Python 3.12, Poetry) — see table above
@@ -266,8 +268,8 @@ sibling directory.
 
 ```bash
 git clone https://github.com/chenzefeng09/saas-foundation.git
-git clone https://github.com/chenzefeng09/agent-platform.git
-cd agent-platform
+git clone https://github.com/chenzefeng09/cloud-worker.git
+cd cloud-worker
 ```
 
 ```bash
@@ -437,7 +439,7 @@ Model-generated code is treated as untrusted throughout:
   is gated behind explicit permissions.
 
 Found a security problem? Please report it privately via a
-[GitHub security advisory](https://github.com/chenzefeng09/agent-platform/security/advisories/new)
+[GitHub security advisory](https://github.com/chenzefeng09/cloud-worker/security/advisories/new)
 rather than opening a public issue.
 
 ---

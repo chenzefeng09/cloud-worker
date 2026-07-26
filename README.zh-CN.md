@@ -10,7 +10,9 @@
 企业级 AI Agent 运行平台：多租户会话、在隔离沙箱（Docker 或 microVM）中执行的 Agent 任务、
 可复用的**应用（App）**、技能包、租户级 MCP 服务、知识库管道，以及一套 28 个模块的管理后台。
 
-> **cloud·worker** 是产品名；**`agent-platform`** 是本仓库名，也是服务、目录与镜像统一使用的名字。
+> **cloud·worker** 是产品名，仓库名为
+> [`cloud-worker`](https://github.com/chenzefeng09/cloud-worker)。仓库内部仍有不少标识
+> 沿用早期的 `agent-platform` 命名（compose 文件、Helm chart、镜像前缀等），下文按实际名称引用。
 
 cloud·worker 是**业务层**，构建在
 [**saas-foundation**](https://github.com/chenzefeng09/saas-foundation) 之上 ——
@@ -104,7 +106,7 @@ cloud·worker 是**业务层**，构建在
 
 两个仓库沿一条线切分：**saas-foundation 是通用企业底座，cloud·worker 是所有与 Agent 相关的部分。**
 
-| | [saas-foundation](https://github.com/chenzefeng09/saas-foundation) | cloud·worker（`agent-platform`，本仓库） |
+| | [saas-foundation](https://github.com/chenzefeng09/saas-foundation) | cloud·worker（`cloud-worker`，本仓库） |
 |---|---|---|
 | **定位** | 可复用 SaaS 底座，独立交付 | 构建在底座之上的业务层 |
 | **负责** | identity、authz、org、billing、audit、compliance、notification、search、api-platform、llm-gateway、storage、crypto、dlp、data-protection、feature-flag、lifecycle、pam、security-ops | 会话、消息、运行、沙箱、Agent worker、技能、MCP、知识库、应用、画布、产物 |
@@ -138,7 +140,7 @@ SDK 有两条获取路径，详见
 ```
 Development/
 ├── saas-foundation/     # 必须先启动
-└── agent-platform/      # 本仓库
+└── cloud-worker/        # 本仓库
 ```
 
 若目录结构不同，请覆盖 `FOUNDATION_DIR`（Makefile）与 `FOUNDATION_SDK_PATH`
@@ -214,7 +216,7 @@ agent-scheduler :8007 ───────────────▶ sandbox-p
 ## 仓库结构
 
 ```
-agent-platform/
+cloud-worker/
 ├── apps/web/              React 19 单页应用（Vite、Zustand、Tailwind）
 │   └── src/admin/         28 个模块的管理后台
 ├── services/              FastAPI 服务（Python 3.12、Poetry）—— 见上方清单
@@ -246,8 +248,8 @@ agent-platform/
 
 ```bash
 git clone https://github.com/chenzefeng09/saas-foundation.git
-git clone https://github.com/chenzefeng09/agent-platform.git
-cd agent-platform
+git clone https://github.com/chenzefeng09/cloud-worker.git
+cd cloud-worker
 ```
 
 ```bash
@@ -405,7 +407,7 @@ make build-claude-sdk-cube-image
 - **审计与回放** —— 运行事件汇入 foundation 审计服务；会话回放受独立权限管控。
 
 发现安全问题？请通过
-[GitHub security advisory](https://github.com/chenzefeng09/agent-platform/security/advisories/new)
+[GitHub security advisory](https://github.com/chenzefeng09/cloud-worker/security/advisories/new)
 私下报告，不要开公开 issue。
 
 ---
