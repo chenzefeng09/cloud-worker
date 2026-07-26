@@ -67,6 +67,10 @@ export class EventTranslator {
   private streamThinkingBlockIds = new Map<number, string>();
   /** streaming content-block index -> tool_call_id (from content_block_start). */
   private streamToolCallIds = new Map<number, string>();
+  /** tool_call_id -> streamed JSON args, when the SDK emits input deltas. */
+  private streamedToolArgs = new Map<string, string>();
+  /** Tool calls whose end event has already been emitted. */
+  private streamedToolCallEnds = new Set<string>();
 
   // ── consolidated-assistant dedup (per turn, keyed on SDK message id) ───────
   // Ground truth (worker-claude-sdk/sdk-messages-sample.jsonl, a real
@@ -211,6 +215,8 @@ export class EventTranslator {
         if (id !== this.streamingMessageId) {
           this.streamedBlockKinds.clear();
           this.streamedTextByKey.clear();
+          this.streamedToolArgs.clear();
+          this.streamedToolCallEnds.clear();
           // accountedUsageIds is intentionally NOT cleared: it guards against
           // re-counting a turn's repeated usage snapshot, and an id is only ever
           // accounted once anyway. Pruning to the current id keeps it bounded.
@@ -240,6 +246,7 @@ export class EventTranslator {
           const toolName = String(block.name ?? "tool");
           if (toolCallId) this.toolNames.set(toolCallId, toolName);
           this.streamToolCallIds.set(index, toolCallId);
+          if (toolCallId) this.streamedToolArgs.set(toolCallId, "");
           this.recordStreamedBlock(index, "tool_use");
           return [
             {
@@ -291,6 +298,13 @@ export class EventTranslator {
         }
         if (delta.type === "input_json_delta") {
           const toolCallId = this.streamToolCallIds.get(index) ?? "";
+          if (toolCallId) {
+            this.streamedToolArgs.set(
+              toolCallId,
+              (this.streamedToolArgs.get(toolCallId) ?? "") +
+                String(delta.partial_json ?? ""),
+            );
+          }
           return [
             {
               event_type: "ToolCallDeltaEvent",
@@ -303,12 +317,14 @@ export class EventTranslator {
       }
       case "content_block_stop": {
         const index = Number(ev.index ?? 0);
-        // A tool_use block must emit ToolCallEndEvent so worker.ts writes the
-        // tool_call Redis entry and refreshes the RUNNING checkpoint. text /
-        // thinking blocks emit their End so block-close semantics match the
-        // non-streaming path.
+        // If tool arguments were streamed, close the call now. Otherwise wait
+        // for the consolidated assistant message, which carries the complete
+        // tool input for SDKs that omit input_json_delta.
         if (this.streamToolCallIds.has(index)) {
           const toolCallId = this.streamToolCallIds.get(index) ?? "";
+          const toolArgs = this.streamedToolArgs.get(toolCallId) ?? "";
+          if (!toolArgs || this.streamedToolCallEnds.has(toolCallId)) return [];
+          this.streamedToolCallEnds.add(toolCallId);
           return [{ event_type: "ToolCallEndEvent", tool_call_id: toolCallId }];
         }
         if (this.streamTextBlockIds.has(index)) {
@@ -368,6 +384,18 @@ export class EventTranslator {
         const toolName = String(block.name ?? "tool");
         if (toolCallId) this.toolNames.set(toolCallId, toolName);
         if (this.wasStreamed(msgId, index, "tool_use", "")) {
+          const streamedArgs = this.streamedToolArgs.get(toolCallId);
+          if (streamedArgs === undefined || streamedArgs.length === 0) {
+            out.push({
+              event_type: "ToolCallDeltaEvent",
+              tool_call_id: toolCallId,
+              delta: JSON.stringify(block.input ?? {}),
+            });
+            if (!this.streamedToolCallEnds.has(toolCallId)) {
+              this.streamedToolCallEnds.add(toolCallId);
+              out.push({ event_type: "ToolCallEndEvent", tool_call_id: toolCallId });
+            }
+          }
           return;
         }
         out.push({

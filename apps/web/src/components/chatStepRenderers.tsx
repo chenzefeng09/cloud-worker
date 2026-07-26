@@ -370,9 +370,38 @@ export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>['com
 
 // ── Tool target extraction ────────────────────────────────────────────────────
 
+type RawToolCallEntry = ToolCallEntry & {
+  args?: unknown;
+};
+
+function decodeToolInput(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+      return { value: parsed };
+    } catch {
+      return { value };
+    }
+  }
+  return {};
+}
+
+export function normalizeToolInput(tc: ToolCallEntry): Record<string, unknown> {
+  const raw = tc as RawToolCallEntry;
+  const input = decodeToolInput(raw.input);
+  if (Object.keys(input).length > 0 || raw.args === undefined) return input;
+  return decodeToolInput(raw.args);
+}
+
 export function extractTarget(tc: ToolCallEntry): string {
   const name = (tc.name ?? '').toLowerCase();
-  const input = tc.input ?? {};
+  const input = normalizeToolInput(tc);
 
   if (name === 'read' || name === 'write' || name === 'edit') {
     const fp = input['file_path'] ?? input['path'] ?? input['filename'];
@@ -383,8 +412,8 @@ export function extractTarget(tc: ToolCallEntry): string {
     return pat ? `"${String(pat)}"` : '';
   }
   if (name === 'bash' || name === 'run' || name === 'shell') {
-    const cmd = input['command'] ?? input['cmd'];
-    return cmd ? String(cmd) : '';
+    const cmd = input['command'] ?? input['cmd'] ?? input['value'];
+    return cmd == null ? '' : String(cmd);
   }
   // Generic: first string value
   const first = Object.values(input).find((v) => typeof v === 'string');
@@ -537,7 +566,7 @@ export function ToolRow({ tc, rowKey: _rowKey, expanded, onToggle }: ToolRowProp
             renderResultWithDiff(tc.result)
           ) : (
             <pre style={{ margin: 0, fontFamily: 'inherit', fontSize: 'inherit' }}>
-              {JSON.stringify(tc.input ?? {}, null, 2)}
+              {JSON.stringify(normalizeToolInput(tc), null, 2)}
             </pre>
           )}
         </div>

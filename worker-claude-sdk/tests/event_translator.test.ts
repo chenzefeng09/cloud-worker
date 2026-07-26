@@ -309,6 +309,36 @@ describe("EventTranslator — per-token streaming (stream_event)", () => {
     expect(consolidated[0].output_tokens).toBe(30);
   });
 
+  it("uses consolidated tool input when the SDK omits input_json_delta", () => {
+    const t = new EventTranslator();
+    const id = "msg_tool_input_fallback";
+
+    t.translateMessage(msgStart(id));
+    expect(
+      types(t.translateMessage(cbStart(0, { type: "tool_use", id: "tc-fallback", name: "Bash" }))),
+    ).toEqual(["ToolCallStartEvent"]);
+
+    // The SDK can close the tool block without sending any argument deltas.
+    expect(t.translateMessage(cbStop(0))).toEqual([]);
+
+    const consolidated = t.translateMessage({
+      type: "assistant",
+      message: {
+        id,
+        content: [{ type: "tool_use", id: "tc-fallback", name: "Bash", input: { cmd: "pwd" } }],
+        usage: { input_tokens: 10, output_tokens: 2 },
+      },
+    } as AnyMsg);
+
+    expect(types(consolidated)).toEqual([
+      "ToolCallDeltaEvent",
+      "ToolCallEndEvent",
+      "ModelCallEndEvent",
+    ]);
+    expect(consolidated[0].delta).toBe(JSON.stringify({ cmd: "pwd" }));
+    expect(t.translateMessage(cbStop(0))).toEqual([]);
+  });
+
   it("counts usage exactly once (from final assistant), never doubled by partials", () => {
     const t = new EventTranslator();
     t.translateMessage(msgStart());

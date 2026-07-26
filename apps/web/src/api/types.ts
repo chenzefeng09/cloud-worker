@@ -89,6 +89,8 @@ export interface ToolCallEntry {
   name: string;
   /** Parsed input object (may be empty if args couldn't be parsed). */
   input: Record<string, unknown>;
+  /** Legacy raw args string used by older persisted tool-call rows. */
+  args?: string;
   /** Tool output text, present after the tool has returned. */
   result?: string;
   /** Execution state, e.g. "success" or "error". */
