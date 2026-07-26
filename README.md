@@ -1,4 +1,4 @@
-# agent-platform
+# cloud·worker
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
@@ -11,11 +11,34 @@ An enterprise-grade platform for running AI agents: multi-tenant chat sessions, 
 runs executed inside isolated sandboxes (Docker or microVM), reusable **Apps**, skill
 packages, tenant-scoped MCP servers, a knowledge pipeline, and a 28-page admin console.
 
-agent-platform is the **business layer**. It runs on top of
+> **cloud·worker** is the product name; **`agent-platform`** is this repository, and the
+> name used throughout for services, directories and images.
+
+cloud·worker is the **business layer**. It runs on top of
 [**saas-foundation**](https://github.com/chenzefeng09/saas-foundation) — a separate,
 reusable enterprise SaaS base that owns identity, authorization, org, billing, audit,
 compliance, LLM gateway, storage, crypto, DLP and feature flags. See
 [Relationship with saas-foundation](#relationship-with-saas-foundation).
+
+---
+
+## Screenshots
+
+An agent run: the model writes and executes Python in a sandbox, then reports back with a
+rendered table. The `33 TOOL CALLS` row collapses the whole tool transcript; the chart it
+produced is a 200 DPI PNG with Chinese labels.
+
+![Agent run — sandboxed Python, tool-call grouping, Markdown tables](docs/images/02-agent-run.png)
+
+The home surface — task entry, model and reasoning-effort pickers, App cards, and
+in-flight runs across the bottom.
+
+![Home](docs/images/01-home.png)
+
+The admin console — tenants, users, RBAC, privileged access, plans and quota, model
+management, and platform governance (App review, skills, MCP, knowledge, sandboxes).
+
+![Admin console](docs/images/03-admin.png)
 
 > **Project status.** Actively developed and deployed for internal pilots — not yet a
 > 1.0. Interfaces between services still move. The dev stack is docker-compose; Helm
@@ -92,9 +115,9 @@ compliance, LLM gateway, storage, crypto, DLP and feature flags. See
 ## Relationship with saas-foundation
 
 The two repositories split along a single line: **saas-foundation is generic enterprise
-plumbing, agent-platform is everything agent-shaped.**
+plumbing, cloud·worker is everything agent-shaped.**
 
-| | [saas-foundation](https://github.com/chenzefeng09/saas-foundation) | agent-platform (this repo) |
+| | [saas-foundation](https://github.com/chenzefeng09/saas-foundation) | cloud·worker (`agent-platform`, this repo) |
 |---|---|---|
 | **Role** | Reusable SaaS base, independently deliverable | Business layer built on that base |
 | **Owns** | identity, authz, org, billing, audit, compliance, notification, search, api-platform, llm-gateway, storage, crypto, dlp, data-protection, feature-flag, lifecycle, pam, security-ops | sessions, messages, runs, sandboxes, agent workers, skills, MCP, knowledge, Apps, canvas, artifacts |
@@ -446,7 +469,7 @@ Issues and pull requests are welcome.
 
 - Keep `make lint` and `make test` green; frontend changes must pass `npm run typecheck`
   and `npm run build`.
-- Changes that cross the agent-platform / saas-foundation boundary need a matching PR in
+- Changes that cross the cloud·worker / saas-foundation boundary need a matching PR in
   the other repository — say so in the description.
 - Architectural changes should come with an ADR under `docs/adr/`.
 - Contributions are accepted under Apache 2.0 (see below).
@@ -458,7 +481,7 @@ Issues and pull requests are welcome.
 Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE).
 
 ```
-Copyright 2026 The agent-platform Authors
+Copyright 2026 The cloud·worker Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

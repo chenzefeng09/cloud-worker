@@ -1,4 +1,4 @@
-# agent-platform
+# cloud·worker
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
@@ -10,10 +10,30 @@
 企业级 AI Agent 运行平台：多租户会话、在隔离沙箱（Docker 或 microVM）中执行的 Agent 任务、
 可复用的**应用（App）**、技能包、租户级 MCP 服务、知识库管道，以及一套 28 个模块的管理后台。
 
-agent-platform 是**业务层**，构建在
+> **cloud·worker** 是产品名；**`agent-platform`** 是本仓库名，也是服务、目录与镜像统一使用的名字。
+
+cloud·worker 是**业务层**，构建在
 [**saas-foundation**](https://github.com/chenzefeng09/saas-foundation) 之上 ——
 后者是一个独立可复用的企业级 SaaS 底座，负责身份、授权、组织、计费、审计、合规、LLM 网关、
 存储、密码学、DLP 与特性开关。详见[与 saas-foundation 的关系](#与-saas-foundation-的关系)。
+
+---
+
+## 界面预览
+
+一次 Agent 运行：模型在沙箱里写并执行 Python，再带着渲染好的表格回报。
+`33 TOOL CALLS` 那一行折叠了完整的工具调用记录；它产出的图表是一张带中文标签的 200 DPI PNG。
+
+![Agent 运行 —— 沙箱内 Python、工具调用分组、Markdown 表格](docs/images/02-agent-run.png)
+
+首页 —— 任务输入、模型与推理强度选择器、应用卡片，底部是进行中的运行。
+
+![首页](docs/images/01-home.png)
+
+管理后台 —— 租户、用户、RBAC、特权访问、套餐与配额、模型管理，
+以及平台治理（应用审核、技能、MCP、知识库、沙箱）。
+
+![管理后台](docs/images/03-admin.png)
 
 > **项目状态**：处于活跃开发中，已用于内部试点，但尚未 1.0。服务之间的接口仍在演进。
 > 开发栈基于 docker-compose；`deploy/helm/` 下有 Helm chart，但打磨程度不及前者。
@@ -82,9 +102,9 @@ agent-platform 是**业务层**，构建在
 
 ## 与 saas-foundation 的关系
 
-两个仓库沿一条线切分：**saas-foundation 是通用企业底座，agent-platform 是所有与 Agent 相关的部分。**
+两个仓库沿一条线切分：**saas-foundation 是通用企业底座，cloud·worker 是所有与 Agent 相关的部分。**
 
-| | [saas-foundation](https://github.com/chenzefeng09/saas-foundation) | agent-platform（本仓库） |
+| | [saas-foundation](https://github.com/chenzefeng09/saas-foundation) | cloud·worker（`agent-platform`，本仓库） |
 |---|---|---|
 | **定位** | 可复用 SaaS 底座，独立交付 | 构建在底座之上的业务层 |
 | **负责** | identity、authz、org、billing、audit、compliance、notification、search、api-platform、llm-gateway、storage、crypto、dlp、data-protection、feature-flag、lifecycle、pam、security-ops | 会话、消息、运行、沙箱、Agent worker、技能、MCP、知识库、应用、画布、产物 |
@@ -416,7 +436,7 @@ make build-claude-sdk-cube-image
 欢迎提 issue 和 PR。
 
 - 保持 `make lint` 与 `make test` 通过；前端改动需通过 `npm run typecheck` 与 `npm run build`。
-- 跨 agent-platform / saas-foundation 边界的改动需要在另一个仓库提配套 PR —— 请在描述中说明。
+- 跨 cloud·worker / saas-foundation 边界的改动需要在另一个仓库提配套 PR —— 请在描述中说明。
 - 架构性改动请附带 `docs/adr/` 下的 ADR。
 - 贡献内容按 Apache 2.0 接受（见下）。
 
@@ -427,7 +447,7 @@ make build-claude-sdk-cube-image
 采用 **Apache License 2.0** —— 见 [LICENSE](LICENSE)。
 
 ```
-Copyright 2026 The agent-platform Authors
+Copyright 2026 The cloud·worker Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
