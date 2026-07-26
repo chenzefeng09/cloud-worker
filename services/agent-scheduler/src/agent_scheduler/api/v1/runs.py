@@ -506,6 +506,16 @@ async def create_run(
     reasoning_effort: str | None = (
         agent_config.get("reasoning_effort") or body.get("reasoning_effort") or None
     )
+    requested_memory_tier = str(
+        agent_config.get("sandbox_memory_tier")
+        or body.get("sandbox_memory_tier")
+        or ""
+    ).strip().lower()
+    if requested_memory_tier not in {"", "small", "large"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="sandbox_memory_tier must be 'small' or 'large'",
+        )
 
     if not (session_id and run_id and task):
         raise HTTPException(
@@ -519,16 +529,33 @@ async def create_run(
     _settings = request.app.state.settings
 
     # Resolve the per-run sandbox memory tier from the reported attachment size.
+    use_large_memory = (
+        requested_memory_tier == "large"
+        or (
+            not requested_memory_tier
+            and total_attachment_bytes
+            >= _settings.sandbox_large_attachment_threshold_bytes
+        )
+    )
     memory_limit = (
         _settings.sandbox_memory_limit_large
-        if total_attachment_bytes >= _settings.sandbox_large_attachment_threshold_bytes
+        if use_large_memory
         else _settings.sandbox_memory_limit_small
     )
     # Warm-pool bucket key for this run.  Under the Cube/microVM runtime each
     # warm sandbox pre-allocates its RAM, so the pool keeps separate "small"
-    # (1g) and "large" (4g) buckets and must be acquired from the matching one.
+    # and "large" buckets and must be acquired from the matching one.
     memory_tier = (
         "large" if memory_limit == _settings.sandbox_memory_limit_large else "small"
+    )
+    logger.info(
+        "sandbox memory tier selected",
+        extra={
+            "run_id": run_id,
+            "memory_tier": memory_tier,
+            "memory_limit": memory_limit,
+            "requested_memory_tier": requested_memory_tier or "auto",
+        },
     )
     # NOTE: the scheduler currently spawns sandboxes directly via
     # ``runtime.spawn_run`` and does NOT yet acquire from services/sandbox-pool.

@@ -32,7 +32,6 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import mimetypes
 import os
 import re
 from pathlib import Path
@@ -47,7 +46,7 @@ from agent_scheduler.config import (
     Settings,
 )
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
-from agent_scheduler.services import egress_policy
+from agent_scheduler.services import artifact_store, egress_policy
 from agent_scheduler.services.feature_flag import (
     evaluate_flag,
     runtime_extensions_for_run,
@@ -736,9 +735,9 @@ class DockerRuntime:
         return result
 
     # ---------------------------------------------------------------- artifacts
-    _EXCLUDED_NAMES: frozenset[str] = frozenset({
-        "task.json", "result.json", "events.jsonl", "canvas.json",
-    })
+    # Kept as thin wrappers over ``artifact_store`` so the cube runtime
+    # publishes byte-identical artifact records from its own host-mount.
+    _EXCLUDED_NAMES: frozenset[str] = artifact_store.EXCLUDED_NAMES
 
     def _upload_artifacts(
         self,
@@ -748,91 +747,20 @@ class DockerRuntime:
         session_id: str,
         run_id: str,
     ) -> list[dict[str, Any]]:
-        """Scan ``workspace`` for output files and upload them to S3.
-
-        Excluded: task.json, result.json, events.jsonl, canvas.json (a
-        diagnostic mirror — the canvas is persisted via the Redis→DB canvas
-        API), and everything under inputs/ (user-uploaded originals).  Returns a
-        list of artifact dicts::
-
-            [{"filename": str, "s3_key": str, "size": int, "mime": str}, ...]
-
-        Failure-open: individual file errors are logged and skipped.
-        """
-        if not workspace.is_dir():
-            return []
-
-        s3_client = self._make_s3_client()
-        if s3_client is None:
-            return []
-
-        artifacts: list[dict[str, Any]] = []
-        inputs_dir = workspace / "inputs"
-
-        for fpath in workspace.rglob("*"):
-            if not fpath.is_file():
-                continue
-            # Skip inputs/ subdirectory.
-            try:
-                fpath.relative_to(inputs_dir)
-                continue  # inside inputs/ — skip
-            except ValueError:
-                pass
-            # Skip system files at workspace root.
-            if fpath.parent == workspace and fpath.name in self._EXCLUDED_NAMES:
-                continue
-
-            relpath = fpath.relative_to(workspace).as_posix()
-            s3_key = (
-                f"tenant/{tenant_id}/sessions/{session_id}"
-                f"/runs/{run_id}/artifacts/{relpath}"
-            )
-            try:
-                data = fpath.read_bytes()
-                mime, _ = mimetypes.guess_type(fpath.name)
-                mime = mime or "application/octet-stream"
-                s3_client.put_object(
-                    Bucket=self._settings.s3_bucket,
-                    Key=s3_key,
-                    Body=data,
-                    ContentType=mime,
-                )
-                artifacts.append({
-                    "filename": fpath.name,
-                    "s3_key": s3_key,
-                    "size": len(data),
-                    "mime": mime,
-                })
-                logger.info(
-                    "artifact uploaded",
-                    extra={"s3_key": s3_key, "size": len(data), "run_id": run_id},
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "artifact upload failed (failure-open)",
-                    extra={"path": str(fpath), "err": str(exc)},
-                )
-
-        return artifacts
+        """Scan ``workspace`` for output files and upload them to S3."""
+        return artifact_store.upload_run_artifacts(
+            workspace=workspace,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            run_id=run_id,
+            bucket=self._settings.s3_bucket,
+            s3_client=self._make_s3_client(),
+            excluded_names=self._EXCLUDED_NAMES,
+        )
 
     def _make_s3_client(self) -> Any | None:
-        """Build a boto3 S3 client using S3_* settings (not AWS_* env vars).
-
-        Returns None if boto3 is unavailable or credentials are unset.
-        """
-        try:
-            import boto3
-            client = boto3.client(
-                "s3",
-                endpoint_url=self._settings.s3_endpoint_url,
-                region_name=self._settings.s3_region,
-                aws_access_key_id=self._settings.s3_access_key_id,
-                aws_secret_access_key=self._settings.s3_secret_access_key,
-            )
-            return client
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("S3 client unavailable: %s", exc)
-            return None
+        """Build a boto3 S3 client using S3_* settings (not AWS_* env vars)."""
+        return artifact_store.make_s3_client(self._settings)
 
     def get_container_tenant(self, container_id: str) -> str:
         """Return the ``agent-platform.tenant-id`` label of a container.

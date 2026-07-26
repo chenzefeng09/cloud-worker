@@ -15,6 +15,7 @@
   "dependencies": {
     "docx-preview": "^0.3.7",
     "highlight.js": "^11.11.1",
+    "katex": "^0.16.47",
     "libarchive.js": "^2.0.2",
     "pptx-preview": "^1.0.7",
     "react": "^19.0.0",
@@ -24,7 +25,9 @@
     "react-router-dom": "^7.0.0",
     "recharts": "^3.8.1",
     "rehype-highlight": "^7.0.2",
+    "rehype-katex": "^7.0.1",
     "remark-gfm": "^4.0.1",
+    "remark-math": "^6.0.0",
     "xlsx": "^0.18.5",
     "zustand": "^5.0.0"
   },

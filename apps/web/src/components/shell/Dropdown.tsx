@@ -88,6 +88,8 @@ interface Props {
   options: DropdownOption[];
   onChange: (id: string) => void;
   disabled?: boolean;
+  /** Copy shown when the value has no matching option, including an empty list. */
+  emptyLabel?: string;
   title?: string;
   ariaLabel?: string;
   /** Which edge the popover aligns to. Defaults to 'right'. */
@@ -111,6 +113,7 @@ export function Dropdown({
   options,
   onChange,
   disabled,
+  emptyLabel,
   title,
   ariaLabel,
   align = 'right',
@@ -121,7 +124,8 @@ export function Dropdown({
   const ref = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useDropdownState(ref);
 
-  const current = options.find((o) => o.id === value)?.label ?? value;
+  const hasOptions = options.length > 0;
+  const current = options.find((o) => o.id === value)?.label ?? emptyLabel ?? value;
 
   return (
     <div ref={ref} className={`relative shrink-0${fullWidth ? ' w-full' : ''}`}>
@@ -140,7 +144,7 @@ export function Dropdown({
         } ${triggerClassName}`}
       >
         {current}
-        <span aria-hidden className="text-[8px]">▾</span>
+        {hasOptions && <span aria-hidden className="text-[8px]">▾</span>}
       </button>
       {open && (
         <DropdownMenu

@@ -7,12 +7,13 @@ import logging
 from typing import Any, Literal
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
 from agent_bff.api._http import foundation_headers
-from agent_bff.api.dependencies import require_auth, TClearance
+from agent_bff.api.dependencies import TClearance, require_auth
+from agent_bff.session_title import generate_and_update_session_title
 
 router = APIRouter(tags=["Conversations"])
 logger = logging.getLogger(__name__)
@@ -103,6 +104,7 @@ async def _resolve_attachment_files(
 async def chat(
     session_id: str,
     request: Request,
+    background_tasks: BackgroundTasks,
     _auth: tuple = Depends(require_auth()),
     clearance: str = TClearance,
 ) -> JSONResponse:
@@ -167,6 +169,21 @@ async def chat(
             )
         msg = resp.json()
         message_id = msg.get("id")
+        # The first persisted user message owns automatic naming.  Run title
+        # generation after the response so it never delays task startup; the
+        # session SSE stream publishes the eventual PATCH to every open client.
+        if msg.get("sequence") == 1 and message_text.strip():
+            background_tasks.add_task(
+                generate_and_update_session_title,
+                settings=request.app.state.settings,
+                session_id=session_id,
+                message=message_text,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                access_token=access_token,
+                clearance=clearance,
+                model_hint=model,
+            )
 
         # 2. Resolve attachment files (failure-open)
         files = await _resolve_attachment_files(

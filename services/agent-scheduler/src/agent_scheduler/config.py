@@ -126,21 +126,21 @@ class Settings(BaseSettings):
     runtime: str = "docker"
     cube_controller_url: str = ""  # required when runtime="cube"
 
-    # Public IP/host of the scheduler's machine, reachable by the cube microVM.
-    # CubeVS only forwards public egress, so a cube VM cannot reach the host's
-    # internal container network (container names / private IPs are unresolvable
-    # inside the VM). The cube runtime therefore rewrites the worker's gateway
-    # URLs (tool-broker / llm-gateway) to point at this public host:hostPort and
-    # adds it to the CubeVS ``allowOut`` allowlist, so the VM loops back to the
-    # host over the public IP. When empty, the cube runtime auto-detects the
-    # machine's public IP at startup (ifconfig.me / api.ipify.org). Set
-    # SCHEDULER_CUBE_PUBLIC_HOST to pin it explicitly (recommended in prod).
+    # IP/host of the scheduler's machine that is reachable by the cube microVM.
+    # The field/env name retains "public" for deployment compatibility, but
+    # CubeSandbox v0.6 can explicitly allow a private node IP in ``allowOut``.
+    # Prefer that private IP when the cloud public NAT lacks hairpin support.
+    # Container names remain unresolvable inside the VM, so the runtime rewrites
+    # worker gateway URLs to this host's published ports. When empty, it probes
+    # for the machine's public IP and finally falls back to the controller host.
+    # Pin SCHEDULER_CUBE_PUBLIC_HOST explicitly in production.
     cube_public_host: str = ""
 
     # CubeVS egress allowlist (CIDRs) applied to broker-mode microVMs via the
-    # E2B ``allow_out`` field. Must contain the tool-broker ClusterIP/32 and the
-    # cluster DNS ClusterIP/32 — resolve per cluster (kubectl get svc ap-tool-broker
-    # / kube-dns) as documented in deploy/cube/README.md. Comma-separated.
+    # E2B ``allowOut`` field. It may contain private CIDRs on v0.6. For a
+    # single-node deployment, allow the private node IP/32 used by the rewritten
+    # gateway URL; a cluster deployment may instead need the tool-broker and DNS
+    # ClusterIP/32s described in deploy/cube/README.md. Comma-separated.
     # Empty in broker mode is a deployment error (see the spawn guard): an empty
     # allow_out with allow_internet_access=false air-gaps the sandbox so it cannot
     # even reach the broker. Only consumed by the cube runtime; docker ignores it.
@@ -175,6 +175,13 @@ class Settings(BaseSettings):
     # enabling grey-release / instant rollback without a redeploy.  The Claude
     # SDK image runs via its own ENTRYPOINT (node), not the AgentScope CMD.
     claude_sdk_image: str = "ghcr.io/agent-platform/claude-sdk-sandbox:0.1"
+    # Cube v0.6 fixes memory on the template rather than accepting a per-spawn
+    # resource override. A deployment may therefore point these two aliases at
+    # the same OCI image with different template memory settings. They only
+    # apply to the Claude SDK worker; empty values preserve the single-template
+    # behaviour for existing deployments and the AgentScope worker path.
+    cube_claude_sdk_template_small: str = ""
+    cube_claude_sdk_template_large: str = ""
     # Global fallback for the Claude SDK worker selection.  The runtimes first
     # evaluate the per-run ``enable_claude_sdk_worker`` feature flag (for
     # gradual / per-tenant grey rollout); when that flag returns False (or the
@@ -251,16 +258,14 @@ class Settings(BaseSettings):
     sandbox_cpu_shares: int = 1024
     sandbox_timeout: int = 600  # seconds; also caps minted token TTL
 
-    # Scheduler-side cube-sandbox reaper.  The cube controller's spawn-time
-    # ``timeout`` TTL has been observed NOT to reap microVMs (VMs alive 4+
-    # hours), so they oversubscribe host RAM and OOM-kill live workers.  A
-    # background task (see ``main.lifespan``) sweeps periodically and deletes
-    # agent-platform cube sandboxes older than the max-age below.
-    #   * ``max_age_seconds`` is set comfortably above ``sandbox_timeout`` (the
-    #     600s run cap) so the reaper never kills a live run.
+    # Scheduler-side cube-sandbox fail-safe reaper. CubeSandbox v0.6 normally
+    # enforces ``sandbox_timeout`` through cube-lifecycle-manager and pauses an
+    # idle VM. This sweep remains as a backstop for controller/CLM failures.
+    #   * ``max_age_seconds`` is intentionally far above ``sandbox_timeout`` so
+    #     normal CLM-managed pause/resume owns the sandbox lifecycle.
     #   * ``interval_seconds`` is how often the sweep runs.
     # Only consumed on the cube path; docker's ``reap_expired`` is a no-op.
-    sandbox_reaper_max_age_seconds: int = 900  # delete VMs older than 15 min
+    sandbox_reaper_max_age_seconds: int = 3600  # delete VMs older than 1 hour
     sandbox_reaper_interval_seconds: int = 120  # sweep every 2 min
 
     # B-M3: base URLs for the MCP registry and skill-store services.

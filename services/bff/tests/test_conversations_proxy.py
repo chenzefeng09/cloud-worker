@@ -64,6 +64,7 @@ class FakeChatFoundation:
         stream_lines: list[str] | None = None,
         attachment_items: list[dict] | None = None,
         stream_error: bool = False,
+        message_sequence: int | None = None,
     ) -> None:
         self.message_status = message_status
         self.run_status = run_status
@@ -77,6 +78,7 @@ class FakeChatFoundation:
         ]
         self.attachment_items = attachment_items  # None means no attachment endpoint
         self.stream_error = stream_error
+        self.message_sequence = message_sequence
         self.calls: list[tuple[str, str]] = []
         # Captures the JSON body of the POST /runs call so tests can assert what
         # the BFF forwarded to the orchestrator (e.g. execution_mode passthrough).
@@ -89,9 +91,16 @@ class FakeChatFoundation:
     def route(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         self.calls.append((method, url))
         if "messages" in url and method == "POST":
+            message_body: dict[str, Any] = {
+                "id": "msg_01",
+                "role": "USER",
+                "content": "hi",
+            }
+            if self.message_sequence is not None:
+                message_body["sequence"] = self.message_sequence
             return httpx.Response(
                 self.message_status,
-                json={"id": "msg_01", "role": "USER", "content": "hi"},
+                json=message_body,
             )
         if "attachments" in url and method == "GET":
             items = self.attachment_items or []
@@ -186,6 +195,33 @@ def test_chat_happy_path_returns_json(
 
     # No SSE stream should have been opened
     assert not any("stream" in m for m, _ in methods_urls), "stream was unexpectedly opened"
+
+
+def test_first_message_schedules_automatic_title(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the first persisted message schedules the non-blocking title job."""
+    from agent_bff.api.v1 import conversations
+
+    fake = FakeChatFoundation(message_sequence=1)
+    _patch_async_client(fake, monkeypatch)
+    generate = AsyncMock()
+    monkeypatch.setattr(conversations, "generate_and_update_session_title", generate)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "设计航天反作用飞轮 FOC 控制验证", "model": "deepseek-fast"},
+    )
+
+    assert resp.status_code == 200
+    generate.assert_awaited_once()
+    kwargs = generate.await_args.kwargs
+    assert kwargs["session_id"] == "ses_abc"
+    assert kwargs["message"] == "设计航天反作用飞轮 FOC 控制验证"
+    assert kwargs["model_hint"] == "deepseek-fast"
 
 
 def test_chat_with_attachment_ids(

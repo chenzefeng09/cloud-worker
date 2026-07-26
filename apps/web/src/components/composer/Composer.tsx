@@ -67,6 +67,7 @@ export interface ComposerWorkspacePicker {
   options: DropdownOption[];
   onChange: (id: string) => void;
   disabled?: boolean;
+  emptyLabel?: string;
 }
 
 interface Props {
@@ -77,7 +78,7 @@ interface Props {
     attachmentIds?: string[],
     attachments?: Attachment[],
     workspaceFileIds?: string[],
-  ) => void;
+  ) => void | boolean | Promise<void | boolean>;
   disabled?: boolean;
   /** An outer submit is in flight (home: creating the session). */
   busy?: boolean;
@@ -287,7 +288,24 @@ export function Composer({
     // session attachments already).
     const workspaceFileIds = activeWorkspaceFileIds(mentionRefs, text);
     // Pass full attachment objects so callers can populate optimistic messages.
-    onSend(text.trim(), ids, ready.slice(), workspaceFileIds.length ? workspaceFileIds : undefined);
+    // A caller may explicitly return false when creation/send was rejected.
+    // Keep the user's draft and attachments intact on that path.
+    setPendingSend(true);
+    let accepted: void | boolean;
+    try {
+      accepted = await onSend(
+        text.trim(),
+        ids,
+        ready.slice(),
+        workspaceFileIds.length ? workspaceFileIds : undefined,
+      );
+    } catch {
+      setPendingSend(false);
+      return;
+    }
+    setPendingSend(false);
+    if (accepted === false) return;
+
     setText('');
     setAttachments([]);
     setMentionRefs([]);
@@ -545,6 +563,7 @@ export function Composer({
               options={workspace.options}
               onChange={workspace.onChange}
               disabled={workspace.disabled}
+              emptyLabel={workspace.emptyLabel}
               ariaLabel="选择工作区"
               align="left"
               triggerClassName="max-w-[190px] overflow-hidden text-ellipsis text-[12px] text-ink-2"

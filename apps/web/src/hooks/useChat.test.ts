@@ -158,6 +158,32 @@ describe('SSE → store routing', () => {
     expect(s.messages['ses_B'][0].content).toBe('b');
   });
 
+  it('applies an automatic session title pushed by the session stream', () => {
+    useChatStore.setState({
+      sessions: [
+        {
+          id: 'ses_A',
+          tenant_id: 'tnt_1',
+          user_id: 'usr_1',
+          title: '新任务',
+          status: 'ACTIVE',
+          current_run_id: null,
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+        },
+      ],
+    });
+
+    dispatchSSE('ses_A', 'session_updated', {
+      session_id: 'ses_A',
+      title: '航天反作用飞轮 FOC 控制验证',
+    });
+
+    expect(useChatStore.getState().sessions[0].title).toBe(
+      '航天反作用飞轮 FOC 控制验证',
+    );
+  });
+
   // ─── Token streaming pipeline ─────────────────────────────────────────────
 
   it('token events build up an open text block', () => {

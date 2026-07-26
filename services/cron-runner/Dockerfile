@@ -12,11 +12,17 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+ARG PYPI_INDEX_URL=https://pypi.org/simple
+ARG PIP_DEFAULT_TIMEOUT=300
+
 RUN pip install --no-cache-dir \
+        --index-url "${PYPI_INDEX_URL}" \
+        --timeout "${PIP_DEFAULT_TIMEOUT}" \
         "fastapi>=0.110" \
         "uvicorn[standard]>=0.29" \
         "sqlalchemy[asyncio]>=2.0" \
         "asyncpg>=0.29" \
+        "aiosqlite>=0.20" \
         "pydantic-settings>=2.2" \
         "alembic>=1.13" \
         "apscheduler>=3.10,<4" \

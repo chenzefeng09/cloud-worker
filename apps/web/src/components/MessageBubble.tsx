@@ -1,8 +1,7 @@
 import { useState } from 'react';
 import type { Message, MessageAttachment, ToolCallEntry } from '../api/types';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import rehypeHighlight from 'rehype-highlight';
+import { markdownRemarkPlugins, markdownRehypePlugins, normalizeMathDelimiters } from '../lib/markdownPlugins';
 import { ToolRow, ThinkingBlock, markdownComponents } from './chatStepRenderers';
 import { useCopied, CopyIcon } from './CopyButton';
 import { formatRelativeTimeZh, formatAbsoluteTimeZh } from '../lib/format';
@@ -101,14 +100,15 @@ export function MessageBubble({ message, friendly, onPreviewFile, onRewind, show
     const canRewind = !!onRewind && !message.id.startsWith('temp_user_') && message.sequence > 0;
     return (
       // `group` lets the action row respond to hover of the outer container.
-      <div className="group flex flex-col items-end gap-0.5">
+      <div className="group flex w-full min-w-0 flex-col items-end gap-0.5">
         <div
-          className="max-w-[80%] text-[14px] leading-[1.55] tracking-[-0.005em]"
+          className="min-w-0 max-w-[80%] whitespace-pre-wrap break-words text-[14px] leading-[1.55] tracking-[-0.005em]"
           style={{
             background: 'var(--paper-2)',
             padding: '10px 14px',
             borderRadius: 'var(--r-md)',
             border: '1px solid var(--line-2)',
+            overflowWrap: 'anywhere',
           }}
         >
           {message.content}
@@ -267,9 +267,11 @@ export function MessageBubble({ message, friendly, onPreviewFile, onRewind, show
   // ── SYSTEM ────────────────────────────────────────────────────────────────
   if (role === 'SYSTEM') {
     return (
-      <div className="flex items-center gap-2 px-3 py-1.5 border border-dashed border-line rounded-md font-mono text-[11px] text-dim">
+      <div className="flex min-w-0 items-center gap-2 px-3 py-1.5 border border-dashed border-line rounded-md font-mono text-[11px] text-dim">
         <span className="text-[9px]">◆</span>
-        <span>{message.content}</span>
+        <span className="min-w-0 whitespace-pre-wrap break-words [overflow-wrap:anywhere]">
+          {message.content}
+        </span>
       </div>
     );
   }
@@ -302,15 +304,17 @@ function AssistantTextBlock({
   createdAt?: string;
 }) {
   const { copied, copy } = useCopied();
-  const displayContent = streaming ? sanitizeStreamingMarkdown(content) : content;
+  const displayContent = normalizeMathDelimiters(
+    streaming ? sanitizeStreamingMarkdown(content) : content,
+  );
 
   return (
     // `group` lets child elements respond to hover of this container.
     <div className="group min-w-0">
-      <div className="prose-cw text-[14px] leading-[1.6] text-ink">
+      <div className="prose-cw min-w-0 text-[14px] leading-[1.6] text-ink [overflow-wrap:anywhere]">
         <ReactMarkdown
-          remarkPlugins={[remarkGfm]}
-          rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+          remarkPlugins={markdownRemarkPlugins}
+          rehypePlugins={markdownRehypePlugins as never}
           components={markdownComponents}
         >
           {displayContent}

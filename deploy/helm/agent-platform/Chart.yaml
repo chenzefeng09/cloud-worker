@@ -46,11 +46,11 @@ dependencies:
   - name: foundation
     version: "0.1.0"
     # 本地开发/CI：helm dependency update 会将 foundation chart 打包到 charts/
-    # 注意：helm 的 file:// 解析相对于执行命令时的工作目录，不同 helm 版本行为略异。
-    # 实测 helm v4.x 需要绝对路径或从对应目录执行；相对路径占位如下，实际使用时调整：
-    #   repository: "file://../../../saas-foundation/deploy/helm/foundation"  # 相对占位
-    # 本地开发绝对路径（CI 替换为构建机实际路径，或改用 OCI ref）：
-    repository: "file:///Users/chenzefeng/Development/saas-foundation/deploy/helm/foundation"
+    # 假设 saas-foundation 与 agent-platform 是兄弟目录（见 README「与 saas-foundation
+    # 的关系」）。注意：helm 的 file:// 解析相对于执行命令时的工作目录，不同 helm 版本
+    # 行为略异 —— 实测 helm v4.x 需要从本 chart 目录执行 `helm dependency update .`，
+    # 否则请改用绝对路径或下方的 OCI ref。
+    repository: "file://../../../../saas-foundation/deploy/helm/foundation"
     # 生产 OCI registry（发布后启用）：
     # repository: oci://registry.example.com/helm-charts
     condition: foundation.enabled

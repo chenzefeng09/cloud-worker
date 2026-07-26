@@ -23,6 +23,9 @@ let nextOpenAIResponse: unknown;
 // When set, the gateway mock returns a text/event-stream body built from these
 // raw SSE frames (each already newline-framed, e.g. "data: {...}\n\n").
 let nextStreamFrames: string[] | null;
+// When set, the mock emits any configured frames and then errors the response
+// body.  This models a gateway stream that is truncated mid-tool-call.
+let nextStreamError: Error | null;
 // Optional non-2xx status to simulate a gateway error in streaming mode.
 let nextGatewayStatus: number | null;
 
@@ -65,7 +68,8 @@ function installFetchMock(): void {
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
           for (const frame of frames) controller.enqueue(encoder.encode(frame));
-          controller.close();
+          if (nextStreamError) controller.error(nextStreamError);
+          else controller.close();
         },
       });
       return new Response(stream, {
@@ -128,6 +132,7 @@ beforeEach(async () => {
     usage: { prompt_tokens: 10, completion_tokens: 4 },
   };
   nextStreamFrames = null;
+  nextStreamError = null;
   nextGatewayStatus = null;
   installFetchMock();
 
@@ -476,6 +481,33 @@ describe("streaming (Anthropic SSE passthrough)", () => {
       output_tokens: 9,
       input_tokens: 5,
       cache_read_input_tokens: 2,
+    });
+  });
+
+  it("surfaces a truncated gateway stream as an error instead of a fake tool-use completion", async () => {
+    nextStreamFrames = [
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_cut","type":"function","function":{"name":"Write","arguments":"{\\"file_path\\":\\"/workspace/a.m\\","}}]}}]}\n\n',
+    ];
+    nextStreamError = new Error("upstream stream reset");
+
+    const resp = await postMessages({
+      model: "claude",
+      stream: true,
+      messages: [{ role: "user", content: "write a large file" }],
+    });
+    const events = await readSse(resp);
+    const types = events.map((event) => event.type);
+
+    expect(types).toContain("error");
+    expect(types).not.toContain("message_delta");
+    expect(types).not.toContain("message_stop");
+    const error = events.find((event) => event.type === "error")!;
+    expect(error.data).toMatchObject({
+      type: "error",
+      error: {
+        type: "api_error",
+        message: "gateway stream interrupted before completion",
+      },
     });
   });
 

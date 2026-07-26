@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     foundation_audit_url: str = "http://audit:8013/api/audit/v1"
     # LLM Gateway — capability probe endpoint (POST /probe).
     foundation_llm_gateway_url: str = "http://llm-gateway:8011/api/llm-gateway/v1"
+    # Optional cheap model dedicated to automatic session titles.  When empty,
+    # the model selected for the first chat turn wins, then the tenant default.
+    session_title_model: str = ""
     # Feature-flag service — flag catalogue + kill-switch (dev compose port 8012,
     # api_prefix=/api/feature-flag/v1).
     foundation_feature_flag_url: str = (

@@ -610,10 +610,9 @@ export function ChatWindow({
     shouldStickToBottomRef.current = true;
     scrollToBottom('smooth');
     if (onSendMessage) {
-      onSendMessage(text, attachmentIds, attMeta, workspaceFileIds);
-      return;
+      return onSendMessage(text, attachmentIds, attMeta, workspaceFileIds);
     }
-    sendMessage(text, attachmentIds, attMeta, workspaceFileIds);
+    return sendMessage(text, attachmentIds, attMeta, workspaceFileIds);
   };
 
   const handleTranscriptWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
@@ -668,14 +667,14 @@ export function ChatWindow({
 
   return (
     <MarkdownAssetsProvider value={markdownAssets}>
-      <div className="flex-1 flex flex-col min-h-0 relative">
+      <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
         <div
           ref={scrollRef}
           onScroll={updateScrollStickiness}
           onWheel={handleTranscriptWheel}
-          className="cw-scroll flex-1 px-8 py-5 flex flex-col gap-[8px]"
+          className="cw-scroll flex min-w-0 flex-1 flex-col gap-[8px] px-8 py-5"
         >
-          <div style={{ maxWidth: 780, margin: '0 auto', width: '100%', display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div className="min-w-0" style={{ maxWidth: 780, margin: '0 auto', width: '100%', display: 'flex', flexDirection: 'column', gap: 8 }}>
             {/* ── Real messages ── */}
             {(() => {
               const units = groupSteps(messages, isStreaming);
@@ -756,7 +755,7 @@ export function ChatWindow({
                     u.message.canvas_id !== inlineCanvasV2Id;
 
                   return (
-                    <div key={u.message.id}>
+                    <div key={u.message.id} className="min-w-0">
                       <MessageBubble
                         message={u.message}
                         friendly={friendly}

@@ -69,8 +69,11 @@ export function FilePreviewPanel({ sessionId, file, onClose, getSource, closeVar
       </div>
 
       {/* Body */}
-      <div className="cw-scroll flex-1 px-3 py-3">
+      {/* min-h-0 + flex lets the body card stretch to the panel bottom (leaving
+          the py-3 gutter) instead of stopping at a fixed height. */}
+      <div className="cw-scroll flex-1 min-h-0 px-3 py-3 flex flex-col">
         <FilePreviewBody
+          fill
           sessionId={sessionId}
           source={source}
           fileId={file.id}

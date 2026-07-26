@@ -23,6 +23,7 @@ import type { Message, MessageAttachment, PendingInteractionItem } from '../api/
 //   message        → clearStreamingBlocks (kind-aware) + addMessage
 //   message_created→ addMessage  (backend echo of the user message)
 //   agent_message  → addMessage  (legacy event name — treated same as message)
+//   session_updated→ updateSessionTitle (automatic title / manual rename)
 //   plan           → setPlanSteps
 //   canvas_created → setMessageCanvasId (anchor a materialized canvas to its
 //                    assistant message) + warm the canvas cache (fetchCanvas)
@@ -46,6 +47,13 @@ interface SSEContext {
 type SSEHandler = (ctx: SSEContext, data: Record<string, unknown>) => void;
 
 const SSE_HANDLERS: Record<string, SSEHandler> = {
+  session_updated(ctx, data) {
+    const title = data.title;
+    if (title === null || typeof title === 'string') {
+      useChatStore.getState().updateSessionTitle(ctx.sessionId, title);
+    }
+  },
+
   run_started(ctx, data) {
     // C3 — replay idempotency:
     // On every run_started (including a reconnect mid-run), wipe the transient

@@ -49,6 +49,7 @@ import os
 import shutil
 import sys
 import tarfile
+import tempfile
 import time
 from pathlib import Path
 
@@ -73,14 +74,17 @@ SKILLS_TGZ_DIR = SEED_DIR / "skills"
 MANIFEST_PATH = SEED_DIR / "manifest.json"
 
 # Source repo + scratch build dir used ONLY in --build mode.
-SKILLS_SRC = Path(
-    os.environ.get("SKILLS_SRC", "/Users/chenzefeng/Development/skills/skills")
-)
+#
+# ``SKILLS_SRC`` must point at a checkout of the upstream skills repo (the
+# directory holding one sub-directory per skill).  There is no sensible default
+# — set the env var when running ``--build``; run_build() fails loudly if the
+# path does not exist.  Neither is needed for the normal (seed-from-tarball)
+# mode, which reads the vendored assets under ``services/skill-store/seed/``.
+SKILLS_SRC = Path(os.environ.get("SKILLS_SRC", "./skills"))
 BUILD_DIR = Path(
     os.environ.get(
         "SEED_BUILD_DIR",
-        "/private/tmp/claude-501/-Users-chenzefeng-Development-agent-platform/"
-        "f4c7e226-d370-4f88-b0d7-184434e6d2a6/scratchpad/skills_build",
+        str(Path(tempfile.gettempdir()) / "agent-platform-skill-seed"),
     )
 )
 

@@ -142,6 +142,42 @@ describe('Composer - home variant', () => {
     await user.click(screen.getByRole('button', { name: '发送' }));
     expect(onSend).toHaveBeenCalledWith('帮我规划明天', [], [], undefined);
   });
+
+  it('shows a clear empty workspace state without a dead dropdown arrow', async () => {
+    render(
+      <Composer
+        variant="home"
+        onSend={vi.fn()}
+        workspace={{
+          value: '',
+          options: [],
+          onChange: vi.fn(),
+          disabled: true,
+          emptyLabel: '无工作区',
+        }}
+      />,
+    );
+
+    const workspace = screen.getByRole('button', { name: '选择工作区' });
+    expect(workspace).toBeDisabled();
+    expect(workspace).toHaveTextContent('无工作区');
+    expect(workspace).not.toHaveTextContent('▾');
+    await waitFor(() => expect(apiMocks.listModels).toHaveBeenCalled());
+  });
+
+  it('keeps the draft when the home-page send is rejected', async () => {
+    const user = userEvent.setup();
+    const onSend = vi.fn().mockResolvedValue(false);
+
+    render(<Composer variant="home" onSend={onSend} />);
+
+    const textbox = screen.getByRole('textbox');
+    await user.type(textbox, 'do not lose this long task');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+
+    await waitFor(() => expect(onSend).toHaveBeenCalled());
+    expect(textbox).toHaveValue('do not lose this long task');
+  });
 });
 
 describe('Composer - model catalogue', () => {

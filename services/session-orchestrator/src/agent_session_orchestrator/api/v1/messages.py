@@ -1252,6 +1252,20 @@ async def _persist_artifacts(
 
     Failure-open: any exception is logged and swallowed.
     """
+    # Attribute outputs to the session owner rather than the reconcile caller.
+    # This path runs under the service identity, and the artifacts page lists
+    # attachments by ``user_id`` — a "SYSTEM"-owned row is invisible to the very
+    # user whose run produced it (the page just reads 暂无产物). Same owner
+    # resolution the memory write above does.
+    owner_id = "SYSTEM"
+    try:
+        owner_id = (await svc.get_session(run.session_id)).user_id or "SYSTEM"
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "artifact persist: could not resolve session owner for %s",
+            run.session_id,
+        )
+
     try:
         for art in artifacts:
             filename = art.get("filename", "artifact")
@@ -1273,7 +1287,7 @@ async def _persist_artifacts(
             # then call dlp_guard.scan_and_tag on the fetched text. fail-open.
             await svc.create_attachment(
                 run.session_id,
-                user_id="SYSTEM",
+                user_id=owner_id,
                 filename=filename,
                 mime=mime,
                 size_bytes=size,
@@ -1455,6 +1469,11 @@ async def stream_session(
         # RUNNING before the final terminal write completes).
         streamed_run_ids: set[str] = set()
         last_seq = 0
+        # Publish the current title once when the stream opens, then again only
+        # when it changes (automatic first-message naming or a manual rename).
+        # A local sentinel distinguishes "not observed yet" from a real NULL
+        # title.
+        last_session_title: object | str | None = object()
         # First-poll completion reconciliation.  A client that (re)connects
         # AFTER its run already reached a terminal state would otherwise never
         # receive a run_complete on this connection — the active-run selector
@@ -1540,6 +1559,19 @@ async def stream_session(
                 # block exits so GeneratorExit cannot roll back committed rows.
                 async for db in acquire_db_session(tenant_id=tenant_id):
                     svc = SessionService(db, tenant_id=tenant_id)
+                    session_obj = await svc.get_session(session_id)
+                    session_user_id = session_obj.user_id
+                    if session_obj.title != last_session_title:
+                        last_session_title = session_obj.title
+                        events.append(
+                            _sse(
+                                "session_updated",
+                                {
+                                    "session_id": session_id,
+                                    "title": session_obj.title,
+                                },
+                            )
+                        )
                     runs = await svc.list_runs(session_id)
 
                     # First poll only: if there is no active/paused run but the
@@ -1579,11 +1611,6 @@ async def stream_session(
                     )
 
                     if active is not None and active.id not in streamed_run_ids:
-                        # New active run we haven't streamed yet — snapshot the
-                        # session user_id now (inside the DB session) for use in
-                        # the scheduler reconcile call below.
-                        session_obj = await svc.get_session(session_id)
-                        session_user_id = session_obj.user_id
                         active_run_to_stream = active
                         # Emit run_started envelope before leaving the DB block
                         # so the client knows which run is about to stream.
@@ -1624,12 +1651,6 @@ async def stream_session(
                     running_runs = [
                         r for r in runs if r.status in ("RUNNING", "PENDING")
                     ]
-                    if running_runs and session_user_id == "SYSTEM":
-                        # We didn't fetch session_obj above (no new active run);
-                        # fetch it now for reconcile.
-                        session_obj = await svc.get_session(session_id)
-                        session_user_id = session_obj.user_id
-
                     for r in running_runs:
                         _terminal, _plan = await _reconcile_run_completion(
                             scheduler_url=scheduler_url,

@@ -24,12 +24,14 @@ import { Agent } from "undici";
 
 /**
  * Hard wall-clock cap (ms) on the WHOLE adapter→gateway exchange (connect +
- * headers + full body / stream). Defense-in-depth paired with the no-keep-alive
- * dispatcher below: even if a hop stalls it FAILS FAST rather than hanging the
- * run for minutes. Sized generously so a legitimately slow model call is never
- * cut off.
+ * headers + full body / stream).  A reasoning model can legitimately spend
+ * several minutes streaming a large tool argument (for example, a MATLAB
+ * source file), so this cap must be longer than the old 120 s value.  Idle
+ * sockets are still bounded independently by the dispatcher's 120 s
+ * headers/body timeouts below; this is only the final wall-clock backstop.
  */
-const GATEWAY_EXCHANGE_TIMEOUT_MS = 120_000;
+const GATEWAY_EXCHANGE_TIMEOUT_MS = 600_000;
+const GATEWAY_IDLE_TIMEOUT_MS = 120_000;
 
 /**
  * Dedicated undici dispatcher for EVERY adapter→gateway fetch — the actual fix
@@ -65,8 +67,8 @@ const GATEWAY_DISPATCHER = new Agent({
   keepAliveTimeout: 10_000,
   keepAliveMaxTimeout: 10_000,
   // A hung hop fails fast instead of hanging the run for minutes.
-  headersTimeout: GATEWAY_EXCHANGE_TIMEOUT_MS,
-  bodyTimeout: GATEWAY_EXCHANGE_TIMEOUT_MS,
+  headersTimeout: GATEWAY_IDLE_TIMEOUT_MS,
+  bodyTimeout: GATEWAY_IDLE_TIMEOUT_MS,
 });
 
 /** Anything translated out of the SDK's dynamic Anthropic/OpenAI JSON. */
@@ -727,10 +729,22 @@ async function streamOpenAIToAnthropic(
     }
     finish();
   } catch (err) {
-    // Failure-open: terminate the SSE cleanly so the SDK reader does not hang.
+    // A truncated stream is NOT a successful model turn.  The old failure-open
+    // path called finish(), which fabricated message_stop/stop_reason=tool_use
+    // from whatever fragments had arrived.  The SDK then executed an incomplete
+    // tool call (often `{}`), emitted a validation error, and still reported the
+    // whole run as successful.  Surface an Anthropic SSE error instead so query()
+    // fails and result.json is correctly written as FAILED.
     console.error(`[adapter] stream read failed: ${(err as Error)?.message ?? String(err)}`);
     try {
-      finish();
+      writeSse(res, "error", {
+        type: "error",
+        error: {
+          type: "api_error",
+          message: "gateway stream interrupted before completion",
+        },
+      });
+      res.end();
     } catch {
       try {
         res.end();

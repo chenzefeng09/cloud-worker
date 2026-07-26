@@ -103,7 +103,7 @@ function CodeBlockPre({ children }: { children?: React.ReactNode }) {
 
   return (
     // Outer wrapper: position:relative so the button doesn't scroll with overflow-x.
-    <div className="group relative my-3">
+    <div className="group relative my-3 min-w-0 max-w-full">
       {/* Hover-reveal copy button */}
       <div
         className="opacity-0 group-hover:opacity-100 transition-opacity duration-150"
@@ -114,7 +114,7 @@ function CodeBlockPre({ children }: { children?: React.ReactNode }) {
       {/* The actual <pre> — overflow-x-auto, no top margin (handled by outer div) */}
       <pre
         ref={preRef}
-        className="rounded-md border border-line overflow-x-auto bg-surface"
+        className="max-w-full rounded-md border border-line overflow-x-auto bg-surface"
         style={{ margin: 0 }}
       >
         {children}
@@ -304,7 +304,7 @@ export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>['com
     return (
       <code
         {...props}
-        className="px-1.5 py-0.5 rounded font-mono text-[12.5px] bg-paper-2 border border-line-2 text-ink"
+        className="break-all px-1.5 py-0.5 rounded font-mono text-[12.5px] bg-paper-2 border border-line-2 text-ink"
       >
         {children}
       </code>

@@ -463,6 +463,14 @@ services:
       # Tenant context forwarded to identity on /sessions/service-account-token.
       # Empty = use the caller's tenant (correct for B-M2 single-tenant smoke).
       SCHEDULER_TENANT_HEADER: ${SCHEDULER_TENANT_HEADER:-}
+      # The base compose remains Docker-compatible; Cube-enabled hosts select
+      # the E2B runtime and endpoint entirely through deployment environment.
+      SCHEDULER_RUNTIME: ${SCHEDULER_RUNTIME:-docker}
+      SCHEDULER_CUBE_CONTROLLER_URL: ${CUBE_CONTROLLER_URL:-}
+      SCHEDULER_CUBE_PUBLIC_HOST: ${CUBE_PUBLIC_HOST:-}
+      SCHEDULER_CUBE_SANDBOX_ALLOW_OUT: ${CUBE_SANDBOX_ALLOW_OUT:-}
+      SCHEDULER_CUBE_TLS_MODE: ${CUBE_TLS_MODE:-mtls}
+      SCHEDULER_CUBE_API_KEY: ${CUBE_API_KEY:-e2b_000000}
       # Sandboxes are reached via the docker-socket-proxy sidecar.  DOCKER_HOST
       # is the *only* way the docker SDK is configured here — there is NO
       # /var/run/docker.sock bind-mount on this container.
@@ -471,6 +479,10 @@ services:
       # Phase 5: alternate Claude SDK worker image, selected per-run by the
       # ``enable_claude_sdk_worker`` flag or globally by the default below.
       SCHEDULER_CLAUDE_SDK_IMAGE: ${CLAUDE_SDK_IMAGE:-ghcr.io/agent-platform/claude-sdk-sandbox:0.1}
+      # Cube v0.6 fixes RAM on templates. These aliases may reference the same
+      # OCI image while exposing small/large per-run memory tiers.
+      SCHEDULER_CUBE_CLAUDE_SDK_TEMPLATE_SMALL: ${CUBE_CLAUDE_SDK_TEMPLATE_SMALL:-claude-sdk-matlab-aerospace-r2-2g}
+      SCHEDULER_CUBE_CLAUDE_SDK_TEMPLATE_LARGE: ${CUBE_CLAUDE_SDK_TEMPLATE_LARGE:-claude-sdk-matlab-aerospace-r2-4g}
       # Global fallback for Claude SDK worker selection.  Stays false so the
       # committed default keeps routing to AgentScope unless the per-run flag
       # enables the SDK worker; a deploy can flip every run by setting
@@ -502,7 +514,9 @@ services:
       SCHEDULER_SANDBOX_BROKER_NETWORK: ${SANDBOX_BROKER_NETWORK:-agent-platform-dev_sandbox_broker}
       SCHEDULER_TOOL_BROKER_URL: ${TOOL_BROKER_URL:-http://tool-broker:8024/api/tool-broker/v1}
       SCHEDULER_TOOL_BROKER_LEASE_SECRET: ${TOOL_BROKER_LEASE_SECRET:-dev-tool-broker-lease-secret-change-me}
-      SCHEDULER_SANDBOX_MEMORY_LIMIT: "2g"
+      SCHEDULER_SANDBOX_MEMORY_LIMIT: ${SANDBOX_MEMORY_LIMIT:-2g}
+      SCHEDULER_SANDBOX_MEMORY_LIMIT_SMALL: ${SANDBOX_MEMORY_LIMIT_SMALL:-2g}
+      SCHEDULER_SANDBOX_MEMORY_LIMIT_LARGE: ${SANDBOX_MEMORY_LIMIT_LARGE:-4g}
       SCHEDULER_SANDBOX_CPU_SHARES: "1024"
       SCHEDULER_SANDBOX_TIMEOUT: "600"
       SCHEDULER_OTEL_ENABLED: "true"

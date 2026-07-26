@@ -18,11 +18,11 @@ logger = logging.getLogger(__name__)
 async def _sandbox_reaper_loop(app: FastAPI) -> None:
     """Periodically delete leaked sandboxes older than the configured max age.
 
-    The cube controller's spawn-time ``timeout`` TTL has been observed NOT to
-    reap microVMs, so they oversubscribe host RAM and OOM-kill live workers.
-    This loop is the scheduler-side safety net.  The cube runtime uses a SYNC
-    ``httpx.Client``, so the sweep runs in a thread to avoid blocking the event
-    loop.  Any exception is caught and logged so the loop never dies.
+    CubeSandbox v0.6 normally pauses idle microVMs through its lifecycle
+    manager. This loop is the scheduler-side backstop if that control path
+    fails. The cube runtime uses a SYNC ``httpx.Client``, so the sweep runs in a
+    thread to avoid blocking the event loop. Any exception is caught and logged
+    so the loop never dies.
     """
     settings: Settings = app.state.settings
     interval = settings.sandbox_reaper_interval_seconds

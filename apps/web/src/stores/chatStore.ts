@@ -136,6 +136,7 @@ interface ChatState {
   setSessionsCursor: (cursor: string | null) => void;
   setSessionsLoadingMore: (loading: boolean) => void;
   addSession: (session: Session) => void;
+  updateSessionTitle: (sessionId: string, title: string | null) => void;
   setActiveSession: (sessionId: string | null) => void;
   setMessages: (sessionId: string, messages: Message[]) => void;
   /**
@@ -593,6 +594,12 @@ export const useChatStore = create<ChatState>((set) => ({
   setSessionsCursor: (cursor) => set({ sessionsCursor: cursor }),
   setSessionsLoadingMore: (loading) => set({ sessionsLoadingMore: loading }),
   addSession: (session) => set((s) => ({ sessions: [session, ...s.sessions] })),
+  updateSessionTitle: (sessionId, title) =>
+    set((s) => ({
+      sessions: s.sessions.map((session) =>
+        session.id === sessionId ? { ...session, title } : session,
+      ),
+    })),
   setActiveSession: (sessionId) => set({ activeSessionId: sessionId }),
   setMessages: (sessionId, messages) =>
     set((s) => ({ messages: { ...s.messages, [sessionId]: messages } })),

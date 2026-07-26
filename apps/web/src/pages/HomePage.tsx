@@ -35,7 +35,12 @@ const DEFAULT_APP_GLYPH = '▤';
 
 export function HomePage() {
   const { lang } = useTranslation();
-  const { activeWorkspace, workspaces, setActiveWorkspaceId } = useWorkspace();
+  const {
+    activeWorkspace,
+    workspaces,
+    loading: workspacesLoading,
+    setActiveWorkspaceId,
+  } = useWorkspace();
   const { sessions, createSession } = useSessions();
   const { apps, loading: appsLoading } = useApps('published');
   const { apps: myApps, loading: myAppsLoading } = useApps('mine');
@@ -95,12 +100,14 @@ export function HomePage() {
   }, [draft]);
 
   // Create the session up front (or return the one already created for an
-  // earlier upload).  Title defaults to the current draft text.
+  // earlier upload). The first persisted message triggers server-side
+  // automatic naming; this placeholder keeps creation independent of prompt
+  // length and is replaced through the session SSE stream.
   const ensureSession = async (): Promise<Session | null> => {
     if (sessionRef.current) return sessionRef.current;
     // Started inside a workspace → tag the session with it so the backend
     // injects the workspace's instructions / base files / skills.
-    const session = await createSession(draft.trim() || undefined, activeWorkspace?.id);
+    const session = await createSession('新任务', activeWorkspace?.id);
     if (session) {
       sessionRef.current = session;
       setSessionExecutionMode(session.id, executionMode);
@@ -117,37 +124,39 @@ export function HomePage() {
     return api.attachments.upload(session.id, file);
   };
 
-  const startChat = async (text: string, attachmentIds?: string[]) => {
+  const startChat = async (text: string, attachmentIds?: string[]): Promise<boolean> => {
     setSubmitError(null);
     setSubmitting(true);
     try {
       // Reuse the session created during an earlier file upload, if any.
       const session = await ensureSession();
-      if (session) {
-        // Persist the composer's model + effort choice onto the new session so
-        // useChat picks them up at send time (same store the chat page reads).
-        setSessionModel(session.id, model);
-        setSessionEffort(session.id, effort);
-        setSessionExecutionMode(session.id, executionMode);
-        // Hand the "+" menu's pre-session skill / MCP choices to the session
-        // that was just created, and clear the draft so the next new task
-        // starts from the defaults instead of inheriting this one.
-        commitDraftSelections(session.id);
-        // Pass the first user message and any pre-uploaded attachments through
-        // router state so AgentPage can dispatch them once the chat store is
-        // bound to the new session.  Without this the draft was being thrown
-        // away.
-        navigate(`/tasks/${session.id}?mode=friendly`, {
-          state: {
-            initialMessage: text,
-            attachmentIds: attachmentIds ?? [],
-          },
-        });
-      }
-    } catch (err) {
-      setSubmitError('创建任务失败，请稍后重试。');
+      if (!session) throw new Error('创建任务失败，请稍后重试。');
 
+      // Persist the composer's model + effort choice onto the new session so
+      // useChat picks them up at send time (same store the chat page reads).
+      setSessionModel(session.id, model);
+      setSessionEffort(session.id, effort);
+      setSessionExecutionMode(session.id, executionMode);
+      // Hand the "+" menu's pre-session skill / MCP choices to the session
+      // that was just created, and clear the draft so the next new task
+      // starts from the defaults instead of inheriting this one.
+      commitDraftSelections(session.id);
+      // Pass the first user message and any pre-uploaded attachments through
+      // router state so AgentPage can dispatch them once the chat store is
+      // bound to the new session.  Without this the draft was being thrown
+      // away.
+      navigate(`/tasks/${session.id}?mode=friendly`, {
+        state: {
+          initialMessage: text,
+          attachmentIds: attachmentIds ?? [],
+        },
+      });
+      return true;
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : '';
+      setSubmitError(detail || '创建任务失败，请稍后重试。');
       console.warn('create session failed', err);
+      return false;
     } finally {
       setSubmitting(false);
     }
@@ -245,7 +254,8 @@ export function HomePage() {
                   label: `${w.name}（${SENSITIVITY_LABELS[w.sensitivity_level ?? DEFAULT_SENSITIVITY]}）`,
                 })),
                 onChange: setActiveWorkspaceId,
-                disabled: workspaces.length === 0,
+                disabled: workspacesLoading || workspaces.length === 0,
+                emptyLabel: workspacesLoading ? '加载工作区…' : '无工作区',
               }}
               executionMode={executionMode}
               onExecutionModeChange={setExecutionMode}
@@ -257,7 +267,7 @@ export function HomePage() {
           </div>
 
           {submitError && (
-            <div className="w-[min(720px,95%)] px-3 py-2 border border-accent-line bg-accent-soft rounded-md text-[12.5px] text-accent">
+            <div role="alert" className="w-[min(720px,95%)] px-3 py-2 border border-accent-line bg-accent-soft rounded-md text-[12.5px] text-accent">
               {submitError}
             </div>
           )}

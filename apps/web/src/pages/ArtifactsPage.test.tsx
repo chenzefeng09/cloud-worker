@@ -21,8 +21,32 @@ vi.mock('../api/client', () => ({
 }));
 
 vi.mock('../components/shell/PageHead', () => ({ PageHead: () => null }));
-vi.mock('../components/FilePreviewPanel', () => ({ FilePreviewPanel: () => null }));
-vi.mock('../components/CanvasReadonlyView', () => ({ CanvasReadonlyView: () => null }));
+vi.mock('../components/FilePreviewPanel', () => ({
+  FilePreviewPanel: ({
+    file,
+    onClose,
+  }: {
+    file: { filename: string };
+    onClose: () => void;
+  }) => (
+    <aside aria-label={`文件预览：${file.filename}`}>
+      <button type="button" onClick={onClose}>返回</button>
+    </aside>
+  ),
+}));
+vi.mock('../components/CanvasReadonlyView', () => ({
+  CanvasReadonlyView: ({
+    canvasId,
+    onClose,
+  }: {
+    canvasId: string;
+    onClose: () => void;
+  }) => (
+    <aside aria-label={`画布预览：${canvasId}`}>
+      <button type="button" onClick={onClose}>返回</button>
+    </aside>
+  ),
+}));
 
 const canvas = {
   id: 'cvs_1',
@@ -32,6 +56,18 @@ const canvas = {
   canvas_kind: 'article',
   filename: null,
   mime: null,
+  created_at: '2026-07-18T00:00:00Z',
+  updated_at: '2026-07-18T00:00:00Z',
+};
+
+const file = {
+  id: 'att_1',
+  session_id: 'ses_1',
+  kind: 'file' as const,
+  title: '季度数据',
+  canvas_kind: null,
+  filename: 'quarter.csv',
+  mime: 'text/csv',
   created_at: '2026-07-18T00:00:00Z',
   updated_at: '2026-07-18T00:00:00Z',
 };
@@ -70,5 +106,38 @@ describe('ArtifactsPage delete confirmation', () => {
     await user.click(screen.getByRole('button', { name: '删除' }));
 
     await waitFor(() => expect(mocks.deleteCanvas).toHaveBeenCalledWith('cvs_1'));
+  });
+});
+
+describe('ArtifactsPage preview layout', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.list.mockResolvedValue({ items: [canvas, file], total: 2 });
+  });
+
+  it('keeps the artifact list visible and opens file previews on the right', async () => {
+    const user = userEvent.setup();
+    render(<ArtifactsPage />);
+
+    await user.click(await screen.findByText('季度数据'));
+
+    expect(screen.getByLabelText('文件预览：quarter.csv')).toBeInTheDocument();
+    expect(screen.getByRole('separator', { name: '拖动调整预览栏宽度' })).toBeInTheDocument();
+    expect(screen.getByText('季度总结')).toBeVisible();
+
+    await user.click(screen.getByRole('button', { name: '返回' }));
+    expect(screen.queryByLabelText('文件预览：quarter.csv')).not.toBeInTheDocument();
+    expect(screen.queryByRole('separator', { name: '拖动调整预览栏宽度' })).not.toBeInTheDocument();
+  });
+
+  it('switches the right-side preview from a file to a canvas', async () => {
+    const user = userEvent.setup();
+    render(<ArtifactsPage />);
+
+    await user.click(await screen.findByText('季度数据'));
+    await user.click(screen.getByText('季度总结'));
+
+    expect(screen.queryByLabelText('文件预览：quarter.csv')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('画布预览：cvs_1')).toBeInTheDocument();
   });
 });

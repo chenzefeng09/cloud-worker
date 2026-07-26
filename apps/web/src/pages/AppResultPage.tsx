@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import rehypeHighlight from 'rehype-highlight';
+import { markdownRemarkPlugins, markdownRehypePlugins, normalizeMathDelimiters } from '../lib/markdownPlugins';
 import { PageHead, type Crumb } from '../components/shell/PageHead';
 import { Chip } from '../components/shell/Chip';
 import { StatusDot, type DesignStatus } from '../components/shell/StatusDot';
@@ -438,11 +437,11 @@ export function AppResultPage() {
                     <div className="prose-cw text-[14px] leading-[1.6] text-ink">
                       <MarkdownAssetsProvider value={markdownAssets}>
                         <ReactMarkdown
-                          remarkPlugins={[remarkGfm]}
-                          rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
+                          remarkPlugins={markdownRemarkPlugins}
+                          rehypePlugins={markdownRehypePlugins as never}
                           components={markdownComponents}
                         >
-                          {run.result_summary}
+                          {normalizeMathDelimiters(run.result_summary)}
                         </ReactMarkdown>
                       </MarkdownAssetsProvider>
                     </div>

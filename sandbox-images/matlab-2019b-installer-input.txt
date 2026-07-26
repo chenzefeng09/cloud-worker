@@ -1,0 +1,10 @@
+# MATLAB 2019b silent-install answers file.
+# Referenced by claude-sdk-cube-matlab.Dockerfile.
+
+destinationFolder=/opt/matlab
+fileInstallationKey=09806-07443-53955-64350-21751-41297
+agreeToLicense=yes
+outputFile=/tmp/matlab-install.log
+mode=silent
+product.MATLAB
+product.Control_System_Toolbox

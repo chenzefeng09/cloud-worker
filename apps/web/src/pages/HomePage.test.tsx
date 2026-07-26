@@ -1,6 +1,6 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { HomePage } from './HomePage';
 
@@ -70,6 +70,11 @@ vi.mock('../api/client', () => ({
   },
 }));
 
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.createSession.mockReset();
+});
+
 describe('HomePage composer toolbar', () => {
   it('uses a single-surface Codex-style control row', async () => {
     const user = userEvent.setup();
@@ -92,5 +97,40 @@ describe('HomePage composer toolbar', () => {
 
     await user.type(screen.getByRole('textbox'), '帮我规划明天');
     expect(sendButton).toBeEnabled();
+  });
+
+  it('uses an auto-title placeholder while forwarding the complete first message', async () => {
+    const user = userEvent.setup();
+    const longPrompt = `MATLAB FOC ${'validation '.repeat(40)}`;
+    mocks.createSession.mockResolvedValue({ id: 'ses_long' });
+    render(<HomePage />);
+
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: longPrompt } });
+    await user.click(screen.getByRole('button', { name: '发送' }));
+
+    await waitFor(() => expect(mocks.navigate).toHaveBeenCalled());
+    expect(mocks.createSession.mock.calls[0][0]).toBe('新任务');
+    expect(mocks.navigate).toHaveBeenCalledWith(
+      '/tasks/ses_long?mode=friendly',
+      expect.objectContaining({
+        state: expect.objectContaining({ initialMessage: longPrompt.trim() }),
+      }),
+    );
+  });
+
+  it('keeps the draft and shows an error when session creation fails', async () => {
+    const user = userEvent.setup();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    mocks.createSession.mockResolvedValue(undefined);
+    render(<HomePage />);
+
+    const textbox = screen.getByRole('textbox');
+    await user.type(textbox, '保留这段任务');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('创建任务失败');
+    expect(textbox).toHaveValue('保留这段任务');
+    expect(mocks.navigate).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
   });
 });

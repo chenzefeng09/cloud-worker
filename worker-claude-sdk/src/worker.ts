@@ -331,6 +331,15 @@ export function buildSystemPrompt(
     );
   }
 
+  // Only the workspace dir is mounted back to the scheduler host; files written
+  // anywhere else (the image's /home/user, /tmp, …) die with the sandbox and
+  // never become run artifacts, so the user never sees them. Static text — the
+  // path is a constant, so this stays prefix-cache friendly.
+  parts.push(
+    `## 输出文件\n\n生成的文件必须写在 ${workspaceDir()}/ 目录下` +
+      `（例如 ${workspaceDir()}/chart.png）。写到其他目录的文件不会被保存，用户也看不到。`,
+  );
+
   return parts.join("\n\n");
 }
 

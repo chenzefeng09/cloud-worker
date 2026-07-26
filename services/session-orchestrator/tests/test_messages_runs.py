@@ -1747,7 +1747,7 @@ def test_stream_session_emits_ping_on_empty_poll() -> None:
             return [], None
 
         async def get_session(self, session_id):
-            raise AssertionError("get_session must not be called for empty poll")
+            return SimpleNamespace(user_id="usr_stream_test", title="新任务")
 
     # Minimal fake Request carrying just the settings the generator reads.
     settings_stub = SimpleNamespace(
@@ -1792,6 +1792,11 @@ def test_stream_session_emits_ping_on_empty_poll() -> None:
     events = asyncio.get_event_loop().run_until_complete(_run())
     parsed = _parse_sse_events("".join(events))
     event_names = [name for name, _ in parsed]
+    assert event_names.count("session_updated") == 1
+    title_payload = next(
+        json.loads(data) for name, data in parsed if name == "session_updated"
+    )
+    assert title_payload == {"session_id": "ses_empty", "title": "新任务"}
     assert "ping" in event_names, f"empty poll should emit a ping, got {event_names}"
     # The ping payload for the session-level heartbeat is intentionally empty.
     ping_payload = next(json.loads(data) for name, data in parsed if name == "ping")

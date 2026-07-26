@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { PageHead } from '../components/shell/PageHead';
 import { Chip } from '../components/shell/Chip';
 import { api, ApiError } from '../api/client';
@@ -40,6 +40,9 @@ export function ArtifactsPage() {
   // Preview state
   const [previewArtifact, setPreviewArtifact] = useState<Artifact | null>(null);
   const [previewCanvasId, setPreviewCanvasId] = useState<string | null>(null);
+  const [previewWidth, setPreviewWidth] = useState(360);
+  const splitContainerRef = useRef<HTMLDivElement>(null);
+  const draggingRef = useRef(false);
 
   const fetchItems = useCallback(async () => {
     setLoading(true);
@@ -110,10 +113,34 @@ export function ArtifactsPage() {
     setPreviewCanvasId(null);
   }, []);
 
+  const startPreviewDrag = useCallback((e: React.MouseEvent) => {
+    e.preventDefault();
+    draggingRef.current = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    const onMove = (ev: MouseEvent) => {
+      if (!draggingRef.current || !splitContainerRef.current) return;
+      const rect = splitContainerRef.current.getBoundingClientRect();
+      const next = rect.right - ev.clientX;
+      setPreviewWidth(Math.min(760, Math.max(280, next)));
+    };
+    const onUp = () => {
+      draggingRef.current = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }, []);
+
   // Build FilePreviewPanel file shape from an Artifact
   const previewFile: FilePreviewPanelFile | null = previewArtifact
     ? { id: previewArtifact.id, filename: previewArtifact.filename ?? previewArtifact.title, mime: previewArtifact.mime }
     : null;
+  const hasPreview = previewArtifact !== null || previewCanvasId !== null;
 
   return (
     <div className="flex flex-col h-full min-w-0 bg-paper">
@@ -121,10 +148,19 @@ export function ArtifactsPage() {
         crumbs={[{ label: '首页', to: '/home' }, { label: '产物' }]}
       />
 
-      <div className="relative flex-1 min-h-0">
-        {/* 列表层 */}
-        <div className="cw-scroll absolute inset-0 overflow-auto px-8 py-5">
-        <div className="w-full max-w-[960px] min-w-0 flex flex-col gap-4">
+      <div
+        ref={splitContainerRef}
+        className="grid flex-1 min-h-0 overflow-hidden"
+        style={{
+          gridTemplateColumns: hasPreview
+            ? `minmax(0, 1fr) 6px ${previewWidth}px`
+            : 'minmax(0, 1fr)',
+          gridTemplateRows: 'minmax(0, 1fr)',
+        }}
+      >
+        {/* 产物列表在预览打开后仍保留在左侧，方便连续切换。 */}
+        <div className="cw-scroll min-w-0 min-h-0 px-8 py-5">
+          <div className="w-full max-w-[960px] min-w-0 flex flex-col gap-4">
 
           {/* kind toggle */}
           <div className="flex items-center gap-0.5 border-b border-line">
@@ -219,28 +255,55 @@ export function ArtifactsPage() {
             )
           )}
 
-        </div>
+          </div>
         </div>
 
-        {/* File preview panel -- 覆盖列表 */}
-        {previewArtifact && previewFile && (
-          <div className="absolute inset-0">
-            <FilePreviewPanel
-              sessionId={previewArtifact.session_id}
-              file={previewFile}
-              onClose={closePreview}
+        {hasPreview && (
+          <div
+            onMouseDown={startPreviewDrag}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="拖动调整预览栏宽度"
+            title="拖动调整预览栏宽度"
+            className="relative flex items-center justify-center"
+            style={{ cursor: 'col-resize', userSelect: 'none' }}
+            onMouseEnter={(e) => {
+              const bar = e.currentTarget.querySelector('[data-bar]') as HTMLElement | null;
+              if (bar) {
+                bar.style.width = '3px';
+                bar.style.background = 'var(--accent)';
+              }
+            }}
+            onMouseLeave={(e) => {
+              if (draggingRef.current) return;
+              const bar = e.currentTarget.querySelector('[data-bar]') as HTMLElement | null;
+              if (bar) {
+                bar.style.width = '1px';
+                bar.style.background = 'var(--line)';
+              }
+            }}
+          >
+            <span
+              data-bar
+              className="h-full transition-all"
+              style={{ width: 1, background: 'var(--line)' }}
             />
           </div>
         )}
 
-        {/* Canvas preview panel -- 覆盖列表 */}
+        {previewArtifact && previewFile && (
+          <FilePreviewPanel
+            sessionId={previewArtifact.session_id}
+            file={previewFile}
+            onClose={closePreview}
+          />
+        )}
+
         {previewCanvasId && (
-          <div className="absolute inset-0">
-            <CanvasReadonlyView
-              canvasId={previewCanvasId}
-              onClose={closePreview}
-            />
-          </div>
+          <CanvasReadonlyView
+            canvasId={previewCanvasId}
+            onClose={closePreview}
+          />
         )}
       </div>
 

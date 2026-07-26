@@ -276,6 +276,54 @@ def test_create_run_small_attachment_uses_small_memory_tier(
     assert mem_limit == "1g"
 
 
+def test_create_run_explicit_large_memory_tier_overrides_attachment_size(
+    app_client: TestClient,
+    mock_docker_client: MagicMock,
+    fake_identity,
+    auth_headers,
+) -> None:
+    spawned = MagicMock()
+    spawned.id = "container-explicit-large"
+    mock_docker_client.containers.run.return_value = spawned
+
+    resp = app_client.post(
+        "/api/scheduler/v1/runs",
+        headers=auth_headers,
+        json={
+            "session_id": "ses_01J5SES0000000000000000001",
+            "run_id": "run_01J5RUN0000000000000000001",
+            "task": "run MATLAB",
+            "agent_config": {"sandbox_memory_tier": "large"},
+            "total_attachment_bytes": 0,
+        },
+    )
+
+    assert resp.status_code == 201, resp.text
+    mem_limit = mock_docker_client.containers.run.call_args.kwargs["mem_limit"]
+    assert mem_limit == "4g"
+
+
+def test_create_run_rejects_invalid_memory_tier(
+    app_client: TestClient,
+    mock_docker_client: MagicMock,
+    fake_identity,
+    auth_headers,
+) -> None:
+    resp = app_client.post(
+        "/api/scheduler/v1/runs",
+        headers=auth_headers,
+        json={
+            "session_id": "ses_01J5SES0000000000000000001",
+            "run_id": "run_01J5RUN0000000000000000001",
+            "task": "hello world",
+            "agent_config": {"sandbox_memory_tier": "huge"},
+        },
+    )
+
+    assert resp.status_code == 422
+    mock_docker_client.containers.run.assert_not_called()
+
+
 def test_create_run_validation(app_client: TestClient, auth_headers) -> None:
     resp = app_client.post(
         "/api/scheduler/v1/runs",
