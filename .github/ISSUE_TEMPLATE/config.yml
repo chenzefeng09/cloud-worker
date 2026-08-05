@@ -1,0 +1,17 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/chenzefeng09/agent-platform/blob/main/SECURITY.md
+    about: >-
+      Please do NOT open a public issue for security vulnerabilities. Follow the
+      coordinated-disclosure process in SECURITY.md, or email chenzefeng09@gmail.com.
+  - name: Questions and discussions
+    url: https://github.com/chenzefeng09/agent-platform/discussions
+    about: >-
+      Have a question, idea, or want to discuss usage? Start a thread in GitHub Discussions
+      rather than opening an issue.
+  - name: SaaS Foundation (the underlying base)
+    url: https://github.com/chenzefeng09/saas-foundation/issues
+    about: >-
+      Agent Platform runs on top of SaaS Foundation. If the problem is in a Foundation
+      service (identity, authz, billing, audit, llm-gateway), file it there instead.

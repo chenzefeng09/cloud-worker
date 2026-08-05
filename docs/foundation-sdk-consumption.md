@@ -13,7 +13,7 @@ foundation-sdk = { version = ">=0.1,<0.2", extras = ["fastapi"], source = "inter
 
 [[tool.poetry.source]]
 name = "internal-pypi"
-url = "https://pypi.internal.example/simple/"
+url = "https://pypi.example.com/simple/"
 priority = "supplemental"
 ```
 

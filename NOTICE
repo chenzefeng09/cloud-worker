@@ -1,0 +1,19 @@
+Agent Platform
+Copyright 2026 The Agent Platform Authors
+
+This product is licensed under the Apache License, Version 2.0 (see the
+LICENSE file in this repository).
+
+Agent Platform builds on a number of third-party open-source projects,
+each distributed under its own license. Notable components include:
+
+  - AgentScope (Apache-2.0) — the agent kernel, integrated (not forked)
+    via the packages under agentscope-ext/.
+  - SaaS Foundation — the enterprise base providing identity, authorization,
+    billing, audit, LLM gateway and related capabilities, consumed through
+    the foundation SDK. See https://github.com/chenzefeng09/saas-foundation
+  - FastAPI, React, Vite and the wider Python and Node.js ecosystems.
+
+Sandbox runtimes (CubeSandbox, Kata Containers, Docker) and the data and
+infrastructure components referenced by the deployment manifests remain the
+property of their respective owners and are governed by their own licenses.
