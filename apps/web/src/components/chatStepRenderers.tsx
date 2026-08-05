@@ -580,22 +580,17 @@ export function ToolRow({ tc, rowKey: _rowKey, expanded, onToggle }: ToolRowProp
 export interface ThinkingBlockProps {
   content: string;
   friendly?: boolean;
+  streaming?: boolean;
 }
 
-export function ThinkingBlock({ content, friendly }: ThinkingBlockProps) {
-  // Default: always collapsed once thinking finishes (both modes); user expands manually.
-  const [open, setOpen] = useState(false);
-
-  // Split content into bullet points (by newline or paragraph)
-  const lines = content
-    .split(/\n+/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0);
+export function ThinkingBlock({ content, friendly, streaming }: ThinkingBlockProps) {
+  const [userToggled, setUserToggled] = useState(false);
+  const open = userToggled ? !streaming : !!streaming;
 
   return (
     <div>
       <div
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => setUserToggled((v) => !v)}
         className="flex items-center gap-2 cursor-pointer"
         style={{
           padding: '6px 10px',
@@ -613,25 +608,14 @@ export function ThinkingBlock({ content, friendly }: ThinkingBlockProps) {
           style={{
             borderLeft: '2px solid var(--accent-line)',
             margin: '6px 0 0 6px',
-            padding: '4px 0 4px 14px',
-            display: 'flex',
-            flexDirection: 'column',
-            gap: 6,
+            padding: '8px 14px',
+            fontSize: 13,
+            color: 'var(--ink-2)',
+            lineHeight: 1.6,
+            whiteSpace: 'pre-wrap',
           }}
         >
-          {lines.map((line, i) => (
-            <div key={i} className="flex gap-2 items-start">
-              <span
-                className="font-mono text-dim"
-                style={{ fontSize: 11, marginTop: 2, minWidth: 16 }}
-              >
-                {i + 1}.
-              </span>
-              <span style={{ fontSize: 13, color: 'var(--ink-2)', lineHeight: 1.5 }}>
-                {line}
-              </span>
-            </div>
-          ))}
+          {content}
         </div>
       )}
     </div>

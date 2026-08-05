@@ -76,17 +76,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     reconcile_task = asyncio.create_task(
         run_sweeper(app), name="run-reconcile-sweep"
     )
+
+    from agent_session_orchestrator.services.version_cleanup import (
+        run_version_cleanup_loop,
+    )
+    version_cleanup_task = asyncio.create_task(
+        run_version_cleanup_loop(settings), name="workspace-version-cleanup"
+    )
+
     try:
         yield
     finally:
         sweep_task.cancel()
         reconcile_task.cancel()
+        version_cleanup_task.cancel()
         # Cancelled tasks raise CancelledError on await — expected; suppress
         # so shutdown completes cleanly.
         with contextlib.suppress(asyncio.CancelledError):
             await sweep_task
         with contextlib.suppress(asyncio.CancelledError):
             await reconcile_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await version_cleanup_task
         await close_db()
 
 
@@ -136,6 +147,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from agent_session_orchestrator.api.v1.workspaces import router as workspaces_router
     app.include_router(workspaces_router, prefix=settings.api_prefix)
+
+    from agent_session_orchestrator.api.v1.admin_config import router as admin_config_router
+    app.include_router(admin_config_router, prefix=settings.api_prefix)
 
     return app
 

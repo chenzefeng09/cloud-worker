@@ -28,6 +28,7 @@ import { PoolMonitorPage } from './pages/PoolMonitorPage';
 import { DataProtectionPage } from './pages/DataProtectionPage';
 import { StorageManagementPage } from './pages/StorageManagementPage';
 import { OrphanReportsPage } from './pages/OrphanReportsPage';
+import { PlatformSettingsPage } from './pages/PlatformSettingsPage';
 import { SsoPage } from './pages/SsoPage';
 import { DialogProvider } from './components/dialogs';
 import { ErrorBoundary } from './components/ErrorBoundary';
@@ -113,6 +114,7 @@ const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
     items: [
       { to: '/admin/storage-quotas', label: '租户配额', glyph: '▤' },
       { to: '/admin/storage-orphans', label: '孤儿对账', glyph: '◌' },
+      { to: '/admin/platform-settings', label: '平台设置', glyph: '⚙' },
     ],
   },
 ];
@@ -294,6 +296,7 @@ export function AdminLayout() {
             <Route path="data-protection" element={<RequirePerm perms={perms}><DataProtectionPage /></RequirePerm>} />
             <Route path="storage-quotas" element={<RequirePerm perms={perms}><StorageManagementPage /></RequirePerm>} />
             <Route path="storage-orphans" element={<RequirePerm perms={perms}><OrphanReportsPage /></RequirePerm>} />
+            <Route path="platform-settings" element={<RequirePerm perms={perms}><PlatformSettingsPage /></RequirePerm>} />
             <Route path="*" element={<Navigate to={firstAccessiblePath(perms)} replace />} />
           </Routes>
           </ErrorBoundary>

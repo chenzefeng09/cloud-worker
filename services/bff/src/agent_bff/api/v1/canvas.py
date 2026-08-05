@@ -32,8 +32,8 @@ from agent_bff.api.dependencies import require_auth
 router = APIRouter(tags=["Canvas"])
 logger = logging.getLogger(__name__)
 
-# gateway ``/chat/completions`` 超时（秒）。推理模型可能慢，给足 120s。
-_COMPLETION_TIMEOUT = 120.0
+# gateway ``/chat/completions`` 超时（秒）。推理模型思考阶段可能很长，给足 300s。
+_COMPLETION_TIMEOUT = 300.0
 # tenant-keys / tenant-defaults 这类轻量元数据查询用短超时。
 _META_TIMEOUT = 5.0
 

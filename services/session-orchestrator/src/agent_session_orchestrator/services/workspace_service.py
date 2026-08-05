@@ -23,7 +23,7 @@ import logging
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent_session_orchestrator.domain.models import Workspace, WorkspaceFile
+from agent_session_orchestrator.domain.models import Workspace, WorkspaceFile, WorkspaceFileVersion
 from agent_session_orchestrator.errors import (
     OrchestratorError,
     WorkspaceDefaultDeleteError,
@@ -271,5 +271,190 @@ class WorkspaceService:
         the blob (``blob_key`` stays readable on the detached instance)."""
         wsf = await self.get_file(workspace_id, file_id, user_id=user_id)
         await self._db.delete(wsf)
+        await self._db.flush()
+        return wsf
+
+    # -------------------------------------------------------------- writeback
+
+    async def process_writeback(
+        self,
+        workspace_id: str,
+        run_id: str,
+        user_id: str,
+        writeback_files: list[dict],
+        max_versions: int = 20,
+    ) -> list[dict]:
+        """Process writeback files from a completed run.
+
+        Returns ``[{file_id, filename, version, is_new}]``.
+        ``evicted_blobs`` on each entry lists S3 keys the caller should
+        best-effort delete.
+        """
+        results: list[dict] = []
+        for wf in writeback_files:
+            filename = wf["filename"]
+            blob_key = wf["blob_key"]
+            size_bytes = int(wf.get("size_bytes") or 0)
+            mime = wf.get("mime") or "application/octet-stream"
+
+            existing = await self._find_file_by_name(workspace_id, filename)
+
+            if existing is not None:
+                old_version = existing.current_version or 1
+                ver = WorkspaceFileVersion(
+                    tenant_id=self._tenant_id,
+                    workspace_file_id=existing.id,
+                    version=old_version,
+                    blob_key=existing.blob_key,
+                    size_bytes=int(existing.size_bytes or 0),
+                    created_by=f"run:{run_id}",
+                )
+                self._db.add(ver)
+
+                existing.blob_key = blob_key
+                existing.size_bytes = size_bytes
+                existing.mime = mime
+                existing.current_version = old_version + 1
+                await self._db.flush()
+
+                evicted = await self._enforce_max_versions(existing.id, max_versions)
+                results.append({
+                    "file_id": existing.id,
+                    "filename": filename,
+                    "version": existing.current_version,
+                    "is_new": False,
+                    "evicted_blobs": evicted,
+                })
+            else:
+                wsf = WorkspaceFile(
+                    tenant_id=self._tenant_id,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    filename=filename,
+                    mime=mime,
+                    size_bytes=size_bytes,
+                    blob_key=blob_key,
+                    current_version=1,
+                )
+                self._db.add(wsf)
+                await self._db.flush()
+                await self._db.refresh(wsf)
+                results.append({
+                    "file_id": wsf.id,
+                    "filename": filename,
+                    "version": 1,
+                    "is_new": True,
+                    "evicted_blobs": [],
+                })
+        return results
+
+    async def _find_file_by_name(
+        self, workspace_id: str, filename: str
+    ) -> WorkspaceFile | None:
+        stmt = select(WorkspaceFile).where(
+            WorkspaceFile.workspace_id == workspace_id,
+            WorkspaceFile.tenant_id == self._tenant_id,
+            WorkspaceFile.filename == filename,
+        )
+        result = await self._db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def _enforce_max_versions(
+        self, file_id: str, max_versions: int
+    ) -> list[str]:
+        """Delete oldest versions exceeding the cap. Returns evicted blob keys."""
+        count_stmt = (
+            select(func.count())
+            .select_from(WorkspaceFileVersion)
+            .where(
+                WorkspaceFileVersion.workspace_file_id == file_id,
+                WorkspaceFileVersion.tenant_id == self._tenant_id,
+            )
+        )
+        total = int((await self._db.execute(count_stmt)).scalar_one() or 0)
+        if total <= max_versions:
+            return []
+
+        excess = total - max_versions
+        oldest_stmt = (
+            select(WorkspaceFileVersion)
+            .where(
+                WorkspaceFileVersion.workspace_file_id == file_id,
+                WorkspaceFileVersion.tenant_id == self._tenant_id,
+            )
+            .order_by(WorkspaceFileVersion.version.asc())
+            .limit(excess)
+        )
+        oldest = (await self._db.execute(oldest_stmt)).scalars().all()
+        evicted: list[str] = []
+        for ver in oldest:
+            evicted.append(ver.blob_key)
+            await self._db.delete(ver)
+        await self._db.flush()
+        return evicted
+
+    # -------------------------------------------------------------- versions
+
+    async def list_file_versions(
+        self, workspace_id: str, file_id: str, *, user_id: str | None
+    ) -> list[WorkspaceFileVersion]:
+        await self.get_file(workspace_id, file_id, user_id=user_id)
+        stmt = (
+            select(WorkspaceFileVersion)
+            .where(
+                WorkspaceFileVersion.workspace_file_id == file_id,
+                WorkspaceFileVersion.tenant_id == self._tenant_id,
+            )
+            .order_by(WorkspaceFileVersion.version.desc())
+        )
+        result = await self._db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_file_version(
+        self, workspace_id: str, file_id: str, version_id: str, *, user_id: str | None
+    ) -> WorkspaceFileVersion:
+        await self.get_file(workspace_id, file_id, user_id=user_id)
+        stmt = select(WorkspaceFileVersion).where(
+            WorkspaceFileVersion.id == version_id,
+            WorkspaceFileVersion.workspace_file_id == file_id,
+            WorkspaceFileVersion.tenant_id == self._tenant_id,
+        )
+        result = await self._db.execute(stmt)
+        ver = result.scalar_one_or_none()
+        if ver is None:
+            raise WorkspaceFileNotFoundError(version_id)
+        return ver
+
+    async def restore_file_version(
+        self,
+        workspace_id: str,
+        file_id: str,
+        version_id: str,
+        *,
+        user_id: str | None,
+        restored_by: str,
+    ) -> WorkspaceFile:
+        """Swap a historical version's blob_key into the current file.
+
+        The old current content becomes a new version entry (reversible).
+        """
+        wsf = await self.get_file(workspace_id, file_id, user_id=user_id)
+        ver = await self.get_file_version(workspace_id, file_id, version_id, user_id=user_id)
+
+        old_version = wsf.current_version or 1
+        snapshot = WorkspaceFileVersion(
+            tenant_id=self._tenant_id,
+            workspace_file_id=wsf.id,
+            version=old_version,
+            blob_key=wsf.blob_key,
+            size_bytes=int(wsf.size_bytes or 0),
+            change_summary=f"snapshot before restore from v{ver.version}",
+            created_by=restored_by,
+        )
+        self._db.add(snapshot)
+
+        wsf.blob_key = ver.blob_key
+        wsf.size_bytes = ver.size_bytes
+        wsf.current_version = old_version + 1
         await self._db.flush()
         return wsf

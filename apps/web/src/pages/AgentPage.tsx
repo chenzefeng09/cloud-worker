@@ -393,7 +393,7 @@ function WorkspaceBadge({
             </div>
           )}
 
-          <div className="cw-label mb-1">基础文件</div>
+          <div className="cw-label mb-1">我的工作区</div>
           <div className="max-h-[220px] overflow-auto cw-scroll -mx-0.5">
             {filesLoading ? (
               <div className="px-1 py-1.5 font-mono text-[11px] text-dim animate-pulse">
@@ -419,7 +419,7 @@ function WorkspaceBadge({
               ))
             ) : (
               <div className="px-1 py-1.5 font-mono text-[11px] italic text-dim">
-                暂无基础文件
+                暂无文件
               </div>
             )}
           </div>

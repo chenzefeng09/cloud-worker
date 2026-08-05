@@ -330,6 +330,48 @@ class WorkspaceFile(Base):
     sensitivity_level: Mapped[str] = mapped_column(
         String(8), nullable=False, default="L2", server_default="L2",
     )
+    current_version: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
     )
+
+
+class WorkspaceFileVersion(Base):
+    """Historical snapshot of a workspace file's bytes.
+
+    Created when an agent run writes back a modified file — the previous
+    blob_key is preserved here before the workspace_file row is updated.
+    """
+
+    __tablename__ = "workspace_file_version"
+    __table_args__ = {"schema": "session_orchestrator"}
+
+    id: Mapped[str] = mapped_column(String(30), primary_key=True, default=lambda: new_id("wfv"))
+    tenant_id: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    workspace_file_id: Mapped[str] = mapped_column(
+        String(30), ForeignKey("session_orchestrator.workspace_file.id"), nullable=False,
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    blob_key: Mapped[str] = mapped_column(Text, nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    change_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_by: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
+    )
+
+
+class PlatformConfig(Base):
+    """Tenant-scoped key-value store for admin-configurable platform settings."""
+
+    __tablename__ = "platform_config"
+    __table_args__ = {"schema": "session_orchestrator"}
+
+    id: Mapped[str] = mapped_column(String(30), primary_key=True, default=lambda: new_id("pcf"))
+    tenant_id: Mapped[str] = mapped_column(String(30), nullable=False)
+    key: Mapped[str] = mapped_column(String(200), nullable=False)
+    value: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
+    )
+    updated_by: Mapped[str | None] = mapped_column(String(60), nullable=True)

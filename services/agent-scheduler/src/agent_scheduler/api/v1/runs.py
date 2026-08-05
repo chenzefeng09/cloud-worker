@@ -644,6 +644,7 @@ async def create_run(
                 hitl=hitl,
                 resume=resume,
                 user_clearance=user_clearance,
+                workspace_id=str(body.get("workspace_id") or ""),
             )
         )
     except SandboxSpawnError as exc:

@@ -343,11 +343,13 @@ class CubeSandboxRuntime:
         hitl: bool = True,
         resume: dict[str, Any] | None = None,
         user_clearance: str = "",
+        workspace_id: str = "",
     ) -> str:
         _check_ids(
             run_id=run_id, session_id=session_id,
             tenant_id=tenant_id, user_id=user_id,
         )
+        self._last_workspace_id = workspace_id
         if not foundation_token:
             raise SandboxSpawnError(
                 "foundation_token is required; mint it via "
@@ -439,6 +441,7 @@ class CubeSandboxRuntime:
             # HITL gate + resume payload (see docker_runtime._write_task_file).
             "hitl": bool(hitl),
             "resume": resume,
+            "workspace_writeback": bool(workspace_id),
         }
         # Per-run MCP selection, presence-carried exactly as in the docker
         # runtime: key absent = tenant default set, [] = disable all, list =
@@ -902,17 +905,21 @@ class CubeSandboxRuntime:
         tenant_id, session_id, run_id = ids
         return Path(self._settings.workspace_base) / tenant_id / session_id / run_id
 
-    def _upload_artifacts(self, sandbox: dict[str, Any]) -> list[dict[str, Any]]:
-        """Publish the run's output files from the host side of the mount."""
+    def _upload_output_files(
+        self, sandbox: dict[str, Any],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Unified output-file scan from the host side of the mount."""
         ids = self._run_ids(sandbox)
         if ids is None:
-            return []
+            return {"workspace_files": [], "artifacts": []}
         tenant_id, session_id, run_id = ids
-        return artifact_store.upload_run_artifacts(
+        workspace_id = getattr(self, "_last_workspace_id", "") or ""
+        return artifact_store.upload_run_output_files(
             workspace=self._run_workspace(ids),
             tenant_id=tenant_id,
             session_id=session_id,
             run_id=run_id,
+            workspace_id=workspace_id,
             bucket=self._settings.s3_bucket,
             s3_client=artifact_store.make_s3_client(self._settings),
         )
@@ -1024,7 +1031,11 @@ class CubeSandboxRuntime:
             # polling calls this repeatedly, and a mid-run upload would ship
             # half-written files (and re-ship them on every poll).
             if result["status"] in ("COMPLETED", "FAILED"):
-                result["artifacts"] = self._upload_artifacts(data)
+                output = self._upload_output_files(data)
+                result["artifacts"] = output["artifacts"]
+                workspace_id = getattr(self, "_last_workspace_id", "") or ""
+                if workspace_id:
+                    result["writeback_files"] = output["workspace_files"]
 
         return result
 

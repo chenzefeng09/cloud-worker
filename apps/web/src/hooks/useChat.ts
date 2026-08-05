@@ -139,6 +139,16 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     }
   },
 
+  thinking_delta(ctx, data) {
+    const store = useChatStore.getState();
+    const runId = data.run_id as string | undefined;
+    const delta = data.delta as string | undefined;
+    const offset = data.offset as string | undefined;
+    if (runId && delta) {
+      store.appendStreamingThinkingDelta(ctx.sessionId, runId, delta, offset);
+    }
+  },
+
   plan(ctx, data) {
     // Real-time plan steps from the worker's TaskCreate/TaskUpdate calls.
     // Shape: { run_id: string, plan_steps: PlanStep[] }

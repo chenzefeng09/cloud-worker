@@ -95,8 +95,8 @@ def _run_canvas_key(run_id: str) -> str:
 # below threshold is skipped (logged at INFO, fail-open — the content is already
 # in the chat message, so skipping loses nothing).  Module-level so they are
 # easy to tune.
-_CANVAS_MIN_CHARS = 200  # min whitespace-stripped content_markdown length
-_CANVAS_MIN_BLOCKS = 2    # min paragraphs (split on blank lines)
+_CANVAS_MIN_CHARS = 20   # min whitespace-stripped content_markdown length
+_CANVAS_MIN_BLOCKS = 1   # min paragraphs (split on blank lines)
 _CANVAS_MIN_HTML_CHARS = 40  # min length for an executable HTML canvas
 
 
@@ -129,6 +129,7 @@ async def materialize_one_canvas(
     title: str | None,
     content_markdown: str,
     content_type: str = "markdown",
+    skip_guard: bool = False,
 ) -> tuple[str, str | None] | None:
     """Create one canvas document + backfill its assistant message (canvas v2).
 
@@ -139,12 +140,10 @@ async def materialize_one_canvas(
     eligible assistant row exists yet (the canvas is still created), or ``None``
     entirely when the payload fails the guard (skipped, logged at INFO).
 
-    Extracted so both the sandbox run-state loop (``_materialize_pending_canvases``)
-    and the inline in-process tool-call path apply the identical guard + create +
-    backfill semantics against the same over-trigger rule.  Callers own the
-    fail-open boundary and any ``canvas_created`` SSE emission.
+    When ``skip_guard`` is True the over-trigger guard is bypassed — used by the
+    canvas rescue path where intent has already been confirmed.
     """
-    if not _canvas_payload_passes_guard(
+    if not skip_guard and not _canvas_payload_passes_guard(
         {
             "content_markdown": content_markdown,
             "title": title,
@@ -396,6 +395,13 @@ async def _stream_tokens(
                                 "thinking",
                                 {"run_id": run_id, "text": text, "offset": last_id},
                             )
+                    elif entry_type == "thinking_delta":
+                        text = entry.get("text") or ""
+                        if text:
+                            yield _sse(
+                                "thinking_delta",
+                                {"run_id": run_id, "delta": text, "offset": last_id},
+                            )
                     elif entry_type == "canvas":
                         # Inline path: the executor materialized a canvas in-process
                         # from a model ``create_canvas`` tool call and wrote a
@@ -497,13 +503,17 @@ async def _read_ordered_blocks_from_redis(
                 text_parts.append(str(entry.get("text") or ""))
                 continue
             if entry_type == "thinking":
-                # Thinking is a side-channel, not a hard boundary in assistant
-                # text. Keep accumulating surrounding delta entries so
-                # "你好" + thinking + "！我是…" persists as one assistant row
-                # below the thinking block instead of two split text rows.
+                # Legacy whole-block thinking event (pre-streaming).
                 text = str(entry.get("text") or "")
                 if text:
                     blocks.append({"kind": "thinking", "text": text})
+                continue
+            if entry_type == "thinking_delta":
+                # Incremental thinking token — accumulate into a single
+                # thinking block during finalize (same as delta→text).
+                if not blocks or blocks[-1].get("kind") != "thinking":
+                    blocks.append({"kind": "thinking", "text": ""})
+                blocks[-1]["text"] += str(entry.get("text") or "")
                 continue
             if entry_type == "tool_call":
                 flush_text()
@@ -1204,6 +1214,46 @@ async def _reconcile_run_completion(
             svc=svc,
             tenant_id=tenant_id,
         )
+
+    # Workspace writeback: if the scheduler reported writeback files, process
+    # them into the workspace (create versions, update current files).
+    writeback_files = payload.get("writeback_files") or []
+    if writeback_files and sched_status == "COMPLETED":
+        try:
+            session_row = await svc.get_session(run.session_id)
+            ws_id = session_row.workspace_id
+            if ws_id:
+                from agent_session_orchestrator.services.workspace_service import WorkspaceService
+                from agent_session_orchestrator.services.platform_config_service import PlatformConfigService
+                ws_svc = WorkspaceService(svc._db, tenant_id=tenant_id)
+                cfg_svc = PlatformConfigService(svc._db, tenant_id=tenant_id)
+                max_ver = int(await cfg_svc.get("workspace.max_versions_per_file", 20))
+                wb_user = user_id if user_id and user_id != "SYSTEM" else session_row.user_id
+                results = await ws_svc.process_writeback(
+                    workspace_id=ws_id,
+                    run_id=run.id,
+                    user_id=wb_user,
+                    writeback_files=writeback_files,
+                    max_versions=max_ver,
+                )
+                all_evicted = [k for r in results for k in r.pop("evicted_blobs", [])]
+                if all_evicted:
+                    blob_store = getattr(svc._db, "_blob_store", None)
+                    for key in all_evicted:
+                        try:
+                            if blob_store:
+                                blob_store.delete(key)
+                        except Exception:  # noqa: BLE001
+                            pass
+                logger.info(
+                    "writeback processed: %d file(s) for run %s",
+                    len(results), run.id,
+                )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "writeback processing failed (failure-open) for run %s",
+                run.id, exc_info=True,
+            )
 
     # Persist a memory document to knowledge-ingest so future runs can
     # retrieve relevant context.  Awaited inline (failure-open): any error

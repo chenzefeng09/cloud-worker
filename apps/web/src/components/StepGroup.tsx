@@ -71,7 +71,7 @@ export function StepGroup({ group, friendly }: StepGroupProps) {
       if (!showThinking) return null;
       return (
         <div className="min-w-0">
-          <ThinkingBlock content={step.content} friendly={friendly} />
+          <ThinkingBlock content={step.content} friendly={friendly} streaming={step.streaming} />
         </div>
       );
     }
@@ -135,7 +135,7 @@ export function StepGroup({ group, friendly }: StepGroupProps) {
               if (step.blockKind === 'thinking') {
                 if (!showThinking) return null;
                 return (
-                  <ThinkingBlock key={step.id} content={step.content} friendly={friendly} />
+                  <ThinkingBlock key={step.id} content={step.content} friendly={friendly} streaming={step.streaming} />
                 );
               }
 

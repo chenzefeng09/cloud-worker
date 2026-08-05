@@ -59,6 +59,7 @@ from agent_session_orchestrator.errors import OrchestratorError
 from agent_session_orchestrator.schemas.workspace import (
     WorkspaceCreate,
     WorkspaceFileOut,
+    WorkspaceFileVersionOut,
     WorkspaceOut,
     WorkspaceUpdate,
 )
@@ -453,3 +454,101 @@ async def get_workspace_file_content(
             "Content-Length": str(len(data)),
         },
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# File versions
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@router.get("/workspaces/{workspace_id}/files/{file_id}/versions",
+            dependencies=[Depends(require_permission("workspace.read", "workspace"))])
+async def list_file_versions(
+    workspace_id: str,
+    file_id: str,
+    request: Request,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+    user_id: str = TUserId,
+) -> dict[str, Any]:
+    owner = _owner_filter(request, user_id)
+    svc = WorkspaceService(db, tenant_id=tenant_id)
+    versions = await svc.list_file_versions(workspace_id, file_id, user_id=owner)
+    return {
+        "items": [
+            WorkspaceFileVersionOut.model_validate(v).model_dump(mode="json")
+            for v in versions
+        ]
+    }
+
+
+@router.post("/workspaces/{workspace_id}/files/{file_id}/versions/{version_id}/restore",
+             dependencies=[Depends(require_permission("workspace.manage", "workspace"))])
+async def restore_file_version(
+    workspace_id: str,
+    file_id: str,
+    version_id: str,
+    request: Request,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+    user_id: str = TUserId,
+) -> dict[str, Any]:
+    owner = _owner_filter(request, user_id)
+    svc = WorkspaceService(db, tenant_id=tenant_id)
+    wsf = await svc.restore_file_version(
+        workspace_id, file_id, version_id,
+        user_id=owner, restored_by=f"user:{user_id}",
+    )
+    return WorkspaceFileOut.model_validate(wsf).model_dump(mode="json")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal writeback (called by run-completion, not user-facing)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@router.post("/internal/workspaces/{workspace_id}/writeback")
+async def process_writeback(
+    workspace_id: str,
+    request: Request,
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+) -> dict[str, Any]:
+    """Process writeback files from a completed run.
+
+    Called internally by the run-completion handler; not user-facing.
+    Body: ``{"run_id": str, "user_id": str, "files": [{filename, blob_key, size_bytes, mime}]}``
+    """
+    body = await request.json()
+    run_id = body.get("run_id", "unknown")
+    user_id = body.get("user_id", "unknown")
+    files = body.get("files") or []
+    if not files:
+        return {"items": []}
+
+    from agent_session_orchestrator.services.platform_config_service import PlatformConfigService
+    cfg_svc = PlatformConfigService(db, tenant_id=tenant_id)
+    max_versions = int(await cfg_svc.get("workspace.max_versions_per_file", 20))
+
+    svc = WorkspaceService(db, tenant_id=tenant_id)
+    results = await svc.process_writeback(
+        workspace_id=workspace_id,
+        run_id=run_id,
+        user_id=user_id,
+        writeback_files=files,
+        max_versions=max_versions,
+    )
+
+    all_evicted: list[str] = []
+    for r in results:
+        all_evicted.extend(r.pop("evicted_blobs", []))
+
+    blob_store = getattr(request.app.state, "blob_store", None)
+    if blob_store and all_evicted:
+        for key in all_evicted:
+            try:
+                await asyncio.to_thread(blob_store.delete, key)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("evicted blob delete failed", extra={"key": key, "err": str(exc)})
+
+    return {"items": results}

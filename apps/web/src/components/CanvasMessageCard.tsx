@@ -251,8 +251,10 @@ export function CanvasMessageCard({
       return;
     }
     if (!storeSuggestion) return;
+    setHistory((prev) => trimHistory([...prev, draft.content]));
+    setFuture([]);
     void applySuggestionAction(canvasId, storeSuggestion.id, true);
-  }, [applySuggestionAction, canvasId, onAcceptSuggestionProp, storeSuggestion]);
+  }, [applySuggestionAction, canvasId, draft.content, onAcceptSuggestionProp, storeSuggestion]);
 
   const handleRejectSuggestion = useCallback(() => {
     if (!canvasId) {

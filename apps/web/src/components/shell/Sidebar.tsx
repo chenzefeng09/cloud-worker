@@ -1,13 +1,11 @@
+import { useMemo, useCallback } from 'react';
 import { NavLink } from 'react-router-dom';
 import { useChatStore } from '../../stores/chatStore';
 import { useSessions } from '../../hooks/useSessions';
+import { useWorkspace } from '../../lib/workspaceContext';
 import { AccountMenu } from './AccountMenu';
 import { canAccessAdmin } from '../../admin/AdminLayout';
-import {
-  RECENCY_BUCKET_ORDER,
-  recencyBucketZh,
-  formatAbsoluteTimeZh,
-} from '../../lib/format';
+import { formatAbsoluteTimeZh } from '../../lib/format';
 import type { Session } from '../../api/types';
 
 interface NavSpec {
@@ -20,30 +18,74 @@ interface NavSpec {
 const NAV: NavSpec[] = [
   { to: '/home', label: '新任务', glyph: '◇' },
   { to: '/apps', label: '应用', glyph: '▦' },
-  // The workspace management page (base files + instructions + skills). This is
-  // where the retired top-of-sidebar WorkspaceSwitcher's "管理工作区" link used
-  // to lead; the base-files nav now owns that entry point.
-  { to: '/workspace', label: '基础文件', glyph: '⌗' },
+  { to: '/workspace', label: '我的工作区', glyph: '⌗' },
   { to: '/library', label: '资源库', glyph: '✦' },
   { to: '/artifacts', label: '产物', glyph: '◈' },
 ];
 
+const UNGROUPED = '__ungrouped__';
+
+interface WorkspaceGroup {
+  key: string;
+  label: string;
+  items: Session[];
+}
+
 export function Sidebar() {
   const { sessions, loadMore, loadingMore, hasMore } = useSessions();
+  const { workspaces } = useWorkspace();
   const userProfile = useChatStore((s) => s.userProfile);
+  const collapsed = useChatStore((s) => s.sidebarCollapsed);
+  const setCollapsed = useChatStore((s) => s.setSidebarCollapsed);
 
   const devBuildLabel = import.meta.env.DEV
     ? `dev ${import.meta.env.VITE_DEV_BUILD_STAMP ?? 'local'}`
     : null;
 
-  // Section the recent sessions into calendar-recency buckets (ChatGPT/Claude
-  // style) so a long list reads as 今天 / 昨天 / 过去 7 天 / … instead of one
-  // undifferentiated wall. `sessions` already arrives newest-first from the
-  // store, so each bucket preserves that order.
-  const recentGroups = RECENCY_BUCKET_ORDER.map((bucket) => ({
-    bucket,
-    items: sessions.filter((s) => recencyBucketZh(s.updated_at) === bucket),
-  })).filter((g) => g.items.length > 0);
+  const wsNameMap = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const w of workspaces) m.set(w.id, w.name);
+    return m;
+  }, [workspaces]);
+
+  const groups = useMemo<WorkspaceGroup[]>(() => {
+    const buckets = new Map<string, Session[]>();
+    for (const s of sessions) {
+      const key = s.workspace_id && wsNameMap.has(s.workspace_id)
+        ? s.workspace_id
+        : UNGROUPED;
+      const list = buckets.get(key);
+      if (list) list.push(s);
+      else buckets.set(key, [s]);
+    }
+
+    const result: WorkspaceGroup[] = [];
+    const ungrouped = buckets.get(UNGROUPED);
+    buckets.delete(UNGROUPED);
+
+    const sorted = [...buckets.entries()].sort((a, b) => {
+      const aMax = a[1][0]?.updated_at ?? '';
+      const bMax = b[1][0]?.updated_at ?? '';
+      return bMax.localeCompare(aMax);
+    });
+
+    for (const [key, items] of sorted) {
+      result.push({ key, label: wsNameMap.get(key) ?? key, items });
+    }
+    if (ungrouped && ungrouped.length > 0) {
+      result.push({ key: UNGROUPED, label: '未分组', items: ungrouped });
+    }
+    return result;
+  }, [sessions, wsNameMap]);
+
+  const toggleGroup = useCallback((key: string) => {
+    setCollapsed((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }, [setCollapsed]);
 
   return (
     <aside className="w-[220px] shrink-0 border-r border-line p-3.5 flex flex-col gap-5 bg-paper overflow-hidden">
@@ -105,15 +147,13 @@ export function Sidebar() {
           <div className="font-mono italic text-dim text-[11px] px-2.5 py-1 shrink-0">暂无任务</div>
         )}
         <div className="flex-1 min-h-0 overflow-y-auto cw-scroll -mx-0.5 px-0.5">
-          {recentGroups.map((g) => (
-            <div key={g.bucket} className="mb-1.5">
-              <div className="text-[10px] text-dim px-2 pt-1.5 pb-1 select-none">{g.bucket}</div>
-              <div className="flex flex-col gap-px">
-                {g.items.map((s) => (
-                  <RecentItem key={s.id} session={s} />
-                ))}
-              </div>
-            </div>
+          {groups.map((g) => (
+            <WorkspaceGroupSection
+              key={g.key}
+              group={g}
+              isCollapsed={collapsed.has(g.key)}
+              onToggle={() => toggleGroup(g.key)}
+            />
           ))}
           {hasMore && (
             <button
@@ -127,7 +167,6 @@ export function Sidebar() {
         </div>
       </nav>
 
-      {/* Admin entry — visible to anyone with at least one admin permission */}
       {canAccessAdmin(userProfile?.permissions) && (
         <div className="pt-2 border-t border-line-2">
           <NavLink
@@ -172,12 +211,44 @@ export function Sidebar() {
   );
 }
 
-/**
- * A single recent-session row in the sidebar. Title-only (ChatGPT/Claude
- * style) — no status glyph, since a wall of coloured dots reads as noise once
- * the list is long. The session's last-updated time is exposed as a hover
- * tooltip instead.
- */
+function WorkspaceGroupSection({
+  group,
+  isCollapsed,
+  onToggle,
+}: {
+  group: WorkspaceGroup;
+  isCollapsed: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="mb-1">
+      <button
+        onClick={onToggle}
+        className="w-full flex items-center gap-1 px-2 pt-2 pb-1 text-left select-none group"
+      >
+        <span className="font-mono text-[9px] text-dim group-hover:text-ink-2 transition-transform duration-150"
+          style={{ transform: isCollapsed ? 'rotate(-90deg)' : 'rotate(0deg)' }}
+        >
+          ▼
+        </span>
+        <span className="text-[10.5px] text-dim group-hover:text-ink-2 truncate font-medium">
+          {group.label}
+        </span>
+        <span className="ml-auto font-mono text-[9px] text-dim">
+          {group.items.length}
+        </span>
+      </button>
+      {!isCollapsed && (
+        <div className="flex flex-col gap-px">
+          {group.items.map((s) => (
+            <RecentItem key={s.id} session={s} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function RecentItem({ session }: { session: Session }) {
   return (
     <NavLink

@@ -60,7 +60,27 @@ export interface WorkspaceFile {
   size_bytes: number;
   description: string;
   sensitivity_level?: DlpSensitivity;
+  current_version?: number | null;
   created_at: string;
+}
+
+/** Historical version snapshot of a workspace file. */
+export interface WorkspaceFileVersion {
+  id: string;
+  workspace_file_id: string;
+  version: number;
+  size_bytes: number;
+  change_summary?: string | null;
+  created_by?: string | null;
+  created_at: string;
+}
+
+/** Admin platform configuration entry. */
+export interface PlatformConfigEntry {
+  key: string;
+  value: unknown;
+  updated_at: string | null;
+  updated_by: string | null;
 }
 
 /** Body for POST /workspaces — only `name` is required. */

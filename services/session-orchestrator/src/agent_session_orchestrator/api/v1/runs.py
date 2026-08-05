@@ -825,6 +825,7 @@ async def create_run(
             "reasoning_effort": body.get("reasoning_effort"),
         },
         "files": files,
+        "workspace_id": session.workspace_id or "",
         # Total attachment bytes for this run; the scheduler maps it
         # to a concrete sandbox memory limit (small vs large tier).
         "total_attachment_bytes": total_attachment_bytes,

@@ -18,7 +18,7 @@ import {
   sensitivityRank,
 } from '../lib/sensitivity';
 import { useChatStore } from '../stores/chatStore';
-import type { DlpSensitivity, WorkspaceFile } from '../api/types';
+import type { DlpSensitivity, WorkspaceFile, WorkspaceFileVersion } from '../api/types';
 
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -222,6 +222,9 @@ export function WorkspacePage() {
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [fileError, setFileError] = useState<string | null>(null);
+
+  // ── Version history ─────────────────────────────────────────────────────
+  const [versionFile, setVersionFile] = useState<WorkspaceFile | null>(null);
 
   // ── Settings dropdown + editor dialogs ──────────────────────────────────
   const [menuOpen, setMenuOpen] = useState(false);
@@ -535,6 +538,20 @@ export function WorkspacePage() {
         {formatRelativeTimeZh(f.created_at)}
       </span>
       <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+        {f.current_version != null && f.current_version > 1 && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setVersionFile(f);
+            }}
+            className="inline-flex items-center justify-center w-[26px] h-[26px] rounded-md text-dim hover:text-ink hover:bg-line-2 transition-colors"
+            title="历史版本"
+            aria-label="历史版本"
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 3v5l3 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/><circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.5"/></svg>
+          </button>
+        )}
         <button
           type="button"
           onClick={(e) => {
@@ -768,7 +785,7 @@ export function WorkspacePage() {
                 )}
               </div>
               <div className="font-mono text-[11px] text-dim">
-                共 {activeWorkspace?.file_count ?? 0} 个基础文件
+                共 {activeWorkspace?.file_count ?? 0} 个文件
               </div>
             </div>
 
@@ -826,7 +843,7 @@ export function WorkspacePage() {
           <div className="px-[22px] py-3.5 border-b border-line-2">
             <div className="flex items-baseline gap-2.5 mb-1.5 flex-wrap">
               <h1 className="m-0 font-display text-[22px] font-normal tracking-[-0.02em] whitespace-nowrap">
-                基础文件
+                我的工作区
               </h1>
               <Chip dashed>始终作为上下文载入</Chip>
             </div>
@@ -959,7 +976,7 @@ export function WorkspacePage() {
               )
             ) : files.length === 0 && effectiveEmptyFolders.length === 0 && !uploading ? (
               <div className="px-[22px] py-8 text-center text-dim text-[12.5px] font-mono">
-                此工作区暂无基础文件
+                此工作区暂无文件
               </div>
             ) : (
               // ── Tree view (folders expand/collapse; files are leaves) ──
@@ -970,7 +987,7 @@ export function WorkspacePage() {
           </div>
 
           <div className="px-[22px] py-2 border-t border-line-2 bg-paper">
-            <span className="cw-label">基础文件 · {files.length}</span>
+            <span className="cw-label">我的工作区 · {files.length}</span>
           </div>
         </section>
 
@@ -1100,6 +1117,18 @@ export function WorkspacePage() {
             </div>
           </div>
         </Dialog>
+      )}
+
+      {versionFile && activeWorkspace && (
+        <VersionHistoryDialog
+          workspaceId={activeWorkspace.id}
+          file={versionFile}
+          onClose={() => setVersionFile(null)}
+          onRestored={() => {
+            setVersionFile(null);
+            toast.success('版本已恢复');
+          }}
+        />
       )}
     </div>
   );
@@ -1475,5 +1504,99 @@ function CreateWorkspaceDialog({
         </div>
       </div>
     </div>
+  );
+}
+
+function VersionHistoryDialog({
+  workspaceId,
+  file,
+  onClose,
+  onRestored,
+}: {
+  workspaceId: string;
+  file: WorkspaceFile;
+  onClose: () => void;
+  onRestored: () => void;
+}) {
+  const [versions, setVersions] = useState<WorkspaceFileVersion[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [restoring, setRestoring] = useState<string | null>(null);
+  const confirm = useConfirm();
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await api.workspaces.listVersions(workspaceId, file.id);
+        if (!cancelled) setVersions(resp.items ?? []);
+      } catch {
+        /* best-effort */
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [workspaceId, file.id]);
+
+  const handleRestore = async (ver: WorkspaceFileVersion) => {
+    const ok = await confirm({ message: `确定恢复到版本 ${ver.version}？当前内容将成为新的历史版本。` });
+    if (!ok) return;
+    setRestoring(ver.id);
+    try {
+      await api.workspaces.restoreVersion(workspaceId, file.id, ver.id);
+      onRestored();
+    } catch {
+      /* best-effort */
+    } finally {
+      setRestoring(null);
+    }
+  };
+
+  // Retention hint: versions older than 90 days may be cleaned up.
+  const retentionDays = 90;
+  const expiryHint = (createdAt: string) => {
+    const expiry = new Date(new Date(createdAt).getTime() + retentionDays * 86400000);
+    return `将于 ${expiry.toLocaleDateString('zh-CN')} 过期`;
+  };
+
+  return (
+    <Dialog title={`历史版本 · ${file.filename}`} onClose={onClose} className="w-full max-w-[520px]">
+      {loading ? (
+        <div className="text-center text-dim text-[13px] py-6">加载中…</div>
+      ) : versions.length === 0 ? (
+        <div className="text-center text-dim text-[13px] py-6">暂无历史版本</div>
+      ) : (
+        <div className="flex flex-col gap-0 max-h-[400px] overflow-y-auto">
+          {versions.map((ver) => (
+            <div
+              key={ver.id}
+              className="flex items-center justify-between px-3 py-2.5 border-b border-line-2 hover:bg-paper-2"
+            >
+              <div className="min-w-0 flex-1">
+                <div className="font-mono text-[12.5px] text-ink">
+                  v{ver.version}
+                  <span className="text-dim ml-2">{formatBytes(ver.size_bytes)}</span>
+                </div>
+                <div className="font-mono text-[11px] text-dim mt-0.5">
+                  {formatRelativeTimeZh(ver.created_at)}
+                  {ver.created_by && <span className="ml-1.5">· {ver.created_by}</span>}
+                </div>
+                <div className="font-mono text-[10px] text-dim mt-0.5 opacity-60">
+                  {expiryHint(ver.created_at)}
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => handleRestore(ver)}
+                disabled={restoring === ver.id}
+                className="cw-btn cw-btn-sm text-[11px] ml-2 shrink-0"
+              >
+                {restoring === ver.id ? '恢复中…' : '恢复'}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </Dialog>
   );
 }

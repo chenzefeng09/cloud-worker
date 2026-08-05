@@ -784,3 +784,45 @@ async def admin_daily_usage(
     return await _proxy_get(
         request, url, _auth, tenant_id, forward_params=True, admin_actor=False,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Platform Config (→ session-orchestrator)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/admin/platform/config")
+async def admin_list_config(
+    request: Request,
+    tenant_id: str | None = None,
+    _auth: tuple = Depends(require_admin_module_bff("platform.admin")),
+) -> dict:
+    url = (
+        f"{request.app.state.settings.session_orchestrator_url}"
+        f"/admin/config"
+    )
+    return await _proxy_get(request, url, _auth, tenant_id, forward_params=True)
+
+
+@router.put("/admin/platform/config/{key:path}")
+async def admin_update_config(
+    key: str,
+    request: Request,
+    tenant_id: str | None = None,
+    _auth: tuple = Depends(require_admin_module_bff("platform.admin")),
+) -> dict:
+    url = (
+        f"{request.app.state.settings.session_orchestrator_url}"
+        f"/admin/config/{key}"
+    )
+    headers = _scope_headers(_auth, tenant_id=tenant_id, admin_actor=True)
+    body = await request.json()
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.put(url, json=body, headers=headers)
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"upstream unreachable: {url} ({exc})",
+        ) from exc
+    _raise_for_upstream(resp)
+    return resp.json()

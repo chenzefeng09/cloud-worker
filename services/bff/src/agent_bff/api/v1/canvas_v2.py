@@ -744,15 +744,59 @@ async def canvas_v2_edit(
             payload = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
+                "stream": True,
                 "response_format": {"type": "json_object"},
             }
+            gw_url = f"{gateway_url.rstrip('/')}/chat/completions"
             try:
-                resp = await gw_client.post(
-                    f"{gateway_url.rstrip('/')}/chat/completions",
-                    json=payload,
-                    headers=gw_headers,
-                )
+                async with gw_client.stream("POST", gw_url, json=payload, headers=gw_headers) as resp:
+                    if resp.status_code != 200:
+                        await resp.aread()
+                        logger.warning(
+                            "canvas v2 edit gateway HTTP %s (session %s)",
+                            resp.status_code,
+                            session_id,
+                        )
+                        upstream_user_message: str | None = None
+                        try:
+                            body = resp.json()
+                            if isinstance(body, dict):
+                                um = body.get("user_message")
+                                if isinstance(um, str) and um:
+                                    upstream_user_message = um
+                        except Exception:  # noqa: BLE001
+                            pass
+                        raise _problem(
+                            502,
+                            upstream_user_message or "模型服务返回错误，请稍后重试。",
+                            code="AGENT.BFF.CANVAS.GATEWAY_ERROR",
+                            detail=f"llm-gateway returned HTTP {resp.status_code}",
+                        )
+
+                    content_parts: list[str] = []
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[len("data: "):]
+                        if data_str.strip() == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            part = delta.get("content")
+                            if part:
+                                content_parts.append(part)
+                        except (json.JSONDecodeError, IndexError, KeyError):
+                            continue
+                    content = "".join(content_parts)
+                    if not content:
+                        logger.warning("canvas v2 edit: empty streamed content (session %s)", session_id)
+                        raise _problem(
+                            502,
+                            "模型返回内容为空，请重试。",
+                            code="AGENT.BFF.CANVAS.BAD_COMPLETION",
+                            detail="streamed completion yielded no content",
+                        )
             except httpx.TimeoutException as exc:
                 logger.warning("canvas v2 edit gateway timeout (session %s): %s", session_id, exc)
                 raise _problem(
@@ -768,42 +812,6 @@ async def canvas_v2_edit(
                     "模型服务暂时不可用，请稍后重试。",
                     code="AGENT.BFF.CANVAS.GATEWAY_UNAVAILABLE",
                     detail=f"llm-gateway unreachable: {exc}",
-                ) from exc
-
-            if resp.status_code != 200:
-                logger.warning(
-                    "canvas v2 edit gateway HTTP %s (session %s)",
-                    resp.status_code,
-                    session_id,
-                )
-                upstream_user_message: str | None = None
-                try:
-                    body = resp.json()
-                    if isinstance(body, dict):
-                        um = body.get("user_message")
-                        if isinstance(um, str) and um:
-                            upstream_user_message = um
-                except Exception:  # noqa: BLE001
-                    pass
-                raise _problem(
-                    502,
-                    upstream_user_message or "模型服务返回错误，请稍后重试。",
-                    code="AGENT.BFF.CANVAS.GATEWAY_ERROR",
-                    detail=f"llm-gateway returned HTTP {resp.status_code}",
-                )
-
-            try:
-                data = resp.json()
-                content = data["choices"][0]["message"]["content"]
-                if not isinstance(content, str):
-                    content = str(content)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("canvas v2 edit: failed to parse gateway completion: %s", exc)
-                raise _problem(
-                    502,
-                    "模型返回内容无法解析，请重试。",
-                    code="AGENT.BFF.CANVAS.BAD_COMPLETION",
-                    detail="unexpected chat/completions response shape",
                 ) from exc
 
             try:

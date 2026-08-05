@@ -515,9 +515,8 @@ async def _stream_completion_into_redis(
 
     * each ``data: {json}`` line is a chunk; ``choices[0].delta.content`` is a
       body token → XADD a ``delta`` entry; ``delta.reasoning_content`` is a
-      DeepSeek-style reasoning token → **accumulate** (never push per-token —
-      historical bug fragmented thinking into N blocks) and flush a single
-      ``thinking`` entry when reasoning ends (first body token or stream end);
+      DeepSeek-style reasoning token → XADD a ``thinking_delta`` entry per
+      token for real-time streaming (the frontend appends incrementally);
     * ``delta.tool_calls`` fragments are accumulated by index (never streamed to
       Redis — the canvas result is surfaced as a synthesized ``canvas_created``
       event by the caller, not as raw tool tokens);
@@ -572,22 +571,13 @@ async def _stream_completion_into_redis(
     usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
     reasoning_buf: list[str] = []
     body_buf: list[str] = []
-    thinking_flushed = False
+    thinking_phase = True
     tool_fragments: dict[int, dict[str, Any]] = {}
     finish_reason: str | None = None
     # Count of delta/thinking entries already XADDed to the token stream.  Carried
     # on InlineGatewayError so the caller knows whether a retry is safe (0 ⇒ the
     # frontend saw nothing from this round yet).
     streamed_entries = 0
-
-    async def _flush_thinking() -> None:
-        nonlocal streamed_entries, thinking_flushed
-        if reasoning_buf and not thinking_flushed:
-            text = "".join(reasoning_buf)
-            if text:
-                await _xadd(redis_client, run_id, {"type": "thinking", "text": text})
-                streamed_entries += 1
-            thinking_flushed = True
 
     url = f"{gateway_url.rstrip('/')}/chat/completions"
     async with client.stream("POST", url, json=payload, headers=headers) as resp:
@@ -642,7 +632,11 @@ async def _stream_completion_into_redis(
 
             reasoning = delta.get("reasoning_content")
             if reasoning:
-                reasoning_buf.append(str(reasoning))
+                text = str(reasoning)
+                reasoning_buf.append(text)
+                if text:
+                    await _xadd(redis_client, run_id, {"type": "thinking_delta", "text": text})
+                    streamed_entries += 1
 
             # Accumulate tool-call fragments by index (id/name arrive first, then
             # arguments stream in over subsequent chunks).
@@ -661,16 +655,12 @@ async def _stream_completion_into_redis(
 
             content = delta.get("content")
             if content:
-                # First body token marks the end of the reasoning phase.
-                await _flush_thinking()
+                if thinking_phase:
+                    thinking_phase = False
                 text = str(content)
                 body_buf.append(text)
                 await _xadd(redis_client, run_id, {"type": "delta", "text": text})
                 streamed_entries += 1
-
-    # Stream ended without any body token after reasoning (rare) — flush now so
-    # the reasoning block is not lost.
-    await _flush_thinking()
 
     if usage["total_tokens"] == 0 and (usage["input_tokens"] or usage["output_tokens"]):
         usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
@@ -784,6 +774,7 @@ async def _materialize_inline_canvas(
     run_id: str,
     redis_client: Any,
     args: dict[str, Any],
+    skip_guard: bool = False,
 ) -> bool:
     """Materialize a canvas from an inline ``create_canvas`` tool call, in-process.
 
@@ -861,6 +852,7 @@ async def _materialize_inline_canvas(
                     title=str(title or "").strip() or None,
                     content_markdown=content_markdown,
                     content_type=content_type,
+                    skip_guard=skip_guard,
                 )
                 if result is not None:
                     canvas_id, message_id = result
@@ -1582,6 +1574,7 @@ async def _run_completion_with_tools(
                     "title": rescue_title,
                     "content_markdown": body_text_all,
                 },
+                skip_guard=True,
             )
         else:
             # Lie/stub reply: the body is too short to be the article (a phantom-
@@ -1619,11 +1612,9 @@ async def _run_completion_with_tools(
                     tools=None,
                     tool_choice=None,
                 )
-            except InlineGatewayError as exc:
-                # A failed rescue completion is non-fatal: the run still finishes on
-                # the (short) reply it already produced.
+            except Exception as exc:
                 logger.warning(
-                    "inline canvas rescue (silent-completion): fetch failed, abandoning",
+                    "inline canvas rescue (silent-completion): fetch failed",
                     extra={"run_id": run_id, "err": str(exc)},
                 )
             if rescue_usage is not None:
@@ -1648,12 +1639,32 @@ async def _run_completion_with_tools(
                         "title": rescue_title,
                         "content_markdown": rescue_text,
                     },
+                    skip_guard=True,
+                )
+            elif body_text_all.strip():
+                logger.info(
+                    "inline canvas rescue: silent fetch too short, "
+                    "falling back to original body",
+                    extra={"run_id": run_id, "chars": len(body_text_all.strip())},
+                )
+                await _materialize_inline_canvas(
+                    settings=settings,
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    run_id=run_id,
+                    redis_client=redis_client,
+                    args={
+                        "kind": "article",
+                        "title": rescue_title,
+                        "content_markdown": body_text_all,
+                    },
+                    skip_guard=True,
                 )
             else:
                 logger.warning(
-                    "inline canvas rescue (silent-completion): fetched text too short, "
-                    "abandoning rescue",
-                    extra={"run_id": run_id, "chars": len(rescue_text.strip())},
+                    "inline canvas rescue: no usable text, abandoning",
+                    extra={"run_id": run_id},
                 )
 
     total_usage["total_tokens"] = total_usage.get("total_tokens", 0) or (

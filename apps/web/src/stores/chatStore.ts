@@ -234,6 +234,13 @@ interface ChatState {
     offset?: string,
   ) => void;
 
+  appendStreamingThinkingDelta: (
+    sessionId: string,
+    runId: string,
+    delta: string,
+    offset?: string,
+  ) => void;
+
   /**
    * Remove temporary blocks whose `streamRunId` matches `runId`.  Called when
    * real DB messages arrive.  When `kind` is given, only streaming blocks of
@@ -394,6 +401,10 @@ interface ChatState {
    * opt-out so the next run sends `include_platform_defaults: false`.
    */
   setPlatformDefaultsEnabled: (sessionId: string, enabled: boolean) => void;
+
+  /** Sidebar workspace groups that are collapsed (stored in localStorage). */
+  sidebarCollapsed: Set<string>;
+  setSidebarCollapsed: (updater: (prev: Set<string>) => Set<string>) => void;
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -467,6 +478,23 @@ function pendingInteractionKey(runId: string, toolCallId: string): string {
  * Reserved, never a real session id (those are `ses_…`).
  */
 export const DRAFT_SESSION_ID = '__draft__';
+
+const SIDEBAR_COLLAPSED_KEY = 'cw.sidebar.collapsed';
+
+function loadSidebarCollapsed(): Set<string> {
+  try {
+    const raw = localStorage.getItem(SIDEBAR_COLLAPSED_KEY);
+    return raw ? new Set(JSON.parse(raw) as string[]) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function saveSidebarCollapsed(set: Set<string>): void {
+  try {
+    localStorage.setItem(SIDEBAR_COLLAPSED_KEY, JSON.stringify([...set]));
+  } catch { /* ignore */ }
+}
 
 const EXECUTION_MODE_STORAGE_KEY = 'chat-execution-mode-v1';
 
@@ -589,6 +617,13 @@ export const useChatStore = create<ChatState>((set) => ({
   platformDefaultsEnabled: {},
   pendingInteractions: {},
   acknowledgedPendingInteractions: {},
+  sidebarCollapsed: loadSidebarCollapsed(),
+  setSidebarCollapsed: (updater) =>
+    set((s) => {
+      const next = updater(s.sidebarCollapsed);
+      saveSidebarCollapsed(next);
+      return { sidebarCollapsed: next };
+    }),
 
   setSessions: (sessions) => set({ sessions }),
   setSessionsCursor: (cursor) => set({ sessionsCursor: cursor }),
@@ -722,7 +757,15 @@ export const useChatStore = create<ChatState>((set) => ({
       }
 
       // No open text block — create a new one.
-      const seq = countTextBlocks(existing, runId);
+      // Seal any streaming thinking block for this run (thinking phase ended).
+      let base = existing;
+      const thinkIdx = base.findIndex(
+        (m) => m.streamRunId === runId && m.blockKind === 'thinking' && m.streaming,
+      );
+      if (thinkIdx !== -1) {
+        base = base.map((m, i) => (i === thinkIdx ? { ...m, streaming: false } : m));
+      }
+      const seq = countTextBlocks(base, runId);
       const placeholder: Message = {
         id: `stream_${runId}_${seq}`,
         session_id: sessionId,
@@ -737,7 +780,7 @@ export const useChatStore = create<ChatState>((set) => ({
         streamRunId: runId,
       };
       return {
-        messages: { ...s.messages, [sessionId]: [...existing, placeholder] },
+        messages: { ...s.messages, [sessionId]: [...base, placeholder] },
         streamOffsets,
       };
     }),
@@ -857,6 +900,53 @@ export const useChatStore = create<ChatState>((set) => ({
             thinkingBlock,
             ...existing.slice(openTextIdx),
           ];
+      return {
+        messages: { ...s.messages, [sessionId]: nextMessages },
+        streamOffsets,
+      };
+    }),
+
+  appendStreamingThinkingDelta: (sessionId, runId, delta, offset) =>
+    set((s) => {
+      if (isRunStreamClosed(s, sessionId, runId)) return s;
+      if (isReplayOffset(s, sessionId, runId, offset)) return s;
+      const streamOffsets = recordOffset(s.streamOffsets, sessionId, runId, offset);
+
+      const existing = getMessages(s, sessionId);
+      const thinkingIdx = existing.findIndex(
+        (m) => m.streamRunId === runId && m.blockKind === 'thinking' && m.streaming,
+      );
+
+      let nextMessages: Message[];
+      if (thinkingIdx !== -1) {
+        nextMessages = existing.map((m, i) =>
+          i === thinkingIdx ? { ...m, content: m.content + delta } : m,
+        );
+      } else {
+        const thinkingBlock: Message = {
+          id: `thinking_${runId}_stream`,
+          session_id: sessionId,
+          role: 'ASSISTANT',
+          content: delta,
+          tool_calls: null,
+          run_id: runId,
+          sequence: 0,
+          created_at: new Date().toISOString(),
+          streaming: true,
+          blockKind: 'thinking',
+          streamRunId: runId,
+        };
+        const openTextIdx = existing.findIndex(
+          (m) => m.streamRunId === runId && m.blockKind === 'text' && m.streaming,
+        );
+        nextMessages = openTextIdx === -1
+          ? [...existing, thinkingBlock]
+          : [
+              ...existing.slice(0, openTextIdx),
+              thinkingBlock,
+              ...existing.slice(openTextIdx),
+            ];
+      }
       return {
         messages: { ...s.messages, [sessionId]: nextMessages },
         streamOffsets,

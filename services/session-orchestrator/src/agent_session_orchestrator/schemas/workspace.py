@@ -80,6 +80,28 @@ class WorkspaceFileOut(BaseModel):
     size_bytes: int
     description: str | None = None
     sensitivity_level: str
+    current_version: int | None = None
     created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+
+class WorkspaceFileVersionOut(BaseModel):
+    id: str
+    workspace_file_id: str
+    version: int
+    size_bytes: int
+    change_summary: str | None = None
+    created_by: str | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+
+class PlatformConfigOut(BaseModel):
+    key: str
+    value: Any
+    updated_at: datetime
+    updated_by: str | None = None
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)

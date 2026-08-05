@@ -211,6 +211,7 @@ class DockerRuntime:
         hitl: bool = True,
         resume: dict[str, Any] | None = None,
         user_clearance: str = "",
+        workspace_id: str = "",
     ) -> str:
         """Spawn a sandbox container for one agent run.
 
@@ -287,6 +288,7 @@ class DockerRuntime:
             sampling_params=sampling_params,
             hitl=hitl,
             resume=resume,
+            workspace_writeback=bool(workspace_id),
         )
 
         # When the ``llm_gateway_enforcer`` extension is active, the sandbox
@@ -549,6 +551,7 @@ class DockerRuntime:
                     "agent-platform.run-id": run_id,
                     "agent-platform.session-id": session_id,
                     "agent-platform.tenant-id": tenant_id,
+                    **({"agent-platform.workspace-id": workspace_id} if workspace_id else {}),
                     **egress_labels,
                 },
                 remove=False,
@@ -723,40 +726,26 @@ class DockerRuntime:
                 if payload.get("status") == "FAILED" and result["status"] == "COMPLETED":
                     result["status"] = "FAILED"
 
-            # Upload artifacts to S3 and attach the list to the result.
-            # Failure-open: any upload error is logged; the run result
-            # is still returned without the failed artifact.
-            result["artifacts"] = self._upload_artifacts(
+            # Unified output-file scan: one pass uploads all files to S3 and
+            # returns two lists — workspace_files (for workspace persistence)
+            # and artifacts (outputs/ subset, for chat output-file cards).
+            workspace_id = labels.get("agent-platform.workspace-id", "")
+            output = artifact_store.upload_run_output_files(
                 workspace=workspace,
                 tenant_id=tenant_id,
                 session_id=session_id,
                 run_id=run_id,
+                workspace_id=workspace_id,
+                bucket=self._settings.s3_bucket,
+                s3_client=self._make_s3_client(),
+                excluded_names=self._EXCLUDED_NAMES,
             )
+            result["artifacts"] = output["artifacts"]
+            if workspace_id:
+                result["writeback_files"] = output["workspace_files"]
         return result
 
-    # ---------------------------------------------------------------- artifacts
-    # Kept as thin wrappers over ``artifact_store`` so the cube runtime
-    # publishes byte-identical artifact records from its own host-mount.
     _EXCLUDED_NAMES: frozenset[str] = artifact_store.EXCLUDED_NAMES
-
-    def _upload_artifacts(
-        self,
-        *,
-        workspace: Path,
-        tenant_id: str,
-        session_id: str,
-        run_id: str,
-    ) -> list[dict[str, Any]]:
-        """Scan ``workspace`` for output files and upload them to S3."""
-        return artifact_store.upload_run_artifacts(
-            workspace=workspace,
-            tenant_id=tenant_id,
-            session_id=session_id,
-            run_id=run_id,
-            bucket=self._settings.s3_bucket,
-            s3_client=self._make_s3_client(),
-            excluded_names=self._EXCLUDED_NAMES,
-        )
 
     def _make_s3_client(self) -> Any | None:
         """Build a boto3 S3 client using S3_* settings (not AWS_* env vars)."""
@@ -859,6 +848,7 @@ class DockerRuntime:
         sampling_params: dict[str, Any] | None = None,
         hitl: bool = True,
         resume: dict[str, Any] | None = None,
+        workspace_writeback: bool = False,
     ) -> Path:
         """Write the task payload ``runtime_worker`` will read.
 
@@ -936,6 +926,7 @@ class DockerRuntime:
             # ({"kind","tool_call_id","confirmed","answer","agent_state"}).
             "hitl": bool(hitl),
             "resume": resume,
+            "workspace_writeback": bool(workspace_writeback),
         }
         # Presence-carried: only write the key when the run made a choice.
         # ``is not None`` — NOT truthiness — because ``[]`` ("disable all MCP")

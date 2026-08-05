@@ -1,12 +1,18 @@
-"""Shared run-artifact upload for the sandbox runtimes.
+"""Shared run-output upload for the sandbox runtimes.
 
 Both runtimes end a run the same way: a per-run host directory (docker bind
-mount / cube host-mount) holds whatever the agent wrote, and the orchestrator
-wants that turned into an ``artifacts`` list.  Keeping the scan, the exclusion
-list and the S3 key layout here means the two runtimes cannot drift on which
-files get published — a drift that previously left cube runs with no artifacts
-at all, so assistant replies referencing ``![chart](chart.png)`` rendered as
-"image not found" in the UI.
+mount / cube host-mount) holds whatever the agent wrote.  This module scans
+that directory once, uploads every output file to S3, and returns two
+categorised lists the orchestrator consumes independently:
+
+* **workspace_files** — every output file; the orchestrator's
+  ``process_writeback`` creates/updates ``WorkspaceFile`` rows so the file
+  appears in the workspace file list.
+* **artifacts** — the subset written to ``outputs/``; the orchestrator
+  persists ``Attachment(kind=output)`` rows so the chat UI shows output-file
+  cards for the deliverables the agent explicitly placed there.
+
+Both lists reference the **same S3 blob** (single upload, no duplication).
 """
 
 from __future__ import annotations
@@ -80,31 +86,50 @@ def make_s3_client(settings: Any) -> Any | None:
         return None
 
 
-def upload_run_artifacts(
+def upload_run_output_files(
     *,
     workspace: Path,
     tenant_id: str,
     session_id: str,
     run_id: str,
+    workspace_id: str,
     bucket: str,
     s3_client: Any | None,
     excluded_names: frozenset[str] = EXCLUDED_NAMES,
-) -> list[dict[str, Any]]:
-    """Scan ``workspace`` for output files and upload them to S3.
+) -> dict[str, list[dict[str, Any]]]:
+    """Scan the per-run workspace for output files, upload once, return two lists.
 
-    Skipped: the control-plane files in ``excluded_names`` (root level only, so
-    an agent's own ``outputs/result.json`` still ships) and everything under
-    ``inputs/`` (user-uploaded originals, already stored).  Returns::
+    Returns::
 
-        [{"filename": str, "s3_key": str, "size": int, "mime": str}, ...]
+        {
+            "workspace_files": [          # ALL output files → workspace persistence
+                {"filename": str, "s3_key": str, "size_bytes": int, "mime": str},
+                ...
+            ],
+            "artifacts": [                # outputs/ subset → chat output-file cards
+                {"filename": str, "s3_key": str, "size": int, "mime": str},
+                ...
+            ],
+        }
+
+    When ``workspace_id`` is non-empty the S3 key uses the workspace namespace
+    (``tenant/{tid}/workspaces/{wid}/files/...``) so the blob is owned by the
+    workspace.  When empty the legacy session/run namespace is used and only
+    ``artifacts`` is populated (no workspace to write back to).
+
+    Skipped: control-plane files in ``excluded_names`` (root level only, so an
+    agent's own ``outputs/result.json`` still ships) and everything under
+    ``inputs/`` (user-uploaded originals, already stored).
 
     Failure-open: individual file errors are logged and skipped.
     """
     if not workspace.is_dir() or s3_client is None:
-        return []
+        return {"workspace_files": [], "artifacts": []}
 
+    workspace_files: list[dict[str, Any]] = []
     artifacts: list[dict[str, Any]] = []
     inputs_dir = workspace / "inputs"
+    outputs_dir = workspace / "outputs"
 
     for fpath in sorted(workspace.rglob("*")):
         if not fpath.is_file():
@@ -112,7 +137,7 @@ def upload_run_artifacts(
         # Skip inputs/ subdirectory.
         try:
             fpath.relative_to(inputs_dir)
-            continue  # inside inputs/ — skip
+            continue
         except ValueError:
             pass
         # Skip system files at workspace root.
@@ -120,10 +145,18 @@ def upload_run_artifacts(
             continue
 
         relpath = fpath.relative_to(workspace).as_posix()
-        s3_key = (
-            f"tenant/{tenant_id}/sessions/{session_id}"
-            f"/runs/{run_id}/artifacts/{relpath}"
-        )
+
+        if workspace_id:
+            s3_key = (
+                f"tenant/{tenant_id}/workspaces/{workspace_id}"
+                f"/files/{run_id}/{relpath}"
+            )
+        else:
+            s3_key = (
+                f"tenant/{tenant_id}/sessions/{session_id}"
+                f"/runs/{run_id}/artifacts/{relpath}"
+            )
+
         try:
             data = fpath.read_bytes()
             mime = guess_mime(fpath.name)
@@ -133,20 +166,39 @@ def upload_run_artifacts(
                 Body=data,
                 ContentType=mime,
             )
+            logger.info(
+                "output file uploaded",
+                extra={"s3_key": s3_key, "size": len(data), "run_id": run_id},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "output file upload failed (failure-open)",
+                extra={"path": str(fpath), "err": str(exc)},
+            )
+            continue
+
+        # workspace_files: everything (writeback to workspace)
+        if workspace_id:
+            workspace_files.append({
+                "filename": relpath,
+                "blob_key": s3_key,
+                "size_bytes": len(data),
+                "mime": mime,
+            })
+
+        # artifacts: only outputs/ files (chat output-file cards)
+        is_output = False
+        try:
+            fpath.relative_to(outputs_dir)
+            is_output = True
+        except ValueError:
+            pass
+        if is_output:
             artifacts.append({
                 "filename": fpath.name,
                 "s3_key": s3_key,
                 "size": len(data),
                 "mime": mime,
             })
-            logger.info(
-                "artifact uploaded",
-                extra={"s3_key": s3_key, "size": len(data), "run_id": run_id},
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "artifact upload failed (failure-open)",
-                extra={"path": str(fpath), "err": str(exc)},
-            )
 
-    return artifacts
+    return {"workspace_files": workspace_files, "artifacts": artifacts}

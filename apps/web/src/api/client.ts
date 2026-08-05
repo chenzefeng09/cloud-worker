@@ -180,7 +180,9 @@ import type {
   WorkspaceFile,
   WorkspaceCreate,
   WorkspaceUpdate,
+  WorkspaceFileVersion,
   DlpSensitivity,
+  PlatformConfigEntry,
 } from './types';
 
 const BFF_BASE = '/api/bff/v1';
@@ -463,6 +465,16 @@ export const api = {
       }
       return { text, blob, mime };
     },
+    listVersions: (wsId: string, fileId: string) =>
+      request<{ items: WorkspaceFileVersion[] }>(
+        'GET',
+        `/workspaces/${wsId}/files/${fileId}/versions`,
+      ),
+    restoreVersion: (wsId: string, fileId: string, versionId: string) =>
+      request<void>(
+        'POST',
+        `/workspaces/${wsId}/files/${fileId}/versions/${versionId}/restore`,
+      ),
   },
 
   // ─── Canvas v2 (→ session-orchestrator /sessions/{sid}/canvases, /canvases/{cid}) ──
@@ -1460,6 +1472,19 @@ export const api = {
         create: (body: RecordConsentRequest, tenantId?: string) =>
           request<ConsentRecord>('POST', `/admin/data-protection/consent${qs({ tenant_id: tenantId })}`, body),
       },
+    },
+    platformConfig: {
+      list: (prefix?: string, tenantId?: string) =>
+        request<{ items: PlatformConfigEntry[] }>(
+          'GET',
+          `/admin/platform/config${qs({ prefix, tenant_id: tenantId })}`,
+        ),
+      set: (key: string, value: unknown, tenantId?: string) =>
+        request<PlatformConfigEntry>(
+          'PUT',
+          `/admin/platform/config/${key}${qs({ tenant_id: tenantId })}`,
+          { value },
+        ),
     },
   },
 

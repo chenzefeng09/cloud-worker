@@ -53,6 +53,6 @@ export function toWorkspaceView(ws: Workspace): WorkspaceView {
   const accent = ws.meta?.accent?.trim() || DEFAULT_ACCENT;
   const desc =
     ws.description?.trim() ||
-    (ws.file_count > 0 ? `${ws.file_count} 个基础文件` : '上下文 · 文件 · 技能');
+    (ws.file_count > 0 ? `${ws.file_count} 个文件` : '上下文 · 文件 · 技能');
   return { id: ws.id, name: ws.name, glyph, desc, accent };
 }
