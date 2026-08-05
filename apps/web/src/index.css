@@ -435,6 +435,212 @@ body {
   margin-bottom: 0;
 }
 
+/* Character-scoped canvas v2 magic-edit.  The accepted document is rendered
+   around paired orig/sugg blocks; only Accept commits the full-block snapshot. */
+.canvas-magic-edit {
+  position: relative;
+  min-height: 360px;
+}
+
+.canvas-magic-edit-head {
+  position: sticky;
+  top: 8px;
+  z-index: 3;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+  padding: 9px 10px;
+  border: 1px solid rgba(44, 95, 138, 0.2);
+  border-radius: 9px;
+  background: rgba(255, 253, 247, 0.96);
+  box-shadow: 0 8px 22px rgba(21, 23, 26, 0.08);
+}
+
+.canvas-magic-edit-document {
+  user-select: text;
+}
+
+.canvas-magic-edit-segment {
+  margin: 8px 0 18px;
+}
+
+.canvas-magic-edit-context > :first-child {
+  margin-top: 0;
+}
+
+.canvas-magic-edit-context > :last-child {
+  margin-bottom: 8px;
+}
+
+.canvas-magic-edit-orig,
+.canvas-magic-edit-sugg {
+  position: relative;
+  margin: 6px 0;
+  padding: 9px 11px 9px 30px;
+  border-radius: 7px;
+  white-space: pre-wrap;
+}
+
+.canvas-magic-edit-orig::before,
+.canvas-magic-edit-sugg::before {
+  position: absolute;
+  left: 10px;
+  top: 9px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.canvas-magic-edit-orig {
+  border-left: 2px solid rgba(210, 58, 31, 0.5);
+  background: rgba(210, 58, 31, 0.055);
+  color: var(--dim);
+  text-decoration: line-through;
+}
+
+.canvas-magic-edit-orig::before {
+  content: '−';
+  color: #b6452f;
+}
+
+.canvas-magic-edit-sugg {
+  border-left: 2px solid rgba(45, 108, 223, 0.56);
+  background: rgba(45, 108, 223, 0.075);
+  color: #1f5db8;
+}
+
+.canvas-magic-edit-sugg::before {
+  content: '+';
+  color: #2d6cdf;
+}
+
+.canvas-magic-edit-sugg > :first-child {
+  margin-top: 0;
+}
+
+.canvas-magic-edit-sugg > :last-child {
+  margin-bottom: 0;
+}
+
+/* Block-level op badges (删除 / 新增) shown above a changed / inserted block. */
+.canvas-magic-edit-tag {
+  display: inline-block;
+  margin-bottom: 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.canvas-magic-edit-tag[data-op='delete'] {
+  color: #d23a1f;
+  background: rgba(210, 58, 31, 0.1);
+}
+
+.canvas-magic-edit-tag[data-op='insert_after'] {
+  color: #1f5db8;
+  background: rgba(45, 108, 223, 0.1);
+}
+
+/* ── Version history dropdown ─────────────────────────────────────────────── */
+.canvas-card-history {
+  position: relative;
+}
+
+.canvas-card-history-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  width: 260px;
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--surface);
+  box-shadow: 0 12px 28px rgba(21, 23, 26, 0.14);
+  padding: 4px;
+}
+
+.canvas-card-history-head {
+  padding: 6px 8px 4px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--dim);
+  font-weight: 700;
+}
+
+.canvas-card-history-empty,
+.canvas-card-history-error {
+  padding: 8px;
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.canvas-card-history-error {
+  color: #d23a1f;
+}
+
+.canvas-card-history-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.canvas-card-history-item:hover:not(:disabled) {
+  background: var(--paper-2);
+}
+
+.canvas-card-history-item:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.canvas-card-history-ver {
+  flex-shrink: 0;
+  margin-top: 1px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 700;
+  color: #2c5f8a;
+}
+
+.canvas-card-history-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.canvas-card-history-summary {
+  font-size: 12.5px;
+  color: var(--ink-2);
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.canvas-card-history-sub {
+  font-size: 10.5px;
+  color: var(--dim);
+}
+
 .canvas-inline-editor {
   min-height: 360px;
   font-size: 15px;
@@ -454,6 +660,41 @@ body {
   color: var(--accent);
   font-size: 12.5px;
   font-weight: 600;
+}
+
+.canvas-card-edit-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 7px 10px;
+  border: 1px solid rgba(210, 58, 31, 0.5);
+  border-radius: var(--r-md);
+  background: rgba(210, 58, 31, 0.08);
+  color: #d23a1f;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.canvas-card-edit-error-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.canvas-card-edit-error-dismiss {
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: #d23a1f;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  padding: 1px 2px;
+  opacity: 0.7;
+}
+
+.canvas-card-edit-error-dismiss:hover {
+  opacity: 1;
 }
 
 .canvas-message-card-foot {
@@ -566,6 +807,11 @@ body {
 .canvas-selection-send:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+/* 「要求更改」输入态下的持久选区高亮(CSS Custom Highlight API)。 */
+::highlight(canvas-pending-edit) {
+  background-color: var(--canvas-pending-highlight);
 }
 
 @media (max-width: 720px) {
@@ -927,6 +1173,7 @@ body {
   --accent:      #d23a1f;
   --accent-soft: rgba(210, 58, 31, 0.08);
   --accent-line: rgba(210, 58, 31, 0.5);
+  --canvas-pending-highlight: rgba(210, 58, 31, 0.20);
   --r-sm: 4px;
   --r-md: 6px;
   --r-lg: 10px;

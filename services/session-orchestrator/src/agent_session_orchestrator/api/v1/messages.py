@@ -31,6 +31,7 @@ import asyncio
 import datetime as dt
 import json
 import logging
+import re
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import suppress
 from typing import Any
@@ -69,10 +70,127 @@ _WORKER_COLDSTART_GRACE_SECONDS = 90.0
 # ever writing its `end` marker.
 _ACTIVE_IDLE_HARDCAP_READS = 600  # ~10 min of pure silence ⇒ assume crashed worker
 _RUN_STATUS_RECHECK_READS = 5  # recheck run status every ~5s of idle
+# Grace window after which a RUNNING/PENDING run whose sandbox the scheduler no
+# longer knows about (``GET /runs/{sandbox_id}`` → 404) *and* whose token stream
+# carries no ``end`` marker is force-FAILED.  A 404 can be momentary right at
+# spawn (the container id is registered a beat after the run row is written), so
+# we only give up once the run has been alive comfortably longer than any cold
+# start.  Module-level so tests can monkeypatch it to a small value.
+_SANDBOX_GONE_GRACE_SECONDS = 30 * 60  # 30 minutes
 
 
 def _run_token_stream_key(run_id: str) -> str:
     return f"agent:run:{run_id}:tokens"
+
+
+def _run_canvas_key(run_id: str) -> str:
+    return f"agent:run:{run_id}:canvas"
+
+
+# ── Canvas materialization guard (canvas v2, Phase B) ─────────────────────────
+# Server-authoritative over-trigger guard: even though the worker's system
+# prompt tells the model to reserve ``create_canvas`` for substantial
+# deliverables, the model can still over-fire.  Before materializing a payload
+# from run-state we require it to look like a real long-form document; anything
+# below threshold is skipped (logged at INFO, fail-open — the content is already
+# in the chat message, so skipping loses nothing).  Module-level so they are
+# easy to tune.
+_CANVAS_MIN_CHARS = 200  # min whitespace-stripped content_markdown length
+_CANVAS_MIN_BLOCKS = 2    # min paragraphs (split on blank lines)
+_CANVAS_MIN_HTML_CHARS = 40  # min length for an executable HTML canvas
+
+
+def _canvas_payload_passes_guard(payload: dict[str, Any]) -> bool:
+    """True when a run-state canvas payload is substantial enough to materialize.
+
+    Prose (content_type="markdown") must clear ``_CANVAS_MIN_CHARS`` and split
+    into at least ``_CANVAS_MIN_BLOCKS`` blank-line-separated segments.  An
+    executable HTML canvas (content_type="html") is stored as one verbatim block,
+    so the blank-line-segment rule does not apply — it only needs a non-trivial
+    document (``_CANVAS_MIN_HTML_CHARS``).  Shared by the streaming and reconcile
+    materialization paths so both apply the identical rule.
+    """
+    content = str(payload.get("content_markdown") or "")
+    stripped = content.strip()
+    if str(payload.get("content_type") or "markdown") == "html":
+        return len(stripped) >= _CANVAS_MIN_HTML_CHARS
+    if len(stripped) < _CANVAS_MIN_CHARS:
+        return False
+    segments = [seg for seg in re.split(r"\n{2,}", stripped) if seg.strip()]
+    return len(segments) >= _CANVAS_MIN_BLOCKS
+
+
+async def materialize_one_canvas(
+    *,
+    canvas_svc: Any,
+    run: Run,
+    user_id: str,
+    kind: str,
+    title: str | None,
+    content_markdown: str,
+    content_type: str = "markdown",
+) -> tuple[str, str | None] | None:
+    """Create one canvas document + backfill its assistant message (canvas v2).
+
+    The shared per-payload core of canvas materialization: apply the over-trigger
+    guard, then create the document via ``CanvasService.create_canvas`` (content +
+    ``source_run_id``) and point the run's assistant message ``canvas_id`` at it.
+    Returns ``(canvas_id, message_id)`` where ``message_id`` is ``None`` if no
+    eligible assistant row exists yet (the canvas is still created), or ``None``
+    entirely when the payload fails the guard (skipped, logged at INFO).
+
+    Extracted so both the sandbox run-state loop (``_materialize_pending_canvases``)
+    and the inline in-process tool-call path apply the identical guard + create +
+    backfill semantics against the same over-trigger rule.  Callers own the
+    fail-open boundary and any ``canvas_created`` SSE emission.
+    """
+    if not _canvas_payload_passes_guard(
+        {
+            "content_markdown": content_markdown,
+            "title": title,
+            "kind": kind,
+            "content_type": content_type,
+        }
+    ):
+        logger.info(
+            "canvas payload below guard threshold; skipping materialization",
+            extra={
+                "run_id": run.id,
+                "title": str(title or ""),
+                "chars": len(str(content_markdown or "").strip()),
+            },
+        )
+        return None
+
+    canvas = await canvas_svc.create_canvas(
+        run.session_id,
+        user_id=user_id,
+        content=str(content_markdown or ""),
+        kind=str(kind or "article"),
+        title=str(title or "").strip() or None,
+        source_run_id=run.id,
+        content_type=str(content_type or "markdown"),
+    )
+    message_id = await canvas_svc.backfill_message_canvas_id(
+        session_id=run.session_id,
+        run_id=run.id,
+        canvas_id=canvas.id,
+    )
+    return canvas.id, message_id
+
+
+def _canvas_created_event(*, canvas_id: str, run_id: str, message_id: str | None) -> str:
+    """Format the ``canvas_created`` SSE the frontend consumes (mode-agnostic).
+
+    Shape ``{canvas_id, run_id, message_id?}`` — ``message_id`` is omitted when no
+    assistant row was anchored yet (the frontend still renders the card from
+    ``canvas_id``).  Shared so the sandbox reconcile path and the inline path emit
+    byte-identical events.
+    """
+    payload: dict[str, Any] = {"canvas_id": canvas_id, "run_id": run_id}
+    if message_id is not None:
+        payload["message_id"] = message_id
+    return _sse("canvas_created", payload)
 
 
 def _sanitize_tool_text(value: Any, *, limit: int = _MAX_TOOL_TEXT_CHARS) -> str:
@@ -205,6 +323,15 @@ async def _stream_tokens(
                             break
                     elif idle_reads >= 2:
                         break
+                # Reached only when this empty read did NOT break out of the
+                # tail (i.e. we're staying to wait for more entries).  Emit a
+                # ``ping`` heartbeat so the client's stall watchdog sees bytes
+                # during long silent gaps — the model thinking between tool
+                # batches has been observed at 36.7s of silence, well past any
+                # reasonable client-side stall timeout.  Placed after all break
+                # decisions so we never ping on a read that is about to end the
+                # tail (an extra ping there would be harmless but pointless).
+                yield _sse("ping", {"run_id": run_id})
                 continue
 
             for _key, entries in batches:
@@ -268,6 +395,22 @@ async def _stream_tokens(
                             yield _sse(
                                 "thinking",
                                 {"run_id": run_id, "text": text, "offset": last_id},
+                            )
+                    elif entry_type == "canvas":
+                        # Inline path: the executor materialized a canvas in-process
+                        # from a model ``create_canvas`` tool call and wrote a
+                        # ``canvas`` entry here so the live tail relays it.  Emit the
+                        # exact ``canvas_created`` event the sandbox reconcile path
+                        # synthesizes ({canvas_id, run_id, message_id?}) so the
+                        # frontend handler is mode-agnostic.  (The sandbox path never
+                        # writes this entry type — it materializes off the separate
+                        # ``:canvas`` key and yields the event from a buffered list.)
+                        canvas_id = entry.get("canvas_id") or ""
+                        if canvas_id:
+                            yield _canvas_created_event(
+                                canvas_id=str(canvas_id),
+                                run_id=run_id,
+                                message_id=entry.get("message_id") or None,
                             )
                     elif entry_type == "pending_confirmation":
                         # HITL: worker paused waiting for user to confirm a tool call.
@@ -418,8 +561,10 @@ async def _write_memory(
     *,
     knowledge_ingest_url: str,
     tenant_id: str,
+    user_id: str,
     task_description: str,
     summary: str,
+    session_id: str = "",
 ) -> None:
     """Write a memory document to knowledge-ingest after run completion.
 
@@ -427,6 +572,16 @@ async def _write_memory(
     uploaded as ``text/plain``, then immediately ingested (embedded) so it
     becomes searchable.  Failure-open: any error is logged at DEBUG level
     and the caller is not affected.
+
+    ``user_id`` must be the real originating user (``usr_...``) — knowledge-
+    ingest's authz guard is fail-closed and rejects the ``SYSTEM`` sentinel,
+    which used to make this write silently 403.  Callers resolve the session
+    owner when they only hold a system identity.
+
+    ``session_id`` is stamped onto the document as ``origin_session_id`` so the
+    memory pre-fetch (``_fetch_memory``) can exclude this session's own prior-turn
+    Q&A — that context is already restored into the agent via conversation
+    history, and re-injecting it as RAG double-feeds the same turns.
 
     Two HTTP calls:
       1. ``POST /documents`` (multipart) → document_id
@@ -440,13 +595,17 @@ async def _write_memory(
     content = f"用户任务：{snippet_task}\n\n助理回答：{snippet_summary}"
     title = f"[memory] {snippet_task[:80]}"
 
+    upload_data = {"title": title, "mime": "text/plain"}
+    if session_id:
+        upload_data["origin_session_id"] = session_id
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            headers = {"X-Tenant-Id": tenant_id, "X-User-Id": "SYSTEM"}
+            headers = {"X-Tenant-Id": tenant_id, "X-User-Id": user_id}
             upload_resp = await client.post(
                 f"{knowledge_ingest_url}/documents",
                 headers=headers,
-                data={"title": title, "mime": "text/plain"},
+                data=upload_data,
                 files={"file": ("memory.txt", content.encode("utf-8"), "text/plain")},
             )
             if upload_resp.status_code not in (200, 201):
@@ -467,6 +626,312 @@ async def _write_memory(
                 )
     except Exception as exc:  # noqa: BLE001
         logger.debug("memory write failed (failure-open): %s", exc)
+
+
+async def _replay_run_blocks_into_messages(
+    *,
+    run: Run,
+    svc: SessionService,
+    tenant_id: str,
+    redis_url: str,
+    dlp_url: str = "",
+) -> tuple[bool, bool]:
+    """Replay a run's Redis token stream into ordered persisted message rows.
+
+    Shared by the two terminal-completion paths that both need to turn the
+    worker's ordered token/tool/thinking blocks into durable message rows:
+
+    * the normal 200-``COMPLETED`` scheduler path, and
+    * the 404 + ``end`` marker path (sandbox pruned after the worker finished
+      writing its stream — see ``_reconcile_run_completion``).
+
+    Keeping both callers on one helper guarantees identical side-effects:
+    the ``already_persisted_for_run`` idempotency guard, the role='thinking'
+    /'assistant'/'tool' row mapping, and the fail-open output-side DLP scan.
+
+    Returns ``(persisted_from_stream, already_persisted_for_run)``:
+    * ``persisted_from_stream`` — at least one message row was written from the
+      replayed blocks this call.
+    * ``already_persisted_for_run`` — assistant/tool/thinking rows for this run
+      already existed, so the replay was skipped (idempotent no-op).
+
+    ``redis_url`` must be truthy; callers gate on it before invoking.
+    """
+    existing_messages, _ = await svc.list_messages(run.session_id, limit=200)
+    already_persisted_for_run = any(
+        m.run_id == run.id and (m.role or "").lower() in {"assistant", "tool", "thinking"}
+        for m in existing_messages
+    )
+    persisted_from_stream = False
+    if already_persisted_for_run:
+        return persisted_from_stream, already_persisted_for_run
+
+    blocks = await _read_ordered_blocks_from_redis(
+        redis_url=redis_url,
+        run_id=run.id,
+    )
+    for block in blocks:
+        if block.get("kind") == "thinking":
+            # Persist reasoning as a dedicated role='thinking' row so the
+            # UI can show a collapsible "已思考" section after the run
+            # (DeepSeek/Claude-style). It is ordered before the assistant
+            # text in `blocks`, so the thinking row gets a lower sequence
+            # and renders above the answer. role is a free String(10)
+            # column (no enum/CHECK), so 'thinking' is accepted.
+            text = str(block.get("text") or "")
+            if text:
+                await svc.create_message(
+                    session_id=run.session_id,
+                    role="thinking",
+                    content=text,
+                    tool_calls=None,
+                    run_id=run.id,
+                )
+                persisted_from_stream = True
+        elif block.get("kind") == "text":
+            text = str(block.get("text") or "")
+            if text:
+                msg = await svc.create_message(
+                    session_id=run.session_id,
+                    role="assistant",
+                    content=text,
+                    tool_calls=None,
+                    run_id=run.id,
+                )
+                persisted_from_stream = True
+                # ── DLP scan (output side): fail-open ───────────────
+                # Scan the assistant's natural-language reply as it is
+                # persisted on its way out to the user, mirroring the
+                # attachment upload path. A hit tags the message, it is
+                # never blocked; any DLP error is swallowed inside
+                # scan_and_tag. Off the hot path: this runs once per
+                # completed text block at run finalization, not per
+                # streamed token.
+                if dlp_url:
+                    await _dlp_scan_transcript(
+                        dlp_url=dlp_url,
+                        tenant_id=tenant_id,
+                        content=text,
+                        resource_id=msg.id,
+                    )
+        elif block.get("kind") == "tool":
+            tool_call = {
+                "id": _sanitize_tool_text(block.get("tool_call_id") or ""),
+                "name": _sanitize_tool_text(block.get("name") or "tool"),
+                "input": _sanitize_json_value(block.get("input") or {}),
+                "result": _sanitize_tool_text(block.get("result")),
+                "state": _sanitize_tool_text(block.get("state")),
+            }
+            await svc.create_message(
+                session_id=run.session_id,
+                role="tool",
+                content=_sanitize_tool_text(block.get("name") or "tool"),
+                tool_calls=[tool_call],
+                run_id=run.id,
+            )
+            persisted_from_stream = True
+
+    return persisted_from_stream, already_persisted_for_run
+
+
+async def _redis_stream_has_end_marker(
+    *,
+    redis_url: str,
+    run_id: str,
+) -> bool:
+    """Return True iff the run's token stream contains a ``type=end`` entry.
+
+    The worker pushes exactly one authoritative ``type=end`` marker as the last
+    stream entry of a *normal* completion (``push_token_end`` in the runtime
+    worker's ``redis_state``).  On an HITL pause it deliberately pushes NO
+    ``end`` marker — only ``pending_confirmation`` / ``pending_question``
+    entries.  So the presence of ``end`` is a reliable "the worker finished
+    normally" signal, which lets the 404 branch of ``_reconcile_run_completion``
+    tell a completed-but-sandbox-pruned run apart from a paused one.
+
+    Failure-open: any connect/read error returns ``False`` (caller then falls
+    through to the grace-window logic, never mis-marking COMPLETED).
+    """
+    try:
+        import redis.asyncio as aioredis  # type: ignore[import-not-found]
+
+        client = aioredis.Redis.from_url(
+            redis_url,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+            decode_responses=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis end-marker connect failed: %s", exc)
+        return False
+
+    try:
+        entries = await client.xrange(_run_token_stream_key(run_id), min="-", max="+")
+        for _entry_id, raw_entry in entries:
+            if _coerce_redis_entry(raw_entry).get("type") == "end":
+                return True
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis end-marker read failed: %s", exc)
+        return False
+    finally:
+        with suppress(Exception):
+            await client.aclose()
+
+
+async def _read_canvas_payloads_from_redis(
+    *,
+    redis_url: str,
+    run_id: str,
+) -> list[dict[str, Any]]:
+    """Read the run's accumulated canvas payloads from ``agent:run:{id}:canvas``.
+
+    The worker's ``create_canvas`` tool appends each payload (``{kind, title,
+    content_markdown, seq}``) to a JSON list under this key (see
+    ``RunStateClient.push_canvas``).  Returns the list ordered by the 1-based
+    ``seq`` the worker assigned; ``[]`` on any connect/read/parse error
+    (failure-open — a missing canvas channel simply means no canvas to
+    materialize, and the reply text is always in the chat message).
+    """
+    try:
+        import redis.asyncio as aioredis  # type: ignore[import-not-found]
+
+        client = aioredis.Redis.from_url(
+            redis_url,
+            socket_connect_timeout=2,
+            socket_timeout=2,
+            decode_responses=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis canvas connect failed: %s", exc)
+        return []
+
+    try:
+        raw = await client.get(_run_canvas_key(run_id))
+        if not raw:
+            return []
+        items = json.loads(raw)
+        if not isinstance(items, list):
+            return []
+        payloads = [it for it in items if isinstance(it, dict)]
+        payloads.sort(key=lambda it: int(it.get("seq") or 0))
+        return payloads
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Redis canvas read failed: %s", exc)
+        return []
+    finally:
+        with suppress(Exception):
+            await client.aclose()
+
+
+async def _materialize_pending_canvases(
+    *,
+    run: Run,
+    user_id: str,
+    svc: SessionService,
+    tenant_id: str,
+    redis_url: str | None,
+) -> list[str]:
+    """Materialize not-yet-created canvas payloads for ``run`` (canvas v2, Phase B).
+
+    Shared by the streaming loop and the run-completion reconcile path so both
+    check run-state for canvas payloads the worker's ``create_canvas`` tool
+    wrote.  Steps, per payload ordered by ``seq``:
+
+    1. **Idempotency** — payloads carry a 1-based ``seq``; we materialize only
+       those whose ``seq`` exceeds the count of canvases already created for this
+       run (``count_canvases_for_run``).  A replay (SSE reconnect / reconcile
+       re-poll) therefore never double-creates.
+    2. **Over-trigger guard** — ``_canvas_payload_passes_guard`` skips payloads
+       that are too short / too few blocks (logged at INFO, fail-open).  A
+       skipped payload still counts against the seq cursor so a later, larger
+       payload keeps its own seq alignment.
+    3. **Materialize** — ``CanvasService.create_canvas`` (content + source_run_id)
+       creates the document + v1 version; then backfill the run's assistant
+       message ``canvas_id`` when one is already persisted.
+
+    Returns a list of ``canvas_created`` SSE strings (one per newly materialized
+    canvas).  Fail-open (design invariant 5): any error is logged as a WARNING
+    and the reply body still flows through the normal message path — a failed
+    materialization never blocks run completion.
+    """
+    if not redis_url:
+        return []
+    try:
+        payloads = await _read_canvas_payloads_from_redis(
+            redis_url=redis_url, run_id=run.id
+        )
+        if not payloads:
+            return []
+
+        # Local import: keep the canvas service off the hot import path for
+        # runs that never touch canvases.
+        from agent_session_orchestrator.services.canvas_service import CanvasService
+
+        canvas_svc = CanvasService(svc._db, tenant_id=tenant_id)  # noqa: SLF001
+        existing_canvases = await canvas_svc.list_canvases_for_run(run.id)
+        already = len(existing_canvases)
+
+        # Creating the canvas and persisting the assistant message happen on
+        # independent timelines.  A previous poll may have created the canvas
+        # before any eligible assistant row existed, so idempotency must skip
+        # document creation but MUST NOT skip the message backfill.  Retrying is
+        # safe: already-linked messages are excluded by the service query.
+        for existing_canvas in existing_canvases:
+            await canvas_svc.backfill_message_canvas_id(
+                session_id=run.session_id,
+                run_id=run.id,
+                canvas_id=existing_canvas.id,
+            )
+
+        events: list[str] = []
+        for payload in payloads:
+            seq = int(payload.get("seq") or 0)
+            # Skip any payload at or below the count already materialized —
+            # idempotency across replays/paths.
+            if seq <= already:
+                continue
+
+            # Count it as consumed so the seq cursor stays aligned regardless of
+            # outcome: a guard-skipped payload keeps re-reads on the next poll
+            # from re-logging the same skip, and a materialized one advances past
+            # its own seq.
+            result = await materialize_one_canvas(
+                canvas_svc=canvas_svc,
+                run=run,
+                user_id=user_id,
+                kind=str(payload.get("kind") or "article"),
+                title=str(payload.get("title") or "").strip() or None,
+                content_markdown=str(payload.get("content_markdown") or ""),
+                content_type=str(payload.get("content_type") or "markdown"),
+            )
+            already = seq
+            if result is None:
+                # Below guard threshold (already logged inside the helper).
+                continue
+
+            canvas_id, message_id = result
+            events.append(
+                _canvas_created_event(
+                    canvas_id=canvas_id, run_id=run.id, message_id=message_id
+                )
+            )
+            logger.info(
+                "materialized canvas from run-state",
+                extra={
+                    "run_id": run.id,
+                    "canvas_id": canvas_id,
+                    "seq": seq,
+                },
+            )
+        return events
+    except Exception as exc:  # noqa: BLE001 — fail-open (invariant 5)
+        logger.warning(
+            "canvas materialization failed (fail-open): %s",
+            exc,
+            extra={"run_id": run.id},
+        )
+        return []
 
 
 async def _dlp_scan_transcript(
@@ -555,6 +1020,95 @@ async def _reconcile_run_completion(
         logger.warning("scheduler poll failed", extra={"run_id": run.id, "err": str(exc)})
         return False, []
 
+    # ── Sandbox-gone (404) reconciliation ──────────────────────────────────
+    # A 404 means the scheduler no longer has a container for this sandbox_id.
+    # The common cause in practice is the Docker container having been pruned
+    # out from under a RUNNING run row — the scheduler then returns 404 forever
+    # and, without this branch, the run stays RUNNING permanently (the sweeper
+    # re-hits the same 404 and gives up too).  We resolve the run definitively
+    # instead of treating 404 as "still running":
+    #
+    #   1. Token stream carries an ``end`` marker  → the worker DID finish
+    #      normally before the sandbox vanished. Replay the ordered blocks into
+    #      durable message rows (same path as a 200-COMPLETED) and mark
+    #      COMPLETED. The scheduler-only fields (result_summary/usage/artifacts)
+    #      are simply unavailable here, so they stay None/absent.
+    #   2. No ``end`` marker, run older than the grace window → the sandbox is
+    #      genuinely gone with no completion recorded. Mark FAILED so the run
+    #      stops hanging.
+    #   3. No ``end`` marker, run still within the grace window → a 404 can be
+    #      momentary right after spawn (container id registered a beat late), so
+    #      keep treating it as still-running and retry on the next poll.
+    #
+    # Only an explicit ``end`` marker takes the COMPLETED path: an HITL pause
+    # writes NO ``end`` marker (only pending_* entries), so a paused run whose
+    # sandbox was pruned correctly falls through to the grace/FAILED logic and
+    # is never mis-marked COMPLETED.
+    if resp.status_code == 404:
+        has_end = bool(redis_url) and await _redis_stream_has_end_marker(
+            redis_url=redis_url,
+            run_id=run.id,
+        )
+        if has_end:
+            logger.info(
+                "sandbox gone (404) but token stream has end marker; "
+                "finalizing run as COMPLETED from Redis replay",
+                extra={"run_id": run.id},
+            )
+            # Replay the ordered blocks into durable rows (idempotent via the
+            # helper's already_persisted_for_run guard).  There is no scheduler
+            # ``summary`` fallback on this path, so the helper's return values
+            # are not needed — the replayed rows ARE the reply.
+            await _replay_run_blocks_into_messages(
+                run=run,
+                svc=svc,
+                tenant_id=tenant_id,
+                redis_url=redis_url,  # non-empty (gated by has_end above)
+                dlp_url=dlp_url,
+            )
+            run.status = "COMPLETED"
+            run.finished_at = dt.datetime.now(tz=dt.UTC)
+            # Scheduler-only fields are unavailable once the sandbox is gone.
+            run.result_summary = None
+            run.error_message = None
+            return True, []
+
+        # No end marker: decide FAILED vs. keep-waiting on the run's age.  Both
+        # started_at and created_at are tz-aware (DateTime(timezone=True)); guard
+        # a naive value defensively so the comparison never raises.
+        reference = run.started_at or run.created_at
+        if reference is not None and reference.tzinfo is None:
+            reference = reference.replace(tzinfo=dt.UTC)
+        now = dt.datetime.now(tz=dt.UTC)
+        age_seconds = (
+            (now - reference).total_seconds() if reference is not None else None
+        )
+        if age_seconds is not None and age_seconds >= _SANDBOX_GONE_GRACE_SECONDS:
+            logger.warning(
+                "sandbox gone (404), no end marker, past grace window; "
+                "marking run FAILED",
+                extra={"run_id": run.id, "age_seconds": int(age_seconds)},
+            )
+            run.status = "FAILED"
+            run.finished_at = now
+            run.result_summary = (
+                "sandbox no longer exists (scheduler returned 404); "
+                "marked FAILED by reconcile"
+            )
+            run.error_message = (
+                "sandbox no longer exists (scheduler returned 404); "
+                "marked FAILED by reconcile"
+            )
+            return True, []
+
+        # Within the grace window — a transient 404 is plausible; retry later.
+        logger.info(
+            "sandbox 404, no end marker, within grace window; treating as "
+            "still-running and retrying next poll",
+            extra={"run_id": run.id},
+        )
+        return False, []
+
     if resp.status_code != 200:
         return False, []
 
@@ -609,76 +1163,15 @@ async def _reconcile_run_completion(
     persisted_from_stream = False
     already_persisted_for_run = False
     if redis_url:
-        existing_messages, _ = await svc.list_messages(run.session_id, limit=200)
-        already_persisted_for_run = any(
-            m.run_id == run.id and (m.role or "").lower() in {"assistant", "tool", "thinking"}
-            for m in existing_messages
-        )
-        if not already_persisted_for_run:
-            blocks = await _read_ordered_blocks_from_redis(
+        persisted_from_stream, already_persisted_for_run = (
+            await _replay_run_blocks_into_messages(
+                run=run,
+                svc=svc,
+                tenant_id=tenant_id,
                 redis_url=redis_url,
-                run_id=run.id,
+                dlp_url=dlp_url,
             )
-            for block in blocks:
-                if block.get("kind") == "thinking":
-                    # Persist reasoning as a dedicated role='thinking' row so the
-                    # UI can show a collapsible "已思考" section after the run
-                    # (DeepSeek/Claude-style). It is ordered before the assistant
-                    # text in `blocks`, so the thinking row gets a lower sequence
-                    # and renders above the answer. role is a free String(10)
-                    # column (no enum/CHECK), so 'thinking' is accepted.
-                    text = str(block.get("text") or "")
-                    if text:
-                        await svc.create_message(
-                            session_id=run.session_id,
-                            role="thinking",
-                            content=text,
-                            tool_calls=None,
-                            run_id=run.id,
-                        )
-                        persisted_from_stream = True
-                elif block.get("kind") == "text":
-                    text = str(block.get("text") or "")
-                    if text:
-                        msg = await svc.create_message(
-                            session_id=run.session_id,
-                            role="assistant",
-                            content=text,
-                            tool_calls=None,
-                            run_id=run.id,
-                        )
-                        persisted_from_stream = True
-                        # ── DLP scan (output side): fail-open ───────────────
-                        # Scan the assistant's natural-language reply as it is
-                        # persisted on its way out to the user, mirroring the
-                        # attachment upload path. A hit tags the message, it is
-                        # never blocked; any DLP error is swallowed inside
-                        # scan_and_tag. Off the hot path: this runs once per
-                        # completed text block at run finalization, not per
-                        # streamed token.
-                        if dlp_url:
-                            await _dlp_scan_transcript(
-                                dlp_url=dlp_url,
-                                tenant_id=tenant_id,
-                                content=text,
-                                resource_id=msg.id,
-                            )
-                elif block.get("kind") == "tool":
-                    tool_call = {
-                        "id": _sanitize_tool_text(block.get("tool_call_id") or ""),
-                        "name": _sanitize_tool_text(block.get("name") or "tool"),
-                        "input": _sanitize_json_value(block.get("input") or {}),
-                        "result": _sanitize_tool_text(block.get("result")),
-                        "state": _sanitize_tool_text(block.get("state")),
-                    }
-                    await svc.create_message(
-                        session_id=run.session_id,
-                        role="tool",
-                        content=_sanitize_tool_text(block.get("name") or "tool"),
-                        tool_calls=[tool_call],
-                        run_id=run.id,
-                    )
-                    persisted_from_stream = True
+        )
 
     # Write an assistant message so the UI sees the reply. If Redis replay
     # already produced ordered text/tool blocks, avoid appending a duplicate
@@ -717,11 +1210,29 @@ async def _reconcile_run_completion(
     # is caught inside _write_memory and logged at DEBUG level, so this
     # never blocks or raises on the reconcile caller.
     if summary and knowledge_ingest_url:
+        # knowledge-ingest's authz guard rejects the "SYSTEM" sentinel
+        # (fail-closed).  Every interactive caller already passes the session
+        # owner, but the reconcile sweeper can fall back to "SYSTEM" when its
+        # cross-tenant scan yields no user — resolve the owner here so the
+        # memory write carries a real identity.  Failure-open: if the session
+        # row is gone the sentinel goes through and knowledge-ingest rejects
+        # it, which _write_memory swallows.
+        memory_user_id = user_id
+        if not memory_user_id or memory_user_id == "SYSTEM":
+            try:
+                memory_user_id = (await svc.get_session(run.session_id)).user_id
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "memory write: could not resolve session owner for %s",
+                    run.session_id,
+                )
         await _write_memory(
             knowledge_ingest_url=knowledge_ingest_url,
             tenant_id=tenant_id,
+            user_id=memory_user_id,
             task_description=run.task_description or "",
             summary=summary,
+            session_id=run.session_id,
         )
 
     return True, plan_steps
@@ -741,6 +1252,20 @@ async def _persist_artifacts(
 
     Failure-open: any exception is logged and swallowed.
     """
+    # Attribute outputs to the session owner rather than the reconcile caller.
+    # This path runs under the service identity, and the artifacts page lists
+    # attachments by ``user_id`` — a "SYSTEM"-owned row is invisible to the very
+    # user whose run produced it (the page just reads 暂无产物). Same owner
+    # resolution the memory write above does.
+    owner_id = "SYSTEM"
+    try:
+        owner_id = (await svc.get_session(run.session_id)).user_id or "SYSTEM"
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "artifact persist: could not resolve session owner for %s",
+            run.session_id,
+        )
+
     try:
         for art in artifacts:
             filename = art.get("filename", "artifact")
@@ -762,7 +1287,7 @@ async def _persist_artifacts(
             # then call dlp_guard.scan_and_tag on the fetched text. fail-open.
             await svc.create_attachment(
                 run.session_id,
-                user_id="SYSTEM",
+                user_id=owner_id,
                 filename=filename,
                 mime=mime,
                 size_bytes=size,
@@ -893,6 +1418,16 @@ async def stream_session(
       ``plan``          — structured plan steps update.
       ``message``       — newly persisted message row.
       ``run_complete``  — active run reached a terminal state.
+      ``ping``          — liveness heartbeat carrying no payload of interest.
+        Emitted on every otherwise-silent poll (no active run, nothing new to
+        send) and on every idle read while tailing an active run's token stream
+        (the model can go quiet for tens of seconds between tool batches).  It
+        exists purely so the client can run a stall watchdog: "no bytes at all"
+        is indistinguishable from a wedged connection, whereas a missing ping
+        past the heartbeat interval means the stream has silently stopped and
+        the client should reconnect (reconnect replays from ``0-0`` and the
+        first ``/messages`` poll synthesises ``run_complete``, so recovery is
+        self-converging).  Clients MUST treat ``ping`` as a no-op otherwise.
       ``done``          — stream deadline exhausted; client should close.
       ``error``         — unexpected server error; detail is opaque.
 
@@ -934,6 +1469,11 @@ async def stream_session(
         # RUNNING before the final terminal write completes).
         streamed_run_ids: set[str] = set()
         last_seq = 0
+        # Publish the current title once when the stream opens, then again only
+        # when it changes (automatic first-message naming or a manual rename).
+        # A local sentinel distinguishes "not observed yet" from a real NULL
+        # title.
+        last_session_title: object | str | None = object()
         # First-poll completion reconciliation.  A client that (re)connects
         # AFTER its run already reached a terminal state would otherwise never
         # receive a run_complete on this connection — the active-run selector
@@ -1019,6 +1559,19 @@ async def stream_session(
                 # block exits so GeneratorExit cannot roll back committed rows.
                 async for db in acquire_db_session(tenant_id=tenant_id):
                     svc = SessionService(db, tenant_id=tenant_id)
+                    session_obj = await svc.get_session(session_id)
+                    session_user_id = session_obj.user_id
+                    if session_obj.title != last_session_title:
+                        last_session_title = session_obj.title
+                        events.append(
+                            _sse(
+                                "session_updated",
+                                {
+                                    "session_id": session_id,
+                                    "title": session_obj.title,
+                                },
+                            )
+                        )
                     runs = await svc.list_runs(session_id)
 
                     # First poll only: if there is no active/paused run but the
@@ -1058,11 +1611,6 @@ async def stream_session(
                     )
 
                     if active is not None and active.id not in streamed_run_ids:
-                        # New active run we haven't streamed yet — snapshot the
-                        # session user_id now (inside the DB session) for use in
-                        # the scheduler reconcile call below.
-                        session_obj = await svc.get_session(session_id)
-                        session_user_id = session_obj.user_id
                         active_run_to_stream = active
                         # Emit run_started envelope before leaving the DB block
                         # so the client knows which run is about to stream.
@@ -1103,12 +1651,6 @@ async def stream_session(
                     running_runs = [
                         r for r in runs if r.status in ("RUNNING", "PENDING")
                     ]
-                    if running_runs and session_user_id == "SYSTEM":
-                        # We didn't fetch session_obj above (no new active run);
-                        # fetch it now for reconcile.
-                        session_obj = await svc.get_session(session_id)
-                        session_user_id = session_obj.user_id
-
                     for r in running_runs:
                         _terminal, _plan = await _reconcile_run_completion(
                             scheduler_url=scheduler_url,
@@ -1123,6 +1665,19 @@ async def stream_session(
                         if _plan:
                             latest_plan_steps = _plan
                             latest_plan_run_id = r.id
+                        # Materialize any canvas payloads the worker wrote to
+                        # run-state (Phase B).  Idempotent + fail-open — safe to
+                        # run every poll while the run is active (a canvas created
+                        # mid-run surfaces immediately) and again post-completion.
+                        events.extend(
+                            await _materialize_pending_canvases(
+                                run=r,
+                                user_id=session_user_id,
+                                svc=svc,
+                                tenant_id=tenant_id,
+                                redis_url=redis_url,
+                            )
+                        )
                         # If the run we're about to stream just reached a terminal
                         # state, remember it: once its durable message rows are
                         # emitted below we can skip the (duplicate) token replay.
@@ -1279,6 +1834,20 @@ async def stream_session(
                                         },
                                     )
                                 )
+                            # Materialize canvas payloads written by this run's
+                            # create_canvas tool (Phase B).  Placed BEFORE the
+                            # message emit below so the backfilled canvas_id lands
+                            # on the assistant message row we then stream out.
+                            # Idempotent with the in-poll materialization above.
+                            post_stream_events.extend(
+                                await _materialize_pending_canvases(
+                                    run=run_obj,
+                                    user_id=session_user_id,
+                                    svc=svc,
+                                    tenant_id=tenant_id,
+                                    redis_url=redis_url,
+                                )
+                            )
                             # Emit newly persisted messages produced by reconcile.
                             new_items, _ = await svc.list_messages(
                                 session_id,
@@ -1378,7 +1947,15 @@ async def stream_session(
                     await asyncio.sleep(_POLL_INTERVAL_SECONDS)
                     continue
 
-                # No active run this poll — sleep and keep the connection alive.
+                # No active run this poll — reaching here means no active tail
+                # and no paused replay ran (both `continue` above), so the only
+                # thing that could have been yielded is the buffered `events`
+                # list.  If that too was empty, emit a ``ping`` heartbeat so the
+                # client's stall watchdog can tell a quiet-but-healthy stream
+                # from a silently wedged one.  A poll that DID yield events skips
+                # the ping — it already proved the stream is live.
+                if not events:
+                    yield _sse("ping", {})
                 await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
             yield _sse("done", {})

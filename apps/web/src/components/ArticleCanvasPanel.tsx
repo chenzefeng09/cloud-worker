@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   CANVAS_OBJECTS,
-  buildCanvasEditPrompt,
   createCanvasDraft,
   getCanvasObject,
   sanitizeCanvasDraft,
@@ -17,9 +16,14 @@ interface ArticleCanvasPanelProps {
   sessionId: string;
   draft: CanvasDocumentDraft;
   aiDisabled?: boolean;
+  /** True while a silent canvas revision request is in flight. */
+  revising?: boolean;
+  /** Localised error from the last failed revision (chat-invisible). */
+  editError?: string | null;
   onDraftChange: (draft: CanvasDocumentDraft) => void;
   onClose: () => void;
-  onRequestEdit: (request: CanvasEditRequest, prompt: string) => void | Promise<void>;
+  onRequestEdit: (request: CanvasEditRequest) => void | Promise<void>;
+  onDismissEditError?: () => void;
 }
 
 const HISTORY_LIMIT = 80;
@@ -321,9 +325,12 @@ export function ArticleCanvasPanel({
   sessionId,
   draft,
   aiDisabled,
+  revising,
+  editError,
   onDraftChange,
   onClose,
   onRequestEdit,
+  onDismissEditError,
 }: ArticleCanvasPanelProps) {
   const editorRef = useRef<HTMLDivElement | null>(null);
   const hydratedDraftIdRef = useRef<string | null>(null);
@@ -339,6 +346,7 @@ export function ArticleCanvasPanel({
 
   const selectedChars = selection ? selection.end - selection.start : 0;
   const activeIntents = object.editIntents;
+  const isRevising = Boolean(busy || revising);
 
   useEffect(() => {
     const el = editorRef.current;
@@ -479,12 +487,12 @@ export function ArticleCanvasPanel({
   };
 
   const requestEdit = async (scope: 'selection' | 'document', intent?: CanvasEditIntent) => {
-    if (aiDisabled) return;
+    if (aiDisabled || busy || revising) return;
     const request = buildRequest(scope, intent);
     if (!request) return;
     setBusy(true);
     try {
-      await onRequestEdit(request, buildCanvasEditPrompt(request));
+      await onRequestEdit(request);
       if (intent) setInstruction(intent.instruction);
     } finally {
       setBusy(false);
@@ -650,13 +658,34 @@ export function ArticleCanvasPanel({
       </div>
 
       <div className="border-t border-line bg-paper px-3 py-3 shrink-0">
+        {isRevising && (
+          <div className="canvas-card-pending mb-2" role="status" aria-live="polite">
+            <span className="cw-blip" />
+            <span>修订中…</span>
+          </div>
+        )}
+        {editError && (
+          <div className="canvas-card-edit-error mb-2" role="alert">
+            <span className="canvas-card-edit-error-text">{editError}</span>
+            {onDismissEditError && (
+              <button
+                type="button"
+                className="canvas-card-edit-error-dismiss"
+                onClick={onDismissEditError}
+                aria-label="关闭错误提示"
+              >
+                ✕
+              </button>
+            )}
+          </div>
+        )}
         <div className="flex flex-wrap gap-1.5 mb-2">
           {activeIntents.map((intent) => (
             <button
               key={intent.id}
               type="button"
               onClick={() => requestEdit(selection ? 'selection' : 'document', intent)}
-              disabled={busy || aiDisabled}
+              disabled={isRevising || aiDisabled}
               className="cw-btn cw-btn-ghost cw-btn-sm"
             >
               {intent.label}
@@ -668,14 +697,21 @@ export function ArticleCanvasPanel({
             value={instruction}
             onChange={(e) => setInstruction(e.target.value)}
             rows={2}
-            className="flex-1 resize-none border border-line rounded-md bg-surface px-2.5 py-2 text-[12.5px] leading-[1.45] outline-none focus:border-accent"
-            placeholder={selection ? `已选中 ${selectedChars} 字符，输入修改要求…` : '输入整篇修改要求…'}
+            disabled={isRevising || aiDisabled}
+            className="flex-1 resize-none border border-line rounded-md bg-surface px-2.5 py-2 text-[12.5px] leading-[1.45] outline-none focus:border-accent disabled:opacity-60"
+            placeholder={
+              isRevising
+                ? '修订中…'
+                : selection
+                  ? `已选中 ${selectedChars} 字符，输入修改要求…`
+                  : '输入整篇修改要求…'
+            }
           />
           <div className="flex flex-col gap-1.5 shrink-0">
             <button
               type="button"
               className="cw-btn cw-btn-accent cw-btn-sm disabled:opacity-40"
-              disabled={!instruction.trim() || busy || aiDisabled}
+              disabled={!instruction.trim() || isRevising || aiDisabled}
               onClick={() => requestEdit('document')}
             >
               整篇
@@ -683,7 +719,7 @@ export function ArticleCanvasPanel({
             <button
               type="button"
               className="cw-btn cw-btn-ghost cw-btn-sm disabled:opacity-40"
-              disabled={!selection || !instruction.trim() || busy || aiDisabled}
+              disabled={!selection || !instruction.trim() || isRevising || aiDisabled}
               onClick={() => requestEdit('selection')}
             >
               选区

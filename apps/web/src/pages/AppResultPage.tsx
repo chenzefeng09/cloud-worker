@@ -1,14 +1,22 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
-import rehypeHighlight from 'rehype-highlight';
-import { PageHead } from '../components/shell/PageHead';
+import { markdownRemarkPlugins, markdownRehypePlugins, normalizeMathDelimiters } from '../lib/markdownPlugins';
+import { PageHead, type Crumb } from '../components/shell/PageHead';
 import { Chip } from '../components/shell/Chip';
 import { StatusDot, type DesignStatus } from '../components/shell/StatusDot';
 import { FilePreviewPanel, type FilePreviewPanelFile } from '../components/FilePreviewPanel';
 import { markdownComponents } from '../components/chatStepRenderers';
+import {
+  MarkdownAssetsProvider,
+  makeAttachmentImageResolver,
+  type MarkdownAssets,
+} from '../components/markdownAssets';
+import { ConfirmCard } from '../components/hitl/ConfirmCard';
+import { QuestionCard } from '../components/hitl/QuestionCard';
 import { useOutputAttachments } from '../hooks/useOutputAttachments';
+import { applyPendingInteractions } from '../hooks/useChat';
+import { useChatStore } from '../stores/chatStore';
 import { api } from '../api/client';
 import type { Run, RunState, RunStatus, AppRunSnapshot } from '../api/types';
 import { modelLabel, effortLabel } from '../lib/modelOptions';
@@ -21,6 +29,8 @@ function runToDesignStatus(status: RunStatus): DesignStatus {
       return 'queued';
     case 'RUNNING':
       return 'thinking';
+    case 'PAUSED':
+      return 'paused';
     case 'COMPLETED':
       return 'done';
     case 'FAILED':
@@ -38,6 +48,8 @@ function runStatusZh(status: RunStatus): string {
       return '排队中';
     case 'RUNNING':
       return '运行中';
+    case 'PAUSED':
+      return '待确认';
     case 'COMPLETED':
       return '已完成';
     case 'FAILED':
@@ -47,6 +59,41 @@ function runStatusZh(status: RunStatus): string {
     default:
       return status;
   }
+}
+
+/**
+ * Translate the run hot-state `cursor` (the raw agent stream event type) into a
+ * phase label the user can act on.
+ *
+ * The sibling `step` field is NOT a step count — the worker bumps it once per
+ * stream event, and token-level deltas dominate, so it reads in the thousands
+ * for a run that made a dozen real moves. We show the phase + elapsed time
+ * instead; both are honest.
+ */
+function phaseZh(cursor: string | undefined, status: RunStatus): string {
+  if (status === 'PENDING') return '正在排队…';
+  // Empty cursor covers both "worker hasn't written state yet" and inline-mode
+  // runs (which never write it) — the generic label is the honest one there.
+  if (!cursor) return '正在执行…';
+  if (cursor === 'start') return '正在启动…';
+  if (cursor.startsWith('TextBlock')) return '正在生成回复…';
+  if (cursor.startsWith('ToolCall')) return '正在调用工具…';
+  if (cursor.startsWith('ToolResult')) return '正在读取工具结果…';
+  if (cursor === 'RequireExternalExecutionEvent') return '等待外部执行…';
+  if (cursor === 'ReplyEndEvent') return '正在收尾…';
+  // ThinkEvent / ThinkingBlock* / ModelCall* / ReplyStartEvent — the model is
+  // working and hasn't emitted user-visible output yet.
+  return '正在思考…';
+}
+
+/** `mm:ss` (or `h:mm:ss`) since the run started. */
+function elapsedZh(fromIso: string, nowMs: number): string {
+  const secs = Math.max(0, Math.floor((nowMs - new Date(fromIso).getTime()) / 1000));
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = secs % 60;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
 /** Render one snapshot input value as a readable string. */
@@ -142,8 +189,48 @@ export function AppResultPage() {
   const { byRunId, refresh: refreshOutputs } = useOutputAttachments(sessionId);
   const outputs = runId ? byRunId.get(runId) ?? [] : [];
 
+  // Lets the markdown renderer turn `![x](outputs/chart.png)` into this run's
+  // real attachment URL, and open it in the preview panel on click.
+  // `outputs` is a fresh array every render, so the memo keys off the id list
+  // instead — a new resolver identity per render would re-render the whole
+  // markdown tree for nothing.
+  const outputsKey = outputs.map((a) => a.id).join(',');
+  const markdownAssets = useMemo<MarkdownAssets>(
+    () => ({
+      resolveImage: makeAttachmentImageResolver(outputs, sessionId),
+      onOpen: (t) =>
+        t.id ? setPreviewFile({ id: t.id, filename: t.filename, mime: t.mime }) : undefined,
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- outputsKey is the stable identity of outputs
+    [outputsKey, sessionId],
+  );
+
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const refreshedOnDoneRef = useRef(false);
+
+  // ── HITL pause ─────────────────────────────────────────────────────────────
+  //
+  // A run can pause mid-flight to ask for a tool-call approval (`confirm`) or a
+  // free-text answer (`question`). The cards are driven by the chat store —
+  // exactly like the chat page — so we inherit its dedup + "acknowledged"
+  // suppression (an answered card cannot be resurrected by a later refetch).
+  // Only this run's interactions are pulled in, and they are cleared on unmount
+  // so nothing leaks into the chat page for the same session.
+  const sessionPending = useChatStore((s) =>
+    sessionId ? s.pendingInteractions[sessionId] : undefined,
+  );
+  const runPending = (sessionPending ?? []).filter((p) => p.runId === runId);
+  const [pendingLoaded, setPendingLoaded] = useState(false);
+  const [pendingError, setPendingError] = useState<string | null>(null);
+
+  // Ticking clock for the elapsed-time readout; only runs while non-terminal.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const running = run != null && !TERMINAL.has(run.status);
+  useEffect(() => {
+    if (!running) return;
+    const id = setInterval(() => setNowMs(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [running]);
 
   useEffect(() => {
     if (!sessionId || !runId) {
@@ -196,10 +283,53 @@ export function AppResultPage() {
   const snapshot = run?.app_snapshot ?? null;
   const status = run?.status;
 
-  const crumbs = [
+  // Pull this run's paused interactions whenever the run enters PAUSED. The
+  // 2 s poll above keeps `status` fresh, so a pause → resume → pause sequence
+  // re-fetches naturally without any extra plumbing.
+  useEffect(() => {
+    if (!sessionId || !runId) return;
+    if (status !== 'PAUSED') {
+      setPendingLoaded(false);
+      setPendingError(null);
+      return;
+    }
+    let alive = true;
+    (async () => {
+      try {
+        const res = await api.sessions.pending(sessionId);
+        if (!alive) return;
+        applyPendingInteractions(
+          sessionId,
+          res.items.filter((it) => it.run_id === runId),
+        );
+        setPendingError(null);
+      } catch (e) {
+        if (alive) setPendingError((e as Error).message);
+      } finally {
+        if (alive) setPendingLoaded(true);
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [sessionId, runId, status]);
+
+  // Drop this run's cards from the shared store on unmount so they never show
+  // up on the chat page for the same session.
+  useEffect(() => {
+    if (!sessionId || !runId) return;
+    return () => {
+      useChatStore.getState().clearPendingInteractions(sessionId, runId);
+    };
+  }, [sessionId, runId]);
+
+  const crumbs: Crumb[] = [
     { label: '首页', to: '/home' },
-    { label: '应用' },
-    { label: snapshot?.app_name || '运行结果' },
+    { label: '应用', to: '/apps' },
+    ...(snapshot?.app_id
+      ? [{ label: snapshot.app_name, to: `/apps/${snapshot.app_id}` }]
+      : []),
+    { label: '运行结果' },
   ];
 
   // ─── Split layout (transcript-ish column + optional preview panel) ──────────
@@ -242,21 +372,55 @@ export function AppResultPage() {
                   <div className="flex items-center gap-2">
                     <span className="cw-dot animate-blip" style={{ background: '#d23a1f' }} />
                     <span className="text-[13px] font-medium text-ink">
-                      {status === 'PENDING' ? '正在排队…' : '正在执行…'}
+                      {phaseZh(state?.cursor, status)}
                     </span>
-                    {state && state.step > 0 && (
-                      <span className="font-mono text-[11px] text-dim">第 {state.step} 步</span>
-                    )}
+                    <span className="font-mono text-[11px] text-dim">
+                      {elapsedZh(run.started_at ?? run.created_at, nowMs)}
+                    </span>
                   </div>
                   {state?.plan && (
                     <div className="text-[12.5px] text-ink-2 leading-[1.55] whitespace-pre-wrap border-t border-line-2 pt-3">
                       {state.plan}
                     </div>
                   )}
-                  {state?.cursor && (
-                    <div className="font-mono text-[11px] text-dim">{state.cursor}</div>
-                  )}
                 </div>
+              </div>
+            )}
+
+            {/* PAUSED — snapshot + HITL cards so the run can be resumed here */}
+            {run && status === 'PAUSED' && sessionId && (
+              <div className="flex flex-col gap-4">
+                {snapshot && <SnapshotPanel snapshot={snapshot} />}
+
+                <div className="border border-line rounded-md bg-surface px-4 py-4 flex flex-col gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="cw-dot" style={{ background: '#c68a17' }} />
+                    <span className="text-[13px] font-medium text-ink">运行已暂停，等待你的确认</span>
+                  </div>
+                  <div className="text-[12.5px] text-dim leading-[1.55]">
+                    处理下面的请求后，运行会自动继续，无需刷新页面。
+                  </div>
+                </div>
+
+                {pendingError && (
+                  <div className="px-3 py-2 border border-accent-line bg-accent-soft rounded-md text-[12.5px] text-accent">
+                    待确认项加载失败：{pendingError}
+                  </div>
+                )}
+
+                {runPending.map((p) =>
+                  p.kind === 'question' ? (
+                    <QuestionCard key={p.toolCallId} sessionId={sessionId} interaction={p} />
+                  ) : (
+                    <ConfirmCard key={p.toolCallId} sessionId={sessionId} interaction={p} />
+                  ),
+                )}
+
+                {pendingLoaded && !pendingError && runPending.length === 0 && (
+                  <div className="font-mono italic text-dim text-[12px]">
+                    暂无待处理的确认项（可能已在别处应答）。运行状态会自动刷新。
+                  </div>
+                )}
               </div>
             )}
 
@@ -271,13 +435,15 @@ export function AppResultPage() {
                       输出
                     </div>
                     <div className="prose-cw text-[14px] leading-[1.6] text-ink">
-                      <ReactMarkdown
-                        remarkPlugins={[remarkGfm]}
-                        rehypePlugins={[[rehypeHighlight, { detect: true, ignoreMissing: true }]]}
-                        components={markdownComponents}
-                      >
-                        {run.result_summary}
-                      </ReactMarkdown>
+                      <MarkdownAssetsProvider value={markdownAssets}>
+                        <ReactMarkdown
+                          remarkPlugins={markdownRemarkPlugins}
+                          rehypePlugins={markdownRehypePlugins as never}
+                          components={markdownComponents}
+                        >
+                          {normalizeMathDelimiters(run.result_summary)}
+                        </ReactMarkdown>
+                      </MarkdownAssetsProvider>
                     </div>
                   </div>
                 )}
@@ -347,6 +513,7 @@ export function AppResultPage() {
             sessionId={sessionId}
             file={previewFile}
             onClose={() => setPreviewFile(null)}
+            closeVariant="x"
           />
         )}
       </div>

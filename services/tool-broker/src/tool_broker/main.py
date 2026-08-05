@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import json
 import logging
 import time
+from typing import Any, Mapping
 from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from tool_broker.config import Settings
@@ -21,7 +24,11 @@ _LOG = logging.getLogger(__name__)
 # Redis key schema shared with the worker's RunStateClient.  Keys are ALWAYS
 # derived from a run_id taken from the validated lease, never from a value the
 # sandbox can choose freely.
-_STATE_KEY_KINDS = frozenset({"state", "paused"})
+# ``canvas`` (Phase B): the create_canvas tool appends payloads to
+# ``agent:run:{run_id}:canvas`` via this same set/get surface; without it the
+# broker 400s the write, the worker fails open (seq=0) and the canvas is
+# silently never materialized.
+_STATE_KEY_KINDS = frozenset({"state", "paused", "canvas"})
 
 
 def _state_key(run_id: str, kind: str) -> str:
@@ -79,6 +86,23 @@ _HOP_BY_HOP_RESPONSE_HEADERS = frozenset(
 )
 
 _ALLOWED_METHODS = frozenset({"GET", "POST", "HEAD"})
+
+# The tenant-MCP passthrough route additionally allows DELETE: the MCP
+# streamable-http transport issues a DELETE to tear down its session.  This is
+# kept SEPARATE from ``_ALLOWED_METHODS`` so the other (foundation-internal)
+# routes do not silently start accepting DELETE.
+_MCP_TENANT_ALLOWED_METHODS = frozenset({"GET", "POST", "HEAD", "DELETE"})
+
+# Required lease scope for the tenant-MCP passthrough route.  The scheduler must
+# include this scope on the lease for runs whose agent is allowed to invoke
+# tenant-registered MCP servers.  (Adding it to the scheduler's scope catalogue
+# is handled separately — see the report.)
+_MCP_TENANT_INVOKE_SCOPE = "mcp.tenant_invoke"
+
+# The fixed service scope the broker presents to the mcp-registry's internal
+# listing guard when resolving a tenant MCP server's endpoint.  This is the same
+# trusted value the existing ``/mcp`` registry route injects.
+_MCP_READ_INTERNAL_SCOPE = "mcp.read_internal"
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +184,21 @@ _UPSTREAM_ALLOWLISTS: dict[str, _UpstreamAllowlist] = {
     # line 15).  Exact.
     "web_fetch.invoke": _UpstreamAllowlist(
         exact=frozenset({"fetch"}),
+    ),
+    # foundation-dlp: the in-sandbox worker POSTs tool-call content to the
+    # single ``/core/scan`` endpoint (DLP contract: POST {dlp_base}/core/scan
+    # with {content, resource_type, resource_id}).  The worker never calls any
+    # other DLP path, so the tightest correct rule is the single exact path.
+    "dlp.scan": _UpstreamAllowlist(
+        exact=frozenset({"core/scan"}),
+    ),
+    # knowledge-ingest: the in-sandbox knowledge_tool GETs a single
+    # ``/search`` endpoint (knowledge_tool/tool.py; ki contract:
+    # GET {ki_base}/search?q=&k=&scope=knowledge).  The worker never calls
+    # /documents or any other ki path from the sandbox, so the tightest
+    # correct rule is the single exact path ``search``.
+    "knowledge.search": _UpstreamAllowlist(
+        exact=frozenset({"search"}),
     ),
 }
 
@@ -284,6 +323,16 @@ def _forward_headers(
         headers["X-Tenant-Id"] = str(lease_payload.get("tenant_id") or "")
         if lease_payload.get("user_id"):
             headers["X-User-Id"] = str(lease_payload["user_id"])
+        # X-User-Clearance: knowledge-ingest enforces the document-visibility
+        # gate on this header, so it MUST come from the trusted, signed lease
+        # (the scheduler threads the run's effective clearance into it) - never
+        # from the sandbox-supplied request header, which a compromised sandbox
+        # could inflate to read higher-sensitivity documents.  Only re-inject
+        # when the lease actually carries it (older leases / non-ki runs have
+        # none); upstreams that don't consume the header simply ignore it.
+        clearance = lease_payload.get("clearance")
+        if clearance:
+            headers["X-User-Clearance"] = str(clearance)
     if inject_service_scope:
         headers["X-Service-Scopes"] = inject_service_scope
     return headers
@@ -417,6 +466,137 @@ def _require_lease(
     return payload
 
 
+async def _forward_to_upstream(
+    request: Request,
+    *,
+    absolute_url: str,
+    forward_headers: dict[str, str],
+    upstream_timeout: float | None = None,
+) -> Response:
+    """Forward the inbound request to a fully-resolved absolute upstream URL.
+
+    This is the shared streaming-passthrough core: it builds the upstream
+    request with the supplied (already-filtered) header set, sends it with
+    ``stream=True`` so the upstream Content-Type can be inspected before the
+    body is read, and either buffers a normal response or streams a
+    ``text/event-stream`` one incrementally.  Both ``_proxy`` (prefix-routed
+    foundation services) and the tenant-MCP passthrough use this so the
+    streaming/teardown logic lives in exactly one place.
+
+    Caller is responsible for auth/lease validation, method gating, the
+    upstream path allowlist (when applicable), and computing both the absolute
+    URL and the upstream header set.  ``forward_headers`` is forwarded verbatim.
+
+    ``upstream_timeout`` (seconds), when supplied by the caller (tenant-MCP
+    passthrough only, from the registry ``timeout_seconds`` field), bounds
+    connect/read/write/pool to the tenant-configured value.  When ``None`` the
+    streaming-friendly default is used: connect/write/pool bounded by
+    ``proxy_timeout_seconds`` but ``read=None`` so a legitimately long-lived
+    SSE stream (per-token LLM streaming) is never aborted mid-flight.
+    """
+    settings: Settings = request.app.state.settings
+    body = await request.body()
+
+    # The streaming path keeps the upstream connection open while the consumer
+    # drains the body, so it needs a separate timeout: the read timeout must NOT
+    # abort a legitimately long-lived SSE stream (per-token LLM streaming can run
+    # far longer than the 30s proxy timeout).  We still bound connect/write/pool
+    # by ``proxy_timeout_seconds`` so a dead upstream still fails fast.  The
+    # tenant-MCP passthrough overrides this with the registry-configured
+    # ``timeout_seconds`` (connect+read+write+pool) so a tenant can bound a
+    # slow/stuck third-party MCP server.
+    if upstream_timeout is not None:
+        stream_timeout = httpx.Timeout(
+            connect=upstream_timeout,
+            read=upstream_timeout,
+            write=upstream_timeout,
+            pool=upstream_timeout,
+        )
+    else:
+        stream_timeout = httpx.Timeout(
+            connect=settings.proxy_timeout_seconds,
+            read=None,
+            write=settings.proxy_timeout_seconds,
+            pool=settings.proxy_timeout_seconds,
+        )
+
+    # We must inspect the upstream Content-Type BEFORE deciding whether to buffer
+    # or stream, which means we need the response object before its body is read.
+    # ``client.send(request, stream=True)`` returns exactly that: headers are
+    # populated, the body is not yet consumed.  The client must stay open for the
+    # whole lifetime of a streamed response, so it is created WITHOUT the
+    # ``async with`` form and closed either inline (buffered/error paths) or in
+    # the streaming generator's ``finally`` (streamed path).
+    client = httpx.AsyncClient(timeout=stream_timeout)
+    try:
+        upstream_request = client.build_request(
+            request.method,
+            absolute_url,
+            headers=forward_headers,
+            content=body,
+        )
+        upstream = await client.send(upstream_request, stream=True)
+    except httpx.HTTPError as exc:
+        await client.aclose()
+        _LOG.warning("tool-broker upstream error for %s: %s", absolute_url, exc)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="tool-broker upstream unavailable",
+        ) from exc
+
+    content_type = upstream.headers.get("content-type", "")
+    response_headers = _response_headers(upstream.headers)
+    status_code = upstream.status_code
+
+    if "text/event-stream" not in content_type.lower():
+        # NON-SSE: preserve the existing buffered behaviour byte-for-byte. Read
+        # the whole body, close the stream + client, and return a plain Response.
+        try:
+            content = await upstream.aread()
+        except httpx.HTTPError as exc:
+            _LOG.warning(
+                "tool-broker upstream read error for %s: %s", absolute_url, exc
+            )
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail="tool-broker upstream unavailable",
+            ) from exc
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+        return Response(
+            content=content,
+            status_code=status_code,
+            headers=response_headers,
+            media_type=content_type or None,
+        )
+
+    # SSE: pipe the upstream bytes through incrementally so per-token streaming
+    # reaches the sandbox worker.  The generator owns the upstream response and
+    # the client and tears both down on normal completion, mid-stream error, or
+    # consumer disconnect (GeneratorExit / cancellation).
+    async def _iter_upstream():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        except httpx.HTTPError as exc:  # mid-stream upstream failure
+            _LOG.warning(
+                "tool-broker upstream stream error for %s: %s", absolute_url, exc
+            )
+            # End the stream cleanly rather than crashing the broker; the
+            # consumer simply sees the stream terminate.
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    return StreamingResponse(
+        _iter_upstream(),
+        status_code=status_code,
+        headers=response_headers,
+        media_type=content_type,
+    )
+
+
 async def _proxy(
     request: Request,
     *,
@@ -446,32 +626,15 @@ async def _proxy(
 
     query = urlencode(list(request.query_params.multi_items()))
     target = _target_url(upstream_base_url, path, query)
-    body = await request.body()
-
-    try:
-        async with httpx.AsyncClient(timeout=settings.proxy_timeout_seconds) as client:
-            upstream = await client.request(
-                request.method,
-                target,
-                headers=_forward_headers(
-                    request,
-                    lease_payload,
-                    inject_service_scope=upstream_service_scope,
-                ),
-                content=body,
-            )
-    except httpx.HTTPError as exc:
-        _LOG.warning("tool-broker upstream error for %s: %s", target, exc)
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="tool-broker upstream unavailable",
-        ) from exc
-
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=_response_headers(upstream.headers),
-        media_type=upstream.headers.get("content-type"),
+    forward_headers = _forward_headers(
+        request,
+        lease_payload,
+        inject_service_scope=upstream_service_scope,
+    )
+    return await _forward_to_upstream(
+        request,
+        absolute_url=target,
+        forward_headers=forward_headers,
     )
 
 
@@ -811,6 +974,415 @@ async def proxy_web_fetch(path: str, request: Request) -> Response:
         # web-fetch-gateway's _require_auth_context 403s unless X-Service-Scopes
         # contains web_fetch.invoke; the broker injects the trusted value.
         upstream_service_scope="web_fetch.invoke",
+    )
+
+
+@router.api_route("/dlp/api/dlp/v1/{path:path}", methods=["GET", "POST", "HEAD"])
+async def proxy_dlp(path: str, request: Request) -> Response:
+    settings: Settings = request.app.state.settings
+    return await _proxy(
+        request,
+        upstream_base_url=settings.dlp_url,
+        path=path,
+        required_scope="dlp.scan",
+        # foundation-dlp authorises tenant-scoped scans via the required
+        # X-Tenant-Id header (re-injected from the validated lease by
+        # _forward_headers) and does NOT consume X-Service-Scopes, so the
+        # broker injects nothing for this route.
+        upstream_service_scope=None,
+    )
+
+
+@router.api_route("/knowledge/v1/{path:path}", methods=["GET", "POST", "HEAD"])
+async def proxy_knowledge_ingest(path: str, request: Request) -> Response:
+    settings: Settings = request.app.state.settings
+    return await _proxy(
+        request,
+        upstream_base_url=settings.knowledge_ingest_url,
+        path=path,
+        required_scope="knowledge.search",
+        # knowledge-ingest needs no bearer/vkey and no X-Service-Scopes: it
+        # authorises retrieval purely on X-Tenant-Id / X-User-Id /
+        # X-User-Clearance, all three re-injected from the validated lease by
+        # _forward_headers (X-User-Clearance from the signed ``clearance``
+        # field, so a sandbox cannot inflate it).  The allowlist pins the
+        # upstream path to the single ``search`` endpoint.
+        upstream_service_scope=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# /mcp-tenant passthrough: invoke a tenant-registered MCP server by id
+# ---------------------------------------------------------------------------
+
+
+async def _resolve_tenant_mcp_record(
+    request: Request, *, tenant_id: str, server_id: str
+) -> dict[str, Any]:
+    """Resolve ``server_id`` to its real upstream endpoint via the mcp-registry.
+
+    Makes a trusted internal GET to ``{mcp_registry_url}/internal/mcp-servers?
+    tenant_id=<tenant>`` (the registry returns ENABLED servers only) presenting
+    the fixed ``mcp.read_internal`` service scope + the matching ``X-Tenant-Id``
+    that its internal guard requires, plus the inbound Authorization bearer.
+    Returns the matched item dict, which always carries a non-empty HTTP
+    ``endpoint``; the registry's ``auth`` / ``headers`` / ``timeout_seconds``
+    fields are passed through so the broker can inject them toward the upstream
+    (broker-routed clients carry only broker-auth headers, so the broker is the
+    single upstream-auth injection point).
+
+    Raises 404 (not 403/502) for every "cannot reach this server" outcome —
+    registry unreachable, non-200, empty list, no id match, or an item with no
+    usable HTTP ``endpoint`` (e.g. a stdio server) — because the worker treats
+    an unreachable/missing MCP server as a failure-open drop, exactly like the
+    other broker 404s.
+    """
+    settings: Settings = request.app.state.settings
+    list_url = (
+        f"{_clean_base(settings.mcp_registry_url)}/internal/mcp-servers"
+        f"?{urlencode({'tenant_id': tenant_id})}"
+    )
+    # The registry's internal guard requires the service scope AND a matching
+    # tenant header; the tenant here comes from the validated lease (or, in dev,
+    # the request header) — NEVER a sandbox-chosen value beyond that.
+    headers = {
+        "X-Service-Scopes": _MCP_READ_INTERNAL_SCOPE,
+        "X-Tenant-Id": tenant_id,
+    }
+    inbound_auth = request.headers.get("Authorization", "").strip()
+    if inbound_auth:
+        headers["Authorization"] = inbound_auth
+
+    client = httpx.AsyncClient(timeout=settings.proxy_timeout_seconds)
+    try:
+        resp = await client.get(list_url, headers=headers)
+    except httpx.HTTPError as exc:
+        _LOG.warning(
+            "tool-broker mcp-tenant registry lookup error for %s: %s",
+            list_url,
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="tool-broker: mcp server not found",
+        ) from exc
+    finally:
+        await client.aclose()
+
+    if resp.status_code != status.HTTP_200_OK:
+        _LOG.warning(
+            "tool-broker mcp-tenant registry lookup non-200 (%s) for tenant %s",
+            resp.status_code,
+            tenant_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="tool-broker: mcp server not found",
+        )
+
+    try:
+        items = resp.json().get("items", [])
+    except (ValueError, json.JSONDecodeError):
+        items = []
+    item = next(
+        (it for it in items if isinstance(it, dict) and it.get("id") == server_id),
+        None,
+    )
+    if item is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="tool-broker: mcp server not found",
+        )
+
+    endpoint = str(item.get("endpoint") or "").strip()
+    if not endpoint:
+        # stdio (or otherwise endpoint-less) servers cannot be reached over HTTP
+        # through the broker; treat exactly like "not found".
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="tool-broker: mcp server not found",
+        )
+    return item
+
+
+# ---------------------------------------------------------------------------
+# OAuth client-credentials token cache (tenant MCP servers)
+# ---------------------------------------------------------------------------
+#
+# The broker is the single upstream-auth injection point for broker-routed
+# sessions.  When a tenant MCP server's ``auth.type`` is ``oauth`` the broker
+# performs the client-credentials flow itself (POST to the registry-supplied
+# ``token_url``), caches the resulting access_token keyed by ``server_id``, and
+# injects ``Authorization: Bearer {access_token}`` toward the real upstream.
+#
+# Cache: module-level ``{server_id: {access_token, expires_at}}``.  A token is
+# refreshed when it is within ``_OAUTH_REFRESH_MARGIN_SECONDS`` of expiry.
+# Single-flight: a per-``server_id`` ``asyncio.Lock`` ensures concurrent broker
+# requests for the same server share one token fetch (no duplicate POSTs).
+_OAUTH_TOKEN_CACHE: dict[str, dict[str, object]] = {}
+_OAUTH_LOCKS: dict[str, asyncio.Lock] = {}
+_OAUTH_REFRESH_MARGIN_SECONDS = 60
+_OAUTH_TOKEN_TIMEOUT_SECONDS = 10.0
+
+
+def _oauth_lock(server_id: str) -> asyncio.Lock:
+    """Return the per-``server_id`` single-flight lock, creating it lazily."""
+    lock = _OAUTH_LOCKS.get(server_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _OAUTH_LOCKS[server_id] = lock
+    return lock
+
+
+async def _fetch_oauth_token(auth: Mapping[str, Any]) -> tuple[str, float]:
+    """POST ``client_credentials`` to ``auth.token_url`` -> (access_token, expires_at).
+
+    ``expires_at`` is a unix-epoch seconds timestamp.  ``expires_in`` defaults to
+    3600s when the token endpoint omits it or returns a non-numeric value.
+    Raises on any transport / HTTP / shape error so the caller can fail-open.
+    """
+    token_url = str(auth.get("token_url") or "").strip()
+    client_id = str(auth.get("client_id") or "").strip()
+    client_secret = str(auth.get("client_secret") or "").strip()
+    if not token_url or not client_id or not client_secret:
+        raise ValueError("oauth auth requires token_url, client_id, client_secret")
+    scopes_raw = auth.get("scopes")
+    scopes = (
+        [str(s) for s in scopes_raw if str(s)]
+        if isinstance(scopes_raw, list)
+        else []
+    )
+    form = {
+        "grant_type": "client_credentials",
+        "client_id": client_id,
+        "client_secret": client_secret,
+    }
+    if scopes:
+        form["scope"] = " ".join(scopes)
+    async with httpx.AsyncClient(timeout=_OAUTH_TOKEN_TIMEOUT_SECONDS) as client:
+        resp = await client.post(token_url, data=form)
+        resp.raise_for_status()
+        body = resp.json()
+    access_token = str(body.get("access_token") or "").strip()
+    if not access_token:
+        raise ValueError("oauth token endpoint returned no access_token")
+    try:
+        expires_in = float(body.get("expires_in"))
+    except (TypeError, ValueError):
+        expires_in = 3600.0
+    return access_token, time.time() + expires_in
+
+
+async def _get_oauth_token(server_id: str, auth: Mapping[str, Any]) -> str:
+    """Return a cached oauth access_token for ``server_id``, refreshing on expiry.
+
+    Single-flight: concurrent callers for the same ``server_id`` share one fetch
+    via a per-``server_id`` ``asyncio.Lock`` so the token endpoint is hit once.
+    """
+    async with _oauth_lock(server_id):
+        cached = _OAUTH_TOKEN_CACHE.get(server_id)
+        now = time.time()
+        if (
+            cached
+            and float(cached.get("expires_at", 0.0)) - now
+            > _OAUTH_REFRESH_MARGIN_SECONDS
+        ):
+            return str(cached["access_token"])
+        access_token, expires_at = await _fetch_oauth_token(auth)
+        _OAUTH_TOKEN_CACHE[server_id] = {
+            "access_token": access_token,
+            "expires_at": expires_at,
+        }
+        return access_token
+
+
+async def _mcp_upstream_auth_headers(record: Mapping[str, Any]) -> dict[str, str]:
+    """Build the UPSTREAM auth + custom headers for a tenant MCP server.
+
+    The broker is the ONLY injection point for registry-supplied upstream
+    auth/headers on broker-routed sessions: the claude-sdk worker and the
+    agentscope injector point their MCP clients at the broker and carry only
+    broker-auth headers (Authorization / X-Tenant-Id / X-Tool-Broker-Lease), so
+    the registry's ``auth`` / ``headers`` fields for the real upstream must be
+    applied here.  Auth headers win over colliding custom ``headers`` keys.
+
+    ``auth`` shape: ``{type: "none"|"bearer"|"api_key"|"oauth", token?,
+    header_name?, api_key?, client_id?, client_secret?, token_url?, scopes?}``.
+    ``header_name`` defaults to ``X-API-Key`` for ``api_key``.  ``oauth``
+    performs the client-credentials flow (cached + single-flight by server_id)
+    and injects ``Authorization: Bearer {access_token}``; a fetch failure is
+    fail-open (logged + no Authorization header) so the upstream decides.
+    """
+    headers: dict[str, str] = {}
+    custom = record.get("headers")
+    if isinstance(custom, dict):
+        headers.update({str(k): str(v) for k, v in custom.items()})
+    auth = record.get("auth")
+    if isinstance(auth, dict):
+        auth_type = str(auth.get("type") or "none").lower()
+        if auth_type == "bearer":
+            token = str(auth.get("token") or "").strip()
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        elif auth_type == "api_key":
+            api_key = str(auth.get("api_key") or "").strip()
+            if api_key:
+                header_name = (
+                    str(auth.get("header_name") or "").strip() or "X-API-Key"
+                )
+                headers[header_name] = api_key
+        elif auth_type == "oauth":
+            server_id = str(record.get("id") or "").strip()
+            if server_id:
+                try:
+                    access_token = await _get_oauth_token(server_id, auth)
+                    headers["Authorization"] = f"Bearer {access_token}"
+                except Exception as exc:  # noqa: BLE001 - fail-open, upstream 401s
+                    _LOG.warning(
+                        "tool-broker oauth token fetch failed for %s: %s",
+                        server_id,
+                        exc,
+                    )
+            else:
+                _LOG.warning(
+                    "tool-broker oauth auth missing server id; skipping token fetch"
+                )
+        # "none" -> no auth header injected
+    return headers
+
+
+# Register BOTH the bare ``/mcp-tenant/v1/{server_id}`` form and the
+# ``/{path:path}`` form. The sandbox's MCP streamable-http transport POSTs to
+# the bare URL with NO trailing slash; if only the ``/{path:path}`` route
+# existed, FastAPI's ``redirect_slashes`` would answer the bare form with a 307
+# to the trailing-slash variant — and the MCP client's fetch/undici drops the
+# custom ``Authorization``/``x-tool-broker-lease`` headers across that redirect,
+# yielding a 401 before the broker can proxy. Matching the bare path directly
+# (``path`` defaults to "") avoids any redirect, so the auth/lease headers
+# survive on every request.
+@router.api_route(
+    "/mcp-tenant/v1/{server_id}",
+    methods=["GET", "POST", "HEAD", "DELETE"],
+)
+@router.api_route(
+    "/mcp-tenant/v1/{server_id}/{path:path}",
+    methods=["GET", "POST", "HEAD", "DELETE"],
+)
+async def proxy_mcp_tenant(
+    server_id: str, request: Request, path: str = ""
+) -> Response:
+    """Passthrough to a tenant-registered MCP server, keyed by opaque server id.
+
+    The sandbox points its MCP streamable-http transport at
+    ``{TOOL_BROKER_URL}/mcp-tenant/v1/{server_id}`` (no trailing path) and the
+    broker:
+
+    1. validates auth + the per-run lease carries ``mcp.tenant_invoke``;
+    2. derives the tenant from the lease (request ``X-Tenant-Id`` only when
+       lease enforcement is off, i.e. dev);
+    3. resolves ``server_id`` to a real upstream ``endpoint`` via the trusted
+       mcp-registry internal listing for THAT tenant (enabled servers only);
+    4. forwards the MCP JSON-RPC request to the resolved endpoint, streaming
+       ``text/event-stream`` responses.
+
+    SSRF is bounded WITHOUT routing through ``_enforce_upstream_allowlist``
+    (whose path sets are keyed to fixed foundation services and would 403 a
+    dynamic, often-empty MCP path): the sandbox supplies only an OPAQUE
+    ``server_id``; the actual destination URL comes exclusively from the trusted
+    registry, scoped to the LEASE's own tenant's enabled servers — so a sandbox
+    can neither choose an arbitrary URL nor reach another tenant's server.
+    """
+    settings: Settings = request.app.state.settings
+    tenant_id = _require_auth(request, settings)
+    lease_payload = _require_lease(
+        request,
+        settings,
+        required_scope=_MCP_TENANT_INVOKE_SCOPE,
+        tenant_id=tenant_id,
+    )
+
+    # DELETE is allowed here (streamable-http session teardown) but kept out of
+    # the shared ``_ALLOWED_METHODS`` so the foundation-internal routes don't
+    # start accepting it.
+    if request.method.upper() not in _MCP_TENANT_ALLOWED_METHODS:
+        raise HTTPException(
+            status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
+            detail=f"method {request.method!r} is not allowed through tool-broker",
+        )
+
+    # Tenant authority: the lease tenant when enforcement is on, else the
+    # (dev-only) request header.  A sandbox can never fetch another tenant's
+    # server because the lookup is scoped to this tenant.
+    if lease_payload is not None:
+        resolved_tenant = str(lease_payload.get("tenant_id") or "").strip()
+    else:
+        resolved_tenant = (tenant_id or "").strip()
+    if not resolved_tenant:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="tool-broker: mcp-tenant tenant unknown",
+        )
+
+    record = await _resolve_tenant_mcp_record(
+        request, tenant_id=resolved_tenant, server_id=server_id
+    )
+    endpoint = str(record.get("endpoint") or "").strip()
+
+    # Path-join: the SDK's streamable-http transport POSTs to the base URL with
+    # no sub-path, so ``path`` is usually empty → forward to ``endpoint``
+    # verbatim.  When non-empty, join onto the resolved endpoint.
+    if path:
+        absolute_url = f"{endpoint.rstrip('/')}/{path}"
+    else:
+        absolute_url = endpoint
+    query = urlencode(list(request.query_params.multi_items()))
+    if query:
+        absolute_url = f"{absolute_url}?{query}"
+
+    # Headers toward a THIRD-PARTY tenant MCP server: strip the sandbox identity
+    # + lease headers via the shared denylist and inject NO foundation identity
+    # (no X-Service-Scopes / X-Tenant-Id / X-Actor / X-User-Id) — this is not a
+    # foundation internal service.  Passing ``lease_payload=None`` +
+    # ``inject_service_scope=None`` to ``_forward_headers`` yields the
+    # denylist-filtered passthrough: the MCP JSON-RPC body + content-type/accept
+    # + mcp-session-id/mcp-protocol-version headers the SDK sends, minus the
+    # stripped identity/authz headers.
+    forward_headers = _forward_headers(
+        request,
+        None,
+        inject_service_scope=None,
+    )
+    # SECURITY: never leak the sandbox's foundation Bearer (a tenant-bound
+    # service-account JWT) to an untrusted, tenant-registered MCP endpoint — a
+    # malicious server could replay it against foundation services. The shared
+    # denylist keeps ``Authorization`` for the trusted internal upstreams; drop
+    # it here. ``_forward_headers`` preserves the request's original header
+    # casing, so strip case-insensitively.
+    forward_headers = {
+        key: value
+        for key, value in forward_headers.items()
+        if key.lower() != "authorization"
+    }
+    # Inject the registry-supplied UPSTREAM auth + custom headers. The sandbox's
+    # foundation Bearer was just stripped above; the registry's ``auth`` (a
+    # bearer/api_key for the third-party MCP server) and ``headers`` are added
+    # here so they reach the real upstream and ONLY the real upstream. This is
+    # the single injection point for broker-routed sessions: the worker /
+    # agentscope clients carry only broker-auth headers, never upstream auth.
+    # For ``auth.type == "oauth"`` the broker performs the client-credentials
+    # flow itself (cached + single-flight by server_id) and injects the bearer.
+    forward_headers.update(await _mcp_upstream_auth_headers(record))
+    # Apply the tenant-configured per-server timeout (connect+read+write+pool).
+    # ``None`` preserves the streaming-friendly default in ``_forward_to_upstream``.
+    raw_timeout = record.get("timeout_seconds")
+    upstream_timeout = (
+        float(raw_timeout) if isinstance(raw_timeout, (int, float)) else None
+    )
+    return await _forward_to_upstream(
+        request,
+        absolute_url=absolute_url,
+        forward_headers=forward_headers,
+        upstream_timeout=upstream_timeout,
     )
 
 

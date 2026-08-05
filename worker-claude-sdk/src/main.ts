@@ -31,7 +31,9 @@ import {
   buildResumeContext,
   buildSystemPrompt,
   downloadAttachments,
+  extractStructuredOutputSchema,
   loadMcpServers,
+  mapReasoningEffort,
   runQuery,
   getWorkspaceDir,
   type RunResult,
@@ -224,6 +226,14 @@ export async function main(deps: MainDeps = {}): Promise<number> {
         virtualKey: env.LLM_VIRTUAL_KEY,
         userId: env.FOUNDATION_USER_ID,
         brokerLease: env.TOOL_BROKER_LEASE,
+        // Request-level features the Claude SDK Options surface cannot express,
+        // so they are carried into the adapter snapshot (see adapter.ts):
+        //   - max_tokens (model OUTPUT cap) from sampling_params,
+        //   - reasoning_effort (clamped to DeepSeek's high/max),
+        //   - structured-output JSON schema (constrained decoding).
+        maxOutputTokens: task.sampling_params?.max_tokens,
+        reasoningEffort: mapReasoningEffort(task.reasoning_effort),
+        structuredOutputSchema: extractStructuredOutputSchema(task.sampling_params),
         port: 0,
       });
 
@@ -233,12 +243,23 @@ export async function main(deps: MainDeps = {}): Promise<number> {
     process.env.ANTHROPIC_BASE_URL = `http://localhost:${port}`;
     process.env.ANTHROPIC_AUTH_TOKEN = OPAQUE_AUTH_TOKEN;
 
+    // Build the resume note BEFORE the first checkpoint write so it reads any
+    // checkpoint left behind by a *prior* run on this run-id — never the
+    // start-checkpoint this run is about to write below (which would otherwise
+    // be misread as "resumed, 1 step done" on every brand-new run).
+    const resumeNote = await buildResumeContext(redis);
+
     // Mark the run RUNNING before dispatch (first checkpoint write).
     await redis.writeStep({ cursor: "start", status: "RUNNING" });
-
-    const resumeNote = await buildResumeContext(redis);
     const downloaded = await downloadAttachments(task, env);
-    const mcpServers = await loadMcpServers(env);
+    // task.mcp_server_ids is three-state: undefined => tenant default (every
+    // enabled server, the historical behaviour), [] => MCP off for this run,
+    // non-empty => only those ids. Forwarded as-is so loadMcpServers can tell
+    // "absent" from "empty" — collapsing them here would break the contract.
+    const { servers: mcpServers, filters: mcpFilters } = await loadMcpServers(
+      env,
+      task.mcp_server_ids,
+    );
     // resumeNote is passed to runQuery (prepended to the user prompt) rather
     // than into the system prompt, so the static system prefix stays stable
     // across runs and remains hittable by DeepSeek's automatic prefix cache.
@@ -248,6 +269,7 @@ export async function main(deps: MainDeps = {}): Promise<number> {
     const result: RunResult = await runQuery(task, env, {
       systemPrompt,
       mcpServers,
+      mcpFilters,
       redis,
       resumeNote,
       deps: deps.queryFn ? { queryFn: deps.queryFn } : undefined,
@@ -263,6 +285,13 @@ export async function main(deps: MainDeps = {}): Promise<number> {
 
     if (result.status === "OK") {
       await redis.markCompleted();
+      return 0;
+    }
+    if (result.status === "paused") {
+      // HITL pause: the worker already wrote the PAUSED state + paused blob to
+      // Redis (worker.handlePause). result.json carries status="paused". The run
+      // is neither completed nor failed — the orchestrator re-dispatches a fresh
+      // sandbox with a resume payload. Exit 0 so the scheduler maps it to PAUSED.
       return 0;
     }
     // A FAILED run status from the agent loop is an infra/model failure → exit 1.

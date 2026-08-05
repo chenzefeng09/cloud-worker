@@ -103,12 +103,18 @@ _TOOL_ENV_SCRUB_KEYS: tuple[str, ...] = (
     "FOUNDATION_API_URL",
     "FOUNDATION_TENANT_ID",
     "FOUNDATION_USER_ID",
+    # Effective clearance for the run - the knowledge_tool reads it from the
+    # pre-scrub snapshot to send X-User-Clearance to ki; scrub it from
+    # os.environ so Bash/MCP subprocesses can't read or relay it.
+    "FOUNDATION_USER_CLEARANCE",
     "RUN_ID",
     "WORKSPACE_BASE",
     # Internal service topology.
     "MCP_REGISTRY_URL",
     "SKILL_STORE_URL",
     "WEB_FETCH_GATEWAY_URL",
+    # Knowledge-ingest endpoint (direct URL or tool-broker facade).
+    "KNOWLEDGE_INGEST_URL",
     "TOOL_BROKER_URL",
     "TOOL_BROKER_LEASE",
     "SANDBOX_EGRESS_MODE",
@@ -720,6 +726,19 @@ def _s3_read_text(s3_client, bucket: str, key: str) -> str | None:
         return None
 
 
+def _canvas_tool_enabled(env: dict) -> bool:
+    """True when the ``canvas_tool`` extension is active for this run.
+
+    The extension (and thus the ``create_canvas`` tool) is only registered when
+    ``canvas_tool`` appears in ``RUNTIME_EXTENSIONS`` — the scheduler appends it
+    per-run behind the ``enable_canvas_tool`` feature flag.  We gate the
+    system-prompt instruction on the same signal so the tool and its usage
+    guidance always appear/disappear together (flag off ⇒ zero change).
+    """
+    raw = env.get("RUNTIME_EXTENSIONS", "") or ""
+    return "canvas_tool" in {part.strip() for part in raw.split(",")}
+
+
 def _load_prompt_files(env: dict, task: dict) -> str:
     """Load soul / identity / user prompt files from S3 and assemble a system prompt.
 
@@ -1169,6 +1188,10 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
     # failure-open -- RunStateClient swallows all Redis errors internally.
     # ------------------------------------------------------------------
     state_client = _redis.from_env()
+    # Share the pre-scrub client with late consumers (canvas tool et al.):
+    # after _scrub_process_env_for_tools() removes REDIS_URL / broker lease
+    # from os.environ, any later from_env() yields a silent no-op client.
+    _redis.set_shared_client(state_client)
     _scrub_process_env_for_tools()
 
     # ------------------------------------------------------------------
@@ -1229,6 +1252,13 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
     # task.json["memory"]).  These arrive as a plain string already formatted
     # by the orchestrator; we prepend them so the agent sees them before the
     # main instructions.
+    #
+    # Scope note: the orchestrator excludes THIS session's own memory documents
+    # from the search (exclude_origin_session_id), so these snippets are
+    # cross-session RAG memory only.  The current session's prior turns are fed
+    # back separately via the restored conversation history below — keeping them
+    # out of here avoids double-injecting the same Q&A into both the system
+    # prompt and the agent context.
     memory_snippets = str(task.get("memory") or "").strip()
     if memory_snippets:
         sys_prompt = f"## \u76f8\u5173\u5386\u53f2\u8bb0\u5fc6\n\n{memory_snippets}\n\n---\n\n{sys_prompt}"
@@ -1274,6 +1304,41 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
             "\u4e0d\u8981\u5728\u6b63\u6587\u91cc\u63d0\u95ee\u540e\u81ea\u884c\u731c\u6d4b\u7ee7\u7eed\uff0c"
             "\u4e5f\u4e0d\u8981\u628a\u95ee\u9898\u4f5c\u4e3a\u6700\u7ec8\u56de\u590d\u7ed3\u675f\u4efb\u52a1\u3002"
             "\u7528\u6237\u56de\u7b54\u540e\u4f1a\u81ea\u52a8\u7ee7\u7eed\u672c\u6b21\u4efb\u52a1\u3002"
+        )
+
+    # Canvas (canvas v2, Phase B): tell the model WHEN to promote a long-form
+    # deliverable into an editable canvas via ``create_canvas``, and that after
+    # doing so the reply body must be a single short pointer sentence.  Gated on
+    # the ``canvas_tool`` extension being active (the tool is only registered
+    # then) so the instruction and the tool appear/disappear together \u2014 flag off
+    # \u21d2 this block is skipped entirely.
+    if _canvas_tool_enabled(env):
+        sys_prompt += (
+            "\n\n## \u957f\u6587\u6210\u6587\u521b\u4f5c\uff1a\u5fc5\u987b\u7528\u753b\u5e03\uff08create_canvas\uff09\n"
+            "\u8fd9\u662f\u4e00\u6761\u786c\u6027\u89c4\u5219\u3002\u51e1\u662f\u300c\u6210\u6587\u521b\u4f5c\u7c7b\u300d\u8bf7\u6c42\u2014\u2014"
+            "\u5199\u6587\u7ae0\u3001\u77ed\u6587\u3001\u62a5\u544a\u3001\u7b80\u62a5\u3001\u65b9\u6848\u3001\u90ae\u4ef6\u3001\u6587\u6848\u3001\u603b\u7ed3\u3001"
+            "\u6f14\u8bb2\u7a3f\u3001\u6545\u4e8b\u3001\u793e\u5a92\u957f\u6587\u3001\u4ee3\u7801\u7b14\u8bb0\u7b49\uff0c"
+            "\u4ee5\u53ca\u4efb\u4f55\u300a\u4e66\u540d\u53f7\u300b\u547d\u9898\u5199\u4f5c\u2014\u2014"
+            "\u552f\u4e00\u6b63\u786e\u7684\u505a\u6cd5\u662f\uff1a\u5148\u8c03\u7528 create_canvas \u5de5\u5177\uff0c"
+            "\u628a\u6807\u9898\uff08\u4ece\u547d\u9898\u6216\u4e66\u540d\u53f7\u91cc\u63d0\u53d6\uff09\u548c**\u5b8c\u6574\u6b63\u6587**\u653e\u8fdb content_markdown\u3002\n"
+            "\u7981\u6b62\uff1a\u4e0d\u8981\u5148\u5728\u6b63\u6587\u91cc\u628a\u6587\u7ae0\u5199\u51fa\u6765\u518d\u8c03\u7528\uff1b"
+            "\u4e0d\u8981\u4e00\u8fb9\u8c03\u7528\u4e00\u8fb9\u5728\u6b63\u6587\u91cd\u590d\u5168\u6587\u3002"
+            "\u8c03\u7528\u5de5\u5177\u540e\uff0c\u4f60\u7684\u6b63\u6587\u56de\u590d**\u53ea\u80fd\u5199\u4e00\u53e5\u8bdd**\u8bf4\u660e\uff0c"
+            "\u4f8b\u5982\u300c\u5df2\u4e3a\u4f60\u521b\u4f5c\u300aXX\u300b\uff0c\u5185\u5bb9\u5728\u53f3\u4fa7\u753b\u5e03\u4e2d\uff0c\u53ef\u67e5\u770b\u548c\u7f16\u8f91\u300d\u3002\n"
+            "\u53ea\u6709\u8fd9\u4e9b\u624d\u4e0d\u8c03\u7528\u3001\u76f4\u63a5\u5728\u6b63\u6587\u56de\u590d\uff1a"
+            "\u95f2\u804a\u3001\u7b80\u77ed\u95ee\u7b54\u3001\u89e3\u91ca\u8bf4\u660e\u3001\u6e05\u5355\u3001\u8ba1\u7b97\u3001\u4ee3\u7801\u8c03\u8bd5\u3001"
+            "\u4f9b\u9605\u8bfb\u7684\u77ed\u4ee3\u7801\u7247\u6bb5\u2014\u2014\u5373\u7528\u6237\u5e76\u975e\u8981\u4e00\u7bc7\u6210\u6587\u4f5c\u54c1\u65f6\u3002\n"
+            "\u793a\u4f8b\uff1a\u7528\u6237\u8bf4\u300c\u5199\u4e00\u7bc7\u300aAI \u4e0e\u5c31\u4e1a\u300b\u77ed\u6587\uff0c\u7ea6300\u5b57\u300d"
+            "\u2192 \u7acb\u5373\u8c03\u7528 create_canvas\uff08title=\u300cAI \u4e0e\u5c31\u4e1a\u300d\uff0c"
+            "content_markdown=\u5b8c\u6574300\u5b57\u6b63\u6587\uff09\uff0c\u6b63\u6587\u53ea\u56de\u4e00\u53e5\u8bf4\u660e\u3002"
+            "\n\u53ef\u8fd0\u884c\u7f51\u9875/\u5c0f\u6e38\u620f\uff1a\u5f53\u7528\u6237\u8981\u300c\u53ef\u73a9\u3001\u53ef\u4ea4\u4e92\u7684\u7f51\u9875\u3001"
+            "\u5c0f\u6e38\u620f\u3001\u53ef\u89c6\u5316\u3001\u5c0f\u52a8\u753b\u3001\u5c0f\u5de5\u5177\u300d\u65f6\uff0c\u540c\u6837\u8c03\u7528 "
+            "create_canvas\uff0c\u4f46\u8bbe content_type='html'\uff0c\u5e76\u628a\u4e00\u4efd**\u5b8c\u6574\u81ea\u5305\u542b "
+            "HTML \u6587\u6863**\uff08\u5185\u8054 <style>/<script>\uff0c\u7981\u6b62\u5916\u90e8 CDN/\u8054\u7f51\uff09"
+            "\u653e\u8fdb content_markdown\uff0c\u753b\u5e03\u4f1a\u5728\u6c99\u7bb1\u91cc\u628a\u5b83\u8dd1\u8d77\u6765\u3002"
+            "**\u4e0d\u8981**\u628a HTML \u5199\u6210\u6587\u4ef6\uff08\u5982 index.html/game.html\uff09\u518d\u8ba9"
+            "\u7528\u6237\u4e0b\u8f7d\u2014\u2014\u5fc5\u987b\u7528 create_canvas \u4ea4\u4ed8\uff0c"
+            "\u7528\u6237\u624d\u80fd\u5728\u5185\u5d4c\u753b\u5e03\u91cc\u76f4\u63a5\u8fd0\u884c\u3002"
         )
 
     # ------------------------------------------------------------------
@@ -1364,6 +1429,17 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
     # Only on fresh runs -- resume runs already have context from the
     # restored AgentState.
     # ------------------------------------------------------------------
+    # Resolve the agent name once, up-front: it must be identical for the
+    # restored history Msgs *and* the Agent below.  agentscope keys context
+    # ownership on ``msg.name == self.name`` (_get_last_msg / _save_to_context /
+    # _update_tool_call_state in agentscope.agent._agent) — if restored
+    # assistant/tool Msgs carry a different name than the agent, the agent does
+    # not recognize them as its own: the first new reply block appends a fresh
+    # AssistantMsg instead of merging, and tool-call-state updates targeting the
+    # restored turn silently no-op.  Stamping restored assistant/tool Msgs with
+    # the same ``agent_name`` keeps the restored turns owned by this agent.
+    agent_name = str(task.get("agent_name") or "Worker")
+
     history = task.get("history") or []
     if resume_payload is None and agent_state is not None and isinstance(history, list):
         from agentscope.message import (
@@ -1388,7 +1464,7 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
                     content_text = str(item.get("content") or "")
                     if content_text:
                         restored.append(
-                            Msg(name="assistant", role="assistant",
+                            Msg(name=agent_name, role="assistant",
                                 content=[TextBlock(type="text", text=content_text)])
                         )
                 elif role == "tool":
@@ -1404,13 +1480,13 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
                     )
                     output_str = str(t.get("result") or "")
                     restored.append(
-                        Msg(name="assistant", role="assistant", content=[
+                        Msg(name=agent_name, role="assistant", content=[
                             ToolCallBlock(type="tool_call", id=cid,
                                           name=tname, input=input_str)
                         ])
                     )
                     restored.append(
-                        Msg(name="assistant", role="assistant", content=[
+                        Msg(name=agent_name, role="assistant", content=[
                             ToolResultBlock(type="tool_result", id=cid,
                                             name=tname, output=output_str)
                         ])
@@ -1422,7 +1498,7 @@ def _run_real(task: dict) -> tuple[str, str, dict, list]:
             logger.info("restored %d history messages into context", len(restored))
 
     agent = Agent(
-        name=str(task.get("agent_name") or "Worker"),
+        name=agent_name,
         system_prompt=sys_prompt,
         model=model,
         toolkit=toolkit,

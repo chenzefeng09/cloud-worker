@@ -26,13 +26,14 @@ import logging
 import secrets
 
 import httpx
-from fastapi import APIRouter, Depends, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from foundation_sdk import (
     CookieSigner,
     SignatureExpiredError,
     SignatureInvalid,
 )
+from pydantic import BaseModel, Field
 from foundation_sdk.fastapi import get_tenant_id, get_user_id
 
 from agent_bff.api._http import foundation_headers
@@ -47,6 +48,68 @@ logger = logging.getLogger(__name__)
 
 def _signer(request: Request) -> CookieSigner:
     return request.app.state.cookie_signer
+
+
+async def _attach_effective_permissions(
+    profile: dict, *, authz_url: str, headers: dict
+) -> dict:
+    """Enrich an identity profile dict with the caller's authz permission set.
+
+    Resolves the caller's effective permissions for the current tenant from
+    authz ``GET /my-permissions`` and attaches them under
+    ``profile["permissions"]`` so the SPA receives roles + permissions in a
+    single round-trip and can drive permission-gated UI without a second call.
+
+    Fail-soft: authz being unreachable / non-200 / unparseable must not break
+    the caller — we attach an empty list and let the SPA degrade.  This is the
+    single source of truth shared by both ``GET /auth/me`` and
+    ``PATCH /auth/me`` so the two ``/auth/me`` response shapes stay identical.
+    """
+    permissions: list = []
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            authz_resp = await client.get(
+                f"{authz_url}/my-permissions",
+                headers=headers,
+            )
+        if authz_resp.status_code == 200:
+            body = authz_resp.json()
+            if isinstance(body, dict) and isinstance(body.get("permissions"), list):
+                permissions = body["permissions"]
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("me: authz permissions fetch failed", extra={"exc": str(exc)})
+
+    if isinstance(profile, dict):
+        profile["permissions"] = permissions
+    return profile
+
+
+def _raise_for_upstream(resp: httpx.Response) -> None:
+    """Surface an upstream identity 4xx/5xx to the SPA as problem+json.
+
+    Mirrors the established convention in ``admin._raise_for_upstream``: the
+    raised :class:`HTTPException` carries the upstream status verbatim and,
+    when the upstream speaks problem+json, lifts its user-facing
+    ``user_message`` to the top level of ``detail`` (keeping the original
+    document nested under ``detail["detail"]``).  This routes through the BFF's
+    problem+json machinery so the SPA shows a friendly message (wrong current
+    password, SSO account, weak password) instead of a raw JSON blob.  Header
+    transport is avoided on purpose — ``user_message`` is frequently non-ASCII
+    (Chinese) and HTTP header values are latin-1.
+    """
+    if resp.status_code >= 400:
+        try:
+            body = resp.json()
+        except ValueError:
+            raise HTTPException(
+                status_code=resp.status_code, detail=resp.text or "upstream error"
+            )
+        if isinstance(body, dict) and body.get("user_message") is not None:
+            raise HTTPException(
+                status_code=resp.status_code,
+                detail={"detail": body, "user_message": body["user_message"]},
+            )
+        raise HTTPException(status_code=resp.status_code, detail=body)
 
 
 async def _foundation_login(
@@ -524,26 +587,150 @@ async def me(request: Request) -> dict:
     # Additionally resolve the caller's effective permission set for the current
     # tenant from authz, so the SPA receives roles + permissions in a single
     # /auth/me round-trip and can drive permission-gated UI without a second
-    # call.  Fail-soft: authz being unreachable / non-200 / unparseable must not
-    # break identity rehydration — attach an empty list and let the SPA degrade.
-    permissions: list = []
+    # call.  Fail-soft enrichment lives in the shared helper so PATCH /auth/me
+    # returns an identical shape.
+    return await _attach_effective_permissions(
+        profile, authz_url=settings.authz_url, headers=headers
+    )
+
+
+@router.patch("/auth/me")
+async def update_me(
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> dict:
+    """Self-service profile update — proxy to foundation identity
+    ``PATCH /sessions/me``.
+
+    The only mutable field today is ``display_name``.  Upstream resolves the
+    caller entirely from the forwarded bearer token (JWKS-verified) and is the
+    authority on validation, so the BFF stays thin: it forwards
+    ``{"display_name": ...}`` and lets identity reject anything malformed with
+    a 422.  We deliberately project the request to *only* ``display_name`` so a
+    client can't smuggle extra fields (e.g. ``roles``) into the upstream body.
+
+    Response: the updated MeResponse-shaped profile dict
+    (``{user_id, tenant_id, email, display_name, roles, clearance,
+    mfa_enabled, locale}``).
+    """
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        body = None
+    if not isinstance(body, dict):
+        body = {}
+    # Project to the single allowed field — never forward arbitrary keys.
+    payload = {"display_name": body.get("display_name")}
+
+    headers = foundation_headers(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        access_token=access_token,
+    )
     try:
         async with httpx.AsyncClient(timeout=5) as client:
-            authz_resp = await client.get(
-                f"{settings.authz_url}/my-permissions",
+            resp = await client.patch(
+                f"{settings.foundation_identity_url}/sessions/me",
+                json=payload,
                 headers=headers,
             )
-        if authz_resp.status_code == 200:
-            body = authz_resp.json()
-            if isinstance(body, dict) and isinstance(body.get("permissions"), list):
-                permissions = body["permissions"]
-    except (httpx.HTTPError, ValueError) as exc:
-        logger.warning("me: authz permissions fetch failed", extra={"exc": str(exc)})
+    except httpx.HTTPError as exc:
+        logger.warning("update_me: identity unreachable", extra={"exc": str(exc)})
+        raise AuthenticationError("Identity service unavailable") from exc
 
-    if isinstance(profile, dict):
-        profile["permissions"] = permissions
+    if resp.status_code == 401:
+        raise AuthenticationError("Session expired")
+    # Preserve the upstream status (notably 422 validation) and surface a
+    # problem+json body carrying ``user_message`` instead of a masked 401 or a
+    # raw JSON blob.
+    _raise_for_upstream(resp)
 
-    return profile
+    # Enrich with the caller's effective permissions exactly like GET /auth/me,
+    # so both /auth/me responses carry ``permissions`` and the SPA's
+    # admin-gating doesn't break after a rename.
+    profile = resp.json()
+    return await _attach_effective_permissions(
+        profile, authz_url=settings.authz_url, headers=headers
+    )
+
+
+class ChangePasswordRequest(BaseModel):
+    """Body for POST /auth/me/password — self-service change-password.
+
+    The target user is always the authenticated caller (resolved upstream from
+    the forwarded bearer token), so this carries only the two passwords.  The
+    new-password policy floor is enforced by foundation identity, not here — the
+    BFF stays thin and forwards a projected ``{current_password, new_password}``.
+    """
+
+    current_password: str = Field(..., min_length=1, max_length=256)
+    new_password: str = Field(..., min_length=1, max_length=256)
+
+
+@router.post("/auth/me/password", status_code=204)
+async def change_my_password(
+    body: ChangePasswordRequest,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> Response:
+    """Self-service password change — proxy to foundation identity
+    ``POST /sessions/me/password``.
+
+    Upstream resolves the caller entirely from the forwarded bearer token
+    (JWKS-verified) and is the authority on the change — verifying the *current*
+    password, rejecting SSO/federated accounts, enforcing the new-password
+    policy, and setting the new password.  The BFF projects the request to
+    *only* ``{current_password, new_password}`` so a client can't smuggle a
+    target ``user_id`` (or any other field) into the upstream body.
+
+    CRITICAL — error propagation: the upstream status code and body are
+    preserved verbatim (other than 401 → "Session expired").  In particular a
+    400 ``CURRENT_PASSWORD_INCORRECT`` and a 409 ``PASSWORD_CHANGE_NOT_ALLOWED``
+    must reach the SPA AS-IS so the user sees a truthful, actionable error —
+    never masked as a generic 401/500.
+
+    On success returns ``204 No Content`` (no body), matching upstream.
+    """
+    tenant_id, user_id, access_token = _auth
+    settings = request.app.state.settings
+
+    # Project to ONLY the two allowed fields — never forward arbitrary keys.
+    payload = {
+        "current_password": body.current_password,
+        "new_password": body.new_password,
+    }
+
+    headers = foundation_headers(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        access_token=access_token,
+    )
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.post(
+                f"{settings.foundation_identity_url}/sessions/me/password",
+                json=payload,
+                headers=headers,
+            )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "change_my_password: identity unreachable", extra={"exc": str(exc)}
+        )
+        raise AuthenticationError("Identity service unavailable") from exc
+
+    if resp.status_code == 401:
+        raise AuthenticationError("Session expired")
+    # Preserve the upstream status (400 wrong current password, 409
+    # SSO/federated, 422 weak new password) and surface a problem+json body
+    # carrying ``user_message`` so the SPA shows a truthful, actionable error
+    # instead of a masked 401 or a raw JSON blob.
+    _raise_for_upstream(resp)
+
+    # 204 (or any other 2xx) → success, no body.
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/auth/sessions")

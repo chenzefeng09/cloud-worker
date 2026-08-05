@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     chunk_size: int = 800
     chunk_overlap: int = 80
 
+    # Retrieval quality gate: a hit whose cosine *distance* exceeds this is
+    # dropped ("宁缺毋滥" — better no result than an irrelevant one).  Cosine
+    # distance is in [0, 2]; 0 == identical direction.
+    knowledge_search_max_distance: float = 0.6
+
     db_pool_size: int = 5
     db_max_overflow: int = 10
     db_pool_recycle: int = 1800

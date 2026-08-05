@@ -23,7 +23,7 @@ interface Props {
 export function PageHead({ crumbs, status, actions }: Props) {
   const navigate = useNavigate();
   return (
-    <div className="flex items-center gap-3.5 px-6 py-3.5 border-b border-line bg-paper shrink-0">
+    <div className="flex items-center gap-3.5 px-6 py-3.5 min-h-[56px] border-b border-line bg-paper shrink-0">
       <div className="flex items-center gap-1.5 font-mono text-[11px] text-dim">
         {crumbs.map((c, i) => (
           <Fragment key={i}>

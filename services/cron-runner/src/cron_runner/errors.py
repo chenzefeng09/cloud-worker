@@ -34,3 +34,14 @@ class InvalidCronExpressionError(CronRunnerError):
             code="CRON.INVALID_EXPRESSION",
             status=400,
         )
+
+
+class TriggerValidationError(CronRunnerError):
+    """A trigger's fields are inconsistent with its trigger_type (400)."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(
+            detail,
+            code="CRON.INVALID_TRIGGER",
+            status=400,
+        )

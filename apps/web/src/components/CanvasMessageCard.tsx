@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ClipboardEvent } from 'react';
 import {
   CANVAS_OBJECTS,
-  buildCanvasEditPrompt,
   getCanvasObject,
   type CanvasDocumentDraft,
   type CanvasEditIntent,
@@ -11,23 +10,51 @@ import {
   type CanvasTextSelection,
 } from '../lib/canvasObjects';
 import {
+  canvasBlocksToHtml,
+  canvasEditorToBlocks,
   canvasHtmlToMarkdown,
+  getCanvasBlockSelectionsInside,
   getMarkdownSelectionInside,
   markdownToCanvasHtml,
 } from '../lib/canvasRichText';
 import { CopyIcon, useCopied } from './CopyButton';
+import { useCanvasStore } from '../stores/canvasStore';
+import { useChatStore } from '../stores/chatStore';
+import { useConfirm } from '../admin/components/dialogs';
+import { api } from '../api/client';
+import type { CanvasSelectionSegment, CanvasVersionSummary } from '../api/types';
+import { InlineCanvasSuggestion } from './InlineCanvasSuggestion';
+import { CanvasHtmlPreview } from './CanvasHtmlPreview';
+import { canvasHtmlSource } from '../lib/canvasHtml';
 
 interface CanvasMessageCardProps {
   sessionId: string;
-  draft: CanvasDocumentDraft;
+  /** Draft mode (canvas.v2 OFF / legacy path). Mutually exclusive with `canvasId`. */
+  draft?: CanvasDocumentDraft;
+  /**
+   * When set, the card binds to a server canvas object from canvasStore
+   * instead of `draft`. Mutually exclusive with `draft`.
+   */
+  canvasId?: string;
+  /** True while the underlying creation run streams — freezes the editor. */
   aiDisabled?: boolean;
   pending?: boolean;
-  onDraftChange: (draft: CanvasDocumentDraft) => void;
-  onRequestEdit: (request: CanvasEditRequest, prompt: string) => void | Promise<void>;
+  /** True while a silent canvas revision request is in flight. */
+  revising?: boolean;
+  /** Localised error from the last failed revision (chat-invisible). */
+  editError?: string | null;
+  onDraftChange?: (draft: CanvasDocumentDraft) => void;
+  onRequestEdit?: (request: CanvasEditRequest) => void | Promise<void>;
+  onDismissEditError?: () => void;
   onOpenPanel?: () => void;
   suggestion?: CanvasEditSuggestion | null;
   onAcceptSuggestion?: () => void;
   onRejectSuggestion?: () => void;
+}
+
+/** Random 8-char id suffix for newly-split blocks created from manual edits. */
+function randomBlockSuffix(): string {
+  return Math.random().toString(36).slice(2, 10);
 }
 
 type ToolbarMode = 'menu' | 'input';
@@ -47,6 +74,8 @@ interface InlineSuggestionPreview {
 
 const HISTORY_LIMIT = 80;
 const STORAGE_PREFIX = 'article-canvas-draft-v1';
+// CSS Custom Highlight API 的注册名:进入「要求更改」输入态后用它给选区打持久高亮。
+const PENDING_EDIT_HIGHLIGHT = 'canvas-pending-edit';
 
 function storageKey(sessionId: string): string {
   return `${STORAGE_PREFIX}:${sessionId}`;
@@ -96,31 +125,176 @@ function shouldPasteAsRichBlocks(text: string): boolean {
   );
 }
 
+// Placeholder empty draft used only to keep hook order stable when in
+// canvasId mode before the store has loaded the canvas. Never rendered from —
+// the component returns null in that case (checked after all hooks run).
+const EMPTY_DRAFT: CanvasDocumentDraft = {
+  id: '',
+  kind: 'article',
+  title: '',
+  content: '',
+  updatedAt: '',
+};
+
 export function CanvasMessageCard({
   sessionId,
-  draft,
+  draft: draftProp,
+  canvasId,
   aiDisabled,
   pending,
+  revising,
+  editError,
   onDraftChange,
   onRequestEdit,
+  onDismissEditError,
   onOpenPanel,
-  suggestion,
-  onAcceptSuggestion,
-  onRejectSuggestion,
+  suggestion: suggestionProp,
+  onAcceptSuggestion: onAcceptSuggestionProp,
+  onRejectSuggestion: onRejectSuggestionProp,
 }: CanvasMessageCardProps) {
+  // ── canvasId mode (canvas.v2 ON): pull from the server-canvas store ────────
+  // Selectors read primitives / stable references only (never a fresh object
+  // literal) — see canvasStore.ts's selector-safety note. Hooks are always
+  // called unconditionally regardless of mode, per Rules of Hooks.
+  const storeCanvas = useCanvasStore((s) => (canvasId ? s.canvasesById[canvasId] : undefined));
+  const storeSuggestion = useCanvasStore((s) =>
+    canvasId ? s.suggestionsByCanvasId[canvasId] ?? null : null,
+  );
+  const storeRevising = useCanvasStore((s) => (canvasId ? s.revisingCanvasIds[canvasId] ?? false : false));
+  const storeError = useCanvasStore((s) => (canvasId ? s.errorByCanvasId[canvasId] ?? null : null));
+  const requestEditAction = useCanvasStore((s) => s.requestEdit);
+  const applySuggestionAction = useCanvasStore((s) => s.applySuggestion);
+  const saveManualAction = useCanvasStore((s) => s.saveManual);
+  const revertAction = useCanvasStore((s) => s.revert);
+  const clearErrorAction = useCanvasStore((s) => s.clearError);
+  const confirm = useConfirm();
+
+  // Derive a CanvasDocumentDraft-shaped view from the server canvas so the
+  // existing rich-editor JSX (below) can render either mode unmodified.
+  const derivedDraft: CanvasDocumentDraft | null = useMemo(() => {
+    if (!canvasId || !storeCanvas) return null;
+    return {
+      id: storeCanvas.id,
+      kind: (storeCanvas.kind as CanvasObjectKind) || 'article',
+      title: storeCanvas.title,
+      content: storeCanvas.blocks.map((b) => b.text).join('\n\n'),
+      updatedAt: storeCanvas.updated_at,
+    };
+  }, [canvasId, storeCanvas]);
+
+  const missingCanvas = Boolean(canvasId) && !derivedDraft;
+  // `draft` is always non-null while hooks run below; the "really missing"
+  // case is handled by `missingCanvas` short-circuiting the render at the end.
+  const draft = canvasId ? derivedDraft ?? EMPTY_DRAFT : draftProp ?? EMPTY_DRAFT;
+
+  // canvasId-mode suggestion, reshaped into the CanvasEditSuggestion shape the
+  // existing JSX below already knows how to render (whole-document form only —
+  // per-block diff review is PR-4 scope). The real per-block orig/sugg text
+  // (`storeSuggestion.diffs`) is rendered directly in a lightweight extra
+  // section below rather than forced through the character-diff path.
+  const derivedSuggestion: CanvasEditSuggestion | null = useMemo(() => {
+    if (!canvasId || !storeSuggestion) return null;
+    return {
+      request: {
+        documentId: canvasId,
+        kind: (draft.kind as CanvasObjectKind) || 'article',
+        title: draft.title,
+        scope: 'document',
+        instruction: storeSuggestion.instruction,
+        content: draft.content,
+      },
+      replacement: draft.content,
+      summary: storeSuggestion.change_summary,
+      receivedAt: storeSuggestion.created_at,
+    };
+  }, [canvasId, draft.content, draft.kind, draft.title, storeSuggestion]);
+
+  const suggestion = canvasId ? derivedSuggestion : suggestionProp;
+  const revisingEffective = canvasId ? storeRevising : revising;
+  const editErrorEffective = canvasId ? storeError : editError;
+  const [blockSelection, setBlockSelection] = useState<CanvasSelectionSegment[]>([]);
+
+  const handleDraftChange = useCallback(
+    (next: CanvasDocumentDraft) => {
+      if (!canvasId) {
+        onDraftChange?.(next);
+      }
+      // canvasId mode: keystroke-level changes stay local to the contentEditable
+      // DOM; persistence to the server happens on blur (handleEditorBlur below)
+      // rather than on every keystroke, to avoid spamming saveManual.
+    },
+    [canvasId, onDraftChange],
+  );
+
+  const handleRequestEdit = useCallback(
+    async (request: CanvasEditRequest) => {
+      if (!canvasId) {
+        await onRequestEdit?.(request);
+        return;
+      }
+      const model = useChatStore.getState().selectedModel[sessionId] || undefined;
+      const scope = request.scope === 'selection' && blockSelection.length > 0
+        ? { type: 'selection' as const, segments: blockSelection }
+        : { type: 'document' as const };
+      await requestEditAction(canvasId, sessionId, {
+        instruction: request.instruction,
+        scope,
+        model,
+      });
+    },
+    [blockSelection, canvasId, onRequestEdit, requestEditAction, sessionId],
+  );
+
+  const handleAcceptSuggestion = useCallback(() => {
+    if (!canvasId) {
+      onAcceptSuggestionProp?.();
+      return;
+    }
+    if (!storeSuggestion) return;
+    void applySuggestionAction(canvasId, storeSuggestion.id, true);
+  }, [applySuggestionAction, canvasId, onAcceptSuggestionProp, storeSuggestion]);
+
+  const handleRejectSuggestion = useCallback(() => {
+    if (!canvasId) {
+      onRejectSuggestionProp?.();
+      return;
+    }
+    if (!storeSuggestion) return;
+    void applySuggestionAction(canvasId, storeSuggestion.id, false);
+  }, [applySuggestionAction, canvasId, onRejectSuggestionProp, storeSuggestion]);
+
+  const handleDismissEditError = useCallback(() => {
+    if (canvasId) {
+      clearErrorAction(canvasId);
+      return;
+    }
+    onDismissEditError?.();
+  }, [canvasId, clearErrorAction, onDismissEditError]);
+
+  const onAcceptSuggestion = canvasId ? handleAcceptSuggestion : onAcceptSuggestionProp;
+  const onRejectSuggestion = canvasId ? handleRejectSuggestion : onRejectSuggestionProp;
+
   const editorRef = useRef<HTMLDivElement | null>(null);
   const hydratedDraftIdRef = useRef<string | null>(null);
   const localEditContentRef = useRef<string | null>(null);
   const selectedRangeRef = useRef<Range | null>(null);
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const popoverRef = useRef<HTMLDivElement | null>(null);
   const object = getCanvasObject(draft.kind);
   const { copied, copy } = useCopied();
   const [selection, setSelection] = useState<CanvasTextSelection | null>(null);
   const [toolbar, setToolbar] = useState<ToolbarState | null>(null);
   const [instruction, setInstruction] = useState('');
+  // 悬浮选区弹框的指令与底部整篇输入框各自独立,避免互相镜像
+  const [popupInstruction, setPopupInstruction] = useState('');
   const [busy, setBusy] = useState(false);
   const [history, setHistory] = useState<string[]>([]);
   const [future, setFuture] = useState<string[]>([]);
+  // ── Version history (canvasId mode only) ──────────────────────────────────
+  const [versionsOpen, setVersionsOpen] = useState(false);
+  const [versions, setVersions] = useState<CanvasVersionSummary[] | null>(null);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [versionsError, setVersionsError] = useState<string | null>(null);
   const inlineSuggestionPreview = useMemo(
     () => buildInlineSuggestionPreview(draft.content, suggestion),
     [draft.content, suggestion],
@@ -136,6 +310,7 @@ export function CanvasMessageCard({
         setHistory([]);
         setFuture([]);
         setSelection(null);
+        setBlockSelection([]);
         setToolbar(null);
       }
       return;
@@ -144,10 +319,13 @@ export function CanvasMessageCard({
     if (hydratedDraftIdRef.current !== draft.id) {
       hydratedDraftIdRef.current = draft.id;
       localEditContentRef.current = null;
-      el.innerHTML = markdownToCanvasHtml(draft.content);
+      el.innerHTML = canvasId && storeCanvas
+        ? canvasBlocksToHtml(storeCanvas.blocks)
+        : markdownToCanvasHtml(draft.content);
       setHistory([]);
       setFuture([]);
       setSelection(null);
+      setBlockSelection([]);
       setToolbar(null);
       return;
     }
@@ -158,8 +336,11 @@ export function CanvasMessageCard({
     }
 
     if (!el.innerHTML.trim() && draft.content.trim()) {
-      el.innerHTML = markdownToCanvasHtml(draft.content);
+      el.innerHTML = canvasId && storeCanvas
+        ? canvasBlocksToHtml(storeCanvas.blocks)
+        : markdownToCanvasHtml(draft.content);
       setSelection(null);
+      setBlockSelection([]);
       setToolbar(null);
       return;
     }
@@ -168,34 +349,136 @@ export function CanvasMessageCard({
     if (current !== draft.content) {
       setHistory((prev) => trimHistory([...prev, current]));
       setFuture([]);
-      el.innerHTML = markdownToCanvasHtml(draft.content);
+      el.innerHTML = canvasId && storeCanvas
+        ? canvasBlocksToHtml(storeCanvas.blocks)
+        : markdownToCanvasHtml(draft.content);
       setSelection(null);
+      setBlockSelection([]);
       setToolbar(null);
     }
-  }, [draft.content, draft.id, hasInlineSuggestionPreview]);
+  }, [canvasId, draft.content, draft.id, hasInlineSuggestionPreview, storeCanvas]);
 
   useEffect(() => {
+    // canvasId mode is server-persisted (saveManual on blur) — the legacy
+    // localStorage draft mirror only applies to the in-memory draft mode.
+    if (canvasId) return;
     try {
       localStorage.setItem(storageKey(sessionId), JSON.stringify(draft));
     } catch {
       // Canvas persistence remains best-effort until backend document APIs land.
     }
-  }, [draft, sessionId]);
+  }, [canvasId, draft, sessionId]);
 
   useEffect(() => {
     if (toolbar?.mode !== 'input') return;
+    // 同步聚焦一次:后台/隐藏标签页里 rAF 会被冻结,不能只依赖它
+    inputRef.current?.focus();
     requestAnimationFrame(() => inputRef.current?.focus());
+  }, [toolbar]);
+
+  useEffect(() => {
+    if (!toolbar) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      const popover = popoverRef.current;
+      if (popover && event.target instanceof Node && popover.contains(event.target)) return;
+      setToolbar(null);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      // isComposing: Escape 取消输入法组合时不应关闭弹框
+      if (event.key === 'Escape' && !event.isComposing) setToolbar(null);
+    };
+    document.addEventListener('pointerdown', handlePointerDown, true);
+    document.addEventListener('keydown', handleKeyDown, true);
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown, true);
+      document.removeEventListener('keydown', handleKeyDown, true);
+    };
+  }, [toolbar]);
+
+  useEffect(() => {
+    // 进入「要求更改」输入态后,焦点移入指令输入框会清掉 contenteditable 的原生选区高亮。
+    // 用 CSS Custom Highlight API 给选中的 Range 打一层持久高亮,让用户始终看得到要改的是哪一段;
+    // 该高亮不改动 DOM,不会污染 markdown 序列化。旧浏览器无此 API 时静默降级。
+    const registry = typeof CSS !== 'undefined' ? CSS.highlights : undefined;
+    if (!registry || typeof Highlight === 'undefined') return;
+    const range = selectedRangeRef.current;
+    if (toolbar?.mode !== 'input' || !range) {
+      registry.delete(PENDING_EDIT_HIGHLIGHT);
+      return;
+    }
+    registry.set(PENDING_EDIT_HIGHLIGHT, new Highlight(range));
+    return () => {
+      registry.delete(PENDING_EDIT_HIGHLIGHT);
+    };
   }, [toolbar?.mode]);
 
   const updateDraft = useCallback(
     (patch: Partial<CanvasDocumentDraft>) => {
-      onDraftChange({
+      handleDraftChange({
         ...draft,
         ...patch,
         updatedAt: new Date().toISOString(),
       });
     },
-    [draft, onDraftChange],
+    [draft, handleDraftChange],
+  );
+
+  // Manual-edit save (canvasId mode only): stable ids are read from the DOM,
+  // so deleting or inserting an earlier paragraph cannot rebind later text to
+  // the wrong block.
+  const handleEditorBlur = useCallback(() => {
+    if (!canvasId || !storeCanvas || !editorRef.current) return;
+    const content = canvasHtmlToMarkdown(editorRef.current);
+    const currentContent = storeCanvas.blocks.map((b) => b.text).join('\n\n');
+    if (content === currentContent) return;
+    const blocks = canvasEditorToBlocks(
+      editorRef.current,
+      storeCanvas.blocks,
+      () => `blk_${randomBlockSuffix()}`,
+    );
+    void saveManualAction(canvasId, blocks, storeCanvas.current_version);
+  }, [canvasId, saveManualAction, storeCanvas]);
+
+  // ── Version history (canvasId mode only) ──────────────────────────────────
+  // Lightweight: toggle a dropdown, lazily fetch the version list, revert to a
+  // chosen version (append a new version server-side). No diff preview.
+  const toggleVersions = useCallback(() => {
+    if (!canvasId) return;
+    setVersionsOpen((open) => {
+      const next = !open;
+      if (next) {
+        setVersionsLoading(true);
+        setVersionsError(null);
+        api.canvas
+          .versions(canvasId)
+          .then((res) => setVersions(res.items))
+          .catch((err) => {
+            setVersionsError(
+              err instanceof Error && err.message ? err.message : '无法加载版本历史。',
+            );
+          })
+          .finally(() => setVersionsLoading(false));
+      }
+      return next;
+    });
+  }, [canvasId]);
+
+  const handleRevert = useCallback(
+    async (toVersion: number) => {
+      if (!canvasId) return;
+      const ok = await confirm({
+        title: '回退版本',
+        message: `确定回退到版本 ${toVersion}？将基于该版本创建一个新版本。`,
+        confirmText: '回退',
+      });
+      if (!ok) return;
+      const reverted = await revertAction(canvasId, toVersion);
+      if (reverted) {
+        setVersionsOpen(false);
+        setVersions(null);
+      }
+    },
+    [canvasId, revertAction, confirm],
   );
 
   const commitContent = useCallback(
@@ -247,13 +530,15 @@ export function CanvasMessageCard({
       const next = getMarkdownSelectionInside(el, draft.content);
       if (!next) {
         setSelection(null);
+        setBlockSelection([]);
         if (toolbar?.mode !== 'input') setToolbar(null);
         return;
       }
       setSelection(next);
+      setBlockSelection(canvasId && storeCanvas ? getCanvasBlockSelectionsInside(el, storeCanvas.blocks) : []);
       showToolbarForRange(range, mode, fallback);
     },
-    [draft.content, showToolbarForRange, toolbar?.mode],
+    [canvasId, draft.content, showToolbarForRange, storeCanvas, toolbar?.mode],
   );
 
   const handleInput = useCallback(() => {
@@ -367,10 +652,14 @@ export function CanvasMessageCard({
     });
   };
 
-  const buildRequest = (scope: 'selection' | 'document', intent?: CanvasEditIntent): CanvasEditRequest | null => {
-    const finalInstruction = (intent?.instruction || instruction).trim();
+  const buildRequest = (
+    scope: 'selection' | 'document',
+    intent?: CanvasEditIntent,
+    instructionText?: string,
+  ): CanvasEditRequest | null => {
+    const finalInstruction = (intent?.instruction || (instructionText ?? instruction)).trim();
     if (!finalInstruction) return null;
-    if (scope === 'selection' && !selection) return null;
+    if (scope === 'selection' && (!selection || (canvasId && blockSelection.length === 0))) return null;
     return {
       documentId: draft.id,
       kind: draft.kind,
@@ -382,16 +671,24 @@ export function CanvasMessageCard({
     };
   };
 
-  const requestEdit = async (scope: 'selection' | 'document', intent?: CanvasEditIntent) => {
-    if (aiDisabled || busy) return;
-    const request = buildRequest(scope, intent);
+  const requestEdit = async (
+    scope: 'selection' | 'document',
+    intent?: CanvasEditIntent,
+    instructionText?: string,
+  ) => {
+    if (aiDisabled || busy || revisingEffective) return;
+    const request = buildRequest(scope, intent, instructionText);
     if (!request) return;
     setBusy(true);
     setToolbar(null);
     try {
-      await onRequestEdit(request, buildCanvasEditPrompt(request));
-      setInstruction('');
-      if (intent) setInstruction(intent.instruction);
+      await handleRequestEdit(request);
+      if (instructionText !== undefined) {
+        setPopupInstruction('');
+      } else {
+        setInstruction('');
+        if (intent) setInstruction(intent.instruction);
+      }
     } finally {
       setBusy(false);
     }
@@ -422,12 +719,82 @@ export function CanvasMessageCard({
     onAcceptSuggestion();
   };
 
-  const selectedChars = selection ? selection.end - selection.start : 0;
-  const canRequestSelection = Boolean(selection && instruction.trim() && !aiDisabled && !busy);
-  const canRequestDocument = Boolean(instruction.trim() && !aiDisabled && !busy);
+  const isRevising = Boolean(busy || revisingEffective);
+  const canRequestDocument = Boolean(instruction.trim() && !aiDisabled && !isRevising);
+  const canRequestPopupEdit = Boolean(selection && popupInstruction.trim() && !aiDisabled && !isRevising);
   const suggestionSource =
     suggestion?.request.scope === 'selection' ? suggestion.request.selection?.text : suggestion?.request.content;
-  const showDocumentSuggestion = Boolean(suggestion && !inlineSuggestionPreview);
+  // canvasId mode renders every active suggestion (selection- or block-level)
+  // in place via InlineCanvasSuggestion — the full document with the changed
+  // blocks highlighted — so the legacy whole-document review card below is only
+  // used by the draft (non-canvasId) path.
+  const showDocumentSuggestion = Boolean(suggestion && !inlineSuggestionPreview && !canvasId);
+  const showCanvasIdSuggestion = Boolean(canvasId && storeCanvas && storeSuggestion);
+
+  // canvasId mode before the canvas has loaded into the store (or, in
+  // practice never, neither draft nor canvasId supplied): render nothing.
+  // This check runs after all hooks above so hook order stays stable
+  // regardless of `missingCanvas`. The caller (ChatWindow) already gates
+  // rendering on the canvas being present in the store, so this is a
+  // defensive no-op in normal operation.
+  if (missingCanvas) return null;
+
+  // Executable canvas (content_type="html"): render a sandboxed live preview
+  // instead of the prose editor. Detected from the server canvas' single html
+  // block; prose canvases return null here and fall through to the editor below.
+  // (All hooks above have already run, so this early return keeps hook order
+  // stable.) Editing is intentionally disabled for html canvases in MVP — they
+  // are runnable artifacts, viewed/copied, not inline-edited.
+  const htmlSource = canvasId ? canvasHtmlSource(storeCanvas) : null;
+  if (htmlSource !== null) {
+    return (
+      <div className="canvas-message-shell">
+        <article className="canvas-message-card">
+          <header className="canvas-message-card-head">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="canvas-card-edit-chip" title="可运行网页">
+                <span className="font-mono">▶</span>
+                <span>网页</span>
+              </span>
+              <span
+                className="truncate text-[13px] font-medium text-ink"
+                title={draft.title}
+              >
+                {draft.title}
+              </span>
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              <button
+                type="button"
+                className="cw-btn cw-btn-ghost cw-btn-sm"
+                onClick={() => copy(htmlSource)}
+                title="复制源码"
+                aria-label="复制源码"
+              >
+                {copied ? <span className="font-mono text-[10px]">已复制</span> : <CopyIcon />}
+              </button>
+              {onOpenPanel && (
+                <button
+                  type="button"
+                  className="cw-btn cw-btn-ghost cw-btn-sm"
+                  onClick={onOpenPanel}
+                  title="在侧栏打开"
+                  aria-label="在侧栏打开"
+                >
+                  ⛶
+                </button>
+              )}
+            </div>
+          </header>
+          <CanvasHtmlPreview
+            html={htmlSource}
+            title={draft.title}
+            reloadKey={storeCanvas?.current_version}
+          />
+        </article>
+      </div>
+    );
+  }
 
   return (
     <div className="canvas-message-shell">
@@ -456,6 +823,61 @@ export function CanvasMessageCard({
             </select>
           </div>
           <div className="flex items-center gap-1 shrink-0">
+            {canvasId && (
+              <div className="canvas-card-history">
+                <button
+                  type="button"
+                  className="cw-btn cw-btn-ghost cw-btn-sm"
+                  onClick={toggleVersions}
+                  title="版本历史"
+                  aria-label="版本历史"
+                  aria-expanded={versionsOpen}
+                >
+                  历史
+                </button>
+                {versionsOpen && (
+                  <div className="canvas-card-history-pop" role="menu" aria-label="版本历史">
+                    <div className="canvas-card-history-head">版本历史</div>
+                    {versionsLoading && (
+                      <div className="canvas-card-history-empty">加载中…</div>
+                    )}
+                    {versionsError && (
+                      <div className="canvas-card-history-error" role="alert">
+                        {versionsError}
+                      </div>
+                    )}
+                    {!versionsLoading && !versionsError && versions && versions.length === 0 && (
+                      <div className="canvas-card-history-empty">暂无历史版本。</div>
+                    )}
+                    {!versionsLoading &&
+                      !versionsError &&
+                      versions &&
+                      versions.map((v) => (
+                        <button
+                          key={v.id}
+                          type="button"
+                          role="menuitem"
+                          className="canvas-card-history-item"
+                          onClick={() => void handleRevert(v.version)}
+                          disabled={revisingEffective}
+                          title={`回退到版本 ${v.version}`}
+                        >
+                          <span className="canvas-card-history-ver">v{v.version}</span>
+                          <span className="canvas-card-history-meta">
+                            <span className="canvas-card-history-summary">
+                              {v.change_summary?.trim() ||
+                                (v.created_by === 'user' ? '手动编辑' : '模型修改')}
+                            </span>
+                            <span className="canvas-card-history-sub">
+                              {new Date(v.created_at).toLocaleString()} · {v.created_by}
+                            </span>
+                          </span>
+                        </button>
+                      ))}
+                  </div>
+                )}
+              </div>
+            )}
             <button
               type="button"
               className="cw-btn cw-btn-ghost cw-btn-sm"
@@ -585,7 +1007,15 @@ export function CanvasMessageCard({
               />
             </section>
           )}
-          {inlineSuggestionPreview && suggestion ? (
+          {showCanvasIdSuggestion && storeCanvas && storeSuggestion ? (
+            <InlineCanvasSuggestion
+              canvas={storeCanvas}
+              suggestion={storeSuggestion}
+              onAccept={handleAcceptSuggestion}
+              onReject={handleRejectSuggestion}
+              busy={revisingEffective}
+            />
+          ) : inlineSuggestionPreview && suggestion ? (
             <div className="canvas-rich-editor canvas-inline-editor canvas-suggestion-preview-document text-ink break-words">
               <div
                 className="canvas-suggestion-preview-segment"
@@ -638,7 +1068,10 @@ export function CanvasMessageCard({
               className="canvas-rich-editor canvas-inline-editor outline-none text-ink break-words"
               role="textbox"
               aria-label="页内画布正文"
+              data-writing-block-fullscreen-editor-region="true"
+              data-writing-block-fullscreen-editor-layout="inline"
               onInput={handleInput}
+              onBlur={handleEditorBlur}
               onMouseUp={() => refreshSelection('menu')}
               onKeyUp={() => refreshSelection('menu')}
               onContextMenu={handleContextMenu}
@@ -651,6 +1084,27 @@ export function CanvasMessageCard({
               <span>正在写入…</span>
             </div>
           )}
+          {isRevising && !pending && (
+            <div className="canvas-card-pending" role="status" aria-live="polite">
+              <span className="cw-blip" />
+              <span>修订中…</span>
+            </div>
+          )}
+          {editErrorEffective && (
+            <div className="canvas-card-edit-error" role="alert">
+              <span className="canvas-card-edit-error-text">{editErrorEffective}</span>
+              {(canvasId || onDismissEditError) && (
+                <button
+                  type="button"
+                  className="canvas-card-edit-error-dismiss"
+                  onClick={handleDismissEditError}
+                  aria-label="关闭错误提示"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
+          )}
         </div>
 
         <footer className="canvas-message-card-foot">
@@ -660,8 +1114,8 @@ export function CanvasMessageCard({
                 key={intent.id}
                 type="button"
                 className="cw-btn cw-btn-ghost cw-btn-sm"
-                disabled={aiDisabled || busy}
-                onClick={() => requestEdit(selection ? 'selection' : 'document', intent)}
+                disabled={aiDisabled || isRevising}
+                onClick={() => requestEdit('document', intent)}
               >
                 {intent.label}
               </button>
@@ -672,8 +1126,8 @@ export function CanvasMessageCard({
               value={instruction}
               onChange={(event) => setInstruction(event.target.value)}
               className="canvas-card-request-input"
-              placeholder={selection ? `已选中 ${selectedChars} 字符，输入修改要求…` : '输入整篇修改要求…'}
-              disabled={aiDisabled || busy}
+              placeholder={isRevising ? '修订中…' : '输入修改要求…'}
+              disabled={aiDisabled || isRevising}
             />
             <button
               type="button"
@@ -681,15 +1135,7 @@ export function CanvasMessageCard({
               disabled={!canRequestDocument}
               onClick={() => requestEdit('document')}
             >
-              整篇
-            </button>
-            <button
-              type="button"
-              className="cw-btn cw-btn-ghost cw-btn-sm"
-              disabled={!canRequestSelection}
-              onClick={() => requestEdit('selection')}
-            >
-              选区
+              修改
             </button>
           </div>
         </footer>
@@ -697,12 +1143,17 @@ export function CanvasMessageCard({
 
       {toolbar && (
         <div
+          ref={popoverRef}
           className="canvas-selection-popover"
           style={{
             left: toolbar.x,
             top: toolbar.y,
           }}
-          onMouseDown={(event) => event.preventDefault()}
+          onMouseDown={(event) => {
+            // 保住编辑器选区（加粗/斜体按钮依赖它），但指令输入框要能点击聚焦
+            if (event.target instanceof HTMLElement && event.target.closest('input')) return;
+            event.preventDefault();
+          }}
         >
           {toolbar.mode === 'menu' ? (
             <>
@@ -729,21 +1180,21 @@ export function CanvasMessageCard({
               className="canvas-selection-input-form"
               onSubmit={(event) => {
                 event.preventDefault();
-                requestEdit(selection ? 'selection' : 'document');
+                requestEdit('selection', undefined, popupInstruction);
               }}
             >
               <input
                 ref={inputRef}
-                value={instruction}
-                onChange={(event) => setInstruction(event.target.value)}
-                placeholder="修改一下"
+                value={popupInstruction}
+                onChange={(event) => setPopupInstruction(event.target.value)}
+                placeholder={isRevising ? '修订中…' : '修改一下'}
                 className="canvas-selection-input"
-                disabled={aiDisabled || busy}
+                disabled={aiDisabled || isRevising}
               />
               <button
                 type="submit"
                 className="canvas-selection-send"
-                disabled={!canRequestSelection && !canRequestDocument}
+                disabled={!canRequestPopupEdit}
                 title="发送修改要求"
               >
                 ↑

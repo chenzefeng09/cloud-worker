@@ -4,6 +4,7 @@ _write_memory, _reconcile_run_completion, _persist_artifacts."""
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 import datetime as dt
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -80,6 +81,7 @@ def test_write_memory_success() -> None:
             _write_memory(
                 knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
                 tenant_id=TEST_TENANT,
+                user_id=TEST_USER,
                 task_description="tell me a joke",
                 summary="why did the chicken cross the road",
             )
@@ -92,6 +94,7 @@ def test_write_memory_noop_on_missing_url() -> None:
         _write_memory(
             knowledge_ingest_url="",
             tenant_id=TEST_TENANT,
+            user_id=TEST_USER,
             task_description="task",
             summary="summary",
         )
@@ -116,6 +119,7 @@ def test_write_memory_failure_open() -> None:
             _write_memory(
                 knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
                 tenant_id=TEST_TENANT,
+                user_id=TEST_USER,
                 task_description="task",
                 summary="summary",
             )
@@ -271,6 +275,50 @@ def test_persist_artifacts_stores_each_artifact() -> None:
     )
 
     assert svc.create_attachment.await_count == 2
+
+
+def test_persist_artifacts_attributes_outputs_to_session_owner() -> None:
+    """Outputs belong to the user whose run made them, not the service identity.
+
+    The artifacts page lists attachments by ``user_id``; a "SYSTEM"-owned row
+    would be invisible to that user.
+    """
+    run = _run(status="RUNNING")
+    svc = AsyncMock()
+    svc.get_session.return_value = SimpleNamespace(user_id="usr_owner")
+
+    asyncio.get_event_loop().run_until_complete(
+        _persist_artifacts(
+            artifacts=[
+                {"filename": "out.txt", "s3_key": "k/out.txt", "size": 1, "mime": "text/plain"},
+            ],
+            run=run,
+            svc=svc,
+            tenant_id=TEST_TENANT,
+        )
+    )
+
+    assert svc.create_attachment.await_args.kwargs["user_id"] == "usr_owner"
+
+
+def test_persist_artifacts_falls_back_to_sentinel_when_owner_unresolvable() -> None:
+    """A missing session row must not lose the artifact — record it as SYSTEM."""
+    run = _run(status="RUNNING")
+    svc = AsyncMock()
+    svc.get_session.side_effect = RuntimeError("session gone")
+
+    asyncio.get_event_loop().run_until_complete(
+        _persist_artifacts(
+            artifacts=[
+                {"filename": "out.txt", "s3_key": "k/out.txt", "size": 1, "mime": "text/plain"},
+            ],
+            run=run,
+            svc=svc,
+            tenant_id=TEST_TENANT,
+        )
+    )
+
+    assert svc.create_attachment.await_args.kwargs["user_id"] == "SYSTEM"
 
 
 def test_persist_artifacts_skips_empty_s3_key() -> None:

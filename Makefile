@@ -7,9 +7,9 @@ SHELL := /usr/bin/env bash
 .ONESHELL:
 .DEFAULT_GOAL := help
 
-# Path to the sibling saas-foundation checkout. Defaults to a sibling directory;
-# override with `make FOUNDATION_DIR=/path/to/saas-foundation ...` or an env var.
-FOUNDATION_DIR ?= ../saas-foundation
+# Path to the sibling saas-foundation checkout. Override with e.g.
+#   FOUNDATION_DIR=/srv/saas-foundation make up
+FOUNDATION_DIR ?= $(abspath $(CURDIR)/../saas-foundation)
 COMPOSE_FOUNDATION := docker compose -f $(FOUNDATION_DIR)/deploy/docker-compose/dev.yml --env-file $(FOUNDATION_DIR)/deploy/docker-compose/.env
 COMPOSE_AGENT := docker compose -f deploy/docker-compose/agent-platform.yml --env-file $(FOUNDATION_DIR)/deploy/docker-compose/.env --env-file deploy/docker-compose/.env
 
@@ -140,6 +140,16 @@ web-install: ## Install frontend dependencies
 # build copies dist/ + a production-only node_modules into the image.  Build
 # context is the repo root because the Dockerfile COPYs from worker-claude-sdk/.
 CLAUDE_SDK_IMAGE ?= ghcr.io/agent-platform/claude-sdk-sandbox:0.1
+CLAUDE_SDK_CUBE_IMAGE ?= claude-sdk-cube:0.2-scientific
+CLAUDE_SDK_CUBE_MATLAB_IMAGE ?= claude-sdk-cube:0.2-matlab-r4
+CLAUDE_SDK_CUBE_MATLAB_CONTROL_IMAGE ?= 127.0.0.1:5000/claude-sdk-cube:0.2-matlab-control-r2
+CLAUDE_SDK_CUBE_MATLAB_BASE_IMAGE ?= 127.0.0.1:5000/claude-sdk-cube:0.2-matlab-r4
+CLAUDE_SDK_CUBE_MATLAB_AEROSPACE_IMAGE ?= 127.0.0.1:5000/claude-sdk-cube:0.2-matlab-aerospace-r1
+CLAUDE_SDK_CUBE_MATLAB_AEROSPACE_BASE_IMAGE ?= 127.0.0.1:5000/claude-sdk-cube:0.2-matlab-control-r2
+CLAUDE_SDK_CUBE_REFRESH_BASE_IMAGE ?= 127.0.0.1:5000/claude-sdk-cube:0.2-matlab-aerospace-r1
+CLAUDE_SDK_CUBE_REFRESH_IMAGE ?= 127.0.0.1:5000/claude-sdk-cube:0.2-matlab-aerospace-r2
+# Extracted MATLAB 2019b installer (the ISO contents, including ./install).
+MATLAB_ISO_DIR ?= /tmp/matlab-iso
 
 .PHONY: build-claude-sdk-image
 build-claude-sdk-image: ## Build claude-sdk-sandbox image (compiles worker first)
@@ -153,6 +163,49 @@ build-claude-sdk-image: ## Build claude-sdk-sandbox image (compiles worker first
 .PHONY: push-claude-sdk-image
 push-claude-sdk-image: ## Push claude-sdk-sandbox image to ghcr.io
 	docker push $(CLAUDE_SDK_IMAGE)
+
+.PHONY: build-claude-sdk-cube-image
+build-claude-sdk-cube-image: ## Build Cube-native Claude image with scientific Python + CMake
+	docker build \
+	  -f sandbox-images/claude-sdk-cube.Dockerfile \
+	  -t $(CLAUDE_SDK_CUBE_IMAGE) \
+	  .
+	@echo "$(GREEN)Built $(CLAUDE_SDK_CUBE_IMAGE)$(RESET)"
+
+.PHONY: build-claude-sdk-cube-matlab-image
+build-claude-sdk-cube-matlab-image: ## Build Cube image with MATLAB 2019b (needs the extracted installer in MATLAB_ISO_DIR)
+	docker buildx build --load \
+	  --build-context matlab-iso=$(MATLAB_ISO_DIR) \
+	  --build-arg BASE_IMAGE=$(CLAUDE_SDK_CUBE_IMAGE) \
+	  -f sandbox-images/claude-sdk-cube-matlab.Dockerfile \
+	  -t $(CLAUDE_SDK_CUBE_MATLAB_IMAGE) \
+	  .
+	@echo "$(GREEN)Built $(CLAUDE_SDK_CUBE_MATLAB_IMAGE)$(RESET)"
+
+.PHONY: build-claude-sdk-cube-matlab-control-image
+build-claude-sdk-cube-matlab-control-image: ## Add Control System Toolbox to an existing Cube MATLAB image
+	MATLAB_MEDIA_DIR=$(MATLAB_ISO_DIR) \
+	MATLAB_BASE_IMAGE=$(CLAUDE_SDK_CUBE_MATLAB_BASE_IMAGE) \
+	MATLAB_CONTROL_IMAGE=$(CLAUDE_SDK_CUBE_MATLAB_CONTROL_IMAGE) \
+	  sandbox-images/build-matlab-control-layer.sh
+	@echo "$(GREEN)Built $(CLAUDE_SDK_CUBE_MATLAB_CONTROL_IMAGE)$(RESET)"
+
+.PHONY: build-claude-sdk-cube-matlab-aerospace-image
+build-claude-sdk-cube-matlab-aerospace-image: ## Add core aerospace products to the Control-enabled MATLAB image
+	MATLAB_MEDIA_DIR=$(MATLAB_ISO_DIR) \
+	MATLAB_BASE_IMAGE=$(CLAUDE_SDK_CUBE_MATLAB_AEROSPACE_BASE_IMAGE) \
+	MATLAB_AEROSPACE_IMAGE=$(CLAUDE_SDK_CUBE_MATLAB_AEROSPACE_IMAGE) \
+	  sandbox-images/build-matlab-aerospace-layer.sh
+	@echo "$(GREEN)Built $(CLAUDE_SDK_CUBE_MATLAB_AEROSPACE_IMAGE)$(RESET)"
+
+.PHONY: build-claude-sdk-cube-worker-refresh-image
+build-claude-sdk-cube-worker-refresh-image: ## Refresh the worker while preserving the existing Cube/MATLAB layers
+	docker build \
+	  --build-arg BASE_IMAGE=$(CLAUDE_SDK_CUBE_REFRESH_BASE_IMAGE) \
+	  -f sandbox-images/claude-sdk-cube-worker-refresh.Dockerfile \
+	  -t $(CLAUDE_SDK_CUBE_REFRESH_IMAGE) \
+	  .
+	@echo "$(GREEN)Built $(CLAUDE_SDK_CUBE_REFRESH_IMAGE)$(RESET)"
 
 # ---- Conformance ----
 .PHONY: conformance

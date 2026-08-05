@@ -42,12 +42,19 @@ class FeatureFlagClient:
             flags[key] = enabled
         return flags
 
-    async def is_enabled(self, key: str, tenant_id: str) -> bool:
-        """Return whether *key* is enabled for *tenant_id* (fail-closed)."""
+    async def is_enabled(
+        self, key: str, tenant_id: str, *, default: bool = False
+    ) -> bool:
+        """Return whether *key* is enabled for *tenant_id*.
+
+        Existing callers remain fail-closed.  Opportunistic features may pass
+        ``default=True`` when both an absent flag and a flag-service outage
+        should preserve the feature; an explicit stored ``False`` still wins.
+        """
         now = time.monotonic()
         cached = self._cache.get(tenant_id)
         if cached and cached[0] > now:
-            return cached[1].get(key, False)
+            return cached[1].get(key, default)
 
         try:
             flags = await self._fetch(tenant_id)
@@ -55,10 +62,10 @@ class FeatureFlagClient:
             logger.debug(
                 "feature-flag fetch failed for tenant=%s", tenant_id, exc_info=True
             )
-            return False
+            return default
 
         self._cache[tenant_id] = (now + self._cache_ttl, flags)
-        return flags.get(key, False)
+        return flags.get(key, default)
 
     def invalidate(self, tenant_id: str | None = None) -> None:
         """Clear cached flags for one tenant (or all)."""

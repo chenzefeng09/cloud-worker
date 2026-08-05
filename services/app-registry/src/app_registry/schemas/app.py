@@ -14,9 +14,13 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+
+# Tag constraints - shared by AppCreate / AppUpdate.
+_TAG_MAX_LEN = 32
+_TAG_MAX_COUNT = 20
 
 
 class Visibility(StrEnum):
@@ -98,6 +102,33 @@ def _validate_input_schema(fields: list[InputField]) -> list[InputField]:
     return fields
 
 
+def _validate_tags(tags: list[str]) -> list[str]:
+    """Normalize + validate an App's tag list.
+
+    Each tag is stripped, must be non-empty and <= ``_TAG_MAX_LEN`` chars; the
+    total (de-duplicated) count must be <= ``_TAG_MAX_COUNT``.  Duplicates are
+    removed case-sensitively while preserving first-seen order.
+    """
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in tags:
+        if not isinstance(raw, str):
+            raise ValueError("tags must be strings")
+        tag = raw.strip()
+        if not tag:
+            raise ValueError("tags must be non-empty")
+        if len(tag) > _TAG_MAX_LEN:
+            raise ValueError(f"tag too long (max {_TAG_MAX_LEN} chars): {tag!r}")
+        if tag not in seen:
+            seen.add(tag)
+            cleaned.append(tag)
+    if len(cleaned) > _TAG_MAX_COUNT:
+        raise ValueError(
+            f"too many tags (max {_TAG_MAX_COUNT}): got {len(cleaned)}"
+        )
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # Versions
 # ---------------------------------------------------------------------------
@@ -107,8 +138,12 @@ class AppVersionCreate(BaseModel):
     # Deprecated request field kept for older clients. The service assigns the
     # persisted version number monotonically per App.
     version: str | None = Field(default=None, min_length=1, max_length=40)
-    system_prompt: str = Field(..., min_length=1)
-    user_prompt_template: str = Field(..., min_length=1)
+    # Both prompts may be empty strings: ``system_prompt`` is optional by
+    # product decision (an App may rely on the default worker persona), and
+    # ``user_prompt_template`` starts out empty on the initial draft created
+    # by the "new App" modal (the editor enforces it before publish).
+    system_prompt: str = Field(...)
+    user_prompt_template: str = Field(...)
     model: str = Field(..., min_length=1, max_length=120)
     reasoning_effort: str | None = Field(default=None, max_length=20)
     sampling_params: SamplingParams = Field(default_factory=SamplingParams)
@@ -157,7 +192,13 @@ class AppCreate(BaseModel):
     description: str | None = Field(None, max_length=2000)
     icon: str | None = Field(None, max_length=120)
     visibility: Visibility = Visibility.PRIVATE
+    tags: list[str] = Field(default_factory=list)
     version: AppVersionCreate
+
+    @field_validator("tags")
+    @classmethod
+    def _normalize_tags(cls, v: list[str]) -> list[str]:
+        return _validate_tags(v)
 
 
 class AppUpdate(BaseModel):
@@ -167,6 +208,12 @@ class AppUpdate(BaseModel):
     description: str | None = Field(None, max_length=2000)
     icon: str | None = Field(None, max_length=120)
     visibility: Visibility | None = None
+    tags: list[str] | None = None
+
+    @field_validator("tags")
+    @classmethod
+    def _normalize_tags(cls, v: list[str] | None) -> list[str] | None:
+        return None if v is None else _validate_tags(v)
 
 
 class AppOut(BaseModel):
@@ -177,6 +224,7 @@ class AppOut(BaseModel):
     icon: str | None = None
     author_id: str
     visibility: Visibility
+    tags: list[str] = Field(default_factory=list)
     current_version_id: str | None = None
     created_at: datetime
     updated_at: datetime

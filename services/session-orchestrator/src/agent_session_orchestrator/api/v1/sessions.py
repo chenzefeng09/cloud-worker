@@ -56,6 +56,7 @@ async def create_session(
         user_id=user_id,
         title=body.title,
         metadata=body.agent_config,
+        workspace_id=body.workspace_id,
     )
 
     await quota_guard.record(

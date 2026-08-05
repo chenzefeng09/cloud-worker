@@ -72,6 +72,7 @@ def test_model_import_and_new_id() -> None:
     expected_cols = {
         "id", "tenant_id", "app_id", "name", "cron_expression",
         "timezone", "input_values", "enabled", "source",
+        "trigger_type", "field_mapping", "webhook_secret_hash",
         "last_run_at", "next_run_at", "last_status", "last_error",
         "created_at", "updated_at",
     }
@@ -92,4 +93,6 @@ def test_config_defaults() -> None:
     assert s.http_port == 8013
     assert s.api_prefix == "/api/cron/v1"
     assert s.db_schema == "cron_runner"
-    assert s.service_user_id == "svc-cron"
+    # service_user_id must match the platform usr_[0-9A-Z]{26} shape so that
+    # downstream RBAC guards accept scheduler-fired runs.
+    assert s.service_user_id == "usr_01SVCCRON00000000000000000"

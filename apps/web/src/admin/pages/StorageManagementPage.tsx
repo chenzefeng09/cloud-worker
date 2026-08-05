@@ -48,19 +48,31 @@ function formatBytes(n: number): string {
   return `${v.toFixed(i === 0 ? 0 : 2)} ${units[i]}`;
 }
 
-function parseSizeInput(raw: string): number | null {
-  const m = raw
-    .trim()
-    .toUpperCase()
-    .match(/^(\d+(?:\.\d+)?)\s*(B|KB|MB|GB|TB)?$/);
-  if (!m) return null;
-  const v = parseFloat(m[1]);
-  const unit = m[2] || 'B';
-  const factor = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4 }[
-    unit
-  ];
-  if (!factor || !Number.isFinite(v) || v < 0) return null;
-  return Math.round(v * factor);
+type SizeUnit = 'B' | 'KB' | 'MB' | 'GB' | 'TB';
+
+const SIZE_UNITS: SizeUnit[] = ['B', 'KB', 'MB', 'GB', 'TB'];
+
+const UNIT_FACTORS: Record<SizeUnit, number> = {
+  B: 1,
+  KB: 1024,
+  MB: 1024 ** 2,
+  GB: 1024 ** 3,
+  TB: 1024 ** 4,
+};
+
+// Split a byte count into a {value, unit} pair using the same unit selection as
+// `formatBytes`: the largest unit that keeps the value in [1, 1024), capped at
+// TB. The numeric part is trimmed to at most two decimals with trailing zeros
+// stripped (10 GB → "10", not "10.00"). A zero/invalid limit prefills as 0 GB.
+function splitBytes(n: number): { value: string; unit: SizeUnit } {
+  if (!Number.isFinite(n) || n <= 0) return { value: '0', unit: 'GB' };
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < SIZE_UNITS.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return { value: parseFloat(v.toFixed(2)).toString(), unit: SIZE_UNITS[i] };
 }
 
 function tonePill(usedPct: number, softWarn: number): string {
@@ -75,7 +87,8 @@ function tonePill(usedPct: number, softWarn: number): string {
 interface EditState {
   open: boolean;
   item: StorageQuotaSummaryItem | null;
-  limitInput: string;
+  limitValue: string;
+  limitUnit: SizeUnit;
   softWarnInput: string;
   busy: boolean;
   error: string | null;
@@ -84,7 +97,8 @@ interface EditState {
 const EMPTY_EDIT: EditState = {
   open: false,
   item: null,
-  limitInput: '',
+  limitValue: '',
+  limitUnit: 'GB',
   softWarnInput: '',
   busy: false,
   error: null,
@@ -139,26 +153,30 @@ export function StorageManagementPage() {
 
   const refresh = () => setReloadKey((k) => k + 1);
 
-  const openEdit = (it: StorageQuotaSummaryItem) =>
+  const openEdit = (it: StorageQuotaSummaryItem) => {
+    const { value, unit } = splitBytes(it.limit_bytes);
     setEdit({
       open: true,
       item: it,
-      limitInput: `${(it.limit_bytes / (1024 ** 3)).toFixed(2)} GB`,
+      limitValue: value,
+      limitUnit: unit,
       softWarnInput: String(it.soft_warn_pct),
       busy: false,
       error: null,
     });
+  };
 
   const closeEdit = () => setEdit(EMPTY_EDIT);
 
   const submitEdit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!edit.item) return;
-    const limitBytes = parseSizeInput(edit.limitInput);
-    if (limitBytes === null) {
-      setEdit((s) => ({ ...s, error: '配额格式无效（示例：100 GB / 1024 MB）' }));
+    const value = parseFloat(edit.limitValue);
+    if (!Number.isFinite(value) || value < 0) {
+      setEdit((s) => ({ ...s, error: '配额数值无效' }));
       return;
     }
+    const limitBytes = Math.round(value * UNIT_FACTORS[edit.limitUnit]);
     const softWarn = parseInt(edit.softWarnInput, 10);
     if (!Number.isFinite(softWarn) || softWarn < 0 || softWarn > 100) {
       setEdit((s) => ({ ...s, error: '软警戒阈值需为 0–100 之间的整数' }));
@@ -503,15 +521,22 @@ export function StorageManagementPage() {
               </div>
             )}
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">
-                上限（支持 B / KB / MB / GB / TB）
-              </label>
-              <input
-                value={edit.limitInput}
-                onChange={(e) => setEdit((s) => ({ ...s, limitInput: e.target.value }))}
-                className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
-                placeholder="100 GB"
-              />
+              <label className="text-[11px] text-dim font-mono">上限</label>
+              <div className="flex gap-2">
+                <input
+                  value={edit.limitValue}
+                  onChange={(e) => setEdit((s) => ({ ...s, limitValue: e.target.value }))}
+                  inputMode="decimal"
+                  className="flex-1 border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
+                  placeholder="100"
+                />
+                <CustomSelect
+                  options={SIZE_UNITS.map((u) => ({ value: u, label: u }))}
+                  value={edit.limitUnit}
+                  onChange={(v) => setEdit((s) => ({ ...s, limitUnit: v as SizeUnit }))}
+                  className="w-24"
+                />
+              </div>
             </div>
             <div className="flex flex-col gap-1">
               <label className="text-[11px] text-dim font-mono">软警戒阈值 (%)</label>

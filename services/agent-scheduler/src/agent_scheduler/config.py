@@ -126,10 +126,21 @@ class Settings(BaseSettings):
     runtime: str = "docker"
     cube_controller_url: str = ""  # required when runtime="cube"
 
+    # IP/host of the scheduler's machine that is reachable by the cube microVM.
+    # The field/env name retains "public" for deployment compatibility, but
+    # CubeSandbox v0.6 can explicitly allow a private node IP in ``allowOut``.
+    # Prefer that private IP when the cloud public NAT lacks hairpin support.
+    # Container names remain unresolvable inside the VM, so the runtime rewrites
+    # worker gateway URLs to this host's published ports. When empty, it probes
+    # for the machine's public IP and finally falls back to the controller host.
+    # Pin SCHEDULER_CUBE_PUBLIC_HOST explicitly in production.
+    cube_public_host: str = ""
+
     # CubeVS egress allowlist (CIDRs) applied to broker-mode microVMs via the
-    # E2B ``allow_out`` field. Must contain the tool-broker ClusterIP/32 and the
-    # cluster DNS ClusterIP/32 — resolve per cluster (kubectl get svc ap-tool-broker
-    # / kube-dns) as documented in deploy/cube/README.md. Comma-separated.
+    # E2B ``allowOut`` field. It may contain private CIDRs on v0.6. For a
+    # single-node deployment, allow the private node IP/32 used by the rewritten
+    # gateway URL; a cluster deployment may instead need the tool-broker and DNS
+    # ClusterIP/32s described in deploy/cube/README.md. Comma-separated.
     # Empty in broker mode is a deployment error (see the spawn guard): an empty
     # allow_out with allow_internet_access=false air-gaps the sandbox so it cannot
     # even reach the broker. Only consumed by the cube runtime; docker ignores it.
@@ -149,6 +160,9 @@ class Settings(BaseSettings):
     cube_client_cert: str | None = None
     cube_client_key: str | None = None
     cube_ca_cert: str | None = None
+    # API key for CubeSandbox's E2B-compatible API (``X-API-Key`` header).
+    # Dev one-click default is ``e2b_000000``; override via SCHEDULER_CUBE_API_KEY.
+    cube_api_key: str = "e2b_000000"
 
     # Sandbox image — built from ``sandbox-images/base.Dockerfile``,
     # ships AgentScope 2.x + agentscope_ext.runtime_worker.  The
@@ -161,6 +175,23 @@ class Settings(BaseSettings):
     # enabling grey-release / instant rollback without a redeploy.  The Claude
     # SDK image runs via its own ENTRYPOINT (node), not the AgentScope CMD.
     claude_sdk_image: str = "ghcr.io/agent-platform/claude-sdk-sandbox:0.1"
+    # Cube v0.6 fixes memory on the template rather than accepting a per-spawn
+    # resource override. A deployment may therefore point these two aliases at
+    # the same OCI image with different template memory settings. They only
+    # apply to the Claude SDK worker; empty values preserve the single-template
+    # behaviour for existing deployments and the AgentScope worker path.
+    cube_claude_sdk_template_small: str = ""
+    cube_claude_sdk_template_large: str = ""
+    # Global fallback for the Claude SDK worker selection.  The runtimes first
+    # evaluate the per-run ``enable_claude_sdk_worker`` feature flag (for
+    # gradual / per-tenant grey rollout); when that flag returns False (or the
+    # flag service is unreachable, since ``evaluate_flag`` is failure-open) they
+    # fall back to this default.  Deliberately False in committed code — flipping
+    # it globally is a deploy-time decision made via
+    # ``SCHEDULER_USE_CLAUDE_SDK_WORKER_DEFAULT``, not a code change.  The flag
+    # still wins when it returns True; this only applies on the False/unreachable
+    # branch.
+    use_claude_sdk_worker_default: bool = False
     # Timeout (ms) for the synchronous feature-flag evaluate call on the spawn
     # path.  Kept tight: the call is failure-open, so a slow flag service must
     # not stall run scheduling.
@@ -227,6 +258,16 @@ class Settings(BaseSettings):
     sandbox_cpu_shares: int = 1024
     sandbox_timeout: int = 600  # seconds; also caps minted token TTL
 
+    # Scheduler-side cube-sandbox fail-safe reaper. CubeSandbox v0.6 normally
+    # enforces ``sandbox_timeout`` through cube-lifecycle-manager and pauses an
+    # idle VM. This sweep remains as a backstop for controller/CLM failures.
+    #   * ``max_age_seconds`` is intentionally far above ``sandbox_timeout`` so
+    #     normal CLM-managed pause/resume owns the sandbox lifecycle.
+    #   * ``interval_seconds`` is how often the sweep runs.
+    # Only consumed on the cube path; docker's ``reap_expired`` is a no-op.
+    sandbox_reaper_max_age_seconds: int = 3600  # delete VMs older than 1 hour
+    sandbox_reaper_interval_seconds: int = 120  # sweep every 2 min
+
     # B-M3: base URLs for the MCP registry and skill-store services.
     # These are forwarded to the sandbox as MCP_REGISTRY_URL / SKILL_STORE_URL
     # where the in-sandbox extensions (mcp_tenant_injector, skills_loader)
@@ -239,8 +280,10 @@ class Settings(BaseSettings):
     # audit + LLM gateway hooks so every tool call and model call is captured.
     # The enterprise default is fail-closed: no direct provider keys in the
     # sandbox, and every model call must route through foundation llm-gateway.
+    # ``knowledge_tool`` is fail-open: it self-gates on KNOWLEDGE_INGEST_URL
+    # being set, so deployments without ki simply don't register the tool.
     runtime_extensions: str = (
-        "mcp_tenant_injector,skills_loader,web_fetch,"
+        "mcp_tenant_injector,skills_loader,web_fetch,knowledge_tool,"
         "event_audit_sink,llm_gateway_enforcer"
     )
 
@@ -251,6 +294,13 @@ class Settings(BaseSettings):
     # docker network shared by all platform services and sandbox containers.
     web_fetch_gateway_url: str = "http://web-fetch-gateway:8013"
 
+    # Foundation DLP — base URL *with* API version prefix.  Forwarded into the
+    # sandbox as DLP_URL so the worker can POST tool-call content to
+    # ``{DLP_URL}/core/scan`` for scanning.  In broker egress mode the URL is
+    # rewritten to the tool-broker /dlp façade (which allowlists /core/scan);
+    # in foundation mode it is this direct service URL.
+    dlp_url: str = "http://foundation-dlp:80/api/dlp/v1"
+
     # LLM Gateway (M1-P3) — base URL *with* API version prefix.
     # Forwarded into every sandbox as LLM_GATEWAY_URL.  The scheduler also
     # queries GET /tenant-keys?tenant_id= on this base URL to retrieve the
@@ -258,6 +308,17 @@ class Settings(BaseSettings):
     # The enforcer is enabled by default.  A missing tenant virtual key is a
     # spawn-time error; direct-connect is reserved for explicit local dev only.
     llm_gateway_url: str = "http://llm-gateway:8011/api/llm-gateway/v1"
+
+    # Knowledge-ingest (KB v1) - base URL *with* API version prefix.
+    # Forwarded into the sandbox as KNOWLEDGE_INGEST_URL so the in-sandbox
+    # ``knowledge_tool`` extension can GET {base}/search?scope=knowledge on
+    # behalf of the agent.  In foundation egress mode this is the direct ki
+    # URL (ki is on the foundation net); in broker mode ``egress_policy``
+    # rewrites it to the tool-broker ``/knowledge/v1`` façade.  ki needs no
+    # bearer/vkey - only X-Tenant-Id / X-User-Id / X-User-Clearance, which the
+    # worker derives from FOUNDATION_* env vars (and the broker re-injects
+    # from the signed lease in broker mode).
+    knowledge_ingest_url: str = "http://knowledge-ingest:8012/api/knowledge/v1"
 
     otel_enabled: bool = True
     otel_exporter_endpoint: str = "http://localhost:4317"

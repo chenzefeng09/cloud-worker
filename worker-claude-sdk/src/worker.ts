@@ -25,16 +25,34 @@ import {
 } from "@aws-sdk/client-s3";
 import {
   query,
+  tool,
+  createSdkMcpServer,
+  AbortError,
   type McpServerConfig,
   type Options,
   type SDKMessage,
+  type SDKUserMessage,
+  type HookInput,
   type HookJSONOutput,
 } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
 
 import type { Env, Task } from "./task.js";
 import type { RedisStateClient } from "./redis_state.js";
 import { appendEvent, writeResult, type Usage } from "./result.js";
 import { EventTranslator, type EventPayload } from "./event_translator.js";
+import { scanToolCall } from "./dlp.js";
+import {
+  ASK_USER_TOOL,
+  buildReplayPrompt,
+  makeCanUseTool,
+  newHitlContext,
+  newTranscriptAccumulator,
+  snapshotTranscriptForPause,
+  type HitlContext,
+  type PendingToolCall,
+  type ReplayState,
+} from "./hitl.js";
 
 /**
  * Workspace root. Defaults to the sandbox mount `/workspace`; overridable via
@@ -56,9 +74,75 @@ function eventsPath(): string {
 }
 const SKILLS_DIR = "/home/skills";
 
+/**
+ * Anthropic server-side ("hosted") tools whose execution runs on Anthropic's
+ * online infrastructure rather than in the sandbox. This worker talks to an
+ * OpenAI-compatible gateway (deepseek), where those tools cannot be executed —
+ * `WebFetch` errors outright and `WebSearch` gets hallucinated into fake search
+ * results. They are part of the SDK's default tool set, so we explicitly remove
+ * them via `disallowedTools`. Client-side tools (Bash/Read/Write/Edit/Glob/Grep/
+ * NotebookEdit/Task/TodoWrite/KillShell, the `mcp__*` tools incl. `mcp__hitl__*`,
+ * and memory) all run locally and are unaffected.
+ *
+ * Names are the SDK's canonical tool identifiers (see
+ * node_modules/@anthropic-ai/claude-agent-sdk/cli.js and the `WebSearchInput`/
+ * `WebFetchInput` entries in sdk-tools.d.ts). This SDK version ships no hosted
+ * code-execution tool, so there is nothing else server-side to disable here.
+ */
+const SERVER_SIDE_TOOLS_UNAVAILABLE_ON_GATEWAY = ["WebSearch", "WebFetch"];
+
+/**
+ * Nominal thinking budget used purely to make the Claude Agent SDK EMIT the
+ * Anthropic `thinking:{type:"enabled"}` field on the wire (the SDK emits it iff
+ * maxThinkingTokens > 0). The actual reasoning depth on the DeepSeek backend is
+ * governed by `reasoning_effort`, not by this token budget, so the precise value
+ * is irrelevant beyond being positive.
+ */
+const THINKING_ENABLE_BUDGET = 2048;
+
+/**
+ * Map a task-supplied reasoning effort onto a value DeepSeek accepts. DeepSeek
+ * only honours `high` / `max`; Anthropic's lower tiers (`low` / `medium`) are
+ * floored to `high` (DeepSeek has no lower setting). An unset / unrecognised
+ * value yields undefined (no reasoning_effort sent, thinking left off).
+ */
+export function mapReasoningEffort(effort: string | undefined): string | undefined {
+  if (!effort) return undefined;
+  const e = effort.trim().toLowerCase();
+  switch (e) {
+    case "max":
+      return "max";
+    case "high":
+    case "medium":
+    case "low":
+      // DeepSeek has no tier below `high`, so low/medium are floored to high.
+      return "high";
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Extract the raw JSON schema for structured outputs from task sampling, or
+ * undefined when none is configured. Accepts the OpenAI-style
+ * `sampling_params.response_format = {type:"json_schema", schema:{...}}`. The
+ * schema is returned verbatim (never rewritten); the adapter wraps it into the
+ * gateway's `response_format`. A response_format that carries no `schema` (e.g.
+ * a bare `{type:"json_object"}`) yields undefined — we only drive constrained
+ * decoding when an actual schema is present.
+ */
+export function extractStructuredOutputSchema(
+  sampling: { response_format?: { type?: string; schema?: unknown } } | undefined,
+): unknown {
+  const rf = sampling?.response_format;
+  if (rf == null || typeof rf !== "object") return undefined;
+  if (rf.schema == null) return undefined;
+  return rf.schema;
+}
+
 /** Result of a completed run, surfaced to main() for result.json + exit code. */
 export interface RunResult {
-  status: "OK" | "FAILED";
+  status: "OK" | "FAILED" | "paused";
   summary: string;
   error?: string;
   usage: Usage;
@@ -247,6 +331,15 @@ export function buildSystemPrompt(
     );
   }
 
+  // Only the workspace dir is mounted back to the scheduler host; files written
+  // anywhere else (the image's /home/user, /tmp, …) die with the sandbox and
+  // never become run artifacts, so the user never sees them. Static text — the
+  // path is a constant, so this stays prefix-cache friendly.
+  parts.push(
+    `## 输出文件\n\n生成的文件必须写在 ${workspaceDir()}/ 目录下` +
+      `（例如 ${workspaceDir()}/chart.png）。写到其他目录的文件不会被保存，用户也看不到。`,
+  );
+
   return parts.join("\n\n");
 }
 
@@ -254,23 +347,51 @@ export function buildSystemPrompt(
 
 /**
  * Resolve the tenant's MCP servers from the registry. failure-open: when
- * MCP_REGISTRY_URL is unset or the call fails, returns {} and logs a warning.
+ * MCP_REGISTRY_URL is unset or the call fails, returns empty servers + filters
+ * and logs a warning.
  *
  * B.5/F.5: the registry's server records are mapped onto the SDK's
  * Record<string, McpServerConfig>. The registry is expected to return
- * `{servers: [{name, type, url|command, headers?, args?, env?}]}`. If the real
- * registry shape diverges, extend `mapRegistryServer` below.
+ * `{servers: [{name, type, url|command, headers?, args?, env?, auth?,
+ * timeout_seconds?, tool_filter?}]}`. If the real registry shape diverges,
+ * extend `mapRegistryServer` below.
+ *
+ * Returns the SDK server map PLUS a per-server `filters` map (from the
+ * registry `tool_filter` field) so runQuery can hide blocked tools via
+ * `disallowedTools` (exposure) and enforce per-server allow-lists via a
+ * PreToolUse gate (the SDK has no per-server allowedTools, so allow is enforced
+ * at execution; block is a true exposure filter).
+ *
+ * `selectedIds` is the run-level selection from `task.json.mcp_server_ids` and
+ * is THREE-STATE (see `Task.mcp_server_ids`): `undefined` = tenant default (all
+ * enabled servers), `[]` = MCP off for this run, non-empty = only those ids.
  */
 export async function loadMcpServers(
   env: Env,
-): Promise<Record<string, McpServerConfig>> {
+  selectedIds?: readonly string[],
+): Promise<{ servers: Record<string, McpServerConfig>; filters: McpToolFilters }> {
+  // Explicit empty selection = MCP is off for this run. Short-circuit before the
+  // registry call: there is no server we could possibly keep, so the fetch would
+  // be pure waste. Note `selectedIds !== undefined` — `[]` is falsy and a
+  // truthiness test here would silently mean "tenant default" instead.
+  if (selectedIds !== undefined && selectedIds.length === 0) {
+    console.log("[worker] MCP disabled for this run (mcp_server_ids=[])");
+    return { servers: {}, filters: {} };
+  }
+
   const base = env.MCP_REGISTRY_URL;
   if (!base) {
     console.warn("[worker] MCP_REGISTRY_URL unset; no MCP servers loaded");
-    return {};
+    return { servers: {}, filters: {} };
   }
 
-  const url = `${base.replace(/\/+$/, "")}/internal/mcp-servers`;
+  // The registry's internal-auth guard requires the tenant_id query param to
+  // match the x-tenant-id header (and the tool-broker forwards the query string
+  // verbatim). Append it whenever we have a tenant; skip it rather than emit
+  // `tenant_id=undefined` when the env var is empty.
+  const tenantId = env.FOUNDATION_TENANT_ID;
+  const query = tenantId ? `?tenant_id=${encodeURIComponent(tenantId)}` : "";
+  const url = `${base.replace(/\/+$/, "")}/internal/mcp-servers${query}`;
   try {
     const resp = await fetch(url, {
       method: "GET",
@@ -288,28 +409,56 @@ export async function loadMcpServers(
       console.warn(
         `[worker] mcp-registry returned ${resp.status}; no MCP servers loaded`,
       );
-      return {};
+      return { servers: {}, filters: {} };
     }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry JSON
     const body: any = await resp.json();
+    // The mcp-registry /internal/mcp-servers endpoint returns a ListPage
+    // envelope `{items: [...], total}`. Older/alternate shapes used a bare
+    // array or `{servers: [...]}`; accept all three.
     const servers: any[] = Array.isArray(body)
       ? body
-      : Array.isArray(body?.servers)
-        ? body.servers
-        : [];
+      : Array.isArray(body?.items)
+        ? body.items
+        : Array.isArray(body?.servers)
+          ? body.servers
+          : [];
+
+    // Run-level selection is applied HERE — before mapRegistryServer, i.e.
+    // BEFORE the transport mapping / broker rewrite / drop logic. The two
+    // filters answer different questions and must not be interleaved:
+    //   selection  = "did the user pick this server for this run?" (identity)
+    //   transport  = "can this runtime actually speak to it?"      (capability)
+    // Selecting first means an unpicked server is never mapped, never rewritten
+    // to a broker endpoint, and never contacted — a deselected server must not
+    // be touched at all. It also keeps the "dropping MCP server X" warnings
+    // meaningful: they now only fire for servers the user actually asked for.
+    const selected =
+      selectedIds === undefined
+        ? servers
+        : servers.filter((raw) => selectedIds.includes(String(raw?.id ?? "").trim()));
+    if (selectedIds !== undefined) {
+      console.log(
+        `[worker] mcp_server_ids selection: ${selected.length}/${servers.length} server(s) kept`,
+      );
+    }
 
     const out: Record<string, McpServerConfig> = {};
-    for (const raw of servers) {
-      const mapped = mapRegistryServer(raw);
-      if (mapped) out[mapped.name] = mapped.config;
+    const filters: McpToolFilters = {};
+    for (const raw of selected) {
+      const mapped = await mapRegistryServer(raw, env);
+      if (mapped) {
+        out[mapped.name] = mapped.config;
+        if (mapped.filter) filters[mapped.name] = mapped.filter;
+      }
     }
     console.log(`[worker] loaded ${Object.keys(out).length} MCP server(s) from registry`);
-    return out;
+    return { servers: out, filters };
   } catch (err) {
     console.warn(
       `[worker] mcp-registry fetch failed; no MCP servers loaded: ${(err as Error).message}`,
     );
-    return {};
+    return { servers: {}, filters: {} };
   }
 }
 
@@ -317,45 +466,375 @@ export async function loadMcpServers(
  * Map one registry server record onto an SDK McpServerConfig entry. Returns null
  * for records we cannot represent. Only the serializable transport configs
  * (http/sse/stdio) are produced here (sdk-instance servers are not registry-backed).
+ *
+ * Broker egress mode (`env.SANDBOX_EGRESS_MODE === "broker"`): the sandbox is NOT
+ * on the foundation network, so the raw http/sse endpoint is unreachable. Each
+ * http/sse server is rewritten to the tool-broker per-server passthrough
+ * `{TOOL_BROKER_URL}/mcp-tenant/v1/{server_id}` and the per-run lease is attached
+ * as the `x-tool-broker-lease` header (the SDK re-sends configured headers on
+ * every MCP request). Failure-open: if the broker URL or the registry `id` is
+ * missing, the server is DROPPED rather than handed an unreachable raw endpoint.
+ * stdio servers run locally in the sandbox and are never rewritten or dropped.
  */
-function mapRegistryServer(
+async function mapRegistryServer(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry JSON
   raw: any,
-): { name: string; config: McpServerConfig } | null {
+  env: Env,
+): Promise<{ name: string; config: McpServerConfig; filter?: { allow?: string[]; block?: string[] } } | null> {
   const name = String(raw?.name ?? "").trim();
   if (!name) return null;
-  const type = String(raw?.type ?? (raw?.url ? "http" : "")).toLowerCase();
+  // The mcp-registry returns `id` (e.g. "mcp_<26HEX>") on every record; needed to
+  // address the broker passthrough by (tenant, server_id).
+  const id = String(raw?.id ?? "").trim();
+  // The mcp-registry uses `transport`/`endpoint`; tolerate `type`/`url` too.
+  const url = raw?.url ?? raw?.endpoint;
+  const type = String(
+    raw?.type ?? raw?.transport ?? (url ? "http" : ""),
+  ).toLowerCase();
+  // tool_filter is transport-agnostic; capture it once for the caller to apply.
+  const filter = parseToolFilter(raw?.tool_filter);
+  // timeout_seconds applies to every transport (forwarded to the SDK config;
+  // the current SDK/CLI ignores an unknown `timeout` field, but strictMcpConfig
+  // defaults to false so it passes through harmlessly - see withTimeout).
+  const timeoutSeconds = raw?.timeout_seconds;
 
-  if ((type === "http" || type === "sse") && raw?.url) {
+  if ((type === "http" || type === "sse") && url) {
+    if (env.SANDBOX_EGRESS_MODE === "broker") {
+      // Broker mode: the raw endpoint is unreachable from the sandbox. Rewrite to
+      // the broker passthrough, or drop the server (failure-open) if we cannot.
+      const brokerBase = (env.TOOL_BROKER_URL ?? "").replace(/\/+$/, "");
+      if (!brokerBase || !id) {
+        console.warn(
+          `[worker] broker-egress: dropping MCP server ${name} (no broker url / id)`,
+        );
+        return null;
+      }
+      // The SDK re-sends these configured headers on EVERY MCP request. The
+      // broker's auth runs in two gates: `_require_auth` (needs an
+      // Authorization bearer + X-Tenant-Id, exactly like the registry fetch
+      // above) THEN `_require_lease` (needs `x-tool-broker-lease` carrying
+      // `mcp.tenant_invoke`). Both must be present on every tool call or the
+      // broker 401s before the lease is even checked, so we attach all three
+      // (mirroring loadMcpServers' registry-fetch header set).
+      //
+      // Registry-supplied upstream `auth`/`headers` are intentionally NOT
+      // attached here: the broker is the single upstream-auth injection point
+      // for broker-routed sessions (it reads them from the registry record and
+      // injects them toward the real upstream). Sending them here would only
+      // hand them to the broker, which already has them, risking duplication.
+      return {
+        name,
+        config: withTimeout(
+          {
+            type: type as "http" | "sse",
+            url: `${brokerBase}/mcp-tenant/v1/${encodeURIComponent(id)}`,
+            headers: {
+              authorization: `Bearer ${env.FOUNDATION_API_TOKEN}`,
+              "x-tenant-id": env.FOUNDATION_TENANT_ID,
+              ...(env.TOOL_BROKER_LEASE
+                ? { "x-tool-broker-lease": env.TOOL_BROKER_LEASE }
+                : {}),
+            },
+          },
+          timeoutSeconds,
+        ),
+        filter,
+      };
+    }
+    // Non-broker mode (foundation/none/unset): the sandbox reaches the upstream
+    // directly, so the worker injects the registry-supplied upstream auth +
+    // custom headers itself (mirroring the inline orchestrator). Broker auth
+    // headers are NOT attached - there is no broker in this path.
+    const directHeaders: Record<string, string> = {
+      ...((raw.headers as Record<string, string>) ?? {}),
+      ...buildUpstreamAuthHeaders(raw?.auth),
+    };
+    // oauth: in direct mode the worker performs the client-credentials flow
+    // itself (cached + single-flight by server_id) and injects the bearer.
+    // Broker mode does NOT fetch a token here - the broker is the single
+    // upstream-auth injection point for broker-routed sessions. A fetch failure
+    // is fail-open (logged + no Authorization header) so the MCP handshake
+    // surfaces the upstream's own 401. The SDK re-sends these configured
+    // headers on every MCP request, so the token is baked in at config time;
+    // sandbox runs are short-lived, so mid-run expiry is not a concern.
+    if (String(raw?.auth?.type ?? "none").toLowerCase() === "oauth") {
+      const oauthServerId = String(raw?.id ?? "").trim();
+      if (oauthServerId) {
+        try {
+          directHeaders["Authorization"] = `Bearer ${await getOauthToken(oauthServerId, raw?.auth)}`;
+        } catch (err) {
+          console.warn(
+            `[worker] oauth token fetch failed for ${name}: ${(err as Error).message}`,
+          );
+        }
+      } else {
+        console.warn(
+          `[worker] oauth auth missing server id for ${name}; skipping token fetch`,
+        );
+      }
+    }
     return {
       name,
-      config: {
-        type: type as "http" | "sse",
-        url: String(raw.url),
-        ...(raw.headers ? { headers: raw.headers as Record<string, string> } : {}),
-      },
+      config: withTimeout(
+        {
+          type: type as "http" | "sse",
+          url: String(url),
+          ...(Object.keys(directHeaders).length
+            ? { headers: directHeaders }
+            : {}),
+        },
+        timeoutSeconds,
+      ),
+      filter,
     };
   }
   if (type === "stdio" && raw?.command) {
+    // stdio: command + args[] + env. args is now a real registry field (it was
+    // a phantom read before the registry exposed it). No HTTP auth/headers.
     return {
       name,
-      config: {
-        type: "stdio",
-        command: String(raw.command),
-        ...(Array.isArray(raw.args) ? { args: raw.args as string[] } : {}),
-        ...(raw.env ? { env: raw.env as Record<string, string> } : {}),
-      },
+      config: withTimeout(
+        {
+          type: "stdio",
+          command: String(raw.command),
+          ...(Array.isArray(raw.args) ? { args: raw.args as string[] } : {}),
+          ...(raw.env ? { env: raw.env as Record<string, string> } : {}),
+        },
+        timeoutSeconds,
+      ),
+      filter,
     };
   }
   console.warn(`[worker] skipping unmappable MCP server record: ${name} (type=${type || "?"})`);
   return null;
 }
 
+/**
+ * Per-server tool_filter from the registry, keyed by the SDK server name.
+ * `allow` non-empty -> only those tools are exposed; `block` non-empty ->
+ * those tools are removed. allow is applied first (whitelist) then block.
+ */
+export type McpToolFilters = Record<string, { allow?: string[]; block?: string[] }>;
+
+/**
+ * Build upstream auth headers (bearer / api_key) from a registry `auth` record.
+ * Used ONLY in direct (non-broker) HTTP mode: broker-routed sessions have the
+ * broker inject upstream auth, so the worker carries only broker-auth headers.
+ * `auth` shape: `{type: "none"|"bearer"|"api_key", token?, header_name?, api_key?}`;
+ * `header_name` defaults to `X-API-Key` for `api_key`.
+ */
+function buildUpstreamAuthHeaders(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry JSON
+  auth: any,
+): Record<string, string> {
+  if (!auth || typeof auth !== "object") return {};
+  const out: Record<string, string> = {};
+  const type = String(auth.type ?? "none").toLowerCase();
+  if (type === "bearer") {
+    const token = String(auth.token ?? "").trim();
+    if (token) out["Authorization"] = `Bearer ${token}`;
+  } else if (type === "api_key") {
+    const apiKey = String(auth.api_key ?? "").trim();
+    if (apiKey) {
+      const headerName = String(auth.header_name ?? "").trim() || "X-API-Key";
+      out[headerName] = apiKey;
+    }
+  }
+  return out;
+}
+
+// ── OAuth client-credentials token cache (direct-mode MCP servers) ──────────
+//
+// Direct (non-broker) mode: the sandbox reaches the upstream directly, so the
+// worker injects registry-supplied upstream auth itself. For `auth.type ===
+// "oauth"` it performs the client-credentials flow (POST to the registry-
+// supplied `token_url`), caches the access_token keyed by server_id, and
+// injects `Authorization: Bearer {access_token}` into the SDK config headers.
+// Broker-routed sessions do NOT fetch tokens here (the broker does it).
+//
+// Cache: module-level Map<server_id, {access_token, expires_at}>. A token is
+// refreshed when within OAUTH_REFRESH_MARGIN_MS of expiry. Single-flight: a
+// per-server_id in-flight Promise ensures concurrent calls share one fetch
+// (the check-and-set is synchronous, so a concurrent caller always sees the
+// stored Promise).
+const _oauthTokenCache = new Map<string, { access_token: string; expires_at: number }>();
+const _oauthInflight = new Map<string, Promise<string>>();
+const OAUTH_REFRESH_MARGIN_MS = 60_000;
+const OAUTH_TOKEN_TIMEOUT_MS = 10_000;
+
+/**
+ * POST `client_credentials` to `auth.token_url` -> {access_token, expires_at}.
+ * `expires_at` is a ms-epoch timestamp. `expires_in` defaults to 3600s when the
+ * token endpoint omits it or returns a non-numeric value. Throws on any
+ * transport / HTTP / shape error so the caller can fail-open.
+ */
+export async function fetchOauthToken(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry JSON
+  auth: any,
+): Promise<{ access_token: string; expires_at: number }> {
+  const tokenUrl = String(auth?.token_url ?? "").trim();
+  const clientId = String(auth?.client_id ?? "").trim();
+  const clientSecret = String(auth?.client_secret ?? "").trim();
+  if (!tokenUrl || !clientId || !clientSecret) {
+    throw new Error("oauth auth requires token_url, client_id, client_secret");
+  }
+  const scopesRaw = Array.isArray(auth?.scopes) ? auth.scopes : [];
+  const scopes = scopesRaw.map((s: unknown) => String(s)).filter(Boolean);
+  const form = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: clientId,
+    client_secret: clientSecret,
+    ...(scopes.length ? { scope: scopes.join(" ") } : {}),
+  });
+  const resp = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: form.toString(),
+    signal: AbortSignal.timeout(OAUTH_TOKEN_TIMEOUT_MS),
+  });
+  if (!resp.ok) {
+    throw new Error(`oauth token endpoint returned HTTP ${resp.status}`);
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- token JSON
+  const data: any = await resp.json();
+  const accessToken = String(data?.access_token ?? "").trim();
+  if (!accessToken) {
+    throw new Error("oauth token endpoint returned no access_token");
+  }
+  const expiresIn = typeof data?.expires_in === "number" ? data.expires_in : 3600;
+  return { access_token: accessToken, expires_at: Date.now() + expiresIn * 1000 };
+}
+
+/**
+ * Return a cached oauth access_token for `serverId`, refreshing on expiry.
+ * Single-flight: concurrent callers for the same `serverId` share one fetch via
+ * a per-`serverId` in-flight Promise (the check-and-set is synchronous, so a
+ * concurrent caller always sees the stored Promise).
+ */
+export async function getOauthToken(
+  serverId: string,
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry JSON
+  auth: any,
+): Promise<string> {
+  const now = Date.now();
+  const cached = _oauthTokenCache.get(serverId);
+  if (cached && cached.expires_at - now > OAUTH_REFRESH_MARGIN_MS) {
+    return cached.access_token;
+  }
+  let inflight = _oauthInflight.get(serverId);
+  if (!inflight) {
+    inflight = (async () => {
+      const { access_token, expires_at } = await fetchOauthToken(auth);
+      _oauthTokenCache.set(serverId, { access_token, expires_at });
+      return access_token;
+    })().finally(() => {
+      _oauthInflight.delete(serverId);
+    });
+    _oauthInflight.set(serverId, inflight);
+  }
+  return inflight;
+}
+
+/**
+ * Test-only: clear the oauth token cache + in-flight promises so tests start
+ * from a clean slate. Not part of the runtime contract.
+ */
+export function _resetOauthTokenCacheForTest(): void {
+  _oauthTokenCache.clear();
+  _oauthInflight.clear();
+}
+
+/**
+ * Attach `timeout_seconds` to an SDK MCP config as a `timeout` field. The
+ * installed SDK (0.1.77) McpServerConfig type has no `timeout` and the CLI's
+ * MCP transport does not consume one, so this is forward-compatible only:
+ * `strictMcpConfig` defaults to false so the extra field passes through to the
+ * CLI unchanged (never rejected). A future SDK that honours a per-server
+ * `timeout` will pick it up with no further change here. Only positive numbers
+ * are attached so absent/invalid values leave the config untouched.
+ */
+function withTimeout(
+  config: McpServerConfig,
+  timeoutSeconds: unknown,
+): McpServerConfig {
+  if (typeof timeoutSeconds === "number" && timeoutSeconds > 0) {
+    return { ...config, timeout: timeoutSeconds } as unknown as McpServerConfig;
+  }
+  return config;
+}
+
+/**
+ * Reduce the per-server `timeout` (seconds, attached by {@link withTimeout})
+ * across the MCP server map to a single minimum value. Returns `undefined`
+ * when no server carries a positive `timeout` - the caller then leaves the
+ * SDK `options.env` untouched so the CLI defaults apply (30s connect, no
+ * tool-call cap).
+ *
+ * MIN-aggregation rationale: the SDK spawns ONE CLI subprocess per run that
+ * hosts every MCP server together, so the CLI's process-global `MCP_TIMEOUT`
+ * (connect/init) and `MCP_TOOL_TIMEOUT` (per tool-call) cannot be set
+ * per-server. Taking the MIN ensures the most conservative (fastest-timeout)
+ * server's bound is the one enforced across the whole run - a MAX or average
+ * would let a tight server hang past its configured bound. This is a
+ * deliberate downgrade from true per-server semantics: a future SDK that
+ * honours the per-server `timeout` field (already attached by withTimeout,
+ * forward-compatible) would let each value apply independently and this
+ * global aggregation could be dropped. In-process SDK servers (hitl /
+ * webfetch) never carry a `timeout` and are naturally skipped.
+ */
+function minMcpTimeoutSeconds(
+  servers: Record<string, McpServerConfig>,
+): number | undefined {
+  let min: number | undefined;
+  for (const cfg of Object.values(servers)) {
+    // withTimeout attaches `timeout` (seconds) as an extra field; the SDK
+    // McpServerConfig union does not declare it, so narrow defensively.
+    const t = (cfg as { timeout?: unknown }).timeout;
+    if (typeof t === "number" && t > 0 && (min === undefined || t < min)) {
+      min = t;
+    }
+  }
+  return min;
+}
+
+/**
+ * Parse a registry `tool_filter` into the {allow, block} shape. Returns
+ * undefined when no non-empty list is present so callers can skip storing it.
+ */
+function parseToolFilter(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- registry JSON
+  raw: any,
+): { allow?: string[]; block?: string[] } | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const allow = Array.isArray(raw.allow)
+    ? raw.allow.map((x: unknown) => String(x)).filter(Boolean)
+    : undefined;
+  const block = Array.isArray(raw.block)
+    ? raw.block.map((x: unknown) => String(x)).filter(Boolean)
+    : undefined;
+  if (!allow?.length && !block?.length) return undefined;
+  const out: { allow?: string[]; block?: string[] } = {};
+  if (allow?.length) out.allow = allow;
+  if (block?.length) out.block = block;
+  return out;
+}
+
 // ── resume context ──────────────────────────────────────────────────────────
 
 /**
- * Read the Redis checkpoint; if a prior non-terminal run exists, return a resume
- * note (matches the Python L569-589 wording). Otherwise return "". Failure-open.
+ * Read the Redis checkpoint; if a *prior* run left real progress behind on this
+ * run-id (worker crashed mid-flight and got re-dispatched under the same id),
+ * return a resume note (matches the Python L569-589 wording). Otherwise "".
+ * Failure-open.
+ *
+ * A genuine resume requires a checkpoint that (a) exists, (b) is non-terminal
+ * (not COMPLETED/FAILED), and (c) reflects real progress past the start marker.
+ * The start-checkpoint (`cursor === "start"`) is written by the run loop itself
+ * right before dispatch (main.ts) and carries no real progress — it must never
+ * be mistaken for a resume, or every brand-new run gets a bogus "已完成 N 步"
+ * note prepended to its first prompt. This function is also called *before*
+ * that write so it only ever sees a prior run's leftover checkpoint, but the
+ * cursor guard keeps it correct regardless of call ordering.
  */
 export async function buildResumeContext(
   redis: RedisStateClient,
@@ -364,7 +843,8 @@ export async function buildResumeContext(
   if (
     checkpoint === null ||
     checkpoint.status === "COMPLETED" ||
-    checkpoint.status === "FAILED"
+    checkpoint.status === "FAILED" ||
+    checkpoint.cursor === "start"
   ) {
     return "";
   }
@@ -377,21 +857,330 @@ export async function buildResumeContext(
   );
 }
 
-// ── PreToolUse hook (placeholder allow-all; DLP integration is a TODO) ───────
+// ── PreToolUse hook (DLP scan) ───────────────────────────────────────────────
 
 /**
- * v1 PreToolUse hook: allow every tool call. The hook mechanism is wired so a
- * real DLP check can be dropped in later (see spike runner.ts for the deny path).
- * TODO(DLP): replace with a `fetch()` to the DLP gateway and honour its verdict.
+ * Build the PreToolUse hook for this run. Each tool call is scanned by
+ * Foundation-DLP (see dlp.ts): a non-ALLOW verdict denies the call, everything
+ * else allows. The hook is **fail-OPEN at two layers**:
+ *   1. dlp.ts fails open on DLP unset / unreachable / timeout / non-2xx / bad JSON.
+ *   2. any unexpected throw inside the hook itself is caught here → allow, so a
+ *      hook bug can never hard-block the agent.
+ *
+ * Identity headers mirror the authenticated MCP-registry fetch (x-tenant-id +
+ * conditional x-tool-broker-lease) so the scan works through the broker façade.
  */
-async function allowAllPreToolUse(): Promise<HookJSONOutput> {
-  return {
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "allow",
-      permissionDecisionReason: "v1 allow-all (DLP integration pending)",
-    },
+export function makeDlpPreToolUse(
+  env: Env,
+): (input: HookInput) => Promise<HookJSONOutput> {
+  return async function dlpPreToolUse(
+    input: HookInput,
+  ): Promise<HookJSONOutput> {
+    try {
+      // The SDK only registers this under PreToolUse, so the input carries
+      // tool_name / tool_input / tool_use_id; narrow defensively all the same.
+      const toolName =
+        "tool_name" in input ? String(input.tool_name ?? "") : "";
+      const toolInput = "tool_input" in input ? input.tool_input : undefined;
+      const toolUseId =
+        "tool_use_id" in input ? String(input.tool_use_id ?? "") : "";
+
+      const { decision, reason } = await scanToolCall({
+        dlpUrl: env.DLP_URL,
+        toolName,
+        toolInput,
+        toolUseId,
+        headers: {
+          apiToken: env.FOUNDATION_API_TOKEN,
+          tenantId: env.FOUNDATION_TENANT_ID,
+          ...(env.TOOL_BROKER_LEASE
+            ? { brokerLease: env.TOOL_BROKER_LEASE }
+            : {}),
+        },
+      });
+
+      // A PreToolUse hook that returns an explicit `permissionDecision: "allow"`
+      // SHORT-CIRCUITS the SDK permission flow and the `canUseTool` callback is
+      // never consulted — which would silently disable the HITL gate (every MCP
+      // tool / ask_user call would auto-run instead of pausing). So on a clean
+      // scan we assert NO permission decision and let `canUseTool` decide. Only
+      // a real DLP hit emits a `deny` (which canUseTool can't override anyway).
+      if (decision === "deny") {
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason: reason,
+          },
+        };
+      }
+      return { continue: true };
+    } catch (err) {
+      // fail-OPEN: a hook bug must never block the agent. Stay silent on the
+      // permission decision (same rationale as the clean-scan path above) so a
+      // hook error doesn't accidentally bypass the HITL canUseTool gate.
+      console.warn(
+        `[worker] DLP PreToolUse hook threw (fail-open, allowing): ${(err as Error).message}`,
+      );
+      return { continue: true };
+    }
   };
+}
+
+/**
+ * Build a PreToolUse hook that enforces per-server MCP `tool_filter` ALLOW lists
+ * at execution time. The SDK has no per-server allowedTools, so a registry
+ * allow list (only expose these tools from this server) cannot be applied as an
+ * exposure filter without enumerating every tool name up front. Instead this
+ * hook DENIES any `mcp__<server>__<tool>` call whose `<tool>` is not in that
+ * server's allow list. Block lists are handled separately as `disallowedTools`
+ * (true exposure), so this hook only needs to reason about allow.
+ *
+ * Returns `null` when no server has an allow list, so runQuery can skip wiring
+ * an extra hook in the common case. Like the DLP hook, it is fail-OPEN: any
+ * unexpected throw returns `{continue:true}` so a hook bug can never hard-block
+ * the agent, and an allowed/non-MCP tool stays silent (`{continue:true}`) so the
+ * HITL canUseTool gate and DLP hook still run (never returns
+ * `permissionDecision:"allow"`, which would short-circuit them).
+ */
+export function makeMcpAllowGate(
+  filters: McpToolFilters,
+): ((input: HookInput) => Promise<HookJSONOutput>) | null {
+  // serverName -> Set(allowed tool names), only for servers with a non-empty allow.
+  const allowSets = new Map<string, Set<string>>();
+  for (const [serverName, f] of Object.entries(filters)) {
+    if (f?.allow?.length) allowSets.set(serverName, new Set(f.allow));
+  }
+  if (allowSets.size === 0) return null;
+
+  return async function mcpAllowGate(
+    input: HookInput,
+  ): Promise<HookJSONOutput> {
+    try {
+      const toolName =
+        "tool_name" in input ? String(input.tool_name ?? "") : "";
+      // MCP tools are named `mcp__<server>__<tool>` (verified against the CLI).
+      // Non-greedy server match: a server name containing `__` would mis-split
+      // and fail to find the allow set -> fail-OPEN (no deny), an acceptable
+      // edge case since registry server names are simple identifiers.
+      const m = toolName.match(/^mcp__(.+?)__(.+)$/);
+      if (!m) return { continue: true };
+      const [, server, tool] = m;
+      const allow = allowSets.get(server);
+      if (allow && !allow.has(tool)) {
+        return {
+          hookSpecificOutput: {
+            hookEventName: "PreToolUse",
+            permissionDecision: "deny",
+            permissionDecisionReason: `MCP tool '${tool}' is not in the allow list for server '${server}'`,
+          },
+        };
+      }
+      return { continue: true };
+    } catch (err) {
+      // fail-OPEN: never block the agent on a hook bug.
+      console.warn(
+        `[worker] MCP allow-gate hook threw (fail-open, allowing): ${(err as Error).message}`,
+      );
+      return { continue: true };
+    }
+  };
+}
+
+// ── HITL: ask_user tool + system prompt block ────────────────────────────────
+
+/**
+ * The HITL system-prompt block (parity with the old worker __main__.py:1268-1277).
+ * Without it the model asks clarification questions as plain reply text and keeps
+ * going instead of calling ask_user, so the pause/resume machinery never engages.
+ */
+export const ASK_USER_PROMPT_BLOCK =
+  "## 向用户提问（ask_user）\n" +
+  "当你需要用户澄清需求、在多个方案中做选择，或缺少继续执行所必需的信息时，" +
+  "必须调用 ask_user 工具提问并等待用户回答；不要在正文里提问后自行猜测继续，" +
+  "也不要把问题作为最终回复结束任务。用户回答后会自动继续本次任务。";
+
+/**
+ * Build the in-process ask_user MCP server. The handler is NEVER invoked: the
+ * canUseTool gate pauses the run (kind="question") before any tool executes, so
+ * the model's ask_user call interrupts before the handler would run. We still
+ * register a real handler because the SDK requires one; it returns a benign
+ * placeholder in the (unreachable) event it were ever called.
+ */
+function buildAskUserServer(): McpServerConfig {
+  const askUser = tool(
+    ASK_USER_TOOL,
+    "向用户提出一个澄清问题并等待用户回答。当你需要用户提供信息、做选择或澄清需求时调用。",
+    { question: z.string().describe("要向用户提出的问题") },
+    async () => ({
+      // Unreachable: canUseTool interrupts before the handler runs.
+      content: [{ type: "text", text: "" }],
+    }),
+  );
+  // createSdkMcpServer returns an McpSdkServerConfigWithInstance, which is a
+  // member of the McpServerConfig union.
+  return createSdkMcpServer({ name: "hitl", tools: [askUser] }) as McpServerConfig;
+}
+
+// ── web_fetch: controlled-egress page fetcher ────────────────────────────────
+
+/**
+ * The sandbox network is Internal=true isolated: the model cannot `curl` an
+ * arbitrary URL and reach the public internet. The ONLY sanctioned egress for
+ * web content is the web-fetch gateway (a direct base in foundation mode, or the
+ * tool-broker passthrough in broker mode), whose URL the scheduler injects as
+ * `WEB_FETCH_GATEWAY_URL`. The AgentScope worker exposed this as a tool; this
+ * function ports it to the Claude SDK as an in-process MCP server named
+ * `webfetch` with one tool `web_fetch` (the model sees `mcp__webfetch__web_fetch`).
+ *
+ * This is deliberately NOT named `WebFetch` — that name is the SDK's hosted
+ * server-side tool, which we disable via `disallowedTools` (it can't run against
+ * the OpenAI-compatible gateway). The MCP-namespaced `mcp__webfetch__web_fetch`
+ * is a wholly distinct identifier and does not collide.
+ */
+const WEB_FETCH_DEFAULT_MAX_BYTES = 1048576;
+const WEB_FETCH_TIMEOUT_MS = 30000;
+
+/**
+ * Resolve the gateway POST endpoint from the configured base. Mirrors the
+ * AgentScope reference (tool.py:200-203): a base already ending in
+ * `/api/web-fetch/v1` (the broker-passthrough shape) only needs `/fetch`
+ * appended; any other base gets the full `/api/web-fetch/v1/fetch` suffix.
+ */
+export function webFetchEndpoint(gatewayUrl: string): string {
+  if (gatewayUrl.endsWith("/api/web-fetch/v1")) {
+    return `${gatewayUrl}/fetch`;
+  }
+  return `${gatewayUrl}/api/web-fetch/v1/fetch`;
+}
+
+/**
+ * Perform one gateway fetch and render the agent-readable text. Pure I/O wrapper
+ * over the gateway; the error-string vocabulary matches the AgentScope reference
+ * (tool.py:217-262) so the model sees identical signals across both workers.
+ * Never throws — every failure path returns a `[WebFetch error]`/`[WebFetch
+ * blocked]` string.
+ */
+export async function runWebFetch(
+  env: Env,
+  url: string,
+  maxBytes: number | undefined,
+): Promise<string> {
+  const gatewayUrl = env.WEB_FETCH_GATEWAY_URL;
+  const endpoint = webFetchEndpoint(gatewayUrl);
+  const body = JSON.stringify({
+    url,
+    max_bytes: maxBytes && maxBytes > 0 ? maxBytes : WEB_FETCH_DEFAULT_MAX_BYTES,
+  });
+
+  // Identity headers: only attach those with a value (parity with tool.py:205-215).
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  if (env.FOUNDATION_API_TOKEN) {
+    headers["authorization"] = `Bearer ${env.FOUNDATION_API_TOKEN}`;
+  }
+  if (env.FOUNDATION_TENANT_ID) headers["x-tenant-id"] = env.FOUNDATION_TENANT_ID;
+  if (env.FOUNDATION_USER_ID) headers["x-user-id"] = env.FOUNDATION_USER_ID;
+  if (env.FOUNDATION_SERVICE_SCOPES) {
+    headers["x-service-scopes"] = env.FOUNDATION_SERVICE_SCOPES;
+  }
+  if (env.TOOL_BROKER_LEASE) headers["x-tool-broker-lease"] = env.TOOL_BROKER_LEASE;
+
+  let resp: Response;
+  try {
+    resp = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body,
+      signal: AbortSignal.timeout(WEB_FETCH_TIMEOUT_MS),
+    });
+  } catch (err) {
+    const e = err as Error;
+    if (e?.name === "TimeoutError" || e?.name === "AbortError") {
+      return `[WebFetch error] Request to ${url} timed out (30 s)`;
+    }
+    return `[WebFetch error] Could not reach gateway at ${gatewayUrl}: ${e?.message ?? String(err)}`;
+  }
+
+  // ── gateway error codes (tool.py:226-241) ──
+  if (resp.status === 403) {
+    let detail: string;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- gateway JSON
+      const j: any = await resp.json();
+      detail = typeof j?.detail === "string" ? j.detail : JSON.stringify(j).slice(0, 200);
+    } catch {
+      detail = (await safeText(resp)).slice(0, 200);
+    }
+    return `[WebFetch blocked] ${url}: ${detail}`;
+  }
+  if (resp.status === 504) {
+    return (
+      `[WebFetch error] Gateway timed out while fetching ${url}. ` +
+      "The remote server did not respond in time."
+    );
+  }
+  if (resp.status >= 400) {
+    return `[WebFetch error] Gateway returned HTTP ${resp.status} for ${url}`;
+  }
+
+  // ── success (tool.py:243-262) ──
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- gateway JSON
+  let data: any;
+  try {
+    data = await resp.json();
+  } catch (err) {
+    return `[WebFetch error] Could not parse gateway response: ${(err as Error).message}`;
+  }
+  if (data?.error) {
+    return `[WebFetch error] ${url}: ${data.error}`;
+  }
+  const statusCode = data?.status_code ?? "?";
+  const contentType = data?.content_type ?? "?";
+  const fetched = data?.body ?? "";
+  const truncated = data?.truncated === true;
+  let result = `[WebFetch] ${url} — HTTP ${statusCode} (${contentType})\n\n${fetched}`;
+  if (truncated) result += "\n[... response truncated at limit ...]";
+  return result;
+}
+
+/** Read a Response body as text without throwing. */
+async function safeText(resp: Response): Promise<string> {
+  try {
+    return await resp.text();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Build the in-process web_fetch MCP server. Unlike ask_user (whose handler is
+ * unreachable), this handler REALLY executes: it POSTs to the controlled
+ * web-fetch gateway via {@link runWebFetch}. The handler never reaches out to an
+ * arbitrary URL itself — the gateway is the sole, controlled egress, preserving
+ * the sandbox's Internal=true isolation.
+ */
+function buildWebFetchServer(env: Env): McpServerConfig {
+  const webFetch = tool(
+    "web_fetch",
+    "抓取公开 HTTP/HTTPS 网页、API 或文档的内容。这是本沙盒唯一的联网方式：" +
+      "沙盒网络被隔离，无法直接 curl/访问外网，任何需要联网获取的信息（网页正文、" +
+      "公开 API 响应、在线文档等）都必须调用本工具，绝不要尝试用 Bash/curl 直连外网。" +
+      "返回网页文本内容（可能被截断）。",
+    {
+      url: z
+        .string()
+        .describe("要抓取的完整 http/https URL（必填）"),
+      max_bytes: z
+        .number()
+        .optional()
+        .describe("响应正文最大字节数（可选，默认 1048576 = 1 MiB）"),
+    },
+    async (args: { url: string; max_bytes?: number }) => {
+      const text = await runWebFetch(env, args.url, args.max_bytes);
+      return { content: [{ type: "text", text }] };
+    },
+  );
+  return createSdkMcpServer({ name: "webfetch", tools: [webFetch] }) as McpServerConfig;
 }
 
 // ── the run ─────────────────────────────────────────────────────────────────
@@ -413,6 +1202,14 @@ export async function runQuery(
   opts: {
     systemPrompt: string;
     mcpServers: Record<string, McpServerConfig>;
+    /**
+     * Per-server tool_filter (allow/block) from the registry, keyed by the SDK
+     * server name. block entries become global `disallowedTools` (true exposure
+     * filter - the model never sees them); allow lists are enforced by a
+     * PreToolUse gate because the SDK has no per-server allowedTools. Optional:
+     * tests / headless callers that pass `mcpServers` directly omit it.
+     */
+    mcpFilters?: McpToolFilters;
     redis: RedisStateClient;
     /**
      * Resume note for a checkpoint-resumed run (see buildResumeContext); "" for
@@ -432,31 +1229,149 @@ export async function runQuery(
   const model = task.model_override || env.LLM_MODEL || undefined;
   const sampling = task.sampling_params ?? {};
 
+  // HITL gate: interactive runs (hitl !== false) get the canUseTool gate +
+  // ask_user tool + the ask_user prompt block; headless runs keep today's bypass.
+  const hitl = task.hitl !== false;
+  const hitlCtx: HitlContext = newHitlContext(task);
+
   const evPath = eventsPath();
   const ws = workspaceDir();
+
+  // Build the MCP server map. In HITL mode we add the in-process ask_user tool
+  // alongside the tenant servers (its name `mcp__hitl__ask_user` is recognised by
+  // the gate as a question-pause).
+  const mcpServers: Record<string, McpServerConfig> = { ...opts.mcpServers };
+
+  // Mutable copy of the per-server tool_filter map. In-process SDK tools
+  // (hitl / webfetch) are added below and OVERWRITE any same-named tenant
+  // server in `mcpServers`; drop their filter entries here so the tenant's
+  // tool_filter is never applied to the in-process tools (e.g. a tenant server
+  // named "hitl" with a block list would otherwise add `mcp__hitl__ask_user`
+  // to disallowedTools and break HITL, or the allow-gate would deny ask_user).
+  const mcpFilters: McpToolFilters = { ...(opts.mcpFilters ?? {}) };
+  if (hitl) delete mcpFilters.hitl;
+  if (env.WEB_FETCH_GATEWAY_URL) delete mcpFilters.webfetch;
+
+  // web_fetch: the sandbox's only sanctioned network egress for page content.
+  // Mounted in BOTH headless and HITL modes (the model needs it regardless of a
+  // human gate), but only when the scheduler injected a gateway URL — matching
+  // the AgentScope behavior of not registering the tool when egress is unset.
+  if (env.WEB_FETCH_GATEWAY_URL) {
+    mcpServers.webfetch = buildWebFetchServer(env);
+  }
+
+  // tool_filter: the SDK has no per-server allowedTools, so we split the filter
+  // across the two mechanisms the SDK does expose:
+  //   * block -> global `disallowedTools` with `mcp__<server>__<tool>` names.
+  //     This is a TRUE EXPOSURE filter: blocked tools are removed from the
+  //     model's context and can never be requested (works in both HITL and
+  //     headless modes).
+  //   * allow -> a PreToolUse gate that DENIES any `mcp__<server>__<tool>` whose
+  //     tool is not in that server's allow list. The SDK can't hide non-allowed
+  //     tools at exposure time without enumerating every tool name, so allow is
+  //     enforced at execution. A deny here is final (canUseTool can't override
+  //     it); an allowed tool returns `{continue:true}` so the HITL canUseTool
+  //     gate and the DLP hook still run untouched (returning
+  //     `permissionDecision:"allow"` would short-circuit them - see
+  //     makeDlpPreToolUse).
+  const blockedToolNames: string[] = [];
+  for (const [serverName, f] of Object.entries(mcpFilters)) {
+    if (f?.block?.length) {
+      for (const tool of f.block) {
+        blockedToolNames.push(`mcp__${serverName}__${tool}`);
+      }
+    }
+  }
+  const allowGate = makeMcpAllowGate(mcpFilters);
+  const preUseHooks = [makeDlpPreToolUse(env)];
+  if (allowGate) preUseHooks.push(allowGate);
+
   const options: Options = {
     cwd: ws,
     additionalDirectories: [inputsDir(), outputsDir(), SKILLS_DIR],
-    systemPrompt: opts.systemPrompt,
-    mcpServers: opts.mcpServers,
-    // Headless sandbox: no human to confirm tool calls.
-    permissionMode: "bypassPermissions",
-    allowDangerouslySkipPermissions: true,
+    systemPrompt: hitl
+      ? `${opts.systemPrompt}\n\n${ASK_USER_PROMPT_BLOCK}`
+      : opts.systemPrompt,
+    mcpServers,
+    // Remove Anthropic server-side tools that can't execute against the
+    // OpenAI-compatible (deepseek) gateway, PLUS per-server tool_filter block
+    // lists (as `mcp__<server>__<tool>` names). Both are exposure filters: the
+    // model never sees these tools. This only narrows the available tool set;
+    // it is orthogonal to permissionMode / canUseTool (HITL) / the DLP +
+    // allow-gate PreToolUse hooks / mcpServers, which all keep operating on the
+    // remaining (client-side + MCP) tools.
+    disallowedTools: [
+      ...SERVER_SIDE_TOOLS_UNAVAILABLE_ON_GATEWAY,
+      ...blockedToolNames,
+    ],
+    // True per-token streaming: emit SDKPartialAssistantMessage (`stream_event`)
+    // partials so event_translator can produce incremental TextBlockDeltaEvents
+    // (one per text_delta) instead of one whole-text delta. The translator
+    // de-duplicates against the final consolidated `assistant` message.
+    includePartialMessages: true,
     hooks: {
-      PreToolUse: [{ hooks: [allowAllPreToolUse] }],
+      PreToolUse: [{ hooks: preUseHooks }],
     },
   };
+  if (hitl) {
+    // Gate every tool through canUseTool (requires NOT bypassing permissions).
+    mcpServers.hitl = buildAskUserServer();
+    options.permissionMode = "default";
+    options.canUseTool = makeCanUseTool(hitlCtx, task);
+  } else {
+    // Headless sandbox: no human to confirm tool calls — auto-approve all.
+    options.permissionMode = "bypassPermissions";
+    options.allowDangerouslySkipPermissions = true;
+  }
   if (model) options.model = model;
-  // SDK sampling controls: only max_tokens has a direct Options analogue
-  // (maxThinkingTokens). temperature / top_p are not exposed by the SDK Options
-  // surface in this version, so they are intentionally dropped (logged once).
-  if (sampling.max_tokens != null) {
-    options.maxThinkingTokens = sampling.max_tokens;
+
+  // ── sampling / reasoning controls ──
+  // The Claude Agent SDK's Options surface exposes ONLY `maxThinkingTokens` (the
+  // thinking budget) and `model`/turns/budget — it has NO field for the model's
+  // output `max_tokens`, nor for reasoning effort or structured outputs. So:
+  //   - sampling.max_tokens (the OUTPUT cap) must NOT be put on maxThinkingTokens
+  //     (the old bug: it conflated the output cap with the thinking budget). It
+  //     is instead carried to the gateway adapter (main.ts) and applied to the
+  //     OpenAI `max_tokens`.
+  //   - reasoning_effort, when set, is mapped to high/max (DeepSeek's only
+  //     accepted values) and carried to the adapter as `reasoning_effort`.
+  // Here in worker.ts we only flip the SDK switch that makes it EMIT the
+  // Anthropic `thinking:{type:"enabled"}` field on the wire (which the adapter
+  // collapses to DeepSeek's thinking enable): the SDK emits `thinking` iff
+  // maxThinkingTokens > 0. So when the task requests reasoning effort we set a
+  // nominal thinking budget to turn thinking on; the actual reasoning depth is
+  // governed by reasoning_effort at the gateway, not this budget.
+  const effort = mapReasoningEffort(task.reasoning_effort);
+  if (effort) {
+    options.maxThinkingTokens = THINKING_ENABLE_BUDGET;
   }
   if (sampling.temperature != null || sampling.top_p != null) {
     console.log(
       "[worker] sampling temperature/top_p are not exposed by the SDK Options; ignoring",
     );
+  }
+
+  // ── MCP timeout (CLI subprocess env) ──
+  // The SDK query() has no timeout option and McpServerConfig has no timeout
+  // field the CLI consumes (the per-server `timeout` attached by withTimeout
+  // is forward-compatible only today). The CLI subprocess DOES honour two env
+  // vars, though: MCP_TIMEOUT (connect/init, default 30000ms) and
+  // MCP_TOOL_TIMEOUT (per tool-call, default unlimited). The SDK uses
+  // `options.env` as the CLI's process.env (sdk.mjs: `options.env ?? process.env`),
+  // so we aggregate the per-server `timeout_seconds` (carried on each config as
+  // `timeout`, in seconds) down to a global MIN and inject both vars in ms.
+  // See minMcpTimeoutSeconds for the MIN-aggregation rationale. When no server
+  // carries a positive timeout, options.env is left unset so the CLI defaults
+  // apply. This only affects worker-direct http/stdio MCP paths; broker egress
+  // is bounded at the broker.
+  const mcpTimeoutSeconds = minMcpTimeoutSeconds(mcpServers);
+  if (mcpTimeoutSeconds !== undefined) {
+    const ms = String(mcpTimeoutSeconds * 1000);
+    options.env = {
+      ...process.env,
+      MCP_TIMEOUT: ms,
+      MCP_TOOL_TIMEOUT: ms,
+    };
   }
 
   let summary = "";
@@ -468,13 +1383,27 @@ export async function runQuery(
   // tool_result after ToolResultEnd; delta as text streams; end at the close).
   const toolArgs = new Map<string, string>();
   const toolResultText = new Map<string, string>();
+  // Thinking accumulator: buffer reasoning deltas per block_id and push the whole
+  // block as ONE Redis type=thinking entry on its End (see pushToRedis doc).
+  const thinkingBuffers = new Map<string, string>();
 
-  // Cache-friendliness: the resume note is the only per-run-varying piece of
-  // context, so it lives on the user turn (here) instead of the system prompt.
-  // The model still learns it is resuming from a checkpoint; the static system
-  // prefix is left untouched so DeepSeek prefix-caching can hit across runs.
+  // HITL transcript accumulator: mirrors the token-stream maps but in a form we
+  // can serialize into the paused blob's agent_state for history-replay.
+  const acc = newTranscriptAccumulator();
+
+  // Prompt selection. A resume leg reconstructs the conversation as a streamed
+  // AsyncIterable<SDKUserMessage> (history-replay); a fresh run uses today's
+  // single string prompt with the resume note prepended.
+  //
+  // Cache-friendliness (fresh runs only): the resume note is the only
+  // per-run-varying piece of context, so it lives on the user turn (here)
+  // instead of the system prompt, keeping the static system prefix cacheable.
   const resumeNote = opts.resumeNote ?? "";
-  const prompt = resumeNote ? `${resumeNote}\n\n${task.task}` : task.task;
+  const prompt: string | AsyncIterable<SDKUserMessage> = task.resume
+    ? buildReplayPrompt(task)
+    : resumeNote
+      ? `${resumeNote}\n\n${task.task}`
+      : task.task;
 
   try {
     const response = queryFn({ prompt, options });
@@ -483,11 +1412,37 @@ export async function runQuery(
       const events = translator.translateMessage(msg);
       for (const ev of events) {
         appendEvent(evPath, ev);
-        await pushToRedis(opts.redis, ev, toolArgs, toolResultText, translator);
+
+        // HITL pause guard: when canUseTool denies+interrupts a tool call, the
+        // SDK emits a synthetic tool_result (is_error, "paused for human
+        // approval") for that call. We MUST NOT push that result to the token
+        // stream — the frontend treats any tool_result as "interaction
+        // consumed" and would acknowledge/remove the very pending card we're
+        // about to raise, so the ConfirmCard/QuestionCard never renders (and
+        // can't be rehydrated). The pending tool_call_id(s) are recorded by
+        // canUseTool before this result arrives, so skip the matching result.
+        if (
+          ev.event_type === "ToolResultEndEvent" &&
+          hitlCtx.pending.some((p) => p.id === String(ev.tool_call_id ?? ""))
+        ) {
+          continue;
+        }
+
+        await pushToRedis(
+          opts.redis,
+          ev,
+          toolArgs,
+          toolResultText,
+          thinkingBuffers,
+          translator,
+        );
 
         if (ev.event_type === "TextBlockDeltaEvent") {
           summary += String(ev.delta ?? "");
+          acc.assistantText += String(ev.delta ?? "");
         } else if (ev.event_type === "ToolCallEndEvent") {
+          // Record the completed tool call for the replay snapshot.
+          recordToolCall(acc, ev, toolArgs, translator);
           // RUNNING checkpoint + result.json refresh after each tool call.
           await opts.redis.writeStep({
             cursor: "ToolCallEndEvent",
@@ -499,25 +1454,54 @@ export async function runQuery(
             usage: translator.getCumulativeUsage(),
             plan_steps: [],
           });
+        } else if (ev.event_type === "ToolResultEndEvent") {
+          recordToolResult(acc, ev, toolResultText);
         } else if (ev.event_type === "ErrorEvent") {
           sawError = true;
           errorMessage = String(ev.message ?? "result error");
         }
       }
+
+      // The pause is signalled inside canUseTool; once observed we stop draining
+      // the iterator (the SDK is interrupting the run anyway). Breaking here also
+      // covers SDKs that keep the iterator open after a deny+interrupt.
+      if (hitlCtx.paused) break;
     }
   } catch (err) {
-    sawError = true;
-    errorMessage = (err as Error)?.message ?? String(err);
-    appendEvent(evPath, {
-      event_type: "ErrorEvent",
-      message: errorMessage,
-    });
+    // A deny+interrupt may surface as a thrown AbortError. When we have already
+    // flagged a pause, treat ANY throw as the pause path (the run was
+    // intentionally interrupted), not a failure. Otherwise it is a real error.
+    if (hitlCtx.paused || err instanceof AbortError) {
+      hitlCtx.paused = true;
+      console.log(
+        `[worker] query() interrupted for HITL pause (${(err as Error)?.name ?? "?"})`,
+      );
+    } else {
+      sawError = true;
+      errorMessage = (err as Error)?.message ?? String(err);
+      appendEvent(evPath, {
+        event_type: "ErrorEvent",
+        message: errorMessage,
+      });
+    }
   }
 
-  // Close the Redis token stream regardless of outcome.
-  await opts.redis.pushTokenEnd();
+  // Wind-down flush: any thinking block that never saw an End (aborted/errored/
+  // paused mid-reasoning) is pushed now so its content is not dropped. A clean
+  // run leaves no residue here (every block flushed at its End).
+  await flushThinkingBuffers(opts.redis, thinkingBuffers);
 
   const usage = translator.getCumulativeUsage();
+
+  // ── HITL pause: persist the paused blob + pending entries, do NOT end stream ──
+  if (hitlCtx.paused) {
+    return await handlePause(task, opts.redis, hitlCtx, acc, summary, usage);
+  }
+
+  // Close the Redis token stream on a non-paused outcome (a pause leaves the
+  // stream open so the resume leg can continue it).
+  await opts.redis.pushTokenEnd();
+
   summary = summary.trim();
   if (!sawError && !summary) summary = "(agent returned an empty reply)";
 
@@ -534,16 +1518,108 @@ export async function runQuery(
 }
 
 /**
+ * Record a completed tool call into the HITL transcript accumulator (name + args
+ * keyed by tool_use_id, in first-seen order) so a pause can snapshot it.
+ */
+function recordToolCall(
+  acc: ReturnType<typeof newTranscriptAccumulator>,
+  ev: EventPayload,
+  toolArgs: Map<string, string>,
+  translator: EventTranslator,
+): void {
+  const id = String(ev.tool_call_id ?? "");
+  if (!id) return;
+  if (!acc.toolName.has(id)) acc.toolOrder.push(id);
+  acc.toolName.set(id, translator.toolNameFor(id));
+  acc.toolArgs.set(id, toolArgs.get(id) ?? "");
+}
+
+/** Record a tool result text into the accumulator, keyed by tool_use_id. */
+function recordToolResult(
+  acc: ReturnType<typeof newTranscriptAccumulator>,
+  ev: EventPayload,
+  toolResultText: Map<string, string>,
+): void {
+  const id = String(ev.tool_call_id ?? "");
+  if (!id) return;
+  acc.toolResult.set(id, toolResultText.get(id) ?? "");
+}
+
+/**
+ * Persist a HITL pause: push the pending confirmation/question entries (NO
+ * type=end — the stream stays open for the resume leg), write the paused blob
+ * with our replay transcript under agent_state, mark the run PAUSED, and return a
+ * paused RunResult. Failure-open: Redis errors are swallowed by the client.
+ */
+async function handlePause(
+  task: Task,
+  redis: RedisStateClient,
+  ctx: HitlContext,
+  acc: ReturnType<typeof newTranscriptAccumulator>,
+  summary: string,
+  usage: Usage,
+): Promise<RunResult> {
+  const pending: PendingToolCall[] = ctx.pending;
+  const kind = ctx.kind === "question" ? "question" : "confirm";
+
+  // Token-stream pending entries (one per pending call).
+  if (kind === "question") {
+    const first = pending[0];
+    await redis.pushPendingQuestion(
+      first?.id ?? "",
+      ctx.question ?? "",
+    );
+  } else {
+    for (const p of pending) {
+      await redis.pushPendingConfirmation(p.id, p.name, p.args);
+    }
+  }
+
+  // Our replay transcript → agent_state (opaque to the orchestrator).
+  const replayState: ReplayState = snapshotTranscriptForPause(task, acc, pending);
+
+  await redis.writePaused({
+    kind,
+    reply_id: "",
+    tool_calls: pending.map((p) => ({ id: p.id, name: p.name, args: p.args })),
+    question: kind === "question" ? ctx.question ?? "" : null,
+    agent_state: replayState,
+    paused_at: new Date().toISOString(),
+  });
+  await redis.markPaused();
+
+  console.log(
+    `[worker] run paused for HITL (${kind}); ${pending.length} pending tool call(s)`,
+  );
+
+  return {
+    status: "paused",
+    summary: summary.trim(),
+    usage,
+    plan_steps: [],
+  };
+}
+
+/**
  * Push one translated event into the Redis token stream, mirroring the
  * AgentScope worker's push order: text deltas → delta; tool call args coalesced
  * and pushed on ToolCallEnd; tool result text coalesced and pushed on
- * ToolResultEnd; thinking pushed on ThinkingBlockEnd.
+ * ToolResultEnd; thinking accumulated per block_id and pushed as ONE entry on
+ * ThinkingBlockEnd.
+ *
+ * Thinking contract (matches the AgentScope worker): the downstream pipeline
+ * treats "one Redis type=thinking entry = one complete thought block", so a
+ * thinking block is buffered by block_id across its deltas and flushed exactly
+ * once at its End. Pushing per-delta would explode one thought into hundreds of
+ * standalone collapsible cards in the UI. Text, by contrast, stays per-token
+ * streamed (pushToken on each delta) for the live typing experience.
  */
 async function pushToRedis(
   redis: RedisStateClient,
   ev: EventPayload,
   toolArgs: Map<string, string>,
   toolResultText: Map<string, string>,
+  thinkingBuffers: Map<string, string>,
   translator: EventTranslator,
 ): Promise<void> {
   switch (ev.event_type) {
@@ -584,14 +1660,48 @@ async function pushToRedis(
       );
       break;
     }
+    case "ThinkingBlockStartEvent": {
+      const id = String(ev.block_id ?? "");
+      thinkingBuffers.set(id, "");
+      break;
+    }
     case "ThinkingBlockDeltaEvent": {
-      const delta = String(ev.delta ?? "");
-      if (delta) await redis.pushThinking(delta);
+      // Accumulate by block_id only; the whole block is pushed once at its End.
+      const id = String(ev.block_id ?? "");
+      thinkingBuffers.set(id, (thinkingBuffers.get(id) ?? "") + String(ev.delta ?? ""));
+      break;
+    }
+    case "ThinkingBlockEndEvent": {
+      const id = String(ev.block_id ?? "");
+      const text = thinkingBuffers.get(id) ?? "";
+      thinkingBuffers.delete(id);
+      if (text) await redis.pushThinking(text);
       break;
     }
     default:
       break;
   }
+}
+
+/**
+ * Flush any thinking blocks that never received a ThinkingBlockEnd (e.g. the run
+ * was aborted/errored mid-block) so their content is not silently dropped. Each
+ * residual buffer is pushed as one Redis thinking entry — same "one entry = one
+ * block" contract as the normal End path. Buffers are consumed (cleared) so this
+ * is safe to call once at run wind-down.
+ */
+async function flushThinkingBuffers(
+  redis: RedisStateClient,
+  thinkingBuffers: Map<string, string>,
+): Promise<void> {
+  if (thinkingBuffers.size === 0) return;
+  for (const text of thinkingBuffers.values()) {
+    if (text) await redis.pushThinking(text);
+  }
+  console.log(
+    `[worker] flushed ${thinkingBuffers.size} unterminated thinking block(s) at wind-down`,
+  );
+  thinkingBuffers.clear();
 }
 
 async function ensureDirs(): Promise<void> {

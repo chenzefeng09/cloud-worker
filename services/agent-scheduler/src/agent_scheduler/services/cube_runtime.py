@@ -30,15 +30,20 @@ import json
 import logging
 import os
 import re
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
 from agent_scheduler.config import SANDBOX_SERVICE_SCOPES, Settings
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
-from agent_scheduler.services import egress_policy
-from agent_scheduler.services.feature_flag import evaluate_flag
+from agent_scheduler.services import artifact_store, egress_policy
+from agent_scheduler.services.feature_flag import (
+    evaluate_flag,
+    runtime_extensions_for_run,
+)
 from agent_scheduler.services.runtime import RUNTIME_REGISTRY
 from agent_scheduler.services.skill_cache import MountedSkill, SkillCache
 
@@ -90,6 +95,123 @@ _E2B_STATUS_MAP: dict[str, str] = {
 }
 
 
+def _sandbox_records(payload: Any) -> list[dict[str, Any]]:
+    """Normalize Cube list responses across controller versions."""
+    if isinstance(payload, list):
+        records = payload
+    elif isinstance(payload, dict):
+        records = payload.get("items", [])
+    else:
+        return []
+    if not isinstance(records, list):
+        return []
+    return [record for record in records if isinstance(record, dict)]
+
+
+# Map a worker-facing gateway's *internal* container port to the host-published
+# port that the cube microVM uses through its configured reachable host.
+# The scheduler config holds container-name URLs (e.g. http://tool-broker:8024
+# /..., http://llm-gateway:8011/...) whose host is unresolvable inside a microVM;
+# we keep the path/query intact but swap host -> {reachable_host}:{host_port}.
+#   * tool-broker:  container 8024  -> host 8024
+#   * llm-gateway:  container 8011  -> host 8021
+_CONTAINER_PORT_TO_HOST_PORT: dict[int, int] = {
+    8024: 8024,  # tool-broker
+    8011: 8021,  # llm-gateway
+}
+# Default host port when the source URL has no explicit port (rare; keeps the
+# rewrite total rather than producing a portless public URL).
+_DEFAULT_HOST_PORT: int = 8024
+
+
+# The reachable host must be a bare IPv4/IPv6 or DNS hostname, never an HTML error
+# page or a URL. We validate before use because the value is interpolated into
+# a CubeVS ``allowOut`` CIDR (``{host}/32``); a bad value (e.g. an upstream
+# proxy's HTML error body returned by an IP-echo probe) would otherwise be sent
+# as a CIDR and the cube-api rejects the whole spawn (error 130547).
+_PUBLIC_HOST_RE = re.compile(
+    r"^(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9A-Fa-f:]+|[A-Za-z0-9.\-]{1,253})$"
+)
+
+
+def _valid_public_host(value: str) -> bool:
+    value = (value or "").strip()
+    if not value or len(value) > 253:
+        return False
+    return bool(_PUBLIC_HOST_RE.match(value))
+
+
+def _detect_public_host(settings: Settings) -> str:
+    """Resolve the host the cube microVM uses to reach host-published gateways.
+
+    The setting name is retained for compatibility and may contain a private
+    node IP. Order: explicit ``cube_public_host`` wins; otherwise probe a public
+    echo endpoint, then fall back to the controller URL host. A private node IP
+    should be pinned when the cloud's public NAT does not support hairpinning.
+    Every candidate is validated by ``_valid_public_host`` before it is accepted
+    — a probe that returns an HTML error page (common when the scheduler's own
+    egress is brokered/blocked) is rejected, never used as a CIDR target.
+    """
+    pinned = (getattr(settings, "cube_public_host", "") or "").strip()
+    if pinned:
+        if _valid_public_host(pinned):
+            return pinned
+        logger.warning(
+            "cube_public_host is set but not a valid IP/hostname; ignoring",
+            extra={"public_host": pinned[:64]},
+        )
+    for url in ("http://ifconfig.me", "https://api.ipify.org"):
+        try:
+            ip = httpx.get(url, timeout=5.0).text.strip()
+        except httpx.HTTPError as exc:  # noqa: PERF203
+            logger.warning(
+                "cube public-host probe failed",
+                extra={"probe": url, "err": str(exc)},
+            )
+            continue
+        if _valid_public_host(ip):
+            logger.info(
+                "cube public host auto-detected", extra={"public_host": ip}
+            )
+            return ip
+        logger.warning(
+            "cube public-host probe returned a non-IP body; ignoring",
+            extra={"probe": url, "body_prefix": ip[:64]},
+        )
+    controller = getattr(settings, "cube_controller_url", "") or ""
+    host = urlsplit(controller).hostname or ""
+    if host and _valid_public_host(host):
+        logger.warning(
+            "cube public host falling back to controller host; "
+            "set SCHEDULER_CUBE_PUBLIC_HOST to a VM-reachable node IP",
+            extra={"public_host": host},
+        )
+        return host
+    return ""
+
+
+def _rewrite_to_public(url: str, public_host: str) -> str:
+    """Rewrite a container-name gateway URL's host -> {public_host}:{host_port}.
+
+    Keeps scheme/path/query/fragment intact; maps the source container port to
+    its host-published port (see ``_CONTAINER_PORT_TO_HOST_PORT``). Returns the
+    input unchanged when it is empty, public_host is empty, or the URL has no
+    host (so a misconfigured/blank URL never becomes a half-rewritten one).
+    """
+    if not url or not public_host:
+        return url
+    parts = urlsplit(url)
+    if not parts.hostname:
+        return url
+    host_port = _CONTAINER_PORT_TO_HOST_PORT.get(
+        parts.port or -1, parts.port or _DEFAULT_HOST_PORT
+    )
+    netloc = f"{public_host}:{host_port}"
+    return urlunsplit(
+        (parts.scheme or "http", netloc, parts.path, parts.query, parts.fragment)
+    )
+
+
 def _check_ids(**named: str) -> None:
     """Same identifier whitelist as docker_runtime — kept in lockstep."""
     for name, value in named.items():
@@ -120,6 +242,10 @@ class CubeSandboxRuntime:
             self._client = self._make_client(url)
         # Lazy — keeps tests that bypass __init__ from constructing a client.
         self._skill_cache: SkillCache | None = None
+        # VM-reachable host used for this machine's published gateways. The
+        # attribute name is retained for compatibility and may hold a private
+        # node IP. Resolved once, then reused for allowOut + URL rewrites.
+        self._public_host: str = _detect_public_host(settings)
 
     def _get_skill_cache(self) -> SkillCache:
         if self._skill_cache is None:
@@ -146,9 +272,12 @@ class CubeSandboxRuntime:
         """
         mode = self._settings.cube_tls_mode
         timeout = httpx.Timeout(connect=2.0, read=10.0, write=10.0, pool=2.0)
+        # CubeSandbox's E2B-compatible API authenticates every request with the
+        # ``X-API-Key`` header (imprinted from a live SDK capture).
+        headers = {"X-API-Key": self._settings.cube_api_key}
 
         if mode == "off":
-            return httpx.Client(base_url=base_url, timeout=timeout)
+            return httpx.Client(base_url=base_url, timeout=timeout, headers=headers)
 
         ca = self._settings.cube_ca_cert
         if not ca:
@@ -158,7 +287,9 @@ class CubeSandboxRuntime:
             )
 
         if mode == "tls":
-            return httpx.Client(base_url=base_url, timeout=timeout, verify=ca)
+            return httpx.Client(
+                base_url=base_url, timeout=timeout, verify=ca, headers=headers
+            )
 
         # mode == "mtls"
         cert = self._settings.cube_client_cert
@@ -174,6 +305,7 @@ class CubeSandboxRuntime:
             timeout=timeout,
             verify=ca,
             cert=(cert, key),
+            headers=headers,
         )
 
     # ------------------------------------------------------------------ guard
@@ -197,6 +329,7 @@ class CubeSandboxRuntime:
         user_id: str,
         foundation_token: str,
         skills: list[str] | None = None,
+        mcp_server_ids: list[str] | None = None,
         files: list[dict] | None = None,
         memory: str | None = None,
         memory_limit: str | None = None,
@@ -209,6 +342,7 @@ class CubeSandboxRuntime:
         sampling_params: dict[str, Any] | None = None,
         hitl: bool = True,
         resume: dict[str, Any] | None = None,
+        user_clearance: str = "",
     ) -> str:
         _check_ids(
             run_id=run_id, session_id=session_id,
@@ -257,8 +391,9 @@ class CubeSandboxRuntime:
                 "broker egress mode requires a CubeVS allow_out CIDR list but "
                 "SCHEDULER_CUBE_SANDBOX_ALLOW_OUT is empty; an empty allowlist "
                 "with allow_internet_access=false air-gaps the sandbox from the "
-                "tool-broker. Set it to the tool-broker + cluster-DNS "
-                "ClusterIP/32s (see deploy/cube/README.md).",
+                "tool-broker. Set it to the reachable node IP/32 or the "
+                "tool-broker + cluster-DNS ClusterIP/32s (see "
+                "deploy/cube/README.md).",
             )
         try:
             service_env = egress_policy.service_env(
@@ -272,16 +407,17 @@ class CubeSandboxRuntime:
                 user_id=user_id,
                 run_id=run_id,
                 ttl_seconds=self._settings.sandbox_timeout,
+                clearance=user_clearance,
             )
         except ValueError as exc:
             raise SandboxSpawnError(str(exc)) from exc
 
-        # The task payload is piped through ``env.AGENT_TASK_JSON``
-        # instead of a workspace file because CubeSandbox sandboxes are
-        # microVMs without a shared workspace bind by default; the
-        # ``runtime_worker`` checks env first, then the file path used
-        # by the docker runtime.  See
-        # ``agentscope_ext.runtime_worker.__main__`` for the contract.
+        # The worker receives the task through ``env.AGENT_TASK_JSON`` when it
+        # is launched via envd below. Do NOT also put this value in Cube's
+        # create-time ``envVars``: Cube v0.6 caps an individual create-time env
+        # value at roughly 4 KiB, while legitimate user prompts can be larger.
+        # Create only boots envd; the worker does not start until
+        # ``_exec_start_worker`` passes the complete env to ``subprocess.Popen``.
         #
         # Skill blobs DO get bind-mounted from the scheduler host into
         # the VM via ``metadata.host-mount`` (Cube convention; see
@@ -304,25 +440,73 @@ class CubeSandboxRuntime:
             "hitl": bool(hitl),
             "resume": resume,
         }
+        # Per-run MCP selection, presence-carried exactly as in the docker
+        # runtime: key absent = tenant default set, [] = disable all, list =
+        # only those ids.  ``is not None`` guard, never truthiness.
+        if mcp_server_ids is not None:
+            task_json["mcp_server_ids"] = [str(s) for s in mcp_server_ids]
+        # Cube-specific URL rewrite: container names are unresolvable inside the
+        # microVM, so the worker reaches host gateways through the configured
+        # node IP/host. CubeSandbox v0.6 can explicitly allow a private address,
+        # which is preferred when public NAT lacks hairpinning. Take gateway URLs
+        # from ``service_env`` when set (broker mode), else from the raw settings
+        # (none/foundation mode blanks them), then rewrite the host. Only the
+        # two URLs the worker dials directly for LLM calls are rewritten:
+        #   * TOOL_BROKER_URL  (façade for LLM/MCP/state/s3/etc. in broker mode)
+        #   * LLM_GATEWAY_URL  (the worker's OpenAI-compatible base)
+        # All other service_env URLs (MCP/SKILL/WEBFETCH/DLP) are passed through
+        # unchanged: in broker mode they nest under the rewritten TOOL_BROKER_URL
+        # host already; in none mode they are blank by design.
+        raw_llm_gateway = (
+            service_env["LLM_GATEWAY_URL"]
+            or (llm_gateway_url or self._settings.llm_gateway_url)
+        )
+        raw_tool_broker = (
+            service_env["TOOL_BROKER_URL"] or self._settings.tool_broker_url
+        )
+        public_llm_gateway = _rewrite_to_public(raw_llm_gateway, self._public_host)
+        public_tool_broker = _rewrite_to_public(raw_tool_broker, self._public_host)
+        # Canvas v2 (Phase B): append ``canvas_tool`` to RUNTIME_EXTENSIONS when
+        # the per-run ``enable_canvas_tool`` flag is on (failure-open — flag off
+        # leaves the base extensions unchanged).
+        runtime_extensions = runtime_extensions_for_run(
+            base_extensions=self._settings.runtime_extensions,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            flag_url=self._settings.feature_flag_url,
+            timeout_ms=self._settings.feature_flag_timeout_ms,
+        )
         env = {
             "LLM_API_KEY": sandbox_llm_api_key,
             "LLM_MODEL": self._settings.llm_model,
             "LLM_PROVIDER": self._settings.llm_provider,
             "LLM_BASE_URL": self._settings.llm_base_url,
-            "LLM_GATEWAY_URL": service_env["LLM_GATEWAY_URL"],
+            "LLM_GATEWAY_URL": public_llm_gateway,
             "FOUNDATION_API_URL": self._settings.foundation_api_url,
             "FOUNDATION_API_TOKEN": foundation_token,
             "FOUNDATION_TENANT_ID": tenant_id,
             "FOUNDATION_USER_ID": user_id,
+            # Effective clearance (min(user, workspace)); mirrors the docker
+            # runtime so knowledge_tool / the broker façade enforce the same
+            # visibility gate under cube.
+            "FOUNDATION_USER_CLEARANCE": user_clearance,
             "OTEL_EXPORTER_OTLP_ENDPOINT": self._settings.otel_exporter_endpoint,
             "SANDBOX_EGRESS_MODE": service_env["SANDBOX_EGRESS_MODE"],
-            "TOOL_BROKER_URL": service_env["TOOL_BROKER_URL"],
+            "TOOL_BROKER_URL": public_tool_broker,
             "MCP_REGISTRY_URL": service_env["MCP_REGISTRY_URL"],
             "SKILL_STORE_URL": service_env["SKILL_STORE_URL"],
             "WEB_FETCH_GATEWAY_URL": service_env["WEB_FETCH_GATEWAY_URL"],
-            "RUNTIME_EXTENSIONS": self._settings.runtime_extensions,
+            "DLP_URL": service_env["DLP_URL"],
+            "RUNTIME_EXTENSIONS": runtime_extensions,
             "FOUNDATION_SERVICE_SCOPES": SANDBOX_SERVICE_SCOPES,
             "RUN_ID": run_id,
+            # The Claude Agent SDK CLI tries to phone home (Statsig / BigQuery 1P
+            # event logging) on a cadence; in the air-gapped cube microVM those
+            # POSTs fail and spew errors. Disable all telemetry so they don't
+            # compete with the model traffic or add noise.
+            "CLAUDE_CODE_ENABLE_TELEMETRY": "0",
+            "DISABLE_TELEMETRY": "1",
+            "DISABLE_ERROR_REPORTING": "1",
             "AGENT_TASK_JSON": json.dumps(task_json, ensure_ascii=False),
             # NB: ``egress_policy.service_env`` is the single source of truth
             # for infra creds.  The Cube microVM path deliberately injects NO
@@ -398,15 +582,19 @@ class CubeSandboxRuntime:
             **egress_metadata,
         }
         # Host-mount entries (Cube convention: a JSON array of
-        # ``{hostPath, mountPath, readOnly}``).  Always includes the per-run
-        # secrets file at the worker's expected path ``/workspace/.secrets.json``
-        # (read-only — the worker reads-then-unlinks it inside the VM's own
-        # writable copy), plus any materialised skills at /home/skills/<name>.
+        # ``{hostPath, mountPath, readOnly}``).  CubeMaster's prepareHostDirVolume
+        # only accepts **directories** as mount sources (a single-file hostPath
+        # fails with error 130545 "not a directory" — verified against the live
+        # cube-api).  So we host-mount the per-run secrets *directory* at
+        # ``/workspace``; the worker then reads ``/workspace/.secrets.json`` from
+        # it.  Plus any materialised skills at /home/skills/<name>.
         host_mounts: list[dict[str, Any]] = [
             {
-                "hostPath": str(secrets_host_path),
-                "mountPath": "/workspace/.secrets.json",
-                "readOnly": True,
+                "hostPath": str(secrets_host_dir),
+                "mountPath": "/workspace",
+                # Writable: the worker reads ``/workspace/.secrets.json`` then
+                # unlinks it, and also writes its result/scratch under /workspace.
+                "readOnly": False,
             }
         ]
         host_mounts.extend(
@@ -432,11 +620,44 @@ class CubeSandboxRuntime:
             flag_url=self._settings.feature_flag_url,
             timeout_ms=self._settings.feature_flag_timeout_ms,
         )
+        # Global config fallback: when the per-run flag is False/unreachable, a
+        # deployment can still route every run to the Claude SDK worker via
+        # ``SCHEDULER_USE_CLAUDE_SDK_WORKER_DEFAULT``.  The flag wins when it
+        # returns True; the default only applies on the False branch.  Committed
+        # default is False, so this is a no-op for existing behaviour.
+        if not use_claude_sdk:
+            use_claude_sdk = self._settings.use_claude_sdk_worker_default
         selected_image = (
             self._settings.claude_sdk_image
             if use_claude_sdk
             else self._settings.agent_image
         )
+        selected_template = selected_image
+        memory_tier = ""
+        if use_claude_sdk and memory_limit:
+            try:
+                memory_tier = (
+                    "large"
+                    if _parse_memory_mb(memory_limit)
+                    >= _parse_memory_mb(
+                        self._settings.sandbox_memory_limit_large
+                    )
+                    else "small"
+                )
+            except ValueError:
+                logger.warning(
+                    "invalid cube memory limit; using the default template",
+                    extra={"run_id": run_id, "memory_limit": memory_limit},
+                )
+            else:
+                tier_template = (
+                    self._settings.cube_claude_sdk_template_large
+                    if memory_tier == "large"
+                    else self._settings.cube_claude_sdk_template_small
+                )
+                if tier_template:
+                    selected_template = tier_template
+                    metadata["agent-platform.memory-tier"] = memory_tier
         selected_cmd = (
             ["node", "/app/dist/main.js"]
             if use_claude_sdk
@@ -448,25 +669,33 @@ class CubeSandboxRuntime:
                 "run_id": run_id,
                 "tenant_id": tenant_id,
                 "image": selected_image,
+                "template": selected_template,
+                "memory_limit": memory_limit,
+                "memory_tier": memory_tier,
                 "claude_sdk": use_claude_sdk,
             },
         )
 
+        # CubeSandbox v0.6.0 E2B-create contract: camelCase ``templateID`` /
+        # ``envVars``, timeout in seconds, and the nested E2B ``lifecycle``
+        # object. Top-level ``autoPause`` is not a create option in v0.6 and is
+        # silently ignored. ``cmd`` and ``resources`` are NOT part of the create
+        # contract — the worker entry (``selected_cmd``) is launched via envd
+        # exec after the sandbox is up (phase-4 wiring), not at create.
+        # ``AGENT_TASK_JSON`` is deliberately launch-only. Keeping it out of
+        # create-time envVars avoids Cube's per-value size limit without
+        # changing the worker contract or truncating user input.
+        create_env = {k: v for k, v in env.items() if k != "AGENT_TASK_JSON"}
         body: dict[str, Any] = {
-            # E2B-compatible fields
-            "template_id": selected_image,
+            "templateID": selected_template,
             "metadata": metadata,
-            "env": env,
-            # AgentScope worker entry — matches the docker runtime's CMD line.
-            # Claude SDK path uses the image's node ENTRYPOINT explicitly.
-            "cmd": selected_cmd,
-            "timeout_seconds": self._settings.sandbox_timeout,
-            "resources": {
-                "memory_mb": _parse_memory_mb(
-                    memory_limit or self._settings.sandbox_memory_limit
-                ),
-                "cpu_shares": self._settings.sandbox_cpu_shares,
+            "envVars": create_env,
+            "timeout": self._settings.sandbox_timeout,
+            "lifecycle": {
+                "onTimeout": "pause",
+                "autoResume": True,
             },
+            "secure": True,
         }
         # ----------------------------------------------------------------- net
         # Per-microVM egress isolation via CubeVS (CubeSandbox's eBPF virtual
@@ -478,15 +707,14 @@ class CubeSandboxRuntime:
         #    Cubelet translates into a CubeVS ``MVMOptions`` struct:
         #      * ``allow_internet_access=False`` (top-level)  -> drop all public
         #        egress (default-deny);
-        #      * ``network={"allow_out": [CIDR, ...]}`` (nested) -> the ONLY
+        #      * ``network={"allowOut": [CIDR, ...]}`` (nested) -> the ONLY
         #        destinations CubeVS forwards.
         #    A CubeSandbox controller that implements CubeVS therefore honours
-        #    this directly — no invented label-only hint.  The ``allow_out``
-        #    CIDRs come from ``cube_sandbox_allow_out`` (operator-provided: the
-        #    tool-broker + cluster-DNS ClusterIP/32s; CubeVS keys on destination
-        #    CIDR, not a label, so the scheduler cannot derive them from
-        #    ``TOOL_BROKER_URL`` and they must be configured — see
-        #    deploy/cube/README.md).  Parsed + fail-closed above.
+        #    this directly — no invented label-only hint. Additional CIDRs come
+        #    from ``cube_sandbox_allow_out`` (operator-provided reachable node,
+        #    tool-broker, or cluster-DNS addresses). CubeVS keys on destination
+        #    CIDR, so the scheduler cannot derive every deployment target from
+        #    ``TOOL_BROKER_URL``. Parsed + fail-closed above.
         #
         # 2. Belt-and-suspenders, also enforced by URL rewriting: in broker mode
         #    ``egress_policy.service_env`` already rewrote every capability URL
@@ -494,41 +722,51 @@ class CubeSandboxRuntime:
         #    tool-broker façade and blanked the direct Redis URL + MinIO keys, so
         #    the worker has no *configured* path to infra even before CubeVS.
         #
-        # 3. The ``agent-platform.network-policy`` label below still matters: it
-        #    drives the host-nftables fallback + any CubeMaster/Cubelet admission
-        #    glue in ``deploy/cube/``.  That fallback is NOT dead weight — CubeVS
-        #    hardwires a drop of RFC-1918 / link-local ranges (10/8, 127/8,
-        #    169.254/16, 172.16/12, 192.168/16) regardless of ``allow_out``, so
-        #    if the broker's ClusterIP falls in one of those ranges the CubeVS
-        #    allowlist alone air-gaps the sandbox and the nftables fallback (no
-        #    such guard) is required.  See deploy/cube/README.md +
-        #    docs/design/b-m2-sandbox-runtime-v1.md.
+        # 3. CubeSandbox v0.6 honours explicitly listed private CIDRs. This is
+        #    important on clouds whose public NAT does not provide hairpinning:
+        #    the private node IP can be both the rewritten gateway host and an
+        #    ``allowOut`` destination. The network-policy label remains useful
+        #    to host-side admission/fallback glue documented in deploy/cube/.
+        # CUBE NETWORK FORM (verified end-to-end against the live cube-api):
+        # the microVM reaches host gateways through ``_public_host`` (a legacy
+        # name that may hold a private node IP), so inject ``{host}/32`` into
+        # CubeVS ``allowOut`` regardless of egress_mode.
+        # ``allow_internet_access=false`` keeps default-deny; ``allowOut`` (NOTE:
+        # camelCase, CIDR form — L7 domain rules break exec, verified) is the
+        # forward allowlist. In broker mode we also forward the operator's
+        # configured CIDRs; in none mode the reachable host is the only entry.
         egress_mode = service_env["SANDBOX_EGRESS_MODE"]
+        allow_out: list[str] = []
+        if self._public_host:
+            allow_out.append(f"{self._public_host}/32")
+        else:
+            logger.warning(
+                "cube spawn without a reachable host: the microVM will have no "
+                "egress path to the host gateways (set SCHEDULER_CUBE_PUBLIC_HOST)",
+                extra={"run_id": run_id},
+            )
         if egress_mode == "broker":
             metadata["agent-platform.network-policy"] = "sandbox-broker-only"
-            # CubeVS: default-deny public egress, forward only the operator's
-            # allowlist (tool-broker + DNS).  ``allow_out_cidrs`` is guaranteed
-            # non-empty here by the fail-closed guard above.
-            body["allow_internet_access"] = False
-            body["network"] = {"allow_out": allow_out_cidrs}
+            # Also forward the operator's node/broker/DNS allowlist.
+            allow_out.extend(c for c in allow_out_cidrs if c not in allow_out)
         elif egress_mode == "none":
             metadata["agent-platform.network-policy"] = "deny-all"
-            # Total air-gap is the intended semantics of ``none`` mode: deny
-            # internet AND forward nothing.  Empty allow_out is correct here, so
-            # we do NOT fail closed.
-            body["allow_internet_access"] = False
-            body["network"] = {"allow_out": []}
+        else:  # foundation
+            metadata["agent-platform.network-policy"] = "foundation"
+        body["allow_internet_access"] = False
+        body["network"] = {"allowOut": allow_out}
         try:
             resp = client.post("/sandboxes", json=body)
         except httpx.HTTPError as exc:
             raise SandboxSpawnError(f"CubeSandbox unreachable: {exc}") from exc
         if resp.status_code >= 400:
             raise SandboxSpawnError(
-                f"CubeSandbox refused spawn (HTTP {resp.status_code})",
+                f"CubeSandbox refused spawn (HTTP {resp.status_code}): "
+                f"{resp.text[:500]}",
             )
-        sandbox_id: str = str(resp.json().get("sandbox_id") or "")
+        sandbox_id: str = str(resp.json().get("sandboxID") or "")
         if not sandbox_id:
-            raise SandboxSpawnError("CubeSandbox returned no sandbox_id")
+            raise SandboxSpawnError("CubeSandbox returned no sandboxID")
         logger.info(
             "cube sandbox spawned",
             extra={
@@ -537,34 +775,267 @@ class CubeSandboxRuntime:
                 "tenant_id": tenant_id,
             },
         )
+        # Phase 7: launch the worker inside the now-running microVM via the envd
+        # ``/execute`` endpoint. Create only boots the VM (envd) — it does NOT
+        # run ``selected_cmd``. We POST a tiny Python bootstrap that
+        # ``subprocess.Popen``-spawns the worker DETACHED (non-blocking) so the
+        # exec returns immediately while the worker streams for tens of seconds
+        # in the background. env is passed explicitly to Popen (carries
+        # AGENT_TASK_JSON + gateway URLs); secrets arrive via the host-mounted
+        # /workspace/.secrets.json the worker reads itself.
+        self._exec_start_worker(sandbox_id, selected_cmd, env, run_id=run_id)
         return sandbox_id
 
-    # --------------------------------------------------------------- inspect
-    def get_run_status(self, container_id: str) -> dict[str, Any]:
-        client = self._require_client()
+    # --------------------------------------------------------------- exec start
+    def _exec_start_worker(
+        self,
+        sandbox_id: str,
+        cmd: list[str],
+        env: dict[str, str],
+        *,
+        run_id: str,
+    ) -> None:
+        """Start the worker process inside the microVM via envd ``/execute``.
+
+        The envd HTTP surface is published per-sandbox at
+        ``https://49999-{sandboxID}.cube.app/execute`` (reached from the
+        scheduler container through the cube-proxy on host :443). It runs the
+        Python in ``body.code`` and streams ndjson. We keep that Python trivial:
+        ``subprocess.Popen`` the worker detached and exit, so ``/execute``
+        returns at once and the worker keeps running after the stream closes.
+
+        Failure here is fatal to the run (the VM is up but idle), so we raise
+        ``SandboxSpawnError`` — the caller already created the sandbox, but a
+        run with no worker is worse than a clean spawn failure.
+        """
+        # cwd=/workspace is load-bearing, not cosmetic: /workspace is the only
+        # path host-mounted back to this host, so it is the only place an agent
+        # can write a file we can publish as a run artifact. envd's default cwd
+        # is the image's /home/user, where output files die with the microVM.
+        bootstrap = (
+            "import subprocess, os\n"
+            f"env = dict(os.environ)\n"
+            f"env.update({env!r})\n"
+            "logf = open('/workspace/worker.log', 'wb')\n"
+            f"p = subprocess.Popen({cmd!r}, env=env, cwd='/workspace', "
+            "stdout=logf, stderr=subprocess.STDOUT, "
+            "start_new_session=True)\n"
+            "print('worker_started', p.pid)\n"
+        )
+        exec_url = f"https://49999-{sandbox_id}.cube.app/execute"
+        headers = {"X-API-Key": self._settings.cube_api_key}
         try:
-            resp = client.get(f"/sandboxes/{container_id}")
+            # verify=False: the per-sandbox envd cert is issued by Cube's
+            # internal mkcert CA (not in the scheduler trust store). The exec
+            # surface is reached over the cube-proxy on the host, not the public
+            # internet, so TLS-trust is not the boundary here.
+            with httpx.Client(verify=False, timeout=30.0) as exec_client:  # noqa: S501
+                resp = exec_client.post(
+                    exec_url, json={"code": bootstrap}, headers=headers
+                )
+        except httpx.HTTPError as exc:
+            raise SandboxSpawnError(
+                f"cube envd exec unreachable for {sandbox_id}: {exc}"
+            ) from exc
+        if resp.status_code >= 400:
+            raise SandboxSpawnError(
+                f"cube envd exec refused (HTTP {resp.status_code}) for "
+                f"{sandbox_id}: {resp.text[:500]}",
+            )
+        logger.info(
+            "cube worker exec started",
+            extra={
+                "sandbox_id": sandbox_id,
+                "run_id": run_id,
+                "exec_status": resp.status_code,
+            },
+        )
+
+    # --------------------------------------------------------------- inspect
+    def _resolve_sandbox(self, container_id: str) -> dict[str, Any] | None:
+        """Return the controller's sandbox record, or ``None`` if not found.
+
+        The cube controller's ``GET /sandboxes/{id}`` only matches the *full*
+        32-char sandboxID, but the orchestrator polls with the short 12-char
+        container id (the prefix the scheduler returned as ``sandbox_id``). When
+        the direct GET 404s we fall back to listing all sandboxes and matching by
+        ``sandboxID`` prefix, so both id forms resolve. The list record also
+        carries the ``metadata`` labels (tenant/session/run) we need to locate
+        the host-mounted ``result.json``.
+        """
+        client = self._require_client()
+        resp = client.get(f"/sandboxes/{container_id}")
+        if resp.status_code == 200:
+            return resp.json()  # type: ignore[no-any-return]
+        if resp.status_code != 404:
+            return None
+        # 404 on the direct path: fall back to a prefix match over the list.
+        try:
+            list_resp = client.get("/sandboxes")
+        except httpx.HTTPError:
+            return None
+        if list_resp.status_code != 200:
+            return None
+        for vm in _sandbox_records(list_resp.json()):
+            sid = str(vm.get("sandboxID") or vm.get("sandbox_id") or "")
+            if sid == container_id or sid.startswith(container_id):
+                return vm  # type: ignore[no-any-return]
+        return None
+
+    @staticmethod
+    def _run_ids(sandbox: dict[str, Any]) -> tuple[str, str, str] | None:
+        """Return ``(tenant_id, session_id, run_id)`` from the VM's metadata.
+
+        ``None`` when any of the three is missing — an externally created VM,
+        or one whose metadata the controller no longer carries.
+        """
+        meta = sandbox.get("metadata") or {}
+        tenant_id = meta.get("agent-platform.tenant-id", "")
+        session_id = meta.get("agent-platform.session-id", "")
+        run_id = meta.get("agent-platform.run-id", "")
+        if not (tenant_id and session_id and run_id):
+            return None
+        return tenant_id, session_id, run_id
+
+    def _run_workspace(self, ids: tuple[str, str, str]) -> Path:
+        """Host path of the per-run dir that is host-mounted at ``/workspace``."""
+        tenant_id, session_id, run_id = ids
+        return Path(self._settings.workspace_base) / tenant_id / session_id / run_id
+
+    def _upload_artifacts(self, sandbox: dict[str, Any]) -> list[dict[str, Any]]:
+        """Publish the run's output files from the host side of the mount."""
+        ids = self._run_ids(sandbox)
+        if ids is None:
+            return []
+        tenant_id, session_id, run_id = ids
+        return artifact_store.upload_run_artifacts(
+            workspace=self._run_workspace(ids),
+            tenant_id=tenant_id,
+            session_id=session_id,
+            run_id=run_id,
+            bucket=self._settings.s3_bucket,
+            s3_client=artifact_store.make_s3_client(self._settings),
+        )
+
+    def _read_result_json(self, sandbox: dict[str, Any]) -> dict[str, Any] | None:
+        """Read the worker's ``result.json`` for a run.
+
+        Key fact (verified on the live stack): the cube spawn host-mounts the
+        per-run host dir ``{workspace_base}/{tenant}/{session}/{run}`` into the
+        microVM at ``/workspace``, so the worker's ``/workspace/result.json``
+        lands back on the *scheduler host* at that same path — exactly like the
+        docker runtime's bind mount. We therefore read the host file directly
+        (robust even after the microVM is destroyed) rather than exec-ing into
+        the VM, which would fail precisely when the VM is gone.
+
+        Returns the parsed payload dict, or ``None`` when the file is absent
+        (worker still running, or it crashed before writing) / unreadable /
+        unparseable. Best-effort: never raises.
+        """
+        ids = self._run_ids(sandbox)
+        if ids is None:
+            return None
+        result_path = self._run_workspace(ids) / "result.json"
+        if not result_path.is_file():
+            return None
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            logger.info(
+                "cube result.json present but unreadable/unparseable; ignoring",
+                extra={"run_id": ids[2]},
+            )
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def get_run_status(self, container_id: str) -> dict[str, Any]:
+        try:
+            sandbox = self._resolve_sandbox(container_id)
         except httpx.HTTPError as exc:
             raise ContainerNotFoundError(container_id) from exc
-        if resp.status_code == 404:
+        if sandbox is None:
+            # Controller has no record of the VM (reaped). We cannot map the
+            # sandbox id back to a run_id without the controller metadata, so we
+            # cannot locate the host result.json here — report NOT_FOUND. The
+            # orchestrator treats this as terminal-ish and stops polling. The VM
+            # must therefore outlive the worker long enough to be polled at least
+            # once after result.json is written (governed by the spawn
+            # ``timeout``); see the note in ``spawn_run``.
             return {"status": "NOT_FOUND", "exit_code": None}
-        data = resp.json()
-        return {
-            "status": _E2B_STATUS_MAP.get(data.get("status", ""), "UNKNOWN"),
+        data = sandbox
+        # The controller reports VM lifecycle under ``state`` (e.g. "running");
+        # older shapes used ``status``. Honour either; result.json (below) is the
+        # authoritative source for the *worker* outcome and overrides this.
+        raw_state = data.get("state") or data.get("status") or ""
+        result: dict[str, Any] = {
+            "status": _E2B_STATUS_MAP.get(raw_state, "RUNNING"),
             "exit_code": data.get("exit_code"),
-            "started_at": data.get("started_at"),
-            "finished_at": data.get("finished_at"),
+            "started_at": data.get("startedAt") or data.get("started_at"),
+            "finished_at": data.get("endAt") or data.get("finished_at"),
+            # Default: no plan_steps / artifacts unless result.json supplies them.
+            "plan_steps": [],
         }
 
+        # Result-collection parity with docker_runtime.get_run_status: read the
+        # worker's result.json (from the host bind-mount; see _read_result_json)
+        # and map its fields onto the dict the orchestrator's
+        # ``_reconcile_run_completion`` expects (result_summary / result_error /
+        # result_status / usage / plan_steps).
+        #
+        # While the worker is mid-run result.json does not exist yet →
+        # ``_read_result_json`` returns None → we leave status RUNNING so the
+        # orchestrator keeps polling.
+        payload = self._read_result_json(data)
+        if payload is not None:
+            worker_status = payload.get("status")
+            result["result_summary"] = payload.get("summary")
+            result["result_error"] = payload.get("error")
+            # Normalise to the orchestrator vocabulary. The worker writes
+            # OK / FAILED / RUNNING / paused (see worker-claude-sdk/src/result.ts).
+            # "paused" is passed through verbatim — the orchestrator keys on the
+            # literal string "paused" for HITL detection. Anything else maps to
+            # COMPLETED/FAILED below.
+            result["result_status"] = worker_status
+            result["usage"] = payload.get("usage")
+            result["plan_steps"] = payload.get("plan_steps") or []
+
+            # Promote run status from the worker's authoritative result.json.
+            # The E2B sandbox status reflects the VM ("running" until killed),
+            # NOT the worker outcome, so result.json is the source of truth for
+            # terminal state — mirroring docker_runtime promoting result.json's
+            # FAILED over the container exit code.
+            if worker_status == "OK":
+                result["status"] = "COMPLETED"
+            elif worker_status == "FAILED":
+                result["status"] = "FAILED"
+            elif worker_status == "paused":
+                # Report COMPLETED so the orchestrator enters its terminal
+                # branch, where ``result_status == "paused"`` flips it to PAUSED
+                # (HITL). Matches the docker path: container exits 0 → COMPLETED,
+                # result.json status=paused → PAUSED.
+                result["status"] = "COMPLETED"
+            # worker_status == "RUNNING" (or anything unexpected): leave the
+            # E2B-derived status untouched so polling continues.
+
+            # Artifacts: the per-run host dir is host-mounted into the VM at
+            # /workspace, so whatever the agent wrote is already on this host —
+            # the same situation the docker runtime uploads from, and readable
+            # even after the microVM is gone. Only publish on a terminal status:
+            # polling calls this repeatedly, and a mid-run upload would ship
+            # half-written files (and re-ship them on every poll).
+            if result["status"] in ("COMPLETED", "FAILED"):
+                result["artifacts"] = self._upload_artifacts(data)
+
+        return result
+
     def get_container_tenant(self, container_id: str) -> str:
-        client = self._require_client()
         try:
-            resp = client.get(f"/sandboxes/{container_id}")
+            sandbox = self._resolve_sandbox(container_id)
         except httpx.HTTPError as exc:
             raise ContainerNotFoundError(container_id) from exc
-        if resp.status_code == 404:
+        if sandbox is None:
             raise ContainerNotFoundError(container_id)
-        tenant = resp.json().get("metadata", {}).get("agent-platform.tenant-id", "")
+        tenant = sandbox.get("metadata", {}).get("agent-platform.tenant-id", "")
         if not tenant:
             raise ContainerNotFoundError(container_id)
         return str(tenant)
@@ -586,6 +1057,87 @@ class CubeSandboxRuntime:
                 extra={"sandbox_id": container_id, "status": resp.status_code},
             )
 
+    # ------------------------------------------------------------------ reap
+    def reap_expired(self, *, max_age_seconds: int) -> int:
+        """Delete agent-platform cube sandboxes older than ``max_age_seconds``.
+
+        CubeSandbox v0.6 normally enforces the spawn-time idle ``timeout`` via
+        cube-lifecycle-manager and pauses the VM. This is a last-resort safety
+        net for controller/CLM failures: a periodic background sweep (see
+        ``main.lifespan``) lists ALL sandboxes across tenants and deletes the
+        ones we spawned whose ``startedAt`` is older than ``max_age_seconds``
+        (set comfortably above the run cap so it never kills a live run).
+
+        Fail-safe by construction:
+
+        * a sandbox with a missing/unparseable ``startedAt`` is SKIPPED (we never
+          delete a VM whose age we can't establish);
+        * a sandbox without an ``agent-platform.*`` metadata marker is SKIPPED
+          (we never touch a foreign VM);
+        * per-sandbox HTTP errors are caught and logged so one failure doesn't
+          abort the whole sweep;
+        * 204 / 404 / 409 on the DELETE are all treated as success (already gone).
+
+        Returns the number of sandboxes deleted.
+        """
+        client = self._require_client()
+        # NO params: list ALL sandboxes across tenants (the leak is host-wide).
+        resp = client.get("/sandboxes")
+        now = datetime.now(UTC)
+        deleted = 0
+        for vm in _sandbox_records(resp.json()):
+            meta = vm.get("metadata") or {}
+            # Only reap VMs WE spawned: require an agent-platform marker.
+            if not (
+                meta.get("agent-platform.run-id")
+                or meta.get("agent-platform.tenant-id")
+            ):
+                continue
+            sandbox_id = str(vm.get("sandboxID") or vm.get("sandbox_id") or "")
+            if not sandbox_id:
+                continue
+            started_raw = vm.get("startedAt") or vm.get("started_at")
+            if not started_raw:
+                continue  # cannot establish age -> fail safe, skip
+            try:
+                # ISO8601 may end in ``Z``; fromisoformat needs +00:00.
+                started = datetime.fromisoformat(
+                    str(started_raw).replace("Z", "+00:00")
+                )
+            except ValueError:
+                continue  # unparseable -> fail safe, skip
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=UTC)
+            age = (now - started).total_seconds()
+            if age <= max_age_seconds:
+                continue
+            try:
+                del_resp = client.delete(f"/sandboxes/{sandbox_id}")
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "cube reaper: delete failed; continuing sweep",
+                    extra={"sandbox_id": sandbox_id, "err": str(exc)},
+                )
+                continue
+            # 204 / 404 / 409 all mean "gone" — count as a successful reap.
+            if del_resp.status_code in (204, 404, 409) or (
+                200 <= del_resp.status_code < 300
+            ):
+                deleted += 1
+                logger.info(
+                    "cube reaper: deleted expired sandbox",
+                    extra={"sandbox_id": sandbox_id, "age_seconds": int(age)},
+                )
+            else:
+                logger.warning(
+                    "cube reaper: delete returned unexpected status; skipping",
+                    extra={
+                        "sandbox_id": sandbox_id,
+                        "status": del_resp.status_code,
+                    },
+                )
+        return deleted
+
     # ------------------------------------------------------------------ list
     def list_containers(self, *, tenant_id: str) -> list[dict[str, Any]]:
         if not tenant_id:
@@ -598,29 +1150,27 @@ class CubeSandboxRuntime:
             params={"metadata.agent-platform.tenant-id": tenant_id},
         )
         items: list[dict[str, Any]] = []
-        for vm in resp.json().get("items", []):
-            meta = vm.get("metadata", {})
+        for vm in _sandbox_records(resp.json()):
+            meta = vm.get("metadata") or {}
             if meta.get("agent-platform.tenant-id") != tenant_id:
                 continue  # belt + braces
             items.append({
-                "container_id": vm.get("sandbox_id", ""),
+                "container_id": vm.get("sandboxID") or vm.get("sandbox_id", ""),
                 "run_id": meta.get("agent-platform.run-id", ""),
                 "session_id": meta.get("agent-platform.session-id", ""),
                 "tenant_id": tenant_id,
-                "status": _E2B_STATUS_MAP.get(vm.get("status", ""), "UNKNOWN"),
-                "image": vm.get("template_id", ""),
-                "created_at": vm.get("created_at", ""),
+                "status": _E2B_STATUS_MAP.get(
+                    vm.get("state") or vm.get("status", ""),
+                    "UNKNOWN",
+                ),
+                "image": vm.get("templateID") or vm.get("template_id", ""),
+                "created_at": vm.get("startedAt") or vm.get("created_at", ""),
             })
         return items
 
 
 def _parse_memory_mb(limit: str) -> int:
-    """Translate ``"2g"`` / ``"512m"`` (docker style) into integer MiB.
-
-    CubeSandbox / E2B expect a raw MiB integer in the ``resources``
-    payload; reuse the docker-style string from Settings rather than
-    introduce a new config knob.
-    """
+    """Translate a Docker-style memory limit into MiB for tier selection."""
     limit = limit.strip().lower()
     if limit.endswith("g"):
         return int(float(limit[:-1]) * 1024)

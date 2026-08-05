@@ -1,4 +1,8 @@
-# syntax=docker/dockerfile:1.7
+# Use BuildKit's bundled Dockerfile frontend (no remote `# syntax=` lookup):
+# a remote frontend image fetch makes otherwise-local rebuilds stall before the
+# first layer on this host (Docker Hub unreachable/flaky). Mirrors the
+# session-orchestrator Dockerfile.overlay stance. The directives used below are
+# all standard and supported by the bundled frontend.
 # BFF is now built on top of agent-platform-dev-session-orchestrator because
 # Docker Desktop on this host corrupts pypi metadata (bm2-bm3 fix-report) and
 # the base already carries all the deps BFF needs (FastAPI + httpx +
@@ -18,8 +22,9 @@ RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl \
  && rm -rf /tmp/wheels
 
 # Install SQLAlchemy + asyncpg + aiosqlite + alembic (not in the base image)
-# 走清华源：同 foundation migration-runner，避开本机 Docker Desktop 损坏 PyPI 元数据的问题
-RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
+# 官方 PyPI：曾因本机 Docker Desktop 损坏 PyPI 元数据改走清华源，该问题已消失；
+# 2026-07 起清华源反而从本机持续 SSL EOF 不可达，切回官方源（CN 云机部署时按需换回镜像源）
+RUN pip install --no-cache-dir \
     "sqlalchemy[asyncio]>=2.0.36,<3" \
     "asyncpg>=0.30.0,<1" \
     "aiosqlite>=0.20.0,<1" \

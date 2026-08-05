@@ -46,7 +46,7 @@ export const EFFORT_OPTIONS: EffortOption[] = [
   { id: 'high', label: 'High' },
 ];
 
-export const DEFAULT_EFFORT: EffortId = '';
+export const DEFAULT_EFFORT: EffortId = 'medium';
 
 export function modelLabel(id: string): string {
   return MODEL_OPTIONS.find((m) => m.id === id)?.label ?? id;

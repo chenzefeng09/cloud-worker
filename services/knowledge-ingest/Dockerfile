@@ -14,7 +14,18 @@ WORKDIR /app
 RUN rm -rf /app/src /app/alembic /app/alembic.ini 2>/dev/null || true
 
 COPY wheels/ /tmp/wheels/
-RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
+RUN pip install --no-cache-dir --no-index --find-links=/tmp/wheels --no-deps \
+      "boto3==1.43.20" \
+      "botocore==1.43.20" \
+      "jmespath==1.1.0" \
+      "numpy==2.2.6" \
+      "pgvector==0.3.6" \
+      "python-dateutil==2.9.0.post0" \
+      "python-multipart==0.0.30" \
+      "s3transfer==0.18.0" \
+      "six==1.17.0" \
+      "urllib3==2.7.0" \
+ && rm -rf /tmp/wheels
 
 COPY src/ ./src/
 COPY alembic/ ./alembic/

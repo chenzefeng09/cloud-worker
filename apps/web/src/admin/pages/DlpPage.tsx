@@ -13,6 +13,7 @@ import { useAdminStore } from '../../stores/adminStore';
 import { formatDateTimeAuto } from '../../i18n/dates';
 import { useToast } from '../components/dialogs';
 import { CustomSelect } from '../components/CustomSelect';
+import { SENSITIVITY_COLORS } from '../../lib/sensitivity';
 import type {
   DlpClassification,
   DlpClassificationRow,
@@ -63,14 +64,6 @@ const DECISION_COLORS: Record<string, string> = {
   QUARANTINE: '#d97706',
   SCAN_REQUIRED: '#0ea5e9',
 };
-const SENSITIVITY_COLORS: Record<string, string> = {
-  L1: '#94a3b8',
-  L2: '#38bdf8',
-  L3: '#0ea5e9',
-  L4: '#d97706',
-  L5: '#dc2626',
-};
-
 const PAGE_LIMIT = 50;
 
 function fmtTime(s?: string | null): string {
@@ -554,7 +547,7 @@ export function DlpPage() {
                     <td className="px-3 py-2">
                       <span
                         className="inline-flex items-center px-1.5 py-0.5 rounded-sm font-mono text-[10.5px] text-white"
-                        style={{ background: SENSITIVITY_COLORS[r.sensitivity] ?? '#64748b' }}
+                        style={{ background: SENSITIVITY_COLORS[r.sensitivity as DlpSensitivity] ?? '#64748b' }}
                       >
                         {r.sensitivity}
                       </span>

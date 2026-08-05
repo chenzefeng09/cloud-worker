@@ -1,3 +1,4 @@
+import type { CanvasBlock, CanvasSelectionSegment } from '../api/types';
 import type { CanvasTextSelection } from './canvasObjects';
 
 function escapeHtml(value: string): string {
@@ -127,6 +128,27 @@ export function markdownToCanvasHtml(markdown: string): string {
   return html.length > 0 ? html.join('') : '<p><br></p>';
 }
 
+function escapeAttribute(value: string): string {
+  return escapeHtml(value).replace(/'/g, '&#39;');
+}
+
+/**
+ * Render server-owned blocks without throwing their stable ids away.  The
+ * wrapper is deliberately part of the editable DOM: selection requests and
+ * manual saves can now address the original block even after other blocks are
+ * inserted or deleted.
+ */
+export function canvasBlocksToHtml(blocks: CanvasBlock[]): string {
+  if (blocks.length === 0) return '<div data-canvas-block-id=""><p><br></p></div>';
+  return blocks
+    .map(
+      (block) =>
+        `<div data-canvas-block-id="${escapeAttribute(block.id)}" data-canvas-block-type="${block.type}">` +
+        `${markdownToCanvasHtml(block.text)}</div>`,
+    )
+    .join('');
+}
+
 function nodeChildrenToMarkdown(node: Node): string {
   return Array.from(node.childNodes).map((child) => nodeToMarkdown(child)).join('');
 }
@@ -161,6 +183,9 @@ function blockToMarkdown(node: ChildNode): string {
   if (!(node instanceof HTMLElement)) return '';
 
   const tag = node.tagName.toLowerCase();
+  if (node.hasAttribute('data-canvas-block-id')) {
+    return canvasHtmlToMarkdown(node);
+  }
   const content = nodeChildrenToMarkdown(node).trim();
   if (!content && tag !== 'hr') return '';
 
@@ -208,6 +233,35 @@ export function canvasHtmlToMarkdown(root: HTMLElement): string {
     .filter(Boolean)
     .join('\n\n')
     .trim();
+}
+
+/** Read a contentEditable canvas back into blocks while preserving DOM ids. */
+export function canvasEditorToBlocks(
+  root: HTMLElement,
+  previousBlocks: CanvasBlock[],
+  makeBlockId: () => string,
+): CanvasBlock[] {
+  const previousById = new Map(previousBlocks.map((block) => [block.id, block]));
+  const used = new Set<string>();
+  const result: CanvasBlock[] = [];
+
+  for (const child of Array.from(root.childNodes)) {
+    const text = child instanceof HTMLElement && child.hasAttribute('data-canvas-block-id')
+      ? canvasHtmlToMarkdown(child)
+      : blockToMarkdown(child);
+    if (!text.trim()) continue;
+
+    const domId = child instanceof HTMLElement ? child.dataset.canvasBlockId : undefined;
+    const id = domId && previousById.has(domId) && !used.has(domId) ? domId : makeBlockId();
+    used.add(id);
+    const previous = previousById.get(id);
+    const type: CanvasBlock['type'] = /^#{1,6}\s/.test(text)
+      ? 'heading'
+      : previous?.type ?? 'paragraph';
+    result.push({ id, type, text });
+  }
+
+  return result;
 }
 
 function markdownToPlainText(markdown: string): string {
@@ -272,4 +326,54 @@ export function getMarkdownSelectionInside(
 
   const start = before.toString().length;
   return findMarkdownSelection(markdown, text, start);
+}
+
+/**
+ * Resolve the browser Range into one exact, block-local segment per touched
+ * server block.  Each segment carries the canonical markdown slice, not just
+ * rendered text, so the BFF can verify it against the current version before
+ * spending a model call.
+ */
+export function getCanvasBlockSelectionsInside(
+  root: HTMLElement,
+  blocks: CanvasBlock[],
+): CanvasSelectionSegment[] {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) return [];
+  const range = selection.getRangeAt(0);
+  if (range.collapsed || !root.contains(range.commonAncestorContainer)) return [];
+
+  const byId = new Map(blocks.map((block) => [block.id, block]));
+  const segments: CanvasSelectionSegment[] = [];
+
+  for (const node of Array.from(root.querySelectorAll<HTMLElement>(':scope > [data-canvas-block-id]'))) {
+    const blockId = node.dataset.canvasBlockId;
+    const block = blockId ? byId.get(blockId) : undefined;
+    if (!block || !range.intersectsNode(node)) continue;
+
+    const intersection = range.cloneRange();
+    if (!node.contains(intersection.startContainer)) {
+      intersection.setStart(node, 0);
+    }
+    if (!node.contains(intersection.endContainer)) {
+      intersection.setEnd(node, node.childNodes.length);
+    }
+    const renderedText = intersection.toString().replace(/\u00a0/g, ' ');
+    if (!renderedText.trim()) continue;
+
+    const before = document.createRange();
+    before.selectNodeContents(node);
+    before.setEnd(intersection.startContainer, intersection.startOffset);
+    const local = findMarkdownSelection(block.text, renderedText, before.toString().length);
+    const canonicalText = block.text.slice(local.start, local.end);
+    if (!canonicalText) continue;
+    segments.push({
+      block_id: block.id,
+      start: local.start,
+      end: local.end,
+      text: canonicalText,
+    });
+  }
+
+  return segments;
 }

@@ -37,8 +37,12 @@ class RegistryService:
         endpoint: str | None,
         command: str | None,
         env: dict[str, str],
-        scopes: list[str],
         enabled: bool,
+        headers: dict[str, str] | None = None,
+        auth: dict[str, str] | None = None,
+        timeout_seconds: int | None = None,
+        tool_filter: dict[str, list[str]] | None = None,
+        args: list[str] | None = None,
     ) -> McpServer:
         server = McpServer(
             tenant_id=self._tenant_id,
@@ -47,8 +51,12 @@ class RegistryService:
             endpoint=endpoint,
             command=command,
             env=env or {},
-            scopes=scopes or [],
             enabled=enabled,
+            headers=headers or {},
+            auth=auth,
+            timeout_seconds=timeout_seconds,
+            tool_filter=tool_filter or {"allow": [], "block": []},
+            args=args or [],
         )
         self._db.add(server)
         try:

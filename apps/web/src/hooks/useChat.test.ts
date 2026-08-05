@@ -8,8 +8,39 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { useChatStore } from '../stores/chatStore';
-import { handleSSEEvent, parseSSEStream, subscribeSessionStream, applyPendingInteractions } from './useChat';
-import type { ToolCallEntry, PendingInteractionItem } from '../api/types';
+import {
+  handleSSEEvent,
+  parseSSEStream,
+  subscribeSessionStream,
+  applyPendingInteractions,
+  recoverSessionCanvasAnchors,
+  shouldWatchdogFire,
+} from './useChat';
+import type { ToolCallEntry, PendingInteractionItem, Message } from '../api/types';
+import { api } from '../api/client';
+import { useCanvasStore } from '../stores/canvasStore';
+
+// Mock the API client so the run_complete reconcile path (fire-and-forget
+// api.messages.list) can be asserted without a real fetch.  Default the mock to
+// an empty page so unrelated run_complete tests don't trip the reconcile's
+// undefined-.items path; tests that assert reconcile behaviour override it.
+vi.mock('../api/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../api/client')>();
+  return {
+    ...actual,
+    api: {
+      ...actual.api,
+      messages: {
+        ...actual.api.messages,
+        list: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
+      },
+      canvas: {
+        ...actual.api.canvas,
+        list: vi.fn().mockResolvedValue({ items: [], next_cursor: null }),
+      },
+    },
+  };
+});
 
 /**
  * Thin wrapper so tests don't need to pass a no-op `onDone` everywhere.
@@ -125,6 +156,32 @@ describe('SSE → store routing', () => {
     const s = useChatStore.getState();
     expect(s.messages['ses_A'][0].content).toBe('a');
     expect(s.messages['ses_B'][0].content).toBe('b');
+  });
+
+  it('applies an automatic session title pushed by the session stream', () => {
+    useChatStore.setState({
+      sessions: [
+        {
+          id: 'ses_A',
+          tenant_id: 'tnt_1',
+          user_id: 'usr_1',
+          title: '新任务',
+          status: 'ACTIVE',
+          current_run_id: null,
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+        },
+      ],
+    });
+
+    dispatchSSE('ses_A', 'session_updated', {
+      session_id: 'ses_A',
+      title: '航天反作用飞轮 FOC 控制验证',
+    });
+
+    expect(useChatStore.getState().sessions[0].title).toBe(
+      '航天反作用飞轮 FOC 控制验证',
+    );
   });
 
   // ─── Token streaming pipeline ─────────────────────────────────────────────
@@ -523,6 +580,17 @@ describe('SSE → store routing', () => {
     );
     warnSpy.mockRestore();
   });
+
+  it('ping is a recognised no-op (does NOT hit the unknown-event warn path)', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    dispatchSSE('ses_A', 'ping', {});
+    dispatchSSE('ses_A', 'ping', { run_id: 'run_1' });
+    // ping is registered, so the unknown-event warn is never reached, and the
+    // handler mutates no store state.
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(useChatStore.getState().messages['ses_A']).toBeUndefined();
+    warnSpy.mockRestore();
+  });
 });
 
 // ─── Singleton SSE-stream manager: one connection per session ────────────────
@@ -796,5 +864,449 @@ describe('applyPendingInteractions (mount rehydration)', () => {
       { run_id: 'run_1', kind: 'confirm', tool_calls: [{ id: 'tc_bash', name: 'Bash', args: '{}' }] },
     ]);
     expect(useChatStore.getState().pendingInteractions['ses_1'] ?? []).toHaveLength(0);
+  });
+});
+
+// ─── run_complete one-shot durable-row reconcile ─────────────────────────────
+//
+// On every run_complete the handler fires a fire-and-forget api.messages.list
+// re-pull and feeds each row back through addMessage (id-dedup + sequence
+// order) — the final backstop for any durable row lost mid-stream.
+describe('run_complete durable-row reconcile', () => {
+  const listMock = api.messages.list as unknown as ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    listMock.mockReset();
+    listMock.mockResolvedValue({ items: [], next_cursor: null });
+    useChatStore.setState({
+      sessions: [],
+      activeSessionId: 'ses_rc',
+      messages: {},
+      streamOffsets: {},
+      closedStreamRuns: {},
+      isStreaming: false,
+      isLoggedIn: true,
+      userProfile: null,
+      bootstrapped: true,
+      pendingInteractions: {},
+      acknowledgedPendingInteractions: {},
+    });
+  });
+
+  const msg = (over: Partial<Message>): Message => ({
+    id: 'x',
+    session_id: 'ses_rc',
+    role: 'ASSISTANT',
+    content: '',
+    tool_calls: null,
+    run_id: 'run_1',
+    sequence: 1,
+    created_at: '2026-01-01',
+    ...over,
+  });
+
+  it('re-pulls messages and backfills a row missing from the stream', async () => {
+    // The stream delivered only the user row; the assistant row was lost.
+    useChatStore.getState().addMessage('ses_rc', msg({
+      id: 'user_1', role: 'USER', content: 'hi', run_id: null, sequence: 1,
+    }));
+    listMock.mockResolvedValue({
+      items: [
+        msg({ id: 'user_1', role: 'USER', content: 'hi', run_id: null, sequence: 1 }),
+        msg({ id: 'assistant_1', role: 'ASSISTANT', content: 'the lost answer', sequence: 2 }),
+      ],
+      next_cursor: null,
+    });
+
+    dispatchSSE('ses_rc', 'run_complete', { run_id: 'run_1' });
+    // Flush the detached async IIFE (fire-and-forget) — one turn for the awaited
+    // promise, plus a microtask drain.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(listMock).toHaveBeenCalledTimes(1);
+    expect(listMock).toHaveBeenCalledWith('ses_rc');
+    const msgs = useChatStore.getState().messages['ses_rc'];
+    expect(msgs.some((m) => m.id === 'assistant_1' && m.content === 'the lost answer')).toBe(true);
+  });
+
+  it('is idempotent — re-pulled rows already present do not duplicate', async () => {
+    useChatStore.getState().addMessage('ses_rc', msg({ id: 'assistant_1', content: 'answer', sequence: 2 }));
+    listMock.mockResolvedValue({
+      items: [msg({ id: 'assistant_1', content: 'answer', sequence: 2 })],
+      next_cursor: null,
+    });
+
+    dispatchSSE('ses_rc', 'run_complete', { run_id: 'run_1' });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    const msgs = useChatStore.getState().messages['ses_rc'];
+    expect(msgs.filter((m) => m.id === 'assistant_1')).toHaveLength(1);
+  });
+
+  it('reconcile failure warns but does not throw', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    listMock.mockRejectedValue(new Error('network down'));
+
+    // Must not throw synchronously (handler is fire-and-forget).
+    expect(() => dispatchSSE('ses_rc', 'run_complete', { run_id: 'run_1' })).not.toThrow();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('[useChat] run_complete reconcile failed'),
+      expect.anything(),
+    );
+    warnSpy.mockRestore();
+  });
+});
+
+// ─── parseSSEStream: handler errors are surfaced, not swallowed ──────────────
+//
+// A throw from inside a handler used to be caught by the same try that guarded
+// JSON.parse, so a real bug looked like a "non-JSON frame" and vanished.  The
+// two try blocks are now split: parse failures stay quiet, handler throws are
+// logged via console.error AND must not abort the read loop.
+describe('parseSSEStream — handler error isolation', () => {
+  it('a throwing handler is logged and the read loop keeps processing later events', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const seen: Array<[string, Record<string, unknown>]> = [];
+
+    await parseSSEStream(
+      readerFromChunks([
+        'event: token\ndata: {"n":1}\n\n',
+        'event: token\ndata: {"n":2}\n\n',
+        'event: token\ndata: {"n":3}\n\n',
+      ]),
+      (event, data) => {
+        // Blow up on the middle event only.
+        if (data.n === 2) throw new Error('handler boom');
+        seen.push([event, data]);
+      },
+    );
+
+    // Events before AND after the throwing one were both processed — one bad
+    // frame did not tear down the stream.
+    expect(seen).toEqual([
+      ['token', { n: 1 }],
+      ['token', { n: 3 }],
+    ]);
+    expect(errSpy).toHaveBeenCalledWith(
+      '[useChat] SSE handler error for',
+      'token',
+      expect.any(Error),
+    );
+    errSpy.mockRestore();
+  });
+
+  it('a non-JSON data frame is still skipped silently (no console.error)', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const seen: Array<[string, Record<string, unknown>]> = [];
+
+    await parseSSEStream(
+      readerFromChunks([
+        'event: token\ndata: not-json-at-all\n\n',
+        'event: token\ndata: {"ok":true}\n\n',
+      ]),
+      (event, data) => seen.push([event, data]),
+    );
+
+    // Bad frame dropped quietly; the good one still dispatched.
+    expect(seen).toEqual([['token', { ok: true }]]);
+    expect(errSpy).not.toHaveBeenCalled();
+    errSpy.mockRestore();
+  });
+});
+
+// ─── Silent-stall watchdog predicate ─────────────────────────────────────────
+//
+// runConnectLoop arms a watchdog only once a `ping` has been seen, then aborts
+// the attempt (forcing a reconnect) if no SSE event arrives for
+// WATCHDOG_STALL_MS.  The decision is extracted into shouldWatchdogFire so it is
+// testable without standing up a fetch/reader.
+describe('shouldWatchdogFire', () => {
+  it('never fires before any ping has been seen (old backend, legit long silence)', () => {
+    const now = 1_000_000;
+    // 36s of silence — legitimate on a pre-heartbeat backend between tool batches.
+    expect(shouldWatchdogFire(false, now - 36_000, now)).toBe(false);
+  });
+
+  it('does not fire when a ping was seen but the gap is under the threshold', () => {
+    const now = 1_000_000;
+    expect(shouldWatchdogFire(true, now - 5_000, now)).toBe(false);
+    // Exactly at the threshold is not "greater than" → still no fire.
+    expect(shouldWatchdogFire(true, now - 30_000, now)).toBe(false);
+  });
+
+  it('fires when a ping was seen and the gap exceeds the threshold', () => {
+    const now = 1_000_000;
+    expect(shouldWatchdogFire(true, now - 30_001, now)).toBe(true);
+    expect(shouldWatchdogFire(true, now - 60_000, now)).toBe(true);
+  });
+});
+
+// ─── canvas.v2 Phase B: canvas_created SSE handler ───────────────────────────
+//
+// The model calls create_canvas → the orchestrator materializes a server
+// canvas, backfills the assistant row's canvas_id, and emits
+// `canvas_created {canvas_id, run_id, message_id?}`.  The handler anchors the
+// canvas to its assistant message (by message_id, or the run's latest assistant
+// message when omitted) and warms the canvas cache with fetchCanvas.  The
+// assistant bubble's content is never touched — the card is additive.
+describe('canvas_created SSE handler', () => {
+  // Stub fetchCanvas via setState (not vi.spyOn, whose typed overload rejects a
+  // store action key) so the handler's cache-warm never hits the network, while
+  // still asserting the call.
+  const fetchCanvasSpy = vi.fn().mockResolvedValue(null);
+  const canvasListMock = api.canvas.list as unknown as ReturnType<typeof vi.fn>;
+  let realFetchCanvas: ReturnType<typeof useCanvasStore.getState>['fetchCanvas'];
+
+  beforeEach(() => {
+    useChatStore.setState({
+      sessions: [],
+      activeSessionId: 'ses_cv',
+      messages: {},
+      streamOffsets: {},
+      closedStreamRuns: {},
+      isStreaming: false,
+      isLoggedIn: true,
+      userProfile: null,
+      bootstrapped: true,
+      pendingInteractions: {},
+      acknowledgedPendingInteractions: {},
+    });
+    fetchCanvasSpy.mockClear();
+    canvasListMock.mockReset();
+    canvasListMock.mockResolvedValue({ items: [], next_cursor: null });
+    realFetchCanvas = useCanvasStore.getState().fetchCanvas;
+    useCanvasStore.setState({ fetchCanvas: fetchCanvasSpy });
+  });
+
+  afterEach(() => {
+    useCanvasStore.setState({ fetchCanvas: realFetchCanvas });
+  });
+
+  const assistantMsg = (over: Partial<Message>): Message => ({
+    id: 'a',
+    session_id: 'ses_cv',
+    role: 'ASSISTANT',
+    content: 'See the draft below.',
+    tool_calls: null,
+    run_id: 'run_1',
+    sequence: 1,
+    created_at: '2026-01-01',
+    ...over,
+  });
+
+  it('anchors the canvas to the assistant message named by message_id', () => {
+    useChatStore.getState().addMessage('ses_cv', assistantMsg({ id: 'msg_a', sequence: 1 }));
+
+    dispatchSSE('ses_cv', 'canvas_created', {
+      canvas_id: 'cvs_1',
+      run_id: 'run_1',
+      message_id: 'msg_a',
+    });
+
+    const msgs = useChatStore.getState().messages['ses_cv'];
+    expect(msgs.find((m) => m.id === 'msg_a')?.canvas_id).toBe('cvs_1');
+    // Cache warmed for the new canvas.
+    expect(fetchCanvasSpy).toHaveBeenCalledWith('cvs_1');
+  });
+
+  it('falls back to the run’s latest assistant message when message_id is absent', () => {
+    // Two assistant text messages for the run; the LAST one is the anchor.
+    useChatStore.getState().addMessage('ses_cv', assistantMsg({ id: 'msg_first', sequence: 1 }));
+    useChatStore.getState().addMessage('ses_cv', assistantMsg({ id: 'msg_last', sequence: 2 }));
+
+    dispatchSSE('ses_cv', 'canvas_created', { canvas_id: 'cvs_2', run_id: 'run_1' });
+
+    const msgs = useChatStore.getState().messages['ses_cv'];
+    expect(msgs.find((m) => m.id === 'msg_first')?.canvas_id).toBeUndefined();
+    expect(msgs.find((m) => m.id === 'msg_last')?.canvas_id).toBe('cvs_2');
+  });
+
+  it('anchors to a streaming text block for the run when no durable row exists yet', () => {
+    // A live streaming text block (sequence 0, streamRunId set) is a valid
+    // live anchor; hydration later reconciles it to the durable row.
+    dispatchSSE('ses_cv', 'token', { run_id: 'run_1', delta: 'writing…' });
+    const streamId = useChatStore.getState().messages['ses_cv'][0].id;
+
+    dispatchSSE('ses_cv', 'canvas_created', { canvas_id: 'cvs_3', run_id: 'run_1' });
+
+    const msgs = useChatStore.getState().messages['ses_cv'];
+    expect(msgs.find((m) => m.id === streamId)?.canvas_id).toBe('cvs_3');
+  });
+
+  it('keeps the canvas when the durable assistant row replaces its streaming block', () => {
+    dispatchSSE('ses_cv', 'token', { run_id: 'run_1', delta: 'writing…' });
+    dispatchSSE('ses_cv', 'canvas_created', {
+      canvas_id: 'cvs_race',
+      run_id: 'run_1',
+    });
+
+    // This is the production race: the DB row lands without canvas_id after
+    // the live event already attached it to the transient streaming block.
+    dispatchSSE('ses_cv', 'message', assistantMsg({
+      id: 'msg_durable',
+      canvas_id: null,
+    }) as unknown as Record<string, unknown>);
+
+    const msgs = useChatStore.getState().messages['ses_cv'];
+    expect(msgs.find((m) => m.id === 'msg_durable')?.canvas_id).toBe('cvs_race');
+    expect(msgs.some((m) => m.id.startsWith('stream_run_1'))).toBe(false);
+  });
+
+  it('recovers an older orphaned canvas from the session canvas list', async () => {
+    useChatStore.getState().addMessage(
+      'ses_cv',
+      assistantMsg({ id: 'msg_orphan', canvas_id: null, run_id: 'run_1' }),
+    );
+    canvasListMock.mockResolvedValue({
+      items: [{
+        id: 'cvs_orphan',
+        session_id: 'ses_cv',
+        kind: 'article',
+        title: 'Recovered',
+        current_version: 1,
+        source_message_id: null,
+        source_run_id: 'run_1',
+        created_at: '2026-01-01',
+        updated_at: '2026-01-01',
+      }],
+      next_cursor: null,
+    });
+
+    await recoverSessionCanvasAnchors('ses_cv');
+
+    const recovered = useChatStore.getState().messages['ses_cv'][0];
+    expect(recovered.canvas_id).toBe('cvs_orphan');
+    expect(fetchCanvasSpy).toHaveBeenCalledWith('cvs_orphan');
+  });
+
+  it('does NOT anchor to a tool or thinking block (only assistant text)', () => {
+    dispatchSSE('ses_cv', 'thinking', { run_id: 'run_1', text: 'planning' });
+    dispatchSSE('ses_cv', 'tool', {
+      run_id: 'run_1', kind: 'call', tool_call_id: 'tc_1', name: 'Read', args: '{}',
+    });
+
+    dispatchSSE('ses_cv', 'canvas_created', { canvas_id: 'cvs_4', run_id: 'run_1' });
+
+    // No assistant text block exists → nothing gets a canvas_id, but the cache
+    // is still warmed so the durable-row hydration path can render it later.
+    const msgs = useChatStore.getState().messages['ses_cv'];
+    expect(msgs.some((m) => m.canvas_id)).toBe(false);
+    expect(fetchCanvasSpy).toHaveBeenCalledWith('cvs_4');
+  });
+
+  it('is a no-op (but does not throw) when canvas_id is missing', () => {
+    useChatStore.getState().addMessage('ses_cv', assistantMsg({ id: 'msg_a', sequence: 1 }));
+    expect(() =>
+      dispatchSSE('ses_cv', 'canvas_created', { run_id: 'run_1', message_id: 'msg_a' }),
+    ).not.toThrow();
+    expect(useChatStore.getState().messages['ses_cv'][0].canvas_id).toBeUndefined();
+    expect(fetchCanvasSpy).not.toHaveBeenCalled();
+  });
+
+  it('never hides or mutates the assistant bubble content (card is additive)', () => {
+    useChatStore.getState().addMessage(
+      'ses_cv',
+      assistantMsg({ id: 'msg_a', content: '给你写了一份初稿。', sequence: 1 }),
+    );
+
+    dispatchSSE('ses_cv', 'canvas_created', {
+      canvas_id: 'cvs_5', run_id: 'run_1', message_id: 'msg_a',
+    });
+
+    const msgs = useChatStore.getState().messages['ses_cv'];
+    // Bubble stays fully present with its original content.
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].content).toBe('给你写了一份初稿。');
+    expect(msgs[0].canvas_id).toBe('cvs_5');
+  });
+
+  it('routes to the snapshotted session, not the active one', () => {
+    useChatStore.getState().addMessage('ses_OTHER', assistantMsg({
+      id: 'msg_o', session_id: 'ses_OTHER', sequence: 1,
+    }));
+
+    dispatchSSE('ses_OTHER', 'canvas_created', {
+      canvas_id: 'cvs_6', run_id: 'run_1', message_id: 'msg_o',
+    });
+
+    expect(
+      useChatStore.getState().messages['ses_OTHER'].find((m) => m.id === 'msg_o')?.canvas_id,
+    ).toBe('cvs_6');
+    // Active session (ses_cv) untouched.
+    expect(useChatStore.getState().messages['ses_cv']).toBeUndefined();
+  });
+});
+
+// ─── Silent-stall watchdog end-to-end (fake timers) ──────────────────────────
+//
+// Drive runConnectLoop (via subscribeSessionStream) with a stream that emits a
+// ping and then goes silent forever.  After the stall window elapses the
+// watchdog must abort THAT attempt's signal and the loop must reconnect (a
+// second fetch), all without the master unsubscribe having been called.
+describe('silent-stall watchdog (integration)', () => {
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const signals: AbortSignal[] = [];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    signals.length = 0;
+  });
+
+  afterEach(() => {
+    vi.runOnlyPendingTimers();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('aborts the stalled attempt after a ping and reconnects', async () => {
+    // First fetch: a body that yields one ping frame then stays open (silent)
+    // forever.  Second fetch onward: park pending so we can count reconnects.
+    let call = 0;
+    fetchMock = vi.fn((_url: string, init: { signal: AbortSignal }) => {
+      signals.push(init.signal);
+      call += 1;
+      if (call === 1) {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('event: ping\ndata: {}\n\n'));
+            // Never close and never enqueue again → the tail is silent.
+          },
+        });
+        return Promise.resolve({ ok: true, body } as unknown as Response);
+      }
+      return new Promise(() => {}); // subsequent attempts park pending
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const unsub = subscribeSessionStream('ses_wd');
+
+    // Let the first fetch resolve and the ping frame be read/parsed.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(signals[0].aborted).toBe(false);
+
+    // Before the stall window elapses the attempt is still live — the watchdog
+    // must NOT fire early.
+    await vi.advanceTimersByTimeAsync(29_000);
+    expect(signals[0].aborted).toBe(false);
+
+    // Advance past the stall window.  The 5s watchdog interval whose tick lands
+    // >30s after the ping aborts the first attempt; reader.cancel() then unblocks
+    // the read loop and the loop reconnects (backoff reset to 1s).
+    await vi.advanceTimersByTimeAsync(8_000); // total ~37s since the ping
+    expect(signals[0].aborted).toBe(true); // stalled attempt aborted
+    await vi.advanceTimersByTimeAsync(1_000); // clear the 1s reconnect backoff
+    expect(fetchMock).toHaveBeenCalledTimes(2); // reconnected
+    // The master controller was never torn down: the second attempt is live.
+    expect(signals[1].aborted).toBe(false);
+
+    unsub();
+    await vi.advanceTimersByTimeAsync(100); // past teardown grace
+    expect(signals[1].aborted).toBe(true); // real teardown aborts the live attempt
   });
 });

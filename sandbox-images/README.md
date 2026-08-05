@@ -17,8 +17,8 @@ agentscope-sandbox-base    ─── always pre-warmed
 agentscope-sandbox-office  ─── + LibreOffice headless (Word/Excel/PPT IO)
        ▲
        │
-agentscope-sandbox-matlab  ─── + MATLAB Runtime + Engine for Python
-                                (requires license server at runtime)
+agentscope-sandbox-matlab  ─── + MATLAB Runtime
+                                (compiled applications only)
 ```
 
 The image the scheduler launches is controlled by the ``SCHEDULER_AGENT_IMAGE``
@@ -43,7 +43,7 @@ env var (per-deployment) and the ``template`` field of the
 |---|---|---|---|
 | ``base``   | NumPy / Pandas / Polars / Requests / Node 20 / Playwright + Chromium | Default agent workload — data wrangling, web scraping, code gen | ~1.6 GiB |
 | ``office`` | LibreOffice headless + ``unoconv`` | Generate / read .docx / .xlsx / .pptx for document agents | ~2.4 GiB |
-| ``matlab`` | MATLAB Runtime + ``matlabengine`` Python binding | Customer demand: numerical scripts; **needs license server at runtime** | ~5 GiB |
+| ``matlab`` | MATLAB Runtime | Runs applications built with MATLAB Compiler; Runtime itself does not check out a MATLAB license | ~5 GiB |
 
 ## How to build
 
@@ -97,6 +97,76 @@ Or just ``make build-claude-sdk-image`` (runs both steps) and
 > CI note: sandbox images are not built in ``.github/workflows`` today (those
 > are per-service lint/test only); images are built manually via the Makefile
 > targets above, matching the AgentScope image workflow.
+
+### Cube-native scientific image
+
+``claude-sdk-cube.Dockerfile`` layers the compiled Claude worker onto Cube's
+native code-interpreter base. It keeps Cube's envd and ``/health`` probe while
+adding NumPy, Pandas, Matplotlib, SciPy, common Office/PDF Python libraries,
+Git, GCC/G++, Make, CMake, Graphviz, and CJK fonts.
+
+```bash
+make build-claude-sdk-cube-image \
+  CLAUDE_SDK_CUBE_IMAGE=127.0.0.1:5000/claude-sdk-cube:0.2-scientific
+```
+
+Cube v0.6 fixes memory on a template, so one image can back multiple resource
+tiers. The development deployment uses the same image digest for
+``claude-sdk-unified-2g`` and ``claude-sdk-unified-4g``. Configure their aliases
+with ``CUBE_CLAUDE_SDK_TEMPLATE_SMALL`` / ``CUBE_CLAUDE_SDK_TEMPLATE_LARGE``.
+Runs default to the small tier, switch automatically for large attachments, or
+can request the large tier explicitly with
+``agent_config.sandbox_memory_tier=large``.
+
+MATLAB is deliberately not installed by this target. MATLAB Runtime can only
+run applications compiled by MATLAB Compiler; arbitrary ``.m`` execution and
+the Python Engine require a full licensed MATLAB installation. Keep either
+variant in a separate private image layer because the installer is multi-GB
+and subject to MathWorks distribution terms.
+
+### Add Control System Toolbox to the Cube MATLAB image
+
+For an existing R2019b image, prepare a minimal installer directory from the
+full ISO and build an incremental layer. The prepared directory is roughly
+hundreds of MB instead of the complete 17 GB ISO. The build script bind-mounts
+that directory into a temporary container and commits only the installed
+toolbox files, never the installer itself.
+
+```bash
+sandbox-images/prepare-matlab-control-media.sh \
+  /path/to/MatlabR2019b_lin64.iso \
+  /tmp/matlab-control-media
+
+make build-claude-sdk-cube-matlab-control-image \
+  MATLAB_ISO_DIR=/tmp/matlab-control-media \
+  CLAUDE_SDK_CUBE_MATLAB_BASE_IMAGE=127.0.0.1:5000/claude-sdk-cube:0.2-matlab-r4 \
+  CLAUDE_SDK_CUBE_MATLAB_CONTROL_IMAGE=127.0.0.1:5000/claude-sdk-cube:0.2-matlab-control-r2
+```
+
+The build script runs a licensed `tf`/`dcgain` smoke test before and after
+committing the image, and explicitly restores Cube's code-interpreter `CMD`.
+Keep the prior Cube templates until the new image and both memory-tier
+templates have passed the same smoke test, so rollback only requires restoring
+the old template aliases.
+
+### Add the core aerospace products
+
+The aerospace media resolver reads MathWorks' R2019b `productdata` metadata and
+extracts only the payloads for Simulink, Aerospace Toolbox, Aerospace Blockset,
+Stateflow, and Simulink Control Design.
+
+```bash
+sandbox-images/prepare-matlab-aerospace-media.sh \
+  /path/to/MatlabR2019b_lin64.iso \
+  /tmp/matlab-aerospace-media
+
+make build-claude-sdk-cube-matlab-aerospace-image \
+  MATLAB_ISO_DIR=/tmp/matlab-aerospace-media
+```
+
+The incremental build validates a headless Simulink model, the Aerospace
+Blockset library, the standard-atmosphere function, Stateflow's API, and
+Simulink Control Design's operating-point API before committing the image.
 
 ## How the scheduler picks an image
 

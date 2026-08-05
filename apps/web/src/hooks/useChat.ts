@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
+import { useCanvasStore } from '../stores/canvasStore';
 import { api, ApiError } from '../api/client';
 import type { Message, MessageAttachment, PendingInteractionItem } from '../api/types';
 
@@ -22,8 +23,13 @@ import type { Message, MessageAttachment, PendingInteractionItem } from '../api/
 //   message        → clearStreamingBlocks (kind-aware) + addMessage
 //   message_created→ addMessage  (backend echo of the user message)
 //   agent_message  → addMessage  (legacy event name — treated same as message)
+//   session_updated→ updateSessionTitle (automatic title / manual rename)
 //   plan           → setPlanSteps
-//   run_complete   → setIsStreaming(false)
+//   canvas_created → setMessageCanvasId (anchor a materialized canvas to its
+//                    assistant message) + warm the canvas cache (fetchCanvas)
+//   run_complete   → setIsStreaming(false) + one-shot messages.list reconcile
+//   ping           → no-op (SSE keepalive heartbeat; see the silent-watchdog
+//                    note on runConnectLoop — presence of pings is what arms it)
 //   done           → onDone()  (5-min server window closed; NOT isStreaming)
 //   error          → addMessage SYSTEM + onDone()
 //   <unknown>      → console.warn (never silently dropped — a silent `message`
@@ -41,6 +47,13 @@ interface SSEContext {
 type SSEHandler = (ctx: SSEContext, data: Record<string, unknown>) => void;
 
 const SSE_HANDLERS: Record<string, SSEHandler> = {
+  session_updated(ctx, data) {
+    const title = data.title;
+    if (title === null || typeof title === 'string') {
+      useChatStore.getState().updateSessionTitle(ctx.sessionId, title);
+    }
+  },
+
   run_started(ctx, data) {
     // C3 — replay idempotency:
     // On every run_started (including a reconnect mid-run), wipe the transient
@@ -138,6 +151,55 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     }
   },
 
+  canvas_created(ctx, data) {
+    // canvas.v2 Phase B: the model called create_canvas and the orchestrator
+    // materialized a server canvas, backfilling the assistant message row's
+    // canvas_id column.  Shape: { canvas_id, run_id, message_id? }.
+    //
+    // This is the LIVE path (the hydration path reads canvas_id straight off
+    // the durable DB row).  Two things happen:
+    //   1. Anchor the canvas to its assistant message so ChatWindow renders the
+    //      card under that bubble.  When message_id is present, anchor exactly
+    //      to it; when the orchestrator omits it, fall back to the LAST
+    //      assistant message for this run (the streamed text block that the
+    //      canvas was created from).  If neither can be resolved we silently
+    //      skip anchoring — the durable DB row still carries canvas_id, so the
+    //      card appears on the next hydration; the assistant bubble is never
+    //      affected either way (content stays visible — the card is additive).
+    //   2. Warm the canvas cache with a fire-and-forget fetchCanvas so the card
+    //      has content the instant it mounts.  Failure is swallowed: the card
+    //      re-fetches for itself, and a fetch error must never break the stream.
+    const store = useChatStore.getState();
+    const canvasId = data.canvas_id as string | undefined;
+    const runId = data.run_id as string | undefined;
+    const messageId = data.message_id as string | undefined;
+    if (!canvasId) return;
+
+    let targetMessageId = messageId;
+    if (!targetMessageId && runId) {
+      // Fallback: newest assistant (text) message for this run.  Prefer a
+      // durable row, but a streaming text block is an acceptable live anchor —
+      // hydration later reconciles it to the durable row (same canvas_id).
+      const msgs = store.messages[ctx.sessionId] || [];
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        const isAssistant = (m.role || '').toUpperCase() === 'ASSISTANT';
+        const belongsToRun = m.run_id === runId || m.streamRunId === runId;
+        const isTextBlock = m.blockKind !== 'tool' && m.blockKind !== 'thinking';
+        if (isAssistant && belongsToRun && isTextBlock) {
+          targetMessageId = m.id;
+          break;
+        }
+      }
+    }
+    if (targetMessageId) {
+      store.setMessageCanvasId(ctx.sessionId, targetMessageId, canvasId);
+    }
+
+    // Warm the canvas cache (fail-open — the card will fetch it itself).
+    void useCanvasStore.getState().fetchCanvas(canvasId).catch(() => {});
+  },
+
   message(ctx, data) {
     // A complete message row from the server.  The orchestrator stores roles
     // lowercase ("assistant"/"user"/"system"/"tool"); compare case-insensitively.
@@ -145,6 +207,23 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     const msg = data as unknown as Message;
     const roleUpper = (msg.role || '').toUpperCase();
     if ((roleUpper === 'ASSISTANT' || roleUpper === 'TOOL' || roleUpper === 'THINKING') && msg.run_id) {
+      // `canvas_created` can arrive while the assistant answer is still a
+      // transient streaming block.  Preserve that live association when the
+      // durable assistant row arrives without canvas_id; otherwise the clear
+      // below deletes the only copy of the association and the canvas flashes
+      // briefly before disappearing.
+      const liveCanvasId = roleUpper === 'ASSISTANT' && !msg.canvas_id
+        ? (store.messages[ctx.sessionId] || [])
+            .slice()
+            .reverse()
+            .find(
+              (m) =>
+                m.streamRunId === msg.run_id &&
+                m.blockKind === 'text' &&
+                Boolean(m.canvas_id),
+            )?.canvas_id
+        : undefined;
+      const durableMessage = liveCanvasId ? { ...msg, canvas_id: liveCanvasId } : msg;
       // Swap the transient streaming block for the durable DB row — but only
       // the block of the SAME kind this row replaces.  Durable rows arrive
       // THINKING-first, then ASSISTANT text; a non-kind-aware clear would wipe
@@ -154,7 +233,7 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
       const kindForRole =
         roleUpper === 'THINKING' ? 'thinking' : roleUpper === 'TOOL' ? 'tool' : 'text';
       store.clearStreamingBlocks(ctx.sessionId, msg.run_id, kindForRole);
-      store.addMessage(ctx.sessionId, msg);
+      store.addMessage(ctx.sessionId, durableMessage);
       // A durable row for this run has landed → the run reached terminal and was
       // hydrated.  Close its streaming channel and drop its offset watermark so
       // any further (replayed) token/tool/thinking events are discarded instead
@@ -240,6 +319,29 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     } else {
       store.clearPendingInteractions(_ctx.sessionId);
     }
+
+    // Final durable-row backstop.  The silent-stall watchdog + replay path
+    // recovers a stream that stopped mid-flight, but a stream can also reach
+    // run_complete having dropped an individual durable row (e.g. a `message`
+    // frame lost to a transient hiccup that did NOT stall the whole tail).  On
+    // every completion we do a fire-and-forget re-pull of the canonical message
+    // list and feed each row back through addMessage — which dedups by id and
+    // inserts in sequence order, so this is fully idempotent and cheap when
+    // nothing is missing.  This is the LAST line of defence for lost durable
+    // rows; it never blocks the handler (must stay synchronous), so we run it
+    // inside a detached async IIFE.
+    const sessionId = _ctx.sessionId;
+    void (async () => {
+      try {
+        const page = await api.messages.list(sessionId);
+        const s = useChatStore.getState();
+        for (const m of page.items) {
+          s.addMessage(sessionId, m);
+        }
+      } catch (err) {
+        console.warn('[useChat] run_complete reconcile failed', err);
+      }
+    })();
   },
 
   run_stream_end(ctx, data) {
@@ -270,6 +372,17 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     // stream) is the source of truth — leave the card and let the user act.
   },
 
+  ping(_ctx, _data) {
+    // SSE keepalive heartbeat.  The orchestrator emits `event: ping` roughly
+    // once a second while it is otherwise idle (poll spin between runs, or an
+    // active tail that is momentarily quiet between tool batches).  It carries
+    // no application state — its ONLY purpose is liveness.  We intentionally do
+    // nothing here so it does not fall into the unknown-event console.warn path;
+    // the value is extracted in runConnectLoop, which treats every parsed event
+    // (ping included) as proof the connection is alive and arms the silent-
+    // stall watchdog once the first ping has been seen.
+  },
+
   done(_ctx, _data) {
     // The server closes the SSE window after ~5 min and emits `done`.  This
     // is NOT a run-completion signal; a run_complete will have preceded it if
@@ -292,6 +405,60 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     ctx.onDone();
   },
 };
+
+/**
+ * Restore canvases whose document row survived but whose message.canvas_id
+ * backfill lost a materialization race.  This makes older affected sessions
+ * self-heal on the next hydration while the server-side retry prevents new
+ * orphaned associations.
+ */
+export async function recoverSessionCanvasAnchors(sessionId: string): Promise<void> {
+  const page = await api.canvas.list(sessionId);
+  if (page.items.length === 0) return;
+
+  const store = useChatStore.getState();
+  const messages = store.messages[sessionId] || [];
+  const claimedMessageIds = new Set(
+    messages.filter((m) => Boolean(m.canvas_id)).map((m) => m.id),
+  );
+
+  for (const canvas of page.items) {
+    const alreadyAnchored = messages.some((m) => m.canvas_id === canvas.id);
+    if (!alreadyAnchored) {
+      let target = canvas.source_message_id
+        ? messages.find(
+            (m) =>
+              m.id === canvas.source_message_id &&
+              (m.role || '').toUpperCase() === 'ASSISTANT',
+          )
+        : undefined;
+
+      if (!target && canvas.source_run_id) {
+        target = messages
+          .slice()
+          .reverse()
+          .find(
+            (m) =>
+              m.run_id === canvas.source_run_id &&
+              (m.role || '').toUpperCase() === 'ASSISTANT' &&
+              !m.canvas_id &&
+              !claimedMessageIds.has(m.id),
+          );
+      }
+
+      if (target && !claimedMessageIds.has(target.id)) {
+        store.setMessageCanvasId(sessionId, target.id, canvas.id);
+        claimedMessageIds.add(target.id);
+      }
+    }
+
+    // List items are summaries without blocks; warm the full document cache so
+    // CanvasMessageCard can render immediately after the recovered anchor lands.
+    if (!useCanvasStore.getState().canvasesById[canvas.id]) {
+      void useCanvasStore.getState().fetchCanvas(canvas.id).catch(() => {});
+    }
+  }
+}
 
 /**
  * Dispatch a single SSE event through the handler registry.
@@ -351,11 +518,26 @@ export async function parseSSEStream(
     }
     const rawData = dataLines.join('\n');
     const type = eventType || 'message';
+    // Two SEPARATE try/catch blocks on purpose.  Parsing and dispatching used to
+    // share one try, so a throw from inside a handler (onEvent) was swallowed by
+    // the "non-JSON frame" catch — a real handler bug would vanish silently and,
+    // worse, could look like a malformed frame.  Split them: a JSON.parse failure
+    // is an expected non-JSON data frame (skip quietly, SSE allows arbitrary
+    // data); a handler throw is a bug we must surface, but it must NOT abort the
+    // read loop — one bad frame can't be allowed to tear down the whole stream.
+    let data: Record<string, unknown>;
     try {
-      const data = JSON.parse(rawData);
-      onEvent(type, data);
+      data = JSON.parse(rawData);
     } catch {
       // Non-JSON data — skip silently (SSE allows arbitrary data frames).
+      eventType = '';
+      dataLines = [];
+      return;
+    }
+    try {
+      onEvent(type, data);
+    } catch (err) {
+      console.error('[useChat] SSE handler error for', type, err);
     }
     eventType = '';
     dataLines = [];
@@ -489,22 +671,103 @@ export function subscribeSessionStream(sid: string): () => void {
   };
 }
 
+// ── Silent-stall watchdog ─────────────────────────────────────────────────────
+//
+// The bug this guards against: the backend session SSE stream can go silent
+// mid-flight — the orchestrator's event loop starves after emitting a few
+// tokens, so the worker has finished and Redis holds the full transcript, but
+// the socket sends no further bytes AND never closes.  runConnectLoop's reader
+// only reconnects when the read loop RETURNS (EOF) or THROWS; "connected but
+// forever byteless" is invisible to it, so the UI hangs (a lone THOUGHT, no
+// answer) until a manual refresh.
+//
+// The fix, in the same "consumer-side idempotent convergence" spirit as C2/C3:
+// the backend now emits an `event: ping` heartbeat roughly once a second while
+// otherwise idle.  We time the gap between parsed SSE events (pings included)
+// and, if it exceeds the threshold, abort THIS connection attempt so the outer
+// loop reconnects.  On reconnect the server replays from the head (synthetic
+// run_complete + full message replay + a run_started that resets the offset
+// watermark), and the existing idempotency (offset watermark, closedStreamRuns,
+// addMessage id-dedup) makes the replay converge with zero extra state.
+//
+// Why only AFTER the first ping (`sawPing`):
+//   Older backends that predate the heartbeat never send pings, and on those a
+//   legitimately busy run can sit silent for 30s+ between tool batches while the
+//   model thinks.  Arming the watchdog there would kill healthy connections.
+//   Requiring at least one ping first means we only ever fire against a backend
+//   that has PROMISED ~1Hz liveness — so a long gap genuinely means "stalled",
+//   not "thinking".
+//
+// Why 30s:
+//   Comfortably above the ~1s ping cadence (so ordinary jitter, GC pauses, or a
+//   brief network hiccup never trip it) yet short enough that a real stall is
+//   recovered in well under the old "refresh the page" timescale.
+const WATCHDOG_STALL_MS = 30_000;
+const WATCHDOG_CHECK_MS = 5_000;
+
+/**
+ * Pure predicate for the silent-stall watchdog: should the current connection
+ * attempt be aborted?  Extracted so the decision is unit-testable without
+ * standing up a fetch/reader.
+ *
+ *   sawPing     — has THIS connection received at least one `ping` event?
+ *   lastEventAt — Date.now() of the most recent parsed SSE event (any type).
+ *   now         — current time.
+ *
+ * Only fires once a ping has been seen (see the sawPing rationale above) and the
+ * gap since the last event exceeds WATCHDOG_STALL_MS.
+ */
+export function shouldWatchdogFire(
+  sawPing: boolean,
+  lastEventAt: number,
+  now: number,
+): boolean {
+  return sawPing && now - lastEventAt > WATCHDOG_STALL_MS;
+}
+
 /** The reconnecting fetch loop for one session's SSE stream. */
 async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> {
-  const { controller } = handle;
+  const { controller: master } = handle;
   let backoffMs = 1000;
 
   while (!handle.cancelled) {
     const connectStart = Date.now();
+
+    // Per-attempt controller.  The master controller (handle.controller) is the
+    // real unsubscribe/teardown signal; each connection attempt gets its OWN
+    // controller so the watchdog can abort just this attempt (triggering a
+    // reconnect) without touching the master.  We bridge master → attempt so a
+    // genuine teardown still kills the in-flight fetch.
+    const attempt = new AbortController();
+    const onMasterAbort = () => attempt.abort();
+    if (master.signal.aborted) {
+      // Torn down between iterations — bail before opening another fetch.
+      break;
+    }
+    master.signal.addEventListener('abort', onMasterAbort, { once: true });
+
+    // Watchdog state for THIS attempt.  lastEventAt is refreshed by every parsed
+    // event (including ping) via the onEvent callback below; sawPing latches once
+    // the first ping lands and only then does the interval arm the abort.
+    let lastEventAt = Date.now();
+    let sawPing = false;
+    let watchdogFired = false;
+    const watchdogTimer = setInterval(() => {
+      if (shouldWatchdogFire(sawPing, lastEventAt, Date.now())) {
+        watchdogFired = true;
+        attempt.abort();
+      }
+    }, WATCHDOG_CHECK_MS);
+
     try {
       const res = await fetch(`/api/bff/v1/sessions/${sid}/stream`, {
         credentials: 'include',
-        signal: controller.signal,
+        signal: attempt.signal,
       });
 
       if (!res.ok || !res.body) {
         console.warn(`[useChat] session stream ${res.status} for ${sid}; backing off ${backoffMs}ms`);
-        await delay(backoffMs, controller.signal);
+        await delay(backoffMs, attempt.signal);
         backoffMs = Math.min(backoffMs * 2, 8000);
         continue;
       }
@@ -514,24 +777,86 @@ async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> 
       const reader = res.body.getReader();
       let doneFired = false;
 
-      await parseSSEStream(reader, (eventType, data) => {
-        if (eventType === 'done') doneFired = true;
-        handleSSEEvent(sid, eventType, data, () => {
-          doneFired = true;
+      // Explicitly cancel the reader when the attempt aborts.  Aborting the
+      // fetch signal errors the body stream in a live browser, but we do NOT
+      // rely on that propagation: a watchdog abort must reject the parked
+      // reader.read() promptly (and this also makes the path testable with a
+      // hand-rolled response body).  reader.cancel() rejects the pending read,
+      // surfacing as an AbortError-shaped rejection routed to the catch below.
+      const onAttemptAbort = () => {
+        reader.cancel().catch(() => {});
+      };
+      if (attempt.signal.aborted) {
+        onAttemptAbort();
+      } else {
+        attempt.signal.addEventListener('abort', onAttemptAbort, { once: true });
+      }
+
+      try {
+        await parseSSEStream(reader, (eventType, data) => {
+          // Every parsed event proves the connection is alive — refresh the
+          // watchdog clock before dispatching (ping included; that's the point).
+          lastEventAt = Date.now();
+          if (eventType === 'ping') sawPing = true;
+          if (eventType === 'done') doneFired = true;
+          handleSSEEvent(sid, eventType, data, () => {
+            doneFired = true;
+          });
         });
-      });
+      } finally {
+        attempt.signal.removeEventListener('abort', onAttemptAbort);
+      }
+
+      // parseSSEStream returned normally.  If the watchdog aborted mid-stream,
+      // reader.cancel() makes the read loop hit EOF (a clean return) rather than
+      // throw — so translate a watchdog abort here into the reconnect path
+      // instead of falling through to the "closed unexpectedly" backoff.
+      if (watchdogFired && !handle.cancelled) {
+        console.warn(
+          `[useChat] session stream for ${sid} silent >${WATCHDOG_STALL_MS}ms after ping; watchdog reconnecting`,
+        );
+        backoffMs = 1000;
+        try {
+          await delay(backoffMs, master.signal);
+          continue;
+        } catch {
+          break; // master aborted during backoff delay
+        }
+      }
 
       if (!handle.cancelled) {
         if (doneFired) {
-          await delay(1000, controller.signal);
+          await delay(1000, attempt.signal);
         } else {
           console.warn(`[useChat] session stream closed unexpectedly for ${sid}; reconnecting in ${backoffMs}ms`);
-          await delay(backoffMs, controller.signal);
+          await delay(backoffMs, attempt.signal);
           backoffMs = Math.min(backoffMs * 2, 8000);
         }
       }
     } catch (e) {
-      if ((e as Error).name === 'AbortError') break;
+      if ((e as Error).name === 'AbortError') {
+        // Distinguish a genuine teardown from a watchdog-forced reconnect.  Only
+        // a real unsubscribe (handle.cancelled) should exit the loop; a watchdog
+        // abort must fall through to the reconnect path.
+        if (handle.cancelled) break;
+        if (watchdogFired) {
+          console.warn(
+            `[useChat] session stream for ${sid} silent >${WATCHDOG_STALL_MS}ms after ping; watchdog reconnecting`,
+          );
+          // Reset backoff to 1s: the server is reachable (it was heartbeating),
+          // this is a stall not an outage, so reconnect promptly.
+          backoffMs = 1000;
+          try {
+            await delay(backoffMs, master.signal);
+          } catch {
+            break; // master aborted during backoff delay
+          }
+          continue;
+        }
+        // AbortError without cancelled/watchdogFired: master aborted mid-fetch
+        // (teardown raced the once-listener) — exit.
+        break;
+      }
       const elapsed = Date.now() - connectStart;
       if (elapsed < 200) {
         backoffMs = Math.min(backoffMs * 2, 8000);
@@ -539,11 +864,16 @@ async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> 
       if (!handle.cancelled) {
         console.warn(`[useChat] session stream error for ${sid}; reconnecting in ${backoffMs}ms`, e);
         try {
-          await delay(backoffMs, controller.signal);
+          await delay(backoffMs, master.signal);
         } catch {
           break; // aborted during backoff delay
         }
       }
+    } finally {
+      // Always tear down this attempt's watchdog + master bridge so neither
+      // leaks across reconnects.
+      clearInterval(watchdogTimer);
+      master.signal.removeEventListener('abort', onMasterAbort);
     }
   }
 }
@@ -587,6 +917,55 @@ export function applyPendingInteractions(
   }
 }
 
+/**
+ * Build the POST /chat body from the per-session composer selections held in
+ * the chat store. Exported (and pure apart from the store read) so the
+ * three-state contract below can be locked down by tests.
+ *
+ * The two optional-key spreads are NOT truthiness checks, on purpose:
+ *   - key ABSENT (store value `undefined`) → this session never expressed a
+ *     choice; the backend injects the user's / tenant's enabled-by-default set.
+ *   - explicit `[]`                        → disable all of them for this
+ *     session.
+ *   - non-empty list                       → exactly these.
+ * `skills` and `mcp_server_ids` share this contract; collapsing `undefined`
+ * into `[]` (or vice versa) silently changes what the agent can reach.
+ */
+export function buildChatRequestBody(
+  sessionId: string,
+  opts: { text: string; attachmentIds?: string[]; workspaceFileIds?: string[] },
+): Record<string, unknown> {
+  const state = useChatStore.getState();
+  const skills = state.selectedSkills[sessionId];
+  const mcpServerIds = state.selectedMcpServerIds[sessionId];
+  // Platform-global default skills are on by default; only a per-session opt-out
+  // (stored as `false`) is forwarded, as `include_platform_defaults: false`.
+  const platformDefaultsDisabled = state.platformDefaultsEnabled[sessionId] === false;
+  // Per-session model + reasoning effort, set via the composer dropdowns.
+  const model = state.selectedModel[sessionId] || undefined;
+  const effortSel = state.selectedEffort[sessionId] || '';
+  // Per-session execution mode (chat/inline vs agent/sandbox). Default to
+  // agent mode ('sandbox') so a session the user never toggled behaves exactly
+  // as before. Always sent explicitly so the choice is unambiguous.
+  const executionMode = state.executionMode[sessionId] || 'sandbox';
+
+  return {
+    message: opts.text,
+    attachment_ids: opts.attachmentIds || [],
+    ...(skills !== undefined ? { skills } : {}),
+    ...(mcpServerIds !== undefined ? { mcp_server_ids: mcpServerIds } : {}),
+    ...(platformDefaultsDisabled ? { include_platform_defaults: false } : {}),
+    ...(model ? { model } : {}),
+    ...(effortSel ? { reasoning_effort: effortSel } : {}),
+    execution_mode: executionMode,
+    // Workspace files referenced via "@" in the composer. Only sent when
+    // non-empty; the backend contract field is `workspace_file_ids`.
+    ...(opts.workspaceFileIds && opts.workspaceFileIds.length > 0
+      ? { workspace_file_ids: opts.workspaceFileIds }
+      : {}),
+  };
+}
+
 export function useChat() {
   const { activeSessionId, messages, setIsStreaming, isStreaming } = useChatStore();
   // abortRef is used by cancel() to abort an in-flight POST (rare — the POST is
@@ -617,6 +996,16 @@ export function useChat() {
         // addMessage handles dedup; we add in order so sequence is preserved.
         for (const m of page.items) {
           store.addMessage(sid, m);
+        }
+        // A canvas can be committed before its assistant message exists.  The
+        // normal server backfill now retries, but list + recover also repairs
+        // sessions created before that fix.
+        try {
+          await recoverSessionCanvasAnchors(sid);
+        } catch (err) {
+          if (!(err instanceof ApiError) || err.status !== 401) {
+            console.warn('recover canvas anchors failed', err);
+          }
         }
       } catch (err) {
         if (!(err instanceof ApiError) || err.status !== 401) {
@@ -688,7 +1077,12 @@ export function useChat() {
   // The `res.body.getReader()` SSE loop that was previously here is GONE — the
   // persistent stream effect handles all events.
   const sendMessage = useCallback(
-    async (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => {
+    async (
+      text: string,
+      attachmentIds?: string[],
+      attachmentsMeta?: MessageAttachment[],
+      workspaceFileIds?: string[],
+    ) => {
       if (!activeSessionId || isStreaming) return;
       const sessionId = activeSessionId;
 
@@ -708,23 +1102,12 @@ export function useChat() {
       try {
         abortRef.current = new AbortController();
 
-        // Skills enabled for this session in the context rail; forwarded so the
-        // worker loads exactly these (BFF → orchestrator → task.json["skills"]).
-        const skills = useChatStore.getState().selectedSkills[sessionId] || [];
-        // Per-session model + reasoning effort, set via the composer dropdowns.
-        const model = useChatStore.getState().selectedModel[sessionId] || undefined;
-        const effortSel = useChatStore.getState().selectedEffort[sessionId] || '';
-
         const res = await fetch(`/api/bff/v1/sessions/${sessionId}/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: text,
-            attachment_ids: attachmentIds || [],
-            skills,
-            ...(model ? { model } : {}),
-            ...(effortSel ? { reasoning_effort: effortSel } : {}),
-          }),
+          body: JSON.stringify(
+            buildChatRequestBody(sessionId, { text, attachmentIds, workspaceFileIds }),
+          ),
           credentials: 'include',
           signal: abortRef.current.signal,
         });
@@ -838,7 +1221,7 @@ export function useChat() {
   }, [activeSessionId, pendingRewind]);
 
   return {
-    sendMessage: sendMessage as (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => Promise<void>,
+    sendMessage: sendMessage as (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[], workspaceFileIds?: string[]) => Promise<void>,
     cancel,
     isStreaming,
     messages: activeSessionId ? messages[activeSessionId] || [] : [],

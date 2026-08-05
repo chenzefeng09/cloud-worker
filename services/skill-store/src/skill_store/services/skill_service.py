@@ -16,12 +16,13 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from skill_store.blob.base import BlobStore, make_key
+from skill_store.constants import PLATFORM_TENANT_ID
 from skill_store.domain.models import Skill, SkillVersion, UserInstalledSkill
 from skill_store.errors import (
     SkillNameConflictError,
@@ -30,7 +31,12 @@ from skill_store.errors import (
     VersionConflictError,
     VersionNotFoundError,
 )
-from skill_store.services.skill_package import validate_and_parse
+from skill_store.services.skill_package import (
+    SKILL_MD_FILENAME,
+    ExtractedFile,
+    read_member,
+    validate_and_parse,
+)
 
 # Visibility levels that make a skill visible on the shared shelf (browse list).
 # "private" skills are excluded from the shelf. This filter applies ONLY to the
@@ -46,13 +52,29 @@ class ResolvedSkill:
     """A resolved (skill, version) pair the scheduler should materialise.
 
     ``blob_url`` is a presigned HTTP URL the scheduler fetches once; ``sha256``
-    is the content-address used as the cache key.
+    is the content-address used as the cache key.  ``description`` is copied from
+    the version manifest so callers can index the skill without a second fetch.
     """
 
     name: str
     version: str
     sha256: str
     blob_url: str
+    description: str
+
+
+def _manifest_description(sv: SkillVersion) -> str:
+    """Pull the description out of a version's manifest, empty when absent."""
+    manifest = sv.manifest or {}
+    value = manifest.get("description")
+    return value if isinstance(value, str) else ""
+
+
+def _manifest_skill_md_path(sv: SkillVersion) -> str:
+    """Archive-relative SKILL.md path from the manifest (root layout fallback)."""
+    manifest = sv.manifest or {}
+    value = manifest.get("skill_md_path")
+    return value if isinstance(value, str) and value else SKILL_MD_FILENAME
 
 
 class SkillService:
@@ -67,18 +89,44 @@ class SkillService:
 
     # ----------------------------------------------------------- skills
 
-    async def list_skills(self) -> list[Skill]:
-        """Browse list — skills published to the tenant shelf."""
-        stmt = (
-            select(Skill)
-            .where(
-                Skill.tenant_id == self._tenant_id,
-                Skill.visibility.in_(_SHELF_VISIBILITIES),
-            )
-            .order_by(Skill.name.asc())
+    async def list_skills(self, *, include_platform: bool = False) -> list[Skill]:
+        """Browse list — skills published to the tenant shelf.
+
+        With ``include_platform`` (the user-facing library), the result also
+        includes the platform-global default skills (owned by
+        ``PLATFORM_TENANT_ID`` with ``default_enabled`` true) so the library
+        surfaces the built-in defaults every organization has rather than showing
+        an empty shelf; a tenant's own skill wins over a platform default of the
+        same name.  Without it (the tenant admin skill-management view), the list
+        stays strictly tenant-scoped — platform built-ins are not tenant-managed
+        and must not appear there with a per-tenant delete affordance.
+        """
+        tenant_clause = and_(
+            Skill.tenant_id == self._tenant_id,
+            Skill.visibility.in_(_SHELF_VISIBILITIES),
         )
+        if include_platform:
+            where_clause = or_(
+                tenant_clause,
+                and_(
+                    Skill.tenant_id == PLATFORM_TENANT_ID,
+                    Skill.default_enabled.is_(True),
+                ),
+            )
+        else:
+            where_clause = tenant_clause
+        stmt = select(Skill).where(where_clause).order_by(Skill.name.asc())
         result = await self._db.execute(stmt)
-        return list(result.scalars().all())
+        # Dedupe by name, tenant's own winning over the platform default.
+        by_name: dict[str, Skill] = {}
+        for s in result.scalars().all():
+            existing = by_name.get(s.name)
+            if existing is None or (
+                existing.tenant_id == PLATFORM_TENANT_ID
+                and s.tenant_id != PLATFORM_TENANT_ID
+            ):
+                by_name[s.name] = s
+        return sorted(by_name.values(), key=lambda s: s.name)
 
     async def create_skill(
         self,
@@ -87,6 +135,7 @@ class SkillService:
         description: str | None,
         owner: str | None,
         visibility: str,
+        default_enabled: bool = False,
     ) -> Skill:
         skill = Skill(
             tenant_id=self._tenant_id,
@@ -94,6 +143,7 @@ class SkillService:
             description=description,
             owner=owner,
             visibility=visibility,
+            default_enabled=default_enabled,
         )
         self._db.add(skill)
         try:
@@ -344,12 +394,124 @@ class SkillService:
         * ``pinned_version_id`` NULL    → use the most recently uploaded
           SkillVersion of the skill (by ``uploaded_at`` desc).
 
-        Skill names with no install record are silently omitted — the caller
-        knows which names it asked for and can decide what to do about misses.
+        A requested name the user has NOT installed falls back to a
+        platform-global default skill (owned by ``PLATFORM_TENANT_ID``) with the
+        same name, if one exists — so brand-new tenants with zero install rows
+        still resolve the platform defaults.  The tenant's own install wins on a
+        name collision.
+
+        Skill names with no install record AND no platform default are silently
+        omitted — the caller knows which names it asked for and can decide what
+        to do about misses.
         """
         if not names:
             return []
 
+        resolved: list[ResolvedSkill] = []
+        for skill, sv in await self._resolve_versions(
+            tenant_id, user_id, names,
+        ):
+            # Presign against the blob's OWNING tenant, never the caller —
+            # platform-default blobs live under PLATFORM_TENANT_ID's prefix.
+            key = make_key(skill.tenant_id, sv.skill_id, sv.version)
+            try:
+                blob_url = self._blob.presign_get(key, ttl_seconds=ttl_seconds)
+            except Exception:  # noqa: BLE001 -- fail-open: scheduler will retry
+                logger.warning(
+                    "presign_get failed during resolve_for_runtime",
+                    extra={"skill_id": sv.skill_id, "version": sv.version, "key": key},
+                    exc_info=True,
+                )
+                blob_url = sv.blob_url
+
+            resolved.append(
+                ResolvedSkill(
+                    name=skill.name,
+                    version=sv.version,
+                    sha256=sv.sha256,
+                    blob_url=blob_url,
+                    description=_manifest_description(sv),
+                )
+            )
+        return resolved
+
+    async def resolve_one_version(
+        self, tenant_id: str, user_id: str, name: str,
+    ) -> tuple[Skill, SkillVersion]:
+        """Resolve a single skill name → its concrete ``(Skill, SkillVersion)``.
+
+        Shares the exact version-selection semantics of
+        :meth:`resolve_for_runtime` (the user's install — pinned version else
+        latest upload — with a platform-default fallback) so a given ``name``
+        resolves to the same version across ``/internal/skills/resolve`` and
+        ``/internal/skills/{name}/file``.
+
+        Raises :class:`SkillNotFoundError` when the user has no matching install,
+        there is no platform default with that name, or the resolved skill has no
+        uploaded version yet.
+        """
+        pairs = await self._resolve_versions(tenant_id, user_id, [name])
+        if not pairs:
+            raise SkillNotFoundError(name)
+        return pairs[0]
+
+    async def _resolve_versions(
+        self, tenant_id: str, user_id: str, names: list[str],
+    ) -> list[tuple[Skill, SkillVersion]]:
+        """Resolve each ``name`` to a concrete ``(Skill, SkillVersion)``.
+
+        The user's install in ``tenant_id`` is preferred; any name the user has
+        not installed falls back to a platform-global default skill (owned by
+        ``PLATFORM_TENANT_ID``) of the same name.  The returned ``Skill`` carries
+        its OWN ``tenant_id`` so callers presign the blob under the right prefix.
+        """
+        installed = await self._resolve_installed_versions(tenant_id, user_id, names)
+        resolved_names = {skill.name for skill, _ in installed}
+        missing = [n for n in names if n not in resolved_names]
+        pairs = list(installed)
+        if missing:
+            pairs.extend(await self._resolve_platform_versions(missing))
+        return pairs
+
+    async def _resolve_platform_versions(
+        self, names: list[str],
+    ) -> list[tuple[Skill, SkillVersion]]:
+        """Resolve ``names`` against the platform-global default skills.
+
+        Reads rows owned by ``PLATFORM_TENANT_ID`` (visible to any caller via the
+        broadened ``skills_tenant_select`` RLS policy) and picks each skill's
+        most recently uploaded version.  Platform-owned skills with zero uploaded
+        versions are silently omitted.
+        """
+        if not names:
+            return []
+        stmt = (
+            select(Skill)
+            .where(
+                Skill.tenant_id == PLATFORM_TENANT_ID,
+                Skill.name.in_(names),
+            )
+            .order_by(Skill.name.asc())
+        )
+        result = await self._db.execute(stmt)
+        pairs: list[tuple[Skill, SkillVersion]] = []
+        for skill in result.scalars().all():
+            sv = await self._latest_version(skill.id)
+            if sv is None:
+                continue
+            pairs.append((skill, sv))
+        return pairs
+
+    async def _resolve_installed_versions(
+        self, tenant_id: str, user_id: str, names: list[str],
+    ) -> list[tuple[Skill, SkillVersion]]:
+        """Resolve each installed ``name`` to a concrete (Skill, SkillVersion).
+
+        Version selection per install: ``pinned_version_id`` when set (falling
+        back to latest on a SET NULL race), else the most recently uploaded
+        version.  Names with no install record — or an installed skill with zero
+        uploaded versions — are silently omitted.
+        """
         stmt = (
             select(Skill, UserInstalledSkill)
             .join(UserInstalledSkill, UserInstalledSkill.skill_id == Skill.id)
@@ -363,7 +525,7 @@ class SkillService:
         result = await self._db.execute(stmt)
         installs = list(result.all())
 
-        resolved: list[ResolvedSkill] = []
+        pairs: list[tuple[Skill, SkillVersion]] = []
         for skill, install in installs:
             sv: SkillVersion | None
             if install.pinned_version_id is not None:
@@ -381,27 +543,32 @@ class SkillService:
             if sv is None:
                 # Skill has zero versions yet — nothing to materialise.
                 continue
+            pairs.append((skill, sv))
+        return pairs
 
-            key = make_key(tenant_id, sv.skill_id, sv.version)
-            try:
-                blob_url = self._blob.presign_get(key, ttl_seconds=ttl_seconds)
-            except Exception:  # noqa: BLE001 -- fail-open: scheduler will retry
-                logger.warning(
-                    "presign_get failed during resolve_for_runtime",
-                    extra={"skill_id": sv.skill_id, "version": sv.version, "key": key},
-                    exc_info=True,
-                )
-                blob_url = sv.blob_url
+    async def read_skill_file(
+        self, tenant_id: str, user_id: str, name: str, path: str,
+    ) -> tuple[SkillVersion, ExtractedFile]:
+        """Read a single member from an installed skill's package as UTF-8 text.
 
-            resolved.append(
-                ResolvedSkill(
-                    name=skill.name,
-                    version=sv.version,
-                    sha256=sv.sha256,
-                    blob_url=blob_url,
-                )
-            )
-        return resolved
+        Resolves ``name`` to the same version as ``resolve_for_runtime`` (shared
+        helper), pulls the tarball bytes straight from blob storage (no presigned
+        HTTP round-trip), and extracts the member at ``path`` — resolved relative
+        to the skill root (the directory containing SKILL.md).
+
+        Raises the storage / package errors surfaced by
+        :func:`skill_package.read_member` (path invalid 400, not found 404, too
+        large 413, non-text 415) plus :class:`SkillNotFoundError` (404) when the
+        skill is neither installed nor a platform default / has no version.
+        """
+        skill, sv = await self.resolve_one_version(tenant_id, user_id, name)
+        # Read against the blob's OWNING tenant (platform defaults live under
+        # PLATFORM_TENANT_ID's prefix), never the caller tenant.
+        key = make_key(skill.tenant_id, sv.skill_id, sv.version)
+        tarball = self._blob.get(key)
+        skill_md_path = _manifest_skill_md_path(sv)
+        extracted = read_member(tarball, skill_md_path, path)
+        return sv, extracted
 
     async def _latest_version(self, skill_id: str) -> SkillVersion | None:
         stmt = (
@@ -415,14 +582,59 @@ class SkillService:
     async def list_internal(
         self, tenant_id: str, names: list[str] | None = None,
     ) -> list[tuple[Skill, list[SkillVersion]]]:
+        """List skills (with versions) for the sandbox skills_loader.
+
+        Returns the tenant's own skills UNION the platform-global default skills
+        (rows owned by ``PLATFORM_TENANT_ID`` with ``default_enabled`` true), so
+        the loader sees the platform defaults just like a tenant-owned skill.  On
+        a name collision the tenant's own skill wins (the platform default is
+        dropped).
+        """
         stmt = (
             select(Skill)
-            .where(Skill.tenant_id == tenant_id)
+            .where(
+                or_(
+                    Skill.tenant_id == tenant_id,
+                    and_(
+                        Skill.tenant_id == PLATFORM_TENANT_ID,
+                        Skill.default_enabled.is_(True),
+                    ),
+                )
+            )
             .options(selectinload(Skill.versions))
             .order_by(Skill.name.asc())
         )
         if names:
             stmt = stmt.where(Skill.name.in_(names))
         result = await self._db.execute(stmt)
-        skills = list(result.scalars().all())
-        return [(s, list(s.versions)) for s in skills]
+
+        # Dedupe by name, tenant's own winning over the platform default.
+        by_name: dict[str, Skill] = {}
+        for s in result.scalars().all():
+            existing = by_name.get(s.name)
+            if existing is None or (
+                existing.tenant_id == PLATFORM_TENANT_ID
+                and s.tenant_id != PLATFORM_TENANT_ID
+            ):
+                by_name[s.name] = s
+        ordered = sorted(by_name.values(), key=lambda s: s.name)
+        return [(s, list(s.versions)) for s in ordered]
+
+    async def list_platform_default_names(self) -> list[str]:
+        """Names of the platform-global default skills (default_enabled=true).
+
+        Reads rows owned by ``PLATFORM_TENANT_ID`` regardless of the caller's
+        ``app.tenant_id`` — the broadened ``skills_tenant_select`` RLS policy
+        makes platform rows selectable to every tenant, so any caller gets the
+        same list.  Feeds ``GET /internal/skills/platform-defaults``.
+        """
+        stmt = (
+            select(Skill.name)
+            .where(
+                Skill.tenant_id == PLATFORM_TENANT_ID,
+                Skill.default_enabled.is_(True),
+            )
+            .order_by(Skill.name.asc())
+        )
+        result = await self._db.execute(stmt)
+        return [row[0] for row in result.all()]

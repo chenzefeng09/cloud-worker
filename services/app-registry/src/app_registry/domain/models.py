@@ -52,6 +52,9 @@ class App(Base):
     icon: Mapped[str | None] = mapped_column(String(120), nullable=True)
     author_id: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
     visibility: Mapped[str] = mapped_column(String(20), nullable=False, default="private")
+    # Author-assigned labels for the App Center shelf (filterable via ?tag=).
+    # Stored as JSONB (list[str]); empty array by default.
+    tags: Mapped[list[str]] = mapped_column(_JSONB, nullable=False, default=list)
     # Pointer to the currently-published version (set on approve/publish).
     current_version_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
 

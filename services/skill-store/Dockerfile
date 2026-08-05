@@ -17,6 +17,12 @@ RUN pip install --no-cache-dir --no-deps /tmp/wheels/*.whl && rm -rf /tmp/wheels
 COPY src/ ./src/
 COPY alembic/ ./alembic/
 COPY alembic.ini .
+# Platform-global default skills: the seed script + vendored skill tarballs are
+# baked in so the one-shot ``skill-store-seed`` sidecar (see compose) can seed
+# them into the platform tenant on a fresh ``docker compose up`` — no dependency
+# on the external skills repo at deploy time.
+COPY scripts/ ./scripts/
+COPY seed/ ./seed/
 RUN chown -R app:app /app
 
 ENV SKILL_STORE_ENV=production \

@@ -162,7 +162,7 @@ def _build_openai_gateway_model(
 
         async def _call_api(
             self,
-            model_name_: str,
+            model_name: str,
             messages: list,
             tools: list[dict] | None = None,
             tool_choice: Any | None = None,
@@ -184,7 +184,7 @@ def _build_openai_gateway_model(
             formatted_messages = await self.formatter.format(messages)
 
             kwargs: dict[str, Any] = {
-                "model": model_name_,
+                "model": model_name,
                 "messages": formatted_messages,
                 "stream": self.stream,
             }
@@ -243,10 +243,25 @@ def _build_openai_gateway_model(
                 else "wav"
             )
 
-            if self.stream:
-                return self._parse_stream_response(start_datetime, response, audio_fmt)
+            # agentscope 2.0.4 dropped the ``audio_fmt`` parameter from both
+            # parse helpers (older/newer releases accept it).  Adapt to the
+            # installed signature instead of hard-coding one — the bootstrap
+            # image pins 2.0.4, where the 3-arg call crashes every streaming
+            # run with "takes 3 positional arguments but 4 were given".
+            import inspect as _inspect
 
-            return self._parse_completion_response(start_datetime, response, audio_fmt)
+            def _parse_args(fn: Any) -> tuple:
+                params = _inspect.signature(fn).parameters
+                if "audio_fmt" in params or len(params) >= 3:
+                    return (start_datetime, response, audio_fmt)
+                return (start_datetime, response)
+
+            if self.stream:
+                parse = self._parse_stream_response
+                return parse(*_parse_args(parse))
+
+            parse = self._parse_completion_response
+            return parse(*_parse_args(parse))
 
     return _GatewayOpenAIChatModel(
         credential=credential,

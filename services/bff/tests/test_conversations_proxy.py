@@ -64,6 +64,7 @@ class FakeChatFoundation:
         stream_lines: list[str] | None = None,
         attachment_items: list[dict] | None = None,
         stream_error: bool = False,
+        message_sequence: int | None = None,
     ) -> None:
         self.message_status = message_status
         self.run_status = run_status
@@ -77,22 +78,41 @@ class FakeChatFoundation:
         ]
         self.attachment_items = attachment_items  # None means no attachment endpoint
         self.stream_error = stream_error
+        self.message_sequence = message_sequence
         self.calls: list[tuple[str, str]] = []
+        # Captures the JSON body of the POST /runs call so tests can assert what
+        # the BFF forwarded to the orchestrator (e.g. execution_mode passthrough).
+        self.runs_body: dict | None = None
+        # Captures the headers of the POST /runs call so tests can assert
+        # forwarding of X-User-Clearance (and other foundation_headers output)
+        # onto the orchestrator-bound run-injection call.
+        self.runs_headers: dict | None = None
 
     def route(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         self.calls.append((method, url))
         if "messages" in url and method == "POST":
+            message_body: dict[str, Any] = {
+                "id": "msg_01",
+                "role": "USER",
+                "content": "hi",
+            }
+            if self.message_sequence is not None:
+                message_body["sequence"] = self.message_sequence
             return httpx.Response(
                 self.message_status,
-                json={"id": "msg_01", "role": "USER", "content": "hi"},
+                json=message_body,
             )
         if "attachments" in url and method == "GET":
             items = self.attachment_items or []
             return httpx.Response(200, json={"items": items})
         if "runs" in url and method == "POST":
+            self.runs_body = kwargs.get("json")
+            self.runs_headers = dict(kwargs.get("headers") or {})
             return httpx.Response(
                 self.run_status,
-                json={"id": "run_01", "status": "QUEUED"},
+                json={"id": "run_01", "status": "QUEUED", "execution_mode": (
+                    (kwargs.get("json") or {}).get("execution_mode", "sandbox")
+                )},
             )
         return httpx.Response(200, json={"ok": True})
 
@@ -177,6 +197,33 @@ def test_chat_happy_path_returns_json(
     assert not any("stream" in m for m, _ in methods_urls), "stream was unexpectedly opened"
 
 
+def test_first_message_schedules_automatic_title(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the first persisted message schedules the non-blocking title job."""
+    from agent_bff.api.v1 import conversations
+
+    fake = FakeChatFoundation(message_sequence=1)
+    _patch_async_client(fake, monkeypatch)
+    generate = AsyncMock()
+    monkeypatch.setattr(conversations, "generate_and_update_session_title", generate)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "设计航天反作用飞轮 FOC 控制验证", "model": "deepseek-fast"},
+    )
+
+    assert resp.status_code == 200
+    generate.assert_awaited_once()
+    kwargs = generate.await_args.kwargs
+    assert kwargs["session_id"] == "ses_abc"
+    assert kwargs["message"] == "设计航天反作用飞轮 FOC 控制验证"
+    assert kwargs["model_hint"] == "deepseek-fast"
+
+
 def test_chat_with_attachment_ids(
     client: TestClient,
     authed_cookie: dict[str, str],
@@ -226,6 +273,297 @@ def test_chat_attachment_with_unknown_id(
     body = resp.json()
     # Run should still have started
     assert body["run_id"] == "run_01"
+
+
+# ---------------------------------------------------------------------------
+# Tests: POST /sessions/{id}/chat — execution_mode (chat vs agent mode)
+# ---------------------------------------------------------------------------
+
+def test_chat_execution_mode_defaults_to_sandbox(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No execution_mode in the body → forwarded as 'sandbox' (agent mode)."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello"},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert fake.runs_body.get("execution_mode") == "sandbox"
+
+
+def test_chat_omits_skills_upstream_when_client_omits_them(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absence must survive the BFF so orchestrator can inject defaults."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello"},
+    )
+
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert "skills" not in fake.runs_body
+
+
+@pytest.mark.parametrize("skills", [[], ["pdf", "xlsx"]])
+def test_chat_preserves_explicit_skill_selection(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    skills: list[str],
+) -> None:
+    """An explicit list, including [], overrides automatic defaults."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello", "skills": skills},
+    )
+
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert fake.runs_body["skills"] == skills
+
+
+def test_chat_omits_mcp_server_ids_upstream_when_client_omits_them(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absence must survive the BFF so the tenant's enabled set is used."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello"},
+    )
+
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert "mcp_server_ids" not in fake.runs_body
+
+
+@pytest.mark.parametrize(
+    "mcp_server_ids", [[], ["mcp_a"], ["mcp_a", "mcp_b"]]
+)
+def test_chat_preserves_explicit_mcp_server_selection(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    mcp_server_ids: list[str],
+) -> None:
+    """An explicit list, including [] (= disable all MCP), must be forwarded.
+
+    ``[]`` is the regression this locks: a truthiness check in the BFF would
+    drop the key and silently restore the auto-inject-everything behaviour.
+    """
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello", "mcp_server_ids": mcp_server_ids},
+    )
+
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert fake.runs_body["mcp_server_ids"] == mcp_server_ids
+
+
+def test_chat_execution_mode_inline_passthrough(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """execution_mode='inline' (chat mode) is forwarded to the runs body."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello", "execution_mode": "inline"},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert fake.runs_body.get("execution_mode") == "inline"
+    # The run object echoes it back to the caller.
+    assert resp.json()["run"].get("execution_mode") == "inline"
+
+
+def test_chat_execution_mode_sandbox_passthrough(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """execution_mode='sandbox' (agent mode) is forwarded to the runs body."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello", "execution_mode": "sandbox"},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert fake.runs_body.get("execution_mode") == "sandbox"
+
+
+def test_chat_execution_mode_invalid_returns_422(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An illegal execution_mode value → 422, and no run is started."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello", "execution_mode": "bogus"},
+    )
+    assert resp.status_code == 422
+    # Validation happens before any orchestrator call → no runs POST attempted.
+    assert not any("runs" in u and m == "POST" for m, u in fake.calls)
+
+
+# ---------------------------------------------------------------------------
+# Tests: POST /sessions/{id}/chat — workspace_file_ids (@-referenced files)
+# ---------------------------------------------------------------------------
+
+def test_chat_forwards_workspace_file_ids(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """workspace_file_ids in the body is forwarded verbatim to the runs body."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "看看这个", "workspace_file_ids": ["wsf_1", "wsf_2"]},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert fake.runs_body.get("workspace_file_ids") == ["wsf_1", "wsf_2"]
+
+
+def test_chat_omits_workspace_file_ids_when_absent(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No workspace_file_ids in the body → the key is not added to the runs body."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello"},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_body is not None
+    assert "workspace_file_ids" not in fake.runs_body
+
+
+def test_chat_workspace_file_ids_invalid_type_422(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An illegal workspace_file_ids type (non-array) → 422, no runs POST."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello", "workspace_file_ids": "wsf_1"},
+    )
+    assert resp.status_code == 422
+    # Validation happens before any orchestrator call → no runs POST attempted.
+    assert not any("runs" in u and m == "POST" for m, u in fake.calls)
+
+
+# ---------------------------------------------------------------------------
+# Tests: POST /sessions/{id}/chat - clearance forwarding (X-User-Clearance)
+# ---------------------------------------------------------------------------
+
+def test_chat_forwards_clearance_on_runs_call(
+    client: TestClient,
+    authed_cookie_with_clearance: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller's clearance is forwarded as X-User-Clearance on the /runs POST.
+
+    Regression guard: the ``chat`` signature must carry ``clearance`` through
+    to ``foundation_headers`` so the orchestrator's run-injection
+    (load_workspace_context) honours the caller's level instead of falling
+    back to L2 and skipping L3+ workspaces entirely.
+    """
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie_with_clearance,
+        json={"message": "hello"},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_headers is not None, "expected a POST /runs call"
+    assert fake.runs_headers.get("X-User-Clearance") == "L3", (
+        f"expected X-User-Clearance: L3 forwarded on /runs, got {fake.runs_headers}"
+    )
+
+
+def test_chat_omits_clearance_when_cookie_lacks_claim(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No clearance claim in the cookie -> no X-User-Clearance header.
+
+    Service-token parity: the base ``authed_cookie`` bakes no ``clearance``
+    field, so the ``current_clearance`` contextvar resolves to "" and
+    ``foundation_headers`` omits the header entirely.  Guards against the BFF
+    inventing a default level on the caller's behalf.
+    """
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.post(
+        "/api/bff/v1/sessions/ses_abc/chat",
+        cookies=authed_cookie,
+        json={"message": "hello"},
+    )
+    assert resp.status_code == 200
+    assert fake.runs_headers is not None, "expected a POST /runs call"
+    assert "X-User-Clearance" not in fake.runs_headers, (
+        f"X-User-Clearance must not be sent without a claim, got {fake.runs_headers}"
+    )
 
 
 # ---------------------------------------------------------------------------

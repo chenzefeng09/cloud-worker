@@ -110,6 +110,180 @@ def test_foundation_mode_exposes_direct_mcp_and_skill_urls() -> None:
     assert env["SKILL_STORE_URL"] == settings.skill_store_url
 
 
+def test_dlp_url_present_in_all_three_modes() -> None:
+    """DLP_URL must be distributed in every egress mode.
+
+    Foundation mode exposes the direct foundation-dlp URL; broker mode rewrites
+    it to the tool-broker /dlp façade (whose /core/scan path is allowlisted);
+    none mode blanks it.  The worker POSTs to ``${DLP_URL}/core/scan``, so the
+    base must omit that suffix.
+    """
+    foundation = egress_policy.service_env(
+        _settings(
+            sandbox_egress_mode="foundation",
+            dlp_url="http://foundation-dlp:8013/api/dlp/v1",
+        )
+    )
+    assert foundation["DLP_URL"] == "http://foundation-dlp:8013/api/dlp/v1"
+
+    broker = egress_policy.service_env(
+        _settings(
+            sandbox_egress_mode="broker",
+            tool_broker_url="http://tool-broker:8024/api/tool-broker/v1",
+        )
+    )
+    # Forced through the broker façade (not the direct DLP service), and the
+    # base ends at the route prefix so the worker can append /core/scan.
+    assert broker["DLP_URL"] == (
+        "http://tool-broker:8024/api/tool-broker/v1/dlp/api/dlp/v1"
+    )
+    assert "tool-broker" in broker["DLP_URL"]
+
+    none = egress_policy.service_env(_settings(sandbox_egress_mode="none"))
+    assert none["DLP_URL"] == ""
+
+
+def test_dlp_scan_is_a_granted_broker_lease_scope() -> None:
+    """The per-run broker lease must grant ``dlp.scan`` so the /dlp façade is
+    reachable; the tool-broker route checks for exactly this scope."""
+    assert "dlp.scan" in egress_policy.BROKER_LEASE_SCOPES
+
+
+def test_mcp_tenant_invoke_is_a_granted_broker_lease_scope() -> None:
+    """The per-run broker lease must grant ``mcp.tenant_invoke`` so the
+    /mcp-tenant/v1/{server_id} passthrough route is reachable; the tool-broker
+    route checks for exactly this scope and returns 403 without it."""
+    assert "mcp.tenant_invoke" in egress_policy.BROKER_LEASE_SCOPES
+
+
+def test_knowledge_search_is_a_granted_broker_lease_scope() -> None:
+    """The per-run broker lease must grant ``knowledge.search`` so the
+    /knowledge/v1/search façade is reachable; the tool-broker route checks for
+    exactly this scope and returns 403 without it."""
+    assert "knowledge.search" in egress_policy.BROKER_LEASE_SCOPES
+
+
+def test_knowledge_ingest_url_present_in_all_three_modes() -> None:
+    """KNOWLEDGE_INGEST_URL must be distributed in every egress mode.
+
+    Foundation mode exposes the direct ki URL; broker mode rewrites it to the
+    tool-broker /knowledge/v1 façade (whose /search path is allowlisted); none
+    mode blanks it so the knowledge_tool self-gates off.  The worker GETs
+    ``{KNOWLEDGE_INGEST_URL}/search``, so the base must omit that suffix.
+    """
+    foundation = egress_policy.service_env(
+        _settings(
+            sandbox_egress_mode="foundation",
+            knowledge_ingest_url="http://knowledge-ingest:8012/api/knowledge/v1",
+        )
+    )
+    assert foundation["KNOWLEDGE_INGEST_URL"] == (
+        "http://knowledge-ingest:8012/api/knowledge/v1"
+    )
+
+    broker = egress_policy.service_env(
+        _settings(
+            sandbox_egress_mode="broker",
+            tool_broker_url="http://tool-broker:8024/api/tool-broker/v1",
+            knowledge_ingest_url="http://knowledge-ingest:8012/api/knowledge/v1",
+        )
+    )
+    # Forced through the broker façade (not the direct ki service), base ends at
+    # the route prefix so the worker can append /search.
+    assert broker["KNOWLEDGE_INGEST_URL"] == (
+        "http://tool-broker:8024/api/tool-broker/v1/knowledge/v1"
+    )
+    assert "tool-broker" in broker["KNOWLEDGE_INGEST_URL"]
+
+    none = egress_policy.service_env(_settings(sandbox_egress_mode="none"))
+    assert none["KNOWLEDGE_INGEST_URL"] == ""
+
+
+def test_knowledge_ingest_url_key_shape_consistent_across_modes() -> None:
+    """KNOWLEDGE_INGEST_URL must appear in every mode's service_env dict so a
+    runtime reading ``service_env[...]`` never KeyErrors regardless of mode."""
+    foundation = set(egress_policy.service_env(_settings(sandbox_egress_mode="foundation")))
+    broker = set(
+        egress_policy.service_env(
+            _settings(
+                sandbox_egress_mode="broker",
+                tool_broker_url="http://tool-broker:8024/api/tool-broker/v1",
+            )
+        )
+    )
+    none = set(egress_policy.service_env(_settings(sandbox_egress_mode="none")))
+    assert "KNOWLEDGE_INGEST_URL" in foundation
+    assert "KNOWLEDGE_INGEST_URL" in broker
+    assert "KNOWLEDGE_INGEST_URL" in none
+
+
+def test_mint_lease_embeds_clearance_in_broker_mode() -> None:
+    """The signed broker lease carries the run's effective clearance so the
+    broker can re-inject X-User-Clearance for the ki façade from a trusted
+    source.  The clearance is NOT secret -> it rides in the signed payload."""
+    import base64
+    import json
+
+    settings = _settings(
+        sandbox_egress_mode="broker",
+        tool_broker_url="http://tool-broker:8024/api/tool-broker/v1",
+        tool_broker_lease_secret="a" * 40,
+    )
+    token = egress_policy.mint_tool_broker_lease(
+        settings,
+        tenant_id="tnt_x",
+        user_id="usr_x",
+        run_id="run_x",
+        ttl_seconds=600,
+        clearance="L3",
+    )
+    assert token.startswith("v1.")
+    _, body, _ = token.split(".", 2)
+    padding = "=" * (-len(body) % 4)
+    payload = json.loads(base64.urlsafe_b64decode((body + padding).encode("ascii")))
+    assert payload["clearance"] == "L3"
+    assert "knowledge.search" in payload["scopes"]
+
+
+def test_mint_lease_omits_clearance_when_empty() -> None:
+    """An empty clearance is omitted from the lease payload (graceful: older
+    callers / non-ki runs), and the broker simply does not re-inject it."""
+    import base64
+    import json
+
+    settings = _settings(
+        sandbox_egress_mode="broker",
+        tool_broker_url="http://tool-broker:8024/api/tool-broker/v1",
+        tool_broker_lease_secret="a" * 40,
+    )
+    token = egress_policy.mint_tool_broker_lease(
+        settings,
+        tenant_id="tnt_x",
+        user_id="usr_x",
+        run_id="run_x",
+        ttl_seconds=600,
+        clearance="",
+    )
+    _, body, _ = token.split(".", 2)
+    padding = "=" * (-len(body) % 4)
+    payload = json.loads(base64.urlsafe_b64decode((body + padding).encode("ascii")))
+    assert "clearance" not in payload
+
+
+def test_mint_lease_returns_empty_outside_broker_mode() -> None:
+    """Foundation / none modes do not mint a lease (no broker to validate it)."""
+    settings = _settings(sandbox_egress_mode="foundation")
+    token = egress_policy.mint_tool_broker_lease(
+        settings,
+        tenant_id="tnt_x",
+        user_id="usr_x",
+        run_id="run_x",
+        ttl_seconds=600,
+        clearance="L3",
+    )
+    assert token == ""
+
+
 def test_none_mode_blanks_every_s3_field_and_redis() -> None:
     env = egress_policy.service_env(_settings(sandbox_egress_mode="none"))
     for key in (

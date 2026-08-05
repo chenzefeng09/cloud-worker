@@ -7,41 +7,23 @@ import { useChatStore } from '../stores/chatStore';
 import { useSessions } from '../hooks/useSessions';
 import { sessionStatusZh } from '../lib/format';
 import { FilePreviewPanel } from '../components/FilePreviewPanel';
-import {
-  ArticleCanvasPanel,
-  loadStoredCanvasDraft,
-} from '../components/ArticleCanvasPanel';
-import {
-  applyCanvasReplacement,
-  createCanvasDraft,
-  extractCanvasDeliverable,
-  extractCanvasReplacement,
-  inferCanvasAuthoringIntent,
-  prepareCanvasOpenSeed,
-  sanitizeCanvasDraft,
-  type CanvasDocumentDraft,
-  type CanvasEditRequest,
-  type CanvasEditSuggestion,
-  type CanvasOpenSeed,
-} from '../lib/canvasObjects';
-import { findCanvasCreationReply } from '../lib/canvasCreation';
-import type { MessageAttachment } from '../api/types';
-
-interface PendingCanvasEdit {
-  request: CanvasEditRequest;
-  fromMessageIndex: number;
-}
-
-interface PendingCanvasCreation {
-  documentId: string;
-  fromMessageIndex: number;
-}
+import type { FileContentSource } from '../components/filePreview';
+import { FilePreviewProvider } from '../lib/filePreviewContext';
+import { useWorkspace } from '../lib/workspaceContext';
+import { api } from '../api/client';
+import { LevelBadge } from '../lib/sensitivity';
+import type { MessageAttachment, Workspace, WorkspaceFile } from '../api/types';
 
 /**
  * Single-task agent view. The URL `/tasks/:id` drives `activeSessionId` in the
  * chat store so the existing `ChatWindow` / `useChat` SSE pipeline (B-M1) keeps
  * working unchanged — this page is essentially a Chinese-labelled shell around
  * those primitives plus a thin context rail.
+ *
+ * Canvas is entirely model-triggered (design §7.1): the worker's `create_canvas`
+ * tool materializes a server canvas, the `canvas_created` SSE handler stamps the
+ * assistant message's `canvas_id`, and ChatWindow renders the anchored
+ * CanvasMessageCard off that id. This page has NO manual canvas entry points.
  *
  * Friendly mode: add `?mode=friendly` to the URL.
  */
@@ -55,26 +37,15 @@ export function AgentPage() {
   const { sessions } = useSessions();
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const setActiveSession = useChatStore((s) => s.setActiveSession);
-  const { sendMessage, isStreaming, messages } = useChat();
+  const { sendMessage } = useChat();
 
   const [previewFile, setPreviewFile] = useState<{ id: string; filename: string; mime?: string } | null>(null);
-  const [canvasDraft, setCanvasDraft] = useState<CanvasDocumentDraft | null>(() =>
-    id ? loadStoredCanvasDraft(id) : null,
-  );
-  const [canvasOpen, setCanvasOpen] = useState(false);
-  const [inlineCanvasOpen, setInlineCanvasOpen] = useState(false);
-  const [inlineCanvasAnchorMessageId, setInlineCanvasAnchorMessageId] = useState<string | null>(null);
-  const [hiddenCanvasMessageIds, setHiddenCanvasMessageIds] = useState<string[]>([]);
-  const [pendingCanvasEdit, setPendingCanvasEdit] = useState<PendingCanvasEdit | null>(null);
-  const [pendingCanvasCreation, setPendingCanvasCreation] = useState<PendingCanvasCreation | null>(null);
-  const [canvasSuggestion, setCanvasSuggestion] = useState<CanvasEditSuggestion | null>(null);
   // Resizable preview panel width (px). Persisted across opens within a session.
   const [previewWidth, setPreviewWidth] = useState(360);
   const PREVIEW_MIN = 280;
   const PREVIEW_MAX = 760;
   const splitContainerRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
-  const sanitizedCanvasDraftKeyRef = useRef<string | null>(null);
 
   const startPreviewDrag = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -108,108 +79,29 @@ export function AgentPage() {
 
   useEffect(() => {
     if (!id) return;
-    setCanvasDraft(loadStoredCanvasDraft(id));
-    setCanvasOpen(false);
-    setInlineCanvasOpen(false);
-    setInlineCanvasAnchorMessageId(null);
-    setHiddenCanvasMessageIds([]);
-    setCanvasSuggestion(null);
     setPreviewFile(null);
   }, [id]);
 
-  useEffect(() => {
-    if (!canvasDraft) {
-      sanitizedCanvasDraftKeyRef.current = null;
-      return;
-    }
-    const draftKey = [
-      canvasDraft.id,
-      canvasDraft.sourceMessageId ?? '',
-      canvasDraft.title,
-      canvasDraft.content,
-    ].join('\u0000');
-    if (sanitizedCanvasDraftKeyRef.current === draftKey) return;
-    sanitizedCanvasDraftKeyRef.current = draftKey;
-    const sanitized = sanitizeCanvasDraft(canvasDraft);
-    if (sanitized !== canvasDraft) setCanvasDraft(sanitized);
-  }, [canvasDraft]);
-
   const session = sessions.find((s) => s.id === id);
+  // Workspace bound to THIS session (not the global active workspace) — sources
+  // the "@" mention workspace files and the wsf_ preview content path.
+  const workspaceId = session?.workspace_id ?? undefined;
 
   const openPreviewFile = useCallback((file: { id: string; filename: string; mime?: string }) => {
     setPreviewFile(file);
-    setCanvasOpen(false);
   }, []);
 
-  const openBlankCanvas = useCallback(() => {
-    setCanvasDraft((current) => current ?? createCanvasDraft('article'));
-    setInlineCanvasOpen(true);
-    setInlineCanvasAnchorMessageId(null);
-    setCanvasOpen(false);
-    setCanvasSuggestion(null);
-    setPreviewFile(null);
-  }, []);
-
-  const openCanvasFromMessage = useCallback((seed: CanvasOpenSeed) => {
-    const sourceMessageId = seed.sourceMessageId;
-    const extracted = prepareCanvasOpenSeed(seed);
-    if (sourceMessageId) {
-      setHiddenCanvasMessageIds((current) =>
-        current.includes(sourceMessageId) ? current : [...current, sourceMessageId],
-      );
-    }
-    setCanvasDraft(
-      createCanvasDraft(extracted.kind, {
-        title: extracted.title,
-        content: extracted.content,
-        sourceMessageId: extracted.sourceMessageId,
-      }),
-    );
-    setInlineCanvasOpen(true);
-    setInlineCanvasAnchorMessageId(sourceMessageId ?? null);
-    setCanvasOpen(false);
-    setCanvasSuggestion(null);
-    setPreviewFile(null);
-  }, []);
-
-  const openInlineCanvasInPanel = useCallback(() => {
-    if (!canvasDraft) return;
-    setCanvasOpen(true);
-    setInlineCanvasOpen(false);
-    setPreviewFile(null);
-  }, [canvasDraft]);
-
-  const maybeStartCanvasFromPrompt = useCallback(
-    (text: string, attachmentIds?: string[]) => {
-      if (attachmentIds && attachmentIds.length > 0) return;
-      const intent = inferCanvasAuthoringIntent(text);
-      if (!intent) return;
-      const draft = createCanvasDraft(intent.kind, {
-        title: intent.title,
-        content: '',
-      });
-      setCanvasDraft(draft);
-      setInlineCanvasOpen(true);
-      setInlineCanvasAnchorMessageId(null);
-      setCanvasOpen(false);
-      setPreviewFile(null);
-      setPendingCanvasEdit(null);
-      setCanvasSuggestion(null);
-      setPendingCanvasCreation({
-        documentId: draft.id,
-        fromMessageIndex: messages.length,
-      });
-    },
-    [messages.length],
-  );
-
-  const sendMessageWithCanvasDetection = useCallback(
-    (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[]) => {
-      maybeStartCanvasFromPrompt(text, attachmentIds);
-      return sendMessage(text, attachmentIds, attachmentsMeta);
-    },
-    [maybeStartCanvasFromPrompt, sendMessage],
-  );
+  // Content-source override for the preview panel: a `wsf_…` id is a workspace
+  // base file, which lives under /workspaces/{id}/files/{fileId}/content rather
+  // than the session path. Only built when a workspace is known; otherwise the
+  // panel keeps its session-scoped behaviour (attachments, `att_…`).
+  const previewGetSource =
+    previewFile && previewFile.id.startsWith('wsf_') && workspaceId
+      ? (fileId: string): FileContentSource => ({
+          url: api.workspaces.fileContentUrl(workspaceId, fileId),
+          getContent: () => api.workspaces.getContent(workspaceId, fileId),
+        })
+      : undefined;
 
   // If HomePage routed us here with an `initialMessage` in state, dispatch it
   // once the chat store has bound to this session. Guard with a ref so React
@@ -226,118 +118,22 @@ export function AgentPage() {
     if (!initial && attachmentIds.length === 0) return;
     if (sentInitialRef.current === id) return;
     sentInitialRef.current = id;
-    sendMessageWithCanvasDetection(initial ?? '', attachmentIds);
+    sendMessage(initial ?? '', attachmentIds);
     // Clear router state so a refresh won't re-send.
     navigate(location.pathname, { replace: true, state: null });
-  }, [id, activeSessionId, location.pathname, location.state, navigate, sendMessageWithCanvasDetection]);
+  }, [id, activeSessionId, location.pathname, location.state, navigate, sendMessage]);
 
-  const requestCanvasEdit = useCallback(
-    async (request: CanvasEditRequest, prompt: string) => {
-      setPendingCanvasCreation(null);
-      setCanvasSuggestion(null);
-      setPendingCanvasEdit({ request, fromMessageIndex: messages.length });
-      await sendMessage(prompt);
-    },
-    [messages.length, sendMessage],
+  const handleSendMessage = useCallback(
+    (
+      text: string,
+      attachmentIds?: string[],
+      attachmentsMeta?: MessageAttachment[],
+      workspaceFileIds?: string[],
+    ) => sendMessage(text, attachmentIds, attachmentsMeta, workspaceFileIds),
+    [sendMessage],
   );
 
-  useEffect(() => {
-    if (!pendingCanvasEdit || isStreaming) return;
-
-    let assistantReply: { id?: string; content: string } | null = null;
-    for (const message of messages.slice(pendingCanvasEdit.fromMessageIndex)) {
-      const role = (message.role || '').toUpperCase();
-      if (
-        role === 'ASSISTANT' &&
-        message.blockKind !== 'tool' &&
-        message.blockKind !== 'thinking' &&
-        !message.streaming
-      ) {
-        assistantReply = message;
-      }
-    }
-
-    if (!assistantReply) return;
-
-    const replacement = extractCanvasReplacement(assistantReply.content);
-    if (replacement) {
-      setCanvasSuggestion({
-        request: pendingCanvasEdit.request,
-        replacement,
-        receivedAt: new Date().toISOString(),
-      });
-      setInlineCanvasOpen(true);
-      setCanvasOpen(false);
-      setPreviewFile(null);
-      if (assistantReply.id) {
-        const assistantReplyId = assistantReply.id;
-        setHiddenCanvasMessageIds((current) =>
-          current.includes(assistantReplyId) ? current : [...current, assistantReplyId],
-        );
-      }
-    }
-    setPendingCanvasEdit(null);
-  }, [isStreaming, messages, pendingCanvasEdit]);
-
-  useEffect(() => {
-    if (!pendingCanvasCreation) return;
-
-    const assistantReply = findCanvasCreationReply(messages, pendingCanvasCreation.fromMessageIndex);
-    if (!assistantReply) return;
-
-    const replacement = extractCanvasReplacement(assistantReply.content) ?? assistantReply.content.trim();
-    if (replacement) {
-      const extracted = extractCanvasDeliverable(replacement, {
-        kind: canvasDraft?.kind ?? 'article',
-        fallbackTitle: canvasDraft?.title,
-        sourceMessageId: assistantReply.id,
-      });
-      setCanvasDraft((current) => {
-        if (!current || current.id !== pendingCanvasCreation.documentId) return current;
-        if (
-          current.content === extracted.content &&
-          current.title === (extracted.title || current.title) &&
-          current.sourceMessageId === (assistantReply.id ?? current.sourceMessageId)
-        ) {
-          return current;
-        }
-        return {
-          ...current,
-          title: extracted.title || current.title,
-          content: extracted.content,
-          sourceMessageId: assistantReply.id ?? current.sourceMessageId,
-          updatedAt: new Date().toISOString(),
-        };
-      });
-      setInlineCanvasOpen(true);
-      setInlineCanvasAnchorMessageId(assistantReply.id ?? null);
-      setCanvasOpen(false);
-      setPreviewFile(null);
-      if (assistantReply.id) {
-        const assistantReplyId = assistantReply.id;
-        setHiddenCanvasMessageIds((current) =>
-          current.includes(assistantReplyId) ? current : [...current, assistantReplyId],
-        );
-      }
-    }
-    if (!isStreaming && !assistantReply.streaming) {
-      setPendingCanvasCreation(null);
-    }
-  }, [canvasDraft?.kind, canvasDraft?.title, isStreaming, messages, pendingCanvasCreation]);
-
-  const acceptCanvasSuggestion = useCallback(() => {
-    setCanvasDraft((current) => {
-      if (!current || !canvasSuggestion || current.id !== canvasSuggestion.request.documentId) return current;
-      return applyCanvasReplacement(current, canvasSuggestion.request, canvasSuggestion.replacement);
-    });
-    setCanvasSuggestion(null);
-  }, [canvasSuggestion]);
-
-  const rejectCanvasSuggestion = useCallback(() => {
-    setCanvasSuggestion(null);
-  }, []);
-
-  const hasSidePanel = previewFile !== null || (canvasOpen && canvasDraft !== null);
+  const hasSidePanel = previewFile !== null;
 
   if (!id) {
     return (
@@ -357,20 +153,22 @@ export function AgentPage() {
           { label: session?.title || '未命名任务' },
         ]}
         status={
-          session && (
-            <span className="font-mono text-[11px] text-ink-2">
-              · {sessionStatusZh(session.status)}
-            </span>
-          )
+          <span className="flex items-center gap-2">
+            {/* Read-only badge: the workspace bound to THIS session at creation
+                time. It is purely informational — there is no way to re-bind an
+                existing session's workspace, so the badge never switches. */}
+            {workspaceId && (
+              <WorkspaceBadge workspaceId={workspaceId} onPreviewFile={openPreviewFile} />
+            )}
+            {session && (
+              <span className="font-mono text-[11px] text-ink-2">
+                · {sessionStatusZh(session.status)}
+              </span>
+            )}
+          </span>
         }
         actions={
           <>
-            <button
-              onClick={openBlankCanvas}
-              className="cw-btn cw-btn-ghost cw-btn-sm"
-            >
-              <span className="font-mono">◇</span> 画布
-            </button>
             {!friendly && (
               <button
                 onClick={() => navigate('/files')}
@@ -428,23 +226,15 @@ export function AgentPage() {
                 : { display: 'flex', flexDirection: 'column', minHeight: 0 }
             }
           >
-            <ChatWindow
-              sessionId={id}
-              friendly={friendly}
-              onPreviewFile={openPreviewFile}
-              onOpenCanvas={openCanvasFromMessage}
-              onSendMessage={sendMessageWithCanvasDetection}
-              inlineCanvasDraft={inlineCanvasOpen ? canvasDraft : null}
-              inlineCanvasPending={Boolean(pendingCanvasCreation)}
-              inlineCanvasSuggestion={canvasSuggestion}
-              inlineCanvasAnchorMessageId={inlineCanvasAnchorMessageId}
-              hiddenMessageIds={hiddenCanvasMessageIds}
-              onInlineCanvasDraftChange={setCanvasDraft}
-              onInlineCanvasRequestEdit={requestCanvasEdit}
-              onInlineCanvasOpenPanel={canvasDraft ? openInlineCanvasInPanel : undefined}
-              onInlineCanvasAcceptSuggestion={canvasSuggestion ? acceptCanvasSuggestion : undefined}
-              onInlineCanvasRejectSuggestion={canvasSuggestion ? rejectCanvasSuggestion : undefined}
-            />
+            <FilePreviewProvider value={openPreviewFile}>
+              <ChatWindow
+                sessionId={id}
+                workspaceId={workspaceId}
+                friendly={friendly}
+                onPreviewFile={openPreviewFile}
+                onSendMessage={handleSendMessage}
+              />
+            </FilePreviewProvider>
             {hasSidePanel && (
               <>
                 {/* Draggable divider */}
@@ -472,27 +262,169 @@ export function AgentPage() {
                     style={{ width: 1, background: 'var(--line)' }}
                   />
                 </div>
-                {previewFile ? (
+                {previewFile && (
                   <FilePreviewPanel
                     sessionId={id}
                     file={previewFile}
                     onClose={() => setPreviewFile(null)}
+                    getSource={previewGetSource}
                   />
-                ) : canvasDraft ? (
-                  <ArticleCanvasPanel
-                    sessionId={id}
-                    draft={canvasDraft}
-                    aiDisabled={isStreaming}
-                    onDraftChange={setCanvasDraft}
-                    onClose={() => setCanvasOpen(false)}
-                    onRequestEdit={requestCanvasEdit}
-                  />
-                ) : null}
+                )}
               </>
             )}
           </div>
         </section>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Read-only workspace badge for the session header. Shows `◇ <工作区名>` and, on
+ * click, a small downward popover describing the workspace the session was bound
+ * to at creation time: a truncated instructions preview and the list of base
+ * files (lazy-loaded once). Clicking a file opens it in the session's preview
+ * panel. There is deliberately NO switching UI here — an existing session's
+ * workspace binding is immutable, so the badge only explains the binding.
+ *
+ * Popover mechanics mirror InputBar's "+" popover (container ref + absolute +
+ * document-mousedown outside-close), but opens DOWNWARD (`top-full`) because the
+ * badge lives in the page header at the top of the viewport.
+ */
+function WorkspaceBadge({
+  workspaceId,
+  onPreviewFile,
+}: {
+  workspaceId: string;
+  onPreviewFile: (file: { id: string; filename: string; mime?: string }) => void;
+}) {
+  const { workspaces } = useWorkspace();
+  // Prefer the already-loaded list; fall back to a direct GET only when the
+  // session's workspace isn't among the user's own (e.g. shared/legacy).
+  const known = workspaces.find((w) => w.id === workspaceId) ?? null;
+  const [fetched, setFetched] = useState<Workspace | null>(null);
+  const ws = known ?? fetched;
+
+  useEffect(() => {
+    if (known) return;
+    let alive = true;
+    api.workspaces
+      .get(workspaceId)
+      .then((w) => {
+        if (alive) setFetched(w);
+      })
+      .catch(() => {
+        /* silent — badge falls back to the generic「工作区」label */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [known, workspaceId]);
+
+  const name = ws?.name ?? '工作区';
+  const instructions = ws?.instructions?.trim() || null;
+  const instructionsPreview =
+    instructions && instructions.length > 200
+      ? `${instructions.slice(0, 200)}…`
+      : instructions;
+
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const [files, setFiles] = useState<WorkspaceFile[] | null>(null);
+  const [filesLoading, setFilesLoading] = useState(false);
+
+  // Close on outside click while open.
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDocClick);
+    return () => document.removeEventListener('mousedown', onDocClick);
+  }, [open]);
+
+  // Lazy-load base files the first time the popover opens.
+  useEffect(() => {
+    if (!open || files !== null || filesLoading) return;
+    setFilesLoading(true);
+    api.workspaces
+      .listFiles(workspaceId)
+      .then((items) => setFiles(items))
+      .catch(() => setFiles([]))
+      .finally(() => setFilesLoading(false));
+  }, [open, files, filesLoading, workspaceId]);
+
+  return (
+    <div ref={ref} className="relative inline-flex">
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="dialog"
+        aria-expanded={open}
+        title="此会话绑定的工作区（只读）"
+        className="inline-flex items-center gap-1.5 px-2 py-0.5 border border-line rounded-full bg-surface font-mono text-[11px] text-ink-2 hover:border-ink-2 hover:text-ink hover:bg-paper-2 transition-colors cursor-pointer max-w-[220px]"
+      >
+        <span aria-hidden className="text-accent">◇</span>
+        <span className="truncate">{name}</span>
+        <LevelBadge level={ws?.sensitivity_level} small />
+      </button>
+
+      {open && (
+        <div
+          role="dialog"
+          className="absolute top-full left-0 mt-1.5 z-40 w-[300px] bg-surface border border-line rounded-lg shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-2.5"
+        >
+          <div className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim mb-1.5">
+            工作区 · 只读
+          </div>
+          <div className="flex items-center gap-1.5 mb-2">
+            <span className="text-[13px] font-semibold tracking-[-0.01em] text-ink truncate">
+              {name}
+            </span>
+            <LevelBadge level={ws?.sensitivity_level} />
+          </div>
+
+          {instructionsPreview && (
+            <div className="mb-2.5 pb-2.5 border-b border-line-2">
+              <div className="cw-label mb-1">工作区指令</div>
+              <div className="text-[12px] leading-[1.5] text-ink-2 whitespace-pre-wrap break-words">
+                {instructionsPreview}
+              </div>
+            </div>
+          )}
+
+          <div className="cw-label mb-1">基础文件</div>
+          <div className="max-h-[220px] overflow-auto cw-scroll -mx-0.5">
+            {filesLoading ? (
+              <div className="px-1 py-1.5 font-mono text-[11px] text-dim animate-pulse">
+                加载中…
+              </div>
+            ) : files && files.length > 0 ? (
+              files.map((f) => (
+                <button
+                  key={f.id}
+                  type="button"
+                  onClick={() => {
+                    onPreviewFile({ id: f.id, filename: f.filename, mime: f.mime });
+                    setOpen(false);
+                  }}
+                  className="w-full flex items-center gap-1.5 px-1.5 py-1.5 rounded-md text-left hover:bg-paper-2 transition-colors"
+                  title={f.filename}
+                >
+                  <span aria-hidden className="font-mono text-[11px] text-dim shrink-0">
+                    ·
+                  </span>
+                  <span className="font-mono text-[12px] text-ink truncate">{f.filename}</span>
+                </button>
+              ))
+            ) : (
+              <div className="px-1 py-1.5 font-mono text-[11px] italic text-dim">
+                暂无基础文件
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

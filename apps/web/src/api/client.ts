@@ -1,6 +1,15 @@
 import type {
   ActiveSession,
   RespondBody,
+  CanvasEditBody,
+  CanvasEditResult,
+  CanvasDocument,
+  CanvasCreateBody,
+  CanvasManualVersionBody,
+  CanvasV2EditBody,
+  CanvasEditResponse,
+  CanvasSuggestion,
+  CanvasVersionSummary,
   PendingInteractionsResponse,
   AddTeamMemberRequest,
   AdminRole,
@@ -12,6 +21,7 @@ import type {
   App,
   AppCreate,
   AppReviewItem,
+  AppRunHistoryResponse,
   AppRunResult,
   AppUpdate,
   AppVersion,
@@ -48,6 +58,7 @@ import type {
   AuditChainVerifyResult,
   AuditEvent,
   AuditQueryRequest,
+  Artifact,
   Attachment,
   AttachmentKind,
   BillingPlanDef,
@@ -69,9 +80,11 @@ import type {
   InviteUserRequest,
   KillSwitchRequest,
   KnowledgeDocument,
+  KnowledgeFolder,
   ListPage,
   LoginResponse,
   McpServer,
+  McpTestResult,
   Message,
   MfaMethod,
   ModelCatalogProvider,
@@ -89,6 +102,7 @@ import type {
   PatchTenantRequest,
   PermissionDefinition,
   PoolSnapshot,
+  ProbeMcpServerRequest,
   ProbeReport,
   ProbeRequest,
   QuotaInfo,
@@ -110,6 +124,7 @@ import type {
   TenantDefaultModel,
   TenantSubscription,
   TokenUsage,
+  TokenUsageBreakdown,
   TopologyGraph,
   UpdateOrgUnitRequest,
   UpdateProviderRequest,
@@ -158,7 +173,14 @@ import type {
   BucketPurpose,
   CronJob,
   CronJobCreate,
+  CronJobCreated,
   CronJobUpdate,
+  WebhookSecret,
+  Workspace,
+  WorkspaceFile,
+  WorkspaceCreate,
+  WorkspaceUpdate,
+  DlpSensitivity,
 } from './types';
 
 const BFF_BASE = '/api/bff/v1';
@@ -252,6 +274,8 @@ export const api = {
       request<LoginResponse>('POST', '/auth/login', { email, password }),
     logout: () => request<void>('POST', '/auth/logout'),
     me: () => request<UserProfile>('GET', '/auth/me'),
+    updateProfile: (body: { display_name: string }) =>
+      request<UserProfile>('PATCH', '/auth/me', body),
     mfaMethods: () => request<MfaMethod[]>('GET', '/auth/mfa/methods'),
     sessions: () => request<ActiveSession[]>('GET', '/auth/sessions'),
     // PUBLIC — enterprise SSO login options shown on the login page before
@@ -294,13 +318,21 @@ export const api = {
       request<TokenUsage>('GET', '/runs/token-usage'),
     tokenUsageDaily: (days = 7) =>
       request<DailyTokenUsageResponse>('GET', `/runs/token-usage/daily?days=${days}`),
+    tokenUsageBreakdown: (days = 30) =>
+      request<TokenUsageBreakdown>('GET', `/runs/token-usage/breakdown?days=${days}`),
   },
 
   sessions: {
     list: (cursor?: string) =>
-      request<CursorPage<Session>>('GET', `/sessions?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`),
-    create: (title?: string, agentConfig?: Record<string, unknown>) =>
-      request<Session>('POST', '/sessions', { title, agent_config: agentConfig }),
+      request<CursorPage<Session>>('GET', `/sessions?limit=20${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`),
+    create: (title?: string, agentConfig?: Record<string, unknown>, workspaceId?: string) =>
+      request<Session>('POST', '/sessions', {
+        title,
+        agent_config: agentConfig,
+        // Only send workspace_id when set — omit for the no-workspace path so
+        // the backend's default behaviour is untouched.
+        ...(workspaceId ? { workspace_id: workspaceId } : {}),
+      }),
     get: (id: string) =>
       request<Session>('GET', `/sessions/${id}`),
     update: (id: string, data: { title?: string; status?: string }) =>
@@ -331,6 +363,143 @@ export const api = {
      */
     pending: (sessionId: string) =>
       request<PendingInteractionsResponse>('GET', `/sessions/${sessionId}/pending`),
+    /**
+     * Silent canvas revision — the ChatGPT-canvas-style局部修订. Unlike the
+     * normal chat flow this does NOT go through POST /chat, does NOT start an
+     * agent run, and leaves the transcript untouched. The BFF returns the
+     * replacement text synchronously; the caller feeds it into the canvas
+     * suggestion card (accept / reject) without any message ever appearing.
+     * Throws ApiError carrying the localised `user_message` on failure.
+     */
+    canvasEdit: (sessionId: string, body: CanvasEditBody) =>
+      request<CanvasEditResult>('POST', `/sessions/${sessionId}/canvas/edit`, body),
+  },
+
+  // ─── Workspaces (→ session-orchestrator, proxied via BFF /workspaces) ────────
+  //
+  // Reusable cross-session context containers (instructions + base files +
+  // skills). GET /workspaces lazily creates a default and always returns >= 1
+  // item. File upload/download use multipart / raw-blob paths (not the JSON
+  // `request` helper), mirroring the attachments namespace.
+  workspaces: {
+    list: () =>
+      request<{ items: Workspace[] }>('GET', '/workspaces').then((r) =>
+        Array.isArray(r?.items) ? r.items : [],
+      ),
+    create: (body: WorkspaceCreate) =>
+      request<Workspace>('POST', '/workspaces', body),
+    get: (id: string) =>
+      request<Workspace>('GET', `/workspaces/${id}`),
+    update: (id: string, body: WorkspaceUpdate) =>
+      request<Workspace>('PATCH', `/workspaces/${id}`, body),
+    remove: (id: string) =>
+      request<void>('DELETE', `/workspaces/${id}`),
+    listFiles: (id: string) =>
+      request<{ items: WorkspaceFile[] }>('GET', `/workspaces/${id}/files`).then((r) =>
+        Array.isArray(r?.items) ? r.items : [],
+      ),
+    // `folder` is a virtual folder path (segments joined by '/'); when set,
+    // the uploaded file's stored filename becomes `folder + '/' + file.name`
+    // so it lands inside that folder in the tree view. The backend stores the
+    // filename string verbatim and Content-Disposition percent-encodes '/',
+    // so virtual folders round-trip end-to-end with zero backend changes.
+    uploadFile: async (
+      id: string,
+      file: File,
+      description?: string,
+      folder?: string,
+      level?: DlpSensitivity,
+    ): Promise<WorkspaceFile> => {
+      const formData = new FormData();
+      const filename = folder ? `${folder}/${file.name}` : file.name;
+      formData.append('file', file, filename);
+      if (description) formData.append('description', description);
+      if (level) formData.append('sensitivity_level', level);
+      const res = await fetch(`${BFF_BASE}/workspaces/${id}/files`, {
+        method: 'POST',
+        body: formData,
+        credentials: 'include',
+        // No Content-Type header — browser sets multipart boundary automatically
+      });
+      if (!res.ok) {
+        const problem = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+      }
+      return res.json();
+    },
+    deleteFile: (id: string, fileId: string) =>
+      request<void>('DELETE', `/workspaces/${id}/files/${fileId}`),
+    /** Absolute URL for a base file's raw bytes — used for download (a[href]/window.open). */
+    fileContentUrl: (id: string, fileId: string) =>
+      `${BFF_BASE}/workspaces/${id}/files/${fileId}/content`,
+    /**
+     * Fetch a base file's bytes for in-app preview (mirrors attachments.getContent).
+     * Returns { text, blob, mime }; `text` is decoded only for text-like MIMEs,
+     * otherwise null. Cookie-auth via the BFF proxy - same path as fileContentUrl.
+     */
+    getContent: async (
+      wsId: string,
+      fileId: string,
+    ): Promise<{ text: string | null; blob: Blob; mime: string }> => {
+      const res = await fetch(`${BFF_BASE}/workspaces/${wsId}/files/${fileId}/content`, {
+        credentials: 'include',
+      });
+      if (!res.ok) {
+        const problem = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+      }
+      const mime = res.headers.get('content-type') || 'application/octet-stream';
+      const blob = await res.blob();
+      // For text-like content, also decode as string for preview.
+      const isText =
+        mime.startsWith('text/') ||
+        mime.includes('json') ||
+        mime.includes('xml') ||
+        mime.includes('yaml') ||
+        mime.includes('markdown');
+      let text: string | null = null;
+      if (isText) {
+        text = await blob.text();
+      }
+      return { text, blob, mime };
+    },
+  },
+
+  // ─── Canvas v2 (→ session-orchestrator /sessions/{sid}/canvases, /canvases/{cid}) ──
+  //
+  // Server-owned canvas documents with versioned blocks + scoped-edit
+  // suggestions. list/versions return a CursorPage envelope; get/accept/
+  // revert/saveVersion return a bare CanvasDocument; reject returns a bare
+  // CanvasSuggestion; edit (the BFF LLM edge) returns { suggestion }.
+  canvas: {
+    create: (sessionId: string, body: CanvasCreateBody) =>
+      request<CanvasDocument>('POST', `/sessions/${sessionId}/canvases`, body),
+    list: (sessionId: string) =>
+      request<{ items: CanvasDocument[]; next_cursor: string | null }>(
+        'GET',
+        `/sessions/${sessionId}/canvases`,
+      ),
+    get: (canvasId: string) =>
+      request<CanvasDocument>('GET', `/canvases/${canvasId}`),
+    versions: (canvasId: string) =>
+      request<{ items: CanvasVersionSummary[]; next_cursor: string | null }>(
+        'GET',
+        `/canvases/${canvasId}/versions`,
+      ),
+    saveVersion: (canvasId: string, body: CanvasManualVersionBody) =>
+      request<CanvasDocument>('POST', `/canvases/${canvasId}/versions`, body),
+    accept: (canvasId: string, suggestionId: string) =>
+      request<CanvasDocument>('POST', `/canvases/${canvasId}/suggestions/${suggestionId}/accept`),
+    reject: (canvasId: string, suggestionId: string) =>
+      request<CanvasSuggestion>('POST', `/canvases/${canvasId}/suggestions/${suggestionId}/reject`),
+    revert: (canvasId: string, toVersion: number) =>
+      request<CanvasDocument>('POST', `/canvases/${canvasId}/revert`, { to_version: toVersion }),
+    edit: (sessionId: string, canvasId: string, body: CanvasV2EditBody) =>
+      request<CanvasEditResponse>(
+        'POST',
+        `/sessions/${sessionId}/canvases/${canvasId}/edit`,
+        body,
+      ),
   },
 
   messages: {
@@ -417,16 +586,43 @@ export const api = {
       request<ListPage<SkillVersion>>('GET', `/library/skills/${skillId}/versions`).then(
         (r) => r.items,
       ),
-    listDocuments: () =>
-      request<ListPage<KnowledgeDocument>>('GET', '/library/documents'),
+    // Optional folderId filters to one folder; omit for the full tenant set
+    // (the SPA fetches all and filters client-side so the root case is exact).
+    listDocuments: (folderId?: string | null) =>
+      request<ListPage<KnowledgeDocument>>(
+        'GET',
+        `/library/documents${qs({ folder_id: folderId })}`,
+      ),
 
-    installMcpServer: (body: {
+    // ─── Knowledge folders (knowledge-library-v1) ─────────────────────────────
+    // Reads are open to all; writes require the tenant-admin document.create
+    // permission (the BFF re-checks — this only gates what the SPA renders).
+    listFolders: () =>
+      request<ListPage<KnowledgeFolder>>('GET', '/library/folders'),
+    createFolder: (body: {
       name: string;
-      transport: McpServer['transport'];
-      endpoint?: string | null;
-      command?: string | null;
-      enabled?: boolean;
-    }) => request<McpServer>('POST', '/library/mcp-servers', body),
+      parent_id?: string | null;
+      default_sensitivity?: DlpSensitivity;
+    }) => request<KnowledgeFolder>('POST', '/library/folders', body),
+    updateFolder: (
+      folderId: string,
+      body: { name?: string; parent_id?: string | null; default_sensitivity?: DlpSensitivity },
+    ) => request<KnowledgeFolder>('PATCH', `/library/folders/${folderId}`, body),
+    deleteFolder: (folderId: string) =>
+      request<void>('DELETE', `/library/folders/${folderId}`),
+
+    // ─── Document mutations ───────────────────────────────────────────────────
+    // Move a doc between folders / change its sensitivity. A move into a folder
+    // with a higher default raises the doc's sensitivity (only-raise rule).
+    updateDocument: (
+      docId: string,
+      body: { folder_id?: string | null; sensitivity?: DlpSensitivity },
+    ) => request<KnowledgeDocument>('PATCH', `/library/documents/${docId}`, body),
+    deleteDocument: (docId: string) =>
+      request<void>('DELETE', `/library/documents/${docId}`),
+
+    installMcpServer: (body: RegisterMcpServerRequest) =>
+      request<McpServer>('POST', '/library/mcp-servers', body),
 
     createSkill: (body: {
       name: string;
@@ -465,6 +661,49 @@ export const api = {
 
     ingestDocument: (docId: string) =>
       request<IngestResult>('POST', `/library/documents/${docId}/ingest`),
+
+    documentContentUrl: (docId: string) =>
+      `${BFF_BASE}/library/documents/${docId}/content`,
+    getDocumentContent: async (
+      docId: string,
+    ): Promise<{ text: string | null; blob: Blob; mime: string }> => {
+      const res = await fetch(`${BFF_BASE}/library/documents/${docId}/content`, {
+        credentials: 'include',
+      });
+      if (!res.ok) {
+        const problem = await res.json().catch(() => ({ detail: res.statusText }));
+        throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+      }
+      const mime = res.headers.get('content-type') || 'application/octet-stream';
+      const blob = await res.blob();
+      const isText =
+        mime.startsWith('text/') ||
+        mime.includes('json') ||
+        mime.includes('xml') ||
+        mime.includes('yaml') ||
+        mime.includes('markdown') ||
+        mime.includes('csv');
+      let text: string | null = null;
+      if (isText) {
+        text = await blob.text();
+      }
+      return { text, blob, mime };
+    },
+  },
+
+  // ─── Artifacts (产物) ───────────────────────────────────────────────────────
+  //
+  // Cross-session view of the calling user's session-generated artifacts
+  // (canvas documents + run output files). `list` returns a BFF-assembled union;
+  // deletes are dispatched per-kind back to the owning namespace
+  // (canvases / sessions-attachments). Canvas preview reuses `canvas.get`.
+  artifacts: {
+    list: () =>
+      request<{ items: Artifact[] }>('GET', '/artifacts'),
+    deleteCanvas: (canvasId: string) =>
+      request<void>('DELETE', `/canvases/${canvasId}`),
+    deleteFile: (sessionId: string, fileId: string) =>
+      request<void>('DELETE', `/sessions/${sessionId}/attachments/${fileId}`),
   },
 
   apps: {
@@ -502,6 +741,11 @@ export const api = {
         session_id?: string;
       },
     ) => request<AppRunResult>('POST', `/apps/${id}/run`, body),
+    listRuns: (id: string, opts?: { limit?: number; offset?: number }) =>
+      request<AppRunHistoryResponse>(
+        'GET',
+        `/apps/${id}/runs${qs({ limit: opts?.limit, offset: opts?.offset })}`,
+      ),
   },
 
   billing: {
@@ -711,6 +955,16 @@ export const api = {
         request<McpServer>('PATCH', `/admin/mcp/servers/${id}`, body),
       delete: (id: string) =>
         request<void>('DELETE', `/admin/mcp/servers/${id}`),
+      // Probe a server's /test endpoint (mcp-registry). Returns ok + discovered
+      // tools / server_info; stdio servers are not testable remotely and the
+      // caller should disable the affordance for them.
+      test: (id: string, body?: Record<string, unknown>) =>
+        request<McpTestResult>('POST', `/admin/mcp/servers/${id}/test`, body),
+      // Id-less probe: same result shape as test(), but the connection config is
+      // supplied inline so a not-yet-created server can still be inspected (the
+      // register form uses this to fill its tool checklist).
+      probe: (body: ProbeMcpServerRequest, tenantId?: string) =>
+        request<McpTestResult>('POST', `/admin/mcp/servers/probe${qs({ tenant_id: tenantId })}`, body),
     },
     // Knowledge base governance (→ knowledge-ingest). documents.list unwraps {items:[...]}.
     knowledge: {
@@ -723,6 +977,35 @@ export const api = {
           request<IngestResult>('POST', `/admin/knowledge/documents/${id}/reingest${qs({ tenant_id: tenantId })}`),
         delete: (id: string, tenantId?: string) =>
           request<void>('DELETE', `/admin/knowledge/documents/${id}${qs({ tenant_id: tenantId })}`),
+        contentUrl: (docId: string, tenantId?: string) =>
+          `${BFF_BASE}/admin/knowledge/documents/${docId}/content${qs({ tenant_id: tenantId })}`,
+        getContent: async (
+          docId: string,
+          tenantId?: string,
+        ): Promise<{ text: string | null; blob: Blob; mime: string }> => {
+          const res = await fetch(
+            `${BFF_BASE}/admin/knowledge/documents/${docId}/content${qs({ tenant_id: tenantId })}`,
+            { credentials: 'include' },
+          );
+          if (!res.ok) {
+            const problem = await res.json().catch(() => ({ detail: res.statusText }));
+            throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+          }
+          const mime = res.headers.get('content-type') || 'application/octet-stream';
+          const blob = await res.blob();
+          const isText =
+            mime.startsWith('text/') ||
+            mime.includes('json') ||
+            mime.includes('xml') ||
+            mime.includes('yaml') ||
+            mime.includes('markdown') ||
+            mime.includes('csv');
+          let text: string | null = null;
+          if (isText) {
+            text = await blob.text();
+          }
+          return { text, blob, mime };
+        },
       },
     },
     // Run & sandbox governance (→ scheduler / sandbox-pool / orchestrator).
@@ -1203,23 +1486,16 @@ export const api = {
       request<ResolvedDefault>('GET', `/llm/user-preferences/resolve?purpose=${purpose}`),
   },
 
-  // User-facing PAM — request elevation, view own history.
-  pam: {
-    requestElevation: (body: RequestElevationRequest) =>
-      request<PamElevation>('POST', '/pam/elevations', body),
-    myElevations: () =>
-      request<{ items: PamElevation[] } | PamElevation[]>(
-        'GET',
-        '/pam/elevations/mine',
-      ).then((r) => (Array.isArray(r) ? r : r.items ?? [])),
-  },
-
   schedules: {
     list: () => request<CronJob[]>('GET', '/schedules'),
-    create: (body: CronJobCreate) => request<CronJob>('POST', '/schedules', body),
+    // Webhook creates return the plaintext secret + path exactly once.
+    create: (body: CronJobCreate) => request<CronJobCreated>('POST', '/schedules', body),
     update: (id: string, body: CronJobUpdate) =>
       request<CronJob>('PATCH', `/schedules/${id}`, body),
     remove: (id: string) => request<void>('DELETE', `/schedules/${id}`),
+    // Regenerate a webhook trigger's secret; the new plaintext is returned once.
+    rotateSecret: (id: string) =>
+      request<WebhookSecret>('POST', `/schedules/${id}/rotate-secret`),
   },
 
   chat: {

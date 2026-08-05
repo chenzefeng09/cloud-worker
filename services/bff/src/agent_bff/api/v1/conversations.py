@@ -4,16 +4,57 @@ from __future__ import annotations
 
 import json
 import logging
+from typing import Any, Literal
 
 import httpx
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ValidationError
 
 from agent_bff.api._http import foundation_headers
-from agent_bff.api.dependencies import require_auth
+from agent_bff.api.dependencies import TClearance, require_auth
+from agent_bff.session_title import generate_and_update_session_title
 
 router = APIRouter(tags=["Conversations"])
 logger = logging.getLogger(__name__)
+
+
+class _ChatBodyEnvelope(BaseModel):
+    """Validates the strictly-typed optional fields of a chat request body.
+
+    The chat endpoint reads the rest of its body as a loose dict (message,
+    attachment_ids, skills, model, reasoning_effort), but a couple of fields must
+    be strictly validated so an illegal value is a 422 rather than a silent
+    fallthrough:
+
+    * ``execution_mode``     — must be one of ``inline`` / ``sandbox`` (defaults
+                               to ``sandbox`` when omitted so existing clients
+                               keep the current agent-mode behaviour with zero
+                               change).  ``inline`` = chat mode (orchestrator
+                               answers in-process via the LLM gateway, no sandbox);
+                               ``sandbox`` = agent mode (existing sandboxed run).
+    * ``workspace_file_ids`` — optional list of workspace-file ids (``wsf_…``) the
+                               user @-referenced in this message.  A non-list value
+                               or a non-string element is a 422; omitted → ``None``.
+    """
+
+    execution_mode: Literal["inline", "sandbox"] = "sandbox"
+    workspace_file_ids: list[str] | None = None
+
+
+def _validate_chat_body(body: dict) -> _ChatBodyEnvelope:
+    """Return the validated chat-body envelope, raising 422 on an illegal value.
+
+    Only the strictly-typed keys are inspected; anything else in ``body`` is
+    ignored here (the endpoint reads those fields separately).
+    """
+    try:
+        return _ChatBodyEnvelope(
+            execution_mode=body.get("execution_mode", "sandbox"),
+            workspace_file_ids=body.get("workspace_file_ids"),
+        )
+    except ValidationError as exc:
+        raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
 
 async def _resolve_attachment_files(
@@ -63,17 +104,32 @@ async def _resolve_attachment_files(
 async def chat(
     session_id: str,
     request: Request,
+    background_tasks: BackgroundTasks,
     _auth: tuple = Depends(require_auth()),
+    clearance: str = TClearance,
 ) -> JSONResponse:
     """Persist user message, trigger run, return run_id + message_id.
 
     Body fields:
-    * ``message``          — required, user text
-    * ``attachment_ids``   — optional list of attachment ids already uploaded to
-                             this session
-    * ``skills``           — optional list of skill names
-    * ``model``            — optional model name
-    * ``reasoning_effort`` — optional reasoning effort string
+    * ``message``            — required, user text
+    * ``attachment_ids``     — optional list of attachment ids already uploaded to
+                               this session
+    * ``workspace_file_ids`` — optional list of workspace-file ids (``wsf_…``) the
+                               user @-referenced; forwarded verbatim so the
+                               orchestrator can prioritise those files in the
+                               injected workspace context.
+    * ``skills``             — optional list of skill names
+    * ``mcp_server_ids``     — optional list of MCP server ids to enable for
+                               this run.  Presence-aware, exactly like
+                               ``skills``: key omitted → the tenant's
+                               enabled-by-default servers; explicit ``[]`` →
+                               no MCP at all for this run; non-empty list →
+                               only those servers.
+    * ``model``              — optional model name
+    * ``reasoning_effort``   — optional reasoning effort string
+    * ``execution_mode``     — optional ``"inline"`` | ``"sandbox"`` (default
+                               ``"sandbox"``); ``inline`` = chat mode (no sandbox),
+                               ``sandbox`` = agent mode.  An illegal value → 422.
 
     Returns JSON ``{"run_id": "...", "message_id": "...", "run": {...}}``.
     On upstream failure returns a JSON error with the upstream status code.
@@ -83,12 +139,22 @@ async def chat(
     body = await request.json()
     message_text = body.get("message", "")
     attachment_ids: list[str] = body.get("attachment_ids") or []
+    skills_provided = "skills" in body
     skills: list[str] = body.get("skills") or []
+    # Same presence semantics as ``skills`` — see the forwarding block below.
+    mcp_server_ids_provided = "mcp_server_ids" in body
+    mcp_server_ids: list[str] = body.get("mcp_server_ids") or []
     model: str | None = body.get("model") or None
     reasoning_effort: str | None = body.get("reasoning_effort") or None
+    # Strictly validated: execution_mode (inline/sandbox; defaults to sandbox for
+    # existing clients so agent mode stays the zero-change default) and
+    # workspace_file_ids (optional list of strings; illegal types → pydantic 422).
+    envelope = _validate_chat_body(body)
+    execution_mode = envelope.execution_mode
+    workspace_file_ids = envelope.workspace_file_ids
 
     async with httpx.AsyncClient(timeout=30) as client:
-        headers = foundation_headers(tenant_id, user_id, access_token)
+        headers = foundation_headers(tenant_id, user_id, access_token, clearance=clearance)
 
         # 1. Persist user message
         resp = await client.post(
@@ -103,6 +169,21 @@ async def chat(
             )
         msg = resp.json()
         message_id = msg.get("id")
+        # The first persisted user message owns automatic naming.  Run title
+        # generation after the response so it never delays task startup; the
+        # session SSE stream publishes the eventual PATCH to every open client.
+        if msg.get("sequence") == 1 and message_text.strip():
+            background_tasks.add_task(
+                generate_and_update_session_title,
+                settings=request.app.state.settings,
+                session_id=session_id,
+                message=message_text,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                access_token=access_token,
+                clearance=clearance,
+                model_hint=model,
+            )
 
         # 2. Resolve attachment files (failure-open)
         files = await _resolve_attachment_files(
@@ -114,15 +195,42 @@ async def chat(
         )
 
         # 3. Trigger run
+        run_body: dict[str, Any] = {
+            "task": message_text,
+            "files": files,
+            "model": model,
+            "reasoning_effort": reasoning_effort,
+            "execution_mode": execution_mode,
+        }
+        # Forward @-referenced workspace file ids verbatim (only when the client
+        # sent the field) so the orchestrator can prioritise those files.
+        if workspace_file_ids is not None:
+            run_body["workspace_file_ids"] = workspace_file_ids
+        # Presence is meaningful: omitted lets orchestrator inject the user's
+        # enabled-by-default installs; explicit [] disables all skills for this
+        # session/run and must not be replaced with defaults.
+        if skills_provided:
+            run_body["skills"] = skills
+        # Presence is meaningful (mirrors ``skills``): omitted lets the
+        # orchestrator fall back to the tenant's enabled-by-default MCP
+        # servers (today's auto-inject-everything behaviour); explicit []
+        # disables MCP entirely for this run and must NOT be dropped by a
+        # truthiness check.
+        if mcp_server_ids_provided:
+            run_body["mcp_server_ids"] = mcp_server_ids
+        # Per-session opt-out of the platform-global default skills. Presence-
+        # tolerant: forward verbatim only when the client sent it. Omitted keeps
+        # the default (platform defaults injected); explicit ``false`` suppresses
+        # them for this run. The orchestrator treats only a literal ``false`` as
+        # disable, so forwarding the raw value is safe.
+        if "include_platform_defaults" in body:
+            run_body["include_platform_defaults"] = body.get(
+                "include_platform_defaults"
+            )
+
         resp = await client.post(
             f"{orch_url}/sessions/{session_id}/runs",
-            json={
-                "task": message_text,
-                "files": files,
-                "skills": skills,
-                "model": model,
-                "reasoning_effort": reasoning_effort,
-            },
+            json=run_body,
             headers=headers,
         )
         if resp.status_code >= 400:

@@ -19,13 +19,23 @@ from __future__ import annotations
 import datetime as dt
 import logging
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.config import Settings
 from agent_session_orchestrator.domain.db import get_session, privileged_scalars
-from agent_session_orchestrator.domain.models import Attachment, Message, Run, Session
-from agent_session_orchestrator.errors import RunNotFoundError, SessionNotFoundError
+from agent_session_orchestrator.domain.models import (
+    Attachment,
+    Message,
+    Run,
+    Session,
+    Workspace,
+)
+from agent_session_orchestrator.errors import (
+    OrchestratorError,
+    RunNotFoundError,
+    SessionNotFoundError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -139,12 +149,34 @@ class SessionService:
     async def create_session(
         self, *, user_id: str, title: str | None = None,
         metadata: dict[str, object] | None = None,
+        workspace_id: str | None = None,
     ) -> Session:
+        # A session may be scoped to a workspace the caller owns.  Validate the
+        # reference before wiring it up: the workspace must exist in this tenant,
+        # belong to this user, and not be soft-deleted.
+        if workspace_id is not None:
+            ws_result = await self._db.execute(
+                select(Workspace.id).where(
+                    Workspace.id == workspace_id,
+                    Workspace.tenant_id == self._tenant_id,
+                    Workspace.user_id == user_id,
+                    Workspace.deleted_at.is_(None),
+                )
+            )
+            if ws_result.scalar_one_or_none() is None:
+                raise OrchestratorError(
+                    "workspace not found or not owned",
+                    code="AGENT.SESSION.WORKSPACE_INVALID",
+                    status=422,
+                    user_message="所选工作区不存在或无权访问。",
+                )
+
         session = Session(
             tenant_id=self._tenant_id,
             user_id=user_id,
             title=title,
             agent_metadata=metadata or {},  # SQL column is still ``metadata``
+            workspace_id=workspace_id,
         )
         self._db.add(session)
         await self._db.flush()  # populate id via PK default
@@ -175,7 +207,24 @@ class SessionService:
 
     async def delete_session(self, session_id: str) -> None:
         session = await self.get_session(session_id)
-        session.deleted_at = _now()
+        now = _now()
+        session.deleted_at = now
+        # Canvas v2 retention cascade (design §3.5): soft-delete the session's
+        # canvas documents in the same transaction so no canvas outlives its
+        # session (avoids a second "soft-deleted orphan" leak class).  Versions
+        # and suggestions are pruned with the document on physical purge; the
+        # soft-delete only needs to flip the parent's deleted_at.
+        from agent_session_orchestrator.domain.models import CanvasDocument
+
+        await self._db.execute(
+            update(CanvasDocument)
+            .where(
+                CanvasDocument.session_id == session_id,
+                CanvasDocument.tenant_id == self._tenant_id,
+                CanvasDocument.deleted_at.is_(None),
+            )
+            .values(deleted_at=now)
+        )
         await self._db.flush()
 
     async def create_message(
@@ -295,15 +344,25 @@ class SessionService:
         *,
         app_snapshot: dict | None = None,
         source: str = "user",
+        execution_mode: str = "sandbox",
     ) -> Run:
         await self.get_session(session_id)
+        # Pull ``app_id`` out of the snapshot onto a first-class indexed column
+        # so the run history of an App is queryable without unpacking the JSONB
+        # (migration 0014).  NULL for ordinary chat runs (no snapshot).  The
+        # value is a string id (``app_<hex>``); guard against a malformed
+        # non-string snapshot value so a bad payload never 500s the run.
+        snap_app_id = app_snapshot.get("app_id") if app_snapshot else None
+        app_id: str | None = snap_app_id if isinstance(snap_app_id, str) else None
         run = Run(
             tenant_id=self._tenant_id,
             session_id=session_id,
             task_description=task,
             status="PENDING",
             app_snapshot=app_snapshot,
+            app_id=app_id,
             source=source,
+            execution_mode=execution_mode,
         )
         self._db.add(run)
         await self._db.flush()
@@ -372,6 +431,71 @@ class SessionService:
             raise SessionNotFoundError(attachment_id)
         return att
 
+    async def list_attachments_for_user(
+        self, user_id: str, *, kind: str | None = "output"
+    ) -> list[Attachment]:
+        """Return every attachment owned by ``user_id`` in this tenant.
+
+        Cross-session listing for the Artifacts panel.  ``kind`` narrows to
+        ``'input'`` / ``'output'`` when given; the Artifacts panel only ever
+        asks for ``'output'`` (agent-produced run outputs) but the parameter is
+        kept general so an inputs view can reuse the same path.  Tenant RLS
+        scopes to ``tenant_id``; the ``user_id`` predicate is a strictly tighter
+        filter on top (never crosses tenants).  Ordered newest-first.
+        """
+        stmt = (
+            select(Attachment)
+            .where(
+                Attachment.tenant_id == self._tenant_id,
+                Attachment.user_id == user_id,
+            )
+            .order_by(Attachment.created_at.desc())
+        )
+        if kind is not None:
+            stmt = stmt.where(Attachment.kind == kind)
+        result = await self._db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def delete_attachment(
+        self,
+        session_id: str,
+        attachment_id: str,
+        *,
+        blob_store=None,
+    ) -> Attachment:
+        """Delete an attachment row and its S3 blob (hard delete).
+
+        Ownership is enforced by ``get_attachment`` (raises NOT_FOUND for a
+        missing / cross-tenant / soft-deleted-session attachment).  The S3 blob
+        is removed best-effort before the row delete — a missing blob is not a
+        blocker (it may already have been purged by retention), and the row is
+        the authoritative metadata record.  ``blob_store`` is the
+        ``app.state.blob_store`` passed in by the endpoint; when ``None`` the
+        blob step is skipped (the row still deletes).
+        """
+        att = await self.get_attachment(session_id, attachment_id)
+        if blob_store is not None and att.blob_key:
+            # Mirror attachments.py:222 — synchronous boto3 call off-loaded to
+            # a thread.  Best-effort: a blob delete failure is logged but does
+            # not abort the row delete (an orphaned blob only costs storage).
+            import asyncio
+
+            try:
+                await asyncio.to_thread(blob_store.delete, att.blob_key)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "attachment blob delete failed (best-effort)",
+                    extra={"attachment_id": att.id, "key": att.blob_key, "err": str(exc)},
+                )
+        await self._db.execute(
+            delete(Attachment).where(
+                Attachment.id == att.id,
+                Attachment.tenant_id == self._tenant_id,
+            )
+        )
+        await self._db.flush()
+        return att
+
     # ------------------------------------------------------------------ runs
 
     async def list_runs(self, session_id: str) -> list[Run]:
@@ -387,19 +511,31 @@ class SessionService:
         return list(result.scalars().all())
 
     async def list_tenant_runs(
-        self, status: str | None = None, limit: int = 50
+        self,
+        status: str | None = None,
+        limit: int = 50,
+        app_id: str | None = None,
+        offset: int = 0,
     ) -> list[Run]:
         """List all runs for the current tenant (across every session).
 
         Tenant-scoped via ``self._tenant_id`` (sourced from the X-Tenant-Id
         middleware, same as every other method here).  ``status`` filters on an
-        exact match when provided; callers normalise casing.  Ordered newest
-        first and capped by ``limit``.
+        exact match when provided; callers normalise casing.  ``app_id`` narrows
+        to a single App's execution history when provided - NULL ``app_id``
+        rows (ordinary chat runs) never match an app filter, so the App history
+        view is naturally free of chat noise.  Both ``app_id`` and ``status``
+        default to ``None`` (no filter) so existing callers are unchanged.
+        Ordered newest first, paged by ``limit`` + ``offset``.
         """
         stmt = select(Run).where(Run.tenant_id == self._tenant_id)
         if status is not None:
             stmt = stmt.where(Run.status == status)
+        if app_id is not None:
+            stmt = stmt.where(Run.app_id == app_id)
         stmt = stmt.order_by(Run.created_at.desc()).limit(limit)
+        if offset:
+            stmt = stmt.offset(offset)
         result = await self._db.execute(stmt)
         return list(result.scalars().all())
 

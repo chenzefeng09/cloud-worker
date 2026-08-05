@@ -12,8 +12,9 @@ import json
 import os
 import stat
 import tempfile
+from datetime import UTC
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
@@ -24,7 +25,6 @@ from agent_scheduler.services.cube_runtime import (
     CubeSandboxRuntime,
     _parse_memory_mb,
 )
-
 
 # The spawn path now writes a 0600 ``.secrets.json`` under ``workspace_base``;
 # the module default (/var/agent-platform/workspaces) is not writable in CI, so
@@ -51,6 +51,13 @@ def _make_runtime(client: object | None = None) -> CubeSandboxRuntime:
     rt._settings = settings  # noqa: SLF001 — test setup
     rt._client = client  # noqa: SLF001
     rt._skill_cache = None  # noqa: SLF001
+    # __init__ resolves this once at startup; tests bypass __init__, so set a
+    # deterministic value here (the spawn path reads it for the reachable-host
+    # URL rewrite + CubeVS allowOut).
+    rt._public_host = "203.0.113.10"  # noqa: SLF001
+    # These tests pin the controller protocol. Worker exec has its own network
+    # surface and must not escape the unit test after a successful create.
+    rt._exec_start_worker = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
     return rt
 
 
@@ -132,7 +139,7 @@ def test_list_containers_rejects_empty_tenant() -> None:
 def test_spawn_posts_to_e2b_endpoint_and_returns_sandbox_id() -> None:
     client = MagicMock()
     client.post.return_value = _ok_response(
-        {"sandbox_id": "sb_xyz"}, status=201,
+        {"sandboxID": "sb_xyz"}, status=201,
     )
     rt = _make_runtime(client)
     sid = rt.spawn_run(
@@ -152,14 +159,68 @@ def test_spawn_posts_to_e2b_endpoint_and_returns_sandbox_id() -> None:
     # FOUNDATION_API_TOKEN is a secret and is delivered out-of-band via the
     # host-mounted .secrets.json — it must NOT be in the VM env (see the
     # dedicated secret-isolation tests below).
-    assert "FOUNDATION_API_TOKEN" not in body["env"]
-    assert body["resources"]["memory_mb"] > 0
+    assert "FOUNDATION_API_TOKEN" not in body["envVars"]
+    assert "resources" not in body
+
+
+@pytest.mark.parametrize(
+    ("memory_limit", "expected_template", "expected_tier"),
+    [
+        ("2g", "claude-sdk-unified-2g", "small"),
+        ("4g", "claude-sdk-unified-4g", "large"),
+        ("8g", "claude-sdk-unified-4g", "large"),
+    ],
+)
+def test_spawn_claude_selects_cube_template_by_memory_tier(
+    monkeypatch: pytest.MonkeyPatch,
+    memory_limit: str,
+    expected_template: str,
+    expected_tier: str,
+) -> None:
+    monkeypatch.setattr(
+        "agent_scheduler.services.cube_runtime.evaluate_flag",
+        lambda *args, **kwargs: False,
+    )
+    client = MagicMock()
+    client.post.return_value = _ok_response({"sandboxID": "sb_tier"}, status=201)
+    rt = _make_runtime(client)
+    rt._settings = Settings(  # noqa: SLF001
+        env="test",
+        log_level="WARNING",
+        otel_enabled=False,
+        runtime="cube",
+        cube_controller_url="http://cube-test:8443",
+        cube_sandbox_allow_out="10.96.0.10/32",
+        workspace_base=_WORKSPACE_BASE,
+        use_claude_sdk_worker_default=True,
+        claude_sdk_image="claude-sdk-fallback",
+        cube_claude_sdk_template_small="claude-sdk-unified-2g",
+        cube_claude_sdk_template_large="claude-sdk-unified-4g",
+        sandbox_memory_limit_small="2g",
+        sandbox_memory_limit_large="4g",
+    )
+
+    rt.spawn_run(
+        run_id="run_tier",
+        session_id="ses_tier",
+        task="hello",
+        tenant_id="tnt_tier",
+        user_id="usr_tier",
+        foundation_token="ft",
+        llm_virtual_key="vk-test",
+        memory_limit=memory_limit,
+    )
+
+    _, kwargs = client.post.call_args
+    body = kwargs["json"]
+    assert body["templateID"] == expected_template
+    assert body["metadata"]["agent-platform.memory-tier"] == expected_tier
 
 
 def test_spawn_broker_egress_posts_broker_metadata_and_urls() -> None:
     client = MagicMock()
     client.post.return_value = _ok_response(
-        {"sandbox_id": "sb_broker"}, status=201,
+        {"sandboxID": "sb_broker"}, status=201,
     )
     rt = _make_runtime(client)
     rt._settings = Settings(  # noqa: SLF001
@@ -187,16 +248,18 @@ def test_spawn_broker_egress_posts_broker_metadata_and_urls() -> None:
     assert sid == "sb_broker"
     _, kwargs = client.post.call_args
     body = kwargs["json"]
-    env = body["env"]
+    env = body["envVars"]
     meta = body["metadata"]
     assert meta["agent-platform.egress-mode"] == "broker"
     assert meta["agent-platform.tool-broker-url"] == (
         "http://tool-broker:8024/api/tool-broker/v1"
     )
     assert env["SANDBOX_EGRESS_MODE"] == "broker"
-    assert env["TOOL_BROKER_URL"] == "http://tool-broker:8024/api/tool-broker/v1"
+    assert env["TOOL_BROKER_URL"] == (
+        "http://203.0.113.10:8024/api/tool-broker/v1"
+    )
     assert env["LLM_GATEWAY_URL"] == (
-        "http://tool-broker:8024/api/tool-broker/v1/llm-gateway/v1"
+        "http://203.0.113.10:8024/api/tool-broker/v1/llm-gateway/v1"
     )
     assert env["MCP_REGISTRY_URL"] == (
         "http://tool-broker:8024/api/tool-broker/v1/mcp/v1"
@@ -214,20 +277,24 @@ def test_spawn_broker_egress_posts_broker_metadata_and_urls() -> None:
         next(
             m["hostPath"]
             for m in host_mounts
-            if m["mountPath"] == "/workspace/.secrets.json"
+            if m["mountPath"] == "/workspace"
         )
-    )
+    ) / ".secrets.json"
     secrets = json.loads(secrets_path.read_text(encoding="utf-8"))
     assert secrets["TOOL_BROKER_LEASE"].startswith("v1.")
     # Broker-mode network isolation: the named policy label (drives the
     # nftables fallback + admission glue) PLUS the real CubeVS create shape —
-    # ``allow_internet_access=false`` (top-level) + ``network.allow_out``
-    # (nested) carrying the operator-provided tool-broker + DNS CIDRs.  A
+    # ``allow_internet_access=false`` (top-level) + ``network.allowOut``
+    # (nested) carrying the reachable host plus operator-provided CIDRs. A
     # controller implementing CubeVS honours this directly.
     assert meta["agent-platform.network-policy"] == "sandbox-broker-only"
     assert body["allow_internet_access"] is False
     assert body["network"] == {
-        "allow_out": ["10.96.0.10/32", "10.96.0.53/32"]
+        "allowOut": [
+            "203.0.113.10/32",
+            "10.96.0.10/32",
+            "10.96.0.53/32",
+        ]
     }
     # Defense-in-depth: the Cube microVM path injects NO direct infra creds at
     # all (prod Cube runs in broker egress; the worker reaches hot-state and
@@ -273,11 +340,11 @@ def test_spawn_broker_without_allow_out_fails_closed() -> None:
     client.post.assert_not_called()
 
 
-def test_spawn_none_egress_air_gaps_without_failing_closed() -> None:
-    """``none`` mode wants total air-gap: deny internet, empty allow_out, no raise."""
+def test_spawn_none_egress_allows_only_host_gateway() -> None:
+    """``none`` denies internet while retaining the host gateway path."""
     client = MagicMock()
     client.post.return_value = _ok_response(
-        {"sandbox_id": "sb_none"}, status=201,
+        {"sandboxID": "sb_none"}, status=201,
     )
     rt = _make_runtime(client)
     rt._settings = Settings(  # noqa: SLF001
@@ -305,14 +372,14 @@ def test_spawn_none_egress_air_gaps_without_failing_closed() -> None:
     body = kwargs["json"]
     assert body["metadata"]["agent-platform.network-policy"] == "deny-all"
     assert body["allow_internet_access"] is False
-    assert body["network"] == {"allow_out": []}
+    assert body["network"] == {"allowOut": ["203.0.113.10/32"]}
 
 
-def test_spawn_foundation_egress_emits_no_network_field() -> None:
-    """``foundation`` (legacy/dev) mode carries no CubeVS network field."""
+def test_spawn_foundation_egress_keeps_host_gateway_only() -> None:
+    """``foundation`` (legacy/dev) keeps the default-deny host gateway path."""
     client = MagicMock()
     client.post.return_value = _ok_response(
-        {"sandbox_id": "sb_foundation"}, status=201,
+        {"sandboxID": "sb_foundation"}, status=201,
     )
     rt = _make_runtime(client)
     rt._settings = Settings(  # noqa: SLF001
@@ -322,7 +389,7 @@ def test_spawn_foundation_egress_emits_no_network_field() -> None:
         runtime="cube",
         cube_controller_url="http://cube-test:8443",
         sandbox_egress_mode="foundation",
-        # allow_out is irrelevant in foundation mode (no fail-closed, no field).
+        # Extra allow_out is irrelevant in foundation mode.
         cube_sandbox_allow_out="",
         workspace_base=_WORKSPACE_BASE,
     )
@@ -338,8 +405,8 @@ def test_spawn_foundation_egress_emits_no_network_field() -> None:
     assert sid == "sb_foundation"
     _, kwargs = client.post.call_args
     body = kwargs["json"]
-    assert "network" not in body
-    assert "allow_internet_access" not in body
+    assert body["allow_internet_access"] is False
+    assert body["network"] == {"allowOut": ["203.0.113.10/32"]}
 
 
 def test_spawn_propagates_e2b_4xx_as_spawn_error() -> None:
@@ -427,6 +494,73 @@ def test_cancel_run_treats_non_404_errors_as_gone(caplog) -> None:
     rt.cancel_run("sb_dying")  # no raise
 
 
+# --------------------------------------------------------------------------- #
+# reap_expired — scheduler-side leaked-sandbox sweep
+# --------------------------------------------------------------------------- #
+
+
+def test_reap_expired_deletes_only_old_agent_platform_sandboxes() -> None:
+    """Reaper deletes only OUR old sandboxes; spares fresh + foreign ones."""
+    from datetime import datetime, timedelta
+
+    now = datetime.now(UTC)
+    old_started = (now - timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    fresh_started = now.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+    client = MagicMock()
+    # Bare array (what the controller returns in practice).
+    client.get.return_value = _ok_response([  # type: ignore[arg-type]
+        {
+            "sandboxID": "sb_old",
+            "startedAt": old_started,
+            "metadata": {"agent-platform.run-id": "r_old"},
+        },
+        {
+            "sandboxID": "sb_fresh",
+            "startedAt": fresh_started,
+            "metadata": {"agent-platform.run-id": "r_fresh"},
+        },
+        {
+            # Foreign VM (no agent-platform marker), old — must NOT be touched.
+            "sandboxID": "sb_foreign",
+            "startedAt": old_started,
+            "metadata": {"someone-else.id": "x"},
+        },
+    ])
+    client.delete.return_value = _ok_response({}, status=204)
+
+    rt = _make_runtime(client)
+    deleted = rt.reap_expired(max_age_seconds=900)
+
+    assert deleted == 1
+    # Only the old agent-platform sandbox was deleted.
+    client.delete.assert_called_once_with("/sandboxes/sb_old")
+    # And the list was fetched with NO params (all sandboxes across tenants).
+    _, kwargs = client.get.call_args
+    assert "params" not in kwargs
+
+
+def test_reap_expired_skips_unparseable_started_at() -> None:
+    """A missing/unparseable ``startedAt`` is fail-safe: never deleted."""
+    client = MagicMock()
+    client.get.return_value = _ok_response({  # wrapper shape, defensively handled
+        "items": [
+            {
+                "sandboxID": "sb_no_started",
+                "metadata": {"agent-platform.tenant-id": "tnt_a"},
+            },
+            {
+                "sandboxID": "sb_bad_started",
+                "startedAt": "not-a-date",
+                "metadata": {"agent-platform.tenant-id": "tnt_a"},
+            },
+        ],
+    })
+    rt = _make_runtime(client)
+    assert rt.reap_expired(max_age_seconds=900) == 0
+    client.delete.assert_not_called()
+
+
 def test_list_containers_filters_by_tenant_label() -> None:
     client = MagicMock()
     client.get.return_value = _ok_response({
@@ -454,6 +588,46 @@ def test_list_containers_filters_by_tenant_label() -> None:
     # And the URL really included the tenant filter param.
     _, kwargs = client.get.call_args
     assert kwargs["params"]["metadata.agent-platform.tenant-id"] == "tnt_a"
+
+
+def test_list_containers_accepts_v06_bare_array_and_camel_case_fields() -> None:
+    client = MagicMock()
+    client.get.return_value = _ok_response([
+        {
+            "sandboxID": "sb_v06",
+            "state": "running",
+            "metadata": {
+                "agent-platform.tenant-id": "tnt_a",
+                "agent-platform.run-id": "r_v06",
+                "agent-platform.session-id": "s_v06",
+            },
+            "templateID": "claude-sdk-prod",
+            "startedAt": "2026-07-25T00:00:00Z",
+        },
+    ])
+
+    rt = _make_runtime(client)
+
+    assert rt.list_containers(tenant_id="tnt_a") == [
+        {
+            "container_id": "sb_v06",
+            "run_id": "r_v06",
+            "session_id": "s_v06",
+            "tenant_id": "tnt_a",
+            "status": "RUNNING",
+            "image": "claude-sdk-prod",
+            "created_at": "2026-07-25T00:00:00Z",
+        },
+    ]
+
+
+def test_list_containers_accepts_empty_v06_bare_array() -> None:
+    client = MagicMock()
+    client.get.return_value = _ok_response([])
+
+    rt = _make_runtime(client)
+
+    assert rt.list_containers(tenant_id="tnt_a") == []
 
 
 # --------------------------------------------------------------------------- #
@@ -498,13 +672,43 @@ def _make_runtime_with_workspace(client: object, workspace_base: Path) -> CubeSa
     rt._settings = settings  # noqa: SLF001
     rt._client = client  # noqa: SLF001
     rt._skill_cache = None  # noqa: SLF001
+    rt._public_host = "203.0.113.10"  # noqa: SLF001
+    rt._exec_start_worker = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
     return rt
+
+
+def test_spawn_uses_v060_autopause_lifecycle(tmp_path: Path) -> None:
+    """Create requests use v0.6's lifecycle object, not ignored legacy fields."""
+    client = MagicMock()
+    client.post.return_value = _ok_response(
+        {"sandboxID": "sb_lifecycle"}, status=201
+    )
+    rt = _make_runtime_with_workspace(client, tmp_path)
+
+    sid = rt.spawn_run(
+        run_id="run_01J5RUN0000000000000000009",
+        session_id="ses_01J5SES0000000000000000009",
+        task="lifecycle",
+        tenant_id="tnt_01J5TNT0000000000000000001",
+        user_id="usr_01J5USR0000000000000000001",
+        foundation_token="ft-secret",
+    )
+
+    assert sid == "sb_lifecycle"
+    body = client.post.call_args.kwargs["json"]
+    assert body["timeout"] == rt._settings.sandbox_timeout  # noqa: SLF001
+    assert body["lifecycle"] == {
+        "onTimeout": "pause",
+        "autoResume": True,
+    }
+    assert "autoPause" not in body
+    assert "autoResume" not in body
 
 
 def test_spawn_keeps_secrets_out_of_vm_env(tmp_path: Path) -> None:
     """The env dict handed to the Cube VM must carry NONE of the secret keys."""
     client = MagicMock()
-    client.post.return_value = _ok_response({"sandbox_id": "sb_sec"}, status=201)
+    client.post.return_value = _ok_response({"sandboxID": "sb_sec"}, status=201)
     rt = _make_runtime_with_workspace(client, tmp_path)
 
     rt.spawn_run(
@@ -518,7 +722,7 @@ def test_spawn_keeps_secrets_out_of_vm_env(tmp_path: Path) -> None:
     )
 
     _, kwargs = client.post.call_args
-    env = kwargs["json"]["env"]
+    env = kwargs["json"]["envVars"]
     for key in _SECRET_KEYS:
         assert key not in env, f"{key} leaked into the Cube VM env dict"
     # Routing / metadata that is NOT a secret stays in env.
@@ -526,13 +730,39 @@ def test_spawn_keeps_secrets_out_of_vm_env(tmp_path: Path) -> None:
     assert env["FOUNDATION_USER_ID"] == "usr_01J5USR0000000000000000001"
     assert env["FOUNDATION_API_URL"]
     assert env["RUN_ID"] == "run_01J5RUN0000000000000000010"
-    assert "AGENT_TASK_JSON" in env
+    assert "AGENT_TASK_JSON" not in env
+    launch_env = rt._exec_start_worker.call_args.args[2]  # noqa: SLF001
+    assert "AGENT_TASK_JSON" in launch_env
+
+
+def test_spawn_keeps_large_task_out_of_create_env_but_passes_it_to_worker(
+    tmp_path: Path,
+) -> None:
+    """Long prompts bypass Cube's ~4 KiB create-time env-value ceiling."""
+    client = MagicMock()
+    client.post.return_value = _ok_response({"sandboxID": "sb_long"}, status=201)
+    rt = _make_runtime_with_workspace(client, tmp_path)
+    long_task = "spacecraft FOC validation " * 400
+
+    rt.spawn_run(
+        run_id="run_long",
+        session_id="ses_long",
+        task=long_task,
+        tenant_id="tnt_long",
+        user_id="usr_long",
+        foundation_token="ft-secret",
+    )
+
+    create_env = client.post.call_args.kwargs["json"]["envVars"]
+    assert "AGENT_TASK_JSON" not in create_env
+    launch_env = rt._exec_start_worker.call_args.args[2]  # noqa: SLF001
+    assert json.loads(launch_env["AGENT_TASK_JSON"])["task"] == long_task
 
 
 def test_spawn_writes_and_mounts_secrets_file(tmp_path: Path) -> None:
     """Secrets land in a 0600 host file host-mounted at /workspace/.secrets.json."""
     client = MagicMock()
-    client.post.return_value = _ok_response({"sandbox_id": "sb_sec2"}, status=201)
+    client.post.return_value = _ok_response({"sandboxID": "sb_sec2"}, status=201)
     rt = _make_runtime_with_workspace(client, tmp_path)
 
     rt.spawn_run(
@@ -548,15 +778,17 @@ def test_spawn_writes_and_mounts_secrets_file(tmp_path: Path) -> None:
     _, kwargs = client.post.call_args
     body = kwargs["json"]
 
-    # 1. A host-mount entry targets exactly the path the worker reads.
+    # 1. CubeMaster requires a directory source, so the writable per-run
+    # directory is mounted at /workspace and contains the file the worker reads.
     host_mounts = json.loads(body["metadata"]["host-mount"])
     secret_mounts = [
-        m for m in host_mounts if m["mountPath"] == "/workspace/.secrets.json"
+        m for m in host_mounts if m["mountPath"] == "/workspace"
     ]
     assert len(secret_mounts) == 1, host_mounts
     mount = secret_mounts[0]
-    assert mount["readOnly"] is True
-    host_path = Path(mount["hostPath"])
+    assert mount["readOnly"] is False
+    host_dir = Path(mount["hostPath"])
+    host_path = host_dir / ".secrets.json"
 
     # 2. The file was actually written under workspace_base, mode 0600.
     expected_dir = (
@@ -565,7 +797,7 @@ def test_spawn_writes_and_mounts_secrets_file(tmp_path: Path) -> None:
         / "ses_01J5SES0000000000000000011"
         / "run_01J5RUN0000000000000000011"
     )
-    assert host_path == expected_dir / ".secrets.json"
+    assert host_dir == expected_dir
     assert host_path.exists()
     assert stat.S_IMODE(os.stat(host_path).st_mode) == 0o600
 
@@ -584,7 +816,7 @@ def test_spawn_writes_and_mounts_secrets_file(tmp_path: Path) -> None:
 def test_spawn_omits_absent_optional_secrets_from_file(tmp_path: Path) -> None:
     """Optional secrets (LLM_VIRTUAL_KEY) absent from env stay out of the file."""
     client = MagicMock()
-    client.post.return_value = _ok_response({"sandbox_id": "sb_sec3"}, status=201)
+    client.post.return_value = _ok_response({"sandboxID": "sb_sec3"}, status=201)
     rt = _make_runtime_with_workspace(client, tmp_path)
 
     rt.spawn_run(
@@ -603,12 +835,98 @@ def test_spawn_omits_absent_optional_secrets_from_file(tmp_path: Path) -> None:
         next(
             m["hostPath"]
             for m in host_mounts
-            if m["mountPath"] == "/workspace/.secrets.json"
+            if m["mountPath"] == "/workspace"
         )
-    )
+    ) / ".secrets.json"
     payload = json.loads(host_path.read_text(encoding="utf-8"))
     assert "LLM_VIRTUAL_KEY" not in payload
     assert payload["FOUNDATION_API_TOKEN"] == "ft-secret"
+
+
+# --------------------------------------------------------------------------- #
+# Artifact publication
+# --------------------------------------------------------------------------- #
+
+
+_ARTIFACT_META = {
+    "agent-platform.tenant-id": "tnt_01J5TNT0000000000000000001",
+    "agent-platform.session-id": "ses_01J5SES0000000000000000009",
+    "agent-platform.run-id": "run_01J5RUN0000000000000000009",
+}
+
+
+def _seed_run_dir(workspace_base: Path) -> Path:
+    """Create a finished run's host dir: two outputs + control-plane files."""
+    run_dir = (
+        workspace_base
+        / _ARTIFACT_META["agent-platform.tenant-id"]
+        / _ARTIFACT_META["agent-platform.session-id"]
+        / _ARTIFACT_META["agent-platform.run-id"]
+    )
+    (run_dir / "inputs").mkdir(parents=True)
+    (run_dir / "chart.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    (run_dir / "report.md").write_text("# report", encoding="utf-8")
+    (run_dir / "result.json").write_text(
+        json.dumps({"status": "OK", "summary": "done"}), encoding="utf-8"
+    )
+    (run_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    (run_dir / "worker.log").write_text("noise", encoding="utf-8")
+    (run_dir / ".secrets.json").write_text('{"LLM_API_KEY": "sk-leak"}', encoding="utf-8")
+    (run_dir / "inputs" / "upload.csv").write_text("a,b\n", encoding="utf-8")
+    return run_dir
+
+
+def test_get_run_status_publishes_output_files(tmp_path: Path) -> None:
+    """A finished cube run uploads its outputs — the UI resolves images by name."""
+    client = MagicMock()
+    client.get.return_value = _ok_response(
+        {"state": "running", "metadata": _ARTIFACT_META},
+    )
+    rt = _make_runtime_with_workspace(client, tmp_path)
+    _seed_run_dir(tmp_path)
+
+    s3 = MagicMock()
+    with patch(
+        "agent_scheduler.services.artifact_store.make_s3_client", return_value=s3
+    ):
+        result = rt.get_run_status("sb_done")
+
+    assert result["status"] == "COMPLETED"
+    names = sorted(a["filename"] for a in result["artifacts"])
+    # Outputs published; control-plane files and user uploads withheld.
+    assert names == ["chart.png", "report.md"]
+    assert {"result.json", "events.jsonl", "worker.log", ".secrets.json",
+            "upload.csv"}.isdisjoint(names)
+    keys = {c.kwargs["Key"] for c in s3.put_object.call_args_list}
+    assert any(k.endswith("/artifacts/chart.png") for k in keys)
+    assert all(
+        k.startswith(
+            f"tenant/{_ARTIFACT_META['agent-platform.tenant-id']}"
+            f"/sessions/{_ARTIFACT_META['agent-platform.session-id']}"
+        )
+        for k in keys
+    )
+
+
+def test_get_run_status_does_not_publish_mid_run(tmp_path: Path) -> None:
+    """No result.json yet -> still RUNNING -> nothing is uploaded half-written."""
+    client = MagicMock()
+    client.get.return_value = _ok_response(
+        {"state": "running", "metadata": _ARTIFACT_META},
+    )
+    rt = _make_runtime_with_workspace(client, tmp_path)
+    run_dir = _seed_run_dir(tmp_path)
+    (run_dir / "result.json").unlink()
+
+    s3 = MagicMock()
+    with patch(
+        "agent_scheduler.services.artifact_store.make_s3_client", return_value=s3
+    ):
+        result = rt.get_run_status("sb_running")
+
+    assert result["status"] == "RUNNING"
+    assert "artifacts" not in result
+    s3.put_object.assert_not_called()
 
 
 # --------------------------------------------------------------------------- #

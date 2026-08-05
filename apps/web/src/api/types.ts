@@ -6,8 +6,81 @@ export interface Session {
   status: 'ACTIVE' | 'PAUSED' | 'COMPLETED' | 'ERROR' | 'ARCHIVED';
   current_run_id: string | null;
   metadata?: Record<string, unknown> | null;
+  /**
+   * Workspace this session was started in. Set at creation time (POST /sessions
+   * body). The workspace's instructions / base files / skills are injected
+   * server-side; the frontend only records the ownership.
+   */
+  workspace_id?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+// ─── Workspace (→ session-orchestrator, proxied via BFF /workspaces) ──────────
+//
+// A workspace is a reusable, cross-session container of an instruction preamble,
+// a set of base files, and a default skill selection. Sessions started inside a
+// workspace inherit that context (injection happens server-side). The backend
+// lazily creates a `default` workspace per user, so the list always has >= 1
+// entry with `is_default: true`.
+
+/** Presentation hints stored on a workspace (optional). */
+export interface WorkspaceMeta {
+  /** A short mono/symbol glyph shown in the switcher chip. */
+  glyph?: string;
+  /** Accent colour (hex) driving the theme stripe. */
+  accent?: string;
+}
+
+export interface Workspace {
+  id: string;
+  tenant_id: string;
+  user_id: string;
+  name: string;
+  description: string | null;
+  /** Instruction preamble injected at the start of every task in this workspace. */
+  instructions: string | null;
+  /** Skill ids enabled by default for tasks in this workspace. */
+  skills: string[];
+  /** The lazily-created fallback workspace — cannot be deleted. */
+  is_default: boolean;
+  meta: WorkspaceMeta;
+  sensitivity_level?: DlpSensitivity;
+  file_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+/** One base file attached to a workspace. */
+export interface WorkspaceFile {
+  id: string;
+  workspace_id: string;
+  filename: string;
+  mime: string;
+  size_bytes: number;
+  description: string;
+  sensitivity_level?: DlpSensitivity;
+  created_at: string;
+}
+
+/** Body for POST /workspaces — only `name` is required. */
+export interface WorkspaceCreate {
+  name: string;
+  description?: string;
+  instructions?: string;
+  skills?: string[];
+  meta?: WorkspaceMeta;
+  sensitivity_level?: DlpSensitivity;
+}
+
+/** Body for PATCH /workspaces/{id} — every field optional. */
+export interface WorkspaceUpdate {
+  name?: string;
+  description?: string;
+  instructions?: string;
+  skills?: string[];
+  meta?: WorkspaceMeta;
+  sensitivity_level?: DlpSensitivity;
 }
 
 /** One entry in a TOOL message's tool_calls array. */
@@ -16,6 +89,8 @@ export interface ToolCallEntry {
   name: string;
   /** Parsed input object (may be empty if args couldn't be parsed). */
   input: Record<string, unknown>;
+  /** Legacy raw args string used by older persisted tool-call rows. */
+  args?: string;
   /** Tool output text, present after the tool has returned. */
   result?: string;
   /** Execution state, e.g. "success" or "error". */
@@ -63,6 +138,16 @@ export interface Message {
    * clearStreamingBlocks to remove all temp blocks for a run at once.
    */
   streamRunId?: string;
+
+  /**
+   * canvas.v2 Phase B: id of a server canvas object materialized from this
+   * assistant message (the model called create_canvas → orchestrator
+   * materialized it and backfilled this column).  Present on the durable DB
+   * row after hydration, and set live via the `canvas_created` SSE handler.
+   * When set (and the canvas.v2 flag is on) ChatWindow renders a
+   * CanvasMessageCard anchored under this message's bubble.
+   */
+  canvas_id?: string | null;
 }
 
 export interface CursorPage<T> {
@@ -89,6 +174,7 @@ export interface UserProfile {
    *  by the BFF via authz /my-permissions). Optional for backward-compat when
    *  authz is unreachable — the BFF attaches `[]` in that case. */
   permissions?: string[];
+  clearance?: DlpSensitivity;
 }
 
 export interface SSEEvent {
@@ -98,7 +184,44 @@ export interface SSEEvent {
 
 // ─── Library ────────────────────────────────────────────────────────────────
 
-export type McpTransport = 'http' | 'stdio';
+export type McpTransport = 'http' | 'sse' | 'stdio';
+
+export type McpAuthType = 'none' | 'bearer' | 'api_key' | 'oauth';
+
+/** Auth configuration for an HTTP MCP server. Secrets (token / api_key /
+ *  client_secret) are write-only: the backend may redact them on read, so
+ *  callers should not assume a round-tripped value equals the one they
+ *  submitted. */
+export interface McpAuth {
+  type: McpAuthType;
+  token?: string | null;
+  /** Header carrying the api key (api_key auth); defaults to "X-API-Key". */
+  header_name?: string | null;
+  api_key?: string | null;
+  /** OAuth 2.0 client id (oauth auth). */
+  client_id?: string | null;
+  /** OAuth 2.0 client secret (oauth auth) - write-only, may be redacted on read. */
+  client_secret?: string | null;
+  /** OAuth 2.0 token endpoint URL (oauth auth). */
+  token_url?: string | null;
+  /** OAuth 2.0 scopes to request (oauth auth). */
+  scopes?: string[];
+  /** True when a bearer token is stored (field value is masked on read). */
+  has_token?: boolean;
+  /** True when an api_key is stored (field value is masked on read). */
+  has_api_key?: boolean;
+  /** True when an OAuth client_secret is stored (field value is masked on read). */
+  has_client_secret?: boolean;
+}
+
+/** Input shape for the auth field on register/patch requests. */
+export type McpAuthInput = McpAuth;
+
+/** Tool allow/block filter applied at MCP invocation time. */
+export interface ToolFilter {
+  allow: string[];
+  block: string[];
+}
 
 export interface McpServer {
   id: string;
@@ -108,8 +231,20 @@ export interface McpServer {
   endpoint: string | null;
   command: string | null;
   env: Record<string, string>;
-  scopes: string[];
   enabled: boolean;
+  /** HTTP custom headers (http transport only). */
+  headers?: Record<string, string>;
+  /** Auth scheme for HTTP transport. */
+  auth?: McpAuth;
+  /** Per-call timeout in seconds; null = backend default. */
+  timeout_seconds?: number | null;
+  /** Tool allow/block list applied at invocation. */
+  tool_filter?: ToolFilter;
+  /** Extra argv for stdio transport (command is the executable). */
+  args?: string[];
+  /** Tools discovered by the last connectivity test. null/empty when the
+   *  server has not been probed yet. Same shape as the test/probe result. */
+  discovered_tools?: McpTestTool[] | null;
   created_at: string;
   updated_at: string;
 }
@@ -122,6 +257,13 @@ export interface Skill {
   owner: string | null;
   visibility: 'private' | 'tenant' | 'public';
   created_at: string;
+  /**
+   * True for platform-global default skills (built into the deployment, owned by
+   * the reserved platform tenant). Every org has them and every user gets them
+   * by default; they are read-only in the library — no per-tenant install/
+   * uninstall/delete applies. Absent/false for a tenant's own skills.
+   */
+  is_platform_default?: boolean;
 }
 
 /** A skill in the user's toolbox — Skill fields + install metadata. */
@@ -156,6 +298,26 @@ export interface KnowledgeDocument {
   status: DocumentStatus;
   uploaded_at: string;
   chunk_count: number;
+  /** Owning folder; null/absent = root. (knowledge-library-v1) */
+  folder_id?: string | null;
+  /** Document sensitivity (L1..L5); defaults to L1 when absent. */
+  sensitivity?: DlpSensitivity;
+  /** Uploader — reserved for a future personal-knowledge-source feature. */
+  uploaded_by_user_id?: string | null;
+}
+
+/** A tenant knowledge folder (self-referential parent_id tree). */
+export interface KnowledgeFolder {
+  id: string;
+  tenant_id: string;
+  /** null = root layer. */
+  parent_id: string | null;
+  name: string;
+  /** Default sensitivity applied to uploads that omit one. */
+  default_sensitivity: DlpSensitivity;
+  created_by_user_id?: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface ListPage<T> {
@@ -249,6 +411,8 @@ export interface App {
   author_id: string;
   visibility: AppVisibility;
   current_version_id?: string | null;
+  /** Free-form tags shown on the app card and used for OR-filtering in the app center. */
+  tags: string[];
   created_at: string;
   updated_at: string;
   versions?: AppVersion[];
@@ -260,6 +424,7 @@ export interface AppCreate {
   description?: string | null;
   icon?: string | null;
   visibility: AppVisibility;
+  tags?: string[];
   version: AppVersionCreate;
 }
 
@@ -269,6 +434,8 @@ export interface AppUpdate {
   description?: string | null;
   icon?: string | null;
   visibility?: AppVisibility;
+  /** Omit (undefined) to leave tags unchanged; send an array to overwrite. */
+  tags?: string[];
 }
 
 /** One row in the admin review queue: a pending version + its App context. */
@@ -312,6 +479,56 @@ export interface AppRunResult {
   status: string;
 }
 
+// ─── App execution history (GET /apps/{id}/runs) ──────────────────────────────
+//
+// Trimmed run rows for an App's history view. The BFF forwards to the
+// orchestrator's `GET /runs?app_id=<id>` and reduces each row to the fields a
+// list card needs (full `app_snapshot` is dropped in favour of a compact
+// `app` block + truncated `inputs`). `status` reuses the shared RunStatus
+// union; `source` is "user" (manual) or "schedule" (cron-triggered).
+
+/** Compact App context embedded in an App run history item. */
+export interface AppRunHistoryApp {
+  app_id: string;
+  app_name: string;
+  /** Version label as stored on the published snapshot (string, e.g. "1"). */
+  app_version: string;
+  app_version_id: string;
+  model: string;
+}
+
+/** One resolved input value recorded in an App run history item. */
+export interface AppRunHistoryInput {
+  key: string;
+  label: string;
+  type: string;
+  /** string for text/textarea/select; string[] for multiselect; file ref array for file. */
+  value: unknown;
+}
+
+/** One run row in an App's execution history. */
+export interface AppRunHistoryItem {
+  id: string;
+  session_id: string;
+  status: RunStatus;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  result_summary: string | null;
+  error_message: string | null;
+  source: string | null;
+  execution_mode: string | null;
+  app: AppRunHistoryApp;
+  inputs: AppRunHistoryInput[];
+}
+
+/** Response envelope for GET /apps/{id}/runs (limit/offset pagination, no total). */
+export interface AppRunHistoryResponse {
+  items: AppRunHistoryItem[];
+  limit: number;
+  offset: number;
+}
+
 // ─── Attachments ────────────────────────────────────────────────────────────
 
 export type AttachmentKind = 'input' | 'output';
@@ -330,6 +547,31 @@ export interface Attachment {
 
 export interface SessionFile extends Attachment {
   // Alias for clarity in UI contexts
+}
+
+// ─── Artifacts (产物) ─────────────────────────────────────────────────────────
+//
+// Cross-session listing of the calling user's session-generated artifacts
+// (canvas documents + run output files). Union view assembled by the BFF; the
+// frontend dispatches preview/delete per `kind`. Fields are optional where the
+// underlying source may not carry them (files have filename/mime/size, canvases
+// carry canvas_kind/current_version).
+
+export type ArtifactKind = 'canvas' | 'file';
+
+export interface Artifact {
+  id: string;
+  kind: ArtifactKind;
+  title: string;
+  filename?: string;
+  mime?: string;
+  size_bytes?: number;
+  session_id: string;
+  run_id?: string | null;
+  canvas_kind?: string;
+  current_version?: number;
+  created_at: string;
+  updated_at?: string;
 }
 
 // ─── Admin ───────────────────────────────────────────────────────────────────
@@ -500,6 +742,11 @@ export interface ProbeResults {
   /** Raw context window value as string, or "unknown" if not advertised. */
   context_window_value: string;
   parallel_tool_calls: ProbeCapabilityResult;
+  /** Per-model details keyed by model id; null fields mean "not detected". */
+  model_details?: Record<string, {
+    context_length?: number | null;
+    max_tokens?: number | null;
+  }>;
 }
 
 export interface ProbeReport {
@@ -525,13 +772,57 @@ export interface DailyTokenUsageResponse {
   days: DailyTokenUsage[];
 }
 
-export type RunStatus = 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
+/** One day's input/output/total split in a usage-breakdown response. */
+export interface DailyTokenBreakdown {
+  day: string;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+}
+
+/** Per-source token aggregate over the breakdown window. */
+export interface SourceTokenUsage {
+  source: string;
+  total_tokens: number;
+  run_count: number;
+}
+
+/** Multi-dimensional token-usage breakdown (daily split + by source). */
+export interface TokenUsageBreakdown {
+  days_window: number;
+  daily: DailyTokenBreakdown[];
+  by_source: SourceTokenUsage[];
+}
+
+/**
+ * Run lifecycle status.  `PAUSED` is the HITL pause state — the run is waiting
+ * for a human confirm/answer and is NOT terminal: it resumes to `RUNNING` once
+ * the pending interaction is responded to.
+ */
+export type RunStatus =
+  | 'PENDING'
+  | 'RUNNING'
+  | 'PAUSED'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'CANCELLED';
+
+/**
+ * How a run executes:
+ *   'inline'  — chat mode: the orchestrator answers in-process via the LLM
+ *               gateway; no sandbox is dispatched.
+ *   'sandbox' — agent mode (default): the run executes in a sandbox.
+ * Optional on the wire — older runs (and non-chat entry points) omit it, which
+ * the backend treats as 'sandbox'.
+ */
+export type ExecutionMode = 'inline' | 'sandbox';
 
 export interface Run {
   id: string;
   session_id: string;
   sandbox_id: string | null;
   status: RunStatus;
+  execution_mode?: ExecutionMode;
   task_description: string | null;
   result_summary: string | null;
   error_message: string | null;
@@ -1113,16 +1404,50 @@ export interface RegisterMcpServerRequest {
   endpoint?: string | null;
   command?: string | null;
   env?: Record<string, string>;
-  scopes?: string[];
   enabled?: boolean;
+  headers?: Record<string, string>;
+  auth?: McpAuthInput;
+  timeout_seconds?: number | null;
+  tool_filter?: ToolFilter;
+  args?: string[];
 }
 
 export interface PatchMcpServerRequest {
   endpoint?: string | null;
   command?: string | null;
   env?: Record<string, string> | null;
-  scopes?: string[] | null;
   enabled?: boolean | null;
+  headers?: Record<string, string> | null;
+  auth?: McpAuthInput | null;
+  timeout_seconds?: number | null;
+  tool_filter?: ToolFilter | null;
+  args?: string[] | null;
+}
+
+/** Body for the id-less probe endpoint (POST /admin/mcp/servers/probe): the
+ *  connection fields as currently typed in the admin form, so a server that has
+ *  not been created yet can still have its tool list discovered. */
+export interface ProbeMcpServerRequest {
+  transport: McpTransport;
+  endpoint?: string | null;
+  headers?: Record<string, string>;
+  auth?: McpAuthInput;
+  timeout_seconds?: number | null;
+}
+
+/** One tool discovered by an MCP "test connection" probe. */
+export interface McpTestTool {
+  name: string;
+  description?: string | null;
+}
+
+/** Result of POST /admin/mcp/servers/{id}/test and of POST
+ *  /admin/mcp/servers/probe (same shape). */
+export interface McpTestResult {
+  ok: boolean;
+  server_info?: Record<string, unknown>;
+  tools?: McpTestTool[];
+  error?: string | null;
 }
 
 // ─── Platform governance: Ops / runs / sandboxes ──────────────────────────────
@@ -1662,6 +1987,34 @@ export interface RespondBody {
 }
 
 /**
+ * Body for POST /sessions/{id}/canvas/edit — the silent, chat-invisible canvas
+ * revision endpoint. Unlike the normal chat flow this does NOT start an agent
+ * run or produce any transcript message; the BFF returns the replacement text
+ * synchronously and the result flows straight into the canvas suggestion card.
+ */
+export interface CanvasEditBody {
+  title: string;
+  content: string;
+  scope: 'selection' | 'document';
+  selection?: { text: string; start: number; end: number } | null;
+  instruction: string;
+  model?: string;
+}
+
+export interface CanvasEditResult {
+  replacement: string;
+  summary: string | null;
+  /**
+   * How the replacement should be applied. Defaults to 'selection' (replace the
+   * selected fragment in place). The BFF returns 'document' when it detects the
+   * model returned a whole-document rewrite for a selection-scoped request — the
+   * frontend then applies `replacement` as the entire new document instead of
+   * splicing it at the selection (which would duplicate the surrounding text).
+   */
+  apply_to?: 'selection' | 'document';
+}
+
+/**
  * A pending HITL interaction awaiting user input.
  * Kept in the chat store's `pendingInteractions` map (per-session).
  */
@@ -1691,6 +2044,120 @@ export interface PendingInteractionItem {
 
 export interface PendingInteractionsResponse {
   items: PendingInteractionItem[];
+}
+
+// ─── Canvas v2 (→ session-orchestrator schemas/canvas.py) ────────────────────
+//
+// Wire types for the "canvas v2" feature — server-owned canvas documents with
+// versioned blocks + scoped-edit suggestions (accept/reject/revert). Field
+// names match agent_session_orchestrator/schemas/canvas.py EXACTLY (Block,
+// CanvasOut, VersionSummaryOut, SuggestionOut, Diff) so the BFF proxy can pass
+// payloads through without reshaping.
+
+export interface CanvasBlock {
+  id: string;
+  // 'html' is an executable-canvas block: one self-contained HTML document
+  // stored verbatim, rendered in a sandboxed iframe instead of the prose editor.
+  type: 'heading' | 'paragraph' | 'html';
+  text: string;
+}
+
+/** Full canvas wire object — current version blocks inline (matches CanvasOut). */
+export interface CanvasDocument {
+  id: string;
+  session_id: string;
+  kind: string;
+  // Derived server-side from the current blocks: 'html' when the canvas is a
+  // single executable HTML block, else 'markdown'. Lets the UI branch to the
+  // sandboxed-iframe preview. Optional so older payloads default to markdown.
+  content_type?: 'markdown' | 'html';
+  title: string;
+  current_version: number;
+  source_message_id?: string | null;
+  source_run_id?: string | null;
+  blocks: CanvasBlock[];
+  created_at: string;
+  updated_at: string;
+}
+
+/** Version list item — metadata only, no blocks (matches VersionSummaryOut). */
+export interface CanvasVersionSummary {
+  id: string;
+  canvas_id: string;
+  version: number;
+  change_summary?: string | null;
+  created_by: string;
+  base_version?: number | null;
+  created_at: string;
+}
+
+/** A single scoped edit in a suggestion (matches Diff). */
+export interface CanvasDiff {
+  block_id: string;
+  op: 'replace' | 'delete' | 'insert_after';
+  orig?: string | null;
+  sugg?: string | null;
+  /**
+   * Present for a character-selection magic edit. `orig` / `sugg` remain the
+   * complete block snapshots used by the accept transaction; these fields let
+   * the UI render only the selected delta in place.
+   */
+  selection_start?: number | null;
+  selection_end?: number | null;
+  selected_orig?: string | null;
+  selected_sugg?: string | null;
+}
+
+/** A proposed scoped edit awaiting accept/reject (matches SuggestionOut). */
+export interface CanvasSuggestion {
+  id: string;
+  canvas_id: string;
+  base_version: number;
+  status: string; // 'proposed' | 'accepted' | 'rejected'
+  instruction: string;
+  diffs: CanvasDiff[];
+  change_summary?: string | null;
+  created_at: string;
+  resolved_at?: string | null;
+}
+
+/** Request body for POST /sessions/{sid}/canvases (create). source_message_id XOR content. */
+export interface CanvasCreateBody {
+  source_message_id?: string;
+  content?: string;
+  kind?: string;
+  title?: string;
+}
+
+export interface CanvasSelectionSegment {
+  block_id: string;
+  start: number;
+  end: number;
+  text: string;
+}
+
+export type CanvasEditScope =
+  | { type: 'document' }
+  | { type: 'blocks'; block_ids: string[] }
+  | { type: 'selection'; segments: CanvasSelectionSegment[] };
+
+/** Body for POST /sessions/{sid}/canvases/{cid}/edit (BFF LLM edge). */
+export interface CanvasV2EditBody {
+  instruction: string;
+  scope: CanvasEditScope;
+  model?: string;
+  base_version?: number; // optimistic-lock pre-check: BFF returns 409 if != current
+}
+
+/** BFF edit response envelope. */
+export interface CanvasEditResponse {
+  suggestion: CanvasSuggestion;
+}
+
+/** Manual version body: POST /canvases/{cid}/versions */
+export interface CanvasManualVersionBody {
+  blocks: CanvasBlock[];
+  base_version: number;
 }
 
 // ─── Storage admin (→ foundation-lifecycle Phase 7) ─────────────────────────────
@@ -1738,14 +2205,23 @@ export interface OrphanReportListResponse {
 
 export type CronJobStatus = 'ok' | 'error' | 'skipped';
 
+/** How a CronJob row is fired: on a cron schedule, or by an inbound webhook. */
+export type TriggerType = 'schedule' | 'webhook';
+
 export interface CronJob {
   id: string;
   tenant_id: string;
   app_id: string;
   name: string;
-  cron_expression: string;
+  trigger_type: TriggerType;
+  // Null for webhook triggers (they carry no cron schedule).
+  cron_expression: string | null;
   timezone: string;
   input_values: Record<string, unknown>;
+  // incoming payload key → App input_schema field key (webhook triggers only).
+  field_mapping?: Record<string, string> | null;
+  // Whether a webhook secret exists; the plaintext is NEVER returned by list/get.
+  has_webhook_secret: boolean;
   enabled: boolean;
   source: string;
   last_run_at: string | null;
@@ -1759,11 +2235,32 @@ export interface CronJob {
 export interface CronJobCreate {
   app_id: string;
   name: string;
-  cron_expression: string;
+  trigger_type?: TriggerType;
+  // Required for schedule triggers; omitted for webhook triggers.
+  cron_expression?: string;
   timezone?: string;
   input_values?: { text?: Record<string, string>; multi?: Record<string, string[]> };
+  // Required for webhook triggers: incoming payload key → App field key.
+  field_mapping?: Record<string, string>;
   enabled?: boolean;
   source?: string;
+}
+
+/**
+ * Create response — a CronJob plus, exactly once for a freshly-created webhook
+ * trigger, the plaintext `webhook_secret` and full `webhook_path`. Both are null
+ * for schedule creates.
+ */
+export interface CronJobCreated extends CronJob {
+  webhook_secret?: string | null;
+  webhook_path?: string | null;
+}
+
+/** Secret-rotation response — the new plaintext secret, returned exactly once. */
+export interface WebhookSecret {
+  id: string;
+  webhook_secret: string;
+  webhook_path: string;
 }
 
 export interface CronJobUpdate {

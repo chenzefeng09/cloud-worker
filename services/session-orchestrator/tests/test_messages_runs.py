@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_session_orchestrator.domain.models import Message, Run, Session
@@ -507,6 +509,7 @@ def test_fetch_memory_returns_empty_on_http_error() -> None:
             _fetch_memory(
                 knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
                 tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
                 query="hello",
             )
         )
@@ -537,11 +540,239 @@ def test_fetch_memory_formats_hits() -> None:
             _fetch_memory(
                 knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
                 tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
                 query="我叫什么",
             )
         )
     assert "张三" in result
     assert "简洁" in result
+
+
+def test_fetch_memory_sends_real_user_header() -> None:
+    """_fetch_memory sends the real user in X-User-Id — never the SYSTEM sentinel.
+
+    knowledge-ingest's authz guard is fail-closed and rejects "SYSTEM", which
+    used to make the memory search silently 403.
+    """
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_memory
+
+    captured_headers: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+        def json(self):
+            return {"hits": []}
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw):
+            captured_headers.update(kw.get("headers") or {})
+            return _FakeResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        asyncio.get_event_loop().run_until_complete(
+            _fetch_memory(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
+                query="hello",
+            )
+        )
+    assert captured_headers.get("X-User-Id") == "usr_TESTUSER00000000000000001"
+    assert captured_headers.get("X-User-Id") != "SYSTEM"
+
+
+def test_fetch_memory_passes_exclude_origin_session_id() -> None:
+    """_fetch_memory forwards session_id as exclude_origin_session_id."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_memory
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+        def json(self):
+            return {"hits": []}
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw):
+            captured.update(kw.get("params") or {})
+            return _FakeResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        asyncio.get_event_loop().run_until_complete(
+            _fetch_memory(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
+                query="我叫什么",
+                session_id="ses_current",
+            )
+        )
+    assert captured.get("exclude_origin_session_id") == "ses_current"
+
+
+def test_fetch_memory_omits_exclude_when_no_session() -> None:
+    """_fetch_memory does not send exclude_origin_session_id when session_id is empty."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_memory
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+        def json(self):
+            return {"hits": []}
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw):
+            captured.update(kw.get("params") or {})
+            return _FakeResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        asyncio.get_event_loop().run_until_complete(
+            _fetch_memory(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
+                query="hi",
+            )
+        )
+    assert "exclude_origin_session_id" not in captured
+
+
+def test_fetch_default_installed_skills_uses_internal_contract() -> None:
+    """The skill-store lookup sends authoritative tenant/user context + scope."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import (
+        _fetch_default_installed_skills,
+    )
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "items": [
+                    {"name": "poet"},
+                    {"name": "poet"},
+                    {"name": "analyst"},
+                    {"unexpected": True},
+                ]
+            }
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+
+        async def get(self, url, **kw):
+            captured["url"] = url
+            captured["params"] = kw.get("params")
+            captured["headers"] = kw.get("headers")
+            return _FakeResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        result = asyncio.get_event_loop().run_until_complete(
+            _fetch_default_installed_skills(
+                skill_store_url="http://skill-store/api/skills/v1/",
+                service_scopes="skill.read_internal",
+                tenant_id="tnt_test",
+                user_id="usr_test",
+            )
+        )
+
+    assert result == ["poet", "analyst"]
+    assert captured["url"].endswith("/internal/skills/default-installed")
+    assert captured["params"] == {"tenant_id": "tnt_test", "user_id": "usr_test"}
+    assert captured["headers"] == {
+        "X-Tenant-Id": "tnt_test",
+        "X-User-Id": "usr_test",
+        "X-Service-Scopes": "skill.read_internal",
+    }
+
+
+def test_fetch_default_installed_skills_is_failure_open() -> None:
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import (
+        _fetch_default_installed_skills,
+    )
+
+    class _FailClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def get(self, url, **kw): raise httpx.ConnectError("down")
+
+    with patch.object(httpx, "AsyncClient", return_value=_FailClient()):
+        result = asyncio.get_event_loop().run_until_complete(
+            _fetch_default_installed_skills(
+                skill_store_url="http://skill-store/api/skills/v1",
+                service_scopes="skill.read_internal",
+                tenant_id="tnt_test",
+                user_id="usr_test",
+            )
+        )
+
+    assert result == []
+
+
+def test_write_memory_stamps_origin_session_id_and_real_user() -> None:
+    """_write_memory sends origin_session_id in the upload data and the real
+    user in X-User-Id (never the SYSTEM sentinel, which knowledge-ingest's
+    fail-closed authz guard rejects)."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.messages import _write_memory
+
+    captured: dict = {}
+    captured_headers: dict = {}
+
+    class _FakeResp:
+        status_code = 201
+        def json(self):
+            return {"id": "doc_x"}
+
+    class _IngestResp:
+        status_code = 200
+        def json(self):
+            return {}
+
+    class _FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def post(self, url, **kw):
+            if "/documents" in url and "/ingest" not in url:
+                captured.update(kw.get("data") or {})
+                captured_headers.update(kw.get("headers") or {})
+                return _FakeResp()
+            return _IngestResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        asyncio.get_event_loop().run_until_complete(
+            _write_memory(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
+                task_description="hello",
+                summary="world",
+                session_id="ses_writeback",
+            )
+        )
+    assert captured.get("origin_session_id") == "ses_writeback"
+    assert captured_headers.get("X-User-Id") == "usr_TESTUSER00000000000000001"
+    assert captured_headers.get("X-User-Id") != "SYSTEM"
 
 
 def test_write_memory_failure_open() -> None:
@@ -561,6 +792,7 @@ def test_write_memory_failure_open() -> None:
             _write_memory(
                 knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
                 tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
                 task_description="hello",
                 summary="world",
             )
@@ -620,6 +852,241 @@ def test_create_run_injects_memory(
     if scheduler_body:
         assert "memory" in scheduler_body[-1]
         assert "张三" in scheduler_body[-1]["memory"]
+
+
+def test_create_run_forwards_effective_clearance_to_scheduler(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers,
+) -> None:
+    """The sandbox branch must forward the run's effective clearance to the
+    scheduler so it can inject FOUNDATION_USER_CLEARANCE into the sandbox env
+    (and sign it into the broker lease for the ki façade).
+
+    With no workspace bound to the session, effective_clearance == the caller's
+    own clearance (L2 from the auth_headers fixture).  The scheduler POST body
+    must carry ``effective_clearance`` == "L2".
+    """
+    import httpx
+
+    session = Session(
+        id="ses_clr", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+    )
+    mock_db.execute.return_value = make_scalar_result(session)
+    mock_db.refresh = AsyncMock(side_effect=[None])
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_clr"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+
+    scheduler_body: list[dict] = []
+
+    class _SchResp:
+        status_code = 201
+        def json(self):
+            return {"id": "run_clr", "sandbox_id": "abc123", "status": "RUNNING"}
+
+    class _FakeClient(AuthzAwareClient):
+        async def get(self, url, **kw):
+            # Memory pre-fetch / workspace lookups -> empty / not found.
+            return httpx.Response(404, json={"detail": "not found"})
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if json:
+                scheduler_body.append(json)
+            return _SchResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        app_client.post(
+            "/api/session/v1/sessions/ses_clr/runs",
+            headers=auth_headers,
+            json={"task": "查一下知识库"},
+        )
+
+    assert scheduler_body, "scheduler was not called"
+    assert scheduler_body[-1]["effective_clearance"] == "L2"
+
+
+@pytest.mark.parametrize(
+    (
+        "include_skills",
+        "request_skills",
+        "default_skills",
+        "expected_skills",
+        "expected_lookups",
+    ),
+    [
+        (False, None, ["poet", "analyst"], ["poet", "analyst"], 1),
+        (True, ["manual"], ["poet"], ["manual"], 0),
+        (True, [], ["poet"], [], 0),
+        (True, None, ["poet"], [], 0),
+    ],
+    ids=[
+        "omitted-loads-defaults",
+        "explicit-wins",
+        "explicit-empty-wins",
+        "explicit-null-wins",
+    ],
+)
+def test_create_run_applies_default_skills_only_when_key_is_omitted(
+    app_client: TestClient,
+    mock_db: AsyncMock,
+    auth_headers: dict[str, str],
+    include_skills: bool,
+    request_skills: list[str] | None,
+    default_skills: list[str],
+    expected_skills: list[str],
+    expected_lookups: int,
+) -> None:
+    import httpx
+
+    session = Session(
+        id="ses_skills", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+    )
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_skills"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+    scheduler_payloads: list[dict] = []
+
+    class _SchedulerResp:
+        status_code = 201
+
+        def json(self):
+            return {"id": "run_skills", "sandbox_id": "abc123", "status": "RUNNING"}
+
+    class _FakeClient(AuthzAwareClient):
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            scheduler_payloads.append(json or {})
+            return _SchedulerResp()
+
+    body: dict = {"task": "use skills"}
+    if include_skills:
+        body["skills"] = request_skills
+
+    default_lookup = AsyncMock(return_value=default_skills)
+    with (
+        patch.object(httpx, "AsyncClient", return_value=_FakeClient()),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._fetch_memory",
+            new=AsyncMock(return_value=""),
+        ),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._assemble_history",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._fetch_default_installed_skills",
+            new=default_lookup,
+        ),
+    ):
+        response = app_client.post(
+            "/api/session/v1/sessions/ses_skills/runs",
+            headers=auth_headers,
+            json=body,
+        )
+
+    assert response.status_code == 201, response.text
+    assert scheduler_payloads[-1]["skills"] == expected_skills
+    assert default_lookup.await_count == expected_lookups
+
+
+@pytest.mark.parametrize(
+    ("include_key", "request_ids", "key_expected", "expected_payload"),
+    [
+        (False, None, False, None),
+        (True, [], True, []),
+        (True, ["mcp_a", "mcp_b"], True, ["mcp_a", "mcp_b"]),
+        (True, None, True, []),
+    ],
+    ids=[
+        "omitted-key-absent-downstream",
+        "explicit-empty-disables-all",
+        "explicit-list-narrows",
+        "explicit-null-disables-all",
+    ],
+)
+def test_create_run_forwards_mcp_server_ids_with_presence_semantics(
+    app_client: TestClient,
+    mock_db: AsyncMock,
+    auth_headers: dict[str, str],
+    include_key: bool,
+    request_ids: list[str] | None,
+    key_expected: bool,
+    expected_payload: list[str] | None,
+) -> None:
+    """Sandbox branch: ``mcp_server_ids`` is presence-carried, not truthy.
+
+    Omitting the key must leave it OFF the scheduler payload entirely (so the
+    in-sandbox injector keeps the tenant-default behaviour); an explicit ``[]``
+    must be forwarded as ``[]`` and must NOT collapse into "absent".
+    """
+    import httpx
+
+    session = Session(
+        id="ses_mcp", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+    )
+    mock_db.execute.return_value = make_scalar_result(session)
+
+    async def _refresh(obj):
+        if isinstance(obj, Run):
+            obj.id = "run_mcp"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+    scheduler_payloads: list[dict] = []
+
+    class _SchedulerResp:
+        status_code = 201
+
+        def json(self):
+            return {"id": "run_mcp", "sandbox_id": "abc123", "status": "RUNNING"}
+
+    class _FakeClient(AuthzAwareClient):
+        async def post(self, url, json=None, **kw):
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            scheduler_payloads.append(json or {})
+            return _SchedulerResp()
+
+    body: dict = {"task": "use mcp"}
+    if include_key:
+        body["mcp_server_ids"] = request_ids
+
+    with (
+        patch.object(httpx, "AsyncClient", return_value=_FakeClient()),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._fetch_memory",
+            new=AsyncMock(return_value=""),
+        ),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._assemble_history",
+            new=AsyncMock(return_value=[]),
+        ),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._fetch_default_installed_skills",
+            new=AsyncMock(return_value=[]),
+        ),
+    ):
+        response = app_client.post(
+            "/api/session/v1/sessions/ses_mcp/runs",
+            headers=auth_headers,
+            json=body,
+        )
+
+    assert response.status_code == 201, response.text
+    payload = scheduler_payloads[-1]
+    assert ("mcp_server_ids" in payload) is key_expected
+    if key_expected:
+        assert payload["mcp_server_ids"] == expected_payload
 
 
 def test_create_run_sums_attachment_bytes_for_memory_tier(
@@ -863,6 +1330,66 @@ def test_stream_tokens_yields_delta_events_and_stops_on_end() -> None:
     )
 
 
+def test_stream_tokens_relays_canvas_entry_as_canvas_created() -> None:
+    """A ``canvas`` token-stream entry (written by the inline executor) is relayed
+    as the exact ``canvas_created`` SSE the sandbox path yields, so the frontend is
+    mode-agnostic.  ``message_id`` is passed through when present."""
+    from agent_session_orchestrator.api.v1.messages import _stream_tokens
+
+    fake_entries = [
+        ("1-0", {"type": "delta", "text": "已为你创作。"}),
+        (
+            "2-0",
+            {
+                "type": "canvas",
+                "canvas_id": "cvs_abc",
+                "run_id": "run_cvs",
+                "message_id": "msg_1",
+            },
+        ),
+        ("3-0", {"type": "end", "text": ""}),
+    ]
+
+    class _FakeRedis:
+        _call_count = 0
+
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def xread(self, streams, block=0, count=None):
+            key = list(streams.keys())[0]
+            if self._call_count == 0:
+                self.__class__._call_count += 1
+                return [(key, fake_entries)]
+            return []
+
+        async def aclose(self): pass
+
+    async def _run():
+        with _patch_redis_asyncio(_FakeRedis):
+            _FakeRedis._call_count = 0
+            deadline = asyncio.get_event_loop().time() + 10.0
+            events = []
+            async for ev in _stream_tokens(
+                redis_url="redis://localhost:6379",
+                run_id="run_cvs",
+                deadline=deadline,
+            ):
+                events.append(ev)
+        return events
+
+    events = asyncio.get_event_loop().run_until_complete(_run())
+    parsed = [
+        (event_name, json.loads(data))
+        for event_name, data in _parse_sse_events("".join(events))
+    ]
+    canvas_events = [p for name, p in parsed if name == "canvas_created"]
+    assert canvas_events == [
+        {"canvas_id": "cvs_abc", "run_id": "run_cvs", "message_id": "msg_1"}
+    ]
+
+
 def test_stream_tokens_waits_through_worker_coldstart() -> None:
     """Regression: with wait_for_worker=True the tail must NOT bail out while the
     worker is still cold-starting (empty xreads), and must yield the deltas once
@@ -916,14 +1443,21 @@ def test_stream_tokens_waits_through_worker_coldstart() -> None:
         (event_name, json.loads(data))
         for event_name, data in _parse_sse_events("".join(events))
     ]
-    assert parsed[0] == (
+    # Idle reads while the worker cold-starts now emit ``ping`` heartbeats so the
+    # client's stall watchdog sees bytes; filter them out to assert on the
+    # meaningful token/end sequence.
+    meaningful = [(name, payload) for name, payload in parsed if name != "ping"]
+    assert meaningful[0] == (
         "token",
         {"run_id": "run_cold", "delta": "spring", "offset": "1-0"},
     )
-    assert parsed[-1] == (
+    assert meaningful[-1] == (
         "run_stream_end",
         {"run_id": "run_cold", "paused": False},
     )
+    # The cold-start silence produced heartbeats (4 empty reads before the
+    # delta) — that is the whole point of the ping: bytes on a quiet stream.
+    assert any(name == "ping" for name, _ in parsed)
 
 
 def test_stream_tokens_replay_bails_out_fast_when_empty() -> None:
@@ -964,7 +1498,11 @@ def test_stream_tokens_replay_bails_out_fast_when_empty() -> None:
         (event_name, json.loads(data))
         for event_name, data in _parse_sse_events("".join(events))
     ]
-    assert parsed == [
+    # An idle read that does NOT end the tail emits a ``ping`` heartbeat; the
+    # last read here breaks out, so we may see one ping before the terminal
+    # ``run_stream_end``.  Filter pings to assert on the meaningful terminator.
+    meaningful = [(name, payload) for name, payload in parsed if name != "ping"]
+    assert meaningful == [
         ("run_stream_end", {"run_id": "run_replay", "paused": False}),
     ]
     # Old fast-exit preserved: returns after the 2nd idle read, not 30s of polls.
@@ -1090,6 +1628,179 @@ def test_stream_tokens_active_run_idle_does_not_break_until_inactive() -> None:
         "run_stream_end",
         {"run_id": "run_stall", "paused": False},
     )
+
+
+def test_stream_tokens_emits_ping_on_idle_reads() -> None:
+    """Stall-watchdog heartbeat: every idle read that keeps the tail alive emits
+    an ``event: ping`` so the client sees bytes during long silent gaps (the
+    model can go quiet for tens of seconds between tool batches).
+
+    Feed: one delta, then several empty reads (model thinking), then the ``end``
+    marker.  The empty reads before ``end`` must each surface a ping carrying the
+    run_id, interleaved with the token/terminal events.
+    """
+    from agent_session_orchestrator.api.v1.messages import _stream_tokens
+
+    # read 0: token; reads 1-3: idle (silence); read 4: end marker.
+    batches = [
+        [("1-0", {"type": "delta", "text": "hi"})],
+        [],
+        [],
+        [],
+        [("2-0", {"type": "end"})],
+    ]
+
+    class _IdleThenEndRedis:
+        _i = 0
+
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def xread(self, streams, block=0, count=None):
+            key = list(streams.keys())[0]
+            i = self.__class__._i
+            self.__class__._i += 1
+            if i < len(batches):
+                b = batches[i]
+                return [(key, b)] if b else []
+            return []
+
+        async def aclose(self): pass
+
+    # Stay RUNNING throughout so idle reads keep the tail alive rather than
+    # breaking — this is exactly when a heartbeat matters.
+    async def _is_run_active() -> bool:
+        return True
+
+    async def _run():
+        with _patch_redis_asyncio(_IdleThenEndRedis):
+            _IdleThenEndRedis._i = 0
+            deadline = asyncio.get_event_loop().time() + 30.0
+            events = []
+            async for ev in _stream_tokens(
+                redis_url="redis://localhost:6379",
+                run_id="run_ping",
+                deadline=deadline,
+                wait_for_worker=True,
+                is_run_active=_is_run_active,
+            ):
+                events.append(ev)
+        return events
+
+    events = asyncio.get_event_loop().run_until_complete(_run())
+    parsed = [
+        (event_name, json.loads(data))
+        for event_name, data in _parse_sse_events("".join(events))
+    ]
+
+    ping_events = [payload for name, payload in parsed if name == "ping"]
+    # The 3 idle reads between the token and the end marker each emit a ping.
+    assert len(ping_events) == 3, (
+        f"Expected 3 idle-read pings, got {len(ping_events)}: {parsed}"
+    )
+    # Each ping carries the run_id so the client can attribute the heartbeat.
+    assert all(p == {"run_id": "run_ping"} for p in ping_events), ping_events
+
+    # The token and terminal events are still delivered around the pings.
+    non_ping = [(name, payload) for name, payload in parsed if name != "ping"]
+    assert non_ping[0] == (
+        "token",
+        {"run_id": "run_ping", "delta": "hi", "offset": "1-0"},
+    )
+    assert non_ping[-1] == (
+        "run_stream_end",
+        {"run_id": "run_ping", "paused": False},
+    )
+
+
+def test_stream_session_emits_ping_on_empty_poll() -> None:
+    """stream_session heartbeat: a poll with no active/paused run and nothing new
+    to send emits an ``event: ping`` before sleeping, so the client's stall
+    watchdog can distinguish a quiet-but-healthy stream from a wedged one.
+
+    Drives ``stream_session`` directly with ``acquire_db_session`` and
+    ``SessionService`` patched so each poll finds an empty session (no runs, no
+    messages).  ``asyncio.sleep`` is stubbed to a no-op and the generator is
+    consumed for a bounded number of events, then closed.
+    """
+    import contextlib
+    import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1 import messages as messages_module
+
+    # Fake DB session context: acquire_db_session is an async generator that
+    # yields a db handle; the code only passes it to SessionService (patched
+    # below), so a bare sentinel object is enough.
+    async def _fake_acquire(*, tenant_id: str, **_kw):
+        yield object()
+
+    # SessionService whose list_runs / list_messages report an empty session.
+    class _EmptySvc:
+        def __init__(self, *a, **kw) -> None:
+            pass
+
+        async def list_runs(self, session_id):
+            return []
+
+        async def list_messages(self, session_id, cursor=None, limit=50):
+            return [], None
+
+        async def get_session(self, session_id):
+            return SimpleNamespace(user_id="usr_stream_test", title="新任务")
+
+    # Minimal fake Request carrying just the settings the generator reads.
+    settings_stub = SimpleNamespace(
+        agent_scheduler_url="http://scheduler",
+        knowledge_ingest_url="",
+        foundation_dlp_url="",
+        redis_url=None,
+    )
+    request_stub = SimpleNamespace(
+        app=SimpleNamespace(state=SimpleNamespace(settings=settings_stub)),
+    )
+
+    async def _run():
+        collected: list[str] = []
+        with (
+            mock.patch.object(messages_module, "acquire_db_session", _fake_acquire),
+            mock.patch.object(messages_module, "SessionService", _EmptySvc),
+            mock.patch.object(
+                messages_module.asyncio, "sleep", new=AsyncMock(return_value=None)
+            ),
+        ):
+            response = await messages_module.stream_session(
+                session_id="ses_empty",
+                request=request_stub,  # type: ignore[arg-type]
+                tenant_id=TEST_TENANT,
+            )
+            agen = response.body_iterator
+            try:
+                # First poll primes completion (no terminal run → nothing) and,
+                # finding no active/paused run and no new messages, emits a ping.
+                # Pull a handful of events so we cross at least one full poll.
+                for _ in range(3):
+                    chunk = await agen.__anext__()
+                    collected.append(
+                        chunk.decode() if isinstance(chunk, bytes) else chunk
+                    )
+            finally:
+                with contextlib.suppress(Exception):
+                    await agen.aclose()
+        return collected
+
+    events = asyncio.get_event_loop().run_until_complete(_run())
+    parsed = _parse_sse_events("".join(events))
+    event_names = [name for name, _ in parsed]
+    assert event_names.count("session_updated") == 1
+    title_payload = next(
+        json.loads(data) for name, data in parsed if name == "session_updated"
+    )
+    assert title_payload == {"session_id": "ses_empty", "title": "新任务"}
+    assert "ping" in event_names, f"empty poll should emit a ping, got {event_names}"
+    # The ping payload for the session-level heartbeat is intentionally empty.
+    ping_payload = next(json.loads(data) for name, data in parsed if name == "ping")
+    assert ping_payload == {}
 
 
 def test_stream_tokens_active_run_stops_on_end_marker_despite_idle() -> None:
@@ -2122,3 +2833,450 @@ def test_create_run_includes_hitl_flag(
     assert body.get("hitl") is True, (
         f"Expected hitl=True in scheduler payload, got: {body.get('hitl')}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Tests -- PART H: sandbox-gone (scheduler 404) reconciliation
+#
+# When the Docker container backing a RUNNING run is pruned, the scheduler's
+# GET /runs/{sandbox_id} returns 404 forever.  _reconcile_run_completion must
+# resolve the run definitively instead of treating every 404 as "still running"
+# (which left runs stuck RUNNING permanently).  These tests drive the three 404
+# branches plus a regression guard that other non-200 statuses are unchanged.
+# ---------------------------------------------------------------------------
+
+
+def _fake_client_with_status(status_code: int):
+    """Build ``(httpx_module, client_instance)`` whose GET returns ``status_code``.
+
+    Callers patch via
+    ``mock.patch.object(httpx_module, "AsyncClient", return_value=client_instance)``.
+    """
+    import httpx as httpx_mod
+
+    class _Resp:
+        def __init__(self) -> None:
+            self.status_code = status_code
+
+        def json(self):  # only reached for 200; 404/503 short-circuit before this
+            return {}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kw):
+            return _Resp()
+
+    return httpx_mod, _Client()
+
+
+def _fake_redis_with_stream(stream):
+    """Fake redis.asyncio.Redis whose xrange returns ``stream``."""
+
+    class _FakeRedis:
+        @classmethod
+        def from_url(cls, *a, **kw):
+            return cls()
+
+        async def xrange(self, key, min="-", max="+"):
+            return stream
+
+        async def xread(self, *a, **kw):
+            return []
+
+        async def aclose(self):
+            pass
+
+    return _FakeRedis
+
+
+def test_reconcile_404_with_end_marker_marks_completed_and_replays() -> None:
+    """404 + Redis stream carrying an end marker → COMPLETED, blocks replayed.
+
+    The sandbox was pruned but the worker had already finished and written the
+    authoritative ``type=end`` marker, so the run is finalized COMPLETED and the
+    ordered blocks are persisted as durable message rows (create_message called).
+    """
+    import asyncio
+    import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
+
+    run = Run(
+        id="run_404_end", tenant_id=TEST_TENANT, session_id="ses_404_end",
+        task_description="finished before prune", status="RUNNING",
+        sandbox_id="sb_pruned",
+        started_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
+    )
+
+    stream = [
+        ("1-0", {"type": "delta", "text": "all done"}),
+        ("2-0", {"type": "end", "text": ""}),
+    ]
+    fake_redis = _fake_redis_with_stream(stream)
+
+    created_messages: list[dict] = []
+
+    async def _fake_create_message(session_id, role, content, tool_calls, run_id):
+        created_messages.append({"role": role, "content": content})
+
+    svc = MagicMock()
+    svc.list_messages = AsyncMock(return_value=([], None))
+    svc.create_message = AsyncMock(side_effect=_fake_create_message)
+
+    httpx_mod, fake_client = _fake_client_with_status(404)
+
+    with (
+        _patch_redis_asyncio(fake_redis),
+        mock.patch.object(httpx_mod, "AsyncClient", return_value=fake_client),
+    ):
+        terminal, plan = asyncio.get_event_loop().run_until_complete(
+            _reconcile_run_completion(
+                scheduler_url="http://scheduler:8080",
+                tenant_id=TEST_TENANT,
+                user_id="u1",
+                run=run,
+                svc=svc,
+                knowledge_ingest_url="",
+                redis_url="redis://localhost:6379",
+            )
+        )
+
+    assert terminal is True
+    assert plan == []
+    assert run.status == "COMPLETED"
+    assert run.finished_at is not None
+    # Scheduler-only fields are unavailable once the sandbox is gone.
+    assert run.result_summary is None
+    # The single assistant text block was replayed into a durable row.
+    assert svc.create_message.call_count == 1
+    assert created_messages[0]["role"] == "assistant"
+    assert created_messages[0]["content"] == "all done"
+
+
+def test_reconcile_404_no_end_marker_past_grace_marks_failed() -> None:
+    """404 + no end marker + run older than the grace window → FAILED.
+
+    The sandbox is genuinely gone with no completion recorded, so the run is
+    force-FAILED with an explanatory result_summary/error_message instead of
+    hanging RUNNING forever.
+    """
+    import asyncio
+    import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1 import messages as messages_mod
+    from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
+
+    # started_at well in the past so it is comfortably past the grace window.
+    run = Run(
+        id="run_404_fail", tenant_id=TEST_TENANT, session_id="ses_404_fail",
+        task_description="sandbox vanished", status="RUNNING",
+        sandbox_id="sb_gone",
+        started_at=dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
+    )
+
+    # Stream has deltas but NO end marker (e.g. crashed worker).
+    stream = [("1-0", {"type": "delta", "text": "partial"})]
+    fake_redis = _fake_redis_with_stream(stream)
+
+    svc = MagicMock()
+    svc.list_messages = AsyncMock(return_value=([], None))
+    svc.create_message = AsyncMock()
+
+    httpx_mod, fake_client = _fake_client_with_status(404)
+
+    with (
+        _patch_redis_asyncio(fake_redis),
+        mock.patch.object(httpx_mod, "AsyncClient", return_value=fake_client),
+        mock.patch.object(messages_mod, "_SANDBOX_GONE_GRACE_SECONDS", 1),
+    ):
+        terminal, plan = asyncio.get_event_loop().run_until_complete(
+            _reconcile_run_completion(
+                scheduler_url="http://scheduler:8080",
+                tenant_id=TEST_TENANT,
+                user_id="u1",
+                run=run,
+                svc=svc,
+                knowledge_ingest_url="",
+                redis_url="redis://localhost:6379",
+            )
+        )
+
+    assert terminal is True
+    assert plan == []
+    assert run.status == "FAILED"
+    assert run.finished_at is not None
+    assert run.result_summary and "404" in run.result_summary
+    assert run.error_message and "sandbox no longer exists" in run.error_message
+    # No completion → nothing replayed.
+    svc.create_message.assert_not_called()
+
+
+def test_reconcile_404_no_end_marker_within_grace_keeps_running() -> None:
+    """404 + no end marker + fresh run → treated as still-running, status unchanged.
+
+    A 404 can be momentary right after spawn; within the grace window we retry
+    on the next poll rather than prematurely failing the run.
+    """
+    import asyncio
+    import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
+
+    # started_at = now → within any positive grace window.
+    now = dt.datetime.now(tz=dt.UTC)
+    run = Run(
+        id="run_404_fresh", tenant_id=TEST_TENANT, session_id="ses_404_fresh",
+        task_description="just spawned", status="RUNNING",
+        sandbox_id="sb_fresh",
+        started_at=now,
+        created_at=now,
+    )
+
+    # No end marker in the stream.
+    stream = [("1-0", {"type": "delta", "text": "warming up"})]
+    fake_redis = _fake_redis_with_stream(stream)
+
+    svc = MagicMock()
+    svc.list_messages = AsyncMock(return_value=([], None))
+    svc.create_message = AsyncMock()
+
+    httpx_mod, fake_client = _fake_client_with_status(404)
+
+    with (
+        _patch_redis_asyncio(fake_redis),
+        mock.patch.object(httpx_mod, "AsyncClient", return_value=fake_client),
+    ):
+        terminal, plan = asyncio.get_event_loop().run_until_complete(
+            _reconcile_run_completion(
+                scheduler_url="http://scheduler:8080",
+                tenant_id=TEST_TENANT,
+                user_id="u1",
+                run=run,
+                svc=svc,
+                knowledge_ingest_url="",
+                redis_url="redis://localhost:6379",
+            )
+        )
+
+    assert terminal is False
+    assert plan == []
+    assert run.status == "RUNNING"  # unchanged
+    assert run.finished_at is None
+    svc.create_message.assert_not_called()
+
+
+def test_reconcile_503_keeps_running_unchanged() -> None:
+    """Non-404 non-200 (503) → (False, []), status unchanged (regression guard).
+
+    Only 404 gets the sandbox-gone handling; other error statuses must still be
+    treated as "still running" so the next poll retries.
+    """
+    import asyncio
+    import unittest.mock as mock
+
+    from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
+
+    run = Run(
+        id="run_503", tenant_id=TEST_TENANT, session_id="ses_503",
+        task_description="scheduler hiccup", status="RUNNING",
+        sandbox_id="sb_503",
+        # Old run so age can't be the reason we keep it running — proving the
+        # 503 path (not the 404 grace window) is what returns (False, []).
+        started_at=dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
+        created_at=dt.datetime(2020, 1, 1, tzinfo=dt.UTC),
+    )
+
+    svc = MagicMock()
+    svc.list_messages = AsyncMock(return_value=([], None))
+    svc.create_message = AsyncMock()
+
+    httpx_mod, fake_client = _fake_client_with_status(503)
+
+    with mock.patch.object(httpx_mod, "AsyncClient", return_value=fake_client):
+        terminal, plan = asyncio.get_event_loop().run_until_complete(
+            _reconcile_run_completion(
+                scheduler_url="http://scheduler:8080",
+                tenant_id=TEST_TENANT,
+                user_id="u1",
+                run=run,
+                svc=svc,
+                knowledge_ingest_url="",
+                redis_url="redis://localhost:6379",
+            )
+        )
+
+    assert terminal is False
+    assert plan == []
+    assert run.status == "RUNNING"  # unchanged
+    assert run.finished_at is None
+    svc.create_message.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Knowledge library v1 — memory scope + knowledge prefetch + effective clearance
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_fetch_memory_sends_scope_memory_and_clearance_header() -> None:
+    """_fetch_memory now scopes to memory and forwards the effective clearance."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_memory
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {"hits": []}
+
+    class _FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, url, **kw):
+            captured["params"] = kw.get("params") or {}
+            captured["headers"] = kw.get("headers") or {}
+            return _FakeResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        asyncio.get_event_loop().run_until_complete(
+            _fetch_memory(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
+                query="hi",
+                clearance="L3",
+            )
+        )
+    assert captured["params"].get("scope") == "memory"
+    assert captured["headers"].get("X-User-Clearance") == "L3"
+
+
+def test_fetch_knowledge_formats_with_provenance_and_scope() -> None:
+    """_fetch_knowledge hits ki with scope=knowledge + clearance and formats
+    each hit with a 【文档名 | 文件夹路径】 provenance header."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_knowledge
+
+    captured: dict = {}
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self):
+            return {
+                "hits": [
+                    {"document_name": "报销规定", "folder_path": "行政", "text": "差旅报销标准…"},
+                ]
+            }
+
+    class _FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, url, **kw):
+            captured["params"] = kw.get("params") or {}
+            captured["headers"] = kw.get("headers") or {}
+            return _FakeResp()
+
+    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+        result = asyncio.get_event_loop().run_until_complete(
+            _fetch_knowledge(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_TESTUSER00000000000000001",
+                query="报销",
+                clearance="L2",
+            )
+        )
+    assert captured["params"].get("scope") == "knowledge"
+    assert captured["headers"].get("X-User-Clearance") == "L2"
+    assert "【报销规定 | 行政】" in result
+    assert "差旅报销标准" in result
+
+
+def test_fetch_knowledge_failure_open() -> None:
+    """A knowledge-search error yields an empty block (retrieval never blocks)."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.runs import _fetch_knowledge
+
+    class _FailClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            pass
+
+        async def get(self, url, **kw):
+            raise httpx.ConnectError("down")
+
+    with patch.object(httpx, "AsyncClient", return_value=_FailClient()):
+        result = asyncio.get_event_loop().run_until_complete(
+            _fetch_knowledge(
+                knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                tenant_id="tnt_test",
+                user_id="usr_1",
+                query="hi",
+                clearance="L1",
+            )
+        )
+    assert result == ""
+
+
+def test_effective_clearance_is_min_of_user_and_workspace() -> None:
+    from agent_session_orchestrator.api.v1.runs import _effective_clearance
+
+    # No workspace → the user's own clearance.
+    assert _effective_clearance("L4", None) == "L4"
+    # Workspace lower than user → capped at the workspace level.
+    assert _effective_clearance("L4", "L2") == "L2"
+    # User lower than workspace → capped at the user level.
+    assert _effective_clearance("L1", "L3") == "L1"
+    # Equal → that level.
+    assert _effective_clearance("L3", "L3") == "L3"
+    # Malformed workspace level → fail-open to user clearance.
+    assert _effective_clearance("L2", "bogus") == "L2"
+
+
+def test_resolve_workspace_sensitivity() -> None:
+    from agent_session_orchestrator.services.workspace_context import (
+        resolve_workspace_sensitivity,
+    )
+
+    # No workspace bound → None (no DB call).
+    ses_none = Session(id="s0", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
+    db = AsyncMock()
+    got = asyncio.get_event_loop().run_until_complete(
+        resolve_workspace_sensitivity(db, ses_none)
+    )
+    assert got is None
+    db.execute.assert_not_called()
+
+    # Workspace bound → the queried level string.
+    ses_ws = Session(
+        id="s1", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE",
+        workspace_id="wsp_1",
+    )
+    db2 = AsyncMock()
+    db2.execute.return_value = make_scalar_result("L2")
+    got2 = asyncio.get_event_loop().run_until_complete(
+        resolve_workspace_sensitivity(db2, ses_ws)
+    )
+    assert got2 == "L2"

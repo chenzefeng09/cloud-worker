@@ -22,6 +22,11 @@ vi.mock('../lib/workspaceContext', () => ({
   useWorkspace: () => ({ allWs: [] }),
 }));
 
+// Mock i18n — the page reads useTranslation() for the 语言 switcher
+vi.mock('../i18n', () => ({
+  useTranslation: () => ({ lang: 'zh', setLang: vi.fn(), t: (k: string) => k }),
+}));
+
 // Mock chatStore
 vi.mock('../stores/chatStore', () => ({
   useChatStore: (selector: (s: unknown) => unknown) =>
@@ -34,6 +39,7 @@ vi.mock('../stores/chatStore', () => ({
         roles: [],
       },
       logout: vi.fn(),
+      setUserProfile: vi.fn(),
     }),
 }));
 
@@ -44,6 +50,7 @@ const mockAuthSessions = vi.fn();
 const mockRunsCount = vi.fn();
 const mockTokenUsage = vi.fn();
 const mockTokenUsageDaily = vi.fn();
+const mockTokenUsageBreakdown = vi.fn();
 const mockApiKeysList = vi.fn();
 const mockNotifPreferences = vi.fn();
 
@@ -54,6 +61,7 @@ vi.mock('../api/client', () => ({
       mfaMethods: () => mockMfaMethods(),
       logout: () => Promise.resolve(),
       sessions: () => mockAuthSessions(),
+      updateProfile: () => Promise.resolve({ id: 'usr_test', email: 'test@example.com', display_name: 'Test User', tenant_id: 'tnt_test', roles: [] }),
     },
     billing: {
       me: () => mockBillingMe(),
@@ -62,6 +70,7 @@ vi.mock('../api/client', () => ({
       count: () => mockRunsCount(),
       tokenUsage: () => mockTokenUsage(),
       tokenUsageDaily: () => mockTokenUsageDaily(),
+      tokenUsageBreakdown: () => mockTokenUsageBreakdown(),
     },
     apiKeys: {
       list: () => mockApiKeysList(),
@@ -93,10 +102,6 @@ vi.mock('../api/client', () => ({
       list: () => Promise.resolve([]),
       put: () => Promise.resolve({}),
       delete: () => Promise.resolve(),
-    },
-    pam: {
-      myElevations: () => Promise.resolve([]),
-      requestElevation: () => Promise.resolve({}),
     },
   },
   ApiError: class ApiError extends Error {
@@ -153,6 +158,17 @@ describe('ProfilePage — billing & MFA wiring', () => {
         { day: '2026-06-02', tokens: 300 },
         { day: '2026-06-03', tokens: 50 },
         { day: '2026-06-04', tokens: 420 },
+      ],
+    });
+    mockTokenUsageBreakdown.mockResolvedValue({
+      days_window: 30,
+      daily: [
+        { day: '2026-06-03', input_tokens: 30, output_tokens: 20, total_tokens: 50 },
+        { day: '2026-06-04', input_tokens: 220, output_tokens: 200, total_tokens: 420 },
+      ],
+      by_source: [
+        { source: 'user', total_tokens: 400, run_count: 3 },
+        { source: 'schedule', total_tokens: 70, run_count: 1 },
       ],
     });
     mockApiKeysList.mockResolvedValue([]);

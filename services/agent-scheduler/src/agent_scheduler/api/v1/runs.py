@@ -19,6 +19,7 @@ not let a caller read or stop another tenant's workload.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import time
@@ -433,6 +434,19 @@ async def create_run(
         if isinstance(skills_raw, list)
         else []
     )
+    # Optional: per-run MCP server selection, carried with PRESENCE semantics
+    # (never truthiness — ``[]`` and "absent" are different instructions):
+    #   * key absent      -> None -> task.json omits the key -> the in-sandbox
+    #     mcp_tenant_injector keeps its historical "inject every enabled
+    #     tenant server" behaviour.
+    #   * explicit ``[]`` -> []   -> task.json carries [] -> no MCP servers.
+    #   * non-empty list  -> only those server ids.
+    mcp_server_ids: list[str] | None = None
+    if "mcp_server_ids" in body:
+        _mcp_raw = body.get("mcp_server_ids")
+        mcp_server_ids = (
+            [str(s) for s in _mcp_raw if s] if isinstance(_mcp_raw, list) else []
+        )
     # Optional: list of attachment file dicts {"key", "filename", "mime"}.
     # Written to task.json; the runtime_worker downloads them to /workspace/inputs/.
     files_raw = body.get("files")
@@ -478,6 +492,13 @@ async def create_run(
         resume_raw if isinstance(resume_raw, dict) else None
     )
 
+    # Effective clearance (min(user, workspace)) for the run, forwarded by the
+    # orchestrator.  Injected into the sandbox env as FOUNDATION_USER_CLEARANCE
+    # and signed into the broker lease so knowledge-ingest can enforce the
+    # document-visibility gate.  Not secret -> plain env.  Empty string is the
+    # fail-open sentinel: ki treats a missing X-User-Clearance as L1.
+    user_clearance: str = str(body.get("effective_clearance") or "")
+
     # Optional per-message LLM selection (model + reasoning effort), nested in
     # agent_config by the orchestrator. Falls back to top-level for direct callers.
     agent_config: dict[str, Any] = body.get("agent_config") or {}
@@ -485,6 +506,16 @@ async def create_run(
     reasoning_effort: str | None = (
         agent_config.get("reasoning_effort") or body.get("reasoning_effort") or None
     )
+    requested_memory_tier = str(
+        agent_config.get("sandbox_memory_tier")
+        or body.get("sandbox_memory_tier")
+        or ""
+    ).strip().lower()
+    if requested_memory_tier not in {"", "small", "large"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="sandbox_memory_tier must be 'small' or 'large'",
+        )
 
     if not (session_id and run_id and task):
         raise HTTPException(
@@ -498,16 +529,33 @@ async def create_run(
     _settings = request.app.state.settings
 
     # Resolve the per-run sandbox memory tier from the reported attachment size.
+    use_large_memory = (
+        requested_memory_tier == "large"
+        or (
+            not requested_memory_tier
+            and total_attachment_bytes
+            >= _settings.sandbox_large_attachment_threshold_bytes
+        )
+    )
     memory_limit = (
         _settings.sandbox_memory_limit_large
-        if total_attachment_bytes >= _settings.sandbox_large_attachment_threshold_bytes
+        if use_large_memory
         else _settings.sandbox_memory_limit_small
     )
     # Warm-pool bucket key for this run.  Under the Cube/microVM runtime each
     # warm sandbox pre-allocates its RAM, so the pool keeps separate "small"
-    # (1g) and "large" (4g) buckets and must be acquired from the matching one.
+    # and "large" buckets and must be acquired from the matching one.
     memory_tier = (
         "large" if memory_limit == _settings.sandbox_memory_limit_large else "small"
+    )
+    logger.info(
+        "sandbox memory tier selected",
+        extra={
+            "run_id": run_id,
+            "memory_tier": memory_tier,
+            "memory_limit": memory_limit,
+            "requested_memory_tier": requested_memory_tier or "auto",
+        },
     )
     # NOTE: the scheduler currently spawns sandboxes directly via
     # ``runtime.spawn_run`` and does NOT yet acquire from services/sandbox-pool.
@@ -565,31 +613,52 @@ async def create_run(
         )
 
     try:
-        container_id = runtime.spawn_run(
-            run_id=run_id,
-            session_id=session_id,
-            task=task,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            foundation_token=foundation_token,
-            skills=skills,
-            files=files,
-            memory=memory,
-            memory_limit=memory_limit,
-            history=history,
-            llm_gateway_url=_settings.llm_gateway_url,
-            llm_virtual_key=virtual_key,
-            model_override=model_override,
-            reasoning_effort=reasoning_effort,
-            sys_prompt=sys_prompt,
-            sampling_params=sampling_params,
-            hitl=hitl,
-            resume=resume,
+        # ``spawn_run`` is a SYNCHRONOUS call (docker SDK / sync httpx.Client) —
+        # see the SandboxRuntime protocol docstring.  Running it inline on the
+        # event loop would block every other request for the full sandbox
+        # create round-trip (and, under the Cube runtime, the sync httpx.Client
+        # does blocking socket I/O on the loop thread).  Offload it to a worker
+        # thread so the loop stays responsive.  ``functools.partial`` carries
+        # the keyword args across the ``to_thread`` boundary.
+        container_id = await asyncio.to_thread(
+            functools.partial(
+                runtime.spawn_run,
+                run_id=run_id,
+                session_id=session_id,
+                task=task,
+                tenant_id=tenant_id,
+                user_id=user_id,
+                foundation_token=foundation_token,
+                skills=skills,
+                mcp_server_ids=mcp_server_ids,
+                files=files,
+                memory=memory,
+                memory_limit=memory_limit,
+                history=history,
+                llm_gateway_url=_settings.llm_gateway_url,
+                llm_virtual_key=virtual_key,
+                model_override=model_override,
+                reasoning_effort=reasoning_effort,
+                sys_prompt=sys_prompt,
+                sampling_params=sampling_params,
+                hitl=hitl,
+                resume=resume,
+                user_clearance=user_clearance,
+            )
         )
     except SandboxSpawnError as exc:
+        logger.error(
+            "sandbox spawn failed for run %s: %s", run_id, exc, exc_info=True
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc),
         ) from exc
+    except Exception as exc:  # TEMP-DIAG: surface the real spawn exception type
+        logger.error(
+            "spawn unexpected %s for run %s: %s",
+            type(exc).__name__, run_id, exc, exc_info=True,
+        )
+        raise
 
     await quota_guard.record(
         tenant_id=tenant_id,

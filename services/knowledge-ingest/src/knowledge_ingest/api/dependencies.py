@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-from fastapi import Depends, HTTPException, Request, status
+from fastapi import Depends, Header, HTTPException, Request, status
 from foundation_sdk.fastapi import get_tenant_id, get_user_id
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +25,19 @@ async def current_tenant() -> str:
 
 async def current_user() -> str:
     return get_user_id() or "SYSTEM"
+
+
+async def current_clearance(
+    x_user_clearance: str | None = Header(default=None),
+) -> str | None:
+    """Raw ``X-User-Clearance`` header (L1..L5) or ``None`` when absent.
+
+    Endpoints decide the fallback: ``/search`` normalises a missing value to
+    the conservative ``L1`` (fail-closed retrieval), while ``/documents``
+    treats ``None`` as "no visibility filter" so the management/audit listing
+    stays complete.  The BFF forwards this header on the end-user browsing path.
+    """
+    return x_user_clearance
 
 
 async def db_session(
@@ -48,5 +61,6 @@ def get_embeddings(request: Request) -> EmbeddingClient:
 TDbSession = Depends(db_session)
 TTenantId = Depends(current_tenant)
 TUserId = Depends(current_user)
+TClearance = Depends(current_clearance)
 TBlobStore = Depends(get_blob_store)
 TEmbeddings = Depends(get_embeddings)

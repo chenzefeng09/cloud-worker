@@ -1,10 +1,11 @@
 """Schedules proxy — forwards CronJob CRUD to the cron-runner service.
 
 Proxies:
-  GET    /schedules              → cron-runner GET    /cron-jobs
-  POST   /schedules              → cron-runner POST   /cron-jobs
-  PATCH  /schedules/{id}         → cron-runner PATCH  /cron-jobs/{id}
-  DELETE /schedules/{id}         → cron-runner DELETE /cron-jobs/{id}
+  GET    /schedules                    → cron-runner GET    /cron-jobs
+  POST   /schedules                    → cron-runner POST   /cron-jobs
+  PATCH  /schedules/{id}               → cron-runner PATCH  /cron-jobs/{id}
+  DELETE /schedules/{id}               → cron-runner DELETE /cron-jobs/{id}
+  POST   /schedules/{id}/rotate-secret → cron-runner POST   /cron-jobs/{id}/rotate-secret
 """
 
 from __future__ import annotations
@@ -86,6 +87,28 @@ async def update_schedule(
         resp = await client.patch(
             f"{url}/cron-jobs/{schedule_id}",
             json=body,
+            headers=foundation_headers(tenant_id, user_id, access_token),
+        )
+        _raise_for_upstream(resp)
+        return resp.json()
+
+
+@router.post("/schedules/{schedule_id}/rotate-secret")
+async def rotate_schedule_secret(
+    schedule_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> dict:
+    """Rotate a webhook trigger's secret in cron-runner.
+
+    Raw passthrough of ``{id, webhook_secret, webhook_path}`` — the new plaintext
+    secret is returned exactly once (webhook triggers only; schedule rows 4xx).
+    """
+    tenant_id, user_id, access_token = _auth
+    url = _cron_runner_url(request)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"{url}/cron-jobs/{schedule_id}/rotate-secret",
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
         _raise_for_upstream(resp)

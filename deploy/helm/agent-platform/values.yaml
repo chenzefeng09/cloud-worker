@@ -66,6 +66,7 @@ global:
     billingUrl: http://foundation-billing:80/api/billing/v1
     auditUrl: http://foundation-audit:80/api/audit/v1
     llmGatewayUrl: http://foundation-llm-gateway:80/api/llm/v1
+    dlpUrl: http://foundation-dlp:80/api/dlp/v1
 
     # OTEL Collector
     otelCollector:
@@ -164,6 +165,9 @@ sessionOrchestrator:
     dbPoolSize: "5"
     dbMaxOverflow: "10"
     dbPoolRecycle: "1800"
+    skillStoreServiceScopes: "skill.read_internal"
+    mcpRegistryServiceScopes: "mcp.read_internal"
+    inlineMcpTimeout: "20"
   env: []
 
 # ---------------------------------------------------------------------------
@@ -481,6 +485,7 @@ toolBroker:
     mcpRegistryUrl: ""       # 默认 http://ap-mcp-registry:8010/api/mcp/v1
     skillStoreUrl: ""        # 默认 http://ap-skill-store:8011/api/skills/v1
     webFetchGatewayUrl: ""   # 默认 http://ap-web-fetch-gateway:8013/api/web-fetch/v1
+    dlpUrl: ""               # 默认 global.foundation.dlpUrl（/dlp façade 上游，allowlist /core/scan）
     # HMAC lease 密钥占位；生产用 existingSecret 注入真实值后此项忽略。
     # 与 scheduler 共享，二者 MUST 同值（见 secrets.yaml / agent-scheduler.yaml）。
     leaseSecret: ""

@@ -13,6 +13,13 @@ class Settings(BaseSettings):
     env: str = "dev"
     log_level: str = "INFO"
     log_format: str = "console"
+    # Emit SQLAlchemy engine SQL/echo logs.  Kept OFF by default even in dev:
+    # ``echo=True`` fire-hoses every statement (and every bound param) into the
+    # log stream, which — under load on the session SSE path — can back the
+    # ``docker logs`` pipe up enough to starve the event loop and stall the
+    # stream mid-flight.  Turn on deliberately (SESSION_ORCHESTRATOR_SQL_ECHO=true)
+    # only for a targeted SQL-debugging session.
+    sql_echo: bool = False
     http_port: int = 8006
     api_prefix: str = "/api/session/v1"
 
@@ -40,16 +47,36 @@ class Settings(BaseSettings):
     # memory write-back (after run completion).
     knowledge_ingest_url: str = "http://knowledge-ingest:8012/api/knowledge/v1"
 
+    # Skill-store — used to resolve the originating user's installed skills
+    # that are enabled by default when a sandbox run omits the ``skills`` key.
+    # The service scope is sent only to skill-store's internal read endpoint.
+    skill_store_url: str = "http://skill-store:8011/api/skills/v1"
+    skill_store_service_scopes: str = "skill.read_internal"
+
+    # MCP registry — inline (no-sandbox) conversations discover the tenant's
+    # enabled HTTP MCP servers here, then execute their tools from the trusted
+    # orchestrator process.  Empty disables inline MCP without affecting chat.
+    mcp_registry_url: str = ""
+    mcp_registry_service_scopes: str = "mcp.read_internal"
+    inline_mcp_timeout: float = 20.0
+
     # Foundation authz + billing — RBAC enforcement and quota checks.
     authz_url: str = "http://authz:8002/api/authz/v1"
     foundation_billing_url: str = "http://billing:8007/api/billing/v1"
     feature_flag_url: str = "http://feature-flag:8012/api/feature-flag/v1"
 
+    # Rich document conversion — optional internal doc_to_markdown service.
+    # When configured, inline attachments prefer its structure-preserving
+    # Markdown output for Word/PDF files and fail open to the local lightweight
+    # extractor whenever the service is absent or unhealthy.
+    doc_to_md_url: str = ""
+    doc_to_md_timeout: float = 120.0
+
     # Foundation DLP — data-flow controls on the attachment path:
     #   • download check:download (fail-open on DLP error — see dlp_guard.py)
     #   • upload   scan + classification:tag (fail-open)
     # Env var: SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL
-    foundation_dlp_url: str = "http://foundation-dlp:8013/api/dlp/v1"
+    foundation_dlp_url: str = "http://foundation-dlp:80/api/dlp/v1"
 
     # Session-retention sweep — background job that soft-deletes sessions older
     # than ``session_retention_days``.  Env vars carry the ``SESSION_ORCHESTRATOR_``
@@ -64,3 +91,21 @@ class Settings(BaseSettings):
     # Failure-open: if unset or unreachable, the /state endpoint returns DB status
     # with empty plan/cursor fields rather than 500.
     redis_url: str | None = None
+
+    # LLM gateway — the OpenAI-protocol proxy the orchestrator talks to directly
+    # for chat-mode "inline" runs (POST {url}/chat/completions with
+    # X-LLM-Virtual-Key).  Default aligns with the BFF value
+    # (``services/bff/src/agent_bff/config.py``); the gateway resolves tenant +
+    # actor from the X-Tenant-Id / X-User-Id / X-Actor headers, so no bearer is
+    # required for the mesh call.  Env: SESSION_ORCHESTRATOR_LLM_GATEWAY_URL.
+    llm_gateway_url: str = "http://llm-gateway:8011/api/llm-gateway/v1"
+
+    # Timeout (seconds) for a single inline /chat/completions stream. Reasoning
+    # models can be slow; give a generous window before we abort the stream.
+    inline_completion_timeout: float = 300.0
+    # Timeout (seconds) for the lightweight gateway metadata calls made during an
+    # inline run (mint/fetch virtual key, resolve default model, revoke key).
+    inline_meta_timeout: float = 5.0
+
+    # Maximum size (bytes) of a single file uploaded to a workspace file library.
+    workspace_file_max_bytes: int = 20 * 1024 * 1024  # 20 MiB

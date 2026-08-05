@@ -16,15 +16,48 @@ import {
   validateSchema,
   blankField,
 } from '../components/app/InputSchemaBuilder';
+import {
+  EmojiPicker,
+  VisibilitySelect,
+  appInputCls,
+} from '../components/app/AppMetaFields';
+import { useConfirm, useToast } from '../admin/components/dialogs';
 import type {
   App,
   AppVersion,
   AppVersionCreate,
+  AppVisibility,
   InputField,
   McpServer,
   SamplingParams,
   Skill,
 } from '../api/types';
+
+/** App-level metadata — takes effect immediately, unlike the version harness. */
+interface MetaForm {
+  name: string;
+  icon: string;
+  description: string;
+  visibility: AppVisibility;
+}
+
+function metaFromApp(app: App): MetaForm {
+  return {
+    name: app.name ?? '',
+    icon: app.icon ?? '',
+    description: app.description ?? '',
+    visibility: app.visibility ?? 'private',
+  };
+}
+
+function metaEqual(a: MetaForm, b: MetaForm): boolean {
+  return (
+    a.name.trim() === b.name.trim() &&
+    a.icon.trim() === b.icon.trim() &&
+    a.description.trim() === b.description.trim() &&
+    a.visibility === b.visibility
+  );
+}
 
 /** Local editor state for the version harness. */
 interface HarnessForm {
@@ -70,11 +103,21 @@ function pickEditableVersion(app: App): AppVersion | null {
   return versions[versions.length - 1];
 }
 
+/**
+ * The system prompt is optional. Legacy drafts were created with a single
+ * space as a placeholder (the API used to reject empty strings), so treat
+ * whitespace-only values as empty — otherwise the textarea looks blank but
+ * hides an invisible space and never shows its placeholder hint.
+ */
+function normalizeSystemPrompt(value: string | null | undefined): string {
+  return value && value.trim() ? value : '';
+}
+
 function harnessFromVersion(v: AppVersion): HarnessForm {
   const sp = v.sampling_params ?? {};
   return {
     version: v.version,
-    system_prompt: v.system_prompt,
+    system_prompt: normalizeSystemPrompt(v.system_prompt),
     user_prompt_template: v.user_prompt_template,
     model: v.model || DEFAULT_MODEL,
     reasoning_effort: v.reasoning_effort ?? DEFAULT_EFFORT,
@@ -101,7 +144,7 @@ function buildSamplingParams(h: HarnessForm): SamplingParams {
 function buildVersionCreate(h: HarnessForm): AppVersionCreate {
   return {
     version: h.version.trim() || '1',
-    system_prompt: h.system_prompt,
+    system_prompt: normalizeSystemPrompt(h.system_prompt),
     user_prompt_template: h.user_prompt_template,
     model: h.model,
     reasoning_effort: h.reasoning_effort || null,
@@ -160,7 +203,7 @@ function StepTabs({
   return (
     <div className="grid grid-cols-2 gap-2">
       {[
-        { id: 1 as const, title: '1 定义任务输入', sub: '用户填写项、默认值、文件限制' },
+        { id: 1 as const, title: '1 定义任务输入', sub: '应用信息、用户填写项、文件限制' },
         { id: 2 as const, title: '2 定义执行环境', sub: '固定流程、Skills、MCP、发布权限' },
       ].map((item) => {
         const active = step === item.id;
@@ -524,8 +567,19 @@ export function AppEditorPage() {
   const [step, setStep] = useState<1 | 2>(1);
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  // App name for breadcrumb display (read-only; edited via the creation modal)
-  const [appName, setAppName] = useState('');
+  const confirm = useConfirm();
+  const toast = useToast();
+
+  // App-level info, edited in step 1. `metaBaseline` is the last persisted
+  // snapshot so we only PUT /apps/{id} when something actually changed.
+  const [meta, setMeta] = useState<MetaForm>({
+    name: '',
+    icon: '',
+    description: '',
+    visibility: 'private',
+  });
+  const [metaBaseline, setMetaBaseline] = useState<MetaForm>(meta);
+  const [metaError, setMetaError] = useState<string | null>(null);
 
   // Version harness
   const [harness, setHarness] = useState<HarnessForm>(emptyHarness());
@@ -576,7 +630,9 @@ export function AppEditorPage() {
       .get(id)
       .then((app) => {
         if (cancelled) return;
-        setAppName(app.name);
+        const m = metaFromApp(app);
+        setMeta(m);
+        setMetaBaseline(m);
         const v = pickEditableVersion(app);
         if (v) {
           const next = harnessFromVersion(v);
@@ -623,7 +679,16 @@ export function AppEditorPage() {
     }));
 
   // ── Validation ────────────────────────────────────────────────────────────
+  // Both the app-info block and the schema builder live on step 1, so the
+  // step-1 gate checks them together.
   const validateInputStep = (): boolean => {
+    if (!meta.name.trim()) {
+      setMetaError('请填写应用名称');
+      setError('应用信息有误，请检查标红项');
+      setStep(1);
+      return false;
+    }
+    setMetaError(null);
     const { errors, ok } = validateSchema(harness.input_schema);
     setFieldErrors(errors);
     if (!ok) {
@@ -642,10 +707,8 @@ export function AppEditorPage() {
     let ok = true;
     const he: typeof harnessErrors = {};
 
-    if (!harness.system_prompt.trim()) {
-      he.system_prompt = '请填写系统提示词';
-      ok = false;
-    }
+    // system_prompt is optional — leaving it empty falls back to the worker's
+    // default persona.
     if (!harness.user_prompt_template.trim()) {
       he.user_prompt_template = '请填写用户提示词模板';
       ok = false;
@@ -689,6 +752,19 @@ export function AppEditorPage() {
    */
   const persist = async (): Promise<{ appId: string; versionId: string } | null> => {
     const appId = id!;
+
+    // App info is immediate-effect and independent of the version lifecycle —
+    // push it first, and only when it actually differs from what's on file.
+    if (!metaEqual(meta, metaBaseline)) {
+      await api.apps.update(appId, {
+        name: meta.name.trim(),
+        icon: meta.icon.trim() || null,
+        description: meta.description.trim() || null,
+        visibility: meta.visibility,
+      });
+      setMetaBaseline(meta);
+    }
+
     const vc = buildVersionCreate(harness);
     let versionId: string;
     if (draftEditable && draftVersionId) {
@@ -715,7 +791,7 @@ export function AppEditorPage() {
     setSaving(true);
     try {
       await persist();
-      window.alert('已保存为草稿。需要发布后更改才生效。');
+      toast.success('已保存为草稿。版本内容需发布后才生效。');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '保存失败');
     } finally {
@@ -723,10 +799,14 @@ export function AppEditorPage() {
     }
   };
 
-  const handleCancel = () => {
-    if (window.confirm('你所做的更改不会被保存，确认离开吗？')) {
-      navigate('/home');
-    }
+  const handleCancel = async () => {
+    const ok = await confirm({
+      title: '放弃更改',
+      message: '你所做的更改不会被保存，确认离开吗？',
+      tone: 'danger',
+      confirmText: '离开',
+    });
+    if (ok) navigate('/home');
   };
 
   const handleSubmit = async () => {
@@ -780,7 +860,7 @@ export function AppEditorPage() {
       <PageHead
         crumbs={[
           { label: '首页', to: '/home' },
-          { label: appName || '编辑应用' },
+          { label: metaBaseline.name || '编辑应用' },
         ]}
         actions={
           <>
@@ -852,7 +932,7 @@ export function AppEditorPage() {
             hint={!draftEditable ? '当前配置不可改，保存将创建新草稿' : ''}
           >
             <PromptTemplateEditor
-              label="系统提示词 (system prompt)"
+              label="系统提示词 (system prompt, 可选)"
               value={harness.system_prompt}
               onChange={(system_prompt) => patchHarness({ system_prompt })}
               fields={harness.input_schema}
@@ -1006,6 +1086,55 @@ export function AppEditorPage() {
             )}
           </Section>
             </>
+          )}
+
+          {/* ── App info (immediate effect, unlike the version below) ── */}
+          {step === 1 && (
+            <Section
+              title="应用信息"
+              hint="名称、图标与简介保存后立即生效；下方的输入字段与提示词属于版本内容，需发布后才生效。"
+            >
+              <div className="flex gap-3 items-end">
+                <div className="flex flex-col gap-1">
+                  <label className="cw-label">图标</label>
+                  <EmojiPicker
+                    value={meta.icon}
+                    onChange={(icon) => setMeta((m) => ({ ...m, icon }))}
+                  />
+                </div>
+                <div className="flex-1 flex flex-col gap-1 min-w-0">
+                  <label className="cw-label">名称 *</label>
+                  <input
+                    className={metaError ? appInputCls.replace('border-line', 'border-accent') : appInputCls}
+                    value={meta.name}
+                    onChange={(e) => {
+                      setMeta((m) => ({ ...m, name: e.target.value }));
+                      if (metaError) setMetaError(null);
+                    }}
+                    placeholder="合同审查助手"
+                  />
+                  {metaError && <span className="text-[10.5px] text-accent">{metaError}</span>}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <label className="cw-label">简介</label>
+                <textarea
+                  className={`${appInputCls} min-h-[60px] resize-y`}
+                  value={meta.description}
+                  onChange={(e) => setMeta((m) => ({ ...m, description: e.target.value }))}
+                  placeholder="一句话说明这个应用做什么"
+                />
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <label className="cw-label">可见性</label>
+                <VisibilitySelect
+                  value={meta.visibility}
+                  onChange={(visibility) => setMeta((m) => ({ ...m, visibility }))}
+                />
+              </div>
+            </Section>
           )}
 
           {/* ── Input schema builder ── */}

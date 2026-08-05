@@ -1,202 +1,470 @@
-# Agent Platform
+# cloud·worker
 
-[English](README.md) | 中文
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
+[![Node](https://img.shields.io/badge/node-%E2%89%A518-green.svg)](https://nodejs.org/)
+[![React](https://img.shields.io/badge/react-19-61dafb.svg)](https://react.dev/)
 
-> 安全地运行会自行编写并执行代码的 AI 智能体 —— 每次运行独享一个内核级隔离的 microVM 沙箱，多租户、可审计、可计费。
+[English](README.md) · **简体中文**
 
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
-[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
-[![Frontend: React 19](https://img.shields.io/badge/frontend-React_19-61dafb.svg)](https://react.dev/)
-[![Agent kernel: AgentScope](https://img.shields.io/badge/agent_kernel-AgentScope_2.x-6f42c1.svg)](https://github.com/agentscope-ai/agentscope)
-[![Built on: SaaS Foundation](https://img.shields.io/badge/built_on-SaaS_Foundation-0a7ea4.svg)](https://github.com/chenzefeng09/saas-foundation)
+企业级 AI Agent 运行平台：多租户会话、在隔离沙箱（Docker 或 microVM）中执行的 Agent 任务、
+可复用的**应用（App）**、技能包、租户级 MCP 服务、知识库管道，以及一套 28 个模块的管理后台。
 
-Agent Platform 是一个面向企业的平台，用于运行会自行编写并执行代码的 AI 智能体。每一次智能体运行都被放入独立的、内核级隔离的 microVM 沙箱中，因此模型生成的不可信代码绝不会与宿主机或其他租户共享内核。平台天生多租户，并从 [SaaS Foundation](https://github.com/chenzefeng09/saas-foundation) 继承身份认证、授权、计费、审计与 LLM 网关能力 —— Agent Platform 正是构建在它之上。
+> **cloud·worker** 是产品名，仓库名为
+> [`cloud-worker`](https://github.com/chenzefeng09/cloud-worker)。仓库内部仍有不少标识
+> 沿用早期的 `agent-platform` 命名（compose 文件、Helm chart、镜像前缀等），下文按实际名称引用。
 
-## 为什么选择 Agent Platform
+cloud·worker 是**业务层**，构建在
+[**saas-foundation**](https://github.com/chenzefeng09/saas-foundation) 之上 ——
+后者是一个独立可复用的企业级 SaaS 底座，负责身份、授权、组织、计费、审计、合规、LLM 网关、
+存储、密码学、DLP 与特性开关。详见[与 saas-foundation 的关系](#与-saas-foundation-的关系)。
 
-让模型自由生成并执行任意代码，是智能体最有用、也最危险的能力。Agent Platform 正是围绕这一张力设计的。
+---
 
-- **每次运行内核级隔离。** 模型生成的不可信代码运行在 CubeSandbox microVM（默认）或 Kata Containers microVM（兜底）中，而非与宿主机共享内核的容器；Docker 仅用于本地开发与 CI。一个沙箱一个智能体、一个智能体一个任务：每次运行的 microVM 即是租户隔离、审计与计费的边界单元。
-- **默认拒绝出网。** 在 broker 模式下，沙箱只接入内部网络，且只能访问唯一一个目标 —— tool-broker 门面。Redis、对象存储、身份提供方、内部注册表、云元数据端点以及公网，都在 microVM 边界处被拒绝。唯一的 Web 出网服务经过 SSRF 过滤，并采用失败即关闭（fail-closed）策略。
-- **每次运行的能力租约。** 调度器为每次运行签发一个短时效的 HMAC 租约。沙箱经由 broker 发起的每一次调用（LLM、MCP、技能、Web 抓取、热状态、对象存储）都必须携带该租约。真实的基础设施凭据只存在于 broker 上 —— 沙箱不持有任何凭据。
-- **企业治理：继承而非重造。** 身份认证、RBAC/ABAC 授权、配额与计量计费、不可篡改审计、DLP 以及租户级 LLM 网关，全部来自 SaaS Foundation。Agent Platform 将智能体运行接入这套治理体系，而不是重新实现它。
+## 界面预览
 
-## 核心特性
+一次 Agent 运行：模型在沙箱里写并执行 Python，再带着渲染好的表格回报。
+`33 TOOL CALLS` 那一行折叠了完整的工具调用记录；它产出的图表是一张带中文标签的 200 DPI PNG。
 
-- 每次智能体运行独享一个内核级隔离的 microVM 沙箱（Cube / Kata / Docker 三种运行时统一在同一 `SandboxRuntime` 接口之后）。
-- 预热沙箱池以降低冷启动延迟，并由温机指标驱动自动伸缩。
-- 基于 AgentScope 的智能体内核（`ReActAgent` + `Toolkit`），通过 sidecar Python 包扩展 —— 而非 fork。
-- 租户级 MCP 服务器注册表、版本化技能包，以及「文档 → 向量嵌入 → 向量检索」的知识管线。
-- 模板化的智能体任务（「Apps」）：带版本化的审核/发布流程，并支持按 cron 定时执行。
-- 所有 LLM 流量经由 Foundation LLM 网关，使用租户级虚拟密钥进行配额、路由与审计。
-- 对上传、下载、运行产物与会话记录进行数据防泄漏（DLP）；对每个智能体事件进行防篡改审计。
-- React 19 Web 应用：实时 SSE 对话、人在回路（HITL）确认卡片、浏览器内文件预览，以及多模块管理控制台。
-- 双语（English / 简体中文）界面与文档。
+![Agent 运行 —— 沙箱内 Python、工具调用分组、Markdown 表格](docs/images/02-agent-run.png)
+
+首页 —— 任务输入、模型与推理强度选择器、应用卡片，底部是进行中的运行。
+
+![首页](docs/images/01-home.png)
+
+管理后台 —— 租户、用户、RBAC、特权访问、套餐与配额、模型管理，
+以及平台治理（应用审核、技能、MCP、知识库、沙箱）。
+
+![管理后台](docs/images/03-admin.png)
+
+> **项目状态**：处于活跃开发中，已用于内部试点，但尚未 1.0。服务之间的接口仍在演进。
+> 开发栈基于 docker-compose；`deploy/helm/` 下有 Helm chart，但打磨程度不及前者。
+
+---
+
+## 目录
+
+- [能力概览](#能力概览)
+- [与 saas-foundation 的关系](#与-saas-foundation-的关系)
+- [架构](#架构)
+- [仓库结构](#仓库结构)
+- [快速开始](#快速开始)
+- [配置](#配置)
+- [开发](#开发)
+- [沙箱镜像](#沙箱镜像)
+- [安全模型](#安全模型)
+- [文档](#文档)
+- [参与贡献](#参与贡献)
+- [许可证](#许可证)
+
+---
+
+## 能力概览
+
+**对话与执行**
+
+- **流式会话** —— 基于 SSE 的真 token 级流式输出，支持思考块、工具调用步骤分组折叠、多轮历史。
+- **沙箱化 Agent 运行** —— 每次运行分配全新隔离工作区。两种运行时：Docker（开发）与
+  CubeSandbox microVM（生产，内核级隔离，见
+  [ADR 0001](docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md)）。
+- **两套可互换的 Agent Worker** —— 基于
+  [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview) 的 TypeScript
+  worker，以及基于 [AgentScope 2.x](https://github.com/agentscope-ai/agentscope) 的 Python
+  worker（见 [ADR 0002](docs/adr/0002-agent-kernel-agentscope-over-openhands.md)）。
+- **人在回路（HITL）** —— Agent 可在运行中途暂停提问或请求确认；卡片在页面刷新后仍能恢复，
+  并原地续跑。
+
+**可复用的 Agent 资产**
+
+- **应用（App）** —— 把固定的 Agent harness（提示词、工具、输入、模型）封装为带版本、
+  可审核、可发布的应用。支持手动运行、定时（cron）触发、以及 Webhook 入站触发（可带文件），
+  并提供按应用维度的完整执行历史。
+- **技能（Skill）** —— 纯指令包（`SKILL.md` + 可选脚本），渐进式披露。以内容寻址的宿主机缓存
+  只读挂载进沙箱，单次运行零下载开销。内置一批平台级默认技能。
+- **MCP** —— 租户级 MCP 服务注册表，支持自定义 header、鉴权（含 OAuth）、超时与工具黑白名单。
+  经 broker 转发，沙箱内不持有租户凭据。
+- **知识库** —— 文档 → 切块 → 向量化 → pgvector 的入库管道，运行期可作为工具检索。
+
+**文档与工作区**
+
+- **工作区与文件** —— 会话绑定的工作区、`@` 文件补全，以及 PDF / Word / Excel / PowerPoint /
+  压缩包的内联预览。
+- **画布（Canvas）** —— 模型可在对话过程中创建与修订的文档面，支持可运行 HTML 在沙箱 iframe 中预览。
+- **产物（Artifacts）** —— 运行产出以可下载卡片的形式呈现在对话流中。
+
+**运维**
+
+- **管理后台** —— 28 个模块，覆盖租户、用户、RBAC、SSO、配额、模型管理、审计、会话回放、DLP、
+  合规、数据保护、PAM、安全运营、生命周期、特性开关、存储、沙箱池监控与应用审核。
+  其中大多数是对 saas-foundation 服务的薄代理。
+- **全链路多租户** —— Postgres RLS、租户隔离存储、租户级配额校验，以及用于成本归集的
+  per-run LLM 虚拟密钥。
+
+---
+
+## 与 saas-foundation 的关系
+
+两个仓库沿一条线切分：**saas-foundation 是通用企业底座，cloud·worker 是所有与 Agent 相关的部分。**
+
+| | [saas-foundation](https://github.com/chenzefeng09/saas-foundation) | cloud·worker（`cloud-worker`，本仓库） |
+|---|---|---|
+| **定位** | 可复用 SaaS 底座，独立交付 | 构建在底座之上的业务层 |
+| **负责** | identity、authz、org、billing、audit、compliance、notification、search、api-platform、llm-gateway、storage、crypto、dlp、data-protection、feature-flag、lifecycle、pam、security-ops | 会话、消息、运行、沙箱、Agent worker、技能、MCP、知识库、应用、画布、产物 |
+| **依赖方向** | 不感知上层 | 通过 HTTP + SDK 消费底座 |
+
+沿用底座的设计原则：**业务服务不直接触碰底层开源组件。** 本仓库没有任何服务直连 Keycloak、
+OPA、LiteLLM、MinIO、Vault 或 Unleash —— 一律调用对应的 foundation 服务。这样底层组件可以整体
+替换，而不必改动 Agent 侧代码。
+
+### 具体怎么打通
+
+1. **`foundation_sdk`（Python）** —— 各服务从中获取 Cookie 签名（`CookieSigner`）、
+   请求上下文透传（`install_request_context`）、RFC 9457 problem+json 错误处理
+   （`register_problem_details`）以及租户/用户提取（`get_tenant_id`、`get_user_id`）。
+2. **共享 Docker 网络** —— agent compose 栈接入 foundation 栈的外部网络，由
+   `FOUNDATION_NETWORK` 指定（默认 `saas-foundation-dev_foundation`）。
+3. **服务间 HTTP** —— BFF 把管理后台流量代理到 foundation 服务；orchestrator 与 worker 携带
+   per-run 虚拟密钥访问 LLM 网关。
+
+SDK 有两条获取路径，详见
+[docs/foundation-sdk-consumption.md](docs/foundation-sdk-consumption.md)：
+
+- **内部 PyPI**（CI / 生产）—— 从私有源拉取 `foundation-sdk = ">=0.1,<0.2"`。
+- **构建上下文**（本地开发，本仓库默认）—— docker-compose 通过 `additional_contexts` 注入兄弟
+  目录里的 `sdks/python`，改 SDK 立即生效，不必先发版。
+
+### ⚠️ 必须有 saas-foundation 才能跑起来
+
+`foundation-sdk` 尚未发布到公网 PyPI。请把两个仓库克隆为兄弟目录：
+
+```
+Development/
+├── saas-foundation/     # 必须先启动
+└── cloud-worker/        # 本仓库
+```
+
+若目录结构不同，请覆盖 `FOUNDATION_DIR`（Makefile）与 `FOUNDATION_SDK_PATH`
+（`deploy/docker-compose/.env`）。
+
+---
 
 ## 架构
 
-一次浏览器请求经由 BFF，进入会话与运行编排，再到调度器，最终进入一个运行 AgentScope worker 的、每次运行独享的沙箱 microVM。沙箱通向外部的唯一路径是 tool-broker 门面；通向公网的唯一路径是 web-fetch 网关。
-
-```mermaid
-flowchart TB
-    Browser["浏览器 (React 19 SPA)"]
-    BFF["bff :8005<br/>鉴权网关 · API 聚合 · SSE 中继"]
-    SO["session-orchestrator :8006<br/>会话 / 消息 / 运行生命周期 · DLP"]
-    SCHED["agent-scheduler :8007<br/>签发每次运行的令牌 + HMAC 租约 · 拉起沙箱"]
-    POOL["sandbox-pool :8008<br/>预热温机水位线"]
-
-    subgraph SB["沙箱 microVM (Cube / Kata / Docker) —— 每次运行一个"]
-        WORKER["AgentScope worker<br/>ReActAgent + Toolkit"]
-    end
-
-    BROKER["tool-broker :8024<br/>唯一出网门面 · 校验租约"]
-    WFG["web-fetch-gateway<br/>唯一公网出口 · SSRF 过滤"]
-
-    subgraph FND["SaaS Foundation"]
-        IDP["identity / authz / billing / audit"]
-        LLM["LLM 网关"]
-    end
-
-    REG["mcp-registry · skill-store · knowledge-ingest"]
-
-    Browser -->|签名会话 Cookie| BFF
-    BFF --> SO
-    SO --> SCHED
-    SCHED -->|领取温机槽位| POOL
-    SCHED -->|拉起| SB
-
-    WORKER -->|每次调用携带运行租约| BROKER
-    BROKER --> LLM
-    BROKER --> REG
-    BROKER --> WFG
-    WFG -->|公网| Internet(("Internet"))
-
-    SCHED --> IDP
-    SO --> IDP
-    BFF --> IDP
+```
+                    浏览器 — React 19 + Vite  (:5173)
+                              │  签名 Cookie 会话 · SSE
+                              ▼
+              ┌───────────────────────────────────┐        ┌──────────────────────────┐
+              │  bff  :8005                       │───────▶│     saas-foundation      │
+              │  鉴权代理 · API 聚合              │        │  identity · authz · org  │
+              │  SSE 中继 · 管理后台代理          │◀───────│  audit · billing · dlp   │
+              └───┬───────────────────────────────┘        │  llm-gateway · storage   │
+                  │                                        │  crypto · feature-flag … │
+                  │                                        └──────────────────────────┘
+   ┌──────────────┼────────────────┬──────────────┬───────────────┬──────────────┐
+   ▼              ▼                ▼              ▼               ▼              ▼
+session-      app-registry    skill-store    mcp-registry    knowledge-     cron-runner
+orchestrator     :8014           :8011          :8010          ingest          :8015
+   :8006       应用：带版本      技能包         租户 MCP        :8012         定时任务 +
+ 会话 · 消息    harness +       （tarball）     服务         文档 → pgvector    Webhook
+ 运行 · 画布    审核/发布
+ 工作区
+   │
+   ▼
+agent-scheduler :8007 ───────────────▶ sandbox-pool :8008
+每次运行拉起一个沙箱                    预热的 CubeSandbox microVM 池
+   │
+   ├── runtime: docker  （开发）
+   └── runtime: cube    （microVM，内核级隔离）
+              │
+              ▼
+        ┌───────────────────────────────────────────────┐
+        │  沙箱内的 Agent Worker                        │
+        │  • worker-claude-sdk   (TS, Claude Agent SDK) │
+        │  • agentscope-ext      (Py, AgentScope 2.x)   │
+        └───────┬───────────────────────────┬───────────┘
+                │                           │
+                ▼                           ▼
+      tool-broker :8024           web-fetch-gateway :8023
+      访问 foundation 工具        受控出网：白名单 + 默认拒绝
+      的策略门面                  + SSRF 防护
 ```
 
-在 **broker 出网模式**（默认）下，沙箱只接入内部 `sandbox_broker` 网络，且**只能**经由 tool-broker 访问 LLM 网关、MCP 注册表、技能库、web-fetch 网关、Redis 热状态与对象存储 —— 每次调用都由签名的运行租约鉴权。web-fetch 网关是唯一接入出网网络的服务。
+**一轮 Agent 对话的链路**：浏览器 → BFF（鉴权、解析租户）→ session-orchestrator（落库消息、
+开启 run）→ agent-scheduler（申请沙箱、签发短期 token 与 per-run LLM 虚拟密钥）→ worker
+（驱动 Agent 循环、经 broker 调用工具）→ 事件经 Redis 回流 → SSE → 浏览器。
 
-## 服务
+### 服务清单
 
-平台由 11 个服务组成。下表端口为 Docker Compose 开发栈的默认值；其中若干服务在容器内部共享 `8013` 端口，通过不同的宿主机端口映射加以区分，已在表中注明。
-
-| 服务 | 端口（开发） | 用途 |
+| 服务 | 宿主端口 | 职责 |
 |---|---|---|
-| `bff` | 8005 | 后端聚合层：鉴权网关、签名 Cookie 会话、API 聚合，以及为 Web 应用做 SSE 中继。 |
-| `session-orchestrator` | 8006 | 负责会话 / 消息 / 运行生命周期的 CRUD、附件存储、运行 SSE 事件流，以及 DLP 强制执行。 |
-| `agent-scheduler` | 8007 | 拉起并管理运行 AgentScope worker 的沙箱 microVM/容器；签发每次运行的令牌与 HMAC 租约。 |
-| `sandbox-pool` | 8008 | 预热空闲沙箱以保证运行温启动；导出 Prometheus 指标用于驱动自动伸缩。 |
-| `mcp-registry` | 8010 | 租户级 MCP 服务器（后端）注册表，供智能体连接。 |
-| `skill-store` | 8011 | 版本化技能包注册表，按租户存储 `skill.yaml` + 代码的 tar 包。 |
-| `knowledge-ingest` | 8012 | 「文档 → 向量嵌入 → pgvector」入库与语义检索管线；同时支撑会话记忆。 |
-| `app-registry` | 容器 8013 → 宿主 8014 | 模板化智能体任务（「Apps」）的注册表，带版本化 harness 与审核/发布流程。容器端口 8013 与 Foundation 审计服务冲突，故以宿主机 8014 暴露。 |
-| `cron-runner` | 容器 8013 → 宿主 8015 | 按 cron 定时运行已发布的 Apps（APScheduler），经由 BFF 用服务令牌触发。与 web-fetch-gateway 共用容器端口 8013，由宿主机端口区分。 |
-| `web-fetch-gateway` | 容器 8013 → 宿主 8023 | 为智能体 `WebFetch` 工具提供受 SSRF 保护的出站 HTTP 抓取网关；唯一接入公网出口网络的服务。 |
-| `tool-broker` | 8024 | 受策略控制的门面，向 broker 模式的沙箱提供对平台工具服务的、按租约限定的窄访问。已禁用 OpenAPI/docs；只有不可信沙箱可达。 |
+| `web` | 5173 | React 19 单页应用 —— 对话、应用、资源库、工作区、管理后台 |
+| `bff` | 8005 | 鉴权代理、API 聚合、SSE 中继、管理后台分发 |
+| `session-orchestrator` | 8006 | 会话、消息、运行、画布、工作区、会话内工具循环 |
+| `agent-scheduler` | 8007 | 拉起沙箱容器/microVM，注入凭据 |
+| `sandbox-pool` | 8008 | 预热的 CubeSandbox microVM 池 |
+| `mcp-registry` | 8010 | 租户 MCP 服务注册表（密钥加密、工具过滤） |
+| `skill-store` | 8011 | 带版本的技能包 |
+| `knowledge-ingest` | 8012 | 文档 → 向量 → pgvector 管道 |
+| `app-registry` | 8014 | 应用：版本化 harness、审核、发布 |
+| `cron-runner` | 8015 | 定时与 Webhook 触发的应用执行 |
+| `web-fetch-gateway` | 8023 | Agent 工具的受控出网 HTTP（SSRF 防护） |
+| `tool-broker` | 8024 | 沙箱访问 foundation 的策略门面 |
 
-> 端口说明：`app-registry`、`cron-runner` 与 `web-fetch-gateway` 在容器内均监听 `8013`，但它们各自映射到不同的宿主机端口（8014 / 8015 / 8023），运行时不会冲突。选用 `8013` 同时也是为了避开 Foundation 审计服务（其自身使用 8013）。
-
-## 技术栈
-
-| 层次 | 技术 |
-|---|---|
-| 前端 | React 19 + TypeScript 5.7、Vite 6、React Router v7、Zustand 5、Tailwind CSS 3；`react-markdown` + `remark-gfm` 渲染对话，`recharts` 用于管理面板，浏览器内 PDF/DOCX/XLSX 预览；自研 i18n（en/zh） |
-| 前端测试 | Vitest 2 + Testing Library + jsdom；ESLint 9 + typescript-eslint |
-| 智能体内核 | [AgentScope](https://github.com/agentscope-ai/agentscope) 2.x（Apache-2.0）—— `ReActAgent` + `Toolkit` + 模型/格式化器抽象。未 fork；相较 OpenHands 的选型理由见 [ADR 0002](./docs/adr/0002-agent-kernel-agentscope-over-openhands.md) |
-| 沙箱扩展 | `agentscope-ext`：独立的 Python 3.12 包（`runtime_worker`、`llm_gateway_enforcer`、`mcp_tenant_injector`、`skills_loader`、`event_audit_sink`、`web_fetch`），pip 安装进沙箱镜像 |
-| 备选 worker | `worker-claude-sdk`：基于 `node:22-slim` 的 TypeScript/Node.js worker，遵循同一 `task.json` → `result.json` 契约 |
-| 后端服务 | Python 3.12、FastAPI + uvicorn、Poetry、asyncpg/SQLAlchemy + Alembic、ruff + mypy + pytest；`foundation_sdk` 路径依赖 |
-| 沙箱运行时 | CubeSandbox microVM（E2B HTTP 协议，生产默认）、Kata Containers + Cloud Hypervisor（兜底）、Docker（开发/CI）—— 由 `SCHEDULER_RUNTIME` 选择 |
-| 沙箱镜像 | OCI 镜像分层（base / office / matlab）：Python 3.12 + 锁定版 AgentScope + NumPy/Pandas/Polars/Node 20/Playwright+Chromium；office 增加 LibreOffice headless；matlab 增加 MATLAB Runtime。另有独立的 `claude-sdk` 镜像 |
-| 数据设施（来自 Foundation） | PostgreSQL 16 + pgvector、Redis、MinIO/S3、Keycloak（OIDC）、ClickHouse（审计）、Vault（KEK） |
-| 部署与运维 | Docker Compose（开发 + Cube override）、Helm chart（small/medium/large 三档，含 Foundation 子 chart）、KEDA 自动伸缩、OpenTelemetry + Prometheus、Locust 压测 |
-
-## 快速开始
-
-> **前置条件 —— 并列的 SaaS Foundation 检出。** 没有在 `../saas-foundation` 检出 [SaaS Foundation](https://github.com/chenzefeng09/saas-foundation)，Agent Platform 既无法构建、也无法启动或运行。它会导入 `foundation_sdk`（以可编辑方式从 foundation 仓库安装）、共享由 foundation 栈创建的 Docker 网络，并在运行时调用 Foundation 的 Identity、LLM 网关与 Billing 服务。请先将两个仓库并列克隆。
-
-```text
-parent/
-├── agent-platform/      # 本仓库
-└── saas-foundation/     # 必需的并列检出
-```
-
-你还需要：GNU `make` + bash、Docker + Docker Compose v2、Python 3.12 + Poetry，以及 Node.js 20+ / npm。
-
-```bash
-# 1. 引导：为每个服务执行 poetry install，并把可编辑的 foundation SDK 装入各自 venv
-make bootstrap
-
-# 2. 从示例创建 .env（使用前请检查并调整）
-make env
-
-# 3. 启动 Foundation 开发栈 + 所有 agent 服务
-make up
-
-# 4. 执行数据库迁移（session-orchestrator 的 Alembic）
-make migrate
-
-# 5. 安装并启动前端
-make web-install
-make web-dev
-```
-
-然后打开 <http://localhost:5173>。Web 应用、BFF、orchestrator 与 scheduler 分别监听 5173 与 8005–8007 端口。
-
-常用后续命令：
-
-```bash
-make agent-up           # 仅启动 agent 服务（Foundation 已在运行）
-make logs SVC=bff       # 跟踪单个服务的日志
-make ps                 # 服务状态
-make down               # 停止服务
-make conformance        # 对运行中的栈执行一致性测试
-```
-
-要在 CubeSandbox microVM 中运行智能体（需要带 `/dev/kvm` 的 Linux 宿主机），参见 [`docs/runbook/enable-cubesandbox.md`](./docs/runbook/enable-cubesandbox.md)。
+---
 
 ## 仓库结构
 
-| 路径 | 内容 |
-|---|---|
-| `services/` | 11 个 Python（FastAPI）后端服务 —— `bff`、`session-orchestrator`、`agent-scheduler`、`sandbox-pool`、`app-registry`、`skill-store`、`mcp-registry`、`tool-broker`、`knowledge-ingest`、`cron-runner`、`web-fetch-gateway` |
-| `apps/web/` | React 19 + Vite 单页应用（工作区 + 管理控制台） |
-| `agentscope-ext/` | 沙箱侧的 AgentScope 扩展包与 `runtime_worker` 入口 |
-| `sandbox-images/` | base / office / matlab 沙箱镜像分层与 `claude-sdk` worker 镜像的 OCI Dockerfile |
-| `deploy/` | Docker Compose 栈、Helm chart、KEDA operator 清单、Cube 出网策略、备份/恢复与压测 |
-| `contracts/` | 服务之间及与沙箱 worker 之间的共享 API / 线缆契约 |
-| `docs/` | ADR、设计文档、运维手册与路线图 |
+```
+cloud-worker/
+├── apps/web/              React 19 单页应用（Vite、Zustand、Tailwind）
+│   └── src/admin/         28 个模块的管理后台
+├── services/              FastAPI 服务（Python 3.12、Poetry）—— 见上方清单
+├── worker-claude-sdk/     TypeScript Agent worker —— Claude Agent SDK
+├── agentscope-ext/        Python Agent worker + AgentScope 扩展
+│                          （画布/知识库/联网工具、网关强制器、
+│                            MCP 租户注入器、技能加载器、审计 sink）
+├── sandbox-images/        沙箱 Dockerfile —— base / office / MATLAB 分层
+├── libs/                  共享客户端库（特性开关、配额守卫）
+├── contracts/             OpenAPI 3.1 契约 + worker 线协议
+├── deploy/
+│   ├── docker-compose/    开发栈
+│   ├── helm/              Kubernetes chart
+│   ├── cube/              CubeSandbox controller 配置
+│   └── scripts/           证书生成、运维脚本
+├── docs/
+│   ├── adr/               架构决策记录
+│   ├── design/            滚动细化的设计文档
+│   └── runbook/           备份恢复、压测、Cube 启用
+└── tests/conformance/     跨服务一致性测试套件
+```
 
-## 与 SaaS Foundation 的关系
+---
 
-Agent Platform 是智能体执行产品；[**SaaS Foundation**](https://github.com/chenzefeng09/saas-foundation) 是它所依托的可复用企业底座。SaaS Foundation 是一个独立、通用的底座 —— 身份认证、授权、组织、计费、审计、合规、DLP 与 LLM 网关 —— 可供任何业务系统使用，而不仅限于本项目。
+## 快速开始
 
-Agent Platform 在四个层面依赖它：
+**前置条件**：Docker（含 Compose v2）、Python 3.12 + Poetry、Node 18+，以及作为兄弟目录存在的
+[saas-foundation](https://github.com/chenzefeng09/saas-foundation) 检出。
 
-- **SDK / 源码。** 几乎每个服务都会 `import foundation_sdk`（请求上下文、problem-details、Cookie 签名器）。该 SDK 通过 `make bootstrap` 从 `../saas-foundation/sdks/python` 以可编辑方式安装。
-- **构建。** 每个服务的 Dockerfile 都以构建上下文方式接收 SDK 源码，因此镜像基于并列检出构建。
-- **网络。** agent 服务接入由 Foundation compose 项目创建的外部 Docker 网络。
-- **运行时。** BFF 将鉴权代理到 Foundation Identity；调度器从 Foundation Identity 签发短时效的每次运行 JWT；沙箱则用这些令牌访问 Foundation 的 LLM 网关、审计与计费。
+```bash
+git clone https://github.com/chenzefeng09/saas-foundation.git
+git clone https://github.com/chenzefeng09/cloud-worker.git
+cd cloud-worker
+```
 
-如果你只需要企业底座而不需要智能体运行时，可直接从 SaaS Foundation 入手。
+```bash
+make env
+```
+
+这会从示例生成 `deploy/docker-compose/.env`。编辑它，至少要设置 `BFF_COOKIE_SECRET`
+（必须 ≥32 字符，弱值会导致启动直接失败）：
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+然后拉起两个栈并构建沙箱镜像：
+
+```bash
+make up
+```
+
+```bash
+make build-claude-sdk-image
+```
+
+浏览器打开 <http://localhost:5173>。开发用的种子账号来自 foundation 栈，见其
+`deploy/docker-compose/README.md`。
+
+常用命令：
+
+```bash
+make ps
+```
+
+```bash
+make logs SVC=bff
+```
+
+```bash
+make down
+```
+
+若想在 Docker 之外跑前端、连容器化的后端：
+
+```bash
+make web-install && make web-dev
+```
+
+---
+
+## 配置
+
+配置集中在 `deploy/docker-compose/.env`（从 `.env.example` 复制）。最关键的几项：
+
+| 变量 | 默认值 | 用途 |
+|---|---|---|
+| `FOUNDATION_NETWORK` | `saas-foundation-dev_foundation` | 与 foundation 栈共享的外部 Docker 网络 |
+| `FOUNDATION_SDK_PATH` | `../../../saas-foundation/sdks/python` | 兄弟目录的 SDK 源码，作为构建上下文注入 |
+| `BFF_COOKIE_SECRET` | *（空 —— 必须自行设置）* | 会话 Cookie 签名密钥，≥32 字符 |
+| `SCHEDULER_RUNTIME` | `docker` | 开发用 `docker`，microVM 隔离用 `cube` |
+| `CLAUDE_SDK_IMAGE` / `AGENT_IMAGE` | 见 `.env.example` | 各 worker 形态对应的沙箱镜像 |
+| `POOL_IDLE_LOW` / `POOL_IDLE_HIGH` / `POOL_MAX_TOTAL` | `2` / `10` / `50` | microVM 池容量 |
+| `CUBE_CONTROLLER_URL`、`CUBE_TLS_MODE`、`CUBE_API_KEY` | — | CubeSandbox controller（`SCHEDULER_RUNTIME=cube` 时必填） |
+
+启用 microVM 运行时是一套独立流程，见
+[docs/runbook/enable-cubesandbox.md](docs/runbook/enable-cubesandbox.md)。
+
+---
+
+## 开发
+
+```bash
+make bootstrap     # 为每个服务执行 poetry install，并可编辑安装 foundation SDK
+```
+
+```bash
+make lint          # 全服务 ruff check + mypy
+```
+
+```bash
+make test          # 全服务 pytest + 覆盖率
+```
+
+```bash
+make migrate       # alembic upgrade head（session-orchestrator）
+```
+
+```bash
+make conformance   # 对运行中的栈执行一致性测试
+```
+
+前端在 `apps/web/` —— `npm run typecheck`、`npm run lint`、`npm run test`（vitest）、
+`npm run build`。
+
+Worker 在 `worker-claude-sdk/` —— `npm run typecheck`、`npm run test`，以及产出 `dist/`
+供沙箱镜像构建使用的 `npm run build`。
+
+GitHub Actions 的分服务流水线位于 `.github/workflows/`。
+
+**注意**：compose 栈里大多数后端服务**不支持热重载**。改完服务代码后需重建：
+`make agent-up`（内部会带 `--build`）。
+
+---
+
+## 沙箱镜像
+
+`sandbox-images/` 负责构建 Agent 运行所在的镜像，分层组织：
+
+```
+base            Python 3.12 · Agent worker · 非 root uid 1000
+                办公文档库 · 科学计算 Python · Noto CJK 字体
+  └─ office     + LibreOffice headless（格式转换，如 docx → pdf）
+       └─ matlab  + MATLAB（Control System / Aerospace 工具箱分层）
+```
+
+**默认镜像本身就具备完整办公能力 —— 不需要额外分层，也不需要任何授权。**
+`claude-sdk.Dockerfile` 与 `claude-sdk-cube.Dockerfile` 已预装 `python-docx`、
+`openpyxl`、`python-pptx`、`pypdf`、`Pillow`、`lxml`、`xlsxwriter`，可读写
+Word / Excel / PowerPoint / PDF；另有 `pandas`、`numpy`、`matplotlib`、`graphviz`、
+`diagrams` 用于分析与绘图。镜像还装了 `fonts-noto-cjk` 并写入 `matplotlibrc`，
+中文标签能正常渲染而不是变成豆腐块。这些全部是开源包，来自 PyPI / apt。
+构建阶段会断言这些库和 CJK 字体确实可用 —— 镜像坏了会在 build 时失败，而不是运行到一半才炸。
+
+独立的 `office` 分层在此之上加 **LibreOffice headless**，只在需要真正的格式**转换**
+（docx → pdf、xlsx → csv，走 `unoconv`）时才用；单纯生成文档用默认镜像即可。
+
+```bash
+make build-claude-sdk-image
+```
+
+```bash
+make build-claude-sdk-cube-image
+```
+
+> **MATLAB 分层需自备授权。** 本仓库不包含、也不得再分发任何 MATLAB 安装介质、许可证文件或
+> 二进制。`matlab*.Dockerfile` 相关目标要求你把 `MATLAB_ISO_DIR` 指向自己合法授权的安装介质。
+> 平台其余部分不依赖它们 —— 完全跳过这些构建目标，上面所有能力照常可用。
+
+完整分层矩阵见 [sandbox-images/README.md](sandbox-images/README.md)。
+
+---
+
+## 安全模型
+
+模型生成的代码全程按不可信处理：
+
+- **内核级隔离** —— 生产运行落在 CubeSandbox microVM，而非共享内核的容器
+  （[ADR 0001](docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md)）。
+- **默认拒绝的出网** —— 沙箱没有直接互联网路由。出站 HTTP 必须经 `web-fetch-gateway`，
+  由其执行白名单并拦截 SSRF（含 fake-IP / DNS 重绑定类攻击）。
+- **工具访问经 broker** —— 沙箱只能通过 `tool-broker` 触达 foundation 服务，由其执行策略，
+  且不下发租户凭据；调用第三方 MCP 时会剥离入站 `Authorization` 头。
+- **短时、单次运行的凭据** —— scheduler 为每次运行签发 run 级 token 与 LLM 虚拟密钥；
+  密钥以文件下发后 unlink，而不是留在进程环境变量里 —— Agent 去读 `/proc/*/environ` 也拿不到。
+- **DLP 拦截** —— 上传、下载与工具调用的内容都会按 foundation DLP 规则校验。
+- **数据密级** —— 文件、工作区与用户都带密级，访问需满足 `文件 ≤ 工作区 ≤ 用户密级`。
+- **审计与回放** —— 运行事件汇入 foundation 审计服务；会话回放受独立权限管控。
+
+发现安全问题？请通过
+[GitHub security advisory](https://github.com/chenzefeng09/cloud-worker/security/advisories/new)
+私下报告，不要开公开 issue。
+
+---
 
 ## 文档
 
-- [架构](./docs/ARCHITECTURE.md) —— 端到端设计、沙箱运行时契约与安全模型。
-- [快速上手](./docs/getting-started.md) —— 更完整的搭建与首次运行指引。
-- [ADR 0001 —— 沙箱运行时：Cube 默认、Kata 兜底](./docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md)
-- [ADR 0002 —— 智能体内核：选用 AgentScope 而非 OpenHands](./docs/adr/0002-agent-kernel-agentscope-over-openhands.md)
+| 主题 | 文档 |
+|---|---|
+| 沙箱运行时决策 | [ADR 0001 —— CubeSandbox 默认、Kata 兜底](docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md) |
+| Agent 内核决策 | [ADR 0002 —— 选 AgentScope 而非 OpenHands](docs/adr/0002-agent-kernel-agentscope-over-openhands.md) |
+| 沙箱运行时设计 | [docs/design/b-m2-sandbox-runtime-v1.md](docs/design/b-m2-sandbox-runtime-v1.md) |
+| foundation SDK 接入 | [docs/foundation-sdk-consumption.md](docs/foundation-sdk-consumption.md) |
+| 管理后台规格 | [docs/admin-console-v2-spec.md](docs/admin-console-v2-spec.md) |
+| 画布设计 | [docs/canvas-v2-design.md](docs/canvas-v2-design.md) |
+| 知识库 | [docs/knowledge-library-v1.md](docs/knowledge-library-v1.md) |
+| DLP 防线方案 | [docs/dlp-real-defense-plan.md](docs/dlp-real-defense-plan.md) |
+| 启用 CubeSandbox | [docs/runbook/enable-cubesandbox.md](docs/runbook/enable-cubesandbox.md) |
+| 备份与恢复 | [docs/runbook/backup-restore-b-m6.md](docs/runbook/backup-restore-b-m6.md) |
+| 压力测试 | [docs/runbook/loadtest-b-m6.md](docs/runbook/loadtest-b-m6.md) |
+| Worker 线协议 | [contracts/worker-wire-contract.md](contracts/worker-wire-contract.md) |
 
-## 贡献
+部分设计文档为英文。
 
-欢迎贡献。请阅读 [CONTRIBUTING.md](./CONTRIBUTING.md) 了解开发环境搭建、编码规范（ruff + mypy + pytest，前端使用 ESLint）以及 Pull Request 流程。
+---
 
-## 安全
+## 参与贡献
 
-请负责任地报告安全漏洞。披露流程参见 [SECURITY.md](./SECURITY.md)，或发送邮件至 **chenzefeng09@gmail.com**。请勿为安全问题创建公开 issue。
+欢迎提 issue 和 PR。
+
+- 保持 `make lint` 与 `make test` 通过；前端改动需通过 `npm run typecheck` 与 `npm run build`。
+- 跨 cloud·worker / saas-foundation 边界的改动需要在另一个仓库提配套 PR —— 请在描述中说明。
+- 架构性改动请附带 `docs/adr/` 下的 ADR。
+- 贡献内容按 Apache 2.0 接受（见下）。
+
+---
 
 ## 许可证
 
-Agent Platform 采用 [Apache License 2.0](./LICENSE) 许可。署名信息见 [`NOTICE`](./NOTICE) 文件。版权所有 © 2026 The Agent Platform Authors。
+采用 **Apache License 2.0** —— 见 [LICENSE](LICENSE)。
+
+```
+Copyright 2026 The cloud·worker Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+第三方组件遵循各自许可证。其中本项目集成了
+[AgentScope](https://github.com/agentscope-ai/agentscope)（Apache 2.0）与
+[Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk)
+（条款由 Anthropic 规定）。若构建 MATLAB 分层镜像，需自行向 MathWorks 取得授权。

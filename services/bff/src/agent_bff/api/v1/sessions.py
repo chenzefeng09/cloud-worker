@@ -598,6 +598,34 @@ async def get_file_content(
     )
 
 
+@router.delete("/sessions/{session_id}/attachments/{attachment_id}", status_code=204)
+async def delete_attachment(
+    session_id: str,
+    attachment_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> Response:
+    """Delete a session attachment (Artifacts 专区删除) — proxy to orchestrator.
+
+    Orchestrator does a hard delete of both the S3 blob (best-effort) and the
+    attachment row.  Owner-scoping lives in the orchestrator's
+    ``SessionService.get_attachment`` (raises 404 for a missing / cross-tenant /
+    soft-deleted-session attachment).  Forwards the DELETE and returns 204 on
+    success; upstream non-2xx is relayed via ``_proxy_json``.
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = await _orchestrator_url(request)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.delete(
+            f"{orch_url}/sessions/{session_id}/attachments/{attachment_id}",
+            headers=foundation_headers(tenant_id, user_id, access_token),
+        )
+    # 204 → empty body; ``_proxy_json`` handles that case safely.
+    if resp.status_code == 204 or not resp.content:
+        return Response(status_code=resp.status_code)
+    return _proxy_json(resp)
+
+
 # --------------------------------------------------------------------------- #
 # Runs proxy
 # --------------------------------------------------------------------------- #
@@ -703,6 +731,37 @@ async def daily_token_usage(
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             f"{orch_url}/runs/token-usage/daily",
+            params={"days": days},
+            headers=hdrs,
+        )
+    return _proxy_json(resp)
+
+
+@router.get("/runs/token-usage/breakdown")
+async def token_usage_breakdown(
+    request: Request,
+    days: int = 7,
+    _auth: tuple = Depends(require_auth()),
+) -> JSONResponse:
+    """Proxy GET /runs/token-usage/breakdown?days=N to orchestrator.
+
+    Returns a token-usage breakdown for the last N days (default 7): a per-day
+    input/output/total series plus a per-source rollup.
+    Response: {
+        "days_window": int,
+        "daily": [{ "day": "YYYY-MM-DD", "input_tokens": int,
+                    "output_tokens": int, "total_tokens": int }, ...],
+        "by_source": [{ "source": str, "total_tokens": int,
+                        "run_count": int }, ...]
+    }
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = await _orchestrator_url(request)
+    hdrs = foundation_headers(tenant_id, user_id, access_token)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{orch_url}/runs/token-usage/breakdown",
             params={"days": days},
             headers=hdrs,
         )

@@ -29,28 +29,45 @@ from knowledge_ingest.main import create_app
 TEST_TENANT = "tnt_01J5TEST00000000000000TNT1"
 TEST_TENANT_OTHER = "tnt_01J5TEST00000000000000TNT2"
 TEST_USER = "usr_01J5TEST0000000000000USER1"
+TEST_USER_OTHER = "usr_01J5TEST0000000000000USER2"
 
 
 class FakeEmbeddings:
-    """Deterministic embedding stub.
+    """Deterministic, *token-aware* embedding stub.
 
-    Maps each input to a unit-norm vector seeded by sha256 of the text,
-    so two calls with the same text return the same vector (important for
-    tests that round-trip ingest → search).
+    Each text is embedded as the (normalised) sum of per-token random unit
+    vectors, keyed by sha256 of the token.  Consequences the search tests rely
+    on:
+
+    * Identical text → identical vector (cosine 1.0).
+    * Overlapping token sets → high cosine (close in distance).
+    * Disjoint token sets → cosine ≈ 0 (far — beyond the distance threshold).
+
+    This lets the ``knowledge_search_max_distance`` gate be exercised with
+    realistic near/far behaviour instead of every distinct string being
+    orthogonal (which the old whole-text hash produced).
     """
 
     def __init__(self, dim: int = EMBEDDING_DIM) -> None:
         self.dim = dim
         self.calls: list[list[str]] = []
 
+    def _token_vec(self, token: str) -> np.ndarray:
+        seed = int.from_bytes(hashlib.sha256(token.encode()).digest()[:8], "big")
+        rng = np.random.default_rng(seed)
+        return rng.standard_normal(self.dim)
+
     async def embed(self, texts: list[str]) -> list[list[float]]:
         self.calls.append(list(texts))
         out: list[list[float]] = []
         for t in texts:
-            seed = int.from_bytes(hashlib.sha256(t.encode()).digest()[:8], "big")
-            rng = np.random.default_rng(seed)
-            v = rng.standard_normal(self.dim)
-            v /= np.linalg.norm(v) or 1.0
+            tokens = set(t.lower().split()) or {t}
+            v = np.zeros(self.dim)
+            for tok in tokens:
+                v += self._token_vec(tok)
+            norm = np.linalg.norm(v)
+            if norm:
+                v /= norm
             out.append(v.tolist())
         return out
 
@@ -199,3 +216,10 @@ def tenant_headers() -> dict[str, str]:
 @pytest.fixture
 def other_tenant_headers() -> dict[str, str]:
     return {"X-Tenant-Id": TEST_TENANT_OTHER, "X-User-Id": TEST_USER}
+
+
+@pytest.fixture
+def other_user_headers() -> dict[str, str]:
+    """Same tenant as ``tenant_headers``, different user — for per-user memory
+    isolation tests."""
+    return {"X-Tenant-Id": TEST_TENANT, "X-User-Id": TEST_USER_OTHER}

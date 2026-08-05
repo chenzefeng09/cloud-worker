@@ -13,7 +13,7 @@
 import { appendFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
-export type ResultStatus = "OK" | "FAILED" | "RUNNING";
+export type ResultStatus = "OK" | "FAILED" | "RUNNING" | "paused";
 
 /** One planning step. n is 1-based; d = done; live = currently in progress. */
 export interface PlanStep {

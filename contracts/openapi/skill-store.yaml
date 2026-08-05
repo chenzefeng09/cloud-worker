@@ -158,6 +158,83 @@ paths:
         '403':
           description: Missing skill.read_internal scope
 
+  /api/skills/v1/internal/skills/default-installed:
+    get:
+      operationId: skills_internal_default_installed
+      summary: List a user's installed skills that are enabled by default
+      tags: [Internal]
+      parameters:
+        - name: tenant_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: user_id
+          in: query
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: X-Service-Scopes
+          in: header
+          required: true
+          schema: { type: string, example: "skill.read_internal" }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ListPage' }
+        '403':
+          description: Missing skill.read_internal scope or tenant mismatch
+
+  /api/skills/v1/internal/skills/{name}/file:
+    get:
+      operationId: skills_internal_read_file
+      summary: Read one member of an installed skill's package as UTF-8 text
+      description: >-
+        Returns a single file from the resolved version of an installed skill
+        (same version-resolution as the internal resolve path) as UTF-8 text, so
+        the session-orchestrator's inline mode can read a skill's SKILL.md body
+        or a references/ file in-process without downloading and unpacking the
+        whole tarball.  `path` is resolved relative to the skill root (the
+        directory containing SKILL.md).
+      tags: [Internal]
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+        - name: tenant_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: user_id
+          in: query
+          required: true
+          schema: { type: string }
+        - name: path
+          in: query
+          required: false
+          schema: { type: string, default: "SKILL.md", example: "references/notes.md" }
+        - $ref: '#/components/parameters/TenantIdHeader'
+        - name: X-Service-Scopes
+          in: header
+          required: true
+          schema: { type: string, example: "skill.read_internal" }
+      responses:
+        '200':
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SkillFile' }
+        '400':
+          description: path is absolute or contains a '..' segment
+        '403':
+          description: Missing skill.read_internal scope or tenant mismatch
+        '404':
+          description: Skill not installed / has no version, or member not found
+        '413':
+          description: Member exceeds the maximum single-file size
+        '415':
+          description: Member is not valid UTF-8 text
+
   /api/skills/v1/healthz:
     get:
       operationId: skills_healthz
@@ -227,6 +304,18 @@ components:
         sha256: { type: string }
         uploaded_by: { type: string, nullable: true }
         uploaded_at: { type: string, format: date-time }
+
+    SkillFile:
+      type: object
+      required: [name, version, sha256, path, content]
+      properties:
+        name: { type: string }
+        version: { type: string }
+        sha256: { type: string }
+        path:
+          type: string
+          description: Normalised path of the returned member, relative to the skill root
+        content: { type: string, description: UTF-8 text of the member }
 
     ListPage:
       type: object

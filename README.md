@@ -1,202 +1,505 @@
-# Agent Platform
+# cloud·worker
 
-English | [中文](README.zh-CN.md)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
+[![Node](https://img.shields.io/badge/node-%E2%89%A518-green.svg)](https://nodejs.org/)
+[![React](https://img.shields.io/badge/react-19-61dafb.svg)](https://react.dev/)
 
-> Run AI agents that execute untrusted, model-generated code safely — one kernel-isolated microVM sandbox per run, multi-tenant, audited, and billed.
+**English** · [简体中文](README.zh-CN.md)
 
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](./LICENSE)
-[![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)](https://www.python.org/)
-[![Frontend: React 19](https://img.shields.io/badge/frontend-React_19-61dafb.svg)](https://react.dev/)
-[![Agent kernel: AgentScope](https://img.shields.io/badge/agent_kernel-AgentScope_2.x-6f42c1.svg)](https://github.com/agentscope-ai/agentscope)
-[![Built on: SaaS Foundation](https://img.shields.io/badge/built_on-SaaS_Foundation-0a7ea4.svg)](https://github.com/chenzefeng09/saas-foundation)
+An enterprise-grade platform for running AI agents: multi-tenant chat sessions, agent
+runs executed inside isolated sandboxes (Docker or microVM), reusable **Apps**, skill
+packages, tenant-scoped MCP servers, a knowledge pipeline, and a 28-page admin console.
 
-Agent Platform is an enterprise platform for running AI agents that write and execute their own code. Every agent run is placed in its own kernel-isolated microVM sandbox, so untrusted model-generated code never shares a kernel with the host or with other tenants. The platform is multi-tenant by construction and inherits identity, authorization, billing, audit, and an LLM gateway from [SaaS Foundation](https://github.com/chenzefeng09/saas-foundation), which it is built on top of.
+> **cloud·worker** is the product; the repository is
+> [`cloud-worker`](https://github.com/chenzefeng09/cloud-worker). A number of internal
+> identifiers still carry the earlier `agent-platform` name — the compose file, the Helm
+> chart, image prefixes — and are referred to by their real names below.
 
-## Why Agent Platform
+cloud·worker is the **business layer**. It runs on top of
+[**saas-foundation**](https://github.com/chenzefeng09/saas-foundation) — a separate,
+reusable enterprise SaaS base that owns identity, authorization, org, billing, audit,
+compliance, LLM gateway, storage, crypto, DLP and feature flags. See
+[Relationship with saas-foundation](#relationship-with-saas-foundation).
 
-Letting a model generate and run arbitrary code is the most useful and the most dangerous thing an agent can do. Agent Platform is built around that tension.
+---
 
-- **Kernel-level isolation per run.** Untrusted, model-generated code runs in a CubeSandbox microVM (default) or a Kata Containers microVM (fallback) — not a host-kernel-sharing container. Docker is used only for local dev and CI. One agent per sandbox, one task per agent: the per-run microVM is the unit of tenant isolation, audit, and billing.
-- **Default-deny egress.** In broker mode a sandbox joins only an internal network and can reach exactly one thing: the tool-broker façade. Redis, object storage, the identity provider, internal registries, cloud metadata endpoints, and the public internet are all refused at the microVM boundary. The single web-egress service is SSRF-filtered and fail-closed.
-- **Per-run capability leases.** The scheduler signs a short-lived HMAC lease for each run. Every call a sandbox makes through the broker (LLM, MCP, skills, web fetch, hot-state, object store) must carry that lease. Real infrastructure credentials live only on the broker — sandboxes hold none.
-- **Enterprise governance, inherited not reinvented.** Identity, RBAC/ABAC authorization, quota and metered billing, immutable audit, DLP, and a tenant-scoped LLM gateway all come from SaaS Foundation. Agent Platform wires agent runs into that governance fabric rather than reimplementing it.
+## Screenshots
 
-## Key features
+An agent run: the model writes and executes Python in a sandbox, then reports back with a
+rendered table. The `33 TOOL CALLS` row collapses the whole tool transcript; the chart it
+produced is a 200 DPI PNG with Chinese labels.
 
-- One kernel-isolated microVM sandbox per agent run (Cube / Kata / Docker runtimes behind one `SandboxRuntime` interface).
-- Pre-warmed sandbox pool for low cold-start latency, with autoscaling driven by a warm-VM metric.
-- AgentScope-based agent kernel (`ReActAgent` + `Toolkit`), extended — not forked — through sidecar Python packages.
-- Per-tenant MCP server registry, versioned skill packages, and a document → embedding → vector-search knowledge pipeline.
-- Templatized agent tasks ("Apps") with a versioned review/publish workflow and cron-scheduled execution.
-- All LLM traffic routed through the Foundation LLM gateway with a per-tenant virtual key for quota, routing, and audit.
-- Data-loss-prevention on uploads, downloads, run artifacts, and transcripts; tamper-evident audit of every agent event.
-- React 19 web app: live SSE chat, human-in-the-loop confirmation cards, in-browser file previews, and a multi-module admin console.
-- Bilingual (English / 简体中文) UI and docs.
+![Agent run — sandboxed Python, tool-call grouping, Markdown tables](docs/images/02-agent-run.png)
+
+The home surface — task entry, model and reasoning-effort pickers, App cards, and
+in-flight runs across the bottom.
+
+![Home](docs/images/01-home.png)
+
+The admin console — tenants, users, RBAC, privileged access, plans and quota, model
+management, and platform governance (App review, skills, MCP, knowledge, sandboxes).
+
+![Admin console](docs/images/03-admin.png)
+
+> **Project status.** Actively developed and deployed for internal pilots — not yet a
+> 1.0. Interfaces between services still move. The dev stack is docker-compose; Helm
+> charts under `deploy/helm/` exist but get less mileage.
+
+---
+
+## Table of contents
+
+- [What you get](#what-you-get)
+- [Relationship with saas-foundation](#relationship-with-saas-foundation)
+- [Architecture](#architecture)
+- [Repository layout](#repository-layout)
+- [Quick start](#quick-start)
+- [Configuration](#configuration)
+- [Development](#development)
+- [Sandbox images](#sandbox-images)
+- [Security model](#security-model)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
+## What you get
+
+**Conversation & execution**
+
+- **Streaming chat sessions** — real token-level streaming over SSE, with thinking
+  blocks, grouped/collapsible tool-call steps, and multi-turn history.
+- **Sandboxed agent runs** — every run gets a fresh, isolated workspace. Two runtimes:
+  Docker (dev) and CubeSandbox microVMs with kernel-level isolation (production, see
+  [ADR 0001](docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md)).
+- **Two interchangeable agent workers** — a TypeScript worker built on the
+  [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview), and a Python
+  worker built on [AgentScope 2.x](https://github.com/agentscope-ai/agentscope)
+  (see [ADR 0002](docs/adr/0002-agent-kernel-agentscope-over-openhands.md)).
+- **Human-in-the-loop** — agents can pause mid-run to ask a question or request
+  confirmation; cards survive a page reload and resume the run in place.
+
+**Reusable agent assets**
+
+- **Apps** — package a fixed agent harness (prompt, tools, inputs, model) as a
+  versioned, reviewable, publishable App. Run it ad hoc, on a cron schedule, or from an
+  inbound webhook (file payloads included). Full per-App run history.
+- **Skills** — instruction packages (`SKILL.md` + optional scripts) with progressive
+  disclosure. Mounted read-only into the sandbox from a content-addressed host cache,
+  so a run costs zero downloads. Ships with a set of platform-global default skills.
+- **MCP** — per-tenant registry of MCP servers with custom headers, auth (including
+  OAuth), timeouts and tool allow/deny filters. A broker fronts them so sandboxes never
+  hold tenant credentials.
+- **Knowledge** — document → chunk → embedding → pgvector ingest pipeline, queryable as
+  a tool from inside a run.
+
+**Documents & workspace**
+
+- **Workspaces and files** — session-bound workspaces, `@`-mention file completion, and
+  inline preview for PDF / Word / Excel / PowerPoint / archives.
+- **Canvas** — a document surface the model can create and revise mid-conversation,
+  including executable HTML previewed in a sandboxed iframe.
+- **Artifacts** — run outputs surfaced as downloadable cards in the transcript.
+
+**Operations**
+
+- **Admin console** — 28 modules covering tenants, users, RBAC, SSO, quota, model
+  management, audit, session replay, DLP, compliance, data protection, PAM,
+  security-ops, lifecycle, feature flags, storage, sandbox pool monitoring and App
+  review. Most are thin proxies over saas-foundation services.
+- **Multi-tenancy throughout** — Postgres RLS, tenant-scoped storage, per-tenant quota
+  enforcement, and per-run LLM virtual keys for cost attribution.
+
+---
+
+## Relationship with saas-foundation
+
+The two repositories split along a single line: **saas-foundation is generic enterprise
+plumbing, cloud·worker is everything agent-shaped.**
+
+| | [saas-foundation](https://github.com/chenzefeng09/saas-foundation) | cloud·worker (`cloud-worker`, this repo) |
+|---|---|---|
+| **Role** | Reusable SaaS base, independently deliverable | Business layer built on that base |
+| **Owns** | identity, authz, org, billing, audit, compliance, notification, search, api-platform, llm-gateway, storage, crypto, dlp, data-protection, feature-flag, lifecycle, pam, security-ops | sessions, messages, runs, sandboxes, agent workers, skills, MCP, knowledge, Apps, canvas, artifacts |
+| **Knows about** | nothing above it | consumes foundation over HTTP + SDK |
+
+Design rule inherited from the base: **business services never touch the underlying
+open-source components directly.** No service in this repo talks to Keycloak, OPA,
+LiteLLM, MinIO, Vault or Unleash — it calls the corresponding foundation service, which
+means those components can be swapped without touching agent code.
+
+### How the wiring works
+
+1. **`foundation_sdk` (Python)** — each service imports it for cookie signing
+   (`CookieSigner`), request-context propagation (`install_request_context`),
+   RFC 9457 problem+json error handling (`register_problem_details`) and tenant/user
+   extraction (`get_tenant_id`, `get_user_id`).
+2. **Shared Docker network** — the agent compose stack joins the foundation stack's
+   external network, set by `FOUNDATION_NETWORK` (default `saas-foundation-dev_foundation`).
+3. **Service-to-service HTTP** — the BFF proxies admin traffic to foundation services;
+   orchestrator and workers reach the LLM gateway with per-run virtual keys.
+
+The SDK reaches your services by one of two paths, documented in
+[docs/foundation-sdk-consumption.md](docs/foundation-sdk-consumption.md):
+
+- **Internal PyPI** (CI/production) — `foundation-sdk = ">=0.1,<0.2"` from a private index.
+- **Build context** (local dev, the default here) — docker-compose injects the sibling
+  checkout's `sdks/python` via `additional_contexts`, so SDK edits show up immediately
+  without a release.
+
+### ⚠️ You need saas-foundation to run this
+
+`foundation-sdk` is not on public PyPI. Clone both repositories as siblings:
+
+```
+Development/
+├── saas-foundation/     # must be running first
+└── cloud-worker/        # this repo
+```
+
+If your layout differs, override `FOUNDATION_DIR` (Makefile) and `FOUNDATION_SDK_PATH`
+(`deploy/docker-compose/.env`).
+
+---
 
 ## Architecture
 
-A browser request flows through the BFF, into session and run orchestration, out to the scheduler, and finally into a per-run sandbox microVM running the AgentScope worker. The sandbox's only path to the outside is the tool-broker façade; the only path to the public internet is the web-fetch gateway.
-
-```mermaid
-flowchart TB
-    Browser["Browser (React 19 SPA)"]
-    BFF["bff :8005<br/>auth gateway · API aggregation · SSE relay"]
-    SO["session-orchestrator :8006<br/>session / message / run lifecycle · DLP"]
-    SCHED["agent-scheduler :8007<br/>mints per-run token + HMAC lease · spawns sandbox"]
-    POOL["sandbox-pool :8008<br/>pre-warmed warm-sandbox watermarks"]
-
-    subgraph SB["Sandbox microVM (Cube / Kata / Docker) — one per run"]
-        WORKER["AgentScope worker<br/>ReActAgent + Toolkit"]
-    end
-
-    BROKER["tool-broker :8024<br/>sole egress façade · lease-verified"]
-    WFG["web-fetch-gateway<br/>only internet egress · SSRF-filtered"]
-
-    subgraph FND["SaaS Foundation"]
-        IDP["identity / authz / billing / audit"]
-        LLM["LLM gateway"]
-    end
-
-    REG["mcp-registry · skill-store · knowledge-ingest"]
-
-    Browser -->|signed session cookie| BFF
-    BFF --> SO
-    SO --> SCHED
-    SCHED -->|claim warm slot| POOL
-    SCHED -->|spawn| SB
-
-    WORKER -->|every call carries per-run lease| BROKER
-    BROKER --> LLM
-    BROKER --> REG
-    BROKER --> WFG
-    WFG -->|public internet| Internet(("Internet"))
-
-    SCHED --> IDP
-    SO --> IDP
-    BFF --> IDP
+```
+                    Browser — React 19 + Vite  (:5173)
+                              │  signed cookie session · SSE
+                              ▼
+              ┌───────────────────────────────────┐        ┌──────────────────────────┐
+              │  bff  :8005                       │───────▶│     saas-foundation      │
+              │  auth proxy · API aggregation     │        │  identity · authz · org  │
+              │  SSE relay · admin proxy          │◀───────│  audit · billing · dlp   │
+              └───┬───────────────────────────────┘        │  llm-gateway · storage   │
+                  │                                        │  crypto · feature-flag … │
+                  │                                        └──────────────────────────┘
+   ┌──────────────┼────────────────┬──────────────┬───────────────┬──────────────┐
+   ▼              ▼                ▼              ▼               ▼              ▼
+session-      app-registry    skill-store    mcp-registry    knowledge-     cron-runner
+orchestrator     :8014           :8011          :8010          ingest          :8015
+   :8006      versioned        skill pkgs     tenant MCP       :8012         schedules +
+sessions ·    harness +       (tarballs)      servers        docs →           webhooks
+messages ·    review/publish                                 pgvector
+runs · canvas
+workspaces
+   │
+   ▼
+agent-scheduler :8007 ───────────────▶ sandbox-pool :8008
+spawns one sandbox per run             pre-warmed CubeSandbox microVMs
+   │
+   ├── runtime: docker  (dev)
+   └── runtime: cube    (microVM, kernel isolation)
+              │
+              ▼
+        ┌───────────────────────────────────────────────┐
+        │  agent worker inside the sandbox              │
+        │  • worker-claude-sdk   (TS, Claude Agent SDK) │
+        │  • agentscope-ext      (Py, AgentScope 2.x)   │
+        └───────┬───────────────────────────┬───────────┘
+                │                           │
+                ▼                           ▼
+      tool-broker :8024           web-fetch-gateway :8023
+      policy façade for           SSRF-guarded outbound
+      foundation tool access      HTTP (allowlist, deny by default)
 ```
 
-In **broker egress mode** (the default), the sandbox joins only the internal `sandbox_broker` network and reaches the LLM gateway, MCP registry, skill store, web-fetch gateway, Redis hot-state, and object store **only** through the tool-broker — each call authenticated by the signed per-run lease. The web-fetch gateway is the single service attached to the outbound network.
+**Request path for one agent turn:** browser → BFF (authenticates, resolves tenant) →
+session-orchestrator (persists the message, opens a run) → agent-scheduler (acquires a
+sandbox, mints a short-lived token and a per-run LLM virtual key) → worker (drives the
+agent loop, calls tools through the broker) → events stream back over Redis → SSE →
+browser.
 
-## Services
+### Services
 
-The platform is composed of 11 services. Ports below are dev defaults from the Docker Compose stack; several services share container port `8013` internally and are separated by distinct host port mappings, as noted.
-
-| Service | Port (dev) | Purpose |
+| Service | Host port | Responsibility |
 |---|---|---|
-| `bff` | 8005 | Backend-for-frontend: auth gateway, signed cookie session, API aggregation, and SSE relay for the web app. |
-| `session-orchestrator` | 8006 | Owns session / message / run lifecycle CRUD, attachment storage, run SSE event streams, and DLP enforcement. |
-| `agent-scheduler` | 8007 | Spawns and manages sandbox microVMs/containers running the AgentScope worker; mints the per-run token and HMAC lease. |
-| `sandbox-pool` | 8008 | Pre-warms idle sandboxes so runs start warm; exports a Prometheus gauge that drives autoscaling. |
-| `mcp-registry` | 8010 | Per-tenant registry of MCP servers (backends) that agents can connect to. |
-| `skill-store` | 8011 | Versioned skill-package registry storing tarballs of `skill.yaml` + code per tenant. |
-| `knowledge-ingest` | 8012 | Document → embedding → pgvector ingest and semantic-search pipeline; also backs session memory. |
-| `app-registry` | container 8013 → host 8014 | Registry of templatized agent tasks ("Apps") with versioned harness and a review/publish workflow. Container port 8013 collides with Foundation's audit service, so it is exposed on host 8014. |
-| `cron-runner` | container 8013 → host 8015 | Runs published Apps on a cron schedule (APScheduler), invoking them through the BFF with a service token. Shares container port 8013 with web-fetch-gateway; separated by host port. |
-| `web-fetch-gateway` | container 8013 → host 8023 | SSRF-protected outbound HTTP fetch gateway for the agent `WebFetch` tool; the only service on the internet-egress network. |
-| `tool-broker` | 8024 | Policy-controlled façade giving broker-mode sandboxes narrow, lease-scoped access to platform tool services. OpenAPI/docs disabled; reachable only by untrusted sandboxes. |
+| `web` | 5173 | React 19 SPA — chat, apps, library, workspace, admin console |
+| `bff` | 8005 | Auth proxy, API aggregation, SSE relay, admin fan-out |
+| `session-orchestrator` | 8006 | Sessions, messages, runs, canvas, workspaces, inline tool loop |
+| `agent-scheduler` | 8007 | Spawns sandbox containers/microVMs, injects credentials |
+| `sandbox-pool` | 8008 | Pre-warmed CubeSandbox microVM pool |
+| `mcp-registry` | 8010 | Tenant MCP server registry (encrypted secrets, tool filters) |
+| `skill-store` | 8011 | Versioned skill packages |
+| `knowledge-ingest` | 8012 | Document → embedding → pgvector pipeline |
+| `app-registry` | 8014 | Apps: versioned harness, review, publish |
+| `cron-runner` | 8015 | Scheduled + webhook-triggered App execution |
+| `web-fetch-gateway` | 8023 | SSRF-protected outbound HTTP for agent tools |
+| `tool-broker` | 8024 | Policy-controlled façade for sandbox → foundation calls |
 
-> Note on ports: `app-registry`, `cron-runner`, and `web-fetch-gateway` all listen on container port `8013`. They never collide at runtime because each is published on a distinct host port (8014 / 8015 / 8023). The `8013` choice also avoids the Foundation audit service, which itself uses 8013.
-
-## Tech stack
-
-| Layer | Technologies |
-|---|---|
-| Frontend | React 19 + TypeScript 5.7, Vite 6, React Router v7, Zustand 5, Tailwind CSS 3; `react-markdown` + `remark-gfm` for chat, `recharts` for admin dashboards, in-browser PDF/DOCX/XLSX previews; custom i18n (en/zh) |
-| Frontend tests | Vitest 2 + Testing Library + jsdom; ESLint 9 + typescript-eslint |
-| Agent kernel | [AgentScope](https://github.com/agentscope-ai/agentscope) 2.x (Apache-2.0) — `ReActAgent` + `Toolkit` + model/formatter abstraction. Not forked; chosen over OpenHands ([ADR 0002](./docs/adr/0002-agent-kernel-agentscope-over-openhands.md)) |
-| Sandbox extensions | `agentscope-ext`: standalone Python 3.12 packages (`runtime_worker`, `llm_gateway_enforcer`, `mcp_tenant_injector`, `skills_loader`, `event_audit_sink`, `web_fetch`) pip-installed into the sandbox image |
-| Alternate worker | `worker-claude-sdk`: a TypeScript/Node.js worker on `node:22-slim` honoring the same `task.json` → `result.json` contract |
-| Backend services | Python 3.12, FastAPI + uvicorn, Poetry, asyncpg/SQLAlchemy + Alembic, ruff + mypy + pytest; `foundation_sdk` path dependency |
-| Sandbox runtimes | CubeSandbox microVM (E2B HTTP protocol, default in prod), Kata Containers + Cloud Hypervisor (fallback), Docker (dev/CI) — selected by `SCHEDULER_RUNTIME` |
-| Sandbox images | OCI image tiers (base / office / matlab): Python 3.12 + pinned AgentScope + NumPy/Pandas/Polars/Node 20/Playwright+Chromium; office adds LibreOffice headless; matlab adds MATLAB Runtime. Separate `claude-sdk` image |
-| Data infra (from Foundation) | PostgreSQL 16 + pgvector, Redis, MinIO/S3, Keycloak (OIDC), ClickHouse (audit), Vault (KEK) |
-| Deploy & ops | Docker Compose (dev + Cube override), Helm chart (small/medium/large profiles with a Foundation subchart), KEDA autoscaling, OpenTelemetry + Prometheus, Locust load tests |
-
-## Quick start
-
-> **Prerequisite — sibling SaaS Foundation checkout.** Agent Platform cannot build, start, or run without [SaaS Foundation](https://github.com/chenzefeng09/saas-foundation) checked out at `../saas-foundation`. It imports `foundation_sdk` (installed editable from the foundation repo), shares a Docker network created by the foundation stack, and calls Foundation's Identity, LLM-gateway, and Billing services at runtime. Clone both repos side by side first.
-
-```text
-parent/
-├── agent-platform/      # this repo
-└── saas-foundation/     # required sibling checkout
-```
-
-You will also need: GNU `make` + bash, Docker + Docker Compose v2, Python 3.12 + Poetry, and Node.js 20+ / npm.
-
-```bash
-# 1. Bootstrap: poetry install for every service + install the editable foundation SDK into each venv
-make bootstrap
-
-# 2. Create your .env from the example (review and adjust before use)
-make env
-
-# 3. Start the Foundation dev stack + all agent services
-make up
-
-# 4. Run database migrations (session-orchestrator Alembic)
-make migrate
-
-# 5. Install and start the frontend
-make web-install
-make web-dev
-```
-
-Then open <http://localhost:5173>. The web app, BFF, orchestrator, and scheduler come up on ports 5173 and 8005–8007.
-
-Useful follow-ups:
-
-```bash
-make agent-up           # start only agent services (Foundation already running)
-make logs SVC=bff       # follow one service's logs
-make ps                 # service status
-make down               # stop services
-make conformance        # run conformance tests against the running stack
-```
-
-To run agents inside CubeSandbox microVMs (a Linux host with `/dev/kvm` is required), see [`docs/runbook/enable-cubesandbox.md`](./docs/runbook/enable-cubesandbox.md).
+---
 
 ## Repository layout
 
-| Path | Contents |
-|---|---|
-| `services/` | The 11 Python (FastAPI) backend services — `bff`, `session-orchestrator`, `agent-scheduler`, `sandbox-pool`, `app-registry`, `skill-store`, `mcp-registry`, `tool-broker`, `knowledge-ingest`, `cron-runner`, `web-fetch-gateway` |
-| `apps/web/` | React 19 + Vite single-page app (workspace + admin console) |
-| `agentscope-ext/` | Sandbox-side AgentScope extension packages and the `runtime_worker` entrypoint |
-| `sandbox-images/` | OCI Dockerfiles for the base / office / matlab sandbox image tiers and the `claude-sdk` worker image |
-| `deploy/` | Docker Compose stacks, Helm chart, KEDA operator manifests, Cube egress policy, backup/restore, and load tests |
-| `contracts/` | Shared API / wire contracts between services and the sandbox worker |
-| `docs/` | ADRs, design docs, runbooks, and roadmap |
+```
+cloud-worker/
+├── apps/web/              React 19 SPA (Vite, Zustand, Tailwind)
+│   └── src/admin/         28-page admin console
+├── services/              FastAPI services (Python 3.12, Poetry) — see table above
+├── worker-claude-sdk/     TypeScript agent worker — Claude Agent SDK
+├── agentscope-ext/        Python agent worker + AgentScope extensions
+│                          (canvas/knowledge/web-fetch tools, gateway enforcer,
+│                           MCP tenant injector, skills loader, audit sink)
+├── sandbox-images/        Sandbox Dockerfiles — base / office / MATLAB tiers
+├── libs/                  Shared client libraries (feature flags, quota guard)
+├── contracts/             OpenAPI 3.1 specs + worker wire contract
+├── deploy/
+│   ├── docker-compose/    Dev stack
+│   ├── helm/              Kubernetes chart
+│   ├── cube/              CubeSandbox controller config
+│   └── scripts/           Cert generation, ops helpers
+├── docs/
+│   ├── adr/               Architecture decision records
+│   ├── design/            Rolling design docs
+│   └── runbook/           Backup/restore, load test, Cube enablement
+└── tests/conformance/     Cross-service conformance suite
+```
 
-## Relationship to SaaS Foundation
+---
 
-Agent Platform is the agent-execution product; [**SaaS Foundation**](https://github.com/chenzefeng09/saas-foundation) is the reusable enterprise base it stands on. SaaS Foundation is a standalone, general-purpose foundation — identity, authorization, organization, billing, audit, compliance, DLP, and an LLM gateway — usable by any business system, not just this one.
+## Quick start
 
-Agent Platform depends on it across four axes:
+**Prerequisites:** Docker (with Compose v2), Python 3.12 + Poetry, Node 18+, and a
+checkout of [saas-foundation](https://github.com/chenzefeng09/saas-foundation) as a
+sibling directory.
 
-- **SDK / source.** Nearly every service does `import foundation_sdk` (request context, problem-details, the cookie signer). The SDK is installed editable from `../saas-foundation/sdks/python` via `make bootstrap`.
-- **Build.** Each service Dockerfile receives the SDK source as a build context, so images are built against the sibling checkout.
-- **Network.** Agent services attach to an external Docker network created by the Foundation compose project.
-- **Runtime.** The BFF proxies authentication to Foundation Identity; the scheduler mints short-lived per-run JWTs from Foundation Identity; and sandboxes reach Foundation's LLM gateway, audit, and billing using those tokens.
+```bash
+git clone https://github.com/chenzefeng09/saas-foundation.git
+git clone https://github.com/chenzefeng09/cloud-worker.git
+cd cloud-worker
+```
 
-If you want the enterprise base without the agent runtime, start with SaaS Foundation directly.
+```bash
+make env
+```
+
+That creates `deploy/docker-compose/.env` from the example. Edit it — at minimum set
+`BFF_COOKIE_SECRET`, which must be ≥32 chars (startup fails on a weak value):
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Then bring up both stacks and build the sandbox image:
+
+```bash
+make up
+```
+
+```bash
+make build-claude-sdk-image
+```
+
+Open <http://localhost:5173>. Seeded dev users come from the foundation stack — see its
+`deploy/docker-compose/README.md`.
+
+Useful targets:
+
+```bash
+make ps
+```
+
+```bash
+make logs SVC=bff
+```
+
+```bash
+make down
+```
+
+To run the frontend outside Docker against the containerized backend:
+
+```bash
+make web-install && make web-dev
+```
+
+---
+
+## Configuration
+
+Everything lives in `deploy/docker-compose/.env` (start from `.env.example`). The knobs
+that matter most:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `FOUNDATION_NETWORK` | `saas-foundation-dev_foundation` | External Docker network shared with the foundation stack |
+| `FOUNDATION_SDK_PATH` | `../../../saas-foundation/sdks/python` | Sibling SDK source, injected as a build context |
+| `BFF_COOKIE_SECRET` | *(empty — you must set it)* | Session cookie signing key, ≥32 chars |
+| `SCHEDULER_RUNTIME` | `docker` | `docker` for dev, `cube` for microVM isolation |
+| `CLAUDE_SDK_IMAGE` / `AGENT_IMAGE` | see `.env.example` | Sandbox image per worker flavor |
+| `POOL_IDLE_LOW` / `POOL_IDLE_HIGH` / `POOL_MAX_TOTAL` | `2` / `10` / `50` | microVM pool sizing |
+| `CUBE_CONTROLLER_URL`, `CUBE_TLS_MODE`, `CUBE_API_KEY` | — | CubeSandbox controller (required when `SCHEDULER_RUNTIME=cube`) |
+
+Enabling the microVM runtime is a separate procedure — see
+[docs/runbook/enable-cubesandbox.md](docs/runbook/enable-cubesandbox.md).
+
+---
+
+## Development
+
+```bash
+make bootstrap     # poetry install for every service + editable foundation SDK
+```
+
+```bash
+make lint          # ruff check + mypy across all services
+```
+
+```bash
+make test          # pytest with coverage across all services
+```
+
+```bash
+make migrate       # alembic upgrade head (session-orchestrator)
+```
+
+```bash
+make conformance   # conformance suite against a running stack
+```
+
+Frontend, in `apps/web/` — `npm run typecheck`, `npm run lint`, `npm run test`
+(vitest), `npm run build`.
+
+Worker, in `worker-claude-sdk/` — `npm run typecheck`, `npm run test`, and `npm run
+build` which emits `dist/` for the sandbox image build.
+
+GitHub Actions run per-service pipelines under `.github/workflows/`.
+
+**Note:** most backend services are not hot-reloaded in the compose stack. After
+changing service code, rebuild with `make agent-up` (which passes `--build`).
+
+---
+
+## Sandbox images
+
+`sandbox-images/` builds the images an agent run executes inside, in layered tiers:
+
+```
+base            Python 3.12 · agent worker · non-root uid 1000
+                office document libs · scientific Python · Noto CJK fonts
+  └─ office     + LibreOffice headless (format conversion, e.g. docx → pdf)
+       └─ matlab  + MATLAB (Control System / Aerospace toolbox layers)
+```
+
+**The default image already does office work — no extra tier, no license needed.**
+`claude-sdk.Dockerfile` and `claude-sdk-cube.Dockerfile` ship `python-docx`,
+`openpyxl`, `python-pptx`, `pypdf`, `Pillow`, `lxml` and `xlsxwriter` for reading and
+writing Word/Excel/PowerPoint/PDF, plus `pandas`, `numpy`, `matplotlib`, `graphviz` and
+`diagrams` for analysis and charting. `fonts-noto-cjk` is installed and wired into
+`matplotlibrc`, so Chinese/Japanese/Korean labels render correctly instead of as tofu
+boxes. All of it is open-source and installed from PyPI/apt. The build asserts the
+imports and the CJK font resolve, so a broken image fails at build time rather than
+mid-run.
+
+The separate `office` tier adds **LibreOffice headless** on top — reach for it only when
+you need true format *conversion* (docx → pdf, xlsx → csv via `unoconv`) rather than
+document generation.
+
+```bash
+make build-claude-sdk-image
+```
+
+```bash
+make build-claude-sdk-cube-image
+```
+
+> **MATLAB tiers are bring-your-own.** No MATLAB installer media, license file or
+> binaries are included in this repository, and none may be redistributed. The
+> `matlab*.Dockerfile` targets expect you to point `MATLAB_ISO_DIR` at your own
+> legitimately licensed installation media. Nothing else in the platform depends on
+> them — skip these targets entirely and everything above still works.
+
+See [sandbox-images/README.md](sandbox-images/README.md) for the full tier matrix.
+
+---
+
+## Security model
+
+Model-generated code is treated as untrusted throughout:
+
+- **Kernel isolation** — production runs land in CubeSandbox microVMs, not shared-kernel
+  containers ([ADR 0001](docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md)).
+- **Deny-by-default egress** — sandboxes have no direct internet route. Outbound HTTP
+  goes through `web-fetch-gateway`, which enforces an allowlist and blocks SSRF,
+  including fake-IP / DNS-rebinding style attacks.
+- **Brokered tool access** — sandboxes reach foundation services only through
+  `tool-broker`, which applies policy and never hands over tenant credentials.
+  Third-party MCP calls have the inbound `Authorization` header stripped.
+- **Short-lived, per-run credentials** — the scheduler mints a run-scoped token and an
+  LLM virtual key per run. Secrets are passed as files and unlinked rather than left in
+  the process environment, so an agent reading `/proc/*/environ` finds nothing.
+- **DLP enforcement** — content is checked against foundation DLP rules on uploads,
+  downloads and tool calls.
+- **Data classification** — files, workspaces and users carry sensitivity levels; access
+  requires `file ≤ workspace ≤ user clearance`.
+- **Audit and replay** — run events flow to the foundation audit service; session replay
+  is gated behind explicit permissions.
+
+Found a security problem? Please report it privately via a
+[GitHub security advisory](https://github.com/chenzefeng09/cloud-worker/security/advisories/new)
+rather than opening a public issue.
+
+---
 
 ## Documentation
 
-- [Architecture](./docs/ARCHITECTURE.md) — end-to-end design, the sandbox runtime contract, and the security model.
-- [Getting started](./docs/getting-started.md) — a fuller setup and first-run walkthrough.
-- [ADR 0001 — sandbox runtime: Cube default, Kata fallback](./docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md)
-- [ADR 0002 — agent kernel: AgentScope over OpenHands](./docs/adr/0002-agent-kernel-agentscope-over-openhands.md)
+| Topic | Document |
+|---|---|
+| Sandbox runtime decision | [ADR 0001 — CubeSandbox default, Kata fallback](docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md) |
+| Agent kernel decision | [ADR 0002 — AgentScope over OpenHands](docs/adr/0002-agent-kernel-agentscope-over-openhands.md) |
+| Sandbox runtime design | [docs/design/b-m2-sandbox-runtime-v1.md](docs/design/b-m2-sandbox-runtime-v1.md) |
+| Consuming the foundation SDK | [docs/foundation-sdk-consumption.md](docs/foundation-sdk-consumption.md) |
+| Admin console spec | [docs/admin-console-v2-spec.md](docs/admin-console-v2-spec.md) |
+| Canvas design | [docs/canvas-v2-design.md](docs/canvas-v2-design.md) |
+| Knowledge library | [docs/knowledge-library-v1.md](docs/knowledge-library-v1.md) |
+| DLP defense plan | [docs/dlp-real-defense-plan.md](docs/dlp-real-defense-plan.md) |
+| Enabling CubeSandbox | [docs/runbook/enable-cubesandbox.md](docs/runbook/enable-cubesandbox.md) |
+| Backup & restore | [docs/runbook/backup-restore-b-m6.md](docs/runbook/backup-restore-b-m6.md) |
+| Load testing | [docs/runbook/loadtest-b-m6.md](docs/runbook/loadtest-b-m6.md) |
+| Worker wire contract | [contracts/worker-wire-contract.md](contracts/worker-wire-contract.md) |
+
+Some design documents are written in Chinese.
+
+---
 
 ## Contributing
 
-Contributions are welcome. Please read [CONTRIBUTING.md](./CONTRIBUTING.md) for development setup, coding standards (ruff + mypy + pytest, ESLint for the frontend), and the pull-request process.
+Issues and pull requests are welcome.
 
-## Security
+- Keep `make lint` and `make test` green; frontend changes must pass `npm run typecheck`
+  and `npm run build`.
+- Changes that cross the cloud·worker / saas-foundation boundary need a matching PR in
+  the other repository — say so in the description.
+- Architectural changes should come with an ADR under `docs/adr/`.
+- Contributions are accepted under Apache 2.0 (see below).
 
-Please report security vulnerabilities responsibly. See [SECURITY.md](./SECURITY.md) for the disclosure process, or email **chenzefeng09@gmail.com**. Please do not open public issues for security reports.
+---
 
 ## License
 
-Agent Platform is licensed under the [Apache License 2.0](./LICENSE). See the [`NOTICE`](./NOTICE) file for attribution. Copyright © 2026 The Agent Platform Authors.
+Licensed under the **Apache License, Version 2.0** — see [LICENSE](LICENSE).
+
+```
+Copyright 2026 The cloud·worker Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+Third-party components keep their own licenses. Notably, this project integrates
+[AgentScope](https://github.com/agentscope-ai/agentscope) (Apache 2.0) and the
+[Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk), whose
+terms are set by Anthropic. MATLAB, if you build those image tiers, requires your own
+license from MathWorks.

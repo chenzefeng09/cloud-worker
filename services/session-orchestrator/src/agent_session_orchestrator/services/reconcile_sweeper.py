@@ -57,9 +57,69 @@ SWEEP_INTERVAL_SECONDS: int = 60
 # freshly-created runs that are still cold-starting their sandbox.
 STALE_AFTER_SECONDS: int = 120
 
+# Inline (chat-mode) runs have no sandbox and no scheduler container, so the
+# scheduler reconciler can never resolve them — a process restart mid-stream
+# would otherwise leave the run RUNNING forever.  After this window an inline
+# run still stuck RUNNING/PENDING is force-FAILED (its executor task died with
+# the process; the registry that held its handle is gone).  Generous so a
+# genuinely slow reasoning completion is never killed out from under a live
+# executor — that completes on its own and finalizes the row before this fires.
+INLINE_ORPHAN_AFTER_SECONDS: int = 20 * 60
+
 # Short startup delay so a fleet of pods restarting together does not all hit
 # the DB at the same instant.
 _SWEEP_STARTUP_DELAY_SECONDS: int = 30
+
+
+def _inline_run_is_orphaned(run_obj: object) -> bool:
+    """True if an inline run is old enough to be considered process-orphaned.
+
+    Age is measured from ``started_at`` (or ``created_at`` when started_at is
+    NULL).  Both are tz-aware DateTime(timezone=True); guard a naive value
+    defensively so the comparison never raises.
+    """
+    reference = getattr(run_obj, "started_at", None) or getattr(
+        run_obj, "created_at", None
+    )
+    if reference is None:
+        return False
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=dt.UTC)
+    age = (dt.datetime.now(tz=dt.UTC) - reference).total_seconds()
+    return age >= INLINE_ORPHAN_AFTER_SECONDS
+
+
+async def _fail_orphaned_inline_run(
+    *, run_obj: object, redis_url: str | None,
+) -> None:
+    """Mark an orphaned inline run FAILED and push the ``end`` SSE marker.
+
+    Mutates the ORM instance in place; the surrounding tenant-bound transaction
+    commits it on teardown (same discipline as ``_reconcile_run_completion``).
+    Fail-open on the Redis push: the DB status flip is what matters; a missing
+    end marker only affects an (unlikely) still-open SSE tail.
+    """
+    run_obj.status = "FAILED"  # type: ignore[attr-defined]
+    run_obj.finished_at = dt.datetime.now(tz=dt.UTC)  # type: ignore[attr-defined]
+    run_obj.error_message = (  # type: ignore[attr-defined]
+        "inline run orphaned (process restart?)"
+    )
+    run_obj.result_summary = (  # type: ignore[attr-defined]
+        "inline run orphaned (process restart?)"
+    )
+
+    if redis_url:
+        try:
+            from agent_session_orchestrator.services.inline_run_executor import (
+                _push_end,  # noqa: PLC0415
+            )
+
+            await _push_end(redis_url, run_obj.id)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 — end marker is best-effort
+            logger.debug(
+                "reconcile_sweeper: end marker push failed for orphaned inline run",
+                extra={"run_id": getattr(run_obj, "id", "?")},
+            )
 
 
 async def _sweep_once(app: FastAPI) -> None:
@@ -68,13 +128,25 @@ async def _sweep_once(app: FastAPI) -> None:
     cutoff = dt.datetime.now(tz=dt.UTC) - dt.timedelta(seconds=STALE_AFTER_SECONDS)
 
     # ── 1. Cross-tenant scan (BYPASSRLS migrator connection) ───────────────
-    # We encode three values as a single string to fit the scalar helper's
-    # one-column contract: "tenant_id\x1frun_id\x1fsession_id".
-    # The session.user_id is fetched later per-run via a tenant-bound session.
+    # We encode four values as a single string to fit the scalar helper's
+    # one-column contract: "tenant_id\x1frun_id\x1fsession_id\x1fuser_id".
+    #
+    # The session.user_id is carried out of the scan directly via a LEFT JOIN
+    # on session_orchestrator.session.  A LEFT JOIN (not INNER) is deliberate:
+    # a session soft-deleted by the 30-day retention sweep only has its
+    # ``deleted_at`` column set — the row still exists — so the JOIN resolves
+    # its user_id even though the tenant-bound ``get_session`` path (which
+    # filters ``deleted_at IS NULL``) would raise SessionNotFoundError for it.
+    # Without this, orphaned runs of soft-deleted sessions fell back to a
+    # ``SYSTEM`` user_id, which the scheduler rejects with 403 → run stuck
+    # RUNNING forever.  COALESCE guards the (rare) case of a run whose session
+    # row is genuinely gone, yielding an empty string handled below.
     rows = await privileged_scalars(
         settings,
         "SELECT r.tenant_id || '\x1f' || r.id || '\x1f' || r.session_id"
+        "       || '\x1f' || COALESCE(s.user_id, '')"
         "  FROM session_orchestrator.run r"
+        "  LEFT JOIN session_orchestrator.session s ON s.id = r.session_id"
         " WHERE r.status IN ('RUNNING', 'PENDING')"
         "   AND COALESCE(r.started_at, r.created_at) < :cutoff"
         " ORDER BY r.tenant_id",
@@ -99,11 +171,13 @@ async def _sweep_once(app: FastAPI) -> None:
 
     # ── 2. Reconcile each run in its own tenant-bound session ──────────────
     for row in rows:
-        parts = str(row).split("\x1f", 2)
-        if len(parts) != 3:
+        parts = str(row).split("\x1f", 3)
+        if len(parts) != 4:
             logger.warning("reconcile_sweeper: malformed scan row %r — skipping", row)
             continue
-        tenant_id, run_id, session_id = parts
+        tenant_id, run_id, session_id, scan_user_id = parts
+        # user_id may legitimately be an empty string (session row genuinely
+        # gone); only the first three fields are required to identify a run.
         if not tenant_id or not run_id or not session_id:
             logger.warning(
                 "reconcile_sweeper: empty field in scan row %r — skipping", row
@@ -116,16 +190,39 @@ async def _sweep_once(app: FastAPI) -> None:
             ):
                 svc = SessionService(db, tenant_id=tenant_id)
 
-                # Fetch session for user_id (scheduler authz needs a real user).
-                try:
-                    session_obj = await svc.get_session(session_id)
-                    user_id = session_obj.user_id
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "reconcile_sweeper: session not found, using SYSTEM",
-                        extra={"tenant_id": tenant_id, "session_id": session_id},
-                    )
-                    user_id = "SYSTEM"
+                # user_id is taken from the cross-tenant scan (LEFT JOIN on
+                # session), which — unlike the RLS-bound get_session below —
+                # resolves it even for soft-deleted sessions.  This keeps the
+                # scheduler authz happy (a real user, never SYSTEM) for
+                # orphaned runs of retention-purged sessions.
+                user_id = scan_user_id
+                # get_session is still probed purely for observability: for a
+                # soft-deleted session it raises, which is the expected signal
+                # that this run is orphaned.  It never overrides user_id.
+                if not user_id:
+                    # Scan produced no user_id (session row genuinely gone).
+                    # Fall back: get_session if it somehow succeeds, else the
+                    # historical SYSTEM sentinel.
+                    try:
+                        session_obj = await svc.get_session(session_id)
+                        user_id = session_obj.user_id
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "reconcile_sweeper: no user_id from scan and "
+                            "session not found, falling back to SYSTEM",
+                            extra={"tenant_id": tenant_id, "session_id": session_id},
+                        )
+                        user_id = "SYSTEM"
+                else:
+                    try:
+                        await svc.get_session(session_id)
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "reconcile_sweeper: session not visible via RLS "
+                            "(likely soft-deleted); reconciling orphaned run "
+                            "with its real user_id from scan",
+                            extra={"tenant_id": tenant_id, "session_id": session_id},
+                        )
 
                 # Re-fetch the run inside the RLS-scoped session.
                 runs = await svc.list_runs(session_id)
@@ -135,6 +232,33 @@ async def _sweep_once(app: FastAPI) -> None:
                         "reconcile_sweeper: run not found in RLS session",
                         extra={"tenant_id": tenant_id, "run_id": run_id},
                     )
+                    continue
+
+                # ── Inline (chat-mode) orphan branch ───────────────────────
+                # An inline run (execution_mode='inline', sandbox_id IS NULL) is
+                # never resolvable via the scheduler.  If it is still stuck past
+                # the (much larger) inline window, its in-process executor task
+                # died with a restarted process — force it FAILED and push the
+                # ``end`` marker so any live SSE tail closes.  Deliberately does
+                # NOT touch sandbox runs (which take the reconcile path below).
+                if (
+                    run_obj.execution_mode == "inline"
+                    and run_obj.sandbox_id is None
+                ):
+                    if _inline_run_is_orphaned(run_obj):
+                        await _fail_orphaned_inline_run(
+                            run_obj=run_obj, redis_url=redis_url,
+                        )
+                        logger.info(
+                            "reconcile_sweeper: orphaned inline run marked FAILED",
+                            extra={"run_id": run_id, "tenant_id": tenant_id},
+                        )
+                    else:
+                        logger.debug(
+                            "reconcile_sweeper: inline run within grace window; "
+                            "leaving to its executor",
+                            extra={"run_id": run_id},
+                        )
                     continue
 
                 terminal, _ = await _reconcile_run_completion(

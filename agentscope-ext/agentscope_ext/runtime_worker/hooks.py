@@ -249,6 +249,11 @@ def snapshot_env() -> dict[str, str]:
         "FOUNDATION_API_TOKEN",
         "FOUNDATION_TENANT_ID",
         "FOUNDATION_USER_ID",
+        # Effective clearance (min(user, workspace)) for the run.  The
+        # knowledge_tool extension sends this as X-User-Clearance to
+        # knowledge-ingest so ki enforces the document-visibility gate.
+        # Not secret -> plain env, kept in the snapshot the tool reads.
+        "FOUNDATION_USER_CLEARANCE",
         # B-M3: dedicated service URLs + service scopes injected by the
         # scheduler so mcp_tenant_injector / skills_loader can reach the
         # mcp-registry / skill-store internal endpoints (instead of falling
@@ -272,11 +277,17 @@ def snapshot_env() -> dict[str, str]:
         # Web-fetch gateway — injected by the scheduler so the web_fetch
         # extension can POST to the gateway sidecar inside the foundation net.
         "WEB_FETCH_GATEWAY_URL",
+        # Knowledge-ingest (KB v1) - injected by the scheduler so the
+        # knowledge_tool extension can GET /search?scope=knowledge.  Direct
+        # URL in foundation mode; tool-broker /knowledge/v1 facade in broker
+        # mode (the broker re-injects X-User-Clearance from the signed lease).
+        "KNOWLEDGE_INGEST_URL",
         # Broker egress mode — the scheduler rewrites service URLs to
         # tool-broker façades and injects a per-run lease.  The S3 shim in
         # ``_s3_client`` keys off ``TOOL_BROKER_URL`` (+ lease) to route
         # attachment reads through ``/s3/v1/object``; omitting the URL here
         # silently falls back to boto3 with blanked creds (download fails).
+        "SANDBOX_EGRESS_MODE",
         "TOOL_BROKER_URL",
         "TOOL_BROKER_LEASE",
         # LLM gateway enforcer (M1) — injected by the scheduler when the

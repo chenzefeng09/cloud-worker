@@ -270,6 +270,92 @@ def test_spawn_run_env_contains_foundation_service_scopes(
     assert "skill.read_internal" in scopes, "skill.read_internal missing from FOUNDATION_SERVICE_SCOPES"
 
 
+def test_spawn_run_env_injects_knowledge_ingest_url_and_clearance(
+    runtime: DockerRuntime,
+    mock_docker_client: MagicMock,
+) -> None:
+    """``spawn_run`` must inject KNOWLEDGE_INGEST_URL (broker façade in broker
+    mode) + FOUNDATION_USER_CLEARANCE (from the new user_clearance kwarg) into
+    the container env, and RUNTIME_EXTENSIONS must list knowledge_tool so the
+    in-sandbox extension activates."""
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-kb")
+
+    runtime.spawn_run(
+        run_id="run_01J5RUN0000000000000KB0001",
+        session_id="ses_01J5SES0000000000000KB0001",
+        task="kb query",
+        tenant_id="tnt_01J5TNT0000000000000000001",
+        user_id="usr_01J5USR0000000000000000001",
+        foundation_token="tok_kb",
+        llm_virtual_key="vk-test",
+        user_clearance="L3",
+    )
+
+    _, kwargs = mock_docker_client.containers.run.call_args
+    env = kwargs["environment"]
+    # Broker mode (default settings fixture) -> façade URL, not the direct ki.
+    assert "KNOWLEDGE_INGEST_URL" in env, "KNOWLEDGE_INGEST_URL missing from env"
+    assert env["KNOWLEDGE_INGEST_URL"].endswith("/knowledge/v1"), env["KNOWLEDGE_INGEST_URL"]
+    assert "tool-broker" in env["KNOWLEDGE_INGEST_URL"]
+    # Clearance is plain env (not secret) - NOT in the secrets file.
+    assert env["FOUNDATION_USER_CLEARANCE"] == "L3"
+    assert "knowledge_tool" in env["RUNTIME_EXTENSIONS"], (
+        "knowledge_tool missing from RUNTIME_EXTENSIONS default"
+    )
+    # The clearance must NOT leak into the secrets file (it isn't secret).
+    secrets_path = (
+        Path(runtime._settings.workspace_base)  # noqa: SLF001
+        / "tnt_01J5TNT0000000000000000001"
+        / "ses_01J5SES0000000000000KB0001"
+        / "run_01J5RUN0000000000000KB0001"
+        / ".secrets.json"
+    )
+    secrets = json.loads(secrets_path.read_text(encoding="utf-8"))
+    assert "FOUNDATION_USER_CLEARANCE" not in secrets
+    assert "KNOWLEDGE_INGEST_URL" not in secrets
+
+
+def test_spawn_run_foundation_egress_injects_direct_knowledge_url(
+    runtime: DockerRuntime,
+    mock_docker_client: MagicMock,
+) -> None:
+    """Foundation mode injects the DIRECT ki URL (ki is on the foundation net),
+    not the broker façade."""
+    from agent_scheduler.config import Settings
+
+    runtime._settings = Settings(  # noqa: SLF001 - test setup
+        env="test",
+        log_level="WARNING",
+        agent_image="hello-world:latest",
+        workspace_base="/tmp/agent-platform-test",
+        docker_network="none",
+        foundation_identity_url="http://identity-test/api/identity/v1",
+        scheduler_service_token="fake-service-token",
+        otel_enabled=False,
+        sandbox_egress_mode="foundation",
+        knowledge_ingest_url="http://knowledge-ingest:8012/api/knowledge/v1",
+    )
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-ki-foundation")
+
+    runtime.spawn_run(
+        run_id="run_01J5RUN0000000000000KF0001",
+        session_id="ses_01J5SES0000000000000KF0001",
+        task="ki direct",
+        tenant_id="tnt_01J5TNT0000000000000000001",
+        user_id="usr_01J5USR0000000000000000001",
+        foundation_token="tok_kf",
+        llm_virtual_key="vk-test",
+        user_clearance="L2",
+    )
+
+    _, kwargs = mock_docker_client.containers.run.call_args
+    env = kwargs["environment"]
+    assert env["KNOWLEDGE_INGEST_URL"] == (
+        "http://knowledge-ingest:8012/api/knowledge/v1"
+    )
+    assert env["FOUNDATION_USER_CLEARANCE"] == "L2"
+
+
 def test_spawn_run_foundation_egress_uses_configured_network(
     runtime: DockerRuntime,
     mock_docker_client: MagicMock,
@@ -560,6 +646,107 @@ def test_spawn_run_task_json_contains_skills(
     assert payload["task"] == "crunch numbers"
     assert payload["skills"] == ["csv-tools", "pandas-helper"]
     assert payload["mcp_servers"] == []
+
+
+# ---------------------------------------------------------------------------
+# mcp_server_ids: per-run MCP selection, presence-carried into task.json
+#
+# task.json is an EXPLICIT field manifest, not a dict passthrough — a new field
+# that isn't listed in ``_write_task_file`` is silently dropped after surviving
+# every layer above.  These tests assert on the serialized file, not on the
+# call args, so the manifest itself is what's under test.
+# ---------------------------------------------------------------------------
+
+
+def _spawn_and_read_task_json(
+    runtime: DockerRuntime, tmpdir: str, **spawn_kwargs
+) -> dict:
+    """Spawn once into ``tmpdir`` and return the parsed task.json."""
+    runtime._settings.workspace_base = tmpdir
+    runtime.spawn_run(
+        run_id="run_01J5RUN0000000000000000009",
+        session_id="ses_01J5SES0000000000000000009",
+        task="use mcp",
+        tenant_id="tnt_01J5TNT0000000000000000001",
+        user_id="usr_01J5USR0000000000000000001",
+        foundation_token="tok_mcp",
+        llm_virtual_key="vk-test",
+        **spawn_kwargs,
+    )
+    task_path = (
+        Path(tmpdir)
+        / "tnt_01J5TNT0000000000000000001"
+        / "ses_01J5SES0000000000000000009"
+        / "run_01J5RUN0000000000000000009"
+        / "task.json"
+    )
+    return json.loads(task_path.read_text(encoding="utf-8"))
+
+
+def test_task_json_omits_mcp_server_ids_when_not_selected(
+    runtime: DockerRuntime, mock_docker_client: MagicMock,
+) -> None:
+    """No selection → the key is ABSENT (not ``null``) so defaults apply.
+
+    ``null`` would be indistinguishable from "disable all" once the worker
+    reads it back, which is exactly the distinction this field exists to carry.
+    """
+    mock_docker_client.containers.run.return_value = MagicMock(id="c1")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        payload = _spawn_and_read_task_json(runtime, tmpdir)
+
+    assert "mcp_server_ids" not in payload
+    raw = json.dumps(payload)
+    assert "mcp_server_ids" not in raw
+    # The legacy key must be untouched — the injector still fetches live.
+    assert payload["mcp_servers"] == []
+
+
+def test_task_json_writes_empty_mcp_server_ids_to_disable_all(
+    runtime: DockerRuntime, mock_docker_client: MagicMock,
+) -> None:
+    """Explicit ``[]`` → the key is PRESENT and empty = no MCP for this run."""
+    mock_docker_client.containers.run.return_value = MagicMock(id="c2")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        payload = _spawn_and_read_task_json(runtime, tmpdir, mcp_server_ids=[])
+
+    assert "mcp_server_ids" in payload
+    assert payload["mcp_server_ids"] == []
+    assert payload["mcp_servers"] == []
+
+
+def test_task_json_writes_selected_mcp_server_ids(
+    runtime: DockerRuntime, mock_docker_client: MagicMock,
+) -> None:
+    """A non-empty selection lands verbatim, in order, as strings."""
+    mock_docker_client.containers.run.return_value = MagicMock(id="c3")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        payload = _spawn_and_read_task_json(
+            runtime, tmpdir, mcp_server_ids=["mcp_b", "mcp_a"]
+        )
+
+    assert payload["mcp_server_ids"] == ["mcp_b", "mcp_a"]
+    assert payload["mcp_servers"] == []
+
+
+def test_write_task_file_mcp_server_ids_presence_matrix(
+    runtime: DockerRuntime,
+) -> None:
+    """Direct writer test for the three states, no docker involved."""
+    cases: list[tuple[list[str] | None, bool, list[str] | None]] = [
+        (None, False, None),
+        ([], True, []),
+        (["srv_1"], True, ["srv_1"]),
+    ]
+    for selection, key_expected, expected in cases:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = runtime._write_task_file(
+                Path(tmpdir), task="t", mcp_server_ids=selection,
+            )
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        assert ("mcp_server_ids" in payload) is key_expected, selection
+        if key_expected:
+            assert payload["mcp_server_ids"] == expected, selection
 
 
 # ---------------------------------------------------------------------------

@@ -102,7 +102,7 @@ class _BrokerTransport:
     """
 
     # Maps the canonical Redis key suffix to the façade ``kind`` value.
-    _SET_KINDS = ("state", "paused")
+    _SET_KINDS = ("state", "paused", "canvas")
 
     def __init__(
         self,
@@ -234,6 +234,10 @@ def _make_paused_key(run_id: str) -> str:
     return f"{_KEY_PREFIX}:{run_id}:paused"
 
 
+def _make_canvas_key(run_id: str) -> str:
+    return f"{_KEY_PREFIX}:{run_id}:canvas"
+
+
 # Maximum number of entries to retain in the token stream.
 # XADD uses approximate trimming (MAXLEN ~) which keeps Redis CPU cheap.
 _TOKEN_STREAM_MAXLEN = 10_000
@@ -258,6 +262,7 @@ class RunStateClient:
         self._key = _make_key(run_id)
         self._token_stream_key = _make_token_stream_key(run_id)
         self._paused_key = _make_paused_key(run_id)
+        self._canvas_key = _make_canvas_key(run_id)
         self._client: Any | None = None
         self._step = 0
         # Tracks whether we have already set EXPIRE on the token stream key.
@@ -692,6 +697,56 @@ class RunStateClient:
                 exc,
             )
 
+    def push_canvas(self, payload: dict) -> int:
+        """Append a canvas payload to ``agent:run:{run_id}:canvas`` (Phase B).
+
+        The key holds a JSON *list* so multiple ``create_canvas`` tool calls in
+        one run accumulate.  Each stored entry is the given ``payload`` plus a
+        1-based ``seq`` field the orchestrator uses to dedupe materialization
+        (idempotency: a payload with a given ``seq`` is materialized at most
+        once).  The orchestrator reads this list on the streaming and reconcile
+        paths and materializes any not-yet-seen entry into a canvas document.
+
+        ``payload`` must be a JSON-serialisable dict; the canonical shape is::
+
+            {"kind": str, "title": str, "content_markdown": str}
+
+        Returns the ``seq`` assigned to this entry (1-based), or ``0`` when
+        hot-state is disabled (no Redis / broker) so the tool can still return a
+        confirmation to the model.  Failure-open: any Redis error is logged as
+        WARNING and swallowed (returns 0) — a canvas write must never crash the
+        run; the reply text is still delivered via the normal message path.
+        """
+        if self._client is None:
+            return 0
+        try:
+            raw = self._client.get(self._canvas_key)
+            items = json.loads(raw) if raw else []
+            if not isinstance(items, list):
+                items = []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis canvas read failed for run %s: %s", self._run_id, exc
+            )
+            items = []
+
+        seq = len(items) + 1
+        entry = dict(payload)
+        entry["seq"] = seq
+        items.append(entry)
+        try:
+            self._client.set(
+                self._canvas_key,
+                json.dumps(items, ensure_ascii=False),
+                ex=STATE_TTL_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Redis canvas write failed for run %s: %s", self._run_id, exc
+            )
+            return 0
+        return seq
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -749,7 +804,32 @@ def from_env() -> RunStateClient:
     when either is unset — callers need not check.  In broker egress mode
     (``REDIS_URL`` blank, ``TOOL_BROKER_URL`` set) the client routes hot-state
     operations through the tool-broker ``/state/v1`` façade instead.
+
+    WARNING: the runtime worker scrubs control-plane secrets (REDIS_URL,
+    broker lease, …) out of ``os.environ`` before tool execution
+    (``_scrub_process_env_for_tools``), so calling this *after* worker boot
+    yields a silent no-op client.  Late consumers (e.g. the canvas tool built
+    inside ``build_toolkit``) must use :func:`get_shared_client` instead,
+    which returns the client the worker built before the scrub.
     """
     run_id = os.environ.get("RUN_ID", "")
     redis_url = os.environ.get("REDIS_URL", "")
     return RunStateClient(run_id=run_id, redis_url=redis_url or None)
+
+
+# ---------------------------------------------------------------------------
+# Shared per-run client (set once by the runtime worker before env scrub)
+# ---------------------------------------------------------------------------
+
+_SHARED_CLIENT: RunStateClient | None = None
+
+
+def set_shared_client(client: RunStateClient) -> None:
+    """Register the worker's run-scoped client for late consumers."""
+    global _SHARED_CLIENT
+    _SHARED_CLIENT = client
+
+
+def get_shared_client() -> RunStateClient | None:
+    """Return the client registered by the runtime worker, if any."""
+    return _SHARED_CLIENT

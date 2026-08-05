@@ -44,3 +44,48 @@ class EmbeddingDimensionError(IngestError):
             code="KNOWLEDGE.EMBEDDING.DIM_MISMATCH",
             status=500,
         )
+
+
+class FolderNotFoundError(IngestError):
+    def __init__(self, folder_id: str) -> None:
+        super().__init__(
+            f"Folder {folder_id} not found",
+            code="KNOWLEDGE.FOLDER.NOT_FOUND",
+            status=404,
+        )
+
+
+class FolderNameConflictError(IngestError):
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"A folder named {name!r} already exists in this location",
+            code="KNOWLEDGE.FOLDER.NAME_CONFLICT",
+            status=409,
+        )
+
+
+class FolderNotEmptyError(IngestError):
+    def __init__(self, folder_id: str) -> None:
+        super().__init__(
+            f"Folder {folder_id} is not empty (contains sub-folders or documents)",
+            code="KNOWLEDGE.FOLDER.NOT_EMPTY",
+            status=409,
+        )
+
+
+class FolderCycleError(IngestError):
+    def __init__(self, folder_id: str) -> None:
+        super().__init__(
+            f"Cannot move folder {folder_id} under itself or one of its descendants",
+            code="KNOWLEDGE.FOLDER.CYCLE",
+            status=409,
+        )
+
+
+class InvalidSensitivityError(IngestError):
+    def __init__(self, value: str) -> None:
+        super().__init__(
+            f"Invalid sensitivity {value!r} (allowed: L1, L2, L3, L4, L5)",
+            code="KNOWLEDGE.SENSITIVITY.INVALID",
+            status=400,
+        )

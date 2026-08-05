@@ -1,19 +1,11 @@
 import type { Message } from '../api/types';
 
-export function getCanvasVisibleMessages(
-  messages: Message[],
-  hiddenMessageIds: string[] | undefined,
-  hasInlineCanvas: boolean,
-  inlineCanvasAnchorMessageId?: string | null,
-): Message[] {
-  if (!hiddenMessageIds || hiddenMessageIds.length === 0) return messages;
-  const hidden = new Set(hiddenMessageIds);
-  return messages.filter(
-    (message) =>
-      !hidden.has(message.id) ||
-      (hasInlineCanvas && inlineCanvasAnchorMessageId === message.id),
-  );
-}
+// NOTE: message hiding has been retired (design §7.1). The "put in canvas"
+// action no longer removes the source bubble — the card and the bubble
+// coexist, so content is always reachable in the transcript. This module now
+// only answers "is the inline canvas anchored to a message that's on screen",
+// which decides whether the card renders at its anchor or at the bottom
+// fallback slot.
 
 export function hasVisibleCanvasAnchor(
   messages: Message[],

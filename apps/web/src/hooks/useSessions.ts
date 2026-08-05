@@ -3,11 +3,19 @@ import { useChatStore } from '../stores/chatStore';
 import { api } from '../api/client';
 
 export function useSessions() {
-  const { sessions, setSessions, addSession, setActiveSession, activeSessionId } = useChatStore();
+  const {
+    sessions,
+    setSessions,
+    addSession,
+    setActiveSession,
+    activeSessionId,
+    sessionsCursor,
+    sessionsLoadingMore,
+    setSessionsCursor,
+    setSessionsLoadingMore,
+  } = useChatStore();
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [cursor, setCursor] = useState<string | null>(null);
-  const [loadingMore, setLoadingMore] = useState(false);
 
   const fetchSessions = useCallback(async () => {
     setLoading(true);
@@ -19,23 +27,23 @@ export function useSessions() {
       // with `undefined` — that used to crash <Sidebar> on `sessions.length`.
       if (Array.isArray(page?.items)) {
         setSessions(page.items);
-        setCursor(page.next_cursor ?? null);
+        setSessionsCursor(page.next_cursor ?? null);
       } else {
         setSessions([]);
-        setCursor(null);
+        setSessionsCursor(null);
       }
     } catch (e) {
       setError((e as Error).message);
     } finally {
       setLoading(false);
     }
-  }, [setSessions]);
+  }, [setSessions, setSessionsCursor]);
 
   const loadMore = useCallback(async () => {
-    if (!cursor || loadingMore) return;
-    setLoadingMore(true);
+    if (!sessionsCursor || sessionsLoadingMore) return;
+    setSessionsLoadingMore(true);
     try {
-      const page = await api.sessions.list(cursor);
+      const page = await api.sessions.list(sessionsCursor);
       const items = Array.isArray(page?.items) ? page.items : [];
       // Append, de-duplicating by id (the store may already hold
       // optimistic/prepended sessions). `setSessions` only accepts a plain
@@ -43,17 +51,17 @@ export function useSessions() {
       // matching the existing `deleteSession` pattern below.
       const seen = new Set(sessions.map((s) => s.id));
       setSessions([...sessions, ...items.filter((s) => !seen.has(s.id))]);
-      setCursor(page.next_cursor ?? null);
+      setSessionsCursor(page.next_cursor ?? null);
     } catch (e) {
       setError((e as Error).message);
     } finally {
-      setLoadingMore(false);
+      setSessionsLoadingMore(false);
     }
-  }, [cursor, loadingMore, sessions, setSessions]);
+  }, [sessionsCursor, sessionsLoadingMore, sessions, setSessions, setSessionsCursor, setSessionsLoadingMore]);
 
-  const createSession = useCallback(async (title?: string) => {
+  const createSession = useCallback(async (title?: string, workspaceId?: string) => {
     try {
-      const session = await api.sessions.create(title);
+      const session = await api.sessions.create(title, undefined, workspaceId);
       addSession(session);
       setActiveSession(session.id);
       return session;
@@ -82,7 +90,7 @@ export function useSessions() {
     deleteSession,
     setActiveSession,
     loadMore,
-    loadingMore,
-    hasMore: cursor !== null,
+    loadingMore: sessionsLoadingMore,
+    hasMore: sessionsCursor !== null,
   };
 }

@@ -46,3 +46,24 @@ deploy/certs/
 
 # Playwright MCP browser-test artifacts
 .playwright-mcp/
+
+# Verification / debug screenshots dropped at the repo root during manual
+# browser testing. Keep them out of the repo — attach to the PR instead.
+/*.png
+
+# Local planning notes and internal (non-public) material.
+/.plan-*.md
+/提取材料说明.md
+
+# Helm: resolved sub-charts and the lock file, which pins a machine-local
+# file:// path to the sibling saas-foundation checkout. Regenerate with
+# `helm dependency update .` inside deploy/helm/agent-platform/.
+deploy/helm/*/charts/
+deploy/helm/*/Chart.lock
+
+# MATLAB licensing material and MathWorks proprietary binaries. NEVER commit
+# these — a FLEXlm licence file with HOSTID=ANY activates MATLAB on any machine,
+# and redistributing MathWorks binaries violates the licence agreement. Keep
+# them locally (the matlab*.Dockerfile builds read them from the build context).
+sandbox-images/license.lic
+sandbox-images/*.so

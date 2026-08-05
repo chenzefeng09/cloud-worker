@@ -32,7 +32,6 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
-import mimetypes
 import os
 import re
 from pathlib import Path
@@ -42,13 +41,16 @@ import docker
 from docker.types import Mount, Ulimit
 
 from agent_scheduler.config import (
+    _DEV_LIKE_ENVS,
     SANDBOX_SERVICE_SCOPES,
     Settings,
-    _DEV_LIKE_ENVS,
 )
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
-from agent_scheduler.services import egress_policy
-from agent_scheduler.services.feature_flag import evaluate_flag
+from agent_scheduler.services import artifact_store, egress_policy
+from agent_scheduler.services.feature_flag import (
+    evaluate_flag,
+    runtime_extensions_for_run,
+)
 from agent_scheduler.services.runtime import RUNTIME_REGISTRY
 from agent_scheduler.services.skill_cache import MountedSkill, SkillCache
 
@@ -195,6 +197,7 @@ class DockerRuntime:
         user_id: str,
         foundation_token: str,
         skills: list[str] | None = None,
+        mcp_server_ids: list[str] | None = None,
         files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
         memory_limit: str | None = None,
@@ -207,6 +210,7 @@ class DockerRuntime:
         sampling_params: dict[str, Any] | None = None,
         hitl: bool = True,
         resume: dict[str, Any] | None = None,
+        user_clearance: str = "",
     ) -> str:
         """Spawn a sandbox container for one agent run.
 
@@ -221,6 +225,13 @@ class DockerRuntime:
                 purpose of per-run tokens, so we reject it outright.
             skills: optional list of skill names to activate in the sandbox.
                 Embedded in task.json; consumed by ``skills_loader`` extension.
+            mcp_server_ids: optional per-run MCP server selection, carried with
+                PRESENCE semantics.  ``None`` -> the ``mcp_server_ids`` key is
+                OMITTED from task.json and the in-sandbox ``mcp_tenant_injector``
+                keeps injecting every enabled tenant server; ``[]`` -> the key is
+                written as ``[]``, meaning no MCP servers for this run; a
+                non-empty list -> only those server ids.  ``None`` is never
+                serialized as ``null``.
             files: optional list of ``{"key": s3key, "filename": name, "mime": mime}``
                 dicts describing user-uploaded attachments.  Written to task.json
                 ``files`` field; the runtime_worker downloads them to
@@ -232,6 +243,13 @@ class DockerRuntime:
             llm_virtual_key: tenant virtual key from the gateway.  Required
                 when ``llm_gateway_enforcer`` is active; omitted only for an
                 explicit local direct-connect configuration.
+            user_clearance: the run's effective clearance (``min(user,
+                workspace)``), forwarded by the orchestrator.  Injected into
+                the sandbox env as ``FOUNDATION_USER_CLEARANCE`` so the
+                ``knowledge_tool`` extension can send ``X-User-Clearance`` to
+                knowledge-ingest (foundation mode) and signed into the broker
+                lease so the broker re-injects it for the ki façade (broker
+                mode).  Not secret -> plain env, like tenant/user id.
         """
         _check_ids(
             run_id=run_id,
@@ -257,6 +275,9 @@ class DockerRuntime:
             workspace_dir,
             task=task,
             skills=skills or [],
+            # Pass through UNCHANGED (no ``or []``): ``None`` and ``[]`` are
+            # different instructions and the writer distinguishes them.
+            mcp_server_ids=mcp_server_ids,
             files=files or [],
             memory=memory or "",
             history=history or [],
@@ -297,9 +318,23 @@ class DockerRuntime:
                 user_id=user_id,
                 run_id=run_id,
                 ttl_seconds=self._settings.sandbox_timeout,
+                clearance=user_clearance,
             )
         except ValueError as exc:
             raise SandboxSpawnError(str(exc)) from exc
+
+        # Canvas v2 (Phase B): append ``canvas_tool`` to RUNTIME_EXTENSIONS when
+        # the per-run ``enable_canvas_tool`` flag is on.  Failure-open (handled
+        # inside ``evaluate_flag``): a down/slow flag service leaves the base
+        # extensions unchanged, so the flag-off path is byte-for-byte identical
+        # to pre-canvas behaviour.
+        runtime_extensions = runtime_extensions_for_run(
+            base_extensions=self._settings.runtime_extensions,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            flag_url=self._settings.feature_flag_url,
+            timeout_ms=self._settings.feature_flag_timeout_ms,
+        )
 
         # NOTE: this dict is assembled with every value (including secrets)
         # for clarity, but the ``_SECRET_ENV_KEYS`` subset is popped out below
@@ -324,6 +359,13 @@ class DockerRuntime:
             "FOUNDATION_API_TOKEN": foundation_token,
             "FOUNDATION_TENANT_ID": tenant_id,
             "FOUNDATION_USER_ID": user_id,
+            # Effective clearance (min(user, workspace)) for the run.  The
+            # ``knowledge_tool`` extension sends this as X-User-Clearance to
+            # knowledge-ingest so ki enforces the visibility gate; in broker
+            # mode the same value is signed into the lease and the broker
+            # re-injects it (trusted) for the ki façade.  Not secret -> plain
+            # env, consistent with FOUNDATION_TENANT_ID / FOUNDATION_USER_ID.
+            "FOUNDATION_USER_CLEARANCE": user_clearance,
             "OTEL_EXPORTER_OTLP_ENDPOINT": self._settings.otel_exporter_endpoint,
             "SANDBOX_EGRESS_MODE": service_env["SANDBOX_EGRESS_MODE"],
             "TOOL_BROKER_URL": service_env["TOOL_BROKER_URL"],
@@ -333,7 +375,7 @@ class DockerRuntime:
             # RUNTIME_EXTENSIONS activates them in declaration order.
             "MCP_REGISTRY_URL": service_env["MCP_REGISTRY_URL"],
             "SKILL_STORE_URL": service_env["SKILL_STORE_URL"],
-            "RUNTIME_EXTENSIONS": self._settings.runtime_extensions,
+            "RUNTIME_EXTENSIONS": runtime_extensions,
             # Dev-mode shim: in prod the API gateway translates the verified
             # Bearer JWT into X-Service-Scopes before requests reach internal
             # endpoints.  In this deployment (no gateway between sandbox and
@@ -360,6 +402,16 @@ class DockerRuntime:
             # POST fetch requests to the gateway sidecar.  The gateway is
             # either reached directly (foundation mode) or through tool-broker.
             "WEB_FETCH_GATEWAY_URL": service_env["WEB_FETCH_GATEWAY_URL"],
+            # Foundation DLP — the worker POSTs tool-call content to
+            # ${DLP_URL}/core/scan for scanning.  Reached directly (foundation
+            # mode) or through the tool-broker /dlp façade (broker mode).
+            "DLP_URL": service_env["DLP_URL"],
+            # Knowledge-ingest (KB v1) - the knowledge_tool extension GETs
+            # ${KNOWLEDGE_INGEST_URL}/search?scope=knowledge.  Reached directly
+            # (foundation mode) or through the tool-broker /knowledge/v1
+            # facade (broker mode, which re-injects X-User-Clearance from the
+            # signed lease).  Blank in none mode -> tool self-gates off.
+            "KNOWLEDGE_INGEST_URL": service_env["KNOWLEDGE_INGEST_URL"],
         }
         if tool_broker_lease:
             env_vars["TOOL_BROKER_LEASE"] = tool_broker_lease
@@ -440,6 +492,13 @@ class DockerRuntime:
             flag_url=self._settings.feature_flag_url,
             timeout_ms=self._settings.feature_flag_timeout_ms,
         )
+        # Global config fallback: when the per-run flag is False/unreachable, a
+        # deployment can still route every run to the Claude SDK worker via
+        # ``SCHEDULER_USE_CLAUDE_SDK_WORKER_DEFAULT``.  The flag wins when it
+        # returns True; the default only applies on the False branch.  Committed
+        # default is False, so this is a no-op for existing behaviour.
+        if not use_claude_sdk:
+            use_claude_sdk = self._settings.use_claude_sdk_worker_default
         selected_image = (
             self._settings.claude_sdk_image
             if use_claude_sdk
@@ -676,9 +735,9 @@ class DockerRuntime:
         return result
 
     # ---------------------------------------------------------------- artifacts
-    _EXCLUDED_NAMES: frozenset[str] = frozenset({
-        "task.json", "result.json", "events.jsonl",
-    })
+    # Kept as thin wrappers over ``artifact_store`` so the cube runtime
+    # publishes byte-identical artifact records from its own host-mount.
+    _EXCLUDED_NAMES: frozenset[str] = artifact_store.EXCLUDED_NAMES
 
     def _upload_artifacts(
         self,
@@ -688,89 +747,20 @@ class DockerRuntime:
         session_id: str,
         run_id: str,
     ) -> list[dict[str, Any]]:
-        """Scan ``workspace`` for output files and upload them to S3.
-
-        Excluded: task.json, result.json, events.jsonl, and everything under
-        inputs/ (user-uploaded originals).  Returns a list of artifact dicts::
-
-            [{"filename": str, "s3_key": str, "size": int, "mime": str}, ...]
-
-        Failure-open: individual file errors are logged and skipped.
-        """
-        if not workspace.is_dir():
-            return []
-
-        s3_client = self._make_s3_client()
-        if s3_client is None:
-            return []
-
-        artifacts: list[dict[str, Any]] = []
-        inputs_dir = workspace / "inputs"
-
-        for fpath in workspace.rglob("*"):
-            if not fpath.is_file():
-                continue
-            # Skip inputs/ subdirectory.
-            try:
-                fpath.relative_to(inputs_dir)
-                continue  # inside inputs/ — skip
-            except ValueError:
-                pass
-            # Skip system files at workspace root.
-            if fpath.parent == workspace and fpath.name in self._EXCLUDED_NAMES:
-                continue
-
-            relpath = fpath.relative_to(workspace).as_posix()
-            s3_key = (
-                f"tenant/{tenant_id}/sessions/{session_id}"
-                f"/runs/{run_id}/artifacts/{relpath}"
-            )
-            try:
-                data = fpath.read_bytes()
-                mime, _ = mimetypes.guess_type(fpath.name)
-                mime = mime or "application/octet-stream"
-                s3_client.put_object(
-                    Bucket=self._settings.s3_bucket,
-                    Key=s3_key,
-                    Body=data,
-                    ContentType=mime,
-                )
-                artifacts.append({
-                    "filename": fpath.name,
-                    "s3_key": s3_key,
-                    "size": len(data),
-                    "mime": mime,
-                })
-                logger.info(
-                    "artifact uploaded",
-                    extra={"s3_key": s3_key, "size": len(data), "run_id": run_id},
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "artifact upload failed (failure-open)",
-                    extra={"path": str(fpath), "err": str(exc)},
-                )
-
-        return artifacts
+        """Scan ``workspace`` for output files and upload them to S3."""
+        return artifact_store.upload_run_artifacts(
+            workspace=workspace,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            run_id=run_id,
+            bucket=self._settings.s3_bucket,
+            s3_client=self._make_s3_client(),
+            excluded_names=self._EXCLUDED_NAMES,
+        )
 
     def _make_s3_client(self) -> Any | None:
-        """Build a boto3 S3 client using S3_* settings (not AWS_* env vars).
-
-        Returns None if boto3 is unavailable or credentials are unset.
-        """
-        try:
-            import boto3
-            client = boto3.client(
-                "s3",
-                endpoint_url=self._settings.s3_endpoint_url,
-                region_name=self._settings.s3_region,
-                aws_access_key_id=self._settings.s3_access_key_id,
-                aws_secret_access_key=self._settings.s3_secret_access_key,
-            )
-            return client
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("S3 client unavailable: %s", exc)
-            return None
+        """Build a boto3 S3 client using S3_* settings (not AWS_* env vars)."""
+        return artifact_store.make_s3_client(self._settings)
 
     def get_container_tenant(self, container_id: str) -> str:
         """Return the ``agent-platform.tenant-id`` label of a container.
@@ -803,6 +793,11 @@ class DockerRuntime:
         with contextlib.suppress(docker.errors.NotFound):
             # Removed concurrently; nothing to do.
             c.remove()
+
+    # ------------------------------------------------------------------ reap
+    def reap_expired(self, *, max_age_seconds: int) -> int:
+        """Docker containers are reaped by their own lifecycle; no-op here."""
+        return 0
 
     # ------------------------------------------------------------------ list
     def list_containers(self, *, tenant_id: str) -> list[dict[str, Any]]:
@@ -854,6 +849,7 @@ class DockerRuntime:
         *,
         task: str,
         skills: list[str] | None = None,
+        mcp_server_ids: list[str] | None = None,
         files: list[dict[str, Any]] | None = None,
         memory: str | None = None,
         history: list[dict[str, Any]] | None = None,
@@ -871,6 +867,7 @@ class DockerRuntime:
             {
               "task": str,
               "mcp_servers": [],   # always empty — mcp_tenant_injector fetches live
+              "mcp_server_ids": [str, ...]  # OPTIONAL key — see below
               "skills": [str, ...] # skill names; skills_loader fetches manifests
               "files": [{"key": s3key, "filename": name, "mime": mime}, ...]
               "memory": str        # pre-fetched memory snippets (may be empty)
@@ -887,6 +884,19 @@ class DockerRuntime:
         ``mcp_servers`` stays empty because the in-sandbox ``mcp_tenant_injector``
         extension fetches the enabled server list directly from ``mcp-registry``
         at runtime using ``MCP_REGISTRY_URL`` + ``FOUNDATION_TENANT_ID``.
+
+        ``mcp_server_ids`` is the per-run narrowing of that live fetch, and it
+        is the one key in this payload whose PRESENCE is load-bearing:
+
+        * key ABSENT  — the run expressed no MCP choice; the injector keeps its
+          historical behaviour and injects every enabled tenant server.
+        * key ``[]``  — the run explicitly disabled MCP; the injector must
+          inject nothing.
+        * non-empty   — the injector keeps only the listed server ids.
+
+        A ``None`` selection therefore omits the key rather than writing
+        ``null``; ``json.dumps`` would otherwise erase the distinction between
+        "no choice" and "disable everything".
 
         ``skills`` carries the caller-supplied list of skill names; the
         ``skills_loader`` extension uses them to resolve manifests from
@@ -927,6 +937,11 @@ class DockerRuntime:
             "hitl": bool(hitl),
             "resume": resume,
         }
+        # Presence-carried: only write the key when the run made a choice.
+        # ``is not None`` — NOT truthiness — because ``[]`` ("disable all MCP")
+        # is a real selection that must reach the sandbox.
+        if mcp_server_ids is not None:
+            payload["mcp_server_ids"] = [str(s) for s in mcp_server_ids]
         task_path = workspace_dir / "task.json"
         task_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return task_path

@@ -18,8 +18,22 @@ from typing import Any
 BROKER_LEASE_SCOPES: tuple[str, ...] = (
     "llm-gateway.invoke",
     "mcp.read_internal",
+    # Tenant MCP server tool invocation via the tool-broker /mcp-tenant
+    # passthrough route; without it the broker returns 403 on that route.
+    "mcp.tenant_invoke",
     "skill.read_internal",
     "web_fetch.invoke",
+    # Knowledge-base retrieval via the tool-broker /knowledge/v1 façade.  The
+    # sandbox's search_knowledge tool GETs {broker}/knowledge/v1/search on
+    # knowledge-ingest; ki needs no bearer/vkey, only the three identity
+    # headers (X-Tenant-Id / X-User-Id / X-User-Clearance) which the broker
+    # re-injects from THIS lease so a compromised sandbox cannot spoof a
+    # higher clearance to read restricted documents.
+    "knowledge.search",
+    # DLP tool-call scanning is mediated by the tool-broker /dlp façade so the
+    # worker can submit content to foundation-dlp's /core/scan endpoint without
+    # direct infra network reach.
+    "dlp.scan",
     # State (Redis hot-state) and object-store reads are mediated by the
     # tool-broker /state and /s3 façades so a sandbox with no direct infra
     # network can still checkpoint run state and read tenant-scoped objects.
@@ -50,12 +64,20 @@ def mint_tool_broker_lease(
     user_id: str,
     run_id: str,
     ttl_seconds: int,
+    clearance: str = "",
 ) -> str:
     """Return a signed per-run lease for tool-broker, or ``""`` outside broker mode.
 
     The lease is deliberately smaller than a platform token: it only proves this
     sandbox may use a fixed set of broker façades for this tenant/run until
     expiry.  The foundation bearer token is still forwarded to upstream services.
+
+    ``clearance`` is the run's effective clearance (``min(user, workspace)``),
+    threaded in so the broker can re-inject ``X-User-Clearance`` for the
+    knowledge-ingest façade from a trusted, signed source rather than trusting
+    a sandbox-supplied header (which a compromised sandbox could inflate to
+    read higher-sensitivity documents).  It is NOT secret, so it rides in the
+    signed lease payload alongside tenant_id / user_id / run_id.
     """
     mode = str(getattr(settings, "sandbox_egress_mode", "foundation") or "foundation")
     if mode != "broker":
@@ -76,6 +98,8 @@ def mint_tool_broker_lease(
         "iat": now,
         "exp": now + ttl,
     }
+    if clearance:
+        payload["clearance"] = clearance
     body = _b64url(
         json.dumps(
             payload,
@@ -121,6 +145,15 @@ def service_env(settings: Any, *, llm_gateway_url: str | None = None) -> dict[st
             "MCP_REGISTRY_URL": settings.mcp_registry_url,
             "SKILL_STORE_URL": settings.skill_store_url,
             "WEB_FETCH_GATEWAY_URL": settings.web_fetch_gateway_url,
+            "DLP_URL": settings.dlp_url,
+            # Knowledge-ingest direct URL (ki is on the foundation net in this
+            # mode, so the sandbox reaches it directly).  ki needs no
+            # bearer/vkey - only the three identity headers the worker derives
+            # from FOUNDATION_TENANT_ID / FOUNDATION_USER_ID /
+            # FOUNDATION_USER_CLEARANCE.  Foundation mode is the known
+            # residual-risk path (see test_foundation_mode_exposes_direct_*),
+            # so the clearance is sandbox-sourced here by design.
+            "KNOWLEDGE_INGEST_URL": settings.knowledge_ingest_url,
             "S3_ENDPOINT_URL": settings.s3_endpoint_url,
             "S3_BUCKET": settings.s3_bucket,
             "S3_REGION": settings.s3_region,
@@ -145,6 +178,13 @@ def service_env(settings: Any, *, llm_gateway_url: str | None = None) -> dict[st
             "WEB_FETCH_GATEWAY_URL": _broker_url(
                 settings, "web-fetch/api/web-fetch/v1"
             ),
+            # The worker appends /core/scan; the broker /dlp route allowlists
+            # that single path on the foundation-dlp upstream.
+            "DLP_URL": _broker_url(settings, "dlp/api/dlp/v1"),
+            # knowledge_tool appends /search; the broker /knowledge/v1 route
+            # allowlists that single path on the knowledge-ingest upstream and
+            # re-injects X-User-Clearance from the signed per-run lease.
+            "KNOWLEDGE_INGEST_URL": _broker_url(settings, "knowledge/v1"),
             # Direct object-store endpoint and Redis access must not be
             # available in broker mode; the worker reaches both through the
             # tool-broker /s3 and /state façades, which hold their own creds.
@@ -170,6 +210,8 @@ def service_env(settings: Any, *, llm_gateway_url: str | None = None) -> dict[st
             "MCP_REGISTRY_URL": "",
             "SKILL_STORE_URL": "",
             "WEB_FETCH_GATEWAY_URL": "",
+            "DLP_URL": "",
+            "KNOWLEDGE_INGEST_URL": "",
             "S3_ENDPOINT_URL": "",
             "S3_BUCKET": "",
             "S3_REGION": "",

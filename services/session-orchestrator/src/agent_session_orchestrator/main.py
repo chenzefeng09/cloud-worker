@@ -128,6 +128,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from agent_session_orchestrator.api.v1.attachments import router as attachments_router
     app.include_router(attachments_router, prefix=settings.api_prefix)
 
+    from agent_session_orchestrator.api.v1.canvas import router as canvas_router
+    app.include_router(canvas_router, prefix=settings.api_prefix)
+
+    from agent_session_orchestrator.api.v1.artifacts import router as artifacts_router
+    app.include_router(artifacts_router, prefix=settings.api_prefix)
+
+    from agent_session_orchestrator.api.v1.workspaces import router as workspaces_router
+    app.include_router(workspaces_router, prefix=settings.api_prefix)
+
     return app
 
 

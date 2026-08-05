@@ -60,10 +60,10 @@ import logging
 from collections.abc import Awaitable, Callable
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
 from agent_bff.api._http import foundation_headers
-from agent_bff.api.dependencies import require_auth
+from agent_bff.api.dependencies import TClearance, require_auth
 
 # Reuse the admin guard + upstream-error helper verbatim so the platform
 # proxies share exactly one super_admin enforcement + error-surfacing path.
@@ -235,9 +235,14 @@ async def _proxy_get(
     forward_params: bool = False,
     timeout: float = 15,
     admin_actor: bool = True,
+    extra_params: dict[str, str] | None = None,
 ) -> dict:
     headers = _scope_headers(auth, tenant_id=tenant_id, admin_actor=admin_actor)
     params = _forward_params(request) if forward_params else None
+    # ``extra_params`` are BFF-injected query args (e.g. ``include_memory`` for
+    # the knowledge audit view). They take precedence over any forwarded param.
+    if extra_params:
+        params = {**(params or {}), **extra_params}
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.get(url, params=params, headers=headers)
@@ -334,7 +339,16 @@ async def admin_delete_skill(
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Downstream (mcp-registry api/v1/mcp_servers.py) is a full match:
-#   GET/POST /mcp-servers, GET/PATCH/DELETE /mcp-servers/{server_id}.
+#   GET/POST /mcp-servers, GET/PATCH/DELETE /mcp-servers/{server_id},
+#   POST /mcp-servers/probe             (live probe of an *unsaved* config),
+#   POST /mcp-servers/{server_id}/test  (live initialize + tools/list probe of
+#                                        the stored config, with an optional
+#                                        body overriding fields for one probe).
+#
+# The BFF is a pure passthrough on every MCP endpoint: POST/PATCH forward the
+# client JSON body verbatim and GET returns ``resp.json()`` unchanged, so the
+# registry's newer connection-config fields (headers / auth / timeout_seconds /
+# tool_filter / args) flow through end-to-end without any BFF schema to extend.
 
 @router.get("/admin/mcp/servers")
 async def admin_list_mcp_servers(
@@ -359,6 +373,45 @@ async def admin_create_mcp_server(
     url = f"{request.app.state.settings.mcp_registry_url}/mcp-servers"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(url, json=body, headers=headers)
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"mcp-registry unreachable ({exc})",
+        ) from exc
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
+# NOTE: declared *before* ``/admin/mcp/servers/{server_id}`` — Starlette matches
+# in declaration order, so a later position would make ``probe`` bind as a
+# ``server_id``.
+@router.post("/admin/mcp/servers/probe")
+async def admin_probe_mcp_server(
+    request: Request,
+    tenant_id: str | None = None,
+    _auth: tuple = Depends(require_admin_module_bff("mcp_server.create")),
+) -> dict:
+    """Probe an unsaved MCP server config (live initialize + tools/list).
+
+    Proxies to mcp-registry ``POST /mcp-servers/probe`` and returns its
+    ``{ok, server_info, tools, error}`` response verbatim.  Unlike
+    ``/{id}/test`` this needs no stored row, so the admin console can populate
+    its tool allow/block picker straight from the create form.
+
+    Conventions are identical to ``admin_test_mcp_server``: the
+    ``require_admin_module_bff("mcp_server.create")`` gate, no ``X-Actor:
+    ADMIN`` so the registry re-authorizes the real caller, an optional
+    ``?tenant_id=`` cross-tenant override for the super_admin, the client body
+    forwarded verbatim (it carries the connection config, including plaintext
+    ``auth``), and a 30s timeout because the registry performs a real outbound
+    handshake.
+    """
+    headers = _scope_headers(_auth, tenant_id=tenant_id, admin_actor=False)
+    body = await request.json() if await request.body() else {}
+    url = f"{request.app.state.settings.mcp_registry_url}/mcp-servers/probe"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(url, json=body, headers=headers)
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         raise HTTPException(
@@ -423,6 +476,47 @@ async def admin_delete_mcp_server(
     return {"status": "deleted"}
 
 
+@router.post("/admin/mcp/servers/{server_id}/test")
+async def admin_test_mcp_server(
+    server_id: str,
+    request: Request,
+    tenant_id: str | None = None,
+    _auth: tuple = Depends(require_admin_module_bff("mcp_server.create")),
+) -> dict:
+    """Probe a registered MCP server (live initialize + tools/list).
+
+    Proxies to mcp-registry ``POST /mcp-servers/{id}/test`` and returns its
+    ``{ok, server_info, tools, error}`` response verbatim.  The registry
+    performs the actual outbound probe against the stored server config, so
+    the BFF grants a generous 30s timeout (the registry's own
+    ``timeout_seconds`` bounds the upstream wait).
+
+    Forwarding conventions match the sibling admin MCP endpoints exactly:
+    ``require_admin_module_bff("mcp_server.create")`` gate (admits tenant_admin
+    via the ``mcp_server.*`` wildcard, excludes member), no ``X-Actor: ADMIN``
+    so the registry's own ``require_permission`` re-authorizes the real caller,
+    optional ``?tenant_id=`` cross-tenant override for the super_admin, and the
+    client body forwarded as-is so the registry may accept test-time config
+    overrides (an empty body probes the stored config unchanged).
+    """
+    headers = _scope_headers(_auth, tenant_id=tenant_id, admin_actor=False)
+    body = await request.json() if await request.body() else {}
+    url = (
+        f"{request.app.state.settings.mcp_registry_url}"
+        f"/mcp-servers/{server_id}/test"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(url, json=body, headers=headers)
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"mcp-registry unreachable ({exc})",
+        ) from exc
+    _raise_for_upstream(resp)
+    return resp.json()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Module 9 — Knowledge documents (→ knowledge-ingest)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -431,6 +525,12 @@ async def admin_delete_mcp_server(
 #   GET /documents, GET /documents/{document_id},
 #   POST /documents/{document_id}/ingest   (= "reingest" — re-runs chunk+embed)
 #   DELETE /documents/{document_id}        (removes the doc row + chunks + blob)
+#
+# knowledge-ingest's GET /documents hides session-memory docs (those stamped
+# with an ``origin_session_id``, titled "[memory] …") by default. The admin
+# audit listing below forces ``include_memory=true`` so governance sees the
+# full tenant set — every user's memory rows included. The ordinary tenant
+# library (BFF library.py) omits the flag and stays memory-free.
 
 @router.get("/admin/knowledge/documents")
 async def admin_list_documents(
@@ -441,6 +541,7 @@ async def admin_list_documents(
     url = f"{request.app.state.settings.knowledge_ingest_url}/documents"
     return await _proxy_get(
         request, url, _auth, tenant_id, forward_params=True, admin_actor=False,
+        extra_params={"include_memory": "true"},
     )
 
 
@@ -456,6 +557,52 @@ async def admin_get_document(
         f"/documents/{document_id}"
     )
     return await _proxy_get(request, url, _auth, tenant_id, admin_actor=False)
+
+
+@router.get("/admin/knowledge/documents/{document_id}/content")
+async def admin_get_document_content(
+    document_id: str,
+    request: Request,
+    tenant_id: str | None = None,
+    _auth: tuple = Depends(require_admin_module_bff("document.create")),
+    clearance: str = TClearance,
+) -> Response:
+    """Cross-tenant audit preview — stream a knowledge document's source bytes.
+
+    Fetches the raw blob for governance / audit preview of any tenant's
+    documents via ``?tenant_id=``.  Deliberately does NOT use
+    ``_scope_headers``: that helper calls ``foundation_headers(...)`` without
+    forwarding ``X-User-Clearance``, so knowledge-ingest's fail-closed L1
+    default would block a platform super_admin from previewing any L2+
+    document.  Instead we build the headers inline, forwarding the caller's
+    clearance (super_admin typically L5 sees all; tenant audit carries its own
+    clearance) so the service's sensitivity gate holds without spuriously
+    locking out audit.
+    """
+    caller_tenant, user_id, access_token = _auth
+    effective = tenant_id or caller_tenant
+    headers = foundation_headers(effective, user_id, access_token, clearance=clearance)
+    url = (
+        f"{request.app.state.settings.knowledge_ingest_url}"
+        f"/documents/{document_id}/content"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.get(url, headers=headers)
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"knowledge-ingest unreachable ({exc})",
+        ) from exc
+    content_type = resp.headers.get("content-type", "application/octet-stream")
+    content_disp = resp.headers.get("content-disposition", "")
+    return Response(
+        content=resp.content,
+        status_code=resp.status_code,
+        media_type=content_type,
+        headers={"Content-Disposition": content_disp} if content_disp else {},
+    )
+
 
 
 @router.post("/admin/knowledge/documents/{document_id}/reingest")

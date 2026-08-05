@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { readTask, validateRequiredEnv } from "../src/task.js";
+import { readEnv, readTask, validateRequiredEnv } from "../src/task.js";
 
 const SAVED = { ...process.env };
 
@@ -56,6 +56,59 @@ describe("readTask", () => {
     expect(task.sampling_params).toEqual({ temperature: 0.2, top_p: 0.9, max_tokens: 1000 });
     expect(task.skills).toEqual(["search"]);
     expect(task.memory).toBe("prior");
+  });
+
+  // ── mcp_server_ids: three-state run-level MCP selection ──────────────────
+  // The scheduler writes this key into task.json. Presence is load-bearing:
+  // absent = tenant default, [] = disable all, non-empty = only those ids.
+  // `[]` is falsy, so a truthiness-based reader would collapse the first two
+  // cases and silently re-enable every tenant server on a "disable all" run.
+  describe("mcp_server_ids (three-state)", () => {
+    it("is undefined when the key is absent (=> tenant default)", () => {
+      process.env.AGENT_TASK_JSON = JSON.stringify({ task: "x" });
+      expect(readTask().mcp_server_ids).toBeUndefined();
+    });
+
+    it("stays [] when explicitly empty (=> MCP disabled for this run)", () => {
+      process.env.AGENT_TASK_JSON = JSON.stringify({ task: "x", mcp_server_ids: [] });
+      const ids = readTask().mcp_server_ids;
+      expect(ids).toEqual([]);
+      // The distinction that matters: empty is NOT absent.
+      expect(ids).not.toBeUndefined();
+    });
+
+    it("keeps the ids when non-empty (=> only those servers)", () => {
+      process.env.AGENT_TASK_JSON = JSON.stringify({
+        task: "x",
+        mcp_server_ids: ["mcp_AAA", "mcp_BBB"],
+      });
+      expect(readTask().mcp_server_ids).toEqual(["mcp_AAA", "mcp_BBB"]);
+    });
+
+    it("drops blanks and non-strings but keeps the list a list", () => {
+      process.env.AGENT_TASK_JSON = JSON.stringify({
+        task: "x",
+        mcp_server_ids: [" mcp_AAA ", "", 7, null, "mcp_BBB"],
+      });
+      expect(readTask().mcp_server_ids).toEqual(["mcp_AAA", "mcp_BBB"]);
+    });
+
+    it("falls back to undefined (tenant default) on a malformed value", () => {
+      // A bad shape must degrade to the pre-existing behaviour, not to
+      // "strip every tool the user has".
+      process.env.AGENT_TASK_JSON = JSON.stringify({
+        task: "x",
+        mcp_server_ids: "mcp_AAA",
+      });
+      expect(readTask().mcp_server_ids).toBeUndefined();
+    });
+
+    it("is unaffected by the legacy mcp_servers key", () => {
+      // The scheduler hardcodes mcp_servers:[] on every run; mistaking it for
+      // the selection would disable MCP everywhere.
+      process.env.AGENT_TASK_JSON = JSON.stringify({ task: "x", mcp_servers: [] });
+      expect(readTask().mcp_server_ids).toBeUndefined();
+    });
   });
 
   it("throws when AGENT_TASK_JSON is malformed", () => {
@@ -112,5 +165,25 @@ describe("validateRequiredEnv", () => {
     setAll();
     process.env.FOUNDATION_TENANT_ID = "   ";
     expect(validateRequiredEnv()).toContain("FOUNDATION_TENANT_ID");
+  });
+});
+
+describe("readEnv", () => {
+  it("snapshots SANDBOX_EGRESS_MODE and TOOL_BROKER_URL from process.env", () => {
+    process.env.SANDBOX_EGRESS_MODE = "broker";
+    process.env.TOOL_BROKER_URL = "http://tool-broker:8024/api/tool-broker/v1";
+    process.env.TOOL_BROKER_LEASE = "v1.body.sig";
+    const env = readEnv();
+    expect(env.SANDBOX_EGRESS_MODE).toBe("broker");
+    expect(env.TOOL_BROKER_URL).toBe("http://tool-broker:8024/api/tool-broker/v1");
+    expect(env.TOOL_BROKER_LEASE).toBe("v1.body.sig");
+  });
+
+  it("defaults missing egress/broker env vars to empty strings", () => {
+    delete process.env.SANDBOX_EGRESS_MODE;
+    delete process.env.TOOL_BROKER_URL;
+    const env = readEnv();
+    expect(env.SANDBOX_EGRESS_MODE).toBe("");
+    expect(env.TOOL_BROKER_URL).toBe("");
   });
 });

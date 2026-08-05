@@ -1,0 +1,59 @@
+{
+  "description": "Platform-global default skill set. Seeded under the reserved platform tenant; every organization and user gets these by default.",
+  "platform_tenant_id": "tnt_00000000000000000PLATFORM",
+  "version": "1.0.0",
+  "skills": [
+    {
+      "name": "docx",
+      "version": "1.0.0"
+    },
+    {
+      "name": "xlsx",
+      "version": "1.0.0"
+    },
+    {
+      "name": "pptx",
+      "version": "1.0.0"
+    },
+    {
+      "name": "pdf",
+      "version": "1.0.0"
+    },
+    {
+      "name": "doc-coauthoring",
+      "version": "1.0.0"
+    },
+    {
+      "name": "canvas-design",
+      "version": "1.0.0"
+    },
+    {
+      "name": "theme-factory",
+      "version": "1.0.0"
+    },
+    {
+      "name": "frontend-design",
+      "version": "1.0.0"
+    },
+    {
+      "name": "internal-comms",
+      "version": "1.0.0"
+    },
+    {
+      "name": "algorithmic-art",
+      "version": "1.0.0"
+    },
+    {
+      "name": "claude-api",
+      "version": "1.0.0"
+    },
+    {
+      "name": "mcp-builder",
+      "version": "1.0.0"
+    },
+    {
+      "name": "skill-creator",
+      "version": "1.0.0"
+    }
+  ]
+}

@@ -1,9 +1,7 @@
-import { NavLink, useNavigate } from 'react-router-dom';
+import { NavLink } from 'react-router-dom';
 import { useChatStore } from '../../stores/chatStore';
 import { useSessions } from '../../hooks/useSessions';
-import { api } from '../../api/client';
-import { WorkspaceSwitcher } from './WorkspaceSwitcher';
-import { useTranslation } from '../../i18n';
+import { AccountMenu } from './AccountMenu';
 import { canAccessAdmin } from '../../admin/AdminLayout';
 import {
   RECENCY_BUCKET_ORDER,
@@ -21,17 +19,18 @@ interface NavSpec {
 
 const NAV: NavSpec[] = [
   { to: '/home', label: '新任务', glyph: '◇' },
-  { to: '/schedules', label: '定时任务', glyph: '◷' },
-  { to: '/files', label: '基础文件', glyph: '⌗' },
-  { to: '/library', label: '资源库', glyph: '✦', count: '13' },
+  { to: '/apps', label: '应用', glyph: '▦' },
+  // The workspace management page (base files + instructions + skills). This is
+  // where the retired top-of-sidebar WorkspaceSwitcher's "管理工作区" link used
+  // to lead; the base-files nav now owns that entry point.
+  { to: '/workspace', label: '基础文件', glyph: '⌗' },
+  { to: '/library', label: '资源库', glyph: '✦' },
+  { to: '/artifacts', label: '产物', glyph: '◈' },
 ];
 
 export function Sidebar() {
   const { sessions, loadMore, loadingMore, hasMore } = useSessions();
   const userProfile = useChatStore((s) => s.userProfile);
-  const logout = useChatStore((s) => s.logout);
-  const navigate = useNavigate();
-  const { lang, setLang } = useTranslation();
 
   const devBuildLabel = import.meta.env.DEV
     ? `dev ${import.meta.env.VITE_DEV_BUILD_STAMP ?? 'local'}`
@@ -46,17 +45,6 @@ export function Sidebar() {
     items: sessions.filter((s) => recencyBucketZh(s.updated_at) === bucket),
   })).filter((g) => g.items.length > 0);
 
-  const handleLogout = async () => {
-    try {
-      await api.auth.logout();
-    } catch {
-      // The BFF logout endpoint is best-effort; even on failure we clear local
-      // state so the user lands back on the login page.
-    }
-    logout();
-    navigate('/home');
-  };
-
   return (
     <aside className="w-[220px] shrink-0 border-r border-line p-3.5 flex flex-col gap-5 bg-paper overflow-hidden">
       {/* brand */}
@@ -68,8 +56,6 @@ export function Sidebar() {
           cloud<em className="not-italic text-accent font-medium">·</em>worker
         </div>
       </NavLink>
-
-      <WorkspaceSwitcher />
 
       <nav className="flex-1 min-h-0 flex flex-col gap-0.5">
         <div className="flex flex-col gap-0.5 shrink-0">
@@ -87,7 +73,7 @@ export function Sidebar() {
                     : 'text-ink-2 border-transparent hover:bg-paper-2 hover:text-ink',
                 ].join(' ')
               }
-              end={n.to === '/home'}
+              end={n.to === '/home' || n.to === '/apps'}
             >
               {({ isActive }) => (
                 <>
@@ -175,36 +161,7 @@ export function Sidebar() {
       )}
 
       <div className="mt-auto flex flex-col gap-2 pt-3.5 border-t border-line">
-        <NavLink
-          to="/profile"
-          className={({ isActive }) =>
-            [
-              'flex items-center gap-2 mt-1 text-left text-[12.5px] no-underline',
-              isActive ? 'text-ink' : 'text-ink-2 hover:text-ink',
-            ].join(' ')
-          }
-        >
-          <span className="inline-flex w-[22px] h-[22px] items-center justify-center rounded-full border border-line bg-surface font-mono text-[10px] font-semibold text-ink shrink-0">
-            {userProfile?.display_name?.[0]?.toUpperCase() ?? 'Y'}
-          </span>
-          <span className="truncate">{userProfile?.email ?? 'you@acme.co'}</span>
-        </NavLink>
-        <div className="flex items-center gap-2 pl-[30px]">
-          <button
-            onClick={handleLogout}
-            className="text-left font-mono text-[10px] text-dim hover:text-ink-2"
-          >
-            登出
-          </button>
-          <span className="font-mono text-[10px] text-dim select-none">·</span>
-          <button
-            onClick={() => setLang(lang === 'zh' ? 'en' : 'zh')}
-            title={lang === 'zh' ? '切换到英文' : 'Switch to Chinese'}
-            className="font-mono text-[10px] text-dim hover:text-ink-2"
-          >
-            {lang === 'zh' ? 'EN' : '中'}
-          </button>
-        </div>
+        <AccountMenu />
         {devBuildLabel && (
           <div className="pl-[30px] font-mono text-[9px] text-dim" title="Frontend dev build stamp">
             {devBuildLabel}

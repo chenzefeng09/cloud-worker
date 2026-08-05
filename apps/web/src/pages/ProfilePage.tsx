@@ -5,9 +5,10 @@ import { formatDateTimeAuto } from '../i18n/dates';
 import { Chip } from '../components/shell/Chip';
 import { useChatStore } from '../stores/chatStore';
 import { useWorkspace } from '../lib/workspaceContext';
+import { useTranslation } from '../i18n';
 import { api } from '../api/client';
 import { formatRelativeTimeZh } from '../lib/format';
-import type { ActiveSession, ApiKey, ApiKeyCreated, DailyTokenUsage, FeatureFlag, MfaMethod, ModelCatalogProvider, ModelPurpose, NotifPreferenceItem, PamElevation, QuotaInfo, TokenUsage, UserModelPreference, UserProfile } from '../api/types';
+import type { ActiveSession, ApiKey, ApiKeyCreated, DailyTokenBreakdown, FeatureFlag, MfaMethod, ModelCatalogProvider, ModelPurpose, NotifPreferenceItem, QuotaInfo, TokenUsage, TokenUsageBreakdown, UserModelPreference, UserProfile } from '../api/types';
 import { useDefaultModel, clearModelCache } from '../hooks/useDefaultModel';
 import { MODEL_OPTIONS, SYSTEM_FALLBACK_MODEL, modelLabel } from '../lib/modelOptions';
 import { findProviderForModel, getModelsForTypes } from '../lib/providerModels';
@@ -81,14 +82,18 @@ interface PfFieldProps {
   value: string;
   onChange?: (v: string) => void;
   readonly?: boolean;
+  inputRef?: React.Ref<HTMLInputElement>;
+  onEnter?: () => void;
 }
-function PfField({ label, value, onChange, readonly }: PfFieldProps) {
+function PfField({ label, value, onChange, readonly, inputRef, onEnter }: PfFieldProps) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
       <label className="cw-label">{label}</label>
       <input
+        ref={inputRef}
         value={value}
         onChange={onChange ? (e) => onChange(e.target.value) : undefined}
+        onKeyDown={onEnter ? (e) => { if (e.key === 'Enter') onEnter(); } : undefined}
         readOnly={readonly}
         style={{
           padding: '7px 10px',
@@ -103,6 +108,40 @@ function PfField({ label, value, onChange, readonly }: PfFieldProps) {
           cursor: readonly ? 'default' : 'text',
         }}
       />
+    </div>
+  );
+}
+
+interface PfSelectFieldProps {
+  label: string;
+  value: string;
+  options: { value: string; label: string }[];
+  onChange: (v: string) => void;
+}
+function PfSelectField({ label, value, options, onChange }: PfSelectFieldProps) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+      <label className="cw-label">{label}</label>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        style={{
+          padding: '7px 10px',
+          border: '1px solid var(--line)',
+          borderRadius: 'var(--r-sm)',
+          fontFamily: 'var(--font-sans)',
+          fontSize: 13.5,
+          width: '100%',
+          background: 'var(--surface)',
+          outline: 'none',
+          color: 'var(--ink)',
+          cursor: 'pointer',
+        }}
+      >
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>{o.label}</option>
+        ))}
+      </select>
     </div>
   );
 }
@@ -141,72 +180,87 @@ function PfToggle({ on, onChange }: PfToggleProps) {
   );
 }
 
-interface SegPickerProps {
-  options: string[];
-  value: string;
-  onChange: (v: string) => void;
-}
-function SegPicker({ options, value, onChange }: SegPickerProps) {
-  return (
-    <div style={{ display: 'flex', gap: 4 }}>
-      {options.map((o) => {
-        const active = o === value;
-        return (
-          <span
-            key={o}
-            onClick={() => onChange(o)}
-            style={{
-              padding: '4px 11px',
-              borderRadius: 999,
-              cursor: 'pointer',
-              border: `1px solid ${active ? 'var(--accent)' : 'var(--line)'}`,
-              background: active ? 'var(--accent-soft)' : 'var(--surface)',
-              color: active ? 'var(--accent)' : 'var(--ink-2)',
-              fontFamily: 'var(--font-mono)',
-              fontSize: 10.5,
-              fontWeight: active ? 600 : 400,
-              transition: 'all 120ms',
-            }}
-          >
-            {o}
-          </span>
-        );
-      })}
-    </div>
-  );
+// Map a backend run-source code to its Chinese label; unknown codes pass through.
+const SOURCE_LABELS: Record<string, string> = {
+  user: '手动',
+  schedule: '定时',
+  app: '应用',
+};
+function sourceLabel(source: string): string {
+  return SOURCE_LABELS[source] ?? source;
 }
 
-interface SparkBarsProps {
-  days: DailyTokenUsage[];
+interface StackedBarsProps {
+  days: DailyTokenBreakdown[];
 }
-function SparkBars({ days }: SparkBarsProps) {
-  const m = Math.max(...days.map((d) => d.tokens), 1);  // avoid division by zero
+// Per-day stacked bar chart: output_tokens (bottom, --accent) + input_tokens
+// (top, muted) so the full bar height ∝ total_tokens. Mirrors the old SparkBars
+// proportions (BAR_H 60, MM-DD labels, today highlighted, all-zero hint).
+function StackedBars({ days }: StackedBarsProps) {
+  const m = Math.max(...days.map((d) => d.total_tokens), 1);  // avoid division by zero
   const BAR_H = 60;
-  const allZero = days.every((d) => d.tokens === 0);
+  const allZero = days.every((d) => d.total_tokens === 0);
   return (
     <div style={{ display: 'flex', gap: 7, height: BAR_H + 22, alignItems: 'flex-end' }}>
       {days.map((d, i) => {
         const isToday = i === days.length - 1;
-        const barPx = allZero ? 3 : Math.max((d.tokens / m) * BAR_H, d.tokens > 0 ? 3 : 0);
+        const totalPx = allZero ? 3 : Math.max((d.total_tokens / m) * BAR_H, d.total_tokens > 0 ? 3 : 0);
+        // Split the total height between output (bottom) and input (top).
+        const outPx = d.total_tokens > 0 ? (d.output_tokens / d.total_tokens) * totalPx : 0;
+        const inPx = Math.max(totalPx - outPx, 0);
         return (
           <div
             key={d.day}
-            title={`${d.day} · ${d.tokens.toLocaleString()} tokens`}
+            title={`${d.day}\n输入 ${d.input_tokens.toLocaleString()} · 输出 ${d.output_tokens.toLocaleString()} · 合计 ${d.total_tokens.toLocaleString()} tokens`}
             style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 5 }}
           >
             <div style={{
               width: '100%',
-              height: `${barPx}px`,
-              background: isToday ? 'var(--accent)' : allZero ? 'var(--line-2)' : 'var(--line)',
+              height: `${totalPx}px`,
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'flex-end',
               borderRadius: '3px 3px 0 0',
-              transition: 'background 120ms',
-            }} />
+              overflow: 'hidden',
+            }}>
+              {/* input — top segment, muted */}
+              <div style={{
+                width: '100%',
+                height: `${inPx}px`,
+                background: allZero ? 'var(--line-2)' : 'var(--line)',
+                transition: 'height 120ms',
+              }} />
+              {/* output — bottom segment, accent (dimmed on today=false to echo SparkBars highlight) */}
+              <div style={{
+                width: '100%',
+                height: `${outPx}px`,
+                background: allZero ? 'var(--line-2)' : isToday ? 'var(--accent)' : 'var(--accent)',
+                opacity: allZero ? 1 : isToday ? 1 : 0.78,
+                transition: 'height 120ms, opacity 120ms',
+              }} />
+            </div>
             <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9, color: 'var(--dim)' }}>
               {d.day.slice(5)}  {/* show MM-DD */}
             </span>
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// Small swatch + label legend used under the stacked daily chart.
+function ChartLegend() {
+  const item = (color: string, opacity: number, label: string) => (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+      <span style={{ width: 9, height: 9, borderRadius: 2, background: color, opacity, display: 'inline-block' }} />
+      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--dim)' }}>{label}</span>
+    </span>
+  );
+  return (
+    <div style={{ display: 'flex', gap: 14, marginTop: 10 }}>
+      {item('var(--accent)', 0.78, '输出')}
+      {item('var(--line)', 1, '输入')}
     </div>
   );
 }
@@ -225,9 +279,11 @@ const TABS: { id: TabId; label: string }[] = [
 
 export function ProfilePage() {
   const navigate = useNavigate();
-  const userProfile = useChatStore((s) => s.userProfile);
-  const logout      = useChatStore((s) => s.logout);
-  const { allWs }   = useWorkspace();
+  const userProfile    = useChatStore((s) => s.userProfile);
+  const logout         = useChatStore((s) => s.logout);
+  const setUserProfile = useChatStore((s) => s.setUserProfile);
+  const { allWs }      = useWorkspace();
+  const { lang, setLang } = useTranslation();
 
   // Real profile data fetched from api.auth.me() — supplements the store cache.
   const [liveProfile, setLiveProfile] = useState<UserProfile | null>(null);
@@ -298,16 +354,23 @@ export function ProfilePage() {
     return () => { cancelled = true; };
   }, []);
 
-  // Daily token usage for the bar chart (last 7 days).
-  const [dailyTokens, setDailyTokens] = useState<DailyTokenUsage[] | null>(null);
+  // Multi-dimensional token-usage breakdown (daily input/output split + by
+  // source) for the usage dashboard. Refetched whenever the time window changes.
+  const [usageDays, setUsageDays] = useState(30);
+  const [breakdown, setBreakdown] = useState<TokenUsageBreakdown | null>(null);
+  const [breakdownError, setBreakdownError] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
-    api.runs.tokenUsageDaily(7).then((data) => {
-      if (!cancelled) setDailyTokens(data.days);
-    }).catch(() => { /* best-effort — chart stays hidden */ });
+    setBreakdown(null);
+    setBreakdownError(false);
+    api.runs.tokenUsageBreakdown(usageDays).then((data) => {
+      if (!cancelled) setBreakdown(data);
+    }).catch(() => {
+      if (!cancelled) setBreakdownError(true);
+    });
     return () => { cancelled = true; };
-  }, []);
+  }, [usageDays]);
 
   // Real active login sessions from identity.
   const [authSessions, setAuthSessions] = useState<ActiveSession[] | null>(null);
@@ -377,8 +440,61 @@ export function ProfilePage() {
 
   const [tab,      setTab]      = useState<TabId>('account');
   const [name,     setName]     = useState(displayName);
-  const [autonomy, setAuto]     = useState('assist');
   const [digestOn, setDigest]   = useState(true);
+
+  // ── Profile edit mode (个人信息) ─────────────────────────────────
+  const [editingProfile, setEditingProfile] = useState(false);
+  const [savingProfile,  setSavingProfile]  = useState(false);
+  const [profileMsg,     setProfileMsg]     = useState<string | null>(null);
+  const nameInputRef = useRef<HTMLInputElement>(null);
+
+  // Keep the editable draft in sync with the live profile while NOT editing,
+  // so the read-only field always shows the REAL current name (the mount-time
+  // useState(displayName) ran before liveProfile resolved).
+  useEffect(() => {
+    if (!editingProfile) setName(displayName);
+  }, [displayName, editingProfile]);
+
+  // Focus the 显示名称 input when entering edit mode.
+  useEffect(() => {
+    if (editingProfile) nameInputRef.current?.focus();
+  }, [editingProfile]);
+
+  const enterProfileEdit = () => {
+    setName(displayName);
+    setEditingProfile(true);
+  };
+
+  const cancelProfileEdit = () => {
+    setName(displayName);
+    setEditingProfile(false);
+    setProfileMsg(null);
+  };
+
+  const handleSaveProfile = async () => {
+    const trimmed = name.trim();
+    // No-op when empty or unchanged — just leave edit mode.
+    if (!trimmed || trimmed === displayName) {
+      cancelProfileEdit();
+      return;
+    }
+    setSavingProfile(true);
+    setProfileMsg(null);
+    try {
+      const updated = await api.auth.updateProfile({ display_name: trimmed });
+      setLiveProfile(updated);
+      setUserProfile(updated); // refresh sidebar / account-menu avatar immediately
+      setEditingProfile(false);
+      setProfileMsg('已保存');
+      setTimeout(() => setProfileMsg(null), 2000);
+    } catch {
+      // Stay in edit mode so the user can retry.
+      setProfileMsg('保存失败');
+      setTimeout(() => setProfileMsg(null), 2000);
+    } finally {
+      setSavingProfile(false);
+    }
+  };
 
   // ── Default model preference (real data) ────────────────────────
   const purpose: ModelPurpose = 'llm';
@@ -448,11 +564,13 @@ export function ProfilePage() {
     }
   }, [userPrefLoading, userPref, resolvedModelId]);
 
-  const handleSaveModel = async () => {
-    if (!draftModel) return;
+  // Auto-save the picked model immediately on selection (no explicit save button).
+  const handleSelectModel = async (modelId: string) => {
+    draftTouched.current = true;
+    setDraftModel(modelId);
     // Resolve the owning provider via type_map + flat models. A model with no
     // resolvable provider must not be saved with an empty provider_id.
-    const providerId = findProviderForModel(providers, draftModel, ['llm']);
+    const providerId = findProviderForModel(providers, modelId, ['llm']);
     if (!providerId) {
       setSaveMsg('无法确定该模型所属的 Provider');
       setTimeout(() => setSaveMsg(null), 3000);
@@ -463,7 +581,7 @@ export function ProfilePage() {
     try {
       await api.modelPreferences.upsert({
         purpose,
-        model_id: draftModel,
+        model_id: modelId,
         provider_id: providerId,
       });
       clearModelCache(purpose);
@@ -474,25 +592,7 @@ export function ProfilePage() {
       setTimeout(() => setSaveMsg(null), 2000);
     } catch {
       setSaveMsg('保存失败');
-    } finally {
-      setSavingModel(false);
-    }
-  };
-
-  const handleResetModel = async () => {
-    setSavingModel(true);
-    setSaveMsg(null);
-    try {
-      await api.modelPreferences.delete(purpose);
-      clearModelCache(purpose);
-      draftTouched.current = false;
-      refetchDefault();
-      fetchUserPref();
-      setDraftModel(null); // force re-sync from effect
-      setSaveMsg('已恢复默认');
-      setTimeout(() => setSaveMsg(null), 2000);
-    } catch {
-      setSaveMsg('恢复失败');
+      setTimeout(() => setSaveMsg(null), 3000);
     } finally {
       setSavingModel(false);
     }
@@ -570,65 +670,6 @@ export function ProfilePage() {
       setTimeout(() => setFfError(null), 3000);
     } finally {
       setFfSaving(null);
-    }
-  };
-
-  // ── PAM elevation (user-facing) ─────────────────────────────────
-  const RESOURCE_OPTIONS = [
-    { value: 'db:read', label: '数据库只读' },
-    { value: 'db:write', label: '数据库读写' },
-    { value: 'secrets:read', label: '密钥查看' },
-    { value: 'secrets:write', label: '密钥管理' },
-    { value: 'audit:read', label: '审计日志' },
-    { value: 'logs:read', label: '运行日志' },
-    { value: 'config:write', label: '配置变更' },
-    { value: 'user:admin', label: '用户管理' },
-  ];
-  const MAX_DURATION = 480;
-
-  const [myElevations, setMyElevations] = useState<PamElevation[]>([]);
-  const [elevLoading, setElevLoading] = useState(false);
-  const [elevError, setElevError] = useState<string | null>(null);
-  const [showElevForm, setShowElevForm] = useState(false);
-  const [elevReason, setElevReason] = useState('');
-  const [elevDuration, setElevDuration] = useState('60');
-  const [elevResources, setElevResources] = useState<Set<string>>(new Set());
-  const [elevBusy, setElevBusy] = useState(false);
-  const [elevMsg, setElevMsg] = useState<string | null>(null);
-
-  const fetchElevations = () => {
-    setElevLoading(true);
-    setElevError(null);
-    api.pam.myElevations()
-      .then(setMyElevations)
-      .catch(() => setElevError('加载升权记录失败'))
-      .finally(() => setElevLoading(false));
-  };
-
-  useEffect(() => { fetchElevations(); }, []);
-
-  const handleRequestElevation = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!elevReason.trim()) return;
-    setElevBusy(true);
-    setElevMsg(null);
-    try {
-      const mins = Math.min(Math.max(Number(elevDuration) || 60, 1), MAX_DURATION);
-      await api.pam.requestElevation({
-        reason: elevReason.trim(),
-        duration_minutes: mins,
-        target_resources: Array.from(elevResources),
-      });
-      setElevMsg('升权申请已提交，等待管理员审批');
-      setElevReason(''); setElevDuration('60'); setElevResources(new Set());
-      setShowElevForm(false);
-      fetchElevations();
-      setTimeout(() => setElevMsg(null), 4000);
-    } catch {
-      setElevMsg('申请失败');
-      setTimeout(() => setElevMsg(null), 3000);
-    } finally {
-      setElevBusy(false);
     }
   };
 
@@ -744,7 +785,10 @@ export function ProfilePage() {
               </div>
             </div>
 
-            <button className="cw-btn cw-btn-sm cw-btn-ghost" onClick={() => setTab('account')}>
+            <button
+              className="cw-btn cw-btn-sm cw-btn-ghost"
+              onClick={() => { setTab('account'); enterProfileEdit(); }}
+            >
               编辑资料
             </button>
           </div>
@@ -782,13 +826,63 @@ export function ProfilePage() {
 
               <PfSection
                 title="个人信息"
-                action={<button className="cw-btn cw-btn-sm cw-btn-primary">保存更改</button>}
+                action={
+                  editingProfile ? (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      {profileMsg && (
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: profileMsg.includes('失败') ? 'var(--accent)' : 'var(--ink-2)' }}>
+                          {profileMsg}
+                        </span>
+                      )}
+                      <button
+                        className="cw-btn cw-btn-sm cw-btn-ghost"
+                        onClick={cancelProfileEdit}
+                        disabled={savingProfile}
+                      >
+                        取消
+                      </button>
+                      <button
+                        className="cw-btn cw-btn-sm cw-btn-primary"
+                        onClick={handleSaveProfile}
+                        disabled={savingProfile}
+                      >
+                        {savingProfile ? '保存中…' : '保存更改'}
+                      </button>
+                    </div>
+                  ) : (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      {profileMsg && (
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: profileMsg.includes('失败') ? 'var(--accent)' : 'var(--ink-2)' }}>
+                          {profileMsg}
+                        </span>
+                      )}
+                      <button className="cw-btn cw-btn-sm" onClick={enterProfileEdit}>
+                        编辑
+                      </button>
+                    </div>
+                  )
+                }
               >
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
-                  <PfField label="显示名称"    value={name}               onChange={setName} />
+                  <PfField
+                    label="显示名称"
+                    value={name}
+                    onChange={editingProfile ? setName : undefined}
+                    readonly={!editingProfile}
+                    inputRef={nameInputRef}
+                    onEnter={editingProfile ? handleSaveProfile : undefined}
+                  />
                   <PfField label="邮箱地址"    value={email}              readonly />
                   <PfField label="时区"        value="Asia / Shanghai (GMT+8)" readonly />
-                  <PfField label="语言"        value="简体中文"            readonly />
+                  <PfSelectField
+                    label="语言"
+                    value={lang}
+                    onChange={(v) => setLang(v as 'zh' | 'en')}
+                    options={[
+                      { value: 'zh', label: '简体中文' },
+                      { value: 'en', label: 'English' },
+                    ]}
+                  />
                 </div>
               </PfSection>
 
@@ -804,10 +898,8 @@ export function ProfilePage() {
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <select
                         value={draftModel ?? ''}
-                        onChange={(e) => {
-                          draftTouched.current = true;
-                          setDraftModel(e.target.value);
-                        }}
+                        onChange={(e) => handleSelectModel(e.target.value)}
+                        disabled={savingModel}
                         style={{
                           padding: '5px 10px',
                           border: '1px solid var(--line)',
@@ -817,7 +909,7 @@ export function ProfilePage() {
                           background: 'var(--surface)',
                           color: 'var(--ink)',
                           outline: 'none',
-                          cursor: 'pointer',
+                          cursor: savingModel ? 'default' : 'pointer',
                           minWidth: 180,
                         }}
                       >
@@ -825,27 +917,9 @@ export function ProfilePage() {
                           <option key={o.id} value={o.id}>{o.label}</option>
                         ))}
                       </select>
-                      <button
-                        className="cw-btn cw-btn-sm cw-btn-primary"
-                        onClick={handleSaveModel}
-                        disabled={savingModel || !draftModel}
-                        style={{ fontSize: 11 }}
-                      >
-                        {savingModel ? '保存中…' : '保存'}
-                      </button>
-                      {userPref && (
-                        <button
-                          className="cw-btn cw-btn-sm cw-btn-ghost"
-                          onClick={handleResetModel}
-                          disabled={savingModel}
-                          style={{ fontSize: 11 }}
-                        >
-                          恢复默认
-                        </button>
-                      )}
-                      {saveMsg && (
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: saveMsg.includes('失败') ? 'var(--accent)' : 'var(--ink-2)' }}>
-                          {saveMsg}
+                      {(savingModel || saveMsg) && (
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: saveMsg?.includes('失败') ? 'var(--accent)' : 'var(--ink-2)' }}>
+                          {savingModel ? '保存中…' : saveMsg}
                         </span>
                       )}
                     </div>
@@ -860,18 +934,6 @@ export function ProfilePage() {
                       {providersError}
                     </div>
                   )}
-                  <div className="cw-divider" />
-                  <PfRow label="默认自主度" sub="工作节点无需确认即可执行的程度">
-                    <SegPicker
-                      options={['辅助', '自动', '完全']}
-                      value={autonomy}
-                      onChange={setAuto}
-                    />
-                  </PfRow>
-                  <div className="cw-divider" />
-                  <PfRow label="默认调度" sub="未被模板覆盖时的任务触发方式">
-                    <Chip>一次 · 手动</Chip>
-                  </PfRow>
                 </div>
               </PfSection>
 
@@ -963,33 +1025,136 @@ export function ProfilePage() {
           {tab === 'usage' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
 
-              {/* gauges + limits — DESIGN FIXTURE (no per-user spend API yet) */}
-              {/* 每日 Token 用量柱状图 — real data from GET /runs/token-usage/daily */}
-              {dailyTokens === null ? (
-                <PfSection title="每日 Token 用量（近 7 天）">
+              {/* ── Time-range segmented control ───────────────── */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span className="cw-label">时间范围</span>
+                <div style={{ flex: 1 }} />
+                <div style={{
+                  display: 'inline-flex',
+                  border: '1px solid var(--line)',
+                  borderRadius: 'var(--r-sm)',
+                  overflow: 'hidden',
+                }}>
+                  {[
+                    { d: 7,  label: '近 7 天' },
+                    { d: 30, label: '近 30 天' },
+                    { d: 90, label: '近 90 天' },
+                  ].map((opt, i) => {
+                    const active = usageDays === opt.d;
+                    return (
+                      <button
+                        key={opt.d}
+                        onClick={() => setUsageDays(opt.d)}
+                        style={{
+                          padding: '4px 12px',
+                          border: 'none',
+                          borderLeft: i === 0 ? 'none' : '1px solid var(--line)',
+                          background: active ? 'var(--accent)' : 'var(--surface)',
+                          color: active ? 'white' : 'var(--ink-2)',
+                          fontFamily: 'var(--font-mono)',
+                          fontSize: 11,
+                          fontWeight: active ? 600 : 400,
+                          cursor: 'pointer',
+                          transition: 'background 120ms, color 120ms',
+                        }}
+                      >
+                        {opt.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* ── 每日 Token 用量（输入/输出堆叠）— GET /runs/token-usage/breakdown ── */}
+              {breakdownError ? (
+                <PfSection title={`Token 用量（近 ${usageDays} 天）`}>
+                  <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>用量数据加载失败</span>
+                </PfSection>
+              ) : breakdown === null ? (
+                <PfSection title={`Token 用量（近 ${usageDays} 天）`}>
                   <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>加载中…</span>
                 </PfSection>
-              ) : (
-                <PfSection
-                  title={`每日 Token 用量（近 7 天）— ${dailyTokens.reduce((a, d) => a + d.tokens, 0).toLocaleString()} tokens 合计`}
-                >
-                  {dailyTokens.every((d) => d.tokens === 0) ? (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                      <SparkBars days={dailyTokens} />
-                      <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)', textAlign: 'center' }}>
-                        近 7 天无 Token 用量
-                      </span>
-                    </div>
-                  ) : (
-                    <SparkBars days={dailyTokens} />
-                  )}
-                </PfSection>
-              )}
+              ) : (() => {
+                const total = breakdown.daily.reduce((a, d) => a + d.total_tokens, 0);
+                const allZero = breakdown.daily.every((d) => d.total_tokens === 0);
+                return (
+                  <PfSection
+                    title={`Token 用量（近 ${usageDays} 天）— ${total.toLocaleString()} tokens 合计`}
+                  >
+                    {allZero ? (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                        <StackedBars days={breakdown.daily} />
+                        <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)', textAlign: 'center' }}>
+                          近 {usageDays} 天无 Token 用量
+                        </span>
+                      </div>
+                    ) : (
+                      <>
+                        <StackedBars days={breakdown.daily} />
+                        <ChartLegend />
+                      </>
+                    )}
+                  </PfSection>
+                );
+              })()}
 
-              {/* 套餐 — real data from GET /billing/me */}
-              <PfSection title="套餐" action={
-                <button className="cw-btn cw-btn-sm" style={{ color: 'var(--accent)' }}>升级 →</button>
-              }>
+              {/* ── 按来源 — GET /runs/token-usage/breakdown by_source ── */}
+              {breakdown !== null && !breakdownError && (() => {
+                const sources = breakdown.by_source;
+                const sourceTotal = sources.reduce((a, s) => a + s.total_tokens, 0);
+                const maxSource = Math.max(...sources.map((s) => s.total_tokens), 1);
+                return (
+                  <PfSection title="按来源">
+                    {sources.length === 0 ? (
+                      <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>暂无用量数据</span>
+                    ) : (
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                        {sources.map((s) => {
+                          const pct = sourceTotal > 0 ? (s.total_tokens / sourceTotal) * 100 : 0;
+                          const barW = (s.total_tokens / maxSource) * 100;
+                          return (
+                            <div key={s.source} style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+                              <div style={{ display: 'flex', alignItems: 'baseline', gap: 8 }}>
+                                <span style={{ fontSize: 13, fontWeight: 500, letterSpacing: '-0.01em' }}>
+                                  {sourceLabel(s.source)}
+                                </span>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)' }}>
+                                  {s.run_count.toLocaleString()} 次运行
+                                </span>
+                                <div style={{ flex: 1 }} />
+                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--ink-2)' }}>
+                                  {s.total_tokens.toLocaleString()}
+                                </span>
+                                <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)', minWidth: 42, textAlign: 'right' }}>
+                                  {pct.toFixed(1)}%
+                                </span>
+                              </div>
+                              <div style={{
+                                width: '100%',
+                                height: 8,
+                                borderRadius: 4,
+                                background: 'var(--line-2)',
+                                overflow: 'hidden',
+                              }}>
+                                <div style={{
+                                  width: `${barW}%`,
+                                  height: '100%',
+                                  background: 'var(--accent)',
+                                  borderRadius: 4,
+                                  transition: 'width 150ms',
+                                }} />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </PfSection>
+                );
+              })()}
+
+              {/* 套餐 — read-only display, real data from GET /billing/me */}
+              <PfSection title="套餐">
                 {billingError ? (
                   <span className="cw-label" style={{ fontStyle: 'italic' }}>套餐数据暂不可用</span>
                 ) : billingInfo === null ? (
@@ -1021,12 +1186,6 @@ export function ProfilePage() {
                           <Chip key={k}>{k}: {v}</Chip>
                         ))}
                       </div>
-                    </div>
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, flexShrink: 0 }}>
-                      <button className="cw-btn cw-btn-sm">账单门户 →</button>
-                      <button className="cw-btn cw-btn-sm cw-btn-ghost" style={{ fontSize: 11, color: 'var(--dim)' }}>
-                        下载发票
-                      </button>
                     </div>
                   </div>
                 )}
@@ -1237,147 +1396,6 @@ export function ProfilePage() {
                   <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>无活跃会话记录</span>
                 </PfSection>
               )}
-
-              {/* ── 权限与升权 ─────────────────────────────── */}
-              <PfSection
-                title="权限与升权"
-                action={
-                  <button className="cw-btn cw-btn-sm" onClick={() => setShowElevForm((v) => !v)}>
-                    {showElevForm ? '取消' : '发起升权申请'}
-                  </button>
-                }
-              >
-                <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                  {elevMsg && (
-                    <div style={{
-                      padding: '8px 12px',
-                      borderRadius: 'var(--r-sm)',
-                      border: `1px solid ${elevMsg.includes('失败') ? 'var(--accent)' : 'var(--accent-line)'}`,
-                      background: elevMsg.includes('失败') ? undefined : 'var(--accent-soft)',
-                      fontFamily: 'var(--font-mono)',
-                      fontSize: 12,
-                      color: elevMsg.includes('失败') ? 'var(--accent)' : 'var(--ink-2)',
-                    }}>
-                      {elevMsg}
-                    </div>
-                  )}
-
-                  {showElevForm && (
-                    <form onSubmit={handleRequestElevation} style={{
-                      display: 'flex',
-                      flexDirection: 'column',
-                      gap: 12,
-                      padding: '14px 16px',
-                      border: '1px solid var(--line)',
-                      borderRadius: 'var(--r-sm)',
-                      background: 'var(--paper)',
-                    }}>
-                      <PfField label="申请理由" value={elevReason} onChange={setElevReason} />
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                        <label className="cw-label">时长（分钟，上限 {MAX_DURATION}）</label>
-                        <input
-                          type="number"
-                          min={1}
-                          max={MAX_DURATION}
-                          value={elevDuration}
-                          onChange={(e) => setElevDuration(e.target.value)}
-                          style={{
-                            padding: '7px 10px',
-                            border: '1px solid var(--line)',
-                            borderRadius: 'var(--r-sm)',
-                            fontFamily: 'var(--font-mono)',
-                            fontSize: 13,
-                            width: 120,
-                            background: 'var(--surface)',
-                            outline: 'none',
-                          }}
-                        />
-                      </div>
-                      <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
-                        <label className="cw-label">目标资源</label>
-                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '6px 24px' }}>
-                          {RESOURCE_OPTIONS.map((r) => (
-                            <label key={r.value} style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer', fontSize: 13 }}>
-                              <input
-                                type="checkbox"
-                                checked={elevResources.has(r.value)}
-                                onChange={() => setElevResources((prev) => {
-                                  const next = new Set(prev);
-                                  if (next.has(r.value)) {
-                                    next.delete(r.value);
-                                  } else {
-                                    next.add(r.value);
-                                  }
-                                  return next;
-                                })}
-                              />
-                              <span style={{ color: 'var(--ink-2)' }}>{r.label}</span>
-                            </label>
-                          ))}
-                        </div>
-                      </div>
-                      <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
-                        <button
-                          type="button"
-                          className="cw-btn cw-btn-sm cw-btn-ghost"
-                          onClick={() => setShowElevForm(false)}
-                          disabled={elevBusy}
-                        >
-                          取消
-                        </button>
-                        <button
-                          type="submit"
-                          className="cw-btn cw-btn-sm cw-btn-primary"
-                          disabled={elevBusy || !elevReason.trim()}
-                        >
-                          {elevBusy ? '提交中…' : '提交申请'}
-                        </button>
-                      </div>
-                    </form>
-                  )}
-
-                  {elevLoading && (
-                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)' }}>加载中…</span>
-                  )}
-                  {elevError && (
-                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)', fontStyle: 'italic' }}>{elevError}</span>
-                  )}
-                  {!elevLoading && !elevError && myElevations.length === 0 && (
-                    <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)', fontStyle: 'italic' }}>暂无升权记录</span>
-                  )}
-                  {myElevations.length > 0 && (
-                    <div style={{ display: 'flex', flexDirection: 'column' }}>
-                      <div style={{
-                        display: 'grid',
-                        gridTemplateColumns: '1.5fr 0.6fr 0.8fr',
-                        gap: '6px 14px',
-                        padding: '5px 4px 9px',
-                        borderBottom: '1px solid var(--line-2)',
-                      }}>
-                        {['理由', '状态', '申请时间'].map((h) => (
-                          <span key={h} className="cw-label">{h}</span>
-                        ))}
-                      </div>
-                      {myElevations.map((el, i) => (
-                        <div key={el.id ?? i} style={{
-                          display: 'grid',
-                          gridTemplateColumns: '1.5fr 0.6fr 0.8fr',
-                          gap: '6px 14px',
-                          padding: '10px 4px',
-                          borderBottom: '1px solid var(--line-2)',
-                          alignItems: 'center',
-                        }}>
-                          <span style={{ fontSize: 13 }}>{el.reason ?? '—'}</span>
-                          <Chip accent={el.status === 'APPROVED'}>{el.status ?? '—'}</Chip>
-                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)' }}>
-                            {el.requested_at ? formatDateTimeAuto(new Date(el.requested_at)) : '—'}
-                          </span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              </PfSection>
 
               <PfSection title="身份验证">
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>

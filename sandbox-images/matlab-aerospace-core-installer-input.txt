@@ -1,0 +1,13 @@
+# MATLAB R2019b incremental silent-install answers file.
+# Adds the core model-based aerospace products to the Control-enabled image.
+
+destinationFolder=/opt/matlab
+fileInstallationKey=09806-07443-53955-64350-21751-41297
+agreeToLicense=yes
+outputFile=/tmp/matlab-aerospace-core-install.log
+mode=silent
+product.Simulink
+product.Aerospace_Toolbox
+product.Aerospace_Blockset
+product.Stateflow
+product.Simulink_Control_Design

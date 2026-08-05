@@ -38,7 +38,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
-from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, TUserId
+from agent_session_orchestrator.api.dependencies import TClearance, TDbSession, TTenantId, TUserId
+
 # Reuse the chat path's run-completion reconciler verbatim (poll scheduler,
 # map container status, persist result_summary/status/finished_at/tokens, write
 # the assistant message, failure-open).  It is module-private in messages.py but
@@ -47,16 +48,80 @@ from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, T
 # duplicating any of its logic.
 from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
 from agent_session_orchestrator.domain.models import Run
+from agent_session_orchestrator.services import inline_knowledge_client
+from agent_session_orchestrator.services.clearance import clearance_rank
+from agent_session_orchestrator.services.inline_run_executor import (
+    cancel_inline_run,
+    has_inline_task,
+    start_inline_run,
+)
 from agent_session_orchestrator.services.session_service import SessionService
 
 router = APIRouter(tags=["Runs"])
 logger = logging.getLogger(__name__)
 
 _MEMORY_SEARCH_K = 5  # top-K memory hits to inject
+_KNOWLEDGE_SEARCH_K = 5  # top-K tenant-knowledge hits to inject
+
+
+def _effective_clearance(user_clearance: str, workspace_sensitivity: str | None) -> str:
+    """The run's effective clearance = ``min(user, workspace)`` by level rank.
+
+    No workspace (or an unreadable/soft-deleted one → ``workspace_sensitivity``
+    is ``None``) means the effective clearance is just the user's own.  This is
+    the file≤workspace≤user matrix landing on the retrieval side: a session bound
+    to an L2 workspace caps knowledge/memory visibility at L2 even for an L5 user.
+    Fail-open to ``user_clearance`` on any malformed level so retrieval is never
+    hard-blocked by a bad value.
+    """
+    if not workspace_sensitivity:
+        return user_clearance
+    try:
+        if clearance_rank(workspace_sensitivity) < clearance_rank(user_clearance):
+            return workspace_sensitivity
+        return user_clearance
+    except ValueError:
+        return user_clearance
 
 
 def _now() -> dt.datetime:
     return dt.datetime.now(tz=dt.UTC)
+
+
+def _merge_skills(base: list[str], extra: list[str]) -> list[str]:
+    """Order-preserving union of two skill-name lists.
+
+    ``base`` (the run's explicit/default skills) keeps its order and wins on
+    duplicates; ``extra`` (the workspace's skill set) is appended in its own
+    order, deduped.  Pure function so the workspace-skills merge is unit-testable.
+    """
+    merged = list(base)
+    seen = set(merged)
+    for name in extra:
+        if name not in seen:
+            merged.append(name)
+            seen.add(name)
+    return merged
+
+
+def _prioritize_workspace_files(
+    files: list[dict[str, Any]], referenced_ids: list[str]
+) -> list[dict[str, Any]]:
+    """Hoist @-referenced workspace files to the front, order-preserving.
+
+    ``files`` is the workspace's file list (dicts carrying an ``id``);
+    ``referenced_ids`` are the ids the message @-referenced.  Files whose id is in
+    ``referenced_ids`` come first in their original relative order, then the
+    un-referenced tail in its original order.  Ids not present in ``files`` are
+    ignored.  Pure function so the priority ordering is unit-testable, and a
+    no-op (returns a shallow copy) when nothing was referenced.
+    """
+    if not referenced_ids:
+        return list(files)
+    ref = set(referenced_ids)
+    referenced = [f for f in files if f.get("id") in ref]
+    unreferenced = [f for f in files if f.get("id") not in ref]
+    return referenced + unreferenced
 
 
 def _serialize_run(r: Run) -> dict[str, Any]:
@@ -77,23 +142,56 @@ def _serialize_run(r: Run) -> dict[str, Any]:
         "total_tokens": r.total_tokens,
         "app_snapshot": r.app_snapshot,
         "source": r.source,
+        "execution_mode": r.execution_mode,
     }
 
 
-async def _fetch_memory(*, knowledge_ingest_url: str, tenant_id: str, query: str) -> str:
+async def _fetch_memory(
+    *,
+    knowledge_ingest_url: str,
+    tenant_id: str,
+    user_id: str,
+    query: str,
+    session_id: str = "",
+    clearance: str = "L1",
+) -> str:
     """Query knowledge-ingest for relevant memories and return a formatted string.
 
-    Uses ``GET /search?q=<query>&k=<K>`` with ``X-Tenant-Id`` header.
-    Returns an empty string on any error (failure-open).
+    Uses ``GET /search?q=<query>&k=<K>&scope=memory`` with ``X-Tenant-Id`` /
+    ``X-User-Id`` / ``X-User-Clearance`` headers.  ``scope=memory`` restricts the
+    search to this user's own ``[memory]`` documents (the knowledge base is a
+    separate ``scope=knowledge`` prefetch — see ``_fetch_knowledge``).  Returns an
+    empty string on any error (failure-open).
+
+    ``user_id`` must be the real originating user (``usr_...``) — knowledge-
+    ingest's authz guard is fail-closed and rejects the ``SYSTEM`` sentinel,
+    which used to make this search silently 403 (memory retrieval always empty).
+    Callers pass the resolved session owner, never the system identity.
+
+    When ``session_id`` is provided it is sent as ``exclude_origin_session_id``
+    so this session's own prior-turn Q&A is excluded from the results — that
+    context is already restored into the agent via conversation history, and
+    re-injecting it as RAG double-feeds the same turns.
     """
     if not query.strip() or not knowledge_ingest_url:
         return ""
+    params: dict[str, Any] = {
+        "q": query[:500],
+        "k": _MEMORY_SEARCH_K,
+        "scope": "memory",
+    }
+    if session_id:
+        params["exclude_origin_session_id"] = session_id
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(
                 f"{knowledge_ingest_url}/search",
-                params={"q": query[:500], "k": _MEMORY_SEARCH_K},
-                headers={"X-Tenant-Id": tenant_id, "X-User-Id": "SYSTEM"},
+                params=params,
+                headers={
+                    "X-Tenant-Id": tenant_id,
+                    "X-User-Id": user_id,
+                    "X-User-Clearance": clearance or "L1",
+                },
             )
         if resp.status_code != 200:
             logger.debug(
@@ -113,6 +211,145 @@ async def _fetch_memory(*, knowledge_ingest_url: str, tenant_id: str, query: str
     except Exception as exc:  # noqa: BLE001
         logger.debug("memory pre-fetch failed (failure-open): %s", exc)
         return ""
+
+
+async def _fetch_knowledge(
+    *,
+    knowledge_ingest_url: str,
+    tenant_id: str,
+    user_id: str,
+    query: str,
+    clearance: str,
+) -> str:
+    """Prefetch top-K tenant-knowledge hits → the "知识库资料" injection block.
+
+    Delegates the ``GET /search?scope=knowledge`` call + 【文档名 | 文件夹路径】
+    provenance formatting to :mod:`inline_knowledge_client` (the same code the
+    inline ``search_knowledge`` tool uses, so prefetch and tool stay consistent).
+    Carries the run's **effective clearance** in ``X-User-Clearance`` so ki
+    enforces the visibility gate.  Failure-open: any error → ``""``.
+    """
+    if not query.strip() or not knowledge_ingest_url:
+        return ""
+    return await inline_knowledge_client.fetch_knowledge_prefetch(
+        base_url=knowledge_ingest_url,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        clearance=clearance,
+        query=query,
+        k=_KNOWLEDGE_SEARCH_K,
+    )
+
+
+async def _fetch_default_installed_skills(
+    *,
+    skill_store_url: str,
+    service_scopes: str,
+    tenant_id: str,
+    user_id: str,
+) -> list[str]:
+    """Return the user's installed skills that are enabled by default.
+
+    This lookup is used only when the run request omits the ``skills`` key.
+    It is intentionally failure-open: an unavailable or malformed skill-store
+    response must not prevent the run from reaching the scheduler.
+    """
+    if not skill_store_url:
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{skill_store_url.rstrip('/')}/internal/skills/default-installed",
+                params={"tenant_id": tenant_id, "user_id": user_id},
+                headers={
+                    "X-Tenant-Id": tenant_id,
+                    "X-User-Id": user_id,
+                    "X-Service-Scopes": service_scopes,
+                },
+            )
+        if resp.status_code != 200:
+            logger.warning(
+                "default installed skills lookup returned %s; proceeding without skills",
+                resp.status_code,
+            )
+            return []
+
+        items = resp.json().get("items") or []
+        names: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name and name not in seen:
+                names.append(name)
+                seen.add(name)
+        return names
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "default installed skills lookup failed; proceeding without skills: %s",
+            exc,
+        )
+        return []
+
+
+async def _fetch_platform_default_skills(
+    *,
+    skill_store_url: str,
+    service_scopes: str,
+    tenant_id: str,
+    user_id: str,
+) -> list[str]:
+    """Return the platform-global default skill names.
+
+    These are the skills EVERY organization (including brand-new tenants) gets by
+    default with zero per-user install rows — owned by skill-store's reserved
+    platform tenant.  The endpoint is tenant-agnostic (any caller gets the same
+    names); we still pass the run's tenant/user/scope headers for consistency
+    with the other ``/internal/*`` calls and to satisfy the internal-auth guard.
+
+    Intentionally failure-open, exactly like ``_fetch_default_installed_skills``:
+    an unavailable or malformed skill-store response must never block a run.
+    """
+    if not skill_store_url:
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(
+                f"{skill_store_url.rstrip('/')}/internal/skills/platform-defaults",
+                params={"tenant_id": tenant_id, "user_id": user_id},
+                headers={
+                    "X-Tenant-Id": tenant_id,
+                    "X-User-Id": user_id,
+                    "X-Service-Scopes": service_scopes,
+                },
+            )
+        if resp.status_code != 200:
+            logger.warning(
+                "platform default skills lookup returned %s; proceeding without them",
+                resp.status_code,
+            )
+            return []
+
+        items = resp.json().get("items") or []
+        names: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name and name not in seen:
+                names.append(name)
+                seen.add(name)
+        return names
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "platform default skills lookup failed; proceeding without them: %s",
+            exc,
+        )
+        return []
 
 
 async def _assemble_history(
@@ -185,11 +422,25 @@ async def create_run(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     user_id: str = TUserId,
+    clearance: str = TClearance,
 ) -> dict[str, Any]:
     svc = SessionService(db, tenant_id=tenant_id)
     session = await svc.get_session(session_id)
 
     task = body.get("task", "")
+
+    # Workspace files the user @-referenced in this message (``wsf_…`` ids).
+    # Optional and best-effort: a non-list body value, or non-string elements,
+    # are silently ignored (never a 400 — an over-eager client should still get a
+    # working run).  Referenced files are hoisted to the front of the injected
+    # workspace-file list below so the MAX_WORKSPACE_FILES / char-budget cuts fall
+    # on the un-referenced tail first.
+    raw_ws_file_ids = body.get("workspace_file_ids")
+    workspace_file_ids: list[str] = (
+        [x for x in raw_ws_file_ids if isinstance(x, str)]
+        if isinstance(raw_ws_file_ids, list)
+        else []
+    )
 
     # App-harness fields (optional; only App runs send these — chat runs omit
     # them and keep working unchanged).  ``sys_prompt`` is appended to the
@@ -200,8 +451,8 @@ async def create_run(
     app_snapshot = body.get("app_snapshot")
 
     # Run origin — "user" (default) for interactive runs, "schedule" for
-    # cron-runner-triggered runs.
-    _VALID_SOURCES = {"user", "schedule"}
+    # cron-runner-triggered runs, "webhook" for inbound-webhook-triggered runs.
+    _VALID_SOURCES = {"user", "schedule", "webhook"}
     source: str = body.get("source") or "user"
     if source not in _VALID_SOURCES:
         raise HTTPException(
@@ -209,8 +460,62 @@ async def create_run(
             detail=f"invalid source {source!r}; must be one of {sorted(_VALID_SOURCES)}",
         )
 
-    # Persist the snapshot and source atomically with the run row (same transaction).
-    run = await svc.create_run(session_id, task, app_snapshot=app_snapshot, source=source)
+    # Execution mode — "sandbox" (default) relays to the agent-scheduler and
+    # spawns an agent worker container; "inline" streams a plain chat completion
+    # directly from the LLM gateway in-process (chat mode, no sandbox, no
+    # scheduler).  Defaulting to "sandbox" keeps the existing behaviour intact
+    # for every caller that omits the field.
+    _VALID_EXECUTION_MODES = {"inline", "sandbox"}
+    execution_mode: str = body.get("execution_mode") or "sandbox"
+    if execution_mode not in _VALID_EXECUTION_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"invalid execution_mode {execution_mode!r}; "
+                f"must be one of {sorted(_VALID_EXECUTION_MODES)}"
+            ),
+        )
+
+    # ── Sandbox hard-guard for App / scheduled runs ─────────────────────────
+    # The inline (chat-mode) path is an interactive, in-process conversation
+    # turn with no sandbox isolation.  App-harness runs (carry ``app_snapshot``)
+    # and scheduled runs (``source != "user"``) MUST run inside a sandbox: they
+    # execute untrusted, published-app or unattended workloads and rely on the
+    # scheduler's isolation + resource limits.  Silently force them back to
+    # ``sandbox`` (never 400 — an over-eager caller should still succeed) and
+    # warn so the downgrade is visible in the logs.
+    if execution_mode == "inline" and (source != "user" or app_snapshot is not None):
+        logger.warning(
+            "forcing execution_mode=sandbox for a non-interactive run "
+            "(App/scheduled runs may not use inline chat mode)",
+            extra={
+                "session_id": session_id,
+                "source": source,
+                "has_app_snapshot": app_snapshot is not None,
+            },
+        )
+        execution_mode = "sandbox"
+
+    # ── Inline quota check (fail-closed) ────────────────────────────────────
+    # Inline runs bypass the scheduler entirely, so the scheduler's QuotaGuard
+    # never sees them.  Enforce the same ``agent_sessions`` dimension here,
+    # BEFORE the run row is created, so a rejected check leaves no RUNNING
+    # orphan behind.  402 (quota exceeded) / 502 (billing bad status) / 503
+    # (billing unreachable) propagate straight to the caller via the shared
+    # problem+json channel.  The sandbox path is untouched — its quota is still
+    # metered by the scheduler, so metering it here too would double-count.
+    if execution_mode == "inline":
+        quota_guard = request.app.state.quota_guard
+        await quota_guard.check(
+            tenant_id=tenant_id, dimension="agent_sessions", requested=1,
+        )
+
+    # Persist the snapshot, source and execution_mode atomically with the run
+    # row (same transaction).
+    run = await svc.create_run(
+        session_id, task, app_snapshot=app_snapshot, source=source,
+        execution_mode=execution_mode,
+    )
 
     # Relay to agent-scheduler.
     scheduler_url = await _get_scheduler_url(request)
@@ -240,12 +545,39 @@ async def create_run(
             )
             total_attachment_bytes = 0
 
-    # Pre-fetch relevant memory from knowledge-ingest; failure-open.
+    # ── Effective clearance (file≤workspace≤user, retrieval side) ───────────
+    # The run's effective clearance caps knowledge/memory visibility at
+    # ``min(user_clearance, workspace_sensitivity)``.  Resolved with a light PK
+    # lookup — NOT gated on the workspace_context_injection flag (clearance is a
+    # security control, not opportunistic context).  Fail-open to the user's own
+    # clearance so a lookup hiccup never hard-blocks retrieval.
+    from agent_session_orchestrator.services.workspace_context import (
+        resolve_workspace_sensitivity,
+    )
+
+    try:
+        workspace_sensitivity = await resolve_workspace_sensitivity(db, session)
+    except Exception:  # noqa: BLE001 — fail-open: retrieval still runs at user clearance
+        logger.debug(
+            "workspace sensitivity lookup failed (fail-open to user clearance)",
+            extra={"session_id": session_id},
+        )
+        workspace_sensitivity = None
+    effective_clearance = _effective_clearance(clearance, workspace_sensitivity)
+
+    # Pre-fetch relevant memory from knowledge-ingest; failure-open.  ``scope``
+    # splits the two sources: memory (this user's own [memory] docs) is fetched
+    # here for both execution modes; the tenant knowledge base (scope=knowledge)
+    # is prefetched inside the inline branch below (the knowledge tools are
+    # inline-only, so a sandbox run would fetch it only to discard it).
     knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
     memory_snippets = await _fetch_memory(
         knowledge_ingest_url=knowledge_ingest_url,
         tenant_id=tenant_id,
+        user_id=user_id,
         query=task,
+        session_id=session_id,
+        clearance=effective_clearance,
     )
 
     # Assemble prior-turn conversation history so the worker can restore it
@@ -254,40 +586,285 @@ async def create_run(
     # as the latest USER row — we drop it (it's this run's input, not history).
     history = await _assemble_history(svc, session_id, current_task=task)
 
+    # Skill selection has presence semantics, not truthiness semantics:
+    # explicitly sending ``skills`` (including ``[]`` or ``null``) suppresses
+    # automatic defaults.  Only a truly omitted key loads the user's installed
+    # skills whose install relation has ``enabled_by_default=true``.  Resolved
+    # here — BEFORE the inline branch returns — so both the inline and sandbox
+    # branches consume the same result (inline threads the names into the
+    # in-process skill loop; sandbox writes them into task.json).
+    if "skills" in body:
+        run_skills = body.get("skills") or []
+    else:
+        _settings = request.app.state.settings
+        run_skills = await _fetch_default_installed_skills(
+            skill_store_url=_settings.skill_store_url,
+            service_scopes=_settings.skill_store_service_scopes,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+
+    # MCP server selection has the SAME presence semantics as skills, and for
+    # the same reason: ``[]`` and "key absent" are different requests.
+    #   * key absent      -> ``None`` -> consumers fall back to the tenant's
+    #                        enabled-by-default server set (the historical
+    #                        auto-inject-everything behaviour).
+    #   * explicit ``[]`` -> ``[]``   -> no MCP servers at all for this run.
+    #   * non-empty list  -> only those server ids.
+    # Never use a truthiness test here — ``if body.get("mcp_server_ids")``
+    # would silently turn "disable all" back into "inject all".
+    run_mcp_server_ids: list[str] | None = None
+    if "mcp_server_ids" in body:
+        _raw_mcp_ids = body.get("mcp_server_ids") or []
+        run_mcp_server_ids = [str(s) for s in _raw_mcp_ids if s]
+
+    # ── Workspace context (both execution modes) ────────────────────────────
+    # A session created against a workspace inherits its instructions / base
+    # files / skills on every run.  Loaded here — before the inline branch
+    # returns — so both branches consume the same resolution.  Values are
+    # extracted into plain str/dicts immediately: the inline executor runs as a
+    # background task outside this request transaction and must never receive
+    # ORM rows.  Gated on the ``workspace_context_injection`` flag (fail-open
+    # ON) and fail-open throughout — a workspace hiccup never blocks a run.
+    from agent_session_orchestrator.services.workspace_context import (
+        load_workspace_context,
+        workspace_context_injection_enabled,
+    )
+
+    # ``None`` = session not workspace-bound (or context injection unavailable);
+    # ``[]`` = workspace bound but it has no base files.  The inline executor
+    # uses the distinction to tell the model the workspace is empty instead of
+    # letting it hallucinate a missing tool.
+    ws_instructions: str | None = None
+    ws_files: list[dict[str, Any]] | None = None
+    if session.workspace_id and await workspace_context_injection_enabled(tenant_id):
+        try:
+            ws_ctx = await load_workspace_context(
+                db, session, user_clearance=clearance
+            )
+        except Exception:  # noqa: BLE001 — fail-open: run proceeds without workspace context
+            logger.warning(
+                "workspace context load failed (fail-open)",
+                extra={"session_id": session_id, "run_id": run.id},
+                exc_info=True,
+            )
+            ws_ctx = None
+        if ws_ctx is not None:
+            ws_instructions = ws_ctx.instructions
+            ws_files = [
+                {
+                    "id": f.id,
+                    "key": f.blob_key,
+                    "filename": f.filename,
+                    "mime": f.mime,
+                    "size_bytes": int(f.size_bytes or 0),
+                }
+                for f in ws_ctx.files
+            ]
+            # @-reference priority: hoist any workspace file the message referenced
+            # to the front (preserving each group's original relative order) so the
+            # downstream MAX_WORKSPACE_FILES + char-budget truncation naturally
+            # favours the @-referenced files.  Unknown ids are silently ignored.
+            ws_files = _prioritize_workspace_files(ws_files, workspace_file_ids)
+            # Union the workspace's skill set into the run's (order-preserving
+            # dedupe: explicit/default skills first, then workspace additions).
+            run_skills = _merge_skills(list(run_skills), ws_ctx.skills)
+
+    # ── Platform-global default skills ──────────────────────────────────────
+    # Union the platform default skill names on top of whatever run_skills
+    # resolved to (explicit selection, user defaults, or workspace additions),
+    # so every organization gets them by default with zero per-user install
+    # rows.  They are appended last (deduped, order-preserving) so
+    # explicit/default/workspace skills keep priority.
+    #
+    # Per-session opt-out: a request may set ``include_platform_defaults: false``
+    # to suppress the platform defaults for THIS run only (e.g. a focused session
+    # where the extra skill catalog is noise).  Presence-tolerant — only a literal
+    # ``false`` disables; absent / null / true all keep the defaults on, so the
+    # "自带" behaviour stays the default.  Failure-open — a skill-store hiccup
+    # never blocks the run.
+    if body.get("include_platform_defaults") is not False:
+        _platform_defaults = await _fetch_platform_default_skills(
+            skill_store_url=request.app.state.settings.skill_store_url,
+            service_scopes=request.app.state.settings.skill_store_service_scopes,
+            tenant_id=tenant_id,
+            user_id=user_id,
+        )
+        run_skills = _merge_skills(list(run_skills), _platform_defaults)
+
+    # ── Inline (chat-mode) branch ───────────────────────────────────────────
+    # No scheduler, no sandbox: flip the run to RUNNING in THIS transaction so
+    # the session SSE multiplex poll can select it the instant the response
+    # returns, then launch the in-process executor as a background task.  The
+    # executor streams a plain chat completion from the LLM gateway into the
+    # same Redis token stream the sandbox worker uses, finalizes the run in its
+    # own transaction, and persists the assistant/thinking rows itself (the
+    # scheduler reconciler short-circuits on sandbox_id=None and never would).
+    if execution_mode == "inline":
+        run.status = "RUNNING"
+        run.started_at = _now()
+        session.current_run_id = run.id
+        # ``sandbox_id`` stays NULL — the sentinel for an inline run everywhere
+        # downstream (reconcile short-circuit, sweeper orphan branch, cancel).
+        await db.flush()
+
+        # Prefetch the tenant knowledge base (scope=knowledge) for the "知识库资料"
+        # system block.  Inline-only: the knowledge tools live in the in-process
+        # loop, so a sandbox run would never consume this.  Carries the effective
+        # clearance; failure-open (empty block).
+        knowledge_snippets = await _fetch_knowledge(
+            knowledge_ingest_url=knowledge_ingest_url,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            query=task,
+            clearance=effective_clearance,
+        )
+
+        settings = request.app.state.settings
+        start_inline_run(
+            settings=settings,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            session_id=session_id,
+            run_id=run.id,
+            task=task,
+            model_hint=body.get("model"),
+            # reasoning_effort: original passthrough (None omits the field).  The
+            # current dev gateway parses /chat/completions into a typed
+            # ChatCompletionRequest without a reasoning_effort field and rebuilds
+            # the upstream payload field-by-field, so it *accepts* the field
+            # (HTTP 200, extra="ignore") but silently drops it before forwarding.
+            # Threading it here is therefore a forward-compatible no-op: it starts
+            # taking effect the moment the gateway adds the field to its model, and
+            # never regresses the request today.
+            reasoning_effort=body.get("reasoning_effort"),
+            sys_prompt=sys_prompt,
+            memory=memory_snippets,
+            # Tenant knowledge prefetch ("知识库资料" block) + the effective
+            # clearance the in-process knowledge tools carry on every ki call.
+            knowledge=knowledge_snippets,
+            effective_clearance=effective_clearance,
+            history=history,
+            sampling_params=sampling_params,
+            # Same presence-resolved skill set the sandbox branch relays (already
+            # unioned with the workspace's skills); the executor resolves these
+            # to a catalog and runs the in-process read_skill loop
+            # (empty/omitted → no skill loop, prior behaviour).
+            skills=run_skills,
+            # Presence-resolved MCP selection: ``None`` = use the tenant's
+            # enabled set, ``[]`` = no MCP for this run, list = only these ids.
+            mcp_server_ids=run_mcp_server_ids,
+            # Workspace context as plain values (str / dicts) — the executor
+            # builds the "# 工作区指令" block and the base-files block itself.
+            workspace_instructions=ws_instructions,
+            workspace_files=ws_files,
+        )
+
+        # Record inline-run usage against the ``agent_sessions`` quota dimension
+        # (matches the scheduler's "spawn succeeded → record" semantics: we bill
+        # for the launched run, not the completed one).  Best-effort — the guard
+        # swallows all record errors, so a billing hiccup never fails an already
+        # started run.
+        await request.app.state.quota_guard.record(
+            tenant_id=tenant_id,
+            dimension="agent_sessions",
+            amount=1.0,
+            description=f"inline run {run.id}",
+        )
+
+        # Same response shape as the sandbox branch (sandbox_id is null).
+        return {
+            "id": run.id,
+            "session_id": session_id,
+            "sandbox_id": None,
+            "status": run.status,
+            "task_description": run.task_description,
+            "source": run.source,
+            "execution_mode": run.execution_mode,
+            "created_at": run.created_at.isoformat(),
+        }
+
+    # ── Workspace context, sandbox shape ────────────────────────────────────
+    # Base files ride the ordinary files[] channel (the worker lands each entry
+    # at /workspace/inputs/<filename>); a workspace file whose name collides
+    # with a session attachment already in files[] is skipped — same-name
+    # writes would overwrite each other in the sandbox, and the session-scoped
+    # upload wins.  Sizes count toward the memory-tier total.  Instructions
+    # are folded into sys_prompt (the worker appends it to the system prompt);
+    # skills were already unioned into run_skills above.
+    if ws_files:
+        existing_names = {
+            str(f.get("filename") or "") for f in files if isinstance(f, dict)
+        }
+        for wf in ws_files:
+            if wf["filename"] in existing_names:
+                logger.info(
+                    "skipping workspace file shadowed by a session attachment",
+                    extra={"run_id": run.id, "ws_filename": wf["filename"]},
+                )
+                continue
+            files.append(
+                {"key": wf["key"], "filename": wf["filename"], "mime": wf["mime"]}
+            )
+            existing_names.add(wf["filename"])
+            total_attachment_bytes += int(wf.get("size_bytes") or 0)
+    if ws_instructions:
+        sys_prompt = (
+            (sys_prompt + "\n\n" if sys_prompt else "")
+            + "# 工作区指令\n"
+            + ws_instructions
+        )
+
+    scheduler_body: dict[str, Any] = {
+        "session_id": session_id,
+        "run_id": run.id,
+        "task": task,
+        "agent_config": {
+            **(body.get("agent_config") or {}),
+            "model": body.get("model"),
+            "reasoning_effort": body.get("reasoning_effort"),
+        },
+        "files": files,
+        # Total attachment bytes for this run; the scheduler maps it
+        # to a concrete sandbox memory limit (small vs large tier).
+        "total_attachment_bytes": total_attachment_bytes,
+        "memory": memory_snippets,
+        # Explicit per-message selection, or (only when the request
+        # omitted ``skills``) the user's default-enabled installs.
+        # The scheduler writes these into task.json["skills"].
+        "skills": run_skills,
+        # Prior-turn conversation history for multi-turn memory.
+        "history": history,
+        # App-harness fields (empty/absent for chat runs).  The
+        # scheduler writes these into task.json for the worker:
+        # ``sys_prompt`` is appended to the system prompt;
+        # ``sampling_params`` is applied per-run by the gateway model.
+        "sys_prompt": sys_prompt,
+        "sampling_params": sampling_params,
+        # HITL gating: normal session runs always enable human-in-the-loop
+        # so the worker can pause for confirmation / free-text questions.
+        # Scheduled/batch runs will override to False (future).
+        "hitl": True,
+        # Effective clearance (min(user, workspace)) so the sandbox
+        # worker's knowledge_tool can send X-User-Clearance to
+        # knowledge-ingest and the scheduler can sign it into the
+        # broker lease (broker mode re-injects it from the lease).
+        # Empty/absent -> ki treats the caller as L1.
+        "effective_clearance": effective_clearance,
+    }
+    # MCP selection is presence-carried all the way down: the key is only put
+    # on the wire when the caller expressed a choice.  ``None`` (= caller said
+    # nothing) must NOT be serialized as ``null`` — the scheduler and the
+    # in-sandbox injector distinguish "absent -> tenant default" from
+    # "[] -> disable all", and a null would collapse that distinction.
+    if run_mcp_server_ids is not None:
+        scheduler_body["mcp_server_ids"] = run_mcp_server_ids
+
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{scheduler_url}/runs",
-                json={
-                    "session_id": session_id,
-                    "run_id": run.id,
-                    "task": task,
-                    "agent_config": {
-                        **(body.get("agent_config") or {}),
-                        "model": body.get("model"),
-                        "reasoning_effort": body.get("reasoning_effort"),
-                    },
-                    "files": files,
-                    # Total attachment bytes for this run; the scheduler maps it
-                    # to a concrete sandbox memory limit (small vs large tier).
-                    "total_attachment_bytes": total_attachment_bytes,
-                    "memory": memory_snippets,
-                    # Per-message skill selection relayed from BFF; scheduler
-                    # writes these into task.json["skills"] for the worker.
-                    "skills": body.get("skills") or [],
-                    # Prior-turn conversation history for multi-turn memory.
-                    "history": history,
-                    # App-harness fields (empty/absent for chat runs).  The
-                    # scheduler writes these into task.json for the worker:
-                    # ``sys_prompt`` is appended to the system prompt;
-                    # ``sampling_params`` is applied per-run by the gateway model.
-                    "sys_prompt": sys_prompt,
-                    "sampling_params": sampling_params,
-                    # HITL gating: normal session runs always enable human-in-the-loop
-                    # so the worker can pause for confirmation / free-text questions.
-                    # Scheduled/batch runs will override to False (future).
-                    "hitl": True,
-                },
+                json=scheduler_body,
                 headers=headers,
             )
     except httpx.HTTPError as exc:
@@ -331,6 +908,7 @@ async def create_run(
         "status": run.status,
         "task_description": run.task_description,
         "source": run.source,
+        "execution_mode": run.execution_mode,
         "created_at": run.created_at.isoformat(),
     }
 
@@ -353,17 +931,25 @@ async def list_tenant_runs(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     status: str | None = None,
+    app_id: str | None = None,
     limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     """List runs for the current tenant across all sessions.
 
     Tenant is scoped from the X-Tenant-Id middleware (same as every other
     endpoint here).  ``status`` is normalised to upper-case before filtering;
-    ``limit`` is capped at 200.  Response shape matches the session-level list.
+    ``app_id`` narrows the result to a single App's execution history (NULL
+    ``app_id`` chat runs never match - the App history view stays chat-free);
+    ``limit`` is capped at 200 and ``offset`` pages past the newest rows.  Both
+    ``app_id`` and ``offset`` default to off so the existing tenant-wide
+    behaviour is preserved.  Response shape matches the session-level list.
     """
     svc = SessionService(db, tenant_id=tenant_id)
     status_norm = status.upper() if status else None
-    runs = await svc.list_tenant_runs(status=status_norm, limit=limit)
+    runs = await svc.list_tenant_runs(
+        status=status_norm, limit=limit, app_id=app_id, offset=offset,
+    )
     return {"items": [_serialize_run(r) for r in runs]}
 
 
@@ -431,6 +1017,8 @@ async def get_run(
         "output_tokens": run.output_tokens,
         "total_tokens": run.total_tokens,
         "app_snapshot": run.app_snapshot,
+        "source": run.source,
+        "execution_mode": run.execution_mode,
     }
 
 
@@ -874,6 +1462,32 @@ async def _do_cancel_run(
     svc = SessionService(db, tenant_id=tenant_id)
     run = await svc.get_run(session_id, run_id)
 
+    # ── Inline (chat-mode) run cancel ───────────────────────────────────────
+    # An inline run has no sandbox / scheduler container: cancel the in-process
+    # asyncio task, push the ``end`` marker so the SSE tail closes, and revoke
+    # the ephemeral key.  We detect inline by execution_mode (authoritative)
+    # OR a live in-process task handle (belt-and-braces).  Never call the
+    # scheduler for these.
+    is_inline = run.execution_mode == "inline" or has_inline_task(run_id)
+    if is_inline:
+        settings = request.app.state.settings
+        await cancel_inline_run(
+            settings=settings,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            run_id=run_id,
+        )
+        run.status = "CANCELLED"
+        run.finished_at = _now()
+        await db.flush()
+        await svc.create_message(
+            session_id,
+            role="system",
+            content="任务已取消",
+            run_id=run_id,
+        )
+        return {"id": run.id, "status": "CANCELLED"}
+
     # Use run.sandbox_id (short Docker container id) as the scheduler path
     # segment — the same convention used by _reconcile_run_completion in
     # messages.py.  Passing run_id here would fail because the scheduler
@@ -954,6 +1568,94 @@ async def daily_token_usage(
         out.append({"day": key, "tokens": by_day.get(key, 0)})
 
     return {"days": out}
+
+
+@router.get("/runs/token-usage/breakdown")
+async def token_usage_breakdown(
+    db: AsyncSession = TDbSession,
+    tenant_id: str = TTenantId,
+    days: int = Query(default=7, ge=1, le=90),
+) -> dict[str, Any]:
+    """Return a token-usage breakdown for the last N days (default 7).
+
+    Combines the per-day series (like ``daily_token_usage`` but split into
+    input/output/total) with a per-source rollup over the same window.
+
+    The ``daily`` list always contains exactly ``days`` entries in ascending
+    order (missing days zero-filled, today is the last entry).  ``by_source``
+    holds one row per distinct ``Run.source`` that actually appears in the
+    window, sorted by ``total_tokens`` descending; it is not zero-filled.
+    """
+    cutoff = dt.datetime.now(tz=dt.UTC) - dt.timedelta(days=days)
+
+    # Per-day series, split into input/output/total token sums.
+    daily_stmt = (
+        select(
+            func.date(Run.created_at).label("day"),
+            func.sum(func.coalesce(Run.input_tokens, 0)).label("input_tokens"),
+            func.sum(func.coalesce(Run.output_tokens, 0)).label("output_tokens"),
+            func.sum(func.coalesce(Run.total_tokens, 0)).label("total_tokens"),
+        )
+        .where(Run.tenant_id == tenant_id, Run.created_at >= cutoff)
+        .group_by(func.date(Run.created_at))
+        .order_by(func.date(Run.created_at))
+    )
+    daily_result = await db.execute(daily_stmt)
+    daily_rows = daily_result.all()
+
+    # Build a dict keyed by date string for fast lookup.
+    by_day: dict[str, dict[str, int]] = {}
+    for row in daily_rows:
+        # row.day may be a date object or a string depending on the DB driver.
+        day_key = str(row.day) if not isinstance(row.day, str) else row.day
+        by_day[day_key] = {
+            "input_tokens": int(row.input_tokens or 0),
+            "output_tokens": int(row.output_tokens or 0),
+            "total_tokens": int(row.total_tokens or 0),
+        }
+
+    # Generate the full range of the last N days (today is index days-1).
+    today = dt.date.today()
+    daily: list[dict[str, Any]] = []
+    for i in range(days):
+        d = today - dt.timedelta(days=days - 1 - i)
+        key = d.isoformat()
+        totals = by_day.get(key)
+        daily.append(
+            {
+                "day": key,
+                "input_tokens": totals["input_tokens"] if totals else 0,
+                "output_tokens": totals["output_tokens"] if totals else 0,
+                "total_tokens": totals["total_tokens"] if totals else 0,
+            }
+        )
+
+    # Per-source rollup over the same window (no zero-fill).
+    source_stmt = (
+        select(
+            Run.source.label("source"),
+            func.sum(func.coalesce(Run.total_tokens, 0)).label("total_tokens"),
+            func.count().label("run_count"),
+        )
+        .where(Run.tenant_id == tenant_id, Run.created_at >= cutoff)
+        .group_by(Run.source)
+        .order_by(func.sum(func.coalesce(Run.total_tokens, 0)).desc())
+    )
+    source_result = await db.execute(source_stmt)
+    source_rows = source_result.all()
+
+    by_source: list[dict[str, Any]] = []
+    for row in source_rows:
+        # Coalesce a NULL/empty source to "user" so the output never crashes.
+        by_source.append(
+            {
+                "source": row.source or "user",
+                "total_tokens": int(row.total_tokens or 0),
+                "run_count": int(row.run_count or 0),
+            }
+        )
+
+    return {"days_window": days, "daily": daily, "by_source": by_source}
 
 
 @router.post("/sessions/{session_id}/runs/{run_id}/cancel",

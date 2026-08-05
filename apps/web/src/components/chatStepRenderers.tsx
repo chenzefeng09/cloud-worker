@@ -2,6 +2,59 @@ import { useState, useRef } from 'react';
 import type { ToolCallEntry } from '../api/types';
 import ReactMarkdown from 'react-markdown';
 import { useCopied, CopyIcon } from './CopyButton';
+import { useFilePreview } from '../lib/filePreviewContext';
+import { assetBasename, isDirectImageSrc, useMarkdownAssets } from './markdownAssets';
+
+// ── File-link interception (assistant replies) ───────────────────────────────
+//
+// The backend has the model emit `[filename](#file:<id>)` links, where `<id>`
+// is an attachment (`att_…`) or workspace file (`wsf_…`). When a preview opener
+// is available in context, we render these as in-app preview triggers instead
+// of new-tab links; everything else stays a normal external link.
+const FILE_LINK_RE = /^#file:((?:att_|wsf_)[A-Za-z0-9]+)$/;
+
+/** Best-effort plain-text extraction from arbitrary markdown children. */
+function nodeText(children: React.ReactNode): string {
+  if (children == null || children === false) return '';
+  if (typeof children === 'string' || typeof children === 'number') return String(children);
+  if (Array.isArray(children)) return children.map(nodeText).join('');
+  if (typeof children === 'object' && 'props' in (children as { props?: unknown })) {
+    return nodeText((children as { props?: { children?: React.ReactNode } }).props?.children);
+  }
+  return '';
+}
+
+function MarkdownLink({ href, children }: { href?: string; children?: React.ReactNode }) {
+  const openPreview = useFilePreview();
+  const match = href ? FILE_LINK_RE.exec(href) : null;
+  if (match && openPreview) {
+    const id = match[1];
+    const filename = nodeText(children) || id;
+    return (
+      <a
+        href={href}
+        onClick={(e) => {
+          e.preventDefault();
+          openPreview({ id, filename });
+        }}
+        className="text-accent underline underline-offset-2 hover:opacity-80 cursor-pointer"
+      >
+        <span aria-hidden className="mr-0.5">📄</span>
+        {children}
+      </a>
+    );
+  }
+  return (
+    <a
+      href={href}
+      className="text-accent underline underline-offset-2 hover:opacity-80"
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      {children}
+    </a>
+  );
+}
 
 // ── Code-block copy button component ─────────────────────────────────────────
 
@@ -50,7 +103,7 @@ function CodeBlockPre({ children }: { children?: React.ReactNode }) {
 
   return (
     // Outer wrapper: position:relative so the button doesn't scroll with overflow-x.
-    <div className="group relative my-3">
+    <div className="group relative my-3 min-w-0 max-w-full">
       {/* Hover-reveal copy button */}
       <div
         className="opacity-0 group-hover:opacity-100 transition-opacity duration-150"
@@ -61,7 +114,7 @@ function CodeBlockPre({ children }: { children?: React.ReactNode }) {
       {/* The actual <pre> — overflow-x-auto, no top margin (handled by outer div) */}
       <pre
         ref={preRef}
-        className="rounded-md border border-line overflow-x-auto bg-surface"
+        className="max-w-full rounded-md border border-line overflow-x-auto bg-surface"
         style={{ margin: 0 }}
       >
         {children}
@@ -181,6 +234,52 @@ function DownloadIcon() {
   );
 }
 
+// ── Image resolution (assistant replies) ─────────────────────────────────────
+//
+// Models reference images by their sandbox path (`![图](outputs/chart.png)`),
+// which the browser would resolve against the page URL and 404 on. Anything
+// that isn't already a fetchable URL is therefore looked up by filename against
+// the session's attachments (see markdownAssets.tsx). A miss renders a labelled
+// placeholder rather than leaving the browser's broken-image glyph on screen.
+
+const IMG_CLS = 'max-w-full h-auto rounded-md border border-line';
+
+function MarkdownImage({ src, alt, title }: { src?: string; alt?: string; title?: string }) {
+  const assets = useMarkdownAssets();
+  const raw = typeof src === 'string' ? src.trim() : '';
+  if (!raw) return null;
+
+  // Already fetchable (remote, inline data, object URL) — render as-is.
+  if (isDirectImageSrc(raw)) {
+    return <img src={raw} alt={alt ?? ''} title={title} className={IMG_CLS} />;
+  }
+
+  const hit = assets?.resolveImage(raw) ?? null;
+  if (!hit) {
+    // Inline (phrasing) element: markdown puts images inside a <p>.
+    return (
+      <span className="inline-flex items-center gap-1.5 px-2 py-1 border border-line rounded-sm bg-paper font-mono text-[11.5px] text-dim align-middle">
+        <span aria-hidden>📎</span>
+        图片未找到：{assetBasename(raw) || raw}
+      </span>
+    );
+  }
+
+  const label = alt || hit.filename;
+  const open = assets?.onOpen;
+  return (
+    <button
+      type="button"
+      onClick={() => (open ? open(hit) : window.open(hit.url, '_blank', 'noopener'))}
+      title={title ?? `查看 ${hit.filename}`}
+      aria-label={`查看 ${hit.filename}`}
+      className="block max-w-full p-0 bg-transparent border-0 cursor-zoom-in"
+    >
+      <img src={hit.url} alt={label} className={IMG_CLS} />
+    </button>
+  );
+}
+
 // ── Shared markdown components (used by ASSISTANT messages) ──────────────────
 export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>['components'] = {
   // Custom <pre> wrapper: applies the box styling and attaches a hover copy button.
@@ -205,7 +304,7 @@ export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>['com
     return (
       <code
         {...props}
-        className="px-1.5 py-0.5 rounded font-mono text-[12.5px] bg-paper-2 border border-line-2 text-ink"
+        className="break-all px-1.5 py-0.5 rounded font-mono text-[12.5px] bg-paper-2 border border-line-2 text-ink"
       >
         {children}
       </code>
@@ -229,16 +328,8 @@ export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>['com
       {children}
     </blockquote>
   ),
-  a: ({ href, children }) => (
-    <a
-      href={href}
-      className="text-accent underline underline-offset-2 hover:opacity-80"
-      target="_blank"
-      rel="noopener noreferrer"
-    >
-      {children}
-    </a>
-  ),
+  a: MarkdownLink,
+  img: MarkdownImage,
   table: ({ children }) => <TableBlock>{children}</TableBlock>,
   thead: ({ children }) => (
     <thead style={{ background: 'var(--paper-2)' }}>{children}</thead>
@@ -279,9 +370,38 @@ export const markdownComponents: React.ComponentProps<typeof ReactMarkdown>['com
 
 // ── Tool target extraction ────────────────────────────────────────────────────
 
+type RawToolCallEntry = ToolCallEntry & {
+  args?: unknown;
+};
+
+function decodeToolInput(value: unknown): Record<string, unknown> {
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(value);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+      return { value: parsed };
+    } catch {
+      return { value };
+    }
+  }
+  return {};
+}
+
+export function normalizeToolInput(tc: ToolCallEntry): Record<string, unknown> {
+  const raw = tc as RawToolCallEntry;
+  const input = decodeToolInput(raw.input);
+  if (Object.keys(input).length > 0 || raw.args === undefined) return input;
+  return decodeToolInput(raw.args);
+}
+
 export function extractTarget(tc: ToolCallEntry): string {
   const name = (tc.name ?? '').toLowerCase();
-  const input = tc.input ?? {};
+  const input = normalizeToolInput(tc);
 
   if (name === 'read' || name === 'write' || name === 'edit') {
     const fp = input['file_path'] ?? input['path'] ?? input['filename'];
@@ -292,8 +412,8 @@ export function extractTarget(tc: ToolCallEntry): string {
     return pat ? `"${String(pat)}"` : '';
   }
   if (name === 'bash' || name === 'run' || name === 'shell') {
-    const cmd = input['command'] ?? input['cmd'];
-    return cmd ? String(cmd) : '';
+    const cmd = input['command'] ?? input['cmd'] ?? input['value'];
+    return cmd == null ? '' : String(cmd);
   }
   // Generic: first string value
   const first = Object.values(input).find((v) => typeof v === 'string');
@@ -446,7 +566,7 @@ export function ToolRow({ tc, rowKey: _rowKey, expanded, onToggle }: ToolRowProp
             renderResultWithDiff(tc.result)
           ) : (
             <pre style={{ margin: 0, fontFamily: 'inherit', fontSize: 'inherit' }}>
-              {JSON.stringify(tc.input ?? {}, null, 2)}
+              {JSON.stringify(normalizeToolInput(tc), null, 2)}
             </pre>
           )}
         </div>

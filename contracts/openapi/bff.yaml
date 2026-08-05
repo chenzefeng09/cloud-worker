@@ -110,6 +110,10 @@ paths:
                 agent_config:
                   type: object
                   description: Optional agent configuration overrides
+                workspace_id:
+                  type: string
+                  nullable: true
+                  description: Optional workspace to pin this session to
       responses:
         '201':
           description: Session created
@@ -209,6 +213,17 @@ paths:
                   type: string
                   minLength: 1
                   description: User message content
+                workspace_file_ids:
+                  type: array
+                  items:
+                    type: string
+                  description: >-
+                    Optional workspace-file ids (wsf_…) the user @-referenced in
+                    this message. Forwarded verbatim to the orchestrator, which
+                    hoists the referenced files to the front of the injected
+                    workspace-file context so they survive the count/character
+                    budget cuts first. Unknown ids are silently ignored. An
+                    illegal type (non-array, or a non-string element) → 422.
       responses:
         '200':
           description: SSE event stream
@@ -225,6 +240,512 @@ paths:
                   - event: run_complete — run finished
                   - event: error — error occurred
                   - event: done — stream ended
+
+  # ---------------------------------------------------------------------------
+  # Workspaces (transparent proxy to session-orchestrator)
+  # ---------------------------------------------------------------------------
+  /api/bff/v1/workspaces:
+    get:
+      operationId: workspaces_list
+      summary: List workspaces (default lazily created upstream)
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Workspace list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspacePage'
+
+    post:
+      operationId: workspaces_create
+      summary: Create a workspace
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                description: { type: string, nullable: true }
+                instructions: { type: string, nullable: true }
+                skills:
+                  type: array
+                  items: { type: string }
+                meta: { type: object, nullable: true }
+      responses:
+        '201':
+          description: Workspace created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+
+  /api/bff/v1/workspaces/{workspace_id}:
+    get:
+      operationId: workspaces_get
+      summary: Get a workspace
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      responses:
+        '200':
+          description: Workspace
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    patch:
+      operationId: workspaces_update
+      summary: Update a workspace (all fields optional)
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                description: { type: string, nullable: true }
+                instructions: { type: string, nullable: true }
+                skills:
+                  type: array
+                  items: { type: string }
+                meta: { type: object, nullable: true }
+      responses:
+        '200':
+          description: Workspace updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      operationId: workspaces_delete
+      summary: Delete a workspace (409 for the default workspace)
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      responses:
+        '204':
+          description: Deleted
+        '409':
+          description: Cannot delete the default workspace
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /api/bff/v1/workspaces/{workspace_id}/files:
+    get:
+      operationId: workspace_files_list
+      summary: List files in a workspace
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      responses:
+        '200':
+          description: File list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceFilePage'
+
+    post:
+      operationId: workspace_files_upload
+      summary: Upload a file to a workspace (multipart)
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                description:
+                  type: string
+      responses:
+        '201':
+          description: File uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceFile'
+
+  /api/bff/v1/workspaces/{workspace_id}/files/{file_id}:
+    delete:
+      operationId: workspace_files_delete
+      summary: Delete a workspace file
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+        - name: file_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '204':
+          description: Deleted
+
+  /api/bff/v1/workspaces/{workspace_id}/files/{file_id}/content:
+    get:
+      operationId: workspace_files_content
+      summary: Download workspace file content (byte stream)
+      tags: [Workspaces]
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/WorkspaceId'
+        - name: file_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: File bytes (Content-Disposition RFC 6266)
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+
+  # ---------------------------------------------------------------------------
+  # Library — knowledge source (folders + documents → knowledge-ingest)
+  #
+  # Reads (list folders / documents) are open to any authenticated tenant user;
+  # writes (folder CRUD, upload, ingest, document PATCH/DELETE) require the
+  # tenant-admin ``document.create`` permission. Every proxy forwards the
+  # caller's X-User-Clearance so knowledge-ingest's sensitivity gate holds.
+  # ---------------------------------------------------------------------------
+  /api/bff/v1/library/folders:
+    get:
+      operationId: library_folders_list
+      summary: List knowledge folders (flat; SPA assembles the tree)
+      tags: [Library]
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Folder list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeFolderPage'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+    post:
+      operationId: library_folders_create
+      summary: Create a knowledge folder (tenant-admin)
+      tags: [Library]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+                parent_id: { type: string, nullable: true, description: "null = root" }
+                default_sensitivity: { type: string, enum: [L1, L2, L3, L4, L5], default: L1 }
+      responses:
+        '201':
+          description: Folder created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeFolder'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Not a tenant administrator (document.create required) }
+        '409': { description: Duplicate name under the same parent }
+
+  /api/bff/v1/library/folders/{folder_id}:
+    patch:
+      operationId: library_folders_update
+      summary: Rename / move / re-default a folder (tenant-admin)
+      tags: [Library]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: folder_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                parent_id: { type: string, nullable: true }
+                default_sensitivity: { type: string, enum: [L1, L2, L3, L4, L5] }
+      responses:
+        '200':
+          description: Folder updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeFolder'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Not a tenant administrator }
+        '409': { description: Duplicate name under the target parent }
+
+    delete:
+      operationId: library_folders_delete
+      summary: Delete an empty folder (tenant-admin)
+      tags: [Library]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: folder_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: deleted }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Not a tenant administrator }
+        '409': { description: Folder not empty }
+
+  /api/bff/v1/library/documents:
+    get:
+      operationId: library_documents_list
+      summary: List knowledge documents (clearance-filtered by knowledge-ingest)
+      tags: [Library]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: folder_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: Filter to one folder (omit = all folders)
+      responses:
+        '200':
+          description: Document list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeDocumentPage'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+    post:
+      operationId: library_documents_upload
+      summary: Upload a knowledge document (multipart, tenant-admin)
+      tags: [Library]
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [title, mime, file]
+              properties:
+                title: { type: string }
+                mime: { type: string }
+                file: { type: string, format: binary }
+                folder_id: { type: string, nullable: true, description: "null/omit = root" }
+                sensitivity: { type: string, enum: [L1, L2, L3, L4, L5], description: "omit = folder default" }
+      responses:
+        '201':
+          description: Document uploaded (PENDING; call /ingest to chunk)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeDocument'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Not a tenant administrator }
+
+  /api/bff/v1/library/documents/{document_id}:
+    patch:
+      operationId: library_documents_update
+      summary: Move a document / change its sensitivity (tenant-admin)
+      tags: [Library]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                folder_id: { type: string, nullable: true }
+                sensitivity: { type: string, enum: [L1, L2, L3, L4, L5] }
+      responses:
+        '200':
+          description: Document updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KnowledgeDocument'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Not a tenant administrator }
+
+    delete:
+      operationId: library_documents_delete
+      summary: Delete a knowledge document (tenant-admin)
+      tags: [Library]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: deleted }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Not a tenant administrator }
+
+  /api/bff/v1/library/documents/{document_id}/ingest:
+    post:
+      operationId: library_documents_ingest
+      summary: Chunk + embed an uploaded document (tenant-admin)
+      tags: [Library]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Ingestion result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  document_id: { type: string }
+                  status: { type: string }
+                  chunks_created: { type: integer }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Not a tenant administrator }
+
+  /api/bff/v1/library/documents/{document_id}/content:
+    get:
+      operationId: library_documents_content
+      summary: Download a knowledge document's source bytes (clearance-gated)
+      tags: [Library]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Raw source bytes (Content-Disposition RFC 6266).
+          headers:
+            Content-Type:
+              description: Document MIME type (or application/octet-stream).
+              schema: { type: string }
+            Content-Disposition:
+              description: RFC 6266 attachment header (filename / filename*).
+              schema: { type: string }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Caller clearance below document sensitivity }
+        '404': { description: Document or source blob not found }
+
+  /api/bff/v1/admin/knowledge/documents/{document_id}/content:
+    get:
+      operationId: admin_knowledge_documents_content
+      summary: Cross-tenant audit preview of a knowledge document's source bytes
+      tags: [Library]
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: document_id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: tenant_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: >
+            Target tenant for cross-tenant audit (platform super_admin only).
+            Omit to act on the caller's own tenant.
+      responses:
+        '200':
+          description: Raw source bytes (Content-Disposition RFC 6266).
+          headers:
+            Content-Type:
+              description: Document MIME type (or application/octet-stream).
+              schema: { type: string }
+            Content-Disposition:
+              description: RFC 6266 attachment header (filename / filename*).
+              schema: { type: string }
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { description: Not a tenant administrator / clearance below document sensitivity }
+        '404': { description: Document or source blob not found }
+
 
   # ---------------------------------------------------------------------------
   # Health
@@ -280,6 +801,13 @@ components:
         maximum: 200
         default: 50
 
+    WorkspaceId:
+      name: workspace_id
+      in: path
+      required: true
+      schema: { type: string }
+      description: "wks_<ULID>"
+
   schemas:
     SessionStatus:
       type: string
@@ -328,6 +856,98 @@ components:
             $ref: '#/components/schemas/Session'
         next_cursor: { type: string, nullable: true }
 
+    Workspace:
+      type: object
+      properties:
+        id: { type: string, description: "wks_<ULID>" }
+        tenant_id: { type: string }
+        user_id: { type: string }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        instructions: { type: string, nullable: true }
+        skills:
+          type: array
+          items: { type: string }
+        is_default: { type: boolean }
+        meta: { type: object, nullable: true }
+        sensitivity_level: { type: string, enum: [L1, L2, L3, L4, L5], default: L2 }
+        file_count: { type: integer }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    WorkspaceFile:
+      type: object
+      properties:
+        id: { type: string }
+        workspace_id: { type: string }
+        filename: { type: string }
+        mime: { type: string }
+        size_bytes: { type: integer }
+        description: { type: string, nullable: true }
+        sensitivity_level: { type: string, enum: [L1, L2, L3, L4, L5], default: L2 }
+        created_at: { type: string, format: date-time }
+
+    WorkspacePage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Workspace'
+
+    WorkspaceFilePage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/WorkspaceFile'
+
+    KnowledgeFolder:
+      type: object
+      properties:
+        id: { type: string, description: "fld_<ULID>" }
+        tenant_id: { type: string }
+        parent_id: { type: string, nullable: true, description: "null = root layer" }
+        name: { type: string }
+        default_sensitivity: { type: string, enum: [L1, L2, L3, L4, L5], default: L1 }
+        created_by_user_id: { type: string, nullable: true }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    KnowledgeFolderPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/KnowledgeFolder'
+        total: { type: integer }
+
+    KnowledgeDocument:
+      type: object
+      properties:
+        id: { type: string, description: "doc_<ULID>" }
+        tenant_id: { type: string }
+        title: { type: string }
+        mime: { type: string }
+        source_uri: { type: string, nullable: true }
+        status: { type: string, enum: [PENDING, INGESTING, READY, FAILED] }
+        chunk_count: { type: integer }
+        folder_id: { type: string, nullable: true, description: "null = root" }
+        sensitivity: { type: string, enum: [L1, L2, L3, L4, L5], default: L1 }
+        uploaded_by_user_id: { type: string, nullable: true }
+        uploaded_at: { type: string, format: date-time }
+
+    KnowledgeDocumentPage:
+      type: object
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/KnowledgeDocument'
+        total: { type: integer }
+
     LoginResponse:
       type: object
       properties:
@@ -348,6 +968,7 @@ components:
         roles:
           type: array
           items: { type: string }
+        clearance: { type: string, enum: [L1, L2, L3, L4, L5] }
 
     HealthStatus:
       type: object

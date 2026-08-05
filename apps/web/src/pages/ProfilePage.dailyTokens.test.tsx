@@ -1,11 +1,14 @@
 /**
- * ProfilePage — daily token usage bar chart tests.
+ * ProfilePage — token usage dashboard tests (用量与账单 tab).
  *
- * Verifies:
- * 1. Chart renders bars with real days data from api.runs.tokenUsageDaily()
- * 2. "近 7 天无 Token 用量" empty state shown when all tokens are 0
- * 3. Loading placeholder shown while API resolves
- * 4. Total token count shown in section title
+ * Verifies the multi-dimensional breakdown built on
+ * api.runs.tokenUsageBreakdown():
+ * 1. Stacked daily chart renders one bar per day with MM-DD labels
+ * 2. "近 N 天无 Token 用量" empty state shown when all totals are 0
+ * 3. Loading placeholder shown while the breakdown API resolves
+ * 4. Total token count shown in the section title (reflecting the window)
+ * 5. 按来源 section renders localized source rows with percent-of-total
+ * 6. Time-range segmented control refetches with the chosen window
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
@@ -21,6 +24,11 @@ vi.mock('../lib/workspaceContext', () => ({
   useWorkspace: () => ({ allWs: [] }),
 }));
 
+// Mock i18n — the page reads useTranslation() for the 语言 switcher
+vi.mock('../i18n', () => ({
+  useTranslation: () => ({ lang: 'zh', setLang: vi.fn(), t: (k: string) => k }),
+}));
+
 // Mock chatStore
 vi.mock('../stores/chatStore', () => ({
   useChatStore: (selector: (s: unknown) => unknown) =>
@@ -33,6 +41,7 @@ vi.mock('../stores/chatStore', () => ({
         roles: [],
       },
       logout: vi.fn(),
+      setUserProfile: vi.fn(),
     }),
 }));
 
@@ -43,6 +52,7 @@ const mockAuthSessions = vi.fn();
 const mockRunsCount = vi.fn();
 const mockTokenUsage = vi.fn();
 const mockTokenUsageDaily = vi.fn();
+const mockTokenUsageBreakdown = vi.fn();
 const mockApiKeysList = vi.fn();
 const mockNotifPreferences = vi.fn();
 
@@ -53,6 +63,7 @@ vi.mock('../api/client', () => ({
       mfaMethods: () => mockMfaMethods(),
       logout: () => Promise.resolve(),
       sessions: () => mockAuthSessions(),
+      updateProfile: () => Promise.resolve({ id: 'usr_test', email: 'test@example.com', display_name: 'Test User', tenant_id: 'tnt_test', roles: [] }),
     },
     billing: {
       me: () => mockBillingMe(),
@@ -61,6 +72,7 @@ vi.mock('../api/client', () => ({
       count: () => mockRunsCount(),
       tokenUsage: () => mockTokenUsage(),
       tokenUsageDaily: () => mockTokenUsageDaily(),
+      tokenUsageBreakdown: (days: number) => mockTokenUsageBreakdown(days),
     },
     apiKeys: {
       list: () => mockApiKeysList(),
@@ -93,10 +105,6 @@ vi.mock('../api/client', () => ({
       put: () => Promise.resolve({}),
       delete: () => Promise.resolve(),
     },
-    pam: {
-      myElevations: () => Promise.resolve([]),
-      requestElevation: () => Promise.resolve({}),
-    },
   },
   ApiError: class ApiError extends Error {
     status: number;
@@ -111,32 +119,40 @@ vi.mock('../api/client', () => ({
 
 import { ProfilePage } from './ProfilePage';
 
-const DAILY_DATA_WITH_USAGE = {
-  days: [
-    { day: '2026-05-29', tokens: 0 },
-    { day: '2026-05-30', tokens: 100 },
-    { day: '2026-05-31', tokens: 200 },
-    { day: '2026-06-01', tokens: 150 },
-    { day: '2026-06-02', tokens: 300 },
-    { day: '2026-06-03', tokens: 50 },
-    { day: '2026-06-04', tokens: 420 },
+const BREAKDOWN_WITH_USAGE = {
+  days_window: 30,
+  daily: [
+    { day: '2026-05-29', input_tokens: 0,   output_tokens: 0,   total_tokens: 0 },
+    { day: '2026-05-30', input_tokens: 60,  output_tokens: 40,  total_tokens: 100 },
+    { day: '2026-05-31', input_tokens: 120, output_tokens: 80,  total_tokens: 200 },
+    { day: '2026-06-01', input_tokens: 90,  output_tokens: 60,  total_tokens: 150 },
+    { day: '2026-06-02', input_tokens: 180, output_tokens: 120, total_tokens: 300 },
+    { day: '2026-06-03', input_tokens: 30,  output_tokens: 20,  total_tokens: 50 },
+    { day: '2026-06-04', input_tokens: 220, output_tokens: 200, total_tokens: 420 },
+  ],
+  by_source: [
+    { source: 'user', total_tokens: 900, run_count: 4 },
+    { source: 'schedule', total_tokens: 320, run_count: 2 },
   ],
 };
 
-const DAILY_DATA_ALL_ZERO = {
-  days: [
-    { day: '2026-05-29', tokens: 0 },
-    { day: '2026-05-30', tokens: 0 },
-    { day: '2026-05-31', tokens: 0 },
-    { day: '2026-06-01', tokens: 0 },
-    { day: '2026-06-02', tokens: 0 },
-    { day: '2026-06-03', tokens: 0 },
-    { day: '2026-06-04', tokens: 0 },
+const BREAKDOWN_ALL_ZERO = {
+  days_window: 30,
+  daily: [
+    { day: '2026-05-29', input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    { day: '2026-05-30', input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    { day: '2026-05-31', input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    { day: '2026-06-01', input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    { day: '2026-06-02', input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    { day: '2026-06-03', input_tokens: 0, output_tokens: 0, total_tokens: 0 },
+    { day: '2026-06-04', input_tokens: 0, output_tokens: 0, total_tokens: 0 },
   ],
+  by_source: [],
 };
 
-describe('ProfilePage — daily token usage chart', () => {
+describe('ProfilePage — token usage dashboard', () => {
   beforeEach(() => {
+    mockTokenUsageBreakdown.mockReset();
     mockAuthMe.mockResolvedValue({
       id: 'usr_test',
       email: 'test@example.com',
@@ -149,17 +165,18 @@ describe('ProfilePage — daily token usage chart', () => {
     mockAuthSessions.mockResolvedValue([]);
     mockRunsCount.mockResolvedValue({ count: 5 });
     mockTokenUsage.mockResolvedValue({ input_tokens: 600, output_tokens: 620, total_tokens: 1220 });
-    mockTokenUsageDaily.mockResolvedValue(DAILY_DATA_WITH_USAGE);
+    mockTokenUsageDaily.mockResolvedValue({ days: [] });
+    mockTokenUsageBreakdown.mockResolvedValue(BREAKDOWN_WITH_USAGE);
     mockApiKeysList.mockResolvedValue([]);
     mockNotifPreferences.mockResolvedValue({ items: [] });
   });
 
-  it('renders chart section title on 用量与账单 tab', async () => {
+  it('renders chart section title on 用量与账单 tab (default 30-day window)', async () => {
     render(<ProfilePage />);
     await userEvent.click(screen.getByText('用量与账单'));
 
     await waitFor(() => {
-      expect(screen.getByText(/每日 Token 用量/)).toBeInTheDocument();
+      expect(screen.getByText(/Token 用量（近 30 天）/)).toBeInTheDocument();
     });
   });
 
@@ -173,42 +190,81 @@ describe('ProfilePage — daily token usage chart', () => {
     });
   });
 
-  it('renders bar tooltips with MM-DD dates', async () => {
+  it('renders stacked-bar tooltips with MM-DD labels', async () => {
     render(<ProfilePage />);
     await userEvent.click(screen.getByText('用量与账单'));
 
     await waitFor(() => {
-      // SparkBars renders date labels sliced to MM-DD (d.day.slice(5))
+      // StackedBars renders date labels sliced to MM-DD (d.day.slice(5))
       expect(screen.getByText('06-04')).toBeInTheDocument();
     });
   });
 
-  it('shows "近 7 天无 Token 用量" when all tokens are 0', async () => {
-    mockTokenUsageDaily.mockResolvedValue(DAILY_DATA_ALL_ZERO);
+  it('shows "近 30 天无 Token 用量" when all totals are 0', async () => {
+    mockTokenUsageBreakdown.mockResolvedValue(BREAKDOWN_ALL_ZERO);
     render(<ProfilePage />);
     await userEvent.click(screen.getByText('用量与账单'));
 
     await waitFor(() => {
-      expect(screen.getByText(/近 7 天无 Token 用量/)).toBeInTheDocument();
+      expect(screen.getByText(/近 30 天无 Token 用量/)).toBeInTheDocument();
     });
   });
 
-  it('shows loading placeholder before daily data resolves', async () => {
-    mockTokenUsageDaily.mockReturnValue(new Promise(() => {})); // never resolves
+  it('shows loading placeholder before breakdown data resolves', async () => {
+    mockTokenUsageBreakdown.mockReturnValue(new Promise(() => {})); // never resolves
     render(<ProfilePage />);
     await userEvent.click(screen.getByText('用量与账单'));
 
     expect(screen.getByText('加载中…')).toBeInTheDocument();
   });
 
-  it('renders 7 bar entries (one per day)', async () => {
+  it('renders one bar entry per day', async () => {
     render(<ProfilePage />);
     await userEvent.click(screen.getByText('用量与账单'));
 
     await waitFor(() => {
-      // Each day renders a div with a title attribute like "YYYY-MM-DD · N tokens"
+      // Each day renders a div with a title attribute containing "tokens"
       const bars = document.querySelectorAll('[title*="tokens"]');
       expect(bars.length).toBe(7);
+    });
+  });
+
+  it('renders 按来源 rows with localized labels and percent-of-total', async () => {
+    render(<ProfilePage />);
+    await userEvent.click(screen.getByText('用量与账单'));
+
+    await waitFor(() => {
+      expect(screen.getByText('按来源')).toBeInTheDocument();
+    });
+    // user → 手动, schedule → 定时
+    expect(screen.getByText('手动')).toBeInTheDocument();
+    expect(screen.getByText('定时')).toBeInTheDocument();
+    // total = 900 + 320 = 1220 → user 73.8%, schedule 26.2%
+    expect(screen.getByText('73.8%')).toBeInTheDocument();
+    expect(screen.getByText('26.2%')).toBeInTheDocument();
+  });
+
+  it('shows "暂无用量数据" when by_source is empty', async () => {
+    mockTokenUsageBreakdown.mockResolvedValue(BREAKDOWN_ALL_ZERO);
+    render(<ProfilePage />);
+    await userEvent.click(screen.getByText('用量与账单'));
+
+    await waitFor(() => {
+      expect(screen.getByText(/暂无用量数据/)).toBeInTheDocument();
+    });
+  });
+
+  it('refetches with the chosen window when time-range changes', async () => {
+    render(<ProfilePage />);
+    await userEvent.click(screen.getByText('用量与账单'));
+
+    await waitFor(() => {
+      expect(mockTokenUsageBreakdown).toHaveBeenCalledWith(30);
+    });
+
+    await userEvent.click(screen.getByText('近 7 天'));
+    await waitFor(() => {
+      expect(mockTokenUsageBreakdown).toHaveBeenCalledWith(7);
     });
   });
 });

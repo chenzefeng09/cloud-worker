@@ -26,7 +26,10 @@ import pytest
 from agent_scheduler.config import Settings
 from agent_scheduler.services.cube_runtime import CubeSandboxRuntime
 from agent_scheduler.services.docker_runtime import DockerRuntime
-from agent_scheduler.services.feature_flag import evaluate_flag
+from agent_scheduler.services.feature_flag import (
+    evaluate_flag,
+    runtime_extensions_for_run,
+)
 
 _TENANT = "tnt_01J5TNT0000000000000000001"
 _USER = "usr_01J5USR0000000000000000001"
@@ -146,6 +149,84 @@ def test_evaluate_flag_failure_open_on_malformed_body(monkeypatch: pytest.Monkey
 
 
 # --------------------------------------------------------------------------- #
+# runtime_extensions_for_run — canvas_tool flag gating (canvas v2, Phase B)
+# --------------------------------------------------------------------------- #
+
+
+_BASE_EXT = "mcp_tenant_injector,skills_loader,web_fetch"
+
+
+def test_runtime_extensions_appends_canvas_tool_when_flag_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(response=_resp({"enabled": True}))
+    monkeypatch.setattr(
+        "agent_scheduler.services.feature_flag.httpx.Client", lambda **kw: fake,
+    )
+    out = runtime_extensions_for_run(
+        base_extensions=_BASE_EXT,
+        tenant_id=_TENANT, user_id=_USER,
+        flag_url="http://feature-flag:8012/api/feature-flag/v1",
+    )
+    assert out == _BASE_EXT + ",canvas_tool"
+    # Contract: evaluated the ``enable_canvas_tool`` flag.
+    assert fake.last_post["json"]["flag"] == "enable_canvas_tool"
+
+
+def test_runtime_extensions_unchanged_when_flag_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(response=_resp({"enabled": False}))
+    monkeypatch.setattr(
+        "agent_scheduler.services.feature_flag.httpx.Client", lambda **kw: fake,
+    )
+    out = runtime_extensions_for_run(
+        base_extensions=_BASE_EXT,
+        tenant_id=_TENANT, user_id=_USER,
+        flag_url="http://feature-flag:8012/api/feature-flag/v1",
+    )
+    assert out == _BASE_EXT  # zero change
+
+
+def test_runtime_extensions_unchanged_when_flag_service_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure-open: an unreachable flag service leaves the base unchanged."""
+    fake = _FakeClient(raises=httpx.ConnectError("unreachable"))
+    monkeypatch.setattr(
+        "agent_scheduler.services.feature_flag.httpx.Client", lambda **kw: fake,
+    )
+    out = runtime_extensions_for_run(
+        base_extensions=_BASE_EXT,
+        tenant_id=_TENANT, user_id=_USER,
+        flag_url="http://feature-flag:8012/api/feature-flag/v1",
+    )
+    assert out == _BASE_EXT
+
+
+def test_runtime_extensions_idempotent_when_already_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A base that already lists canvas_tool is returned unchanged, no dupe,
+    and the flag is not even evaluated (no HTTP)."""
+    def _boom(**_kw: object):  # pragma: no cover - must not be called
+        raise AssertionError("flag should not be evaluated when already present")
+
+    monkeypatch.setattr(
+        "agent_scheduler.services.feature_flag.httpx.Client", _boom,
+    )
+    base = _BASE_EXT + ",canvas_tool"
+    assert (
+        runtime_extensions_for_run(
+            base_extensions=base,
+            tenant_id=_TENANT, user_id=_USER,
+            flag_url="http://feature-flag:8012/api/feature-flag/v1",
+        )
+        == base
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Docker runtime image routing
 # --------------------------------------------------------------------------- #
 
@@ -178,6 +259,43 @@ def test_docker_flag_enabled_uses_claude_image(
     assert kwargs["image"] == _CLAUDE_IMAGE
     # command=None → docker uses the image ENTRYPOINT (node).
     assert kwargs["command"] is None
+
+
+def test_docker_canvas_flag_on_appends_canvas_tool_to_env(
+    runtime: DockerRuntime, mock_docker_client: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """enable_canvas_tool on → container env RUNTIME_EXTENSIONS gains canvas_tool."""
+    monkeypatch.setattr(
+        "agent_scheduler.services.docker_runtime.evaluate_flag",
+        lambda *a, **kw: False,  # keep the AgentScope image; isolate the ext var
+    )
+    # Force the canvas-flag branch on deterministically (no flag-service HTTP).
+    monkeypatch.setattr(
+        "agent_scheduler.services.docker_runtime.runtime_extensions_for_run",
+        lambda *, base_extensions, **kw: base_extensions + ",canvas_tool",
+    )
+    mock_docker_client.containers.run.return_value = MagicMock(id="c-canvas-on")
+    kwargs = _docker_spawn(runtime)
+    assert "canvas_tool" in kwargs["environment"]["RUNTIME_EXTENSIONS"].split(",")
+
+
+def test_docker_canvas_flag_off_env_has_no_canvas_tool(
+    runtime: DockerRuntime, mock_docker_client: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """enable_canvas_tool off → RUNTIME_EXTENSIONS is the unmodified base."""
+    monkeypatch.setattr(
+        "agent_scheduler.services.docker_runtime.evaluate_flag",
+        lambda *a, **kw: False,
+    )
+    monkeypatch.setattr(
+        "agent_scheduler.services.docker_runtime.runtime_extensions_for_run",
+        lambda *, base_extensions, **kw: base_extensions,  # flag off ⇒ unchanged
+    )
+    mock_docker_client.containers.run.return_value = MagicMock(id="c-canvas-off")
+    kwargs = _docker_spawn(runtime)
+    assert "canvas_tool" not in kwargs["environment"]["RUNTIME_EXTENSIONS"].split(",")
 
 
 def test_docker_flag_disabled_uses_agent_image_regression(
@@ -227,12 +345,48 @@ def test_docker_flag_service_timeout_falls_back(
     assert kwargs["command"] == ["python", "-m", "agentscope_ext.runtime_worker"]
 
 
+def test_docker_flag_false_global_default_true_uses_claude_image(
+    runtime: DockerRuntime, mock_docker_client: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag False + ``use_claude_sdk_worker_default=True`` → claude image.
+
+    The per-run flag returns False, but the global config fallback flips the
+    selection so every run lands on the Claude SDK worker.
+    """
+    monkeypatch.setattr(
+        "agent_scheduler.services.docker_runtime.evaluate_flag",
+        lambda *a, **kw: False,
+    )
+    runtime._settings.use_claude_sdk_worker_default = True  # noqa: SLF001
+    mock_docker_client.containers.run.return_value = MagicMock(id="c-default")
+    kwargs = _docker_spawn(runtime)
+    assert kwargs["image"] == _CLAUDE_IMAGE
+    assert kwargs["command"] is None
+
+
+def test_docker_flag_true_global_default_false_still_claude_image(
+    runtime: DockerRuntime, mock_docker_client: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag True wins regardless of the (False) global default → claude image."""
+    monkeypatch.setattr(
+        "agent_scheduler.services.docker_runtime.evaluate_flag",
+        lambda *a, **kw: True,
+    )
+    runtime._settings.use_claude_sdk_worker_default = False  # noqa: SLF001
+    mock_docker_client.containers.run.return_value = MagicMock(id="c-flagwins")
+    kwargs = _docker_spawn(runtime)
+    assert kwargs["image"] == _CLAUDE_IMAGE
+    assert kwargs["command"] is None
+
+
 # --------------------------------------------------------------------------- #
 # Cube runtime image routing
 # --------------------------------------------------------------------------- #
 
 
-def _make_cube_runtime() -> CubeSandboxRuntime:
+def _make_cube_runtime(*, use_claude_sdk_worker_default: bool = False) -> CubeSandboxRuntime:
     settings = Settings(
         env="test",
         log_level="WARNING",
@@ -240,6 +394,9 @@ def _make_cube_runtime() -> CubeSandboxRuntime:
         runtime="cube",
         cube_controller_url="http://cube-test:8443",
         agent_image=_AGENT_IMAGE,
+        # Global config fallback for the Claude SDK worker selection (default
+        # False keeps the existing regression behaviour green).
+        use_claude_sdk_worker_default=use_claude_sdk_worker_default,
         # Broker mode (the default) now fail-closes without a CubeVS allow_out
         # CIDR list; these image-routing tests don't exercise egress, so give
         # the runtime a valid allowlist to reach the spawn POST.
@@ -313,3 +470,31 @@ def test_cube_flag_service_unreachable_falls_back(
     body = _cube_spawn(rt)
     assert body["template_id"] == _AGENT_IMAGE
     assert body["cmd"] == ["python", "-m", "agentscope_ext.runtime_worker"]
+
+
+def test_cube_flag_false_global_default_true_uses_claude_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag False + ``use_claude_sdk_worker_default=True`` → claude image."""
+    monkeypatch.setattr(
+        "agent_scheduler.services.cube_runtime.evaluate_flag",
+        lambda *a, **kw: False,
+    )
+    rt = _make_cube_runtime(use_claude_sdk_worker_default=True)
+    body = _cube_spawn(rt)
+    assert body["template_id"] == _CLAUDE_IMAGE
+    assert body["cmd"] == ["node", "/app/dist/main.js"]
+
+
+def test_cube_flag_true_global_default_false_still_claude_image(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Flag True wins regardless of the (False) global default → claude image."""
+    monkeypatch.setattr(
+        "agent_scheduler.services.cube_runtime.evaluate_flag",
+        lambda *a, **kw: True,
+    )
+    rt = _make_cube_runtime(use_claude_sdk_worker_default=False)
+    body = _cube_spawn(rt)
+    assert body["template_id"] == _CLAUDE_IMAGE
+    assert body["cmd"] == ["node", "/app/dist/main.js"]
