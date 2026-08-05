@@ -7,7 +7,9 @@ SHELL := /usr/bin/env bash
 .ONESHELL:
 .DEFAULT_GOAL := help
 
-FOUNDATION_DIR := /Users/chenzefeng/Development/saas-foundation
+# Path to the sibling saas-foundation checkout. Defaults to a sibling directory;
+# override with `make FOUNDATION_DIR=/path/to/saas-foundation ...` or an env var.
+FOUNDATION_DIR ?= ../saas-foundation
 COMPOSE_FOUNDATION := docker compose -f $(FOUNDATION_DIR)/deploy/docker-compose/dev.yml --env-file $(FOUNDATION_DIR)/deploy/docker-compose/.env
 COMPOSE_AGENT := docker compose -f deploy/docker-compose/agent-platform.yml --env-file $(FOUNDATION_DIR)/deploy/docker-compose/.env --env-file deploy/docker-compose/.env
 

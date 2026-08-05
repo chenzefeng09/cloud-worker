@@ -1,0 +1,137 @@
+name: Bug report
+description: Report a defect in Agent Platform so we can reproduce and fix it.
+title: "[bug]: "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        Before you start:
+        - Please search [existing issues](https://github.com/chenzefeng09/agent-platform/issues) to avoid duplicates.
+        - **Do not report security vulnerabilities here.** Follow the process in
+          [SECURITY.md](https://github.com/chenzefeng09/agent-platform/blob/main/SECURITY.md) instead.
+        - Agent Platform runs on top of [SaaS Foundation](https://github.com/chenzefeng09/saas-foundation).
+          If the problem clearly originates in a Foundation service (identity, authz, billing, audit, llm-gateway, etc.),
+          consider filing it on the SaaS Foundation repository instead.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A clear and concise description of the bug.
+      placeholder: When I do X, Y happens instead of Z.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact steps that trigger the bug. Include the request/command you ran where possible.
+      placeholder: |
+        1. Start the stack with `make up`
+        2. Log in via the BFF and open a session
+        3. POST a chat run to `/api/bff/v1/sessions/{id}/chat`
+        4. Observe the SSE stream stalls after the first token
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What actually happened, including any error messages or HTTP status codes.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      description: Which part of Agent Platform is affected? Pick the closest match.
+      options:
+        - "bff"
+        - "session-orchestrator"
+        - "agent-scheduler"
+        - "sandbox-pool"
+        - "app-registry"
+        - "skill-store"
+        - "mcp-registry"
+        - "tool-broker"
+        - "knowledge-ingest"
+        - "cron-runner"
+        - "web-fetch-gateway"
+        - "Web frontend (apps/web)"
+        - "Sandbox / agentscope-ext (runtime_worker, extensions, sandbox images)"
+        - "Deploy (docker-compose, Helm, operator, scripts)"
+        - "Other / not sure"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment mode
+      description: How were you running Agent Platform when the bug occurred?
+      options:
+        - "Docker Compose (SCHEDULER_RUNTIME=docker, local dev)"
+        - "CubeSandbox microVM (SCHEDULER_RUNTIME=cube, staging)"
+        - "Kubernetes via Helm (small/medium/large)"
+        - "Other / not sure"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: The release tag or git commit SHA you are running.
+      placeholder: "v0.1.0 or commit edc0470"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs and output
+      description: |
+        Paste any relevant log output (e.g. `make logs SVC=<service>`), tracebacks, or browser console errors.
+        This will be rendered as a code block, so no backticks are needed.
+        **Redact secrets, tokens, and private filesystem paths before pasting.**
+      render: shell
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Docker/Compose version, Python/Node versions, and anything else relevant.
+      placeholder: |
+        - OS: Ubuntu 24.04
+        - Docker: 27.x, Compose v2
+        - Python: 3.12, Node: 20
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submission checks
+      options:
+        - label: I have searched existing issues and this is not a duplicate.
+          required: true
+        - label: This is not a security vulnerability (those go through SECURITY.md).
+          required: true
+        - label: I have removed secrets, tokens, and private paths from logs and screenshots.
+          required: true

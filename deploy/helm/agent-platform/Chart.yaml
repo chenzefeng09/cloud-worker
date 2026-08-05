@@ -22,7 +22,7 @@ description: |
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
-home: https://github.com/your-org/agent-platform
+home: https://github.com/chenzefeng09/agent-platform
 maintainers:
   - name: Agent Platform Team
     email: platform@example.com
@@ -50,7 +50,7 @@ dependencies:
     # 实测 helm v4.x 需要绝对路径或从对应目录执行；相对路径占位如下，实际使用时调整：
     #   repository: "file://../../../saas-foundation/deploy/helm/foundation"  # 相对占位
     # 本地开发绝对路径（CI 替换为构建机实际路径，或改用 OCI ref）：
-    repository: "file:///Users/chenzefeng/Development/saas-foundation/deploy/helm/foundation"
+    repository: "file://../../../saas-foundation/deploy/helm/foundation"
     # 生产 OCI registry（发布后启用）：
     # repository: oci://registry.example.com/helm-charts
     condition: foundation.enabled
