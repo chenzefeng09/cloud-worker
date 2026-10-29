@@ -286,6 +286,7 @@ async def test_verify_match_returns_context(client: httpx.AsyncClient) -> None:
         "field_mapping": {"incoming_key": "app_field"},
         "input_values": input_values,
         "trigger_type": "webhook",
+        "created_by_user_id": "usr_test",
     }
 
 

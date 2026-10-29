@@ -245,6 +245,46 @@ function isJsonSchemaUnsupportedError(status: number, body: string): boolean {
   return hasHint;
 }
 
+// A gateway / upstream error body can echo the request (prompt text, tool
+// arguments, file contents), so it never reaches a log line or the SDK-facing
+// error (which the worker records as the run's error message). Both carry the
+// HTTP status plus a short machine reason instead.
+const GATEWAY_STATUS_REASONS: Record<number, string> = {
+  400: "bad_request",
+  401: "unauthorized",
+  403: "forbidden",
+  404: "not_found",
+  408: "timeout",
+  413: "payload_too_large",
+  422: "unprocessable",
+  429: "rate_limited",
+  500: "upstream_error",
+  502: "bad_gateway",
+  503: "unavailable",
+  504: "gateway_timeout",
+};
+const SAFE_REASON_TOKEN = /^[A-Za-z0-9_.:-]{1,64}$/;
+
+/**
+ * Content-free reason for a gateway error: the body's `error.code` /
+ * `error.type` (or a string `error`) when it is a plain token, else a generic
+ * label for the status. Never returns any free text from the body.
+ */
+export function gatewayErrorReason(status: number, body: string): string {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    const err = parsed && typeof parsed === "object" ? (parsed as Json).error : undefined;
+    const candidates: unknown[] =
+      err && typeof err === "object" ? [(err as Json).code, (err as Json).type] : [err];
+    for (const candidate of candidates) {
+      if (typeof candidate === "string" && SAFE_REASON_TOKEN.test(candidate)) return candidate;
+    }
+  } catch {
+    // Not JSON: fall back to the status label.
+  }
+  return GATEWAY_STATUS_REASONS[status] ?? `http_${status}`;
+}
+
 /**
  * Build the schema-hint message injected when falling back to json_object. The
  * DeepSeek json_object mode requires the prompt to contain the word "json" and
@@ -524,15 +564,28 @@ async function streamOpenAIToAnthropic(
   };
   let finishReason: string | null = null;
 
-  const closeOpenBlocks = (): void => {
+  // The thinking / text block is closed as soon as the output moves on to a
+  // different kind of block, not only at finish(): the SDK surfaces a block
+  // (its consolidated assistant message) at that block's content_block_stop,
+  // so a reasoning block left open until the end of the turn would reach the
+  // consumer only after the whole answer. Tool blocks stay open until finish()
+  // because OpenAI may interleave argument fragments of parallel calls.
+  const closeThinking = (): void => {
     if (thinkingStarted && thinkingBlockIndex >= 0) {
       writeSse(res, "content_block_stop", { type: "content_block_stop", index: thinkingBlockIndex });
       thinkingStarted = false;
     }
+  };
+  const closeText = (): void => {
     if (textStarted && textBlockIndex >= 0) {
       writeSse(res, "content_block_stop", { type: "content_block_stop", index: textBlockIndex });
       textStarted = false;
     }
+  };
+
+  const closeOpenBlocks = (): void => {
+    closeThinking();
+    closeText();
     for (const tb of toolBlocks.values()) {
       if (tb.started) {
         writeSse(res, "content_block_stop", { type: "content_block_stop", index: tb.anthropicIndex });
@@ -581,6 +634,7 @@ async function streamOpenAIToAnthropic(
     // then surfaces a thinking group ahead of the reply (see event_translator).
     if (typeof delta.reasoning_content === "string" && delta.reasoning_content.length > 0) {
       if (!thinkingStarted) {
+        closeText();
         thinkingBlockIndex = nextBlockIndex++;
         writeSse(res, "content_block_start", {
           type: "content_block_start",
@@ -599,6 +653,8 @@ async function streamOpenAIToAnthropic(
     // TEXT fragments → one text block (index assigned on first appearance).
     if (typeof delta.content === "string" && delta.content.length > 0) {
       if (!textStarted) {
+        // Reasoning is over once the answer starts: close it now (see above).
+        closeThinking();
         textBlockIndex = nextBlockIndex++;
         writeSse(res, "content_block_start", {
           type: "content_block_start",
@@ -653,6 +709,9 @@ async function streamOpenAIToAnthropic(
           }
           if (!state.name && tc.function?.name) state.name = tc.function.name;
           sawToolCall = true;
+          // The reasoning / text that led to the call is complete: close it.
+          closeThinking();
+          closeText();
           writeSse(res, "content_block_start", {
             type: "content_block_start",
             index: state.anthropicIndex,
@@ -1020,9 +1079,12 @@ export class GatewayAdapter {
           // Surface the gateway failure as an Anthropic SSE `error` event so the
           // SDK's stream reader observes a clean terminal event instead of a
           // hang or a content-type mismatch.
-          const rawText = await gwResp.text().catch(() => "");
+          const reason = gatewayErrorReason(
+            gwResp.status,
+            await gwResp.text().catch(() => ""),
+          );
           console.error(
-            `[adapter] gateway error (stream) status=${gwResp.status} body=${rawText.slice(0, 500)}`,
+            `[adapter] gateway error (stream) status=${gwResp.status} reason=${reason}`,
           );
           res.writeHead(200, {
             "content-type": "text/event-stream",
@@ -1031,7 +1093,7 @@ export class GatewayAdapter {
           });
           writeSse(res, "error", {
             type: "error",
-            error: { type: "api_error", message: `gateway ${gwResp.status}: ${rawText.slice(0, 500)}` },
+            error: { type: "api_error", message: `gateway ${gwResp.status}: ${reason}` },
           });
           res.end();
           return;
@@ -1052,10 +1114,11 @@ export class GatewayAdapter {
       // ── Non-streaming path: single JSON response (existing behaviour) ──
       const rawText = await gwResp.text();
       if (!gwResp.ok) {
-        console.error(`[adapter] gateway error status=${gwResp.status} body=${rawText.slice(0, 500)}`);
+        const reason = gatewayErrorReason(gwResp.status, rawText);
+        console.error(`[adapter] gateway error status=${gwResp.status} reason=${reason}`);
         sendJson(res, gwResp.status, {
           type: "error",
-          error: { type: "api_error", message: `gateway ${gwResp.status}: ${rawText.slice(0, 500)}` },
+          error: { type: "api_error", message: `gateway ${gwResp.status}: ${reason}` },
         });
         return;
       }
@@ -1064,7 +1127,9 @@ export class GatewayAdapter {
       try {
         oa = JSON.parse(rawText);
       } catch {
-        console.error(`[adapter] gateway returned non-JSON: ${rawText.slice(0, 200)}`);
+        console.error(
+          `[adapter] gateway returned non-JSON status=${gwResp.status} bytes=${Buffer.byteLength(rawText)}`,
+        );
         sendJson(res, 502, {
           type: "error",
           error: { type: "api_error", message: "gateway returned non-JSON" },

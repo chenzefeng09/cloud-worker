@@ -1,32 +1,29 @@
-import { Dialog } from '../admin/components/Dialog';
+import { PrivacyNoticeDialog } from './privacy/PrivacyNoticeDialog';
+import { useDataNotice } from './privacy/useDataNotice';
 
 /**
- * First-use data-usage notice shown the first time a user enters the chat page.
+ * Privacy notice gate for the chat page (GDPR Art. 13 information).
  *
- * For transparency / compliance, users are told that their conversations with
- * the agent are retained and may be replayed by administrators for auditing.
- * Once acknowledged, the dismissal is persisted to localStorage so the modal
- * never appears again on this device (see DATA_NOTICE_ACK_KEY).
+ * Self-contained: renders nothing until it knows whether the signed-in user
+ * has acknowledged the *current* notice version, then shows the notice if
+ * not. Content comes from `GET /privacy/notice` (controller / DPO, purposes and
+ * legal bases, retention, memory, processors and transfers, rights), with a
+ * built-in summary if that endpoint fails. "Got it" records the
+ * acknowledgement server-side, so a new notice version is shown again on
+ * every device; ESC / backdrop only closes it until next time.
  *
- * The overlay shell (backdrop, ESC, scroll lock, focus) is delegated to the
- * shared `Dialog` base so this stays visually consistent with other app modals.
+ * The same dialog is available on demand from Profile → Privacy & data.
  */
-export function DataNoticeModal({ onAck }: { onAck: () => void }) {
+export function DataNoticeModal() {
+  const n = useDataNotice({ autoOpen: true });
+  if (!n.open) return null;
   return (
-    <Dialog
-      title="Data usage notice"
-      onClose={onAck}
-      className="w-full max-w-[440px]"
-    >
-      <p className="text-[13px] leading-[1.6] text-ink-2">
-        To ensure service quality and support security audits, your conversations with the agent are retained and may be replayed by administrators for auditing. Retention period: 30 days.
-      </p>
-
-      <div className="flex items-center justify-end gap-2 pt-1">
-        <button className="cw-btn cw-btn-accent cw-btn-sm" onClick={onAck}>
-          Got it
-        </button>
-      </div>
-    </Dialog>
+    <PrivacyNoticeDialog
+      notice={n.notice}
+      onClose={n.dismiss}
+      onAcknowledge={n.acknowledge}
+      busy={n.ackBusy}
+      error={n.ackError}
+    />
   );
 }

@@ -83,12 +83,15 @@ def test_guard_rejects_short_content() -> None:
     ) is False
 
 
-def test_guard_rejects_single_block() -> None:
-    one_block = "这是一段足够长的内容，" * 30  # long but no blank-line split
-    assert len(one_block.strip()) >= msg_mod._CANVAS_MIN_CHARS
-    assert msg_mod._canvas_payload_passes_guard(
-        {"content_markdown": one_block}
-    ) is False
+def test_guard_accepts_a_single_substantial_block() -> None:
+    # The model calls create_canvas deliberately, so one paragraph is enough.
+    one_block = "这是一段足够长的内容，" * 30  # no blank-line split
+    assert msg_mod._canvas_payload_passes_guard({"content_markdown": one_block}) is True
+
+
+def test_guard_rejects_a_fragment() -> None:
+    fragment = "x" * (msg_mod._CANVAS_MIN_CHARS - 1)
+    assert msg_mod._canvas_payload_passes_guard({"content_markdown": f"  {fragment}  "}) is False
 
 
 def test_guard_accepts_long_multiblock() -> None:
@@ -96,8 +99,8 @@ def test_guard_accepts_long_multiblock() -> None:
 
 
 def test_guard_constants_are_tunable() -> None:
-    assert msg_mod._CANVAS_MIN_CHARS == 200
-    assert msg_mod._CANVAS_MIN_BLOCKS == 2
+    assert msg_mod._CANVAS_MIN_CHARS == 20
+    assert msg_mod._CANVAS_MIN_BLOCKS == 1
 
 
 # ── happy path ────────────────────────────────────────────────────────────────

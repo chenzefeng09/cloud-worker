@@ -250,10 +250,10 @@ function SessionSearch({
  * Reuses the exact same rendering chain as the live chat:
  *   groupSteps() → MessageBubble / StepGroup → chatStepRenderers (ThinkingBlock, ToolRow)
  *
- * Session listing uses the admin-only api.admin.sessions.list() (whole-tenant,
- * tenant_admin-gated in the BFF); runs and messages reuse the existing
- * api.runs.list / api.messages.list proxies (scoped per session_id, which the
- * orchestrator already tenant-checks).
+ * Everything goes through the tenant_admin-gated api.admin.sessions.* proxies:
+ * list() for the whole tenant, runs() / messages() for one member's session.
+ * The owner-scoped api.runs / api.messages proxies would 404 on a peer's
+ * session, and the admin ones audit every read in the BFF.
  *
  * TODO (time-axis): add a step-by-step playback slider that reveals messages
  * one-by-one so operators can "scrub" through the run timeline.  The data is
@@ -296,7 +296,7 @@ export function SessionReplayPage() {
     setMessages([]);
     setRunsLoading(true);
     try {
-      const res = await api.runs.list(sid);
+      const res = await api.admin.sessions.runs(sid);
       const items = Array.isArray(res?.items) ? res.items : [];
       // Sort newest-first for display
       items.sort((a, b) => (b.created_at > a.created_at ? 1 : -1));
@@ -324,7 +324,7 @@ export function SessionReplayPage() {
         // Load all messages for the session and filter to this run.
         // The API doesn't support per-run filtering yet, so we filter client-side.
         // For sessions with many messages, pagination may be needed (future work).
-        const page = await api.messages.list(selectedSessionId);
+        const page = await api.admin.sessions.messages(selectedSessionId);
         const all = Array.isArray(page?.items) ? page.items : [];
         // Keep messages that belong to this run, plus USER messages (they seed each run).
         // USER messages have run_id = null so we include them all.

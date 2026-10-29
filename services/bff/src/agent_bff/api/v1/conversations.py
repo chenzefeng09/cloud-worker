@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
@@ -92,6 +93,120 @@ async def _resolve_attachment_files(
         return []
 
 
+class TurnError(Exception):
+    """An upstream step of :func:`start_turn` failed.
+
+    ``message`` is the persisted user message when the failure happened after
+    it was saved (the caller may still want to act on it, e.g. auto-naming).
+    """
+
+    def __init__(self, status_code: int, detail: str, *, message: dict | None = None) -> None:
+        super().__init__(detail)
+        self.status_code = status_code if status_code < 600 else 502
+        self.detail = detail
+        self.message = message
+
+    def response(self) -> JSONResponse:
+        return JSONResponse(
+            status_code=self.status_code,
+            content={"detail": self.detail, "status": self.status_code},
+        )
+
+
+async def start_turn(
+    client: httpx.AsyncClient,
+    *,
+    orch_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    message_text: str,
+    attachment_ids: list[str],
+    model: str | None,
+    reasoning_effort: str | None,
+    run_options: dict[str, Any],
+    persist_message: bool = True,
+) -> tuple[dict | None, dict]:
+    """Persist the user turn (optional) and start a sandbox run for it.
+
+    Shared by the chat endpoint and the task board (create / retry).
+    ``run_options`` holds the presence-carried run knobs (``skills``,
+    ``mcp_server_ids``, ``workspace_file_ids``, ``include_platform_defaults``,
+    ``hitl``): a key is forwarded only when the caller expressed a choice, so
+    "omitted → defaults" and "explicit [] → none" stay distinguishable.
+
+    ``persist_message=False`` re-runs an already-persisted user message (task
+    retry); the orchestrator's history assembly drops that row as this turn's
+    input, exactly as it does for a freshly persisted one.
+
+    Returns ``(message, run)``; raises :class:`TurnError` on upstream failure.
+    """
+    message: dict | None = None
+    if persist_message:
+        resp = await client.post(
+            f"{orch_url}/sessions/{session_id}/messages",
+            json={"role": "USER", "content": message_text, "attachment_ids": attachment_ids},
+            headers=headers,
+        )
+        if resp.status_code >= 400:
+            raise TurnError(resp.status_code, "Failed to save message")
+        message = resp.json()
+
+    files = await _resolve_attachment_files(
+        client=client,
+        orch_url=orch_url,
+        session_id=session_id,
+        attachment_ids=attachment_ids,
+        headers=headers,
+    )
+    run_body: dict[str, Any] = {
+        "task": message_text,
+        "files": files,
+        "model": model,
+        "reasoning_effort": reasoning_effort,
+        **run_options,
+    }
+    resp = await client.post(
+        f"{orch_url}/sessions/{session_id}/runs",
+        json=run_body,
+        headers=headers,
+    )
+    if resp.status_code >= 400:
+        raise TurnError(resp.status_code, "Failed to start run", message=message)
+    return message, resp.json()
+
+
+def schedule_auto_title(
+    background_tasks: BackgroundTasks,
+    request: Request,
+    *,
+    message: dict | None,
+    message_text: str,
+    session_id: str,
+    auth: tuple[str, str, str],
+    clearance: str,
+    model_hint: str | None,
+) -> None:
+    """Name the session from its first user message, after the response.
+
+    Runs in the background so it never delays task startup; the session SSE
+    stream publishes the eventual PATCH to every open client.
+    """
+    if not message or message.get("sequence") != 1 or not message_text.strip():
+        return
+    tenant_id, user_id, access_token = auth
+    background_tasks.add_task(
+        generate_and_update_session_title,
+        settings=request.app.state.settings,
+        session_id=session_id,
+        message=message_text,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        access_token=access_token,
+        clearance=clearance,
+        model_hint=model_hint,
+    )
+
+
 @router.post("/sessions/{session_id}/chat")
 async def chat(
     session_id: str,
@@ -128,109 +243,69 @@ async def chat(
     body = await request.json()
     message_text = body.get("message", "")
     attachment_ids: list[str] = body.get("attachment_ids") or []
-    skills_provided = "skills" in body
-    skills: list[str] = body.get("skills") or []
-    # Same presence semantics as ``skills`` — see the forwarding block below.
-    mcp_server_ids_provided = "mcp_server_ids" in body
-    mcp_server_ids: list[str] = body.get("mcp_server_ids") or []
     model: str | None = body.get("model") or None
     reasoning_effort: str | None = body.get("reasoning_effort") or None
     # Strictly validated: workspace_file_ids (optional list of strings; illegal
     # types → pydantic 422).  Every run executes in a Claude SDK worker sandbox.
     envelope = _validate_chat_body(body)
-    workspace_file_ids = envelope.workspace_file_ids
 
+    run_options: dict[str, Any] = {}
+    # Forward @-referenced workspace file ids verbatim (only when the client
+    # sent the field) so the orchestrator can prioritise those files.
+    if envelope.workspace_file_ids is not None:
+        run_options["workspace_file_ids"] = envelope.workspace_file_ids
+    # Presence is meaningful: omitted lets orchestrator inject the user's
+    # enabled-by-default installs; explicit [] disables all skills for this
+    # session/run and must not be replaced with defaults.
+    if "skills" in body:
+        run_options["skills"] = body.get("skills") or []
+    # Presence is meaningful (mirrors ``skills``): omitted lets the
+    # orchestrator fall back to the tenant's enabled-by-default MCP
+    # servers (today's auto-inject-everything behaviour); explicit []
+    # disables MCP entirely for this run and must NOT be dropped by a
+    # truthiness check.
+    if "mcp_server_ids" in body:
+        run_options["mcp_server_ids"] = body.get("mcp_server_ids") or []
+    # Per-session opt-out of the platform-global default skills. Presence-
+    # tolerant: forward verbatim only when the client sent it. Omitted keeps
+    # the default (platform defaults injected); explicit ``false`` suppresses
+    # them for this run. The orchestrator treats only a literal ``false`` as
+    # disable, so forwarding the raw value is safe.
+    if "include_platform_defaults" in body:
+        run_options["include_platform_defaults"] = body.get("include_platform_defaults")
+
+    headers = foundation_headers(tenant_id, user_id, access_token, clearance=clearance)
     async with httpx.AsyncClient(timeout=30) as client:
-        headers = foundation_headers(tenant_id, user_id, access_token, clearance=clearance)
-
-        # 1. Persist user message
-        resp = await client.post(
-            f"{orch_url}/sessions/{session_id}/messages",
-            json={"role": "USER", "content": message_text, "attachment_ids": attachment_ids},
-            headers=headers,
-        )
-        if resp.status_code >= 400:
-            return JSONResponse(
-                status_code=resp.status_code if resp.status_code < 600 else 502,
-                content={"detail": "Failed to save message", "status": resp.status_code},
-            )
-        msg = resp.json()
-        message_id = msg.get("id")
-        # The first persisted user message owns automatic naming.  Run title
-        # generation after the response so it never delays task startup; the
-        # session SSE stream publishes the eventual PATCH to every open client.
-        if msg.get("sequence") == 1 and message_text.strip():
-            background_tasks.add_task(
-                generate_and_update_session_title,
-                settings=request.app.state.settings,
+        try:
+            message, run = await start_turn(
+                client,
+                orch_url=orch_url,
+                headers=headers,
                 session_id=session_id,
-                message=message_text,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                access_token=access_token,
-                clearance=clearance,
-                model_hint=model,
+                message_text=message_text,
+                attachment_ids=attachment_ids,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                run_options=run_options,
             )
-
-        # 2. Resolve attachment files (failure-open)
-        files = await _resolve_attachment_files(
-            client=client,
-            orch_url=orch_url,
-            session_id=session_id,
-            attachment_ids=attachment_ids,
-            headers=headers,
-        )
-
-        # 3. Trigger run
-        run_body: dict[str, Any] = {
-            "task": message_text,
-            "files": files,
-            "model": model,
-            "reasoning_effort": reasoning_effort,
-        }
-        # Forward @-referenced workspace file ids verbatim (only when the client
-        # sent the field) so the orchestrator can prioritise those files.
-        if workspace_file_ids is not None:
-            run_body["workspace_file_ids"] = workspace_file_ids
-        # Presence is meaningful: omitted lets orchestrator inject the user's
-        # enabled-by-default installs; explicit [] disables all skills for this
-        # session/run and must not be replaced with defaults.
-        if skills_provided:
-            run_body["skills"] = skills
-        # Presence is meaningful (mirrors ``skills``): omitted lets the
-        # orchestrator fall back to the tenant's enabled-by-default MCP
-        # servers (today's auto-inject-everything behaviour); explicit []
-        # disables MCP entirely for this run and must NOT be dropped by a
-        # truthiness check.
-        if mcp_server_ids_provided:
-            run_body["mcp_server_ids"] = mcp_server_ids
-        # Per-session opt-out of the platform-global default skills. Presence-
-        # tolerant: forward verbatim only when the client sent it. Omitted keeps
-        # the default (platform defaults injected); explicit ``false`` suppresses
-        # them for this run. The orchestrator treats only a literal ``false`` as
-        # disable, so forwarding the raw value is safe.
-        if "include_platform_defaults" in body:
-            run_body["include_platform_defaults"] = body.get(
-                "include_platform_defaults"
+        except TurnError as exc:
+            # The message may have been saved before the run failed to start;
+            # it still names the session.
+            schedule_auto_title(
+                background_tasks, request, message=exc.message, message_text=message_text,
+                session_id=session_id, auth=_auth, clearance=clearance, model_hint=model,
             )
+            return exc.response()
 
-        resp = await client.post(
-            f"{orch_url}/sessions/{session_id}/runs",
-            json=run_body,
-            headers=headers,
-        )
-        if resp.status_code >= 400:
-            return JSONResponse(
-                status_code=resp.status_code if resp.status_code < 600 else 502,
-                content={"detail": "Failed to start run", "status": resp.status_code},
-            )
-        run = resp.json()
-        # run["id"] is the canonical field; fall back to run["run_id"] if present
-        run_id = run.get("id") or run.get("run_id")
-
+    schedule_auto_title(
+        background_tasks, request, message=message, message_text=message_text,
+        session_id=session_id, auth=_auth, clearance=clearance, model_hint=model,
+    )
+    # run["id"] is the canonical field; fall back to run["run_id"] if present
+    run_id = run.get("id") or run.get("run_id")
     return JSONResponse(
         status_code=200,
-        content={"run_id": run_id, "message_id": message_id, "run": run},
+        content={"run_id": run_id, "message_id": (message or {}).get("id"), "run": run},
     )
 
 
@@ -326,42 +401,75 @@ async def pending(
     )
 
 
-@router.get("/sessions/{session_id}/stream")
+@router.get("/sessions/{session_id}/stream", response_model=None)
 async def stream(
     session_id: str,
     request: Request,
+    after: int | None = Query(default=None, ge=0),
+    after_id: str | None = Query(default=None, max_length=64),
     _auth: tuple = Depends(require_auth()),
-) -> StreamingResponse:
+) -> StreamingResponse | JSONResponse:
     """Relay the session-scoped SSE stream from the orchestrator.
 
     Connects to ``GET {orch}/sessions/{session_id}/stream`` and relays all
     SSE lines verbatim: ``event:``, ``data:``, and blank-line frame separators.
+    ``after`` / ``after_id`` (the newest message the client holds) are
+    forwarded so a reconnect only receives newer rows.
 
-    Emits an ``event: error`` frame if the upstream connection fails.
+    The upstream connection is opened before the response starts, so its
+    status reaches the client: a 4xx (not the owner, session deleted) is
+    passed through and tells the client to stop reconnecting, and an
+    unreachable orchestrator is a 502.  A connection lost mid-stream ends with
+    a generic ``event: error`` frame — never internal exception text.
     """
     tenant_id, user_id, access_token = _auth
     orch_url = request.app.state.settings.session_orchestrator_url
+    headers = foundation_headers(tenant_id, user_id, access_token)
+
+    client = httpx.AsyncClient(timeout=httpx.Timeout(600, connect=10))
+    upstream_cm = client.stream(
+        "GET", f"{orch_url}/sessions/{session_id}/stream", headers=headers,
+        params={
+            key: value for key, value in (("after", after), ("after_id", after_id))
+            if value is not None
+        } or None,
+    )
+    try:
+        upstream = await upstream_cm.__aenter__()
+    except Exception as exc:  # noqa: BLE001
+        await client.aclose()
+        logger.warning("stream relay connect failed for session %s: %s", session_id, exc)
+        return JSONResponse(status_code=502,
+                            content={"detail": "Stream unavailable", "status": 502})
+
+    status = getattr(upstream, "status_code", 200)
+    if status != 200:
+        detail: Any = "Stream unavailable"
+        with contextlib.suppress(Exception):
+            body = json.loads(await upstream.aread())
+            detail = body.get("detail", detail) if isinstance(body, dict) else detail
+        with contextlib.suppress(Exception):
+            await upstream_cm.__aexit__(None, None, None)
+        await client.aclose()
+        relay_status = status if 400 <= status < 500 else 502
+        return JSONResponse(status_code=relay_status,
+                            content={"detail": detail, "status": relay_status})
 
     async def event_generator():
-        headers = foundation_headers(tenant_id, user_id, access_token)
         try:
-            async with (
-                httpx.AsyncClient(timeout=600) as client,
-                client.stream(
-                    "GET",
-                    f"{orch_url}/sessions/{session_id}/stream",
-                    headers=headers,
-                ) as upstream,
-            ):
-                async for line in upstream.aiter_lines():
-                    if line.startswith("event:") or line.startswith("data:"):
-                        yield f"{line}\n"
-                    elif line == "":
-                        yield "\n"
+            async for line in upstream.aiter_lines():
+                if line.startswith("event:") or line.startswith("data:"):
+                    yield f"{line}\n"
+                elif line == "":
+                    yield "\n"
         except Exception as exc:  # noqa: BLE001
             logger.warning("stream relay error for session %s: %s", session_id, exc)
-            payload = json.dumps({"detail": "Stream connection failed", "error": str(exc)})
+            payload = json.dumps({"detail": "Stream connection lost"})
             yield f"event: error\ndata: {payload}\n\n"
+        finally:
+            with contextlib.suppress(Exception):
+                await upstream_cm.__aexit__(None, None, None)
+            await client.aclose()
 
     return StreamingResponse(
         event_generator(),

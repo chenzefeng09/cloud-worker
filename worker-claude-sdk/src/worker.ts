@@ -48,10 +48,14 @@ import {
   makeCanUseTool,
   newHitlContext,
   newTranscriptAccumulator,
+  recordTranscriptText,
+  recordTranscriptToolCall,
+  recordTranscriptToolResult,
   snapshotTranscriptForPause,
   type HitlContext,
   type PendingToolCall,
   type ReplayState,
+  type TranscriptAccumulator,
 } from "./hitl.js";
 
 /**
@@ -140,13 +144,52 @@ export function extractStructuredOutputSchema(
   return rf.schema;
 }
 
-/** Result of a completed run, surfaced to main() for result.json + exit code. */
+/**
+ * Result of a completed run, surfaced to main() for result.json + exit code.
+ * "cancelled" = the run was aborted from outside (SIGTERM / abortController)
+ * before it finished; main() records it as FAILED in result.json.
+ */
 export interface RunResult {
-  status: "OK" | "FAILED" | "paused";
+  status: "OK" | "FAILED" | "paused" | "cancelled";
   summary: string;
   error?: string;
   usage: Usage;
   plan_steps: never[];
+}
+
+/**
+ * The short, user-safe text pushed as the token stream's `error` entry when a
+ * run fails. Deliberately generic: never the raw exception / upstream body
+ * (stack traces, paths, hostnames, keys). `apiError` is the SDK's assistant
+ * error code; `resultSubtype` the SDK result subtype.
+ */
+export function userSafeErrorMessage(info: {
+  apiError?: string;
+  resultSubtype?: string;
+}): string {
+  switch (info.apiError) {
+    case "rate_limit":
+      return "The model service is rate-limiting requests. Please try again in a moment.";
+    case "authentication_failed":
+    case "billing_error":
+      return "The model service rejected the request. Please contact your administrator.";
+    case "invalid_request":
+      return "The model service rejected the request.";
+    case "server_error":
+      return "The model service is temporarily unavailable. Please try again.";
+    default:
+      break;
+  }
+  switch (info.resultSubtype) {
+    case "error_max_turns":
+      return "The agent stopped after reaching its maximum number of steps.";
+    case "error_max_budget_usd":
+      return "The agent stopped after reaching its budget limit.";
+    case "error_max_structured_output_retries":
+      return "The agent could not produce output in the required format.";
+    default:
+      return "The agent run failed unexpectedly. Please try again.";
+  }
 }
 
 // ── S3 attachment download ─────────────────────────────────────────────────
@@ -1220,6 +1263,11 @@ export async function runQuery(
      * prompt so the (static) system prefix stays cache-hittable across runs.
      */
     resumeNote?: string;
+    /**
+     * Aborting it (main() does on SIGTERM / SIGINT) stops the SDK query; the
+     * run then ends as "cancelled" with `end(status="cancelled")` pushed.
+     */
+    abortController?: AbortController;
     deps?: RunQueryDeps;
   },
 ): Promise<RunResult> {
@@ -1327,6 +1375,7 @@ export async function runQuery(
     options.allowDangerouslySkipPermissions = true;
   }
   if (model) options.model = model;
+  if (opts.abortController) options.abortController = opts.abortController;
 
   // ── sampling / reasoning controls ──
   // The Claude Agent SDK's Options surface exposes ONLY `maxThinkingTokens` (the
@@ -1378,20 +1427,29 @@ export async function runQuery(
   }
 
   let summary = "";
+  /** block_id of the text block the summary was last extended from. */
+  let summaryBlockId: string | null = null;
   let sawError = false;
   let errorMessage: string | undefined;
+  /** SDK error code of an API failure the CLI surfaced as an assistant message. */
+  let apiError: string | undefined;
+  /** SDK result subtype behind a failed run (error_max_turns, …). */
+  let resultSubtype: string | undefined;
+  /** A result message (success or error) was received. */
+  let sawResult = false;
+  /** Aborted from outside (SIGTERM / abortController) before finishing. */
+  let cancelled = false;
 
   // Tool-call accumulators, used to drive the Redis token-stream pushes in the
   // exact order the AgentScope worker uses (tool_call after ToolCallEnd;
   // tool_result after ToolResultEnd; delta as text streams; end at the close).
   const toolArgs = new Map<string, string>();
   const toolResultText = new Map<string, string>();
-  // Thinking accumulator: buffer reasoning deltas per block_id and push the whole
-  // block as ONE Redis type=thinking entry on its End (see pushToRedis doc).
-  const thinkingBuffers = new Map<string, string>();
+  /** Tool calls already closed: a repeat close is dropped entirely. */
+  const closedToolCalls = new Set<string>();
 
-  // HITL transcript accumulator: mirrors the token-stream maps but in a form we
-  // can serialize into the paused blob's agent_state for history-replay.
+  // HITL transcript accumulator: text and tool calls in stream order, in a form
+  // we can serialize into the paused blob's agent_state for history-replay.
   const acc = newTranscriptAccumulator();
 
   // Prompt selection. A resume leg reconstructs the conversation as a streamed
@@ -1414,6 +1472,15 @@ export async function runQuery(
     for await (const msg of response as AsyncIterable<SDKMessage>) {
       const events = translator.translateMessage(msg);
       for (const ev of events) {
+        // Defensive: the translator closes each tool call exactly once. Should a
+        // second close for the same id ever slip through, drop it entirely — no
+        // second tool_call entry, transcript record or checkpoint.
+        if (ev.event_type === "ToolCallEndEvent") {
+          const id = String(ev.tool_call_id ?? "");
+          if (id && closedToolCalls.has(id)) continue;
+          if (id) closedToolCalls.add(id);
+        }
+
         appendEvent(evPath, ev);
 
         // HITL pause guard: when canUseTool denies+interrupts a tool call, the
@@ -1431,21 +1498,30 @@ export async function runQuery(
           continue;
         }
 
-        await pushToRedis(
-          opts.redis,
-          ev,
-          toolArgs,
-          toolResultText,
-          thinkingBuffers,
-          translator,
-        );
+        await pushToRedis(opts.redis, ev, toolArgs, toolResultText, translator);
 
         if (ev.event_type === "TextBlockDeltaEvent") {
-          summary += String(ev.delta ?? "");
-          acc.assistantText += String(ev.delta ?? "");
+          const delta = String(ev.delta ?? "");
+          const blockId = String(ev.block_id ?? "");
+          if (delta) {
+            // Separate text blocks (e.g. before and after a tool call) by a
+            // paragraph break instead of running them together.
+            if (summary && blockId !== summaryBlockId) {
+              summary = withParagraphBreak(summary);
+            }
+            summaryBlockId = blockId;
+            summary += delta;
+          }
+          recordTranscriptText(acc, blockId, delta);
         } else if (ev.event_type === "ToolCallEndEvent") {
-          // Record the completed tool call for the replay snapshot.
-          recordToolCall(acc, ev, toolArgs, translator);
+          // Record the closed tool call (at its position) for the replay snapshot.
+          const id = String(ev.tool_call_id ?? "");
+          recordTranscriptToolCall(
+            acc,
+            id,
+            translator.toolNameFor(id),
+            toolCallArgs(ev, toolArgs),
+          );
           // RUNNING checkpoint + result.json refresh after each tool call.
           await opts.redis.writeStep({
             cursor: "ToolCallEndEvent",
@@ -1458,10 +1534,18 @@ export async function runQuery(
             plan_steps: [],
           });
         } else if (ev.event_type === "ToolResultEndEvent") {
-          recordToolResult(acc, ev, toolResultText);
+          const id = String(ev.tool_call_id ?? "");
+          recordTranscriptToolResult(acc, id, toolResultText.get(id) ?? "");
+        } else if (ev.event_type === "ApiErrorEvent") {
+          // Not terminal by itself (the CLI may recover); the result decides.
+          apiError = String(ev.error ?? "unknown");
         } else if (ev.event_type === "ErrorEvent") {
+          sawResult = true;
           sawError = true;
           errorMessage = String(ev.message ?? "result error");
+          resultSubtype = typeof ev.subtype === "string" ? ev.subtype : undefined;
+        } else if (ev.event_type === "ReplyEndEvent") {
+          sawResult = true;
         }
       }
 
@@ -1471,17 +1555,23 @@ export async function runQuery(
       if (hitlCtx.paused) break;
     }
   } catch (err) {
-    // A deny+interrupt may surface as a thrown AbortError. When we have already
-    // flagged a pause, treat ANY throw as the pause path (the run was
-    // intentionally interrupted), not a failure. Otherwise it is a real error.
-    if (hitlCtx.paused || err instanceof AbortError) {
-      hitlCtx.paused = true;
+    if (hitlCtx.paused) {
+      // canUseTool recorded a pending confirmation/question and interrupted the
+      // run on purpose; the SDK may surface that as a throw (AbortError).
       console.log(
         `[worker] query() interrupted for HITL pause (${(err as Error)?.name ?? "?"})`,
       );
+    } else if (opts.abortController?.signal.aborted) {
+      cancelled = true;
+      console.log("[worker] query() aborted from outside: run cancelled");
     } else {
+      // A real failure — including an AbortError with nothing pending (never
+      // mistaken for a pause: there is nothing for a human to answer).
       sawError = true;
-      errorMessage = (err as Error)?.message ?? String(err);
+      errorMessage =
+        err instanceof AbortError
+          ? `query aborted unexpectedly: ${err.message}`
+          : (err as Error)?.message ?? String(err);
       appendEvent(evPath, {
         event_type: "ErrorEvent",
         message: errorMessage,
@@ -1489,26 +1579,45 @@ export async function runQuery(
     }
   }
 
-  // Wind-down flush: any thinking block that never saw an End (aborted/errored/
-  // paused mid-reasoning) is pushed now so its content is not dropped. A clean
-  // run leaves no residue here (every block flushed at its End).
-  await flushThinkingBuffers(opts.redis, thinkingBuffers);
+  // Aborted from outside without the iterator throwing, before any result.
+  if (
+    !hitlCtx.paused &&
+    !cancelled &&
+    !sawResult &&
+    opts.abortController?.signal.aborted
+  ) {
+    cancelled = true;
+  }
+  // An API error with no result after it: the run did not recover.
+  if (!hitlCtx.paused && !cancelled && !sawResult && apiError && !sawError) {
+    sawError = true;
+    errorMessage = `model API error (${apiError})`;
+  }
 
   const usage = translator.getCumulativeUsage();
 
-  // ── HITL pause: persist the paused blob + pending entries, do NOT end stream ──
+  // ── HITL pause: paused blob + pending entries + end(status="paused") ──
   if (hitlCtx.paused) {
     return await handlePause(task, opts.redis, hitlCtx, acc, summary, usage);
   }
 
-  // Close the Redis token stream on a non-paused outcome (a pause leaves the
-  // stream open so the resume leg can continue it).
-  await opts.redis.pushTokenEnd();
+  // Every other exit closes the token stream with exactly one terminal entry
+  // (the client drops duplicates); a failure first pushes a user-safe `error`.
+  if (cancelled) {
+    await opts.redis.pushTokenEnd("cancelled");
+    return {
+      status: "cancelled",
+      summary: summary.trim(),
+      error: "run cancelled",
+      usage,
+      plan_steps: [],
+    };
+  }
 
   summary = summary.trim();
-  if (!sawError && !summary) summary = "(agent returned an empty reply)";
-
   if (sawError) {
+    await opts.redis.pushError(userSafeErrorMessage({ apiError, resultSubtype }));
+    await opts.redis.pushTokenEnd("failed");
     return {
       status: "FAILED",
       summary: summary || "worker run failed",
@@ -1517,66 +1626,45 @@ export async function runQuery(
       plan_steps: [],
     };
   }
+  if (!summary) summary = "(agent returned an empty reply)";
+  await opts.redis.pushTokenEnd("completed");
   return { status: "OK", summary, usage, plan_steps: [] };
 }
 
+/** Append a paragraph break unless `s` already ends with one. */
+function withParagraphBreak(s: string): string {
+  if (s.endsWith("\n\n")) return s;
+  return s.endsWith("\n") ? `${s}\n` : `${s}\n\n`;
+}
+
 /**
- * Record a completed tool call into the HITL transcript accumulator (name + args
- * keyed by tool_use_id, in first-seen order) so a pause can snapshot it.
+ * The complete JSON args of a closed tool call: the ToolCallEndEvent's `args`
+ * (consolidated, CLI-normalised input) when present, else the streamed deltas.
  */
-function recordToolCall(
-  acc: ReturnType<typeof newTranscriptAccumulator>,
-  ev: EventPayload,
-  toolArgs: Map<string, string>,
-  translator: EventTranslator,
-): void {
-  const id = String(ev.tool_call_id ?? "");
-  if (!id) return;
-  if (!acc.toolName.has(id)) acc.toolOrder.push(id);
-  acc.toolName.set(id, translator.toolNameFor(id));
-  acc.toolArgs.set(id, toolArgs.get(id) ?? "");
-}
-
-/** Record a tool result text into the accumulator, keyed by tool_use_id. */
-function recordToolResult(
-  acc: ReturnType<typeof newTranscriptAccumulator>,
-  ev: EventPayload,
-  toolResultText: Map<string, string>,
-): void {
-  const id = String(ev.tool_call_id ?? "");
-  if (!id) return;
-  acc.toolResult.set(id, toolResultText.get(id) ?? "");
+function toolCallArgs(ev: EventPayload, toolArgs: Map<string, string>): string {
+  if (typeof ev.args === "string") return ev.args;
+  return toolArgs.get(String(ev.tool_call_id ?? "")) ?? "";
 }
 
 /**
- * Persist a HITL pause: push the pending confirmation/question entries (NO
- * type=end — the stream stays open for the resume leg), write the paused blob
- * with our replay transcript under agent_state, mark the run PAUSED, and return a
- * paused RunResult. Failure-open: Redis errors are swallowed by the client.
+ * Persist a HITL pause, in an order that is safe for a consumer reacting to
+ * the stream: write the paused blob (our replay transcript under agent_state),
+ * mark the run PAUSED (also extending the token stream to the paused TTL),
+ * then push the pending confirmation/question entries and finally
+ * `end(status="paused")` — the resume leg (a new process) appends to the same
+ * stream. Returns a paused RunResult. Failure-open: the client swallows Redis
+ * errors.
  */
 async function handlePause(
   task: Task,
   redis: RedisStateClient,
   ctx: HitlContext,
-  acc: ReturnType<typeof newTranscriptAccumulator>,
+  acc: TranscriptAccumulator,
   summary: string,
   usage: Usage,
 ): Promise<RunResult> {
   const pending: PendingToolCall[] = ctx.pending;
   const kind = ctx.kind === "question" ? "question" : "confirm";
-
-  // Token-stream pending entries (one per pending call).
-  if (kind === "question") {
-    const first = pending[0];
-    await redis.pushPendingQuestion(
-      first?.id ?? "",
-      ctx.question ?? "",
-    );
-  } else {
-    for (const p of pending) {
-      await redis.pushPendingConfirmation(p.id, p.name, p.args);
-    }
-  }
 
   // Our replay transcript → agent_state (opaque to the orchestrator).
   const replayState: ReplayState = snapshotTranscriptForPause(task, acc, pending);
@@ -1590,6 +1678,20 @@ async function handlePause(
     paused_at: new Date().toISOString(),
   });
   await redis.markPaused();
+
+  // Token-stream pending entries (one per pending call), then the terminal end.
+  if (kind === "question") {
+    const first = pending[0];
+    await redis.pushPendingQuestion(
+      first?.id ?? "",
+      ctx.question ?? "",
+    );
+  } else {
+    for (const p of pending) {
+      await redis.pushPendingConfirmation(p.id, p.name, p.args);
+    }
+  }
+  await redis.pushTokenEnd("paused");
 
   console.log(
     `[worker] run paused for HITL (${kind}); ${pending.length} pending tool call(s)`,
@@ -1606,23 +1708,19 @@ async function handlePause(
 /**
  * Push one translated event into the Redis token stream, mirroring the
  * AgentScope worker's push order: text deltas → delta; tool call args coalesced
- * and pushed on ToolCallEnd; tool result text coalesced and pushed on
- * ToolResultEnd; thinking accumulated per block_id and pushed as ONE entry on
- * ThinkingBlockEnd.
+ * and pushed (once per call, complete JSON) on ToolCallEnd; tool result text
+ * coalesced and pushed on ToolResultEnd.
  *
- * Thinking contract (matches the AgentScope worker): the downstream pipeline
- * treats "one Redis type=thinking entry = one complete thought block", so a
- * thinking block is buffered by block_id across its deltas and flushed exactly
- * once at its End. Pushing per-delta would explode one thought into hundreds of
- * standalone collapsible cards in the UI. Text, by contrast, stays per-token
- * streamed (pushToken on each delta) for the live typing experience.
+ * Thinking: live reasoning chunks stream as `thinking_delta` entries (the
+ * client coalesces adjacent chunks) so reasoning shows while it happens, before
+ * the answer; a whole block from a non-streamed (consolidated-only) message is
+ * pushed as one `thinking` entry.
  */
 async function pushToRedis(
   redis: RedisStateClient,
   ev: EventPayload,
   toolArgs: Map<string, string>,
   toolResultText: Map<string, string>,
-  thinkingBuffers: Map<string, string>,
   translator: EventTranslator,
 ): Promise<void> {
   switch (ev.event_type) {
@@ -1641,7 +1739,7 @@ async function pushToRedis(
       await redis.pushToolCall(
         id,
         translator.toolNameFor(id),
-        toolArgs.get(id) ?? "",
+        toolCallArgs(ev, toolArgs),
       );
       break;
     }
@@ -1663,48 +1761,19 @@ async function pushToRedis(
       );
       break;
     }
-    case "ThinkingBlockStartEvent": {
-      const id = String(ev.block_id ?? "");
-      thinkingBuffers.set(id, "");
-      break;
-    }
     case "ThinkingBlockDeltaEvent": {
-      // Accumulate by block_id only; the whole block is pushed once at its End.
-      const id = String(ev.block_id ?? "");
-      thinkingBuffers.set(id, (thinkingBuffers.get(id) ?? "") + String(ev.delta ?? ""));
-      break;
-    }
-    case "ThinkingBlockEndEvent": {
-      const id = String(ev.block_id ?? "");
-      const text = thinkingBuffers.get(id) ?? "";
-      thinkingBuffers.delete(id);
-      if (text) await redis.pushThinking(text);
+      const text = String(ev.delta ?? "");
+      if (!text) break;
+      if (ev.whole_block === true) {
+        await redis.pushThinking(text);
+      } else {
+        await redis.pushThinkingDelta(text);
+      }
       break;
     }
     default:
       break;
   }
-}
-
-/**
- * Flush any thinking blocks that never received a ThinkingBlockEnd (e.g. the run
- * was aborted/errored mid-block) so their content is not silently dropped. Each
- * residual buffer is pushed as one Redis thinking entry — same "one entry = one
- * block" contract as the normal End path. Buffers are consumed (cleared) so this
- * is safe to call once at run wind-down.
- */
-async function flushThinkingBuffers(
-  redis: RedisStateClient,
-  thinkingBuffers: Map<string, string>,
-): Promise<void> {
-  if (thinkingBuffers.size === 0) return;
-  for (const text of thinkingBuffers.values()) {
-    if (text) await redis.pushThinking(text);
-  }
-  console.log(
-    `[worker] flushed ${thinkingBuffers.size} unterminated thinking block(s) at wind-down`,
-  );
-  thinkingBuffers.clear();
 }
 
 async function ensureDirs(): Promise<void> {

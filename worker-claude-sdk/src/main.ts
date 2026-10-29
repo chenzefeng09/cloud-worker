@@ -1,11 +1,21 @@
 /**
  * main.ts — the Claude SDK runtime worker coordinator.
  *
- * Mirrors the AgentScope runtime_worker `main()` exit-code contract:
- *   - missing required infra env  → result.json(FAILED) → exit 1
- *   - missing / malformed task    → result.json(FAILED) → exit 2
- *   - run completed (OK or FAILED status inside result.json) → exit 0
- *   - worker raised / crashed     → result.json(FAILED) → exit 1
+ * Exit-code contract (what the code below actually returns):
+ *   - missing required infra env        → result.json(FAILED)  → exit 1
+ *   - missing / malformed task          → result.json(FAILED)  → exit 2
+ *   - empty task text                   → result.json(FAILED)  → exit 0
+ *   - run completed OK                  → result.json(OK)      → exit 0
+ *   - run paused for HITL               → result.json(paused)  → exit 0
+ *   - run FAILED (model / agent failure) → result.json(FAILED) → exit 1
+ *   - run cancelled (SIGTERM / SIGINT)  → result.json(FAILED)  → exit 1
+ *   - worker raised / crashed           → result.json(FAILED)  → exit 1
+ *
+ * Token stream: every path above that has a RUN_ID ends the run's Redis token
+ * stream with exactly one `end` entry carrying the terminal status
+ * (completed | failed | paused | cancelled); a failure pushes a short,
+ * user-safe `error` entry first. These pushes are best-effort — a Redis outage
+ * never masks the original failure or changes the exit code.
  *
  * It also owns lifecycle: start the in-process gateway adapter, point the SDK at
  * it via ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN, drive worker.runQuery, then
@@ -26,7 +36,7 @@ import {
 } from "./task.js";
 import { writeResult } from "./result.js";
 import { fromEnv as redisFromEnv, type RedisStateClient } from "./redis_state.js";
-import { GatewayAdapter } from "./adapter.js";
+import { GatewayAdapter, type GatewayAdapterOptions } from "./adapter.js";
 import {
   buildResumeContext,
   buildSystemPrompt,
@@ -36,6 +46,7 @@ import {
   mapReasoningEffort,
   runQuery,
   getWorkspaceDir,
+  userSafeErrorMessage,
   type RunResult,
 } from "./worker.js";
 
@@ -162,8 +173,87 @@ export interface MainDeps {
   queryFn?: typeof query;
   /** Build the Redis client (defaults to redis_state.fromEnv()). */
   makeRedis?: () => RedisStateClient;
-  /** Build the gateway adapter (defaults to a real GatewayAdapter). */
-  makeAdapter?: (env: Env, task: Task) => GatewayAdapter;
+  /**
+   * Build the gateway adapter (defaults to a real GatewayAdapter). `opts` are
+   * the options main() derived from env + task (see buildAdapterOptions).
+   */
+  makeAdapter?: (env: Env, task: Task, opts: GatewayAdapterOptions) => GatewayAdapter;
+  /**
+   * Aborting it cancels the run (the direct entrypoint wires SIGTERM / SIGINT
+   * to it): the SDK query stops and the run ends as cancelled.
+   */
+  abortController?: AbortController;
+}
+
+/** User-safe stream messages for failures before the agent loop starts. */
+const EARLY_FAILURE_MESSAGES = {
+  env: "The agent could not start (sandbox configuration error).",
+  task: "The agent could not start (invalid task payload).",
+  emptyTask: "The task text is empty.",
+} as const;
+
+/**
+ * The gateway adapter options for a task. A resume leg derives them from its
+ * (re-sent) task payload exactly like a fresh run: model, output cap,
+ * reasoning effort and structured-output schema.
+ */
+export function buildAdapterOptions(env: Env, task: Task): GatewayAdapterOptions {
+  return {
+    gatewayUrl: env.LLM_GATEWAY_URL || undefined,
+    targetModel: task.model_override || env.LLM_MODEL,
+    foundationToken: env.FOUNDATION_API_TOKEN,
+    tenantId: env.FOUNDATION_TENANT_ID,
+    virtualKey: env.LLM_VIRTUAL_KEY,
+    userId: env.FOUNDATION_USER_ID,
+    brokerLease: env.TOOL_BROKER_LEASE,
+    // Request-level features the Claude SDK Options surface cannot express,
+    // so they are carried into the adapter snapshot (see adapter.ts):
+    //   - max_tokens (model OUTPUT cap) from sampling_params,
+    //   - reasoning_effort (clamped to DeepSeek's high/max),
+    //   - structured-output JSON schema (constrained decoding).
+    maxOutputTokens: task.sampling_params?.max_tokens,
+    reasoningEffort: mapReasoningEffort(task.reasoning_effort),
+    structuredOutputSchema: extractStructuredOutputSchema(task.sampling_params),
+    port: 0,
+  };
+}
+
+/**
+ * Best-effort: end the token stream as failed — a user-safe `error` entry,
+ * then `end(status="failed")`. Never throws, so a Redis/broker outage cannot
+ * mask the original failure or change the exit code.
+ */
+async function pushFailureToStream(
+  redis: RedisStateClient,
+  message: string,
+): Promise<void> {
+  try {
+    await redis.pushError(message);
+    await redis.pushTokenEnd("failed");
+  } catch (err) {
+    console.warn(
+      `[main] could not report the failure to the token stream: ${(err as Error).message}`,
+    );
+  }
+}
+
+/** {@link pushFailureToStream} for a failure before the run's client exists. */
+async function reportEarlyFailure(deps: MainDeps, message: string): Promise<void> {
+  let redis: RedisStateClient | null = null;
+  try {
+    redis = deps.makeRedis ? deps.makeRedis() : redisFromEnv();
+    await pushFailureToStream(redis, message);
+  } catch (err) {
+    console.warn(
+      `[main] could not report the failure to the token stream: ${(err as Error).message}`,
+    );
+  } finally {
+    try {
+      await redis?.close();
+    } catch {
+      // best-effort
+    }
+  }
 }
 
 export async function main(deps: MainDeps = {}): Promise<number> {
@@ -182,6 +272,7 @@ export async function main(deps: MainDeps = {}): Promise<number> {
       usage: EMPTY_USAGE,
       plan_steps: [],
     });
+    await reportEarlyFailure(deps, EARLY_FAILURE_MESSAGES.env);
     return 1;
   }
 
@@ -197,6 +288,7 @@ export async function main(deps: MainDeps = {}): Promise<number> {
       usage: EMPTY_USAGE,
       plan_steps: [],
     });
+    await reportEarlyFailure(deps, EARLY_FAILURE_MESSAGES.task);
     return 2;
   }
 
@@ -211,30 +303,15 @@ export async function main(deps: MainDeps = {}): Promise<number> {
       usage: EMPTY_USAGE,
       plan_steps: [],
     });
+    await reportEarlyFailure(deps, EARLY_FAILURE_MESSAGES.emptyTask);
     return 0;
   }
 
   const redis = deps.makeRedis ? deps.makeRedis() : redisFromEnv();
+  const adapterOptions = buildAdapterOptions(env, task);
   const adapter = deps.makeAdapter
-    ? deps.makeAdapter(env, task)
-    : new GatewayAdapter({
-        gatewayUrl: env.LLM_GATEWAY_URL || undefined,
-        targetModel: task.model_override || env.LLM_MODEL,
-        foundationToken: env.FOUNDATION_API_TOKEN,
-        tenantId: env.FOUNDATION_TENANT_ID,
-        virtualKey: env.LLM_VIRTUAL_KEY,
-        userId: env.FOUNDATION_USER_ID,
-        brokerLease: env.TOOL_BROKER_LEASE,
-        // Request-level features the Claude SDK Options surface cannot express,
-        // so they are carried into the adapter snapshot (see adapter.ts):
-        //   - max_tokens (model OUTPUT cap) from sampling_params,
-        //   - reasoning_effort (clamped to DeepSeek's high/max),
-        //   - structured-output JSON schema (constrained decoding).
-        maxOutputTokens: task.sampling_params?.max_tokens,
-        reasoningEffort: mapReasoningEffort(task.reasoning_effort),
-        structuredOutputSchema: extractStructuredOutputSchema(task.sampling_params),
-        port: 0,
-      });
+    ? deps.makeAdapter(env, task, adapterOptions)
+    : new GatewayAdapter(adapterOptions);
 
   try {
     // Point the SDK at the in-process adapter BEFORE query() runs.
@@ -271,12 +348,14 @@ export async function main(deps: MainDeps = {}): Promise<number> {
       mcpFilters,
       redis,
       resumeNote,
+      abortController: deps.abortController,
       deps: deps.queryFn ? { queryFn: deps.queryFn } : undefined,
     });
 
     writeResult(getWorkspaceDir(), {
-      status: result.status,
-      summary: result.summary,
+      // result.json has no "cancelled" status; the scheduler sees FAILED.
+      status: result.status === "cancelled" ? "FAILED" : result.status,
+      summary: result.status === "cancelled" ? "run cancelled" : result.summary,
       error: result.error ?? null,
       usage: result.usage,
       plan_steps: result.plan_steps,
@@ -293,7 +372,8 @@ export async function main(deps: MainDeps = {}): Promise<number> {
       // sandbox with a resume payload. Exit 0 so the scheduler maps it to PAUSED.
       return 0;
     }
-    // A FAILED run status from the agent loop is an infra/model failure → exit 1.
+    // A FAILED (or cancelled) run from the agent loop → exit 1. runQuery has
+    // already pushed the stream's error/end entries.
     await redis.markFailed();
     return 1;
   } catch (err) {
@@ -305,6 +385,9 @@ export async function main(deps: MainDeps = {}): Promise<number> {
       usage: EMPTY_USAGE,
       plan_steps: [],
     });
+    // A no-op when runQuery already ended the stream (the client pushes `end`
+    // only once).
+    await pushFailureToStream(redis, userSafeErrorMessage({}));
     try {
       await redis.markFailed();
     } catch {
@@ -334,7 +417,19 @@ const isDirectRun =
   import.meta.url === `file://${process.argv[1]}`;
 
 if (isDirectRun) {
-  main()
+  // Cancellation: `docker stop` / a VM teardown sends SIGTERM (node runs as
+  // PID 1, which ignores it without a handler). Abort the run instead so it
+  // ends the token stream with end(status="cancelled") before exiting.
+  const abortController = new AbortController();
+  const onSignal = (signal: NodeJS.Signals): void => {
+    if (abortController.signal.aborted) return;
+    console.log(`[main] received ${signal}; cancelling the run`);
+    abortController.abort();
+  };
+  process.once("SIGTERM", onSignal);
+  process.once("SIGINT", onSignal);
+
+  main({ abortController })
     .then((code) => {
       process.exit(code);
     })

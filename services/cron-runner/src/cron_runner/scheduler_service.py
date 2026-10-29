@@ -123,6 +123,11 @@ async def _do_fire(job_id: str, settings: Settings) -> None:
         "inputs": flat_inputs,
         "source": "schedule",  # forwarded as-is; run_app ignores unknown keys
     }
+    # The run executes as the service account; naming the trigger's owner lets
+    # the BFF record whose behalf the session is on, so that user's export and
+    # erasure reach it.
+    if job.created_by_user_id:
+        run_body["on_behalf_of"] = job.created_by_user_id
 
     async with httpx.AsyncClient(timeout=30) as client:
         run_resp = await client.post(

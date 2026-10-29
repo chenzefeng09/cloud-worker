@@ -12,13 +12,13 @@ service can still operate behind a gateway that doesn't unwrap the JWT.
 from __future__ import annotations
 
 import logging
-import uuid
-from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.responses import JSONResponse
 
+from agent_bff.api._audit import emit_admin_audit
 from agent_bff.api._http import foundation_headers
 from agent_bff.api.dependencies import TClearance, require_auth
 
@@ -31,25 +31,12 @@ _AUTHZ_TIMEOUT = 2.0
 
 # Audit event types emitted when an admin views session replay data.
 _AUDIT_EVENT_SESSION_LIST = "admin.session.list.viewed"
-
-# Short timeout so audit (a side-channel) never holds up the user-facing
-# response.  foundation-audit ingest is fire-and-forget from the BFF's view.
-_AUDIT_TIMEOUT = 5
+_AUDIT_EVENT_SESSION_RUNS = "admin.session.runs.viewed"
+_AUDIT_EVENT_SESSION_MESSAGES = "admin.session.messages.viewed"
 
 
 async def _orchestrator_url(request: Request) -> str:
     return request.app.state.settings.session_orchestrator_url
-
-
-def _new_event_id() -> str:
-    """Generate an ``evt_<26 upper-alnum>`` id.
-
-    foundation-audit's ``AuditEvent.event_id`` is constrained to the pattern
-    ``^evt_[0-9A-Z]{26}$``.  We reuse the same uuid-hex scheme the BFF domain
-    models use (``new_id``) — 26 hex chars uppercased satisfies ``[0-9A-Z]``
-    without pulling in a ULID dependency.
-    """
-    return f"evt_{uuid.uuid4().hex[:26].upper()}"
 
 
 async def _emit_session_view_audit(
@@ -59,48 +46,26 @@ async def _emit_session_view_audit(
     access_token: str,
     event_type: str,
     resource_id: str | None,
+    *,
+    payload: dict[str, Any] | None = None,
 ) -> None:
     """Write a best-effort audit event for an admin session-view action.
 
-    This is a SIDE-CHANNEL: any failure (bad config, audit down, non-2xx,
-    timeout) is swallowed with a warning log and never propagates to the
-    caller.  The session-view endpoints must return their data regardless of
-    whether the audit record landed.
-
-    Posts the canonical ``AuditEvent`` shape to foundation-audit's ingest
-    endpoint ``POST {foundation_audit_url}/events`` using the same
-    ``foundation_headers`` convention every other BFF→foundation call uses
-    (``X-Tenant-Id`` / ``X-User-Id`` + bearer); the audit service builds its
-    tenant context from those headers.
+    A side-channel (see ``agent_bff.api._audit``): failures are logged and
+    never reach the caller, so the session-view endpoints return their data
+    whether or not the audit record landed.  ``payload`` adds counts and ids
+    to the ``via`` marker — never message content.
     """
-    try:
-        body = {
-            "event_id": _new_event_id(),
-            "occurred_at": datetime.now(UTC).isoformat(),
-            "tenant_id": tenant_id,
-            "service": "agent-bff",
-            "event_type": event_type,
-            "outcome": "SUCCESS",
-            "actor_kind": "ADMIN",
-            "actor_user_id": user_id,
-            "resource_type": "session",
-            "resource_id": resource_id,
-            "payload": {"via": "admin_session_view"},
-        }
-        async with httpx.AsyncClient(timeout=_AUDIT_TIMEOUT) as client:
-            resp = await client.post(
-                f"{settings.foundation_audit_url}/events",
-                json=body,
-                headers=foundation_headers(tenant_id, user_id, access_token),
-            )
-        if resp.status_code >= 400:
-            logger.warning(
-                "session-view audit rejected (%s): %s",
-                resp.status_code,
-                event_type,
-            )
-    except Exception as exc:  # noqa: BLE001 — audit is best-effort, never blocks
-        logger.warning("session-view audit emit failed (%s): %s", event_type, exc)
+    await emit_admin_audit(
+        settings,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        access_token=access_token,
+        event_type=event_type,
+        resource_type="session",
+        resource_id=resource_id,
+        payload={"via": "admin_session_view", **(payload or {})},
+    )
 
 
 def _proxy_json(resp: httpx.Response) -> JSONResponse:
@@ -182,6 +147,45 @@ async def require_tenant_admin_bff(
     return tenant_id, user_id, access_token
 
 
+def _admin_actor_headers(tenant_id: str, user_id: str, access_token: str) -> dict[str, str]:
+    """``foundation_headers`` + ``X-Actor: ADMIN`` (only after the tenant-admin guard).
+
+    The orchestrator's per-session owner check returns 404 to anyone but the
+    owner unless this marker is present, so admin replay must assert it.
+    """
+    headers = foundation_headers(tenant_id, user_id, access_token)
+    headers["X-Actor"] = "ADMIN"
+    return headers
+
+
+def _page_items(resp: httpx.Response) -> list[dict[str, Any]] | None:
+    """The ``items`` of a 2xx JSON page, or None when nothing was disclosed."""
+    if not 200 <= resp.status_code < 300 or not resp.content:
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    items = body.get("items") if isinstance(body, dict) else None
+    if not isinstance(items, list):
+        return None
+    return [item for item in items if isinstance(item, dict)]
+
+
+async def _session_owner(
+    client: httpx.AsyncClient, orch_url: str, session_id: str, headers: dict[str, str],
+) -> str | None:
+    """The session owner's user id for the audit record (best-effort)."""
+    try:
+        resp = await client.get(f"{orch_url}/sessions/{session_id}", headers=headers)
+        if resp.status_code == 200:
+            owner = resp.json().get("user_id")
+            return owner if isinstance(owner, str) else None
+    except Exception as exc:  # noqa: BLE001 — the audit still lands without it
+        logger.debug("session owner lookup for audit failed (%s): %s", session_id, exc)
+    return None
+
+
 @router.get("/admin/sessions")
 async def admin_list_sessions(
     request: Request,
@@ -204,8 +208,7 @@ async def admin_list_sessions(
     if cursor:
         params["cursor"] = cursor
 
-    headers = foundation_headers(tenant_id, user_id, access_token)
-    headers["X-Actor"] = "ADMIN"
+    headers = _admin_actor_headers(tenant_id, user_id, access_token)
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             f"{orch_url}/sessions",
@@ -220,6 +223,94 @@ async def admin_list_sessions(
         _AUDIT_EVENT_SESSION_LIST,
         None,
     )
+    return _proxy_json(resp)
+
+
+@router.get("/admin/sessions/{session_id}/runs")
+async def admin_list_session_runs(
+    session_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_tenant_admin_bff),
+) -> JSONResponse:
+    """A session's runs for admin replay — any member's session in the tenant.
+
+    Runs carry the task text and result summary, so a successful read emits
+    ``admin.session.runs.viewed`` (resource = the session; payload = the
+    owner and the run count).
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = await _orchestrator_url(request)
+    headers = _admin_actor_headers(tenant_id, user_id, access_token)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(f"{orch_url}/sessions/{session_id}/runs", headers=headers)
+        runs = _page_items(resp)
+        owner = (
+            await _session_owner(client, orch_url, session_id, headers)
+            if runs is not None else None
+        )
+    if runs is not None:
+        payload: dict[str, Any] = {"run_count": len(runs)}
+        if owner:
+            payload["subject_user_id"] = owner
+        await _emit_session_view_audit(
+            request.app.state.settings,
+            tenant_id,
+            user_id,
+            access_token,
+            _AUDIT_EVENT_SESSION_RUNS,
+            session_id,
+            payload=payload,
+        )
+    return _proxy_json(resp)
+
+
+@router.get("/admin/sessions/{session_id}/messages")
+async def admin_list_session_messages(
+    session_id: str,
+    request: Request,
+    cursor: str | None = None,
+    limit: int = Query(50, ge=1, le=200),
+    _auth: tuple = Depends(require_tenant_admin_bff),
+) -> JSONResponse:
+    """A page of any member's transcript for admin replay.
+
+    Same parameters as ``GET /sessions/{id}/messages``.  A successful read
+    emits ``admin.session.messages.viewed`` (resource = the session; payload
+    = the owner, the message count and the sequence range read — never the
+    content).
+    """
+    tenant_id, user_id, access_token = _auth
+    orch_url = await _orchestrator_url(request)
+    params: dict[str, int | str] = {"limit": limit}
+    if cursor:
+        params["cursor"] = cursor
+    headers = _admin_actor_headers(tenant_id, user_id, access_token)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{orch_url}/sessions/{session_id}/messages", params=params, headers=headers,
+        )
+        messages = _page_items(resp)
+        owner = (
+            await _session_owner(client, orch_url, session_id, headers)
+            if messages is not None else None
+        )
+    if messages is not None:
+        payload: dict[str, Any] = {"message_count": len(messages)}
+        if owner:
+            payload["subject_user_id"] = owner
+        sequences = [m["sequence"] for m in messages if isinstance(m.get("sequence"), int)]
+        if sequences:
+            payload["first_sequence"] = min(sequences)
+            payload["last_sequence"] = max(sequences)
+        await _emit_session_view_audit(
+            request.app.state.settings,
+            tenant_id,
+            user_id,
+            access_token,
+            _AUDIT_EVENT_SESSION_MESSAGES,
+            session_id,
+            payload=payload,
+        )
     return _proxy_json(resp)
 
 
@@ -410,7 +501,7 @@ async def list_messages(
     session_id: str,
     request: Request,
     cursor: str | None = None,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=200),
     _auth: tuple = Depends(require_auth()),
 ) -> JSONResponse:
     """Proxy the transcript fetch so the SPA can hydrate after refresh."""
@@ -425,12 +516,9 @@ async def list_messages(
             params=params,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    # No audit here: this transcript endpoint is shared by the chat page (a user
-    # reading *their own* conversation), so it is not inherently a privileged
-    # action.  Audit for admin replay lives on the tenant-wide ``/admin/*``
-    # surface.  KNOWN GAP: admin replay reuses this endpoint to read a peer's
-    # messages and therefore is not yet audited at message granularity — needs a
-    # dedicated admin messages endpoint to close (out of scope here).
+    # No audit here: this is the owner-scoped path (a user reading *their own*
+    # conversation).  Admin replay of a peer's transcript goes through
+    # ``GET /admin/sessions/{id}/messages``, which audits every page it reads.
     return _proxy_json(resp)
 
 

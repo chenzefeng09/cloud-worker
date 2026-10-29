@@ -8,6 +8,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { useChatStore } from '../stores/chatStore';
+import { act, renderHook } from '@testing-library/react';
 import {
   handleSSEEvent,
   parseSSEStream,
@@ -15,6 +16,10 @@ import {
   applyPendingInteractions,
   recoverSessionCanvasAnchors,
   shouldWatchdogFire,
+  fetchTranscript,
+  isPermanentStreamFailure,
+  syncTranscript,
+  useChat,
 } from './useChat';
 import type { ToolCallEntry, PendingInteractionItem, Message } from '../api/types';
 import { api } from '../api/client';
@@ -476,9 +481,23 @@ describe('SSE → store routing', () => {
   // C3: on every run_started (including a reconnect mid-run), the handler
   // clears transient streaming blocks AND resets offset watermarks so the
   // server's token replay from "0-0" is applied cleanly, not dropped.
-  it('run_started sets isStreaming to true', () => {
+  it('run_started marks only its own session as streaming', () => {
+    // A run starting in a background session (ses_A) must not lock the
+    // composer of the session the user is looking at (ses_B).
     dispatchSSE('ses_A', 'run_started', { run_id: 'run_new' });
+    expect(useChatStore.getState().streamingSessions['ses_A']).toBe(true);
+    expect(useChatStore.getState().isStreaming).toBe(false);
+
+    dispatchSSE('ses_B', 'run_started', { run_id: 'run_b' });
     expect(useChatStore.getState().isStreaming).toBe(true);
+  });
+
+  it('switching sessions mirrors that session’s own live-run flag', () => {
+    dispatchSSE('ses_A', 'run_started', { run_id: 'run_a' });
+    useChatStore.getState().setActiveSession('ses_A');
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    useChatStore.getState().setActiveSession('ses_C');
+    expect(useChatStore.getState().isStreaming).toBe(false);
   });
 
   it('run_started clears existing streaming blocks for the run (C3 reconnect)', () => {
@@ -526,9 +545,14 @@ describe('SSE → store routing', () => {
     expect(msgs.some((m) => m.streamRunId === 'run_other')).toBe(true);
   });
 
-  it('run_complete sets isStreaming to false', () => {
-    useChatStore.setState({ isStreaming: true });
+  it('run_complete clears only its own session’s live-run flag', () => {
+    useChatStore.getState().setSessionStreaming('ses_A', true);
+    useChatStore.getState().setSessionStreaming('ses_B', true);
     dispatchSSE('ses_A', 'run_complete', {});
+    expect(useChatStore.getState().streamingSessions['ses_A']).toBe(false);
+    // ses_B (active) is still running.
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    dispatchSSE('ses_B', 'run_complete', {});
     expect(useChatStore.getState().isStreaming).toBe(false);
   });
 
@@ -538,12 +562,12 @@ describe('SSE → store routing', () => {
     // goes quiet between tool batches; the tail can end and re-open later, so
     // run_stream_end must leave isStreaming alone.  run_complete remains the
     // authoritative completer.
-    useChatStore.setState({ isStreaming: true });
-    dispatchSSE('ses_A', 'run_stream_end', { run_id: 'run_1', paused: false });
+    useChatStore.getState().setSessionStreaming('ses_B', true);
+    dispatchSSE('ses_B', 'run_stream_end', { run_id: 'run_1', paused: false });
     expect(useChatStore.getState().isStreaming).toBe(true);
 
     // run_complete is still what clears it.
-    dispatchSSE('ses_A', 'run_complete', { run_id: 'run_1' });
+    dispatchSSE('ses_B', 'run_complete', { run_id: 'run_1' });
     expect(useChatStore.getState().isStreaming).toBe(false);
   });
 
@@ -919,13 +943,13 @@ describe('run_complete durable-row reconcile', () => {
     });
 
     dispatchSSE('ses_rc', 'run_complete', { run_id: 'run_1' });
-    // Flush the detached async IIFE (fire-and-forget) — one turn for the awaited
-    // promise, plus a microtask drain.
-    await Promise.resolve();
-    await Promise.resolve();
+    // Flush the detached async IIFE (fire-and-forget): one macrotask turn
+    // drains however many promise hops the fetch takes.
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(listMock).toHaveBeenCalledTimes(1);
-    expect(listMock).toHaveBeenCalledWith('ses_rc');
+    // Re-pulls the latest turn from just before its USER row (sequence 1).
+    expect(listMock).toHaveBeenCalledWith('ses_rc', undefined, 200);
     const msgs = useChatStore.getState().messages['ses_rc'];
     expect(msgs.some((m) => m.id === 'assistant_1' && m.content === 'the lost answer')).toBe(true);
   });
@@ -938,8 +962,7 @@ describe('run_complete durable-row reconcile', () => {
     });
 
     dispatchSSE('ses_rc', 'run_complete', { run_id: 'run_1' });
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     const msgs = useChatStore.getState().messages['ses_rc'];
     expect(msgs.filter((m) => m.id === 'assistant_1')).toHaveLength(1);
@@ -951,8 +974,7 @@ describe('run_complete durable-row reconcile', () => {
 
     // Must not throw synchronously (handler is fire-and-forget).
     expect(() => dispatchSSE('ses_rc', 'run_complete', { run_id: 'run_1' })).not.toThrow();
-    await Promise.resolve();
-    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(warnSpy).toHaveBeenCalledWith(
       expect.stringContaining('[useChat] run_complete reconcile failed'),
@@ -1308,5 +1330,265 @@ describe('silent-stall watchdog (integration)', () => {
     unsub();
     await vi.advanceTimersByTimeAsync(100); // past teardown grace
     expect(signals[1].aborted).toBe(true); // real teardown aborts the live attempt
+  });
+});
+
+// ─── Session-stream robustness ────────────────────────────────────────────────
+describe('stream connect loop — permanent failures', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('classifies which HTTP statuses stop reconnecting', () => {
+    for (const status of [400, 403, 404, 410, 422]) {
+      expect(isPermanentStreamFailure(status)).toBe(true);
+    }
+    for (const status of [401, 408, 429, 500, 502, 503]) {
+      expect(isPermanentStreamFailure(status)).toBe(false);
+    }
+  });
+
+  it('stops reconnecting once the session stream answers 404', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchMock = vi.fn(async () => new Response('{"detail":"Session not found"}', { status: 404 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const unsub = subscribeSessionStream('ses_gone');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    unsub();
+    warn.mockRestore();
+  });
+
+  it('keeps backing off (not a 1 s storm) while the relay answers 502', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fetchMock = vi.fn(async () => new Response('{}', { status: 502 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const unsub = subscribeSessionStream('ses_down');
+    await vi.advanceTimersByTimeAsync(15_000);
+    // 1 s → 2 s → 4 s → 8 s backoff: at most a handful of attempts in 15 s.
+    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(5);
+    unsub();
+    await vi.advanceTimersByTimeAsync(100);
+    warn.mockRestore();
+  });
+});
+
+describe('transcript loading', () => {
+  const listMock = api.messages.list as unknown as ReturnType<typeof vi.fn>;
+  const row = (seq: number): Message => ({
+    id: `m${seq}`, session_id: 'ses_t', role: seq % 2 ? 'USER' : 'ASSISTANT', content: `c${seq}`,
+    tool_calls: null, run_id: null, sequence: seq, created_at: '2026-01-01',
+  });
+
+  beforeEach(() => {
+    listMock.mockReset();
+  });
+
+  it('follows next_cursor past the first page', async () => {
+    listMock
+      .mockResolvedValueOnce({ items: [row(1), row(2)], next_cursor: '2' })
+      .mockResolvedValueOnce({ items: [row(3)], next_cursor: null });
+    const rows = await fetchTranscript('ses_t');
+    expect(rows.map((m) => m.sequence)).toEqual([1, 2, 3]);
+    expect(listMock).toHaveBeenNthCalledWith(1, 'ses_t', undefined, 200);
+    expect(listMock).toHaveBeenNthCalledWith(2, 'ses_t', '2', 200);
+  });
+
+  it('starts after a given sequence', async () => {
+    listMock.mockResolvedValueOnce({ items: [row(8)], next_cursor: null });
+    await fetchTranscript('ses_t', 7);
+    expect(listMock).toHaveBeenCalledWith('ses_t', '7', 200);
+  });
+});
+
+describe('transcript sync after a rewind', () => {
+  const listMock = api.messages.list as unknown as ReturnType<typeof vi.fn>;
+  const row = (seq: number, id = `m${seq}`, over: Partial<Message> = {}): Message => ({
+    id, session_id: 'ses_rw', role: 'USER', content: id, tool_calls: null, run_id: null,
+    sequence: seq, created_at: '2026-01-01', ...over,
+  });
+  const ids = () => (useChatStore.getState().messages['ses_rw'] || []).map((m) => m.id);
+
+  beforeEach(() => {
+    listMock.mockReset();
+    useChatStore.setState({
+      activeSessionId: 'ses_rw', messages: {}, streamOffsets: {}, closedStreamRuns: {},
+      pendingInteractions: {}, acknowledgedPendingInteractions: {},
+    });
+  });
+
+  it('transcript_reset drops rows the server deleted and shows their replacements', async () => {
+    useChatStore.getState().mergeMessages('ses_rw', [row(1), row(2), row(3)]);
+    listMock.mockResolvedValueOnce({ items: [row(1), row(2, 'm2b')], next_cursor: null });
+
+    dispatchSSE('ses_rw', 'transcript_reset', { session_id: 'ses_rw' });
+    await vi.waitFor(() => expect(ids()).toEqual(['m1', 'm2b']));
+  });
+
+  it('keeps rows that streamed in while the transcript was loading', async () => {
+    useChatStore.getState().mergeMessages('ses_rw', [row(1)]);
+    listMock.mockImplementationOnce(async () => {
+      // A row the stream delivers before the fetch answers.
+      useChatStore.getState().mergeMessages('ses_rw', [row(2)]);
+      return { items: [row(1)], next_cursor: null };
+    });
+
+    await syncTranscript('ses_rw');
+
+    expect(ids()).toEqual(['m1', 'm2']);
+  });
+
+  it('a fetch cut at the page cap keeps the rows past its last one', async () => {
+    useChatStore.getState().mergeMessages('ses_rw', [row(1), row(2), row(999)]);
+    listMock.mockResolvedValue({ items: [row(1), row(3)], next_cursor: 'more' });
+
+    await syncTranscript('ses_rw');
+
+    // m2 was deleted (inside the fetched range); m999 lies beyond it.
+    expect(ids()).toEqual(['m1', 'm3', 'm999']);
+  });
+
+  it('a recovered assistant row replaces the live streaming block of its run', async () => {
+    useChatStore.getState().mergeMessages('ses_rw', [row(1)]);
+    useChatStore.getState().appendStreamingToken('ses_rw', 'run_1', 'the answer', '1-0');
+    listMock.mockResolvedValueOnce({
+      items: [row(1), row(2, 'a2', { role: 'ASSISTANT', content: 'the answer', run_id: 'run_1' })],
+      next_cursor: null,
+    });
+
+    await syncTranscript('ses_rw');
+
+    expect(ids()).toEqual(['m1', 'a2']);
+    // The run's channel is closed: a replayed token does not rebuild the block.
+    useChatStore.getState().appendStreamingToken('ses_rw', 'run_1', 'the answer', '1-0');
+    expect(ids()).toEqual(['m1', 'a2']);
+  });
+});
+
+describe('stream reconnect cursor', () => {
+  afterEach(() => {
+    vi.runOnlyPendingTimers();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('resumes after the newest persisted row the store holds', () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_url: string) => new Promise(() => {}));
+    vi.stubGlobal('fetch', fetchMock);
+    useChatStore.setState({ messages: {}, streamOffsets: {}, closedStreamRuns: {} });
+    useChatStore.getState().mergeMessages('ses_cur', [
+      { id: 'msg_4', session_id: 'ses_cur', role: 'USER', content: 'q', tool_calls: null,
+        run_id: null, sequence: 4, created_at: '2026-01-01' },
+      { id: 'msg_5', session_id: 'ses_cur', role: 'ASSISTANT', content: 'a', tool_calls: null,
+        run_id: 'run_1', sequence: 5, created_at: '2026-01-01' },
+    ]);
+    useChatStore.getState().appendStreamingToken('ses_cur', 'run_2', 'live', '1-0');
+
+    const unsub = subscribeSessionStream('ses_cur');
+    unsub();
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/api/bff/v1/sessions/ses_cur/stream?after=5&after_id=msg_5',
+    );
+  });
+
+  it('opens a fresh stream without a cursor', () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_url: string) => new Promise(() => {}));
+    vi.stubGlobal('fetch', fetchMock);
+    useChatStore.setState({ messages: {}, streamOffsets: {}, closedStreamRuns: {} });
+
+    const unsub = subscribeSessionStream('ses_new');
+    unsub();
+
+    expect(fetchMock.mock.calls[0][0]).toBe('/api/bff/v1/sessions/ses_new/stream');
+  });
+});
+
+describe('HITL — answered cards after a reload mid-resume', () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      activeSessionId: 'ses_h', messages: {}, pendingInteractions: {},
+      acknowledgedPendingInteractions: {}, streamOffsets: {}, closedStreamRuns: {},
+    });
+  });
+
+  it('pending_resolved removes the replayed card and keeps it from coming back', () => {
+    const card = { run_id: 'run_1', tool_call_id: 'tc_1', name: 'Bash', args: '{}' };
+    dispatchSSE('ses_h', 'pending_confirmation', card);
+    expect(useChatStore.getState().pendingInteractions['ses_h']).toHaveLength(1);
+    dispatchSSE('ses_h', 'pending_resolved', { run_id: 'run_1', tool_call_id: 'tc_1' });
+    expect(useChatStore.getState().pendingInteractions['ses_h']).toHaveLength(0);
+    // A second replay of the original pending event stays suppressed.
+    dispatchSSE('ses_h', 'pending_confirmation', card);
+    expect(useChatStore.getState().pendingInteractions['ses_h']).toHaveLength(0);
+  });
+});
+
+describe('stream error notice', () => {
+  beforeEach(() => {
+    useChatStore.setState({ activeSessionId: 'ses_e', messages: {} });
+  });
+
+  it('shows one notice per session however many errors arrive', () => {
+    dispatchSSE('ses_e', 'error', { detail: 'Stream connection lost' });
+    dispatchSSE('ses_e', 'error', { detail: 'Stream connection lost' });
+    dispatchSSE('ses_e', 'error', {});
+    const rows = useChatStore.getState().messages['ses_e'];
+    expect(rows).toHaveLength(1);
+    expect(rows[0].content).toContain('reconnecting');
+  });
+});
+
+describe('sendMessage — per-session busy guard', () => {
+  beforeEach(() => {
+    (api.messages.list as unknown as ReturnType<typeof vi.fn>)
+      .mockResolvedValue({ items: [], next_cursor: null });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it('refuses (adds nothing) while THIS session has a live run', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    useChatStore.setState({ activeSessionId: 'ses_busy', messages: {} });
+    useChatStore.getState().setSessionStreaming('ses_busy', true);
+    const { result } = renderHook(() => useChat());
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = await result.current.sendMessage('hello');
+    });
+    expect(outcome).toBe('busy');
+    expect(fetchMock).not.toHaveBeenCalledWith(expect.stringContaining('/chat'), expect.anything());
+    expect(useChatStore.getState().messages['ses_busy'] ?? []).toHaveLength(0);
+  });
+
+  it('sends in a new session even while another session is still running', async () => {
+    const fetchMock = vi.fn(async (url: string) => (
+      url.endsWith('/chat')
+        ? new Response(JSON.stringify({ run_id: 'r1' }), { status: 201 })
+        : new Promise<Response>(() => {}) // keep the session stream parked
+    ));
+    vi.stubGlobal('fetch', fetchMock);
+    useChatStore.getState().setSessionStreaming('ses_other', true);
+    useChatStore.setState({ activeSessionId: 'ses_new', messages: {} });
+    const { result, unmount } = renderHook(() => useChat());
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = await result.current.sendMessage('first prompt');
+    });
+    expect(outcome).toBe('sent');
+    expect(useChatStore.getState().streamingSessions['ses_new']).toBe(true);
+    unmount();
   });
 });

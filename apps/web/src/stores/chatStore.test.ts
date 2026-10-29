@@ -747,3 +747,47 @@ describe('chatStore', () => {
     expect(useChatStore.getState().acknowledgedPendingInteractions).toEqual({});
   });
 });
+
+describe('replacePersistedMessages', () => {
+  const row = (seq: number, id = `m${seq}`): Message => ({ ...MESSAGE, id, sequence: seq });
+  const ids = () => (useChatStore.getState().messages['ses_1'] || []).map((m) => m.id);
+
+  beforeEach(() => {
+    useChatStore.setState(RESET_STATE);
+  });
+
+  it('drops known rows the fetch no longer returns, keeping placeholders', () => {
+    const store = useChatStore.getState();
+    store.mergeMessages('ses_1', [row(1), row(2), row(3)]);
+    store.addMessage('ses_1', { ...MESSAGE, id: 'temp_user_1', content: 'draft', sequence: 0 });
+
+    store.replacePersistedMessages('ses_1', [row(1), row(2, 'm2b')], new Set(['m1', 'm2', 'm3']));
+
+    expect(ids()).toEqual(['m1', 'm2b', 'temp_user_1']);
+  });
+
+  it('an empty fetch drops every known row', () => {
+    useChatStore.getState().mergeMessages('ses_1', [row(1)]);
+
+    useChatStore.getState().replacePersistedMessages('ses_1', [], new Set(['m1']));
+
+    expect(ids()).toEqual([]);
+  });
+
+  it('only drops the known ids it is given', () => {
+    useChatStore.getState().mergeMessages('ses_1', [row(1), row(9)]);
+
+    useChatStore.getState().replacePersistedMessages('ses_1', [row(1)], new Set(['m1']));
+
+    expect(ids()).toEqual(['m1', 'm9']);
+  });
+
+  it('is a no-op when the store already matches', () => {
+    useChatStore.getState().mergeMessages('ses_1', [row(1)]);
+    const before = useChatStore.getState().messages;
+
+    useChatStore.getState().replacePersistedMessages('ses_1', [row(1)], new Set(['m1']));
+
+    expect(useChatStore.getState().messages).toBe(before);
+  });
+});

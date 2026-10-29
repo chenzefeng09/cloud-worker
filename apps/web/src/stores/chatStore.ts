@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import type { Message, PendingInteraction, Session, ToolCallEntry, UserProfile } from '../api/types';
 import type { PlanStep } from '../lib/designFixtures';
+import { clearLocalUserContent } from '../lib/localUserData';
 
 /** Payload for a single tool event from the SSE stream. */
 export interface ToolCallUpdate {
@@ -47,6 +48,13 @@ interface ChatState {
    * normally.  Internal bookkeeping — never rendered, never persisted.
    */
   closedStreamRuns: Record<string, Set<string>>;
+  /**
+   * Whether a run is live, per session.  Each session streams independently:
+   * a run still going in session A must never lock the composer of session B
+   * (or swallow B's first prompt).
+   */
+  streamingSessions: Record<string, boolean>;
+  /** Mirror of `streamingSessions[activeSessionId]` for the active view. */
   isStreaming: boolean;
   isLoggedIn: boolean;
   userProfile: UserProfile | null;
@@ -140,6 +148,27 @@ interface ChatState {
    * in-place rather than appended.
    */
   addMessage: (sessionId: string, message: Message) => void;
+  /**
+   * Apply persisted rows in one update: `addMessage`'s dedup / ordering, plus
+   * the swap a durable assistant / tool / thinking row makes for its run (see
+   * `applyPersistedRows`).  Used by the live `message` event and by every
+   * transcript fetch, so a row recovered by a re-fetch replaces its streaming
+   * block exactly as a streamed one does.
+   */
+  mergeMessages: (sessionId: string, messages: Message[]) => void;
+  /**
+   * `mergeMessages` for a full transcript fetch that also drops rows deleted
+   * on the server (a rewind, retention): every id in `knownIds` that `rows`
+   * lacks.  Callers pass the persisted ids the store held when the fetch
+   * started, so rows that streamed in meanwhile stay.
+   */
+  replacePersistedMessages: (
+    sessionId: string,
+    messages: Message[],
+    knownIds: ReadonlySet<string>,
+  ) => void;
+  /** Drop one message by id (no-op when absent). */
+  removeMessage: (sessionId: string, messageId: string) => void;
   updateLastMessage: (sessionId: string, content: string) => void;
 
   /**
@@ -303,6 +332,9 @@ interface ChatState {
   truncateFromSequence: (sessionId: string, fromSequence: number) => void;
 
   setPlanSteps: (sessionId: string, steps: PlanStep[]) => void;
+  /** Set the live-run flag of one session (keeps `isStreaming` in sync). */
+  setSessionStreaming: (sessionId: string, streaming: boolean) => void;
+  /** Set the live-run flag of the ACTIVE session. */
   setIsStreaming: (streaming: boolean) => void;
 
   // ── HITL mutators ─────────────────────────────────────────────────────────
@@ -561,6 +593,124 @@ export function hasPendingInteraction(
   return Array.isArray(pending) && pending.length > 0;
 }
 
+/**
+ * Insert one message into a transcript array (pure; returns the same array
+ * when nothing changes).  Rules, in order:
+ *   1. hard dedup by id;
+ *   2. a persisted USER row replaces the optimistic `temp_user_*` entry with
+ *      the same (trimmed) content — the backend `.strip()`s user content;
+ *   3. persisted rows (sequence > 0) slot into sequence order, ahead of the
+ *      trailing sequence-0 placeholders (streaming / optimistic blocks) — the
+ *      array invariant is [real rows by sequence..., placeholders...], which
+ *      keeps same-run rows contiguous for groupSteps;
+ *   4. anything else is appended.
+ * Persisted reasoning rows (role 'thinking') are normalised into a thinking
+ * block so the renderer shows them collapsed.
+ */
+export function insertMessage(existing: Message[], incoming: Message): Message[] {
+  let message = incoming;
+  if ((message.role || '').toUpperCase() === 'THINKING' && message.blockKind !== 'thinking') {
+    message = { ...message, blockKind: 'thinking' };
+  }
+
+  if (message.id && existing.some((m) => m.id === message.id)) return existing;
+
+  if (message.role === 'USER' && message.id && !message.id.startsWith('temp_user_')) {
+    const tempIdx = existing.findIndex(
+      (m) => m.id.startsWith('temp_user_') && m.content.trim() === message.content.trim(),
+    );
+    if (tempIdx !== -1) {
+      const updated = [...existing];
+      updated[tempIdx] = message;
+      return updated;
+    }
+  }
+
+  if (message.sequence > 0) {
+    const insertIdx = existing.findIndex(
+      (m) => m.sequence === 0 || m.sequence > message.sequence,
+    );
+    if (insertIdx !== -1) {
+      return [...existing.slice(0, insertIdx), message, ...existing.slice(insertIdx)];
+    }
+  }
+
+  return [...existing, message];
+}
+
+/** The streaming-block kind a persisted row of `role` replaces, if any. */
+function durableBlockKind(role: string): 'text' | 'tool' | 'thinking' | null {
+  switch ((role || '').toUpperCase()) {
+    case 'ASSISTANT':
+      return 'text';
+    case 'TOOL':
+      return 'tool';
+    case 'THINKING':
+      return 'thinking';
+    default:
+      return null;
+  }
+}
+
+/**
+ * Apply persisted rows to the store state (pure; `null` when nothing changes).
+ *
+ * Each assistant / tool / thinking row with a run id replaces that run's
+ * transient streaming blocks of the SAME kind — durable rows land
+ * thinking-first, so a kind-blind clear would wipe the live answer text — and
+ * closes the run's streaming channel (dropping its offsets), so a replay of the
+ * run's token stream can't rebuild a duplicate next to the rows.  An assistant
+ * row without a canvas_id keeps the canvas `canvas_created` had attached to its
+ * streaming block; otherwise the card would flash and disappear.
+ */
+function applyPersistedRows(
+  s: ChatState,
+  sessionId: string,
+  rows: Message[],
+): Partial<ChatState> | null {
+  const existing = getMessages(s, sessionId);
+  let next = existing;
+  const settledRuns = new Set<string>();
+  for (const row of rows) {
+    const kind = durableBlockKind(row.role);
+    let incoming = row;
+    if (kind && row.run_id) {
+      const runId = row.run_id;
+      if (kind === 'text' && !row.canvas_id) {
+        const liveCanvasId = next
+          .slice()
+          .reverse()
+          .find((m) => m.streamRunId === runId && m.blockKind === 'text' && Boolean(m.canvas_id))
+          ?.canvas_id;
+        if (liveCanvasId) incoming = { ...row, canvas_id: liveCanvasId };
+      }
+      const kept = next.filter((m) => m.streamRunId !== runId || m.blockKind !== kind);
+      if (kept.length !== next.length) next = kept;
+      settledRuns.add(runId);
+    }
+    next = insertMessage(next, incoming);
+  }
+
+  const patch: Partial<ChatState> = {};
+  if (next !== existing) patch.messages = { ...s.messages, [sessionId]: next };
+  if (settledRuns.size > 0) {
+    const closed = s.closedStreamRuns[sessionId];
+    if ([...settledRuns].some((runId) => !closed?.has(runId))) {
+      patch.closedStreamRuns = {
+        ...s.closedStreamRuns,
+        [sessionId]: new Set([...(closed ?? []), ...settledRuns]),
+      };
+    }
+    const offsets = s.streamOffsets[sessionId];
+    if (offsets && [...settledRuns].some((runId) => offsets[runId] !== undefined)) {
+      const rest = { ...offsets };
+      for (const runId of settledRuns) delete rest[runId];
+      patch.streamOffsets = { ...s.streamOffsets, [sessionId]: rest };
+    }
+  }
+  return Object.keys(patch).length > 0 ? patch : null;
+}
+
 export const useChatStore = create<ChatState>((set) => ({
   sessions: [],
   sessionsCursor: null,
@@ -570,6 +720,7 @@ export const useChatStore = create<ChatState>((set) => ({
   planSteps: {},
   streamOffsets: {},
   closedStreamRuns: {},
+  streamingSessions: {},
   isStreaming: false,
   isLoggedIn: false,
   userProfile: null,
@@ -599,75 +750,42 @@ export const useChatStore = create<ChatState>((set) => ({
         session.id === sessionId ? { ...session, title } : session,
       ),
     })),
-  setActiveSession: (sessionId) => set({ activeSessionId: sessionId }),
+  setActiveSession: (sessionId) =>
+    set((s) => ({
+      activeSessionId: sessionId,
+      isStreaming: sessionId ? Boolean(s.streamingSessions[sessionId]) : false,
+    })),
   setMessages: (sessionId, messages) =>
     set((s) => ({ messages: { ...s.messages, [sessionId]: messages } })),
 
   addMessage: (sessionId, message) =>
     set((s) => {
-      // Normalize persisted reasoning rows (role='thinking') into a thinking
-      // block so the renderer (StepGroup → ThinkingBlock) shows them collapsed.
-      // DB rows carry no blockKind; streaming thinking blocks already set it.
-      if ((message.role || '').toUpperCase() === 'THINKING' && message.blockKind !== 'thinking') {
-        message = { ...message, blockKind: 'thinking' };
-      }
-
       const existing = getMessages(s, sessionId);
+      const next = insertMessage(existing, message);
+      return next === existing ? s : { messages: { ...s.messages, [sessionId]: next } };
+    }),
 
-      // 1. Hard dedup by id.
-      if (message.id && existing.some((m) => m.id === message.id)) return s;
+  mergeMessages: (sessionId, rows) => set((s) => applyPersistedRows(s, sessionId, rows) ?? s),
 
-      // 2. Optimistic USER message replacement.
-      //    Compare content trimmed — the backend `.strip()`s user content, so
-      //    a temp placeholder built from raw input may carry trailing/leading
-      //    whitespace the persisted row does not.
-      if (
-        message.role === 'USER' &&
-        message.id &&
-        !message.id.startsWith('temp_user_')
-      ) {
-        const tempIdx = existing.findIndex(
-          (m) =>
-            m.id.startsWith('temp_user_') &&
-            m.content.trim() === message.content.trim(),
-        );
-        if (tempIdx !== -1) {
-          const updated = [...existing];
-          updated[tempIdx] = message;
-          return { messages: { ...s.messages, [sessionId]: updated } };
-        }
-      }
+  replacePersistedMessages: (sessionId, rows, knownIds) =>
+    set((s) => {
+      const patch = applyPersistedRows(s, sessionId, rows);
+      const merged = patch?.messages?.[sessionId] ?? getMessages(s, sessionId);
+      const fetched = new Set(rows.map((m) => m.id));
+      const kept = merged.filter(
+        (m) => m.sequence === 0 || fetched.has(m.id) || !knownIds.has(m.id),
+      );
+      if (kept.length === merged.length) return patch ?? s;
+      return { ...patch, messages: { ...s.messages, [sessionId]: kept } };
+    }),
 
-      // 3. Ordered insertion for real (persisted) messages.
-      //    Streaming/optimistic placeholders carry sequence===0 and are anchored
-      //    at the current tail (they're "in progress"); a real message with
-      //    sequence>0 must land at its sequence-ordered position so that a USER
-      //    row arriving after an assistant streaming block doesn't get appended
-      //    below it. The array invariant is [real rows sorted by sequence...,
-      //    sequence===0 placeholders...]; we insert before the first element
-      //    that is either a real row with a greater sequence OR a placeholder
-      //    (sequence===0) — so the real row slots into sequence order and ahead
-      //    of any trailing streaming blocks. Real rows preserve strict sequence
-      //    order, which keeps same-run messages contiguous for groupSteps.
-      if (message.sequence > 0) {
-        const insertIdx = existing.findIndex(
-          (m) => m.sequence === 0 || m.sequence > message.sequence,
-        );
-        if (insertIdx !== -1) {
-          const updated = [
-            ...existing.slice(0, insertIdx),
-            message,
-            ...existing.slice(insertIdx),
-          ];
-          return { messages: { ...s.messages, [sessionId]: updated } };
-        }
-      }
-
-      // 4. Fallback: placeholder/streaming block (sequence===0) or a real
-      //    message that belongs at the tail → append.
-      return {
-        messages: { ...s.messages, [sessionId]: [...existing, message] },
-      };
+  removeMessage: (sessionId, messageId) =>
+    set((s) => {
+      const existing = getMessages(s, sessionId);
+      const next = existing.filter((m) => m.id !== messageId);
+      return next.length === existing.length
+        ? s
+        : { messages: { ...s.messages, [sessionId]: next } };
     }),
 
   updateLastMessage: (sessionId, content) =>
@@ -1016,7 +1134,24 @@ export const useChatStore = create<ChatState>((set) => ({
 
   setPlanSteps: (sessionId, steps) =>
     set((s) => ({ planSteps: { ...s.planSteps, [sessionId]: steps } })),
-  setIsStreaming: (isStreaming) => set({ isStreaming }),
+  setSessionStreaming: (sessionId, streaming) =>
+    set((s) => {
+      if (Boolean(s.streamingSessions[sessionId]) === streaming
+          && (sessionId !== s.activeSessionId || s.isStreaming === streaming)) {
+        return s;
+      }
+      return {
+        streamingSessions: { ...s.streamingSessions, [sessionId]: streaming },
+        ...(sessionId === s.activeSessionId ? { isStreaming: streaming } : {}),
+      };
+    }),
+  setIsStreaming: (isStreaming) =>
+    set((s) => (s.activeSessionId
+      ? {
+          isStreaming,
+          streamingSessions: { ...s.streamingSessions, [s.activeSessionId]: isStreaming },
+        }
+      : { isStreaming })),
 
   // ── HITL mutators ─────────────────────────────────────────────────────────
 
@@ -1094,7 +1229,9 @@ export const useChatStore = create<ChatState>((set) => ({
       };
     }),
   login: (profile) => set({ isLoggedIn: true, userProfile: profile, bootstrapped: true }),
-  logout: () =>
+  logout: () => {
+    // The browser's copies of what the user wrote go too (shared devices).
+    clearLocalUserContent();
     set({
       isLoggedIn: false,
       userProfile: null,
@@ -1105,6 +1242,8 @@ export const useChatStore = create<ChatState>((set) => ({
       planSteps: {},
       streamOffsets: {},
       closedStreamRuns: {},
+      streamingSessions: {},
+      isStreaming: false,
       activeSessionId: null,
       bootstrapped: true,
       // Wipes the per-session entries AND the pre-session draft slot
@@ -1116,7 +1255,8 @@ export const useChatStore = create<ChatState>((set) => ({
       platformDefaultsEnabled: {},
       pendingInteractions: {},
       acknowledgedPendingInteractions: {},
-    }),
+    });
+  },
   setUserProfile: (profile) => set({ userProfile: profile }),
   setBootstrapped: (value) => set({ bootstrapped: value }),
   toggleSkill: (sessionId, name) =>

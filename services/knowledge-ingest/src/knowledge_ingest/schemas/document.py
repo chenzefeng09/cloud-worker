@@ -105,6 +105,20 @@ class SearchResponse(BaseModel):
     hits: list[SearchHit]
 
 
+class SearchRequest(BaseModel):
+    """``POST /search`` body — the same fields as the ``GET /search`` query.
+
+    Prompts are personal data: carried in the body they stay out of access
+    logs, proxy logs and trace attributes, which record the URL.
+    """
+
+    q: str
+    k: int = 5
+    scope: SearchScope = SearchScope.ALL
+    workspace_id: str | None = None
+    exclude_origin_session_id: str | None = None
+
+
 class FolderList(BaseModel):
     items: list[FolderOut]
     total: int

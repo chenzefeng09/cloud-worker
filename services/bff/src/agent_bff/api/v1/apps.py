@@ -22,6 +22,7 @@ Attachment-scoping contract for ``file_inputs`` (option A):
 
 from __future__ import annotations
 
+import hmac
 import logging
 import re
 from datetime import UTC, datetime
@@ -61,6 +62,29 @@ def _registry_url(request: Request) -> str:
 
 def _orchestrator_url(request: Request) -> str:
     return request.app.state.settings.session_orchestrator_url
+
+
+_USER_ID_RE = re.compile(r"^usr_[0-9A-Z]{26}$")
+
+
+def _on_behalf_of(request: Request, body: dict[str, Any]) -> str | None:
+    """The user a service caller (cron-runner) starts this run for, if any.
+
+    Scheduled runs execute as the cron service account; the trigger's owner
+    is recorded on the session so that user's export and erasure reach it.
+    Only a caller holding the service token may name one — anyone else's
+    value is ignored, so a user cannot attach their session to someone else.
+    """
+    value = body.get("on_behalf_of")
+    if not isinstance(value, str) or not _USER_ID_RE.fullmatch(value):
+        return None
+    configured: str = request.app.state.settings.service_token or ""
+    presented = request.headers.get("X-Service-Token", "")
+    if not configured or not presented or not hmac.compare_digest(
+        configured.encode(), presented.encode(),
+    ):
+        return None
+    return value
 
 
 # --------------------------------------------------------------------------- #
@@ -564,6 +588,7 @@ async def run_app(
             status_code=400,
             detail=f"invalid source {source!r}; must be one of {sorted(_VALID_SOURCES)}",
         )
+    on_behalf_of = _on_behalf_of(request, body)
 
     async with httpx.AsyncClient(timeout=30) as client:
         # 1. Fetch the App + versions (RLS + visibility authorize the caller).
@@ -640,6 +665,10 @@ async def run_app(
             "app_id": app_id,
             "app_version_id": vid,
         }
+        if on_behalf_of:
+            # The orchestrator honours this only on sessions a configured
+            # service account owns (``on_behalf_principal_user_ids``).
+            app_run_meta["on_behalf_of_user_id"] = on_behalf_of
         if not session_id:
             sess_resp = await client.post(
                 f"{orch_url}/sessions",

@@ -27,6 +27,8 @@ import type {
   AppVersion,
   AppVersionCreate,
   AssessDpiaRequest,
+  BreachRecord,
+  BreachRecordInput,
   CompleteDpiaRequest,
   ComplianceReport,
   CreatePlatformApiKeyRequest,
@@ -183,6 +185,12 @@ import type {
   WorkspaceFileVersion,
   DlpSensitivity,
   PlatformConfigEntry,
+  CreateTaskRequest,
+  Task,
+  TaskListParams,
+  TaskListResponse,
+  TaskOptions,
+  TaskStartResponse,
 } from './types';
 
 const BFF_BASE = '/api/bff/v1';
@@ -514,9 +522,32 @@ export const api = {
       ),
   },
 
+  tasks: {
+    list: (params: TaskListParams = {}) =>
+      request<TaskListResponse>('GET', `/tasks${qs({
+        status: params.status?.join(','),
+        kind: params.kind?.join(','),
+        workspace_id: params.workspace_id,
+        q: params.q,
+        cursor: params.cursor,
+        limit: params.limit,
+      })}`),
+    get: (id: string) =>
+      request<Task>('GET', `/tasks/${id}`),
+    /** Create a task and start its first run in the background. */
+    create: (body: CreateTaskRequest) =>
+      request<TaskStartResponse>('POST', '/tasks', body),
+    /**
+     * Re-run the latest attempt with a fresh sandbox.  The previous attempt's
+     * output is rewound server-side; omitted overrides replay the stored options.
+     */
+    retry: (id: string, overrides?: TaskOptions) =>
+      request<TaskStartResponse>('POST', `/tasks/${id}/retry`, overrides ?? {}),
+  },
+
   messages: {
-    list: (sessionId: string, cursor?: string) =>
-      request<CursorPage<Message>>('GET', `/sessions/${sessionId}/messages${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`),
+    list: (sessionId: string, cursor?: string, limit?: number) =>
+      request<CursorPage<Message>>('GET', `/sessions/${sessionId}/messages${qs({ cursor, limit })}`),
     deleteFrom: (sessionId: string, fromSequence: number) =>
       request<{ deleted_count: number }>('DELETE', `/sessions/${sessionId}/messages?from_sequence=${fromSequence}`),
   },
@@ -789,6 +820,15 @@ export const api = {
         request<CursorPage<Session>>(
           'GET',
           `/admin/sessions?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`,
+        ),
+      // Any member's runs / transcript page; every successful read is audited
+      // server-side (admin.session.runs.viewed / admin.session.messages.viewed).
+      runs: (sessionId: string) =>
+        request<{ items: Run[] }>('GET', `/admin/sessions/${sessionId}/runs`),
+      messages: (sessionId: string, cursor?: string, limit?: number) =>
+        request<CursorPage<Message>>(
+          'GET',
+          `/admin/sessions/${sessionId}/messages${qs({ cursor, limit })}`,
         ),
     },
     tenants: {
@@ -1244,6 +1284,22 @@ export const api = {
         complete: (id: string, body: CompleteDpiaRequest, tenantId?: string) =>
           request<DpiaRecord>('POST', `/admin/compliance/dpia/${id}/complete${qs({ tenant_id: tenantId })}`, body),
       },
+      // Personal-data breach register (stored in the BFF, not foundation-compliance).
+      breaches: {
+        list: (tenantId?: string) =>
+          request<{ items: BreachRecord[] }>(
+            'GET',
+            `/admin/compliance/breaches${qs({ tenant_id: tenantId })}`,
+          ).then((r) => r.items ?? []),
+        create: (body: BreachRecordInput, tenantId?: string) =>
+          request<BreachRecord>('POST', `/admin/compliance/breaches${qs({ tenant_id: tenantId })}`, body),
+        update: (id: string, body: Partial<BreachRecordInput>, tenantId?: string) =>
+          request<BreachRecord>(
+            'PATCH',
+            `/admin/compliance/breaches/${id}${qs({ tenant_id: tenantId })}`,
+            body,
+          ),
+      },
     },
     // Security operations (→ foundation-security-ops): vulnerabilities / incidents /
     // scans / SBOM watch / drills. Platform-level; tenant_id is optional.
@@ -1539,3 +1595,10 @@ export const api = {
 };
 
 export { ApiError };
+
+/**
+ * The shared JSON request helper (credentials, problem-details → ApiError).
+ * Exported for feature modules that keep their endpoints in their own file
+ * (e.g. `api/privacy.ts`) instead of growing the `api` object above.
+ */
+export { request as apiRequest, qs as apiQuery, BFF_BASE };

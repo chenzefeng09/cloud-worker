@@ -50,7 +50,7 @@ pgBackRest stanza: agent-platform
   加密:       --cipher-type=aes-256-cbc（pgBackRest 内置 + 独立 KEK）
   保留:       全量 4 次（约 4 周）; 增量 7 天; WAL 7 天
   PITR 窗口:  7 天内任意时间点
-  地理约束:   中国客户 → 桶在 cn-north-1/cn-northwest-1；非中国 → ap-east-1 + 异地副本
+  地理约束:   主桶与异地副本都在 EU/EEA（例：eu-central-1 + eu-west-1）；放在 EU/EEA 之外的区域属于 GDPR 第五章跨境传输，需要有充分性认定或 SCC 并记入 ROPA
 ```
 
 关键 pgBackRest 配置（`/etc/pgbackrest/pgbackrest.conf`）：
@@ -59,8 +59,8 @@ pgBackRest stanza: agent-platform
 [global]
 repo1-path=/var/lib/pgbackrest
 repo1-s3-bucket=agent-platform-backup
-repo1-s3-endpoint=s3.cn-northwest-1.amazonaws.com.cn
-repo1-s3-region=cn-northwest-1
+repo1-s3-endpoint=s3.eu-central-1.amazonaws.com
+repo1-s3-region=eu-central-1
 repo1-s3-key=<PGBACKREST_S3_KEY>
 repo1-s3-key-secret=<PGBACKREST_S3_SECRET>
 repo1-type=s3
@@ -160,7 +160,7 @@ clickhouse:
 s3:
   bucket: agent-platform-backup
   path: clickhouse/
-  region: cn-northwest-1
+  region: eu-central-1
   access_key: ${BACKUP_S3_KEY}
   secret_key: ${BACKUP_S3_SECRET}
   compression_format: gz
@@ -209,8 +209,8 @@ velero install \
   --plugins velero/velero-plugin-for-aws:v1.10 \
   --bucket agent-platform-backup \
   --prefix velero/ \
-  --backup-location-config region=cn-northwest-1 \
-  --snapshot-location-config region=cn-northwest-1 \
+  --backup-location-config region=eu-central-1 \
+  --snapshot-location-config region=eu-central-1 \
   --use-node-agent \
   --secret-file ./velero-credentials
 
@@ -231,9 +231,9 @@ velero backup describe manual-$(date +%Y%m%d) --details
 
 ### 2.6 保留期 / 加密 / 地理约束汇总
 
-| 数据源 | 备份保留期 | 加密方式 | 地理约束（中国客户） |
+| 数据源 | 备份保留期 | 加密方式 | 地理约束（EU/EEA） |
 |---|---|---|---|
-| Postgres（业务数据） | 全量 4 周；WAL 7 天 | pgBackRest AES-256 + 独立备份 KEK | 桶在 cn-northwest-1 或 cn-north-1 |
+| Postgres（业务数据） | 全量 4 周；WAL 7 天 | pgBackRest AES-256 + 独立备份 KEK | 桶在 EU/EEA 区域（例：eu-central-1） |
 | MinIO agent-platform | 90 天（noncurrent） | SSE-KMS 独立 KEK | 副本桶同区域 |
 | MinIO audit-worm | 7 年（COMPLIANCE Object Lock） | SSE-KMS | 副本桶同区域；不可删除 |
 | ClickHouse | 7 天 | AES-256 独立 KEK | 同 Postgres 桶区域 |

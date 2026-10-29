@@ -18,6 +18,18 @@
  * root cause). We instead accumulate `message.message.usage` from every
  * assistant message into `cumulativeUsage`, expose it via getCumulativeUsage(),
  * and the worker writes THAT into result.json.
+ *
+ * Event fields added on top of the inherited vocabulary:
+ *   - ToolCallEndEvent.args — the complete JSON args string for the call (the
+ *     consolidated, CLI-normalised input when available, else the streamed
+ *     input_json_delta concatenation). Emitted AT MOST ONCE per tool_call_id.
+ *   - ThinkingBlockDeltaEvent.whole_block — true when the delta is a whole
+ *     non-streamed block (from a consolidated message), absent for live chunks.
+ *   - ApiErrorEvent {error} — the CLI surfaced an API failure as a synthetic
+ *     assistant message ("API Error: …"); `error` is the SDK's error code
+ *     ("unknown" when the notice has none). Its raw text is deliberately NOT
+ *     forwarded as answer text.
+ *   - ErrorEvent.subtype — the SDK result subtype behind a failed run.
  */
 
 import { randomUUID } from "node:crypto";
@@ -47,6 +59,47 @@ export interface CumulativeUsage {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- dynamic wire JSON
 type Json = any;
 
+/**
+ * The CLI replaces a whitespace-only text block with this placeholder in the
+ * consolidated assistant message (cli.js `ML`), so the streamed and
+ * consolidated texts of that block differ.
+ */
+const NO_CONTENT_PLACEHOLDER = "(no content)";
+
+/** `model` of the assistant messages the CLI makes up itself (cli.js `dWA`). */
+const SYNTHETIC_MODEL = "<synthetic>";
+/** Prefix of the CLI's API-error notices (cli.js `TV`). */
+const API_ERROR_PREFIX = "API Error";
+
+/**
+ * A CLI-made API-error notice (never model output: the model cannot produce a
+ * "<synthetic>" message), whether or not it carries an SDK error code.
+ */
+function isSyntheticApiErrorNotice(message: Json): boolean {
+  if (message?.model !== SYNTHETIC_MODEL) return false;
+  const content: Json[] = Array.isArray(message?.content) ? message.content : [];
+  return content.some(
+    (b: Json) =>
+      b?.type === "text" &&
+      typeof b.text === "string" &&
+      b.text.startsWith(API_ERROR_PREFIX),
+  );
+}
+
+/** One text/thinking content block streamed this turn, in stream order. */
+interface StreamedBlock {
+  kind: "text" | "thinking";
+  text: string;
+  /** Matched by a consolidated assistant block already (never re-matched). */
+  consumed: boolean;
+}
+
+interface UsageSnapshot {
+  input: number;
+  output: number;
+  cacheRead: number;
+}
+
 export class EventTranslator {
   /** blockIndex (within one assistant message) -> minted uuid. */
   private textBlockIds = new Map<number, string>();
@@ -66,62 +119,53 @@ export class EventTranslator {
   private streamThinkingBlockIds = new Map<number, string>();
   /** streaming content-block index -> tool_call_id (from content_block_start). */
   private streamToolCallIds = new Map<number, string>();
-  /** tool_call_id -> streamed JSON args, when the SDK emits input deltas. */
+  /** tool_call_id -> streamed JSON args, while the call is still open. */
   private streamedToolArgs = new Map<string, string>();
-  /** Tool calls whose end event has already been emitted. */
-  private streamedToolCallEnds = new Set<string>();
+  /**
+   * Run-wide tool-call bookkeeping, keyed on the globally unique tool_use id:
+   * ids whose ToolCallStartEvent / ToolCallEndEvent were already emitted. A
+   * tool call is announced and closed exactly once no matter how many times the
+   * SDK surfaces it (partials + per-block consolidated message).
+   */
+  private startedToolCalls = new Set<string>();
+  private endedToolCalls = new Set<string>();
 
   // ── consolidated-assistant dedup (per turn, keyed on SDK message id) ───────
-  // Ground truth (worker-claude-sdk/sdk-messages-sample.jsonl, a real
-  // deepseek-v4-pro turn): under includePartialMessages the SDK emits ONE
-  // `message_start` at the top of the turn, then streams content blocks, and
-  // delivers a SEPARATE consolidated `assistant` message for EACH content block
-  // — interleaved with the partials, NOT a single aggregate at the end (the
-  // thinking-block consolidated arrives while text is still streaming). Every
-  // such per-block consolidated puts its one block at content-array index 0,
-  // regardless of the streaming content-block `index` (thinking streamed at
-  // index 0, text at index 1, but both consolidate at array index 0). All of
-  // them — and the message_start — share ONE stable `msg_…` id.
+  // Ground truth (sdk-messages-sample.jsonl + cli.js): under
+  // includePartialMessages the CLI emits ONE `message_start` per turn, streams
+  // the content blocks, and delivers a SEPARATE consolidated `assistant`
+  // message for EACH content block. Each one is emitted when the CLI sees that
+  // block's content_block_stop, so it reaches us BEFORE the matching
+  // `stream_event` content_block_stop, puts its single block at content-array
+  // index 0 (whatever the streaming index was), and shares the turn's `msg_…`
+  // id with the message_start. The CLI also normalises the block: tool_use
+  // input is re-parsed/coerced, a whitespace-only text becomes "(no content)".
   //
-  // Two consequences drive the design:
-  //   (a) An index-based dedup key cannot work: the consolidated array index is
-  //       always 0 while the streaming index varies, so they never line up. We
-  //       therefore dedup on (messageId, kind) via streamed-text prefix match,
-  //       which is index-independent.
-  //   (b) The streamed-block record must NOT be cleared per consolidated
-  //       message: the first (thinking) consolidated would otherwise wipe the
-  //       record the second (text) consolidated needs, re-emitting the whole
-  //       reply (the observed 163-char answer rendered twice). We reset ONLY
-  //       when a genuinely new turn begins — a `message_start` whose message id
-  //       differs from the one we are currently tracking.
+  // Consequences:
+  //   (a) no index-keyed dedup: the consolidated index is always 0;
+  //   (b) tool calls dedup on their unique id (start/end sets above);
+  //   (c) text/thinking dedup matches the consolidated block against this
+  //       turn's streamed blocks of the same kind in stream order (first
+  //       unconsumed block whose text agrees) — only within the SAME message
+  //       id, so a consolidated message with an id never matches partials of a
+  //       different (or id-less) message;
+  //   (d) records are never cleared per consolidated message (one turn yields
+  //       several); they reset only when a message_start opens a turn with a
+  //       different message id.
   /** SDK message id of the turn currently being streamed (from message_start). */
   private streamingMessageId: string | null = null;
+  /** Text/thinking blocks streamed under streamingMessageId, in order. */
+  private turnBlocks: StreamedBlock[] = [];
+  /** Streaming content-block index -> its turnBlocks entry (per message). */
+  private streamBlockByIndex = new Map<number, StreamedBlock>();
   /**
-   * Index-independent dedup for tool_use blocks (which carry no accumulated
-   * text to prefix-match): `${messageId}|${kind}|${index}` for each streamed
-   * block. tool_use consolidated arrives at array index matching its streamed
-   * index in practice, but we keep the bare `${kind}|${index}` fallback too for
-   * the id-less SDK shape. Reset only on a new-turn message_start.
+   * Highest usage snapshot seen per SDK message id. Every per-block
+   * consolidated message of a turn repeats a usage snapshot (which may be
+   * partial for a block closed mid-stream), and the turn's message_delta
+   * carries the final one; taking the per-field max and accounting only the
+   * growth counts each turn exactly once.
    */
-  private streamedBlockKinds = new Set<string>();
-  /**
-   * Primary dedup for text/thinking: the accumulated text streamed per
-   * (messageId, kind) this turn. translateAssistant prefix-matches a
-   * consolidated block's whole text against what was already streamed for the
-   * same (messageId, kind) — index-independent, which is required because the
-   * consolidated array index never matches the streaming index. Keyed by
-   * `${messageId}|${kind}` (id-less fallback: bare kind). Reset only on a
-   * new-turn message_start.
-   */
-  private streamedTextByKey = new Map<string, string>();
-  /**
-   * Usage is carried IDENTICALLY on every per-block consolidated assistant of a
-   * turn (the same final snapshot repeated). Accounting it per consolidated
-   * message would double/triple-count a single turn's tokens. We instead account
-   * usage at most once per SDK message id; this set remembers which ids were
-   * already counted. Bounded to the current turn's id on a new-turn reset.
-   */
-  private accountedUsageIds = new Set<string>();
+  private usageById = new Map<string, UsageSnapshot>();
 
   private cumulative: CumulativeUsage = {
     input_tokens: 0,
@@ -183,11 +227,9 @@ export class EventTranslator {
    * becomes one TextBlockDeltaEvent, each input_json_delta one ToolCallDeltaEvent.
    *
    * The companion `translateAssistant` skips re-emitting any text/thinking block
-   * that was streamed here (matched by `${message.id}|${index}` in
-   * this.streamedBlocks, with a streamed-text prefix fallback), so text/thinking
-   * are NOT duplicated in Redis. Usage accounting stays solely in
-   * translateAssistant (the final, authoritative `assistant` message);
-   * message_delta usage here is intentionally ignored to avoid double-counting.
+   * that was streamed here (see consumeStreamedBlock) and closes each tool call
+   * exactly once (see consolidatedToolUse), so nothing is duplicated in Redis.
+   * message_delta usage feeds the per-message-id max snapshot (observeUsage).
    */
   private translateStreamEvent(msg: Json): EventPayload[] {
     const ev: Json = msg.event ?? {};
@@ -199,27 +241,15 @@ export class EventTranslator {
         //
         // Reset the turn-scoped dedup records ONLY when this message_start opens
         // a genuinely NEW turn — its message id differs from the one we are
-        // currently tracking. The real SDK sequence emits one message_start per
-        // turn (no trailing/duplicate), so a differing id is the reliable
-        // new-turn signal; resetting here (and never on the consolidated
-        // messages) means the multiple per-block consolidated messages of ONE
-        // turn all still see their blocks as already-streamed. A new turn's
-        // first message_start clears the previous turn's records so nothing
-        // stale leaks across turns (and the consolidated of the new turn emits
-        // its blocks when it was genuinely streamed / dedups when it wasn't).
+        // currently tracking — never on a consolidated message (one turn yields
+        // several, which must all still see their blocks as already-streamed).
         this.streamTextBlockIds.clear();
         this.streamThinkingBlockIds.clear();
         this.streamToolCallIds.clear();
+        this.streamBlockByIndex.clear();
         const id = this.messageIdOf(ev.message);
         if (id !== this.streamingMessageId) {
-          this.streamedBlockKinds.clear();
-          this.streamedTextByKey.clear();
-          this.streamedToolArgs.clear();
-          this.streamedToolCallEnds.clear();
-          // accountedUsageIds is intentionally NOT cleared: it guards against
-          // re-counting a turn's repeated usage snapshot, and an id is only ever
-          // accounted once anyway. Pruning to the current id keeps it bounded.
-          this.accountedUsageIds.clear();
+          this.turnBlocks = [];
         }
         this.streamingMessageId = id;
         return [];
@@ -231,22 +261,26 @@ export class EventTranslator {
         if (kind === "text") {
           const blockId = randomUUID();
           this.streamTextBlockIds.set(index, blockId);
-          this.recordStreamedBlock(index, "text");
+          this.openStreamedBlock(index, "text");
           return [{ event_type: "TextBlockStartEvent", block_id: blockId }];
         }
         if (kind === "thinking") {
           const blockId = randomUUID();
           this.streamThinkingBlockIds.set(index, blockId);
-          this.recordStreamedBlock(index, "thinking");
+          this.openStreamedBlock(index, "thinking");
           return [{ event_type: "ThinkingBlockStartEvent", block_id: blockId }];
         }
         if (kind === "tool_use") {
           const toolCallId = String(block.id ?? "");
           const toolName = String(block.name ?? "tool");
-          if (toolCallId) this.toolNames.set(toolCallId, toolName);
           this.streamToolCallIds.set(index, toolCallId);
-          if (toolCallId) this.streamedToolArgs.set(toolCallId, "");
-          this.recordStreamedBlock(index, "tool_use");
+          if (toolCallId) {
+            this.toolNames.set(toolCallId, toolName);
+            // A replayed start for a call we already announced emits nothing.
+            if (this.startedToolCalls.has(toolCallId)) return [];
+            this.startedToolCalls.add(toolCallId);
+            this.streamedToolArgs.set(toolCallId, "");
+          }
           return [
             {
               event_type: "ToolCallStartEvent",
@@ -266,11 +300,9 @@ export class EventTranslator {
             this.streamTextBlockIds.set(index, blockId);
           }
           // Record even if content_block_start was missed (defensive) and feed
-          // the (messageId,kind) prefix accumulator that translateAssistant
-          // matches against — index-independent on purpose.
-          this.recordStreamedBlock(index, "text");
+          // the per-turn block record that translateAssistant matches against.
           const text = String(delta.text ?? "");
-          this.appendStreamedText("text", text);
+          this.appendStreamedBlockText(index, "text", text);
           return [
             {
               event_type: "TextBlockDeltaEvent",
@@ -284,9 +316,8 @@ export class EventTranslator {
           if (!this.streamThinkingBlockIds.has(index)) {
             this.streamThinkingBlockIds.set(index, blockId);
           }
-          this.recordStreamedBlock(index, "thinking");
           const text = String(delta.thinking ?? "");
-          this.appendStreamedText("thinking", text);
+          this.appendStreamedBlockText(index, "thinking", text);
           return [
             {
               event_type: "ThinkingBlockDeltaEvent",
@@ -297,18 +328,20 @@ export class EventTranslator {
         }
         if (delta.type === "input_json_delta") {
           const toolCallId = this.streamToolCallIds.get(index) ?? "";
+          const partial = String(delta.partial_json ?? "");
           if (toolCallId) {
+            // A call that is already closed never grows again.
+            if (this.endedToolCalls.has(toolCallId)) return [];
             this.streamedToolArgs.set(
               toolCallId,
-              (this.streamedToolArgs.get(toolCallId) ?? "") +
-                String(delta.partial_json ?? ""),
+              (this.streamedToolArgs.get(toolCallId) ?? "") + partial,
             );
           }
           return [
             {
               event_type: "ToolCallDeltaEvent",
               tool_call_id: toolCallId,
-              delta: String(delta.partial_json ?? ""),
+              delta: partial,
             },
           ];
         }
@@ -316,15 +349,18 @@ export class EventTranslator {
       }
       case "content_block_stop": {
         const index = Number(ev.index ?? 0);
-        // If tool arguments were streamed, close the call now. Otherwise wait
-        // for the consolidated assistant message, which carries the complete
-        // tool input for SDKs that omit input_json_delta.
+        // Real CLI order: the block's consolidated assistant message (handled
+        // in translateAssistant) arrives BEFORE this stop and already closed
+        // the call, so this is normally a no-op. When the stop comes first and
+        // arguments were streamed, close the call with the streamed args;
+        // without streamed args wait for the consolidated message, which
+        // carries the complete input for SDKs that omit input_json_delta.
         if (this.streamToolCallIds.has(index)) {
           const toolCallId = this.streamToolCallIds.get(index) ?? "";
+          if (!toolCallId || this.endedToolCalls.has(toolCallId)) return [];
           const toolArgs = this.streamedToolArgs.get(toolCallId) ?? "";
-          if (!toolArgs || this.streamedToolCallEnds.has(toolCallId)) return [];
-          this.streamedToolCallEnds.add(toolCallId);
-          return [{ event_type: "ToolCallEndEvent", tool_call_id: toolCallId }];
+          if (!toolArgs) return [];
+          return [this.endToolCall(toolCallId, toolArgs)];
         }
         if (this.streamTextBlockIds.has(index)) {
           const blockId = this.streamTextBlockIds.get(index) ?? "";
@@ -336,10 +372,13 @@ export class EventTranslator {
         }
         return [];
       }
-      // message_delta / message_stop: usage is intentionally NOT counted here —
-      // the consolidated `assistant` message carries the authoritative usage and
-      // is the single source of truth for cumulative accounting (see class doc).
       case "message_delta":
+        // The turn's final usage. Folded into the per-id max snapshot so a
+        // consolidated message carrying a partial snapshot (a block closed
+        // mid-stream) cannot under-count the turn; never summed on top of the
+        // consolidated usage. Id-less partials cannot be correlated: ignored.
+        if (this.streamingMessageId === null) return [];
+        return this.observeUsage(this.streamingMessageId, ev.usage);
       case "message_stop":
       default:
         return [];
@@ -353,180 +392,162 @@ export class EventTranslator {
     this.textBlockIds.clear();
     this.thinkingBlockIds.clear();
 
-    // Per-block dedup, index-independent (see streamedTextByKey doc). The real
-    // SDK delivers a SEPARATE consolidated assistant per content block, each
-    // putting its block at array index 0 — so the streaming index never matches
-    // and we must NOT key dedup on index for text/thinking. Instead wasStreamed()
-    // prefix-matches the block's whole text against what was streamed for this
-    // (messageId, kind). If it was streamed we skip re-emitting (already in
-    // Redis); otherwise we emit the full block — the non-streamed path where the
-    // model returns a complete assistant message with no partials at all.
-    // tool_use (no accumulated text) keeps the (messageId,kind,index) /
-    // (kind,index) key so it is never mistakenly re-emitted nor lost.
     const msgId = this.messageIdOf(msg.message);
+
+    // The CLI surfaces an API failure (auth, billing, rate limit, gateway 5xx…)
+    // as a synthetic assistant message whose text is "API Error: <raw upstream
+    // message>" and whose `error` carries the SDK error code. That text is not
+    // an answer and can leak gateway internals, so it is never forwarded as
+    // text; the worker maps the code to a user-safe message instead.
+    if (typeof msg.error === "string" && msg.error.length > 0) {
+      return [{ event_type: "ApiErrorEvent", error: msg.error }];
+    }
+    // Some of those notices carry no code (output-token cap — after which the
+    // CLI asks the model to continue — or context window exhausted). They are
+    // still recognisable: synthetic (model "<synthetic>") and "API Error"-led.
+    if (isSyntheticApiErrorNotice(msg.message)) {
+      return [{ event_type: "ApiErrorEvent", error: "unknown" }];
+    }
+
+    // Per-block dedup (see the bookkeeping doc above): a text/thinking block
+    // that was streamed this turn is skipped (already in Redis); otherwise the
+    // full block is emitted — the non-streamed path where the model returned a
+    // complete assistant message with no partials at all. Tool calls are
+    // closed exactly once by id.
     const content: Json[] = msg.message?.content ?? [];
     content.forEach((block: Json, index: number) => {
       const kind = block?.type;
       if (kind === "text") {
-        if (this.wasStreamed(msgId, index, "text", String(block.text ?? ""))) {
-          return;
-        }
+        const text = String(block.text ?? "");
+        if (this.consumeStreamedBlock(msgId, "text", text)) return;
         const blockId = this.mintTextBlockId(index);
         out.push({ event_type: "TextBlockStartEvent", block_id: blockId });
         out.push({
           event_type: "TextBlockDeltaEvent",
           block_id: blockId,
-          delta: String(block.text ?? ""),
+          delta: text,
         });
       } else if (kind === "tool_use") {
-        const toolCallId = String(block.id ?? "");
-        const toolName = String(block.name ?? "tool");
-        if (toolCallId) this.toolNames.set(toolCallId, toolName);
-        if (this.wasStreamed(msgId, index, "tool_use", "")) {
-          const streamedArgs = this.streamedToolArgs.get(toolCallId);
-          if (streamedArgs === undefined || streamedArgs.length === 0) {
-            out.push({
-              event_type: "ToolCallDeltaEvent",
-              tool_call_id: toolCallId,
-              delta: JSON.stringify(block.input ?? {}),
-            });
-            if (!this.streamedToolCallEnds.has(toolCallId)) {
-              this.streamedToolCallEnds.add(toolCallId);
-              out.push({ event_type: "ToolCallEndEvent", tool_call_id: toolCallId });
-            }
-          }
-          return;
-        }
-        out.push({
-          event_type: "ToolCallStartEvent",
-          tool_call_id: toolCallId,
-          tool_call_name: toolName,
-        });
-        out.push({
-          event_type: "ToolCallDeltaEvent",
-          tool_call_id: toolCallId,
-          delta: JSON.stringify(block.input ?? {}),
-        });
-        out.push({ event_type: "ToolCallEndEvent", tool_call_id: toolCallId });
+        out.push(...this.consolidatedToolUse(block));
       } else if (kind === "thinking") {
-        if (
-          this.wasStreamed(msgId, index, "thinking", String(block.thinking ?? ""))
-        ) {
-          return;
-        }
+        const text = String(block.thinking ?? "");
+        if (this.consumeStreamedBlock(msgId, "thinking", text)) return;
         const blockId = this.mintThinkingBlockId(index);
         out.push({ event_type: "ThinkingBlockStartEvent", block_id: blockId });
         out.push({
           event_type: "ThinkingBlockDeltaEvent",
           block_id: blockId,
-          delta: String(block.thinking ?? ""),
+          delta: text,
+          // A whole non-streamed block, not a live chunk (worker pushes a
+          // single `thinking` entry for it).
+          whole_block: true,
         });
         out.push({ event_type: "ThinkingBlockEndEvent", block_id: blockId });
       }
       // image / other blocks are ignored in v1.
     });
 
-    // Do NOT clear the turn-scoped dedup records here. One turn delivers MULTIPLE
-    // per-block consolidated assistants (real SDK: a thinking one mid-stream,
-    // then a text one); clearing after the first would wipe the records the next
-    // needs and re-emit the whole reply (the 163-char-twice bug). Records are
-    // reset only when a new turn's message_start arrives with a different id.
-    //
-    // The genuinely non-streamed path (a complete assistant with no partials,
-    // hence no message_start) carries a NEW message id, which differs from the
-    // last streamed turn's id — but there is no message_start to trigger the
-    // reset, so stale streamedTextByKey from a previous streamed turn could in
-    // principle linger. It cannot cause a false skip here because the keys are
-    // `${messageId}|${kind}` and this message's id is different (id-less is the
-    // only ambiguous case, handled by the bare-kind fallback only when no id
-    // exists on either side). For safety and boundedness we still re-home the
-    // tracking id; we do not wipe the maps so a later same-turn consolidated of
-    // THIS message keeps matching.
-    if (msgId !== null && msgId !== this.streamingMessageId) {
-      this.streamingMessageId = msgId;
-    }
-
-    // Accumulate usage from this assistant turn AT MOST ONCE per message id. Each
-    // per-block consolidated of a turn repeats the SAME usage snapshot; counting
-    // every one would multiply a single turn's tokens (observed 2× on the real
-    // two-block turn). The per-turn increment event is emitted only on that first
-    // accounting so downstream sees one ModelCallEnd per turn.
-    out.push(...this.accountUsage(msg, msgId));
+    // Usage: per-id max snapshot, accounting only growth (see usageById).
+    out.push(...this.observeUsage(msgId, msg.message?.usage));
 
     return out;
   }
 
   /**
-   * Record that block `index` (of `kind`) of the currently-streaming message was
-   * streamed. Adds the (messageId,kind,index) key and the id-less (kind,index)
-   * fallback — used to dedup tool_use blocks, which carry no accumulated text to
-   * prefix-match; text/thinking are deduped by the streamed-text accumulator
-   * (appendStreamedText) instead.
+   * The consolidated copy of a tool_use block. Emits nothing for a call that
+   * is already closed. For a call announced by the partials it emits only the
+   * closing ToolCallEndEvent (plus the arguments when no input_json_delta was
+   * streamed); a never-streamed call gets the full Start/Delta/End triple.
+   * The End's `args` is the consolidated input — the CLI-normalised arguments
+   * the tool actually runs with — and the partial args are never re-appended.
    */
-  private recordStreamedBlock(index: number, kind: string): void {
-    this.streamedBlockKinds.add(
-      `${this.streamingMessageId ?? "?"}|${kind}|${index}`,
-    );
-    this.streamedBlockKinds.add(`${kind}|${index}`);
-  }
-
-  /**
-   * Accumulate streamed text for the current turn's (messageId, kind). Keyed on
-   * `${messageId}|${kind}` so it survives the multiple per-block consolidated
-   * messages of one turn and is distinct across turns; bare `${kind}` is also
-   * recorded as an id-less fallback for the leaner SDK shape that omits ids.
-   */
-  private appendStreamedText(kind: string, text: string): void {
-    const id = this.streamingMessageId;
-    if (id !== null) {
-      const k = `${id}|${kind}`;
-      this.streamedTextByKey.set(k, (this.streamedTextByKey.get(k) ?? "") + text);
+  private consolidatedToolUse(block: Json): EventPayload[] {
+    const toolCallId = String(block.id ?? "");
+    const toolName = String(block.name ?? "tool");
+    const argsJson = JSON.stringify(block.input ?? {});
+    if (toolCallId) {
+      this.toolNames.set(toolCallId, toolName);
+      if (this.endedToolCalls.has(toolCallId)) return [];
     }
-    this.streamedTextByKey.set(
-      kind,
-      (this.streamedTextByKey.get(kind) ?? "") + text,
-    );
+    const out: EventPayload[] = [];
+    if (!toolCallId || !this.startedToolCalls.has(toolCallId)) {
+      if (toolCallId) this.startedToolCalls.add(toolCallId);
+      out.push({
+        event_type: "ToolCallStartEvent",
+        tool_call_id: toolCallId,
+        tool_call_name: toolName,
+      });
+      out.push({
+        event_type: "ToolCallDeltaEvent",
+        tool_call_id: toolCallId,
+        delta: argsJson,
+      });
+    } else if (!this.streamedToolArgs.get(toolCallId)) {
+      // Announced by a content_block_start but no input_json_delta streamed:
+      // the consolidated input is the only copy of the arguments.
+      out.push({
+        event_type: "ToolCallDeltaEvent",
+        tool_call_id: toolCallId,
+        delta: argsJson,
+      });
+    }
+    out.push(this.endToolCall(toolCallId, argsJson));
+    return out;
+  }
+
+  /** Build the single ToolCallEndEvent for a call and mark it closed. */
+  private endToolCall(toolCallId: string, args: string): EventPayload {
+    if (toolCallId) {
+      this.endedToolCalls.add(toolCallId);
+      this.streamedToolArgs.delete(toolCallId);
+    }
+    return { event_type: "ToolCallEndEvent", tool_call_id: toolCallId, args };
+  }
+
+  /** Open a streamed text/thinking block record for the current turn. */
+  private openStreamedBlock(index: number, kind: "text" | "thinking"): StreamedBlock {
+    const block: StreamedBlock = { kind, text: "", consumed: false };
+    this.turnBlocks.push(block);
+    this.streamBlockByIndex.set(index, block);
+    return block;
+  }
+
+  /** Append streamed text to the block at `index` (opening it if missed). */
+  private appendStreamedBlockText(
+    index: number,
+    kind: "text" | "thinking",
+    text: string,
+  ): void {
+    let block = this.streamBlockByIndex.get(index);
+    if (!block || block.kind !== kind) {
+      block = this.openStreamedBlock(index, kind);
+    }
+    block.text += text;
   }
 
   /**
-   * Did partials already stream this consolidated block? INDEX-INDEPENDENT by
-   * design — the real SDK puts every per-block consolidated at array index 0
-   * while the streaming index varies, so an index-keyed test never lines up.
-   *
-   *   • text / thinking: prefix-match the consolidated block's whole text against
-   *     the streamed-text accumulator for this (messageId, kind) (id-less
-   *     fallback: bare kind). If the consolidated text is a prefix of (or equals)
-   *     what was streamed, it was already emitted token-by-token → skip.
-   *   • tool_use: no accumulated text, so fall back to the (messageId,kind,index)
-   *     / (kind,index) key recorded during streaming. In the real SDK a streamed
-   *     tool_use consolidates at the same index it streamed at, and the id-less
-   *     key covers the leaner shape — never re-emitting nor dropping a tool call.
-   *
-   * Returns false for the genuinely non-streamed case so the full block emits.
+   * Was this consolidated text/thinking block already streamed? Matches it to
+   * the first not-yet-matched block of the same kind streamed under the SAME
+   * message id whose text agrees (equal, the streamed text extends it, or the
+   * CLI's whitespace-only "(no content)" placeholder), and marks that block
+   * matched so it is never matched twice. A message id that differs from the
+   * streamed turn's (a non-streamed message, or id vs id-less) never matches,
+   * so the full block is emitted rather than silently dropped.
    */
-  private wasStreamed(
+  private consumeStreamedBlock(
     messageId: string | null,
-    index: number,
-    kind: string,
+    kind: "text" | "thinking",
     text: string,
   ): boolean {
-    if (kind === "tool_use") {
-      if (
-        messageId !== null &&
-        this.streamedBlockKinds.has(`${messageId}|${kind}|${index}`)
-      ) {
+    if (messageId !== this.streamingMessageId) return false;
+    for (const block of this.turnBlocks) {
+      if (block.kind !== kind || block.consumed) continue;
+      if (sameBlockText(block.text, text)) {
+        block.consumed = true;
         return true;
       }
-      return this.streamedBlockKinds.has(`${kind}|${index}`);
     }
-    // text / thinking: index-independent streamed-text prefix match.
-    if (text.length === 0) return false;
-    if (messageId !== null) {
-      const streamed = this.streamedTextByKey.get(`${messageId}|${kind}`);
-      if (streamed && streamed.startsWith(text)) return true;
-    }
-    const fallback = this.streamedTextByKey.get(kind);
-    return fallback !== undefined && fallback.length > 0 && fallback.startsWith(text);
+    return false;
   }
 
   /** Extract the `msg_…` id from a consolidated message or a partial's
@@ -537,37 +558,45 @@ export class EventTranslator {
   }
 
   /**
-   * Accumulate this assistant turn's usage into the cumulative total and return
-   * the single per-turn ModelCallEndEvent — AT MOST ONCE per SDK message id. A
-   * turn delivers multiple per-block consolidated assistants that each repeat the
-   * SAME usage snapshot (real SDK: thinking + text consolidated both carry
-   * in=13154/out=117); counting each would multiply one turn's tokens. We account
-   * the first time we see an id and skip every later consolidated of that id.
-   * When no id is present (leaner SDK shape) we cannot dedup, so we account it —
-   * matching the legacy one-consolidated-per-turn behavior. The streaming
-   * `message_delta` path deliberately adds no usage, so a turn contributes
-   * exactly one ModelCallEnd worth of input/output regardless of partials.
+   * Fold one usage snapshot of message `msgId` into the cumulative total and
+   * return a ModelCallEndEvent carrying the INCREMENT, or nothing when the
+   * snapshot adds nothing. Every per-block consolidated message of a turn
+   * repeats a snapshot (real SDK: thinking + text consolidated both carry
+   * in=13154/out=117) and message_delta carries the final one, so per id we
+   * keep the per-field max and account only its growth: a turn is counted
+   * once, and a snapshot taken mid-stream (a block closed early) cannot
+   * under-count it. The ModelCallEndEvent increments of a run sum to the
+   * cumulative usage (what the orchestrator aggregates). When no id is present
+   * (leaner SDK shape) snapshots cannot be correlated, so each is counted as-is
+   * — the legacy one-consolidated-per-turn behaviour.
    */
-  private accountUsage(msg: Json, msgId: string | null): EventPayload[] {
+  private observeUsage(msgId: string | null, usage: Json): EventPayload[] {
+    const cur = readUsage(usage);
+    let inc: UsageSnapshot = cur;
     if (msgId !== null) {
-      if (this.accountedUsageIds.has(msgId)) return [];
-      this.accountedUsageIds.add(msgId);
+      const prev = this.usageById.get(msgId) ?? { input: 0, output: 0, cacheRead: 0 };
+      const next: UsageSnapshot = {
+        input: Math.max(prev.input, cur.input),
+        output: Math.max(prev.output, cur.output),
+        cacheRead: Math.max(prev.cacheRead, cur.cacheRead),
+      };
+      this.usageById.set(msgId, next);
+      inc = {
+        input: next.input - prev.input,
+        output: next.output - prev.output,
+        cacheRead: next.cacheRead - prev.cacheRead,
+      };
     }
-    const usage: Json = msg.message?.usage ?? {};
-    const input = Number(usage.input_tokens ?? 0) || 0;
-    const output = Number(usage.output_tokens ?? 0) || 0;
-    // DeepSeek prefix-cache hits, mapped by the adapter onto Anthropic's
-    // cache_read_input_tokens. Failure-open: absent => 0.
-    const cacheRead = Number(usage.cache_read_input_tokens ?? 0) || 0;
-    this.cumulative.input_tokens += input;
-    this.cumulative.output_tokens += output;
-    this.cumulative.cache_read_input_tokens += cacheRead;
+    if (inc.input === 0 && inc.output === 0 && inc.cacheRead === 0) return [];
+    this.cumulative.input_tokens += inc.input;
+    this.cumulative.output_tokens += inc.output;
+    this.cumulative.cache_read_input_tokens += inc.cacheRead;
     return [
       {
         event_type: "ModelCallEndEvent",
-        input_tokens: input,
-        output_tokens: output,
-        cache_read_input_tokens: cacheRead,
+        input_tokens: inc.input,
+        output_tokens: inc.output,
+        cache_read_input_tokens: inc.cacheRead,
       },
     ];
   }
@@ -606,14 +635,24 @@ export class EventTranslator {
 
   // ── type:"result" ──────────────────────────────────────────────────────────
   private translateResult(msg: Json): EventPayload[] {
-    if (msg.subtype === "success") {
+    // The CLI reports subtype "success" with is_error=true when the turn ended
+    // on an API error (its result text is the raw "API Error: …" message).
+    if (msg.subtype === "success" && msg.is_error !== true) {
       return [{ event_type: "ReplyEndEvent" }];
     }
     // error_during_execution / error_max_turns / error_max_budget_usd / ...
     const errors: string[] = Array.isArray(msg.errors) ? msg.errors : [];
-    const message =
-      errors.length > 0 ? errors.join("; ") : `result subtype ${msg.subtype}`;
-    return [{ event_type: "ErrorEvent", message }];
+    const subtype = String(msg.subtype ?? "unknown");
+    let message: string;
+    if (errors.length > 0) {
+      message = errors.join("; ");
+    } else if (msg.subtype === "success") {
+      // Do not copy the raw upstream error text (may echo gateway internals).
+      message = "model API error";
+    } else {
+      message = `result subtype ${subtype}`;
+    }
+    return [{ event_type: "ErrorEvent", message, subtype }];
   }
 
   // ── type:"system" ──────────────────────────────────────────────────────────
@@ -648,6 +687,32 @@ export class EventTranslator {
     }
     return id;
   }
+}
+
+/** Read an Anthropic usage object; absent/garbage fields count as 0. */
+function readUsage(usage: Json): UsageSnapshot {
+  const u: Json = usage ?? {};
+  return {
+    input: Number(u.input_tokens ?? 0) || 0,
+    output: Number(u.output_tokens ?? 0) || 0,
+    // DeepSeek prefix-cache hits, mapped by the adapter onto Anthropic's
+    // cache_read_input_tokens. Failure-open: absent => 0.
+    cacheRead: Number(u.cache_read_input_tokens ?? 0) || 0,
+  };
+}
+
+/**
+ * Does a consolidated block's text agree with a streamed block's text? Equal;
+ * the streamed text extends it (snapshot taken before the last delta); or the
+ * streamed block was whitespace-only, which the CLI consolidates as "(no
+ * content)".
+ */
+function sameBlockText(streamed: string, consolidated: string): boolean {
+  if (streamed === consolidated) return true;
+  if (streamed.trim() === "") {
+    return consolidated.trim() === "" || consolidated === NO_CONTENT_PLACEHOLDER;
+  }
+  return consolidated.length > 0 && streamed.startsWith(consolidated);
 }
 
 /**

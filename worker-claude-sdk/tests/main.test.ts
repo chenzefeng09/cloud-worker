@@ -9,13 +9,39 @@
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { AbortError } from "@anthropic-ai/claude-agent-sdk";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { RedisStateClient } from "../src/redis_state.js";
+import { RedisStateClient, type StateTransport } from "../src/redis_state.js";
 import { main } from "../src/main.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnyMsg = any;
+
+/**
+ * A StateTransport that records every token-stream entry. Used under a REAL
+ * RedisStateClient so the tests assert the exact wire entries main() produces.
+ */
+class WireTransport implements StateTransport {
+  entries: Array<Record<string, string>> = [];
+  sets: Array<{ key: string; value: string; ttlSec: number }> = [];
+  async get(): Promise<string | null> {
+    return null;
+  }
+  async set(key: string, value: string, ttlSec: number): Promise<void> {
+    this.sets.push({ key, value, ttlSec });
+  }
+  async xadd(fields: Record<string, string>): Promise<void> {
+    this.entries.push({ ...fields });
+  }
+  async close(): Promise<void> {}
+}
+
+/** A real (coalescing, exactly-once-end) client over a WireTransport. */
+function wireRedis(): { redis: RedisStateClient; wire: WireTransport } {
+  const wire = new WireTransport();
+  return { redis: new RedisStateClient("run", undefined, wire), wire };
+}
 
 const REQUIRED_ENV = {
   FOUNDATION_API_URL: "https://foundation.local",
@@ -261,5 +287,317 @@ describe("main", () => {
     const result = JSON.parse(readFileSync(path.join(ws, "result.json"), "utf8"));
     expect(result.status).toBe("FAILED");
     expect(result.summary).toContain("empty");
+  });
+
+  // ── the token stream always ends, with a status ─────────────────────────
+
+  it("happy path wire: delta entries, then exactly one end(completed)", async () => {
+    setEnv(REQUIRED_ENV);
+    setEnv({ AGENT_TASK_JSON: JSON.stringify({ task: "say hi" }) });
+    const { redis, wire } = wireRedis();
+
+    const code = await main({
+      makeRedis: () => redis,
+      makeAdapter: () => new FakeAdapter() as never,
+      queryFn: fakeQuerySuccess("hi back") as never,
+    });
+
+    expect(code).toBe(0);
+    expect(wire.entries).toEqual([
+      { type: "delta", text: "hi back" },
+      { type: "end", text: "", status: "completed" },
+    ]);
+  });
+
+  describe("early failures reach the token stream", () => {
+    const cases = [
+      {
+        name: "missing infra env",
+        env: { ...REQUIRED_ENV, FOUNDATION_TENANT_ID: "" },
+        taskJson: JSON.stringify({ task: "x" }),
+        code: 1,
+        message: "The agent could not start (sandbox configuration error).",
+      },
+      {
+        name: "malformed task payload",
+        env: REQUIRED_ENV,
+        taskJson: "{not valid json",
+        code: 2,
+        message: "The agent could not start (invalid task payload).",
+      },
+      {
+        name: "empty task text",
+        env: REQUIRED_ENV,
+        taskJson: JSON.stringify({ task: "   " }),
+        code: 0,
+        message: "The task text is empty.",
+      },
+    ];
+
+    for (const c of cases) {
+      it(`${c.name}: error + end(failed), exit ${c.code}`, async () => {
+        setEnv(c.env);
+        setEnv({ AGENT_TASK_JSON: c.taskJson });
+        const { redis, wire } = wireRedis();
+
+        const code = await main({
+          makeRedis: () => redis,
+          makeAdapter: () => new FakeAdapter() as never,
+          queryFn: fakeQuerySuccess("never") as never,
+        });
+
+        expect(code).toBe(c.code);
+        expect(wire.entries).toEqual([
+          { type: "error", message: c.message },
+          { type: "end", text: "", status: "failed" },
+        ]);
+      });
+
+      it(`${c.name}: a Redis outage while reporting never changes the exit code`, async () => {
+        setEnv(c.env);
+        setEnv({ AGENT_TASK_JSON: c.taskJson });
+        const redis = new RedisStateClient("run", undefined);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (redis as any).pushError = async () => {
+          throw new Error("redis down");
+        };
+
+        const code = await main({
+          makeRedis: () => redis,
+          makeAdapter: () => new FakeAdapter() as never,
+          queryFn: fakeQuerySuccess("never") as never,
+        });
+        expect(code).toBe(c.code);
+      });
+    }
+
+    it("a client that cannot even be built never changes the exit code", async () => {
+      setEnv({ ...REQUIRED_ENV, FOUNDATION_TENANT_ID: "" });
+      setEnv({ AGENT_TASK_JSON: JSON.stringify({ task: "x" }) });
+      const code = await main({
+        makeRedis: () => {
+          throw new Error("bad REDIS_URL");
+        },
+        makeAdapter: () => new FakeAdapter() as never,
+        queryFn: fakeQuerySuccess("never") as never,
+      });
+      expect(code).toBe(1);
+    });
+  });
+
+  it("worker crash (adapter fails to start): user-safe error + end(failed), exit 1", async () => {
+    setEnv(REQUIRED_ENV);
+    setEnv({ AGENT_TASK_JSON: JSON.stringify({ task: "say hi" }) });
+    const { redis, wire } = wireRedis();
+    const crashingAdapter = {
+      async start(): Promise<number> {
+        throw new Error("listen EADDRINUSE 127.0.0.1:41000");
+      },
+      async stop(): Promise<void> {},
+    };
+
+    const code = await main({
+      makeRedis: () => redis,
+      makeAdapter: () => crashingAdapter as never,
+      queryFn: fakeQuerySuccess("never") as never,
+    });
+
+    expect(code).toBe(1);
+    const result = JSON.parse(readFileSync(path.join(ws, "result.json"), "utf8"));
+    expect(result.summary).toBe("worker crashed");
+    expect(result.error).toContain("EADDRINUSE"); // detail stays in result.json
+    expect(wire.entries).toEqual([
+      { type: "error", message: "The agent run failed unexpectedly. Please try again." },
+      { type: "end", text: "", status: "failed" },
+    ]);
+    // The state key ends FAILED.
+    const lastState = JSON.parse(wire.sets[wire.sets.length - 1].value);
+    expect(lastState.status).toBe("FAILED");
+  });
+
+  it("a failed agent run: one error + one end(failed) (main adds no second end)", async () => {
+    setEnv(REQUIRED_ENV);
+    setEnv({ AGENT_TASK_JSON: JSON.stringify({ task: "say hi" }) });
+    const { redis, wire } = wireRedis();
+    const queryFn = () =>
+      (async function* () {
+        yield { type: "result", subtype: "error_during_execution", errors: ["boom"] } as AnyMsg;
+      })() as AnyMsg;
+
+    const code = await main({
+      makeRedis: () => redis,
+      makeAdapter: () => new FakeAdapter() as never,
+      queryFn: queryFn as never,
+    });
+
+    expect(code).toBe(1);
+    expect(wire.entries).toEqual([
+      { type: "error", message: "The agent run failed unexpectedly. Please try again." },
+      { type: "end", text: "", status: "failed" },
+    ]);
+  });
+
+  it("cancellation (abortController): end(cancelled), result.json FAILED, exit 1", async () => {
+    setEnv(REQUIRED_ENV);
+    setEnv({ AGENT_TASK_JSON: JSON.stringify({ task: "long job" }) });
+    const { redis, wire } = wireRedis();
+    const abortController = new AbortController();
+    let sawAbortController = false;
+    const queryFn = (args: AnyMsg) =>
+      (async function* () {
+        sawAbortController = args.options.abortController === abortController;
+        yield { type: "stream_event", event: { type: "message_start" } } as AnyMsg;
+        yield {
+          type: "stream_event",
+          event: { type: "content_block_start", index: 0, content_block: { type: "text" } },
+        } as AnyMsg;
+        yield {
+          type: "stream_event",
+          event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Working" } },
+        } as AnyMsg;
+        abortController.abort(); // what the SIGTERM handler does
+        throw new AbortError("Operation aborted");
+      })() as AnyMsg;
+
+    const code = await main({
+      makeRedis: () => redis,
+      makeAdapter: () => new FakeAdapter() as never,
+      queryFn: queryFn as never,
+      abortController,
+    });
+
+    expect(sawAbortController).toBe(true);
+    expect(code).toBe(1);
+    const result = JSON.parse(readFileSync(path.join(ws, "result.json"), "utf8"));
+    expect(result.status).toBe("FAILED");
+    expect(result.summary).toBe("run cancelled");
+    expect(wire.entries).toEqual([
+      { type: "delta", text: "Working" },
+      { type: "end", text: "", status: "cancelled" },
+    ]);
+  });
+
+  it("paused run wire: pending entry, then end(paused); stream + state get the paused TTL", async () => {
+    setEnv(REQUIRED_ENV);
+    setEnv({ AGENT_TASK_JSON: JSON.stringify({ task: "search the repo", hitl: true }) });
+    const { redis, wire } = wireRedis();
+    const queryFn = (args: AnyMsg) =>
+      (async function* () {
+        await args.options.canUseTool("mcp__github__search_code", { q: "x" }, { toolUseID: "tu_1" });
+      })() as AnyMsg;
+
+    const code = await main({
+      makeRedis: () => redis,
+      makeAdapter: () => new FakeAdapter() as never,
+      queryFn: queryFn as never,
+    });
+
+    expect(code).toBe(0);
+    expect(wire.entries).toEqual([
+      {
+        type: "pending_confirmation",
+        tool_call_id: "tu_1",
+        name: "mcp__github__search_code",
+        args: '{"q":"x"}',
+      },
+      { type: "end", text: "", status: "paused" },
+    ]);
+    const paused = wire.sets.find((s) => s.key.endsWith(":paused"));
+    expect(paused?.ttlSec).toBe(7 * 24 * 3600);
+    const state = wire.sets.filter((s) => s.key.endsWith(":state")).pop();
+    expect(JSON.parse(state!.value).status).toBe("PAUSED");
+    expect(state!.ttlSec).toBe(7 * 24 * 3600);
+  });
+
+  // ── a resume leg is configured exactly like a fresh run ─────────────────
+
+  it("fresh and resume legs get identical adapter + query options (only the prompt differs)", async () => {
+    const baseTaskJson = {
+      task: "post the weekly report",
+      model_override: "claude-override",
+      reasoning_effort: "high",
+      sampling_params: { max_tokens: 2048 },
+      sys_prompt: "You are the reporting agent.",
+      memory: "The user prefers short reports.",
+      history: [
+        { role: "user", content: "what did we ship?" },
+        { role: "assistant", content: "Three features." },
+      ],
+      hitl: true,
+    };
+    const resumeTaskJson = {
+      ...baseTaskJson,
+      resume: {
+        kind: "confirm",
+        tool_call_id: "tu_9",
+        confirmed: true,
+        agent_state: {
+          version: 2,
+          original_task: "post the weekly report",
+          transcript: [{ role: "assistant", text: "Posting it now." }],
+          pending: [{ id: "tu_9", name: "mcp__slack__post", args: '{"text":"report"}' }],
+        },
+      },
+    };
+
+    async function runLeg(taskJson: unknown) {
+      // main() scrubs control-plane env before the query; re-set it per leg.
+      Object.assign(process.env, REQUIRED_ENV, { AGENT_TASK_JSON: JSON.stringify(taskJson) });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let adapterOpts: any;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let queryArgs: any;
+      const code = await main({
+        makeRedis: () => new RedisStateClient("run", undefined),
+        makeAdapter: (_env, _task, opts) => {
+          adapterOpts = opts;
+          return new FakeAdapter() as never;
+        },
+        queryFn: ((args: AnyMsg) => {
+          queryArgs = args;
+          return fakeQuerySuccess("done")();
+        }) as never,
+      });
+      expect(code).toBe(0);
+      return { adapterOpts, queryArgs };
+    }
+
+    setEnv(REQUIRED_ENV); // records the pre-test values for afterEach
+    const fresh = await runLeg(baseTaskJson);
+    const resumed = await runLeg(resumeTaskJson);
+
+    expect(resumed.adapterOpts).toEqual(fresh.adapterOpts);
+    expect(fresh.adapterOpts).toMatchObject({
+      targetModel: "claude-override",
+      maxOutputTokens: 2048,
+      reasoningEffort: "high",
+    });
+
+    const pick = (o: AnyMsg) => ({
+      systemPrompt: o.systemPrompt,
+      model: o.model,
+      maxThinkingTokens: o.maxThinkingTokens,
+      disallowedTools: o.disallowedTools,
+      mcpServers: Object.keys(o.mcpServers).sort(),
+      permissionMode: o.permissionMode,
+      includePartialMessages: o.includePartialMessages,
+      hasCanUseTool: typeof o.canUseTool === "function",
+    });
+    expect(pick(resumed.queryArgs.options)).toEqual(pick(fresh.queryArgs.options));
+    // History, memory and the agent's own system prompt reach BOTH legs.
+    const sys = String(fresh.queryArgs.options.systemPrompt);
+    expect(sys).toContain("You are the reporting agent.");
+    expect(sys).toContain("The user prefers short reports.");
+    expect(sys).toContain("Three features.");
+
+    // The prompt is the only difference: a string vs the replayed transcript.
+    expect(typeof fresh.queryArgs.prompt).toBe("string");
+    expect(typeof resumed.queryArgs.prompt).not.toBe("string");
+    const replayed: AnyMsg[] = [];
+    for await (const m of resumed.queryArgs.prompt) replayed.push(m);
+    expect(replayed).toHaveLength(1);
+    const text = String(replayed[0].message.content);
+    expect(text).toContain("[Original task] post the weekly report");
+    expect(text).toContain("Assistant: Posting it now.");
   });
 });

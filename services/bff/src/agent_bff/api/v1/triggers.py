@@ -40,7 +40,11 @@ from fastapi.responses import JSONResponse
 from starlette.datastructures import UploadFile
 
 from agent_bff.api._http import foundation_headers
-from agent_bff.api.v1.apps import _raise_for_upstream, _select_published_version
+from agent_bff.api.v1.apps import (
+    _USER_ID_RE,
+    _raise_for_upstream,
+    _select_published_version,
+)
 
 router = APIRouter(tags=["Triggers"])
 logger = logging.getLogger(__name__)
@@ -275,6 +279,12 @@ async def receive_webhook(trigger_id: str, request: Request) -> JSONResponse:
     # field_mapping still only covers from-event keys — fixed fields arrive here,
     # not in the payload.
     fixed_inputs: dict[str, Any] = _flatten_input_values(verified.get("input_values"))
+    # The trigger's owner: the run executes as the cron service account, so
+    # the session records whose behalf it is on for that user's export and
+    # erasure (NULL for triggers created before cron-runner tracked owners).
+    owner = verified.get("created_by_user_id")
+    if not (isinstance(owner, str) and _USER_ID_RE.fullmatch(owner)):
+        owner = None
 
     # Machine identity for foundation calls (no bearer — foundation services
     # trust X-Tenant-Id / X-User-Id on the internal hop) and for the
@@ -339,15 +349,19 @@ async def receive_webhook(trigger_id: str, request: Request) -> JSONResponse:
         session_id: str | None = None
         file_inputs: dict[str, list[str]] = {}
         if pending_files:
+            agent_config: dict[str, Any] = {
+                "kind": "app_run",
+                "app_id": app_id,
+                "app_version_id": vid,
+            }
+            if owner:
+                # run_app tags only the sessions it creates itself.
+                agent_config["on_behalf_of_user_id"] = owner
             sess_resp = await client.post(
                 f"{orch_url}/sessions",
                 json={
                     "title": app.get("name") or "Webhook run",
-                    "agent_config": {
-                        "kind": "app_run",
-                        "app_id": app_id,
-                        "app_version_id": vid,
-                    },
+                    "agent_config": agent_config,
                 },
                 headers=fheaders,
             )
@@ -377,6 +391,8 @@ async def receive_webhook(trigger_id: str, request: Request) -> JSONResponse:
         }
         if session_id:
             run_body["session_id"] = session_id
+        if owner:
+            run_body["on_behalf_of"] = owner
         run_resp = await client.post(
             f"{self_url}{api_prefix}/apps/{app_id}/run",
             json=run_body,

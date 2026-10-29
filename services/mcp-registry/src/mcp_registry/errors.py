@@ -44,3 +44,12 @@ class InternalScopeRequiredError(RegistryError):
             code="MCP.AUTH.INTERNAL_SCOPE_REQUIRED",
             status=403,
         )
+
+
+class SecretEncryptionUnavailableError(RegistryError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Secrets can't be saved right now because the encryption service is unavailable",
+            code="MCP.CRYPTO.UNAVAILABLE",
+            status=503,
+        )

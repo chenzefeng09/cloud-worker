@@ -27,7 +27,7 @@ import logging
 import math
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge_ingest.blob.base import BlobStore, make_key
@@ -395,22 +395,32 @@ class IngestService:
         idempotent and any leaked object can be GC'd later.
         """
         doc, _ = await self.get_document(document_id)
+        await self._delete_documents([doc])
 
-        if doc.source_uri is not None:
-            key = doc.source_uri.replace("memory://", "")
-            if doc.source_uri.startswith("s3://"):
-                key = doc.source_uri.split("/", 3)[-1]
-            try:
-                self._blob.delete(key)
-            except Exception:  # noqa: BLE001 — tolerate blob leak, keep going
-                logger.warning(
-                    "blob delete failed during document delete; leaking object",
-                    extra={"document_id": doc.id, "key": key},
-                    exc_info=True,
-                )
+    async def _delete_documents(self, docs: list[Document]) -> None:
+        """Delete documents the way ``delete_document`` does, in one flush.
 
-        await self._db.delete(doc)
-        await self._db.flush()
+        Per document: best-effort source-blob delete, then the ORM delete,
+        which cascades to the chunks (and with them the embeddings).
+        """
+        for doc in docs:
+            self._delete_source_blob(doc)
+            await self._db.delete(doc)
+        if docs:
+            await self._db.flush()
+
+    def _delete_source_blob(self, doc: Document) -> None:
+        if doc.source_uri is None:
+            return
+        key = _blob_key(doc.source_uri)
+        try:
+            self._blob.delete(key)
+        except Exception:  # noqa: BLE001 — tolerate blob leak, keep going
+            logger.warning(
+                "blob delete failed during document delete; leaking object",
+                extra={"document_id": doc.id, "key": key},
+                exc_info=True,
+            )
 
     async def ingest_document(self, document_id: str) -> tuple[Document, int]:
         doc, _ = await self.get_document(document_id)
@@ -452,6 +462,88 @@ class IngestService:
             if isinstance(exc, IngestFailedError | EmbeddingDimensionError | UnsupportedMimeError):
                 raise
             raise IngestFailedError(doc.id, str(exc)) from exc
+
+    # ----------------------------------------------------------- memories
+    #
+    # Session-memory documents are the run-completion "[memory] …" docs the
+    # session-orchestrator writes: ``origin_session_id`` is set and
+    # ``origin_user_id`` is the owning user.  They are owner-private personal
+    # data, so listing and erasure are always scoped to an owner, a session,
+    # or both.  A legacy memory doc with a NULL ``origin_user_id`` cannot be
+    # attributed to anyone; only a session-scoped purge reaches it.
+
+    def _memory_stmt(
+        self, *, owner_user_id: str | None, origin_session_id: str | None,
+    ) -> Select[tuple[Document]]:
+        stmt = select(Document).where(
+            Document.tenant_id == self._tenant_id,
+            Document.origin_session_id.is_not(None),
+        )
+        if owner_user_id is not None:
+            stmt = stmt.where(Document.origin_user_id == owner_user_id)
+        if origin_session_id is not None:
+            stmt = stmt.where(Document.origin_session_id == origin_session_id)
+        return stmt
+
+    async def list_memories(self, *, owner_user_id: str) -> list[tuple[Document, str]]:
+        """The owner's memory docs (newest first), each with its stored text."""
+        stmt = self._memory_stmt(
+            owner_user_id=owner_user_id, origin_session_id=None,
+        ).order_by(Document.uploaded_at.desc(), Document.id.desc())
+        docs = list((await self._db.execute(stmt)).scalars().all())
+        return [(doc, await self._document_text(doc)) for doc in docs]
+
+    async def delete_memory(self, memory_id: str, *, owner_user_id: str) -> None:
+        """Delete one memory doc; anything not owned by the caller is a 404."""
+        stmt = self._memory_stmt(
+            owner_user_id=owner_user_id, origin_session_id=None,
+        ).where(Document.id == memory_id)
+        doc = (await self._db.execute(stmt)).scalar_one_or_none()
+        if doc is None:
+            raise DocumentNotFoundError(memory_id)
+        await self._delete_documents([doc])
+
+    async def delete_memories(
+        self,
+        *,
+        owner_user_id: str | None = None,
+        origin_session_id: str | None = None,
+    ) -> int:
+        """Delete memory docs by owner and/or originating session; returns the count.
+
+        At least one filter is required: an unscoped call would wipe every
+        user's memory in the tenant.
+        """
+        if owner_user_id is None and origin_session_id is None:
+            raise ValueError("memory purge needs an owner or an origin session")
+        stmt = self._memory_stmt(
+            owner_user_id=owner_user_id, origin_session_id=origin_session_id,
+        )
+        docs = list((await self._db.execute(stmt)).scalars().all())
+        await self._delete_documents(docs)
+        return len(docs)
+
+    async def _document_text(self, doc: Document) -> str:
+        """The document's stored text: the source blob, else its chunk texts.
+
+        The blob holds the exact text that was written; chunks are trimmed,
+        overlapping windows of it, so they are only the fallback for a missing
+        or unreadable blob.
+        """
+        if doc.source_uri is not None:
+            try:
+                raw = self._blob.get(_blob_key(doc.source_uri))
+                return parse_document(mime=doc.mime, data=raw)
+            except Exception:  # noqa: BLE001 — fall back to the chunk copies
+                logger.warning(
+                    "memory blob unreadable; using chunk text",
+                    extra={"document_id": doc.id},
+                    exc_info=True,
+                )
+        rows = await self._db.execute(
+            select(Chunk.text).where(Chunk.document_id == doc.id).order_by(Chunk.ord.asc())
+        )
+        return "\n".join(rows.scalars().all())
 
     # ----------------------------------------------------------- search
 
@@ -636,6 +728,13 @@ class IngestService:
             scored.append((sim, chunk, doc))
         scored.sort(key=lambda t: t[0], reverse=True)
         return [(chunk, doc, sim) for sim, chunk, doc in scored[:k]]
+
+
+def _blob_key(source_uri: str) -> str:
+    """Recover the blob key from ``s3://<bucket>/<key>`` or ``memory://<key>``."""
+    if source_uri.startswith("s3://"):
+        return source_uri.split("/", 3)[-1]
+    return source_uri.replace("memory://", "")
 
 
 def _cosine(a: list[float], b: list[float]) -> float:

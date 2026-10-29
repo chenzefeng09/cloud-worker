@@ -40,6 +40,7 @@ from agent_session_orchestrator.api.dlp_guard import (
     check_download,
     scan_and_tag,
 )
+from agent_session_orchestrator.api.ownership import require_session_owner
 from agent_session_orchestrator.services.session_service import SessionService
 
 router = APIRouter(tags=["Attachments"])
@@ -58,7 +59,10 @@ def _get_blob_store(request: Request):  # type: ignore[no-untyped-def]
 
 
 @router.post("/sessions/{session_id}/attachments", status_code=201,
-             dependencies=[Depends(require_permission("session.attachment.create", "session"))])
+             dependencies=[
+                 Depends(require_permission("session.attachment.create", "session")),
+                 Depends(require_session_owner),
+             ])
 async def upload_attachment(
     session_id: str,
     file: UploadFile,
@@ -138,7 +142,10 @@ async def upload_attachment(
 
 
 @router.get("/sessions/{session_id}/attachments",
-            dependencies=[Depends(require_permission("session.attachment.read", "session"))])
+            dependencies=[
+                Depends(require_permission("session.attachment.read", "session")),
+                Depends(require_session_owner),
+            ])
 async def list_attachments(
     session_id: str,
     request: Request,
@@ -174,7 +181,10 @@ async def list_attachments(
 @router.delete(
     "/sessions/{session_id}/attachments/{attachment_id}",
     status_code=204,
-    dependencies=[Depends(require_permission("session.attachment.create", "session"))],
+    dependencies=[
+        Depends(require_permission("session.attachment.create", "session")),
+        Depends(require_session_owner),
+    ],
 )
 async def delete_attachment(
     session_id: str,
@@ -200,7 +210,10 @@ async def delete_attachment(
 
 
 @router.get("/sessions/{session_id}/files/{file_id}/content",
-            dependencies=[Depends(require_permission("session.attachment.read", "session"))])
+            dependencies=[
+                Depends(require_permission("session.attachment.read", "session")),
+                Depends(require_session_owner),
+            ])
 async def get_file_content(
     session_id: str,
     file_id: str,

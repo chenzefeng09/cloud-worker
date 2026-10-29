@@ -6,6 +6,7 @@ import { WorkspaceProvider } from '../lib/workspaceContext';
 import { Sidebar } from './shell/Sidebar';
 import { HomePage } from '../pages/HomePage';
 import { AgentPage } from '../pages/AgentPage';
+import { TasksPage } from '../pages/TasksPage';
 import { AppRunPage } from '../pages/AppRunPage';
 import { AppResultPage } from '../pages/AppResultPage';
 import { AppEditorPage } from '../pages/AppEditorPage';
@@ -27,7 +28,7 @@ import { DialogProvider } from '../admin/components/dialogs';
  * cloud-worker-specific state.
  *
  * The route table is kept flat and mirrors the cloud-worker hash routes:
- *   /home /tasks/:id /files /library /workspace
+ *   /home /tasks /tasks/:id /files /library /workspace
  * Anything else falls back to /home.
  */
 export function WorkspaceLayout() {
@@ -65,6 +66,7 @@ export function WorkspaceLayout() {
                   <main className="flex-1 flex flex-col min-w-0">
                     <Routes>
                       <Route path="/home" element={<HomePage />} />
+                      <Route path="/tasks" element={<TasksPage />} />
                       <Route path="/tasks/:id" element={<AgentPage />} />
                       {/* App routes — static/longer paths first so react-router v6
                           ranking never lets `/apps/:id` shadow `/apps/new` etc. */}

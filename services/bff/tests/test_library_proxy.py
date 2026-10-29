@@ -175,10 +175,12 @@ def test_list_mcp_servers_scrubs_secrets(
     authed_cookie: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Library list never leaks auth credentials or connection headers.
+    """Library list never leaks auth credentials, connection headers, env
+    values or CLI args.
 
-    ``auth`` is reduced to ``{type}`` (token dropped) and ``headers`` is
-    withheld entirely; metadata (timeout_seconds / tool_filter / args) is kept.
+    ``auth`` is reduced to ``{type}`` (token dropped), ``headers`` is withheld
+    entirely, and env values / args are masked (env keys kept); metadata
+    (timeout_seconds / tool_filter) is kept.
     """
     fake = FakeLibraryUpstream(body={"items": [{
         "id": "mcp_01",
@@ -186,9 +188,10 @@ def test_list_mcp_servers_scrubs_secrets(
         "transport": "http",
         "auth": {"type": "bearer", "token": "sk-secret"},
         "headers": {"Authorization": "Bearer sk-secret", "X-Trace": "1"},
+        "env": {"GITHUB_TOKEN": "ghp-secret", "LOG_LEVEL": "debug"},
         "timeout_seconds": 30,
         "tool_filter": {"allow": ["search"], "block": []},
-        "args": ["--verbose"],
+        "args": ["--token", "ghp-secret"],
     }]})
     _patch_async_client(fake, monkeypatch)
 
@@ -199,10 +202,13 @@ def test_list_mcp_servers_scrubs_secrets(
     assert server["auth"] == {"type": "bearer"}
     # headers withheld entirely.
     assert "headers" not in server
+    # env keys kept, values and args masked.
+    assert server["env"] == {"GITHUB_TOKEN": "••••••", "LOG_LEVEL": "••••••"}
+    assert server["args"] == ["••••••", "••••••"]
+    assert "ghp-secret" not in resp.text
     # metadata still present end-to-end.
     assert server["timeout_seconds"] == 30
     assert server["tool_filter"] == {"allow": ["search"], "block": []}
-    assert server["args"] == ["--verbose"]
 
 
 def test_create_mcp_server_scrubs_secrets(

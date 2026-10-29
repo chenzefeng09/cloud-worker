@@ -1,3 +1,5 @@
+import type { TaskStatus } from '../api/types';
+
 /**
  * Format an ISO timestamp (or Date) as a short relative time string used
  * throughout the workspace UI: just now / 5 min ago / 3 hr ago / 2 days ago.
@@ -112,4 +114,43 @@ export function taskStatusLabel(status: string | null | undefined): string {
     default:
       return status ?? '—';
   }
+}
+
+/** Task board status (server vocabulary) → display label. */
+export function boardStatusLabel(status: TaskStatus): string {
+  switch (status) {
+    case 'queued':
+      return 'Queued';
+    case 'running':
+      return 'Running';
+    case 'needs_input':
+      return 'Needs input';
+    case 'completed':
+      return 'Completed';
+    case 'failed':
+      return 'Failed';
+    case 'cancelled':
+      return 'Cancelled';
+    case 'idle':
+      return 'Not started';
+  }
+}
+
+/**
+ * Compact elapsed time between two instants ("42s", "3m 05s", "1h 12m").
+ * `end` defaults to now so a running task's clock keeps ticking.
+ */
+export function formatElapsed(
+  start: string | Date | null | undefined,
+  end?: string | Date | null,
+): string {
+  if (!start) return '—';
+  const s = typeof start === 'string' ? new Date(start) : start;
+  const e = end ? (typeof end === 'string' ? new Date(end) : end) : new Date();
+  const secs = Math.max(0, Math.round((e.getTime() - s.getTime()) / 1000));
+  if (Number.isNaN(secs)) return '—';
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ${String(secs % 60).padStart(2, '0')}s`;
+  return `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, '0')}m`;
 }

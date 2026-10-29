@@ -58,8 +58,53 @@ class FakeRedis {
     return "1-0";
   }
 
+  /** Commands queued per MULTI, in order (asserts XADD+EXPIRE pairing). */
+  multiBatches: string[][] = [];
+  /** Make EXEC report a per-command error for the XADD. */
+  failXaddInMulti = false;
+
+  multi(): FakeMulti {
+    return new FakeMulti(this);
+  }
+
   async quit(): Promise<"OK"> {
     return "OK";
+  }
+}
+
+/** ioredis ChainableCommander stand-in: queues, then applies on exec(). */
+class FakeMulti {
+  private readonly ops: Array<() => Promise<[Error | null, unknown]>> = [];
+  private readonly names: string[] = [];
+
+  constructor(private readonly redis: FakeRedis) {}
+
+  xadd(key: string, ...args: unknown[]): this {
+    this.names.push("xadd");
+    this.ops.push(async () => {
+      if (this.redis.throwOnXadd || this.redis.failXaddInMulti) {
+        return [new Error("boom-xadd"), null];
+      }
+      this.redis.xaddCalls.push({ key, args });
+      return [null, "1-0"];
+    });
+    return this;
+  }
+
+  expire(key: string, ttl: number): this {
+    this.names.push("expire");
+    this.ops.push(async () => {
+      this.redis.expireCalls.push({ key, ttl });
+      return [null, 1];
+    });
+    return this;
+  }
+
+  async exec(): Promise<Array<[Error | null, unknown]>> {
+    this.redis.multiBatches.push([...this.names]);
+    const out: Array<[Error | null, unknown]> = [];
+    for (const op of this.ops) out.push(await op());
+    return out;
   }
 }
 
@@ -92,7 +137,64 @@ describe("token stream entry fields", () => {
     expect(calls).toHaveLength(2);
     expect(calls[0].key).toBe("agent:run:run_x:tokens");
     expect(streamFields(calls[0])).toEqual({ type: "delta", text: "hi back" });
-    expect(streamFields(calls[1])).toEqual({ type: "end", text: "" });
+    // The terminal entry carries its status (default "completed").
+    expect(streamFields(calls[1])).toEqual({ type: "end", text: "", status: "completed" });
+  });
+
+  it("pushTokenEnd carries the given terminal status", async () => {
+    for (const status of ["failed", "paused", "cancelled"] as const) {
+      const c = new RedisStateClient("run_x", "redis://localhost:6379");
+      await c.pushTokenEnd(status);
+      expect(streamFields(FakeRedis.last!.xaddCalls[0])).toEqual({ type: "end", text: "", status });
+    }
+  });
+
+  it("pushes exactly one end entry and drops every push after it", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.pushTokenEnd("failed");
+    await c.pushTokenEnd("completed");
+    await c.pushToken("late");
+    await c.pushToolCall("tc-late", "Bash", "{}");
+    await c.flush();
+    const entries = FakeRedis.last!.xaddCalls.map(streamFields);
+    expect(entries).toEqual([{ type: "end", text: "", status: "failed" }]);
+  });
+
+  it("pushError writes type=error with the message", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.pushError("The model service is temporarily unavailable. Please try again.");
+    expect(streamFields(FakeRedis.last!.xaddCalls[0])).toEqual({
+      type: "error",
+      message: "The model service is temporarily unavailable. Please try again.",
+    });
+  });
+
+  it("pushThinkingDelta writes type=thinking_delta", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.pushThinkingDelta("step one");
+    await c.flush();
+    expect(streamFields(FakeRedis.last!.xaddCalls[0])).toEqual({
+      type: "thinking_delta",
+      text: "step one",
+    });
+  });
+
+  it("writes at most one tool_call entry per tool_call_id", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.pushToolCall("tc-1", "Bash", '{"cmd":"pwd"}');
+    await c.pushToolCall("tc-1", "Bash", '{"cmd":"pwd"}{"cmd":"pwd"}');
+    await c.pushToolCall("tc-2", "Read", '{"f":"a"}');
+    const entries = FakeRedis.last!.xaddCalls.map(streamFields);
+    expect(entries).toEqual([
+      { type: "tool_call", tool_call_id: "tc-1", name: "Bash", args: '{"cmd":"pwd"}' },
+      { type: "tool_call", tool_call_id: "tc-2", name: "Read", args: '{"f":"a"}' },
+    ]);
+  });
+
+  it("trims with MAXLEN ~ 100000", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.pushToolCall("tc-1", "Bash", "{}");
+    expect(FakeRedis.last!.xaddCalls[0].args.slice(0, 4)).toEqual(["MAXLEN", "~", 100000, "*"]);
   });
 
   it("pushToolCall writes type=tool_call with id/name/args", async () => {
@@ -126,12 +228,23 @@ describe("token stream entry fields", () => {
     expect(streamFields(FakeRedis.last!.xaddCalls[0])).toEqual({ type: "thinking", text: "hmm" });
   });
 
-  it("sets the stream TTL exactly once on first push", async () => {
-    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+  it("refreshes the stream TTL on EVERY write, atomically with the XADD", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379", null, {
+      coalesceWindowMs: 0,
+    });
     await c.pushToken("a");
     await c.pushToken("b");
+    await c.pushToolCall("tc-1", "Bash", "{}");
     expect(FakeRedis.last!.expireCalls).toEqual([
       { key: "agent:run:run_x:tokens", ttl: 1800 },
+      { key: "agent:run:run_x:tokens", ttl: 1800 },
+      { key: "agent:run:run_x:tokens", ttl: 1800 },
+    ]);
+    // One MULTI per entry: the entry never lands without its TTL refresh.
+    expect(FakeRedis.last!.multiBatches).toEqual([
+      ["xadd", "expire"],
+      ["xadd", "expire"],
+      ["xadd", "expire"],
     ]);
   });
 
@@ -142,6 +255,86 @@ describe("token stream entry fields", () => {
     const fields = streamFields(FakeRedis.last!.xaddCalls[0]);
     expect(fields.result.endsWith("…[truncated]")).toBe(true);
     expect(fields.result.length).toBeLessThan(big.length);
+  });
+});
+
+describe("delta coalescing", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("merges adjacent delta chunks into one entry", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.pushToken("Hel");
+    await c.pushToken("lo ");
+    await c.pushToken("world");
+    // Still buffered (inside the window) …
+    expect(FakeRedis.last!.xaddCalls).toHaveLength(0);
+    await c.flush();
+    expect(FakeRedis.last!.xaddCalls.map(streamFields)).toEqual([
+      { type: "delta", text: "Hello world" },
+    ]);
+  });
+
+  it("flushes the buffer when the window elapses", async () => {
+    vi.useFakeTimers();
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.pushToken("a");
+    await c.pushToken("b");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(FakeRedis.last!.xaddCalls.map(streamFields)).toEqual([{ type: "delta", text: "ab" }]);
+    await c.pushToken("c");
+    await vi.advanceTimersByTimeAsync(60);
+    expect(FakeRedis.last!.xaddCalls.map(streamFields)).toEqual([
+      { type: "delta", text: "ab" },
+      { type: "delta", text: "c" },
+    ]);
+  });
+
+  it("flushes as soon as the buffer reaches 512 chars", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.pushToken("x".repeat(300));
+    expect(FakeRedis.last!.xaddCalls).toHaveLength(0);
+    await c.pushToken("y".repeat(300));
+    const entries = FakeRedis.last!.xaddCalls.map(streamFields);
+    expect(entries).toEqual([{ type: "delta", text: "x".repeat(300) + "y".repeat(300) }]);
+  });
+
+  it("flushes buffered text before any other entry (order preserved)", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.pushThinkingDelta("think ");
+    await c.pushThinkingDelta("more");
+    await c.pushToken("I'll ");
+    await c.pushToken("look.");
+    await c.pushToolCall("tc-1", "Bash", '{"cmd":"ls"}');
+    await c.pushToken("Done.");
+    await c.pushTokenEnd("completed");
+    expect(FakeRedis.last!.xaddCalls.map(streamFields)).toEqual([
+      { type: "thinking_delta", text: "think more" },
+      { type: "delta", text: "I'll look." },
+      { type: "tool_call", tool_call_id: "tc-1", name: "Bash", args: '{"cmd":"ls"}' },
+      { type: "delta", text: "Done." },
+      { type: "end", text: "", status: "completed" },
+    ]);
+  });
+
+  it("close() flushes the buffer before closing", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.pushToken("tail");
+    await c.close();
+    expect(FakeRedis.last!.xaddCalls.map(streamFields)).toEqual([{ type: "delta", text: "tail" }]);
+  });
+
+  it("writes every chunk immediately when coalescing is disabled", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379", null, {
+      coalesceWindowMs: 0,
+    });
+    await c.pushToken("a");
+    await c.pushToken("b");
+    expect(FakeRedis.last!.xaddCalls.map(streamFields)).toEqual([
+      { type: "delta", text: "a" },
+      { type: "delta", text: "b" },
+    ]);
   });
 });
 
@@ -169,11 +362,48 @@ describe("HITL pause (ioredis)", () => {
     });
   });
 
-  it("does NOT push a type=end token on pause (pending pushes only)", async () => {
+  it("pending pushes alone do not end the stream; end(paused) does", async () => {
     const c = new RedisStateClient("run_x", "redis://localhost:6379");
     await c.pushPendingConfirmation("tc-1", "mcp__x__y", "{}");
-    const types = FakeRedis.last!.xaddCalls.map((x) => streamFields(x).type);
-    expect(types).not.toContain("end");
+    expect(FakeRedis.last!.xaddCalls.map((x) => streamFields(x).type)).toEqual([
+      "pending_confirmation",
+    ]);
+    await c.pushTokenEnd("paused");
+    expect(streamFields(FakeRedis.last!.xaddCalls[1])).toEqual({
+      type: "end",
+      text: "",
+      status: "paused",
+    });
+  });
+
+  it("markPaused extends the token stream to the paused TTL, now and for later writes", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.pushToolCall("tc-0", "Read", "{}");
+    await c.markPaused();
+    await c.pushPendingConfirmation("tc-1", "mcp__x__y", "{}");
+    await c.pushTokenEnd("paused");
+    expect(FakeRedis.last!.expireCalls).toEqual([
+      { key: "agent:run:run_x:tokens", ttl: 1800 }, // tool_call (running)
+      { key: "agent:run:run_x:tokens", ttl: PAUSED_TTL }, // markPaused itself
+      { key: "agent:run:run_x:tokens", ttl: PAUSED_TTL }, // pending_confirmation
+      { key: "agent:run:run_x:tokens", ttl: PAUSED_TTL }, // end(paused)
+    ]);
+  });
+
+  it("a delta buffered before markPaused is written with the paused TTL", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.pushToken("partial answer");
+    await c.markPaused();
+    await c.flush();
+    expect(FakeRedis.last!.xaddCalls.map(streamFields)).toEqual([
+      { type: "delta", text: "partial answer" },
+    ]);
+    // The buffered delta's MULTI and markPaused's own EXPIRE both use 7 days —
+    // nothing can shrink the stream back to the running TTL.
+    expect(FakeRedis.last!.expireCalls).toEqual([
+      { key: "agent:run:run_x:tokens", ttl: PAUSED_TTL },
+      { key: "agent:run:run_x:tokens", ttl: PAUSED_TTL },
+    ]);
   });
 
   it("writePaused sets the :paused key with the 7-day TTL", async () => {
@@ -273,6 +503,15 @@ describe("failure-open", () => {
     const c = new RedisStateClient("run_x", "redis://localhost:6379");
     FakeRedis.last!.throwOnXadd = true;
     await expect(c.pushToken("x")).resolves.toBeUndefined();
+    await expect(c.flush()).resolves.toBeUndefined();
+    await expect(c.pushTokenEnd("failed")).resolves.toBeUndefined();
+  });
+
+  it("does not throw when EXEC reports a per-command error", async () => {
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    FakeRedis.last!.failXaddInMulti = true;
+    await expect(c.pushToolCall("tc-1", "Bash", "{}")).resolves.toBeUndefined();
+    await expect(c.close()).resolves.toBeUndefined();
   });
 
   it("readCheckpoint returns null when get throws", async () => {
@@ -351,6 +590,7 @@ describe("broker egress transport", () => {
     const calls = stubFetch(() => Response.json({ ok: true }));
     const c = fromEnv();
     await c.pushToken("hi back");
+    await c.flush(); // deltas are coalesced; flush writes the buffered chunk
 
     expect(calls).toHaveLength(1);
     const call = calls[0];
@@ -365,11 +605,33 @@ describe("broker egress transport", () => {
     expect(body).toEqual({
       run_id: "run_b",
       fields: { type: "delta", text: "hi back" },
-      maxlen: 10000,
+      maxlen: 100000,
       expire: 1800,
     });
     // No key is sent — the broker reconstructs the token stream key from run_id.
     expect(body).not.toHaveProperty("key");
+  });
+
+  it("every xadd carries the TTL; after markPaused it carries the paused TTL", async () => {
+    const calls = stubFetch((url) =>
+      new URL(url).pathname === "/state/v1/get"
+        ? Response.json({ value: null })
+        : Response.json({ ok: true }),
+    );
+    const c = fromEnv();
+    await c.pushToolCall("tc-0", "Read", "{}");
+    await c.markPaused();
+    await c.pushPendingConfirmation("tc-1", "mcp__x__y", "{}");
+    await c.pushTokenEnd("paused");
+    const xadds = calls
+      .filter((x) => new URL(x.url).pathname === "/state/v1/xadd")
+      .map((x) => JSON.parse(x.init.body as string));
+    expect(xadds.map((b) => [b.fields.type, b.expire])).toEqual([
+      ["tool_call", 1800],
+      ["pending_confirmation", 7 * 24 * 3600],
+      ["end", 7 * 24 * 3600],
+    ]);
+    expect(xadds[2].fields).toEqual({ type: "end", text: "", status: "paused" });
   });
 
   it("writeStep POSTs /state/v1/set with kind=state and the aligned blob", async () => {

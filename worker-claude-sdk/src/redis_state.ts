@@ -8,7 +8,21 @@
  * Key schema (must stay stable across deploys — the scheduler reads these):
  *   agent:run:{run_id}:state  -> JSON blob (string) with TTL STATE_TTL_SECONDS
  *   agent:run:{run_id}:tokens -> Redis Stream of interleaved
- *                                delta | end | tool_call | tool_result | thinking
+ *                                delta | thinking_delta | thinking | tool_call |
+ *                                tool_result | pending_confirmation |
+ *                                pending_question | error | end
+ *
+ * Token stream guarantees (what the orchestrator SSE bridge relies on):
+ *   - every write refreshes the stream TTL (MULTI XADD+EXPIRE on ioredis, the
+ *     `expire` field on every broker xadd), so the key never outlives its TTL
+ *     and never expires while the run is still writing; a pause extends it to
+ *     the paused TTL so the pending entries survive the human wait;
+ *   - adjacent `delta` (and adjacent `thinking_delta`) chunks are coalesced for
+ *     up to COALESCE_WINDOW_MS / COALESCE_MAX_CHARS; any other entry flushes
+ *     the buffer first, so the relative order of entries is preserved;
+ *   - at most one `tool_call` entry per tool_call_id;
+ *   - exactly one terminal `end` entry `{type:"end", text:"", status}` per
+ *     process (later pushes are dropped).
  *
  * Transport abstraction
  * ---------------------
@@ -36,8 +50,33 @@ const STATE_TTL_SECONDS = 1800;
  */
 const PAUSED_TTL_SECONDS = 7 * 24 * 3600;
 
-/** Approximate cap on the token stream (matches Python _TOKEN_STREAM_MAXLEN). */
-const TOKEN_STREAM_MAXLEN = 10_000;
+/**
+ * Approximate cap on the token stream. MAXLEN ~ trims the OLDEST entries, which
+ * for a late subscriber replaying from 0 means losing the start of the answer,
+ * so the cap is a safety valve sized well above a real run (deltas are
+ * coalesced, so a long answer is a few thousand entries, not one per token).
+ */
+const TOKEN_STREAM_MAXLEN = 100_000;
+
+/** Max time a delta / thinking_delta chunk waits in the coalescing buffer. */
+const COALESCE_WINDOW_MS = 50;
+
+/** Flush the coalescing buffer as soon as it holds this many characters. */
+const COALESCE_MAX_CHARS = 512;
+
+/** Terminal status carried by the `end` stream entry. */
+export type TerminalStatus = "completed" | "failed" | "paused" | "cancelled";
+
+/** Stream entry types whose adjacent chunks are merged into one entry. */
+type CoalescibleType = "delta" | "thinking_delta";
+
+/** Tunables for {@link RedisStateClient} (tests disable coalescing). */
+export interface RedisStateOptions {
+  /** Coalescing window in ms; 0 (or less) writes every chunk immediately. */
+  coalesceWindowMs?: number;
+  /** Flush the buffer once it holds at least this many characters. */
+  coalesceMaxChars?: number;
+}
 
 /** Truncate oversized tool results (matches Python _TOOL_RESULT_MAX_BYTES). */
 const TOOL_RESULT_MAX_BYTES = 8 * 1024;
@@ -78,20 +117,25 @@ export interface StateTransport {
     maxlen: number,
     ttlSec: number,
   ): Promise<void>;
+  /**
+   * Optional: re-set the token stream TTL without appending an entry. A
+   * transport without it (broker: no standalone expire endpoint) relies on the
+   * TTL folded into the next xadd instead.
+   */
+  expireTokenStream?(ttlSec: number): Promise<void>;
   /** Release the underlying connection (best-effort). */
   close(): Promise<void>;
 }
 
 /**
- * Direct ioredis transport — talks to foundation Redis over the wire. Wraps the
- * original RedisStateClient behaviour: SET … EX, XADD … MAXLEN ~ N, and a
- * once-per-stream EXPIRE on the first successful xadd.
+ * Direct ioredis transport — talks to foundation Redis over the wire: SET … EX,
+ * and XADD … MAXLEN ~ N + EXPIRE in one MULTI on EVERY push, so the stream TTL
+ * is refreshed by each write and the key never exists without a TTL.
  */
 class IoredisTransport implements StateTransport {
   private readonly runId: string;
   private readonly tokenStreamKey: string;
   private readonly client: Redis;
-  private tokenStreamExpireSet = false;
 
   constructor(runId: string, client: Redis) {
     this.runId = runId;
@@ -130,22 +174,32 @@ class IoredisTransport implements StateTransport {
       for (const [k, v] of Object.entries(fields)) {
         pairs.push(k, v);
       }
-      // XADD key MAXLEN ~ <n> * field value ...
-      await this.client.xadd(
-        this.tokenStreamKey,
-        "MAXLEN",
-        "~",
-        maxlen,
-        "*",
-        ...pairs,
-      );
-      if (!this.tokenStreamExpireSet) {
-        await this.client.expire(this.tokenStreamKey, ttlSec);
-        this.tokenStreamExpireSet = true;
+      // MULTI / XADD key MAXLEN ~ <n> * field value ... / EXPIRE key ttl / EXEC
+      // — one round-trip, and the entry never lands without the TTL refresh.
+      const results = await this.client
+        .multi()
+        .xadd(this.tokenStreamKey, "MAXLEN", "~", maxlen, "*", ...pairs)
+        .expire(this.tokenStreamKey, ttlSec)
+        .exec();
+      if (results === null) {
+        throw new Error("MULTI discarded");
+      }
+      for (const [err] of results) {
+        if (err) throw err;
       }
     } catch (err) {
       console.warn(
         `[redis_state] token push (${fields.type}) failed for run ${this.runId}: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  async expireTokenStream(ttlSec: number): Promise<void> {
+    try {
+      await this.client.expire(this.tokenStreamKey, ttlSec);
+    } catch (err) {
+      console.warn(
+        `[redis_state] token stream expire failed for run ${this.runId}: ${(err as Error).message}`,
       );
     }
   }
@@ -323,21 +377,40 @@ export class RedisStateClient {
   private transport: StateTransport | null = null;
   private step = 0;
 
+  /** TTL folded into every stream write; markPaused() raises it. */
+  private streamTtlSec = STATE_TTL_SECONDS;
+  private readonly coalesceWindowMs: number;
+  private readonly coalesceMaxChars: number;
+  /** Coalescing buffer: one entry type at a time. */
+  private bufferedType: CoalescibleType | null = null;
+  private bufferedText = "";
+  private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Serialises stream writes so coalesced and direct entries keep their order. */
+  private writeChain: Promise<void> = Promise.resolve();
+  /** Set once the terminal `end` entry is queued; later stream pushes drop. */
+  private ended = false;
+  private closed = false;
+  private readonly pushedToolCallIds = new Set<string>();
+
   /**
    * @param runId      stable run identifier (scheduler injects RUN_ID).
    * @param redisUrl   redis://[:password@]host:port/db. Empty/undefined =>
    *                   direct Redis disabled; falls back to `transport` if given.
    * @param transport  optional pre-built transport (broker mode). When supplied
    *                   and `redisUrl` is empty, the client routes through it.
+   * @param options    coalescing tunables (defaults: 50 ms / 512 chars).
    */
   constructor(
     runId: string,
     redisUrl: string | undefined,
     transport?: StateTransport | null,
+    options?: RedisStateOptions,
   ) {
     this.runId = runId;
     this.stateKey = `${KEY_PREFIX}:${runId}:state`;
     this.pausedKey = `${KEY_PREFIX}:${runId}:paused`;
+    this.coalesceWindowMs = options?.coalesceWindowMs ?? COALESCE_WINDOW_MS;
+    this.coalesceMaxChars = options?.coalesceMaxChars ?? COALESCE_MAX_CHARS;
 
     if (!runId) {
       console.warn("[redis_state] RUN_ID unset; hot-state disabled");
@@ -449,10 +522,23 @@ export class RedisStateClient {
   /**
    * Mark status=PAUSED, re-setting the state key with the long (7-day) TTL so a
    * paused run survives the human-confirmation window. Mirrors writeTerminal but
-   * with the paused TTL. Failure-open.
+   * with the paused TTL. Also extends the TOKEN STREAM to the paused TTL (the
+   * pending_* entries the orchestrator replays live there): every later stream
+   * write carries the paused TTL, and ioredis re-EXPIREs the stream right away.
+   * Failure-open.
    */
   async markPaused(): Promise<void> {
     if (this.transport === null) return;
+    this.streamTtlSec = PAUSED_TTL_SECONDS;
+    const transport = this.transport;
+    if (transport.expireTokenStream) {
+      // Queued behind in-flight stream writes so none of them can shrink the
+      // TTL back afterwards (each write reads streamTtlSec when it runs).
+      this.flushBuffer();
+      await this.enqueueWrite(() =>
+        transport.expireTokenStream!(PAUSED_TTL_SECONDS),
+      );
+    }
     let state: CheckpointState;
     const raw = await this.transport.get(this.stateKey);
     if (raw) {
@@ -474,9 +560,10 @@ export class RedisStateClient {
 
   /**
    * Append a type=pending_confirmation token entry — one per pending MCP tool
-   * call awaiting approval. NO type=end is pushed on pause (the stream stays open
-   * for the resume leg). Field shape matches the Python contract
-   * (redis_state.py example `mcp__github__search_code`).
+   * call awaiting approval. The worker follows the pending entries with
+   * `end(status="paused")`; the resume leg (a new process) appends to the same
+   * stream. Field shape matches the Python contract (redis_state.py example
+   * `mcp__github__search_code`).
    */
   async pushPendingConfirmation(
     toolCallId: string,
@@ -505,22 +592,55 @@ export class RedisStateClient {
 
   // ── token stream ─────────────────────────────────────────────────────────
 
-  /** Append a type=delta entry (one assistant text token chunk). */
+  /**
+   * Append a type=delta entry (assistant answer text). Adjacent chunks are
+   * coalesced (see COALESCE_WINDOW_MS); the returned promise may resolve before
+   * the chunk is written — {@link flush} / any non-delta push writes it.
+   */
   async pushToken(text: string): Promise<void> {
-    await this.xadd({ type: "delta", text });
+    await this.pushCoalesced("delta", text);
   }
 
-  /** Append the terminal type=end entry; consumers stop when they see it. */
-  async pushTokenEnd(): Promise<void> {
-    await this.xadd({ type: "end", text: "" });
+  /** Append a type=thinking_delta entry (live reasoning chunk), coalesced. */
+  async pushThinkingDelta(text: string): Promise<void> {
+    await this.pushCoalesced("thinking_delta", text);
   }
 
-  /** Append a type=tool_call entry. args is the complete JSON args string. */
+  /**
+   * Append a type=error entry with a short, user-safe message (no stack
+   * traces, paths, hostnames or keys — the caller sanitises). Pushed before the
+   * terminal `end(status="failed")`.
+   */
+  async pushError(message: string): Promise<void> {
+    await this.xadd({ type: "error", message });
+  }
+
+  /**
+   * Append the terminal type=end entry; consumers stop when they see it. Only
+   * the first call per process writes (exactly one `end`); every stream push
+   * after it is dropped. Flushes the coalescing buffer first.
+   */
+  async pushTokenEnd(status: TerminalStatus = "completed"): Promise<void> {
+    if (this.transport === null || this.ended || this.closed) return;
+    this.flushBuffer();
+    const written = this.enqueueStreamWrite({ type: "end", text: "", status });
+    // Mark synchronously so a push racing this one cannot land after `end`.
+    this.ended = true;
+    await written;
+  }
+
+  /**
+   * Append a type=tool_call entry. args is the complete JSON args string. At
+   * most one entry per tool_call_id: a repeat for an already-pushed id is
+   * dropped (the SDK can surface the same call twice).
+   */
   async pushToolCall(
     toolCallId: string,
     name: string,
     args: string,
   ): Promise<void> {
+    if (this.pushedToolCallIds.has(toolCallId)) return;
+    this.pushedToolCallIds.add(toolCallId);
     await this.xadd({
       type: "tool_call",
       tool_call_id: toolCallId,
@@ -587,18 +707,91 @@ export class RedisStateClient {
   }
 
   /**
-   * Append one stream entry with approximate MAXLEN trimming + TTL. The
-   * transport owns the token stream key and the once-per-stream EXPIRE
-   * semantics. Failure-open (the transport swallows its own errors).
+   * Append one non-coalescible stream entry with approximate MAXLEN trimming +
+   * TTL refresh. Flushes the coalescing buffer first so entries keep their
+   * order. Dropped after the terminal `end`. Failure-open (the transport
+   * swallows its own errors).
    */
   private async xadd(fields: Record<string, string>): Promise<void> {
-    if (this.transport === null) return;
-    await this.transport.xadd(fields, TOKEN_STREAM_MAXLEN, STATE_TTL_SECONDS);
+    if (this.transport === null || this.ended || this.closed) return;
+    this.flushBuffer();
+    await this.enqueueStreamWrite(fields);
   }
 
-  /** Close the underlying connection (no-op when disabled). */
-  async close(): Promise<void> {
+  private async pushCoalesced(
+    type: CoalescibleType,
+    text: string,
+  ): Promise<void> {
+    if (this.transport === null || this.ended || this.closed) return;
+    if (!text) return;
+    if (this.coalesceWindowMs <= 0) {
+      await this.enqueueStreamWrite({ type, text });
+      return;
+    }
+    if (this.bufferedType !== null && this.bufferedType !== type) {
+      this.flushBuffer();
+    }
+    this.bufferedType = type;
+    this.bufferedText += text;
+    if (this.bufferedText.length >= this.coalesceMaxChars) {
+      await this.flushBuffer();
+      return;
+    }
+    if (this.flushTimer === null) {
+      this.flushTimer = setTimeout(() => {
+        this.flushTimer = null;
+        void this.flushBuffer();
+      }, this.coalesceWindowMs);
+      // Never keep the process alive just to flush a chunk; close() flushes.
+      this.flushTimer.unref?.();
+    }
+  }
+
+  /** Queue the buffered chunk (if any) for writing; resolves once written. */
+  private flushBuffer(): Promise<void> {
+    if (this.flushTimer !== null) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+    if (this.bufferedType === null) return this.writeChain;
+    const fields = { type: this.bufferedType, text: this.bufferedText };
+    this.bufferedType = null;
+    this.bufferedText = "";
+    return this.enqueueStreamWrite(fields);
+  }
+
+  private enqueueStreamWrite(fields: Record<string, string>): Promise<void> {
+    const transport = this.transport;
+    if (transport === null) return Promise.resolve();
+    // streamTtlSec is read when the write RUNS, so a write queued before
+    // markPaused() still carries the paused TTL.
+    return this.enqueueWrite(() =>
+      transport.xadd(fields, TOKEN_STREAM_MAXLEN, this.streamTtlSec),
+    );
+  }
+
+  private enqueueWrite(op: () => Promise<void>): Promise<void> {
+    const next = this.writeChain.then(op).catch((err: unknown) => {
+      console.warn(
+        `[redis_state] token stream write failed for run ${this.runId}: ${(err as Error).message}`,
+      );
+    });
+    this.writeChain = next;
+    return next;
+  }
+
+  /** Write any buffered delta chunk and wait for every queued stream write. */
+  async flush(): Promise<void> {
     if (this.transport === null) return;
+    await this.flushBuffer();
+    await this.writeChain;
+  }
+
+  /** Flush buffered writes, then close the underlying connection. */
+  async close(): Promise<void> {
+    if (this.transport === null || this.closed) return;
+    await this.flush();
+    this.closed = true;
     await this.transport.close();
   }
 }

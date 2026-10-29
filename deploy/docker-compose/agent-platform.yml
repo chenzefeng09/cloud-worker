@@ -678,6 +678,9 @@ services:
       MCP_REGISTRY_DB_POOL_RECYCLE: "1800"
       MCP_REGISTRY_AUTHZ_URL: http://authz:8002/api/authz/v1
       MCP_REGISTRY_CRYPTO_URL: http://crypto:8004/api/crypto/v1
+      # Local stack only: keep saving MCP secrets (in plaintext) when crypto is
+      # down.  Production leaves this unset, so such a write fails with 503.
+      MCP_REGISTRY_ALLOW_PLAINTEXT_SECRETS: ${MCP_REGISTRY_ALLOW_PLAINTEXT_SECRETS:-true}
     ports:
       - "${PORT_MCP_REGISTRY:-8010}:8010"
     networks: [foundation]

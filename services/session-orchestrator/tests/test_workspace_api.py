@@ -361,23 +361,30 @@ def test_list_workspace_files(
     assert items[0]["filename"] == "handbook.txt"
 
 
-def test_delete_workspace_file_row_and_blob(
+def test_delete_workspace_file_row_versions_and_blobs(
     app_client: TestClient, mock_db: AsyncMock, auth_headers: dict,
 ) -> None:
     ws = _fake_workspace()
     wsf = _fake_ws_file()
     mock_db.execute.side_effect = [
-        make_scalar_result(ws),   # ownership check
-        make_scalar_result(wsf),  # get_file
+        make_scalar_result(ws),                 # ownership check
+        make_scalar_result(wsf),                # get_file
+        make_scalar_result(["k/v1", "k/v2"]),   # the file's version blob keys
+        MagicMock(),                            # delete the versions
     ]
     fake_blob = MagicMock()
-    with patch.object(app_client.app.state, "blob_store", fake_blob, create=True):
+    cleanup = AsyncMock(return_value=3)
+    with patch.object(app_client.app.state, "blob_store", fake_blob, create=True), \
+            patch("agent_session_orchestrator.api.v1.workspaces.delete_unreferenced_blobs",
+                  cleanup):
         resp = app_client.delete(
             "/api/session/v1/workspaces/wsp_001/files/wsf_001", headers=auth_headers,
         )
     assert resp.status_code == 204
     mock_db.delete.assert_called_once_with(wsf)
-    fake_blob.delete.assert_called_once_with(wsf.blob_key)
+    cleanup.assert_awaited_once()
+    assert cleanup.await_args.kwargs["keys"] == [wsf.blob_key, "k/v1", "k/v2"]
+    assert cleanup.await_args.kwargs["blob_store"] is fake_blob
 
 
 def test_delete_workspace_file_blob_failure_still_204(
@@ -388,6 +395,8 @@ def test_delete_workspace_file_blob_failure_still_204(
     mock_db.execute.side_effect = [
         make_scalar_result(ws),
         make_scalar_result(wsf),
+        make_scalar_result([]),
+        MagicMock(),
     ]
     fake_blob = MagicMock()
     fake_blob.delete.side_effect = RuntimeError("s3 down")

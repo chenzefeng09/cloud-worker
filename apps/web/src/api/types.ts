@@ -16,6 +16,92 @@ export interface Session {
   updated_at: string;
 }
 
+// ─── Tasks (task board → BFF /tasks) ─────────────────────────────────────────
+//
+// A task is a session seen through its latest run: the board status is derived
+// server-side from that run, so it always matches what the sandbox reported.
+// `kind` says how it was started: `task` (the New task form), `chat` (the
+// composer) or `app_run` (an App execution).
+
+export type TaskStatus =
+  | 'queued'
+  | 'running'
+  | 'needs_input'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'idle';
+
+export type TaskKind = 'task' | 'chat' | 'app_run';
+
+export interface TaskRunSummary {
+  id: string;
+  status: string;
+  source: string;
+  app_id: string | null;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  result_summary: string | null;
+  error_message: string | null;
+  total_tokens: number | null;
+}
+
+/** Run knobs a task was started with (replayed on retry). */
+export interface TaskOptions {
+  skills?: string[];
+  mcp_server_ids?: string[];
+  model?: string | null;
+  reasoning_effort?: string | null;
+  hitl?: boolean;
+}
+
+export interface Task {
+  id: string;
+  title: string | null;
+  kind: TaskKind;
+  status: TaskStatus;
+  workspace_id: string | null;
+  instructions: string | null;
+  options: TaskOptions | null;
+  latest_run: TaskRunSummary | null;
+  run_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TaskListResponse {
+  items: Task[];
+  next_cursor: string | null;
+  counts: Record<TaskStatus, number>;
+}
+
+export interface TaskListParams {
+  status?: TaskStatus[];
+  kind?: TaskKind[];
+  workspace_id?: string;
+  q?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface CreateTaskRequest extends TaskOptions {
+  instructions: string;
+  title?: string;
+  workspace_id?: string;
+  /** Draft `kind: 'task'` session the form uploaded attachments to. */
+  session_id?: string;
+  attachment_ids?: string[];
+}
+
+export interface TaskStartResponse {
+  task: Task;
+  run_id: string | null;
+  /** Retry only: first sequence of the cleared previous attempt (null when
+   *  nothing followed the task's prompt). */
+  rewound_from?: number | null;
+}
+
 // ─── Workspace (→ session-orchestrator, proxied via BFF /workspaces) ──────────
 //
 // A workspace is a reusable, cross-session container of an instruction preamble,
@@ -1786,6 +1872,41 @@ export interface AssessDpiaRequest {
 export interface CompleteDpiaRequest {
   conclusion: string;
   residual_risks: string;
+}
+
+// Personal-data breach register (BFF-owned, GDPR Art. 33/34).
+export type BreachStatus = 'open' | 'contained' | 'closed';
+/** low: unlikely to result in a risk (no notification due); medium: notify the
+ *  supervisory authority; high: also tell the individuals (Art. 34). */
+export type BreachRiskLevel = 'low' | 'medium' | 'high';
+
+export interface BreachRecordInput {
+  title: string;
+  description: string;
+  occurred_at: string | null;
+  aware_at: string;
+  status: BreachStatus;
+  risk_level: BreachRiskLevel;
+  data_categories: string[];
+  approx_subjects: number | null;
+  approx_records: number | null;
+  likely_consequences: string;
+  measures_taken: string;
+  authority_notified_at: string | null;
+  authority_reference: string | null;
+  subjects_notified_at: string | null;
+  delay_reason: string | null;
+  security_incident_id: string | null;
+}
+
+export interface BreachRecord extends BreachRecordInput {
+  id: string;
+  tenant_id: string;
+  /** aware_at + 72 hours — the Art. 33(1) deadline for notifying the authority. */
+  notify_authority_by: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
 }
 
 // ─── Security operations (→ foundation-security-ops) ────────────────────────────

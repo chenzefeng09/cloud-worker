@@ -29,8 +29,12 @@ from fastapi.testclient import TestClient
 class FakeStreamContext:
     """Mimics httpx.AsyncClient.stream() context manager for SSE relay tests."""
 
-    def __init__(self, lines: list[str]) -> None:
+    def __init__(self, lines: list[str], *, status_code: int = 200, body: bytes = b"",
+                 fail_after: int | None = None) -> None:
         self._lines = lines
+        self.status_code = status_code
+        self._body = body
+        self._fail_after = fail_after
 
     async def __aenter__(self) -> FakeStreamContext:
         return self
@@ -38,8 +42,13 @@ class FakeStreamContext:
     async def __aexit__(self, *args: Any) -> None:
         pass
 
+    async def aread(self) -> bytes:
+        return self._body
+
     async def aiter_lines(self):  # type: ignore[override]
-        for line in self._lines:
+        for i, line in enumerate(self._lines):
+            if self._fail_after is not None and i >= self._fail_after:
+                raise httpx.ReadError("connection reset by peer at 10.0.0.7:8002")
             yield line
 
 
@@ -80,6 +89,7 @@ class FakeChatFoundation:
         self.stream_error = stream_error
         self.message_sequence = message_sequence
         self.calls: list[tuple[str, str]] = []
+        self.stream_params: list[dict[str, Any] | None] = []
         # Captures the JSON body of the POST /runs call so tests can assert what
         # the BFF forwarded to the orchestrator (e.g. execution_mode passthrough).
         self.runs_body: dict | None = None
@@ -143,7 +153,11 @@ def _patch_async_client(fake: FakeChatFoundation, monkeypatch: pytest.MonkeyPatc
 
         def stream(self, method: str, url: str, **kw: Any):
             fake.calls.append((method + "_stream", url))
+            fake.stream_params.append(kw.get("params"))
             return fake.make_stream_ctx()
+
+        async def aclose(self) -> None:
+            pass
 
     monkeypatch.setattr(httpx, "AsyncClient", _AC)
 
@@ -629,12 +643,43 @@ def test_stream_relays_sse_events(
     )
 
 
-def test_stream_upstream_connection_error_emits_error_frame(
+def test_stream_forwards_the_after_cursor(
     client: TestClient,
     authed_cookie: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If upstream stream connection fails, an SSE error frame is emitted."""
+    """A reconnect's cursor reaches the orchestrator; a first connect sends none."""
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    client.get(
+        "/api/bff/v1/sessions/ses_abc/stream?after=42&after_id=msg_42", cookies=authed_cookie,
+    )
+    client.get("/api/bff/v1/sessions/ses_abc/stream", cookies=authed_cookie)
+
+    assert fake.stream_params == [{"after": 42, "after_id": "msg_42"}, None]
+
+
+def test_stream_rejects_a_negative_after_cursor(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = FakeChatFoundation()
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.get("/api/bff/v1/sessions/ses_abc/stream?after=-1", cookies=authed_cookie)
+
+    assert resp.status_code == 422
+    assert fake.stream_params == []
+
+
+def test_stream_upstream_connection_error_is_502(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unreachable orchestrator is an HTTP 502, not an empty 200 stream."""
     fake = FakeChatFoundation(stream_error=True)
     _patch_async_client(fake, monkeypatch)
 
@@ -642,10 +687,48 @@ def test_stream_upstream_connection_error_emits_error_frame(
         "/api/bff/v1/sessions/ses_abc/stream",
         cookies=authed_cookie,
     )
-    assert resp.status_code == 200  # StreamingResponse still 200; error is in body
-    content = resp.text
-    assert "event: error" in content
-    assert "Stream connection failed" in content
+    assert resp.status_code == 502
+    assert resp.json()["detail"] == "Stream unavailable"
+    assert "upstream unavailable" not in resp.text
+
+
+@pytest.mark.parametrize("upstream_status", [403, 404])
+def test_stream_passes_upstream_4xx_through(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    upstream_status: int,
+) -> None:
+    """A deleted / foreign session keeps its 4xx so the client stops reconnecting."""
+    fake = FakeChatFoundation()
+    fake.make_stream_ctx = lambda: FakeStreamContext(  # type: ignore[method-assign]
+        [], status_code=upstream_status, body=b'{"detail": "Session not found"}',
+    )
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.get("/api/bff/v1/sessions/ses_abc/stream", cookies=authed_cookie)
+    assert resp.status_code == upstream_status
+    assert resp.json()["detail"] == "Session not found"
+
+
+def test_stream_lost_midway_emits_generic_error_frame(
+    client: TestClient,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connection lost mid-stream ends with an error frame free of internals."""
+    fake = FakeChatFoundation()
+    fake.make_stream_ctx = lambda: FakeStreamContext(  # type: ignore[method-assign]
+        ["event: ping", "data: {}", "", "event: token"], fail_after=3,
+    )
+    _patch_async_client(fake, monkeypatch)
+
+    resp = client.get("/api/bff/v1/sessions/ses_abc/stream", cookies=authed_cookie)
+    assert resp.status_code == 200
+    assert "event: ping" in resp.text
+    assert "event: error" in resp.text
+    assert "Stream connection lost" in resp.text
+    assert "10.0.0.7" not in resp.text
 
 
 # ---------------------------------------------------------------------------

@@ -328,3 +328,19 @@ def test_cross_tenant_canvas_invisible(client: TestClient) -> None:
     other = {"X-Tenant-Id": "tnt_OTHER0000000000000000000", "X-User-Id": TEST_USER}
     resp = client.get(f"{_PREFIX}/canvases/{cid}", headers=other)
     assert resp.status_code == 404
+
+
+def test_cross_user_canvas_invisible(client: TestClient) -> None:
+    """Another member of the same tenant cannot read, edit or list the canvas."""
+    cid = client.post(
+        f"{_PREFIX}/sessions/ses_1/canvases",
+        headers=_HEADERS,
+        json={"content": "secret"},
+    ).json()["id"]
+    other = {"X-Tenant-Id": TEST_TENANT, "X-User-Id": "usr_01J5TEST0000000000000USER2"}
+    assert client.get(f"{_PREFIX}/canvases/{cid}", headers=other).status_code == 404
+    assert client.get(f"{_PREFIX}/canvases/{cid}/versions", headers=other).status_code == 404
+    assert client.delete(f"{_PREFIX}/canvases/{cid}", headers=other).status_code == 404
+    assert client.get(f"{_PREFIX}/sessions/ses_1/canvases", headers=other).status_code == 404
+    # The owner still sees it.
+    assert client.get(f"{_PREFIX}/canvases/{cid}", headers=_HEADERS).status_code == 200

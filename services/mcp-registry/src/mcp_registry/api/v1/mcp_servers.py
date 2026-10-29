@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, Response, status
@@ -27,11 +28,13 @@ from mcp_registry.schemas.mcp_server import (
 from mcp_registry.services.registry_service import RegistryService
 from mcp_registry.services.secret_crypto import (
     MASKED_SENTINEL,
+    _secret_fields_for,
     decrypt_auth,
+    decrypt_values,
     encrypt_auth,
+    encrypt_values,
     has_secret,
     mask_auth,
-    _secret_fields_for,
 )
 from mcp_registry.services.server_tester import test_connection
 
@@ -48,29 +51,47 @@ def _crypto_ctx(tenant_id: str) -> dict[str, Any]:
     }
 
 
-async def _serialize_internal(server: Any, tenant_id: str) -> dict[str, Any]:
-    """Validate to McpServerOut and decrypt the auth secret fields.
+def _encrypt_ctx(tenant_id: str) -> dict[str, Any]:
+    """``_crypto_ctx`` plus the dev-only plaintext fallback, for encrypt calls."""
+    return {**_crypto_ctx(tenant_id), "allow_plaintext": Settings().allow_plaintext_secrets}
 
-    DB stores envelope-encrypted secrets; the internal consumer endpoint
-    surfaces plaintext so consumers (mcp_tenant_injector, worker, tool-broker)
-    never touch envelopes.
-    """
+
+async def _revealed(server: Any, tenant_id: str) -> McpServerOut:
+    """Validate to McpServerOut with ``auth``, ``env`` and ``headers`` decrypted."""
     out = McpServerOut.model_validate(server)
-    out.auth = await decrypt_auth(out.auth, **_crypto_ctx(tenant_id))
-    return out.model_dump(mode="json")
+    ctx = _crypto_ctx(tenant_id)
+    out.auth, out.env, out.headers = await asyncio.gather(
+        decrypt_auth(out.auth, **ctx),
+        decrypt_values(out.env, **ctx),
+        decrypt_values(out.headers, **ctx),
+    )
+    return out
 
 
-async def _serialize_masked(server: Any, tenant_id: str) -> dict[str, Any]:
-    """Validate to McpServerOut, decrypt, then mask secret fields.
+async def _masked(server: Any, tenant_id: str) -> McpServerOut:
+    """``_revealed`` with the auth secret fields masked.
 
     Used by the tenant-facing admin surface (GET/list/create/PATCH) so
     plaintext credentials never reach the browser.  Non-secret fields
     (header_name, client_id, token_url, scopes) pass through unchanged.
     """
-    out = McpServerOut.model_validate(server)
-    out.auth = await decrypt_auth(out.auth, **_crypto_ctx(tenant_id))
+    out = await _revealed(server, tenant_id)
     out.auth = mask_auth(out.auth)
-    return out.model_dump(mode="json")
+    return out
+
+
+async def _serialize_internal(server: Any, tenant_id: str) -> dict[str, Any]:
+    """Plaintext view for the internal consumer endpoint.
+
+    DB stores envelope-encrypted secrets; the internal consumer endpoint
+    surfaces plaintext so consumers (mcp_tenant_injector, worker, tool-broker)
+    never touch envelopes.
+    """
+    return (await _revealed(server, tenant_id)).model_dump(mode="json")
+
+
+async def _serialize_masked(server: Any, tenant_id: str) -> dict[str, Any]:
+    return (await _masked(server, tenant_id)).model_dump(mode="json")
 
 
 @router.get("/mcp-servers", response_model=ListPage,
@@ -98,24 +119,26 @@ async def create_server(
 ) -> McpServerOut:
     svc = RegistryService(db, tenant_id=tenant_id)
     plain_auth = body.auth.model_dump(exclude_none=True) if body.auth else None
-    encrypted_auth = await encrypt_auth(plain_auth, **_crypto_ctx(tenant_id))
+    ctx = _encrypt_ctx(tenant_id)
+    encrypted_auth, env, headers = await asyncio.gather(
+        encrypt_auth(plain_auth, **ctx),
+        encrypt_values(body.env, **ctx),
+        encrypt_values(body.headers, **ctx),
+    )
     server = await svc.create(
         name=body.name,
         transport=body.transport.value,
         endpoint=body.endpoint,
         command=body.command,
-        env=body.env,
+        env=env,
         enabled=body.enabled,
-        headers=body.headers,
+        headers=headers,
         auth=encrypted_auth,
         timeout_seconds=body.timeout_seconds,
         tool_filter=body.tool_filter.model_dump(),
         args=body.args,
     )
-    out = McpServerOut.model_validate(server)
-    out.auth = await decrypt_auth(out.auth, **_crypto_ctx(tenant_id))
-    out.auth = mask_auth(out.auth)
-    return out
+    return await _masked(server, tenant_id)
 
 
 # NOTE: declared *before* the ``/mcp-servers/{server_id}`` routes below so the
@@ -168,11 +191,7 @@ async def get_server(
     tenant_id: str = TTenantId,
 ) -> McpServerOut:
     svc = RegistryService(db, tenant_id=tenant_id)
-    server = await svc.get(server_id)
-    out = McpServerOut.model_validate(server)
-    out.auth = await decrypt_auth(out.auth, **_crypto_ctx(tenant_id))
-    out.auth = mask_auth(out.auth)
-    return out
+    return await _masked(await svc.get(server_id), tenant_id)
 
 
 @router.patch("/mcp-servers/{server_id}", response_model=McpServerOut,
@@ -207,14 +226,15 @@ async def update_server(
             # encrypt_auth is idempotent on envelopes (is_envelope → pass
             # through), so the preserved stored values survive unchanged
             # while newly typed plaintext values get encrypted.
-            changes["auth"] = await encrypt_auth(auth_dict, **_crypto_ctx(tenant_id))
+            changes["auth"] = await encrypt_auth(auth_dict, **_encrypt_ctx(tenant_id))
         else:
-            changes["auth"] = await encrypt_auth(auth_dict, **_crypto_ctx(tenant_id))
+            changes["auth"] = await encrypt_auth(auth_dict, **_encrypt_ctx(tenant_id))
+    for field in ("env", "headers"):
+        if field in changes:
+            # Idempotent on envelopes, like ``encrypt_auth``.
+            changes[field] = await encrypt_values(changes[field], **_encrypt_ctx(tenant_id))
     server = await svc.update(server_id, **changes)
-    out = McpServerOut.model_validate(server)
-    out.auth = await decrypt_auth(out.auth, **_crypto_ctx(tenant_id))
-    out.auth = mask_auth(out.auth)
-    return out
+    return await _masked(server, tenant_id)
 
 
 @router.delete("/mcp-servers/{server_id}", status_code=204,
@@ -323,6 +343,15 @@ async def test_server(
         # before the auth is even read.
         auth = await decrypt_auth(server.auth, **_crypto_ctx(tenant_id))
 
+    if "headers" in overrides:
+        # Sent headers replace the stored ones even when empty or null: the
+        # redirect guard above admits an explicit ``{}`` because it means "no
+        # headers", so falling back to the stored map here would hand it to
+        # the redirected endpoint.
+        headers = overrides["headers"] or {}
+    else:
+        headers = await decrypt_values(server.headers, **_crypto_ctx(tenant_id))
+
     # ``exclude_unset`` distinguishes "field omitted" from "field sent as null";
     # an explicit null falls back to the stored value rather than blanking it.
     transport = (
@@ -333,7 +362,7 @@ async def test_server(
     view = _ServerView(
         transport=transport,
         endpoint=overrides.get("endpoint") or server.endpoint,
-        headers=overrides.get("headers") or server.headers,
+        headers=headers,
         auth=auth,
         timeout_seconds=overrides.get("timeout_seconds") or server.timeout_seconds,
     )

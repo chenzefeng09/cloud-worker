@@ -12,6 +12,7 @@ import type { ActiveSession, ApiKey, ApiKeyCreated, DailyTokenBreakdown, Feature
 import { useDefaultModel, clearModelCache } from '../hooks/useDefaultModel';
 import { MODEL_OPTIONS, SYSTEM_FALLBACK_MODEL, modelLabel } from '../lib/modelOptions';
 import { findProviderForModel, getModelsForTypes } from '../lib/providerModels';
+import { PrivacyTab } from '../components/privacy/PrivacyTab';
 
 const FLAG_DESCRIPTIONS: Record<string, string> = {
   'ai.thinking_ui': 'AI thinking process',
@@ -266,14 +267,26 @@ function ChartLegend() {
 
 // ── Main page ─────────────────────────────────────────────────────
 
-type TabId = 'account' | 'usage' | 'security' | 'notifications';
+type TabId = 'account' | 'usage' | 'security' | 'notifications' | 'privacy';
 
 const TABS: { id: TabId; label: string }[] = [
   { id: 'account',       label: 'Account' },
   { id: 'usage',         label: 'Usage & billing' },
   { id: 'security',      label: 'Security' },
   { id: 'notifications', label: 'Notifications' },
+  { id: 'privacy',       label: 'Privacy & data' },
 ];
+
+// Deep link: `/profile?tab=privacy` (used by the privacy notice). Read from
+// window.location rather than a router hook — it's only needed on mount.
+function initialTab(): TabId {
+  try {
+    const t = new URLSearchParams(window.location.search).get('tab');
+    return TABS.some((x) => x.id === t) ? (t as TabId) : 'account';
+  } catch {
+    return 'account';
+  }
+}
 
 export function ProfilePage() {
   const navigate = useNavigate();
@@ -436,7 +449,7 @@ export function ProfilePage() {
     setTimeout(() => setCopyDone(false), 2000);
   };
 
-  const [tab,      setTab]      = useState<TabId>('account');
+  const [tab,      setTab]      = useState<TabId>(initialTab);
   const [name,     setName]     = useState(displayName);
   const [digestOn, setDigest]   = useState(true);
 
@@ -1493,6 +1506,9 @@ export function ProfilePage() {
 
             </div>
           )}
+
+          {/* ══ Privacy & data ═════════════════════════════════ */}
+          {tab === 'privacy' && <PrivacyTab />}
 
         </div>
       </div>

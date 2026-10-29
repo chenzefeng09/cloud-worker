@@ -72,7 +72,7 @@ def test_model_import_and_new_id() -> None:
     expected_cols = {
         "id", "tenant_id", "app_id", "name", "cron_expression",
         "timezone", "input_values", "enabled", "source",
-        "trigger_type", "field_mapping", "webhook_secret_hash",
+        "trigger_type", "field_mapping", "webhook_secret_hash", "created_by_user_id",
         "last_run_at", "next_run_at", "last_status", "last_error",
         "created_at", "updated_at",
     }

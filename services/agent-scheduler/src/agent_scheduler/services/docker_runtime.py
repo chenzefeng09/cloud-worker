@@ -34,6 +34,9 @@ import json
 import logging
 import os
 import re
+import time
+from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +50,18 @@ from agent_scheduler.config import (
 )
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
 from agent_scheduler.services import artifact_store, egress_policy
+
+# Per-run host dir lifecycle, shared by both runtimes (see the comment block in
+# cube_runtime: it lives there so that module never needs the docker SDK).
+from agent_scheduler.services.cube_runtime import (
+    clear_run_collected,
+    mark_run_collected,
+    remove_run_workspace,
+    run_collected_at,
+    run_workspace_dir,
+    sweep_run_workspaces,
+    workspace_gc_settings,
+)
 from agent_scheduler.services.runtime import RUNTIME_REGISTRY
 from agent_scheduler.services.skill_cache import MountedSkill, SkillCache
 
@@ -61,6 +76,15 @@ _CONTAINER_STATUS_MAP = {
     "restarting": "RUNNING",
     "removing": "FAILED",
 }
+
+# Container states whose worker may still be using its run dir.  (``paused`` is
+# the cgroup freeze; a HITL-paused run's container has ``exited``.)
+_LIVE_CONTAINER_STATES = frozenset({"running", "restarting", "paused"})
+# Containers that will never run again ("created" = never started).
+_FINISHED_CONTAINER_STATES = frozenset({"exited", "dead", "created"})
+# Docker timestamps carry nanoseconds ("2026-01-02T03:04:05.123456789Z");
+# ``datetime.fromisoformat`` takes at most microseconds.
+_DOCKER_TIME = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(\.\d+)?(Z|[+-]\d\d:\d\d)$")
 
 # Conservative identifier whitelist for anything that gets spliced into
 # filesystem paths or container labels.  ULIDs (26 base32 chars) and
@@ -147,6 +171,28 @@ def _check_ids(**named: str) -> None:
             raise SandboxSpawnError(
                 f"{name}={value!r} fails identifier whitelist; refusing to spawn",
             )
+
+
+def _stopped_at(container: Any) -> float | None:
+    """When a finished container stopped (or, never started, was created)."""
+    try:
+        state = container.attrs.get("State") or {}
+        raw = state.get("FinishedAt")
+        if not isinstance(raw, str) or raw.startswith("0001-"):
+            raw = container.attrs.get("Created")
+    except (AttributeError, TypeError):
+        return None
+    match = _DOCKER_TIME.match(raw) if isinstance(raw, str) else None
+    if match is None:
+        return None
+    stamp, fraction, zone = match.groups()
+    try:
+        moment = datetime.fromisoformat(
+            stamp + (fraction or "")[:7] + ("+00:00" if zone == "Z" else zone)
+        )
+    except ValueError:
+        return None
+    return moment.timestamp()
 
 
 class DockerRuntime:
@@ -263,6 +309,7 @@ class DockerRuntime:
 
         workspace_dir = Path(self._settings.workspace_base) / tenant_id / session_id / run_id
         workspace_dir.mkdir(parents=True, exist_ok=True)
+        clear_run_collected(workspace_dir)
 
         # The task arrives as a file the worker reads, not an argv arg,
         # so we never splice user-controlled text into a shell command.
@@ -673,6 +720,10 @@ class DockerRuntime:
             result["artifacts"] = output["artifacts"]
             if workspace_id:
                 result["writeback_files"] = output["workspace_files"]
+            # Collected: the reaper removes the host dir after the grace.  A
+            # paused run keeps it — the resumed container reuses it.
+            if str(result.get("result_status") or "").lower() != "paused":
+                mark_run_collected(self._labelled_run_dir(c))
         return result
 
     _EXCLUDED_NAMES: frozenset[str] = artifact_store.EXCLUDED_NAMES
@@ -698,11 +749,13 @@ class DockerRuntime:
         return str(tenant)
 
     # ---------------------------------------------------------------- cancel
-    def cancel_run(self, container_id: str) -> None:
+    def cancel_run(self, container_id: str, *, remove_workspace: bool = True) -> None:
         try:
             c = self.client.containers.get(container_id)
         except docker.errors.NotFound as exc:
             raise ContainerNotFoundError(container_id) from exc
+        # Read the run's ids BEFORE removal: the labels go with the container.
+        run_dir = self._labelled_run_dir(c)
         try:
             c.stop(timeout=10)
         except docker.errors.APIError:
@@ -712,11 +765,132 @@ class DockerRuntime:
         with contextlib.suppress(docker.errors.NotFound):
             # Removed concurrently; nothing to do.
             c.remove()
+        if run_dir is None or not remove_workspace:
+            return
+        # A resumed HITL run gets a new container with the same run id and dir;
+        # stopping the stale container must not pull the workspace out from
+        # under the live one.  Unknown (list failed) counts as live.
+        live = self._live_run_ids()
+        if live is None or run_dir.name in live:
+            logger.info(
+                "cancel: run workspace may still be in use; leaving it to the reaper",
+                extra={"container_id": container_id, "run_id": run_dir.name},
+            )
+            return
+        remove_run_workspace(self._settings.workspace_base, run_dir)
+
+    def _labelled_run_dir(self, container: Any) -> Path | None:
+        """The container's per-run host dir, from its (untrusted) labels."""
+        labels = getattr(container, "labels", None)
+        if not isinstance(labels, Mapping):
+            return None
+        return run_workspace_dir(
+            self._settings.workspace_base,
+            labels.get("agent-platform.tenant-id"),
+            labels.get("agent-platform.session-id"),
+            labels.get("agent-platform.run-id"),
+        )
+
+    def _live_run_ids(self) -> set[str] | None:
+        """Run ids of containers that may still be using their dir; ``None`` on error."""
+        try:
+            containers = self.client.containers.list(
+                all=True, filters={"label": "agent-platform.run-id"},
+            )
+        except Exception as exc:  # noqa: BLE001 -- docker unavailable / API error
+            logger.warning("docker container list failed", extra={"err": str(exc)})
+            return None
+        live: set[str] = set()
+        for container in containers:
+            if getattr(container, "status", None) not in _LIVE_CONTAINER_STATES:
+                continue
+            labels = getattr(container, "labels", None)
+            run_id = labels.get("agent-platform.run-id") if isinstance(labels, Mapping) else None
+            if isinstance(run_id, str):
+                live.add(run_id)
+        return live
 
     # ------------------------------------------------------------------ reap
     def reap_expired(self, *, max_age_seconds: int) -> int:
-        """Docker containers are reaped by their own lifecycle; no-op here."""
-        return 0
+        """Remove finished run containers and sweep per-run host dirs.
+
+        Returns how many containers were removed.  Dirs go when collected and
+        past their grace, or idle past ``workspace_max_age_seconds`` (see
+        ``sweep_run_workspaces``), never one whose run id has a live container;
+        finished containers follow the same schedule (``_remove_finished``).
+        Skipped entirely when the daemon cannot list containers.
+        ``max_age_seconds`` (the sandbox age cap) does not apply to docker.
+        """
+        live = self._live_run_ids()
+        if live is None:
+            logger.warning("run workspace sweep skipped: cannot list containers")
+            return 0
+        grace, max_age = workspace_gc_settings(self._settings)
+        # Containers first: their schedule reads the ``.collected`` markers the
+        # dir sweep deletes.
+        containers = self._remove_finished(grace=grace, max_age=max_age)
+        removed = sweep_run_workspaces(
+            self._settings.workspace_base,
+            collected_grace_seconds=grace,
+            max_age_seconds=max_age,
+            live_run_ids=live,
+        )
+        if removed:
+            logger.info("removed %d run workspace dir(s)", removed)
+        return containers
+
+    def _remove_finished(self, *, grace: float, max_age: float) -> int:
+        """Remove run containers that stopped and are no longer needed.
+
+        A stopped container keeps its writable layer - everything the worker
+        wrote outside the bind-mounted workspace, the Agent SDK's session
+        transcript under ``~/.claude`` included - and its environment, so it
+        holds the same personal data as the run dir and gets the same
+        lifetime: it goes once its run dir is collected and past the grace (or
+        already gone), or once it stopped more than ``max_age`` ago.  A paused
+        run's container is not collected and stays for its resume.
+        """
+        try:
+            containers = self.client.containers.list(
+                all=True, filters={"label": "agent-platform.run-id"},
+            )
+        except Exception as exc:  # noqa: BLE001 -- docker unavailable / API error
+            logger.warning("docker container list failed", extra={"err": str(exc)})
+            return 0
+        now = time.time()
+        removed = 0
+        for container in containers:
+            if getattr(container, "status", None) not in _FINISHED_CONTAINER_STATES:
+                continue
+            stopped_at = _stopped_at(container)
+            if stopped_at is None:
+                continue
+            idle = now - stopped_at
+            run_dir = self._labelled_run_dir(container)
+            collected_at = run_collected_at(run_dir)
+            due = (max_age > 0 and idle >= max_age) or (
+                run_dir is not None
+                and grace >= 0
+                and idle >= grace
+                and (
+                    (collected_at is not None and now - collected_at >= grace)
+                    or not run_dir.exists()
+                )
+            )
+            if not due:
+                continue
+            try:
+                container.remove(force=True)
+            except docker.errors.NotFound:
+                continue
+            except docker.errors.APIError as exc:
+                logger.warning(
+                    "finished container removal failed",
+                    extra={"container_id": getattr(container, "id", None), "err": str(exc)},
+                )
+                continue
+            removed += 1
+        return removed
 
     # ------------------------------------------------------------------ list
     def list_containers(self, *, tenant_id: str) -> list[dict[str, Any]]:

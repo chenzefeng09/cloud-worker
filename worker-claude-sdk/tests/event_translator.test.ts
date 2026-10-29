@@ -871,3 +871,307 @@ describe("EventTranslator — per-token streaming (stream_event)", () => {
     expect(t.getCumulativeUsage().output_tokens).toBe(80);
   });
 });
+
+// ── Real CLI (SDK 0.1.77) shape ───────────────────────────────────────────────
+// Most streaming tests above use the stop-first / one-aggregate-consolidated
+// shape. The real CLI instead yields each content block's consolidated
+// `assistant` message (that block alone, at content index 0, the turn's msg id)
+// BEFORE the block's content_block_stop, with the block normalised: tool input
+// re-parsed/coerced, whitespace-only text replaced by "(no content)".
+describe("EventTranslator — real CLI shape (per-block consolidated before the stop)", () => {
+  const consolidated = (
+    id: string | undefined,
+    block: AnyMsg,
+    usage: AnyMsg = { input_tokens: 100, output_tokens: 20 },
+  ): AnyMsg => ({
+    type: "assistant",
+    message: { ...(id ? { id } : {}), content: [block], usage },
+  });
+  const runAll = (t: EventTranslator, msgs: AnyMsg[]): EventPayload[] =>
+    msgs.flatMap((m) => t.translateMessage(m));
+
+  it("thinking → text → tool: one Start/End per call, End args = consolidated input, nothing re-emitted", () => {
+    const t = new EventTranslator();
+    const id = "msg_cli_1";
+    const events = runAll(t, [
+      msgStart(id),
+      cbStart(0, { type: "thinking", thinking: "" }),
+      cbDelta(0, { type: "thinking_delta", thinking: "plan: " }),
+      cbDelta(0, { type: "thinking_delta", thinking: "list files" }),
+      consolidated(id, { type: "thinking", thinking: "plan: list files" }),
+      cbStop(0),
+      cbStart(1, { type: "text", text: "" }),
+      cbDelta(1, { type: "text_delta", text: "Listing " }),
+      cbDelta(1, { type: "text_delta", text: "files." }),
+      consolidated(id, { type: "text", text: "Listing files." }),
+      cbStop(1),
+      cbStart(2, { type: "tool_use", id: "toolu_1", name: "Bash", input: {} }),
+      cbDelta(2, { type: "input_json_delta", partial_json: '{"command": "ls -la", ' }),
+      cbDelta(2, { type: "input_json_delta", partial_json: '"timeout": "5000"}' }),
+      // The CLI re-parses and coerces the input ("5000" -> 5000).
+      consolidated(id, {
+        type: "tool_use",
+        id: "toolu_1",
+        name: "Bash",
+        input: { command: "ls -la", timeout: 5000 },
+      }),
+      cbStop(2),
+      streamEvent({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 20 } }),
+      msgStop(),
+    ]);
+
+    expect(types(events)).toEqual([
+      "ThinkingBlockStartEvent",
+      "ThinkingBlockDeltaEvent",
+      "ThinkingBlockDeltaEvent",
+      "ModelCallEndEvent", // the turn's first consolidated accounts its usage
+      "ThinkingBlockEndEvent",
+      "TextBlockStartEvent",
+      "TextBlockDeltaEvent",
+      "TextBlockDeltaEvent",
+      "TextBlockEndEvent",
+      "ToolCallStartEvent",
+      "ToolCallDeltaEvent",
+      "ToolCallDeltaEvent",
+      "ToolCallEndEvent",
+    ]);
+    const end = events.find((e) => e.event_type === "ToolCallEndEvent")!;
+    expect(end.tool_call_id).toBe("toolu_1");
+    // The complete arguments the tool runs with, once.
+    expect(end.args).toBe('{"command":"ls -la","timeout":5000}');
+    // The streamed fragments are never re-appended (the doubled-args bug).
+    const argDeltas = events
+      .filter((e) => e.event_type === "ToolCallDeltaEvent")
+      .map((e) => e.delta);
+    expect(argDeltas.join("")).toBe('{"command": "ls -la", "timeout": "5000"}');
+    expect(t.getCumulativeUsage()).toMatchObject({ input_tokens: 100, output_tokens: 20 });
+  });
+
+  it("a tool call surfaced again (second consolidated, replayed start, late delta) is never re-announced", () => {
+    const t = new EventTranslator();
+    const id = "msg_cli_2";
+    runAll(t, [
+      msgStart(id),
+      cbStart(0, { type: "tool_use", id: "toolu_2", name: "Read", input: {} }),
+      cbDelta(0, { type: "input_json_delta", partial_json: '{"file_path":"/a"}' }),
+      consolidated(id, { type: "tool_use", id: "toolu_2", name: "Read", input: { file_path: "/a" } }),
+      cbStop(0),
+    ]);
+    const again = runAll(t, [
+      consolidated(id, { type: "tool_use", id: "toolu_2", name: "Read", input: { file_path: "/a" } }),
+      cbStart(0, { type: "tool_use", id: "toolu_2", name: "Read", input: {} }),
+      cbDelta(0, { type: "input_json_delta", partial_json: '{"file_path":"/a"}' }),
+      cbStop(0),
+    ]);
+    expect(again.filter((e) => e.event_type.startsWith("ToolCall"))).toEqual([]);
+  });
+
+  it("text → tool → text → tool across two turns: every block once, in stream order", () => {
+    const t = new EventTranslator();
+    const turn = (id: string, text: string, toolId: string, cmd: string): AnyMsg[] => [
+      msgStart(id),
+      cbStart(0, { type: "text", text: "" }),
+      cbDelta(0, { type: "text_delta", text }),
+      consolidated(id, { type: "text", text }),
+      cbStop(0),
+      cbStart(1, { type: "tool_use", id: toolId, name: "Bash", input: {} }),
+      cbDelta(1, { type: "input_json_delta", partial_json: JSON.stringify({ command: cmd }) }),
+      consolidated(id, { type: "tool_use", id: toolId, name: "Bash", input: { command: cmd } }),
+      cbStop(1),
+      msgStop(),
+      {
+        type: "user",
+        message: { content: [{ type: "tool_result", tool_use_id: toolId, content: `${cmd} ok` }] },
+      },
+    ];
+    const events = runAll(t, [
+      ...turn("msg_a", "First I list.", "toolu_a", "ls"),
+      ...turn("msg_b", "Now I count.", "toolu_b", "wc -l"),
+    ]);
+
+    const seq = events
+      .filter((e) =>
+        ["TextBlockDeltaEvent", "ToolCallEndEvent", "ToolResultEndEvent"].includes(e.event_type),
+      )
+      .map((e) =>
+        e.event_type === "TextBlockDeltaEvent"
+          ? `text:${e.delta}`
+          : `${e.event_type}:${e.tool_call_id}`,
+      );
+    expect(seq).toEqual([
+      "text:First I list.",
+      "ToolCallEndEvent:toolu_a",
+      "ToolResultEndEvent:toolu_a",
+      "text:Now I count.",
+      "ToolCallEndEvent:toolu_b",
+      "ToolResultEndEvent:toolu_b",
+    ]);
+    expect(events.filter((e) => e.event_type === "ToolCallStartEvent")).toHaveLength(2);
+    expect(t.getCumulativeUsage().input_tokens).toBe(200);
+  });
+
+  it("a whitespace-only streamed text block is not re-emitted as \"(no content)\"", () => {
+    const t = new EventTranslator();
+    const id = "msg_ws";
+    const events = runAll(t, [
+      msgStart(id),
+      cbStart(0, { type: "text", text: "" }),
+      cbDelta(0, { type: "text_delta", text: "\n\n" }),
+      consolidated(id, { type: "text", text: "(no content)" }),
+      cbStop(0),
+    ]);
+    expect(
+      events.filter((e) => e.event_type === "TextBlockDeltaEvent").map((e) => e.delta),
+    ).toEqual(["\n\n"]);
+  });
+
+  it("two text blocks with the same text in one turn are matched one-to-one, in order", () => {
+    const t = new EventTranslator();
+    const id = "msg_same";
+    const events = runAll(t, [
+      msgStart(id),
+      cbStart(0, { type: "text", text: "" }),
+      cbDelta(0, { type: "text_delta", text: "OK." }),
+      consolidated(id, { type: "text", text: "OK." }),
+      cbStop(0),
+      cbStart(1, { type: "tool_use", id: "toolu_s", name: "Bash", input: {} }),
+      cbDelta(1, { type: "input_json_delta", partial_json: "{}" }),
+      consolidated(id, { type: "tool_use", id: "toolu_s", name: "Bash", input: {} }),
+      cbStop(1),
+      cbStart(2, { type: "text", text: "" }),
+      cbDelta(2, { type: "text_delta", text: "OK." }),
+      consolidated(id, { type: "text", text: "OK." }),
+      cbStop(2),
+    ]);
+    expect(
+      events.filter((e) => e.event_type === "TextBlockDeltaEvent").map((e) => e.delta),
+    ).toEqual(["OK.", "OK."]);
+  });
+
+  it("a consolidated message is only deduped against partials of the SAME message id", () => {
+    const t = new EventTranslator();
+    // Streamed id-less turn "Done."
+    runAll(t, [
+      msgStart(),
+      cbStart(0, { type: "text", text: "" }),
+      cbDelta(0, { type: "text_delta", text: "Done." }),
+      cbStop(0),
+    ]);
+    // A different (non-streamed) message with the same text is real content.
+    const other = t.translateMessage(consolidated("msg_other", { type: "text", text: "Done." }));
+    expect(types(other)).toEqual(["TextBlockStartEvent", "TextBlockDeltaEvent", "ModelCallEndEvent"]);
+    expect(other[1].delta).toBe("Done.");
+  });
+
+  it("usage: a partial snapshot on an early consolidated is topped up by message_delta, counted once", () => {
+    const t = new EventTranslator();
+    const id = "msg_usage";
+    const early = { input_tokens: 500, output_tokens: 3, cache_read_input_tokens: 400 };
+    const events = runAll(t, [
+      msgStart(id),
+      cbStart(0, { type: "thinking", thinking: "" }),
+      cbDelta(0, { type: "thinking_delta", thinking: "hmm" }),
+      consolidated(id, { type: "thinking", thinking: "hmm" }, early),
+      cbStop(0),
+      cbStart(1, { type: "text", text: "" }),
+      cbDelta(1, { type: "text_delta", text: "answer" }),
+      consolidated(id, { type: "text", text: "answer" }, early),
+      cbStop(1),
+      streamEvent({
+        type: "message_delta",
+        delta: { stop_reason: "end_turn" },
+        usage: { input_tokens: 500, output_tokens: 42, cache_read_input_tokens: 400 },
+      }),
+      msgStop(),
+    ]);
+    expect(t.getCumulativeUsage()).toMatchObject({
+      input_tokens: 500,
+      output_tokens: 42,
+      cache_read_input_tokens: 400,
+    });
+    // The ModelCallEndEvent increments sum to the cumulative usage.
+    const inc = events.filter((e) => e.event_type === "ModelCallEndEvent");
+    expect(inc.reduce((s, e) => s + Number(e.input_tokens), 0)).toBe(500);
+    expect(inc.reduce((s, e) => s + Number(e.output_tokens), 0)).toBe(42);
+    expect(inc.reduce((s, e) => s + Number(e.cache_read_input_tokens), 0)).toBe(400);
+  });
+
+  it("an API-error assistant message becomes ApiErrorEvent only (its raw text is never emitted)", () => {
+    const t = new EventTranslator();
+    const out = t.translateMessage({
+      type: "assistant",
+      error: "rate_limit",
+      message: {
+        id: "msg_err",
+        content: [{ type: "text", text: 'API Error: 429 {"detail":"tenant t-1 over quota"}' }],
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    } as AnyMsg);
+    expect(out).toEqual([{ event_type: "ApiErrorEvent", error: "rate_limit" }]);
+  });
+
+  it("a code-less synthetic \"API Error\" notice is an ApiErrorEvent too; real model text is not", () => {
+    const t = new EventTranslator();
+    const notice = t.translateMessage({
+      type: "assistant",
+      message: {
+        id: "b2c1",
+        model: "<synthetic>",
+        content: [
+          {
+            type: "text",
+            text: "API Error: Claude's response exceeded the 32000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.",
+          },
+        ],
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+    } as AnyMsg);
+    expect(notice).toEqual([{ event_type: "ApiErrorEvent", error: "unknown" }]);
+
+    // The model itself writing "API Error…" is ordinary answer text.
+    const real = t.translateMessage({
+      type: "assistant",
+      message: {
+        id: "msg_real",
+        model: "deepseek-chat",
+        content: [{ type: "text", text: "API Error codes are listed below." }],
+        usage: { input_tokens: 5, output_tokens: 5 },
+      },
+    } as AnyMsg);
+    expect(types(real)).toEqual(["TextBlockStartEvent", "TextBlockDeltaEvent", "ModelCallEndEvent"]);
+  });
+
+  it("result success with is_error=true is an ErrorEvent that does not copy the raw text", () => {
+    const t = new EventTranslator();
+    expect(
+      t.translateMessage({
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        result: "API Error: 500 upstream 10.0.0.7",
+      } as AnyMsg),
+    ).toEqual([{ event_type: "ErrorEvent", message: "model API error", subtype: "success" }]);
+    expect(t.translateMessage({ type: "result", subtype: "error_max_turns" } as AnyMsg)).toEqual([
+      {
+        event_type: "ErrorEvent",
+        message: "result subtype error_max_turns",
+        subtype: "error_max_turns",
+      },
+    ]);
+  });
+
+  it("flags a non-streamed thinking block whole_block; streamed thinking deltas are live chunks", () => {
+    const t = new EventTranslator();
+    const whole = t.translateMessage(
+      consolidated("msg_ns", { type: "thinking", thinking: "all at once" }),
+    );
+    const wholeDelta = whole.find((e) => e.event_type === "ThinkingBlockDeltaEvent")!;
+    expect(wholeDelta.whole_block).toBe(true);
+    expect(wholeDelta.delta).toBe("all at once");
+
+    t.translateMessage(msgStart("msg_s"));
+    t.translateMessage(cbStart(0, { type: "thinking", thinking: "" }));
+    const live = t.translateMessage(cbDelta(0, { type: "thinking_delta", thinking: "chunk" }));
+    expect(live[0].whole_block).toBeUndefined();
+  });
+});

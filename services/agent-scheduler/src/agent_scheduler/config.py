@@ -230,6 +230,13 @@ class Settings(BaseSettings):
     sandbox_reaper_max_age_seconds: int = 3600  # delete VMs older than 1 hour
     sandbox_reaper_interval_seconds: int = 120  # sweep every 2 min
 
+    # Host-side run workspace dirs (user files) on both runtimes: the reaper
+    # removes a dir this long after its result was collected, and any dir idle
+    # longer than the max age — kept above the worker's 7-day HITL pause TTL
+    # so a paused run keeps its files while it can still resume.
+    workspace_collected_grace_seconds: int = 600
+    workspace_max_age_seconds: int = 8 * 24 * 3600
+
     # B-M3: base URLs for the MCP registry and skill-store services.
     # These are forwarded to the sandbox as MCP_REGISTRY_URL / SKILL_STORE_URL
     # where the in-sandbox worker appends /internal/mcp-servers and

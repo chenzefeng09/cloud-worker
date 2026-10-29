@@ -6,6 +6,7 @@ import { useWorkspace } from '../../lib/workspaceContext';
 import { AccountMenu } from './AccountMenu';
 import { canAccessAdmin } from '../../admin/AdminLayout';
 import { formatAbsoluteTime } from '../../lib/format';
+import { useActiveTaskCount } from '../../hooks/useTasks';
 import type { Session } from '../../api/types';
 
 interface NavSpec {
@@ -17,6 +18,7 @@ interface NavSpec {
 
 const NAV: NavSpec[] = [
   { to: '/home', label: 'New task', glyph: '◇' },
+  { to: '/tasks', label: 'Tasks', glyph: '☰' },
   { to: '/apps', label: 'Apps', glyph: '▦' },
   { to: '/workspace', label: 'My workspace', glyph: '⌗' },
   { to: '/library', label: 'Library', glyph: '✦' },
@@ -37,6 +39,7 @@ export function Sidebar() {
   const userProfile = useChatStore((s) => s.userProfile);
   const collapsed = useChatStore((s) => s.sidebarCollapsed);
   const setCollapsed = useChatStore((s) => s.setSidebarCollapsed);
+  const taskCounts = useActiveTaskCount();
 
   const devBuildLabel = import.meta.env.DEV
     ? `dev ${import.meta.env.VITE_DEV_BUILD_STAMP ?? 'local'}`
@@ -103,6 +106,15 @@ export function Sidebar() {
         <div className="flex flex-col gap-0.5 shrink-0">
         {NAV.map((n) => {
           const count = n.count;
+          // The Tasks entry carries a live badge: tasks waiting on the user
+          // (accent) take precedence over the number still running.
+          const taskBadge = n.to === '/tasks'
+            ? taskCounts.needsInput > 0
+              ? { text: `${taskCounts.needsInput} waiting`, accent: true }
+              : taskCounts.running > 0
+                ? { text: `${taskCounts.running} running`, accent: false }
+                : null
+            : null;
           return (
             <NavLink
               key={n.to}
@@ -115,7 +127,7 @@ export function Sidebar() {
                     : 'text-ink-2 border-transparent hover:bg-paper-2 hover:text-ink',
                 ].join(' ')
               }
-              end={n.to === '/home' || n.to === '/apps'}
+              end={n.to === '/home' || n.to === '/apps' || n.to === '/tasks'}
             >
               {({ isActive }) => (
                 <>
@@ -132,6 +144,14 @@ export function Sidebar() {
                   <span className="flex-1 truncate">{n.label}</span>
                   {count && (
                     <span className="ml-auto font-mono text-[10px] text-dim">{count}</span>
+                  )}
+                  {taskBadge && (
+                    <span
+                      data-testid="tasks-badge"
+                      className={`ml-auto font-mono text-[10px] ${taskBadge.accent ? 'text-accent' : 'text-dim'}`}
+                    >
+                      {taskBadge.text}
+                    </span>
                   )}
                 </>
               )}

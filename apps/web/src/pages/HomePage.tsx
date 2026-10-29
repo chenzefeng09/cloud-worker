@@ -17,6 +17,7 @@ import { useApps } from '../hooks/useApps';
 import { useInstalledSkills } from '../hooks/useInstalledSkills';
 import { useMcpServers } from '../hooks/useMcpServers';
 import { CreateAppModal } from '../components/app/CreateAppModal';
+import { CreateTaskDialog } from '../components/tasks/CreateTaskDialog';
 import { GridBackdrop } from '../components/GridBackdrop';
 import { SYSTEM_FALLBACK_MODEL, DEFAULT_EFFORT } from '../lib/modelOptions';
 import { useDefaultModel } from '../hooks/useDefaultModel';
@@ -48,6 +49,7 @@ export function HomePage() {
   const navigate = useNavigate();
   const [draft, setDraft] = useState('');
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showCreateTask, setShowCreateTask] = useState(false);
   const [phIdx, setPhIdx] = useState(0);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -280,9 +282,17 @@ export function HomePage() {
 
           {/* 应用中心 — published apps */}
           <div className="w-[min(960px,95%)] grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-            {/* 空白任务 */}
+            {/* 空白任务 — a structured background task (instructions, files, tools) */}
             <div
-              onClick={() => setShowCreateModal(true)}
+              role="button"
+              tabIndex={0}
+              onClick={() => setShowCreateTask(true)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  setShowCreateTask(true);
+                }
+              }}
               className="border border-line bg-surface rounded-md p-3.5 cursor-pointer flex flex-col gap-1.5 min-h-[120px] transition-all hover:border-ink-2 hover:-translate-y-px"
             >
               <div className="flex items-center gap-2.5 mb-0.5">
@@ -294,11 +304,12 @@ export function HomePage() {
                 <span className="font-mono text-[10.5px] text-dim">→</span>
               </div>
               <div className="text-[12px] text-dim leading-[1.45]">
-                Start from scratch — describe your goal in plain language.
+                Describe a goal, attach files, and let it run in the background.
               </div>
               <div className="flex-1" />
               <div className="flex gap-1 flex-wrap">
                 <Chip>Free-form</Chip>
+                <Chip>Background</Chip>
               </div>
             </div>
 
@@ -451,6 +462,15 @@ export function HomePage() {
       <CreateAppModal
         open={showCreateModal}
         onClose={() => setShowCreateModal(false)}
+      />
+      <CreateTaskDialog
+        open={showCreateTask}
+        onClose={() => setShowCreateTask(false)}
+        onCreated={(task) => {
+          // Started → watch it run; saved but not started → the board, where
+          // its card offers Start.
+          navigate(task ? `/tasks/${task.id}` : '/tasks');
+        }}
       />
     </div>
   );

@@ -58,10 +58,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 
+from agent_bff.api._audit import emit_admin_audit
 from agent_bff.api._http import foundation_headers
 from agent_bff.api.dependencies import TClearance, require_auth
 
@@ -224,6 +226,43 @@ def require_admin_module_bff(
 def _forward_params(request: Request) -> dict[str, str]:
     """All query params except the BFF-private ``tenant_id`` override."""
     return {k: v for k, v in request.query_params.items() if k != "tenant_id"}
+
+
+async def _audit_admin_read(
+    request: Request,
+    auth: tuple[str, str, str],
+    tenant_id: str | None,
+    *,
+    event_type: str,
+    resource_type: str,
+    resource_id: str | None,
+    payload: dict[str, Any],
+) -> None:
+    """Audit an admin read of tenant members' content (best-effort).
+
+    The event is recorded in the tenant whose data was read — the
+    ``?tenant_id=`` target for a cross-tenant super_admin, with the actor's
+    own tenant noted in the payload.
+    """
+    caller_tenant, user_id, access_token = auth
+    effective = tenant_id or caller_tenant
+    if effective != caller_tenant:
+        payload = {**payload, "actor_tenant_id": caller_tenant}
+    await emit_admin_audit(
+        request.app.state.settings,
+        tenant_id=effective,
+        user_id=user_id,
+        access_token=access_token,
+        event_type=event_type,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        payload=payload,
+    )
+
+
+def _item_count(body: Any) -> int | None:
+    items = body.get("items") if isinstance(body, dict) else None
+    return len(items) if isinstance(items, list) else None
 
 
 async def _proxy_get(
@@ -539,10 +578,23 @@ async def admin_list_documents(
     _auth: tuple = Depends(require_admin_module_bff("document.create")),
 ) -> dict:
     url = f"{request.app.state.settings.knowledge_ingest_url}/documents"
-    return await _proxy_get(
+    body = await _proxy_get(
         request, url, _auth, tenant_id, forward_params=True, admin_actor=False,
         extra_params={"include_memory": "true"},
     )
+    # The listing includes members' session memories, whose titles quote
+    # their prompts — audited like the session list.
+    await _audit_admin_read(
+        request, _auth, tenant_id,
+        event_type="admin.knowledge.document.list.viewed",
+        resource_type="document",
+        resource_id=None,
+        payload={
+            "via": "admin_knowledge", "includes_memory": True,
+            "document_count": _item_count(body),
+        },
+    )
+    return body
 
 
 @router.get("/admin/knowledge/documents/{document_id}")
@@ -556,7 +608,19 @@ async def admin_get_document(
         f"{request.app.state.settings.knowledge_ingest_url}"
         f"/documents/{document_id}"
     )
-    return await _proxy_get(request, url, _auth, tenant_id, admin_actor=False)
+    body = await _proxy_get(request, url, _auth, tenant_id, admin_actor=False)
+    payload: dict[str, Any] = {"via": "admin_knowledge"}
+    subject = body.get("origin_user_id") or body.get("uploaded_by_user_id")
+    if isinstance(subject, str) and subject:
+        payload["subject_user_id"] = subject
+    await _audit_admin_read(
+        request, _auth, tenant_id,
+        event_type="admin.knowledge.document.viewed",
+        resource_type="document",
+        resource_id=document_id,
+        payload=payload,
+    )
+    return body
 
 
 @router.get("/admin/knowledge/documents/{document_id}/content")
@@ -594,6 +658,14 @@ async def admin_get_document_content(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"knowledge-ingest unreachable ({exc})",
         ) from exc
+    if 200 <= resp.status_code < 300:
+        await _audit_admin_read(
+            request, _auth, tenant_id,
+            event_type="admin.knowledge.document.content.viewed",
+            resource_type="document",
+            resource_id=document_id,
+            payload={"via": "admin_knowledge_preview", "bytes": len(resp.content)},
+        )
     content_type = resp.headers.get("content-type", "application/octet-stream")
     content_disp = resp.headers.get("content-disposition", "")
     return Response(
@@ -684,11 +756,23 @@ async def admin_list_runs(
     tenant_id: str | None = None,
     _auth: tuple = Depends(require_admin_module_bff("sandbox.read")),
 ) -> dict:
-    """List runs via the scheduler's tenant-wide ``GET /runs`` (params透传)."""
+    """List runs via the scheduler's tenant-wide ``GET /runs`` (params透传).
+
+    Each run carries its task text and result summary, so the listing is
+    audited (``admin.ops.runs.list.viewed``, counts only).
+    """
     url = f"{request.app.state.settings.agent_scheduler_url}/runs"
-    return await _proxy_get(
+    body = await _proxy_get(
         request, url, _auth, tenant_id, forward_params=True, admin_actor=False,
     )
+    await _audit_admin_read(
+        request, _auth, tenant_id,
+        event_type="admin.ops.runs.list.viewed",
+        resource_type="run",
+        resource_id=None,
+        payload={"via": "admin_ops", "run_count": _item_count(body)},
+    )
+    return body
 
 
 @router.post("/admin/ops/runs/{run_id}/cancel")

@@ -812,3 +812,93 @@ def test_super_admin_cross_tenant_allowed_no_admin_actor(
     ]
     assert doc_reqs and doc_reqs[0].get("X-Tenant-Id") == target
     assert "X-Actor" not in doc_reqs[0]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Audit of admin reads of members' content (knowledge docs incl. memories, runs)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _audit_events(fake: FakePlatform) -> list[dict[str, Any]]:
+    return [b for (m, u, b) in fake.body_calls if m == "POST" and u.endswith("/events")]
+
+
+def test_admin_document_list_is_audited(client, authed_cookie, fake_allowed) -> None:
+    fake_allowed.routes[("GET", "/documents")] = (
+        200, {"items": [{"id": "doc_1"}, {"id": "doc_2"}], "total": 2},
+    )
+    resp = client.get("/api/bff/v1/admin/knowledge/documents", cookies=authed_cookie)
+    assert resp.status_code == 200
+    events = _audit_events(fake_allowed)
+    assert len(events) == 1
+    assert events[0]["event_type"] == "admin.knowledge.document.list.viewed"
+    assert events[0]["tenant_id"] == CALLER_TENANT
+    assert events[0]["payload"] == {
+        "via": "admin_knowledge", "includes_memory": True, "document_count": 2,
+    }
+
+
+def test_admin_document_get_is_audited_with_its_subject(
+    client, authed_cookie, fake_allowed,
+) -> None:
+    fake_allowed.routes[("GET", "/documents/")] = (
+        200, {"id": "doc_1", "title": "[memory] my prompt", "origin_user_id": "usr_SUBJECT"},
+    )
+    resp = client.get("/api/bff/v1/admin/knowledge/documents/doc_1", cookies=authed_cookie)
+    assert resp.status_code == 200
+    events = _audit_events(fake_allowed)
+    assert len(events) == 1
+    assert events[0]["event_type"] == "admin.knowledge.document.viewed"
+    assert events[0]["resource_type"] == "document"
+    assert events[0]["resource_id"] == "doc_1"
+    assert events[0]["payload"] == {"via": "admin_knowledge", "subject_user_id": "usr_SUBJECT"}
+    assert "my prompt" not in str(events[0])
+
+
+def test_admin_document_preview_is_audited_in_the_target_tenant(
+    client, authed_cookie, fake_allowed,
+) -> None:
+    target = "tnt_OTHER0000000000000000000001"
+    resp = client.get(
+        f"/api/bff/v1/admin/knowledge/documents/doc_1/content?tenant_id={target}",
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    events = _audit_events(fake_allowed)
+    assert len(events) == 1
+    event = events[0]
+    assert event["event_type"] == "admin.knowledge.document.content.viewed"
+    assert event["tenant_id"] == target
+    assert event["payload"] == {
+        "via": "admin_knowledge_preview",
+        "bytes": len(resp.content),
+        "actor_tenant_id": CALLER_TENANT,
+    }
+    audit_headers = [h for (m, u, h) in fake_allowed.requests if u.endswith("/events")]
+    assert audit_headers[0]["X-Tenant-Id"] == target
+
+
+def test_failed_admin_document_preview_is_not_audited(
+    client, authed_cookie, monkeypatch,
+) -> None:
+    fake = FakePlatform(authz_allowed=True)
+    fake.routes[("GET", "/documents/")] = (404, {"detail": "not found"})
+    _install(monkeypatch, fake)
+    resp = client.get(
+        "/api/bff/v1/admin/knowledge/documents/doc_1/content", cookies=authed_cookie,
+    )
+    assert resp.status_code == 404
+    assert not _audit_events(fake)
+
+
+def test_admin_ops_run_list_is_audited(client, authed_cookie, fake_allowed) -> None:
+    fake_allowed.routes[("GET", "/runs")] = (
+        200, {"items": [{"id": "run_1", "task_description": "a private prompt"}]},
+    )
+    resp = client.get("/api/bff/v1/admin/ops/runs", cookies=authed_cookie)
+    assert resp.status_code == 200
+    events = _audit_events(fake_allowed)
+    assert len(events) == 1
+    assert events[0]["event_type"] == "admin.ops.runs.list.viewed"
+    assert events[0]["resource_type"] == "run"
+    assert events[0]["payload"] == {"via": "admin_ops", "run_count": 1}
+    assert "private prompt" not in str(events[0])

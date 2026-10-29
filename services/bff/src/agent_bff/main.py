@@ -97,6 +97,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from agent_bff.api.v1.conversations import router as chat_router
     app.include_router(chat_router, prefix=settings.api_prefix)
 
+    # Task board — agentic tasks created from the UI, run in the background.
+    from agent_bff.api.v1.tasks import router as tasks_router
+    app.include_router(tasks_router, prefix=settings.api_prefix)
+
     # Canvas 局部修订 — 直连 llm-gateway 做一次 chat completion，不建 run/不落消息。
     from agent_bff.api.v1.canvas import router as canvas_router
     app.include_router(canvas_router, prefix=settings.api_prefix)
@@ -182,6 +186,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.include_router(admin_compliance_router, prefix=settings.api_prefix)
 
+    from agent_bff.api.v1.admin_breaches import router as admin_breaches_router
+    app.include_router(admin_breaches_router, prefix=settings.api_prefix)
+
     from agent_bff.api.v1.admin_security_ops import (
         router as admin_security_ops_router,
     )
@@ -218,6 +225,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from agent_bff.api.v1.api_keys import router as api_keys_router
     app.include_router(api_keys_router, prefix=settings.api_prefix)
+
+    # GDPR self-service — export / erase my data, memory setting + memories,
+    # privacy notice and its acknowledgements.
+    from agent_bff.api.v1.privacy import router as privacy_router
+    app.include_router(privacy_router, prefix=settings.api_prefix)
+
+    # Tenant-admin data-subject requests — export / erase one member's data.
+    from agent_bff.api.v1.admin_privacy import router as admin_privacy_router
+    app.include_router(admin_privacy_router, prefix=settings.api_prefix)
 
     from agent_bff.api.v1.schedules import router as schedules_router
     app.include_router(schedules_router, prefix=settings.api_prefix)

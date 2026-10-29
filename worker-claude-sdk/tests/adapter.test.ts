@@ -8,7 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { GatewayAdapter } from "../src/adapter.js";
+import { GatewayAdapter, gatewayErrorReason } from "../src/adapter.js";
 
 interface CapturedRequest {
   url: string;
@@ -710,6 +710,37 @@ describe("thinking — response side", () => {
     expect(stops).toContain(1);
     expect(events[events.length - 1].type).toBe("message_stop");
   });
+
+  // The CLI emits a block's consolidated message only at its content_block_stop,
+  // so a block left open until the end of the response delays it. Each block is
+  // closed as soon as the next one opens.
+  it("streaming: closes the thinking block before the text opens, and the text before a tool", async () => {
+    nextStreamFrames = [
+      'data: {"choices":[{"index":0,"delta":{"reasoning_content":"plan"}}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{"content":"Checking."}}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"Bash","arguments":"{}"}}]}}]}\n\n',
+      'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+      "data: [DONE]\n\n",
+    ];
+
+    const resp = await postMessages({
+      model: "claude",
+      stream: true,
+      messages: [{ role: "user", content: "q" }],
+    });
+    const events = await readSse(resp);
+    const pos = (type: string, index: number) =>
+      events.findIndex((e) => e.type === type && e.data.index === index);
+
+    // index 0 = thinking, 1 = text, 2 = tool_use
+    expect(pos("content_block_stop", 0)).toBeGreaterThan(-1);
+    expect(pos("content_block_stop", 0)).toBeLessThan(pos("content_block_start", 1));
+    expect(pos("content_block_stop", 1)).toBeLessThan(pos("content_block_start", 2));
+    // Each block is closed exactly once.
+    for (const i of [0, 1, 2]) {
+      expect(events.filter((e) => e.type === "content_block_stop" && e.data.index === i)).toHaveLength(1);
+    }
+  });
 });
 
 describe("tool strict passthrough", () => {
@@ -1057,5 +1088,75 @@ describe("misc", () => {
       body: JSON.stringify({ model: "claude", messages: [] }),
     });
     expect(resp.status).toBe(401);
+  });
+});
+
+describe("gateway error redaction", () => {
+  // Upstream errors routinely echo the request; none of it may reach a log
+  // line or the SDK-facing error, which becomes the run's error message.
+  const PERSONAL = "Jane Doe, born 1980-01-01, jane@example.com";
+
+  /** Make the gateway answer every call with `body` / `status`. */
+  function gatewayAnswers(status: number, body: string): void {
+    const previous = global.fetch;
+    global.fetch = vi.fn(async (url: string | URL | Request, init?: RequestInit) =>
+      String(url).startsWith("http://gateway.test")
+        ? new Response(body, { status, headers: { "content-type": "application/json" } })
+        : previous(url, init),
+    ) as unknown as typeof fetch;
+  }
+
+  function captureLogs(): () => string {
+    const spies = (["error", "warn", "log", "info"] as const).map((level) =>
+      vi.spyOn(console, level).mockImplementation(() => {}),
+    );
+    return () => spies.flatMap((spy) => spy.mock.calls.flat().map(String)).join("\n");
+  }
+
+  it.each([false, true])("keeps an echoing error body out of logs and errors (stream=%s)", async (stream) => {
+    const logs = captureLogs();
+    gatewayAnswers(
+      400,
+      JSON.stringify({
+        error: { message: `invalid request: ${PERSONAL}`, type: "invalid_request_error", code: null },
+      }),
+    );
+
+    const resp = await postMessages({
+      model: "claude",
+      stream,
+      messages: [{ role: "user", content: PERSONAL }],
+    });
+    const text = await resp.text();
+
+    expect(text).toContain("gateway 400: invalid_request_error");
+    expect(text).not.toContain("Jane Doe");
+    expect(logs()).toContain("status=400 reason=invalid_request_error");
+    expect(logs()).not.toContain("Jane Doe");
+  });
+
+  it("logs only the size of a non-JSON success body", async () => {
+    const logs = captureLogs();
+    gatewayAnswers(200, `<html>${PERSONAL}</html>`);
+
+    const resp = await postMessages({ model: "claude", messages: [{ role: "user", content: "hi" }] });
+
+    expect(resp.status).toBe(502);
+    expect(await resp.text()).not.toContain("Jane Doe");
+    expect(logs()).toMatch(/non-JSON status=200 bytes=\d+/);
+    expect(logs()).not.toContain("Jane Doe");
+  });
+
+  it("derives the reason from plain tokens only, else from the status", () => {
+    const body = (error: unknown): string => JSON.stringify({ error });
+    expect(gatewayErrorReason(400, body({ code: "context_length_exceeded", type: "x" }))).toBe(
+      "context_length_exceeded",
+    );
+    expect(gatewayErrorReason(429, body({ code: 429, type: "rate_limit_error" }))).toBe("rate_limit_error");
+    expect(gatewayErrorReason(503, body("boom"))).toBe("boom");
+    expect(gatewayErrorReason(400, body({ code: PERSONAL, type: `bad: ${PERSONAL}` }))).toBe("bad_request");
+    expect(gatewayErrorReason(502, `<html>${PERSONAL}</html>`)).toBe("bad_gateway");
+    expect(gatewayErrorReason(418, "")).toBe("http_418");
+    expect(gatewayErrorReason(500, body("x".repeat(65)))).toBe("upstream_error");
   });
 });

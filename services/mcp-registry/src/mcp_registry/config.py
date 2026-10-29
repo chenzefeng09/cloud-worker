@@ -40,10 +40,12 @@ class Settings(BaseSettings):
     authz_url: str = "http://authz:8002/api/authz/v1"
 
     # Foundation crypto - envelope encryption for auth secrets
-    # (token / api_key / client_secret).  Mirrors llm-gateway's crypto wiring;
-    # the crypto service runs on the shared foundation network as ``crypto:8004``.
-    # When unreachable, the secret helpers fall back to plaintext (graceful
-    # degradation) so registry writes are never blocked by crypto unavailability -
-    # see ``services/secret_crypto.py``.
+    # (token / api_key / client_secret) and every ``env`` / ``headers`` value.
+    # Mirrors llm-gateway's crypto wiring; the crypto service runs on the shared
+    # foundation network as ``crypto:8004``.  See ``services/secret_crypto.py``.
     crypto_url: str = "http://crypto:8004/api/crypto/v1"
     crypto_timeout: float = 5.0
+    # Local development only: store a secret in plaintext when the crypto
+    # service can't encrypt it.  Off by default, so a write carrying a secret
+    # fails with 503 instead of putting the secret in the database in clear.
+    allow_plaintext_secrets: bool = False

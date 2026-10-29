@@ -67,6 +67,7 @@ from agent_session_orchestrator.services.clearance import (
     CLEARANCE_RANK,
     level_allows,
 )
+from agent_session_orchestrator.services.privacy_service import delete_unreferenced_blobs
 from agent_session_orchestrator.services.workspace_service import WorkspaceService
 
 router = APIRouter(tags=["Workspaces"])
@@ -379,20 +380,16 @@ async def delete_workspace_file(
 ) -> Response:
     owner = _owner_filter(request, user_id)
     svc = WorkspaceService(db, tenant_id=tenant_id)
-    wsf = await svc.delete_file(workspace_id, file_id, user_id=owner)
+    blob_keys = await svc.delete_file(workspace_id, file_id, user_id=owner)
 
     # Best-effort blob delete: the row delete is authoritative; an orphaned
     # blob only costs storage and never blocks the API.  Deliberately does NOT
     # use _get_blob_store (503) — the delete must succeed without a blob store.
-    blob_store = getattr(request.app.state, "blob_store", None)
-    if blob_store is not None and wsf.blob_key:
-        try:
-            await asyncio.to_thread(blob_store.delete, wsf.blob_key)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "workspace file blob delete failed (best-effort)",
-                extra={"key": wsf.blob_key, "err": str(exc)},
-            )
+    # Bytes another row still uses (a restore shares keys) are kept.
+    await delete_unreferenced_blobs(
+        db, tenant_id=tenant_id, keys=blob_keys,
+        blob_store=getattr(request.app.state, "blob_store", None),
+    )
     return Response(status_code=204)
 
 
@@ -543,12 +540,11 @@ async def process_writeback(
     for r in results:
         all_evicted.extend(r.pop("evicted_blobs", []))
 
-    blob_store = getattr(request.app.state, "blob_store", None)
-    if blob_store and all_evicted:
-        for key in all_evicted:
-            try:
-                await asyncio.to_thread(blob_store.delete, key)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("evicted blob delete failed", extra={"key": key, "err": str(exc)})
+    # An evicted version's bytes can still back the current file (a restore
+    # shares keys), so only unreferenced ones are deleted.  Best-effort.
+    await delete_unreferenced_blobs(
+        db, tenant_id=tenant_id, keys=all_evicted,
+        blob_store=getattr(request.app.state, "blob_store", None),
+    )
 
     return {"items": results}

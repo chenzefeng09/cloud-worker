@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+
+from agent_scheduler.services.docker_runtime import DockerRuntime
 
 # Mirrors conftest._TENANT / _USER (the headers the gateway injects).
 _TENANT = "tnt_01J5TEST00000000000000TNT1"
@@ -64,6 +66,21 @@ def test_stop_sandbox_rejects_cross_tenant(
         "/api/scheduler/v1/sandboxes/c_alien/stop", headers=auth_headers,
     )
     assert resp.status_code == 404
+
+
+def test_stop_sandbox_keeps_the_run_workspace(
+    app_client: TestClient, mock_docker_client: MagicMock, auth_headers,
+) -> None:
+    """An admin stop frees the container; a paused run's files stay resumable."""
+    container = MagicMock()
+    container.labels = {"agent-platform.tenant-id": _TENANT}
+    mock_docker_client.containers.get.return_value = container
+    with patch.object(DockerRuntime, "cancel_run") as cancel:
+        resp = app_client.post(
+            "/api/scheduler/v1/sandboxes/c_own/stop", headers=auth_headers,
+        )
+    assert resp.status_code == 204
+    cancel.assert_called_once_with("c_own", remove_workspace=False)
 
 
 def test_create_run_mints_token_then_spawns(

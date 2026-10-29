@@ -26,10 +26,14 @@ References
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
+import shutil
+import time
+from collections.abc import Collection
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -101,6 +105,19 @@ def _sandbox_records(payload: Any) -> list[dict[str, Any]]:
     if not isinstance(records, list):
         return []
     return [record for record in records if isinstance(record, dict)]
+
+
+def _vm_started_at(vm: dict[str, Any]) -> datetime | None:
+    """A VM record's ``startedAt`` as an aware datetime; ``None`` if unusable."""
+    raw = vm.get("startedAt") or vm.get("started_at")
+    if not raw:
+        return None
+    try:
+        # ISO8601 may end in ``Z``; fromisoformat needs +00:00.
+        started = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return started if started.tzinfo is not None else started.replace(tzinfo=UTC)
 
 
 # Map a worker-facing gateway's *internal* container port to the host-published
@@ -214,6 +231,227 @@ def _check_ids(**named: str) -> None:
             raise SandboxSpawnError(
                 f"{name}={value!r} fails identifier whitelist; refusing to spawn",
             )
+
+
+# --------------------------------------------------------------------------- #
+# Per-run host dir lifecycle (shared with docker_runtime)
+# --------------------------------------------------------------------------- #
+#
+# Both runtimes keep ``{workspace_base}/{tenant}/{session}/{run}`` on the host
+# (docker bind mount / cube host-mount at ``/workspace``).  It holds the task
+# payload (prompt, conversation history, memory snippets), the user's
+# downloaded attachments, everything the agent wrote and a credentials file:
+# personal data that must not outlive the run.
+#
+# * The first terminal, non-paused status poll (result read, outputs uploaded)
+#   drops a ``.{run_id}.collected`` marker NEXT TO the run dir: outside the
+#   mount, so sandbox code can neither forge nor delete it, and the output
+#   scan never uploads it.
+# * The reaper sweep removes a collected dir once its marker is older than
+#   ``workspace_collected_grace_seconds`` (the grace lets racing reconcilers
+#   re-read the same result) and any dir idle for longer than
+#   ``workspace_max_age_seconds``, which sits above the worker's 7-day HITL
+#   pause TTL so a paused run keeps its files for as long as it can resume.
+# * Cancel removes the dir straight away.
+#
+# These live here, not in docker_runtime, because this module must stay
+# importable without the docker SDK; docker_runtime imports them.
+WORKSPACE_COLLECTED_GRACE_SECONDS = 600
+WORKSPACE_MAX_AGE_SECONDS = 8 * 24 * 3600
+_COLLECTED_SUFFIX = ".collected"
+# Never prune a tenant/session dir younger than this: a concurrent spawn may
+# have just created it and be about to create the run dir inside.
+_EMPTY_DIR_MIN_AGE_SECONDS = 60
+
+
+def workspace_gc_settings(settings: Any) -> tuple[float, float]:
+    """``(collected_grace_seconds, max_age_seconds)`` from settings or defaults."""
+    grace = getattr(settings, "workspace_collected_grace_seconds", None)
+    max_age = getattr(settings, "workspace_max_age_seconds", None)
+    return (
+        float(WORKSPACE_COLLECTED_GRACE_SECONDS if grace is None else grace),
+        float(WORKSPACE_MAX_AGE_SECONDS if max_age is None else max_age),
+    )
+
+
+def run_workspace_dir(
+    base: str | os.PathLike[str], tenant_id: Any, session_id: Any, run_id: Any,
+) -> Path | None:
+    """``{base}/{tenant}/{session}/{run}``, or ``None`` unless all are safe ids.
+
+    Container labels / VM metadata are not trusted to be well-formed (anyone
+    with daemon access can label a container), so nothing that fails
+    ``_SAFE_ID`` is ever turned into a path we might delete.
+    """
+    ids = (tenant_id, session_id, run_id)
+    if not all(isinstance(v, str) and _SAFE_ID.match(v) for v in ids):
+        return None
+    return Path(base).joinpath(*ids)
+
+
+def _collected_marker(run_dir: Path) -> Path:
+    return run_dir.parent / f".{run_dir.name}{_COLLECTED_SUFFIX}"
+
+
+def mark_run_collected(run_dir: Path | None) -> None:
+    """Record, once, that this run's result was collected and uploaded."""
+    if run_dir is None or not run_dir.is_dir():
+        return
+    try:
+        fd = os.open(
+            _collected_marker(run_dir), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+        )
+    except FileExistsError:
+        return
+    except OSError as exc:
+        logger.warning(
+            "could not mark run workspace collected",
+            extra={"run_id": run_dir.name, "err": str(exc)},
+        )
+        return
+    os.close(fd)
+
+
+def run_collected_at(run_dir: Path | None) -> float | None:
+    """When this run's result was collected (marker mtime), or ``None``."""
+    return None if run_dir is None else _mtime(_collected_marker(run_dir))
+
+
+def clear_run_collected(run_dir: Path) -> None:
+    """Forget an earlier collection: a spawn is (re)using this run dir."""
+    with contextlib.suppress(OSError):
+        _collected_marker(run_dir).unlink(missing_ok=True)
+
+
+def remove_run_workspace(base: str | os.PathLike[str], run_dir: Path | None) -> bool:
+    """Delete a per-run host dir and its marker; ``True`` once it is gone.
+
+    Never raises.  Links are removed, never followed: ``rmtree`` does not
+    descend into symlinks the agent created, and a run dir whose parent
+    resolves outside ``base`` is refused outright.
+    """
+    if run_dir is None:
+        return False
+    try:
+        if not run_dir.parent.resolve().is_relative_to(Path(base).resolve()):
+            logger.warning(
+                "refusing to remove a run workspace outside workspace_base",
+                extra={"run_id": run_dir.name},
+            )
+            return False
+        if run_dir.is_symlink():
+            run_dir.unlink()
+        elif run_dir.is_dir():
+            shutil.rmtree(run_dir)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning(
+            "run workspace removal failed",
+            extra={"run_id": run_dir.name, "err": str(exc)},
+        )
+        return False
+    with contextlib.suppress(OSError):
+        _collected_marker(run_dir).unlink(missing_ok=True)
+    return True
+
+
+def _scan(directory: Path) -> list[os.DirEntry[str]]:
+    try:
+        with os.scandir(directory) as it:
+            return sorted(it, key=lambda e: e.name)
+    except OSError:
+        return []
+
+
+def _is_id_dir(entry: os.DirEntry[str]) -> bool:
+    try:
+        return bool(_SAFE_ID.match(entry.name)) and entry.is_dir(follow_symlinks=False)
+    except OSError:
+        return False
+
+
+def _mtime(path: Path) -> float | None:
+    try:
+        return path.lstat().st_mtime
+    except OSError:
+        return None
+
+
+def _last_activity(run_dir: Path, now: float) -> float:
+    """Newest mtime of the run dir and its direct children (``now`` if unknown)."""
+    newest = _mtime(run_dir)
+    if newest is None:
+        return now
+    for entry in _scan(run_dir):
+        try:
+            newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
+        except OSError:
+            return now
+    return newest
+
+
+def _rmdir_if_idle(directory: Path, now: float) -> None:
+    mtime = _mtime(directory)
+    if mtime is not None and now - mtime >= _EMPTY_DIR_MIN_AGE_SECONDS:
+        with contextlib.suppress(OSError):  # not empty, or already gone
+            directory.rmdir()
+
+
+def sweep_run_workspaces(
+    base: str | os.PathLike[str],
+    *,
+    collected_grace_seconds: float,
+    max_age_seconds: float,
+    live_run_ids: Collection[str] = (),
+    now: float | None = None,
+) -> int:
+    """Remove collected and long-idle per-run host dirs; return how many.
+
+    A run dir goes when its ``.collected`` marker is at least
+    ``collected_grace_seconds`` old (a negative value disables this) or when
+    nothing in it changed for ``max_age_seconds`` (``<= 0`` disables this).
+    Run ids in ``live_run_ids`` are always kept.  Orphaned markers and idle
+    empty tenant/session dirs are tidied up too.  Never raises.
+    """
+    root = Path(base)
+    if not root.is_dir():
+        return 0
+    now = time.time() if now is None else now
+    removed = 0
+    for tenant_entry in filter(_is_id_dir, _scan(root)):
+        tenant_dir = Path(tenant_entry.path)
+        for session_entry in filter(_is_id_dir, _scan(tenant_dir)):
+            session_dir = Path(session_entry.path)
+            entries = _scan(session_dir)
+            run_ids = {e.name for e in entries if _is_id_dir(e)}
+            for run_id in sorted(run_ids):
+                if run_id in live_run_ids:
+                    continue
+                run_dir = session_dir / run_id
+                collected_at = _mtime(_collected_marker(run_dir))
+                due = (
+                    collected_at is not None
+                    and collected_grace_seconds >= 0
+                    and now - collected_at >= collected_grace_seconds
+                ) or (
+                    max_age_seconds > 0
+                    and now - _last_activity(run_dir, now) >= max_age_seconds
+                )
+                if due and remove_run_workspace(root, run_dir):
+                    removed += 1
+            for entry in entries:
+                name = entry.name
+                if (
+                    name.startswith(".")
+                    and name.endswith(_COLLECTED_SUFFIX)
+                    and name[1 : -len(_COLLECTED_SUFFIX)] not in run_ids
+                ):
+                    with contextlib.suppress(OSError):
+                        os.unlink(entry.path)
+            _rmdir_if_idle(session_dir, now)
+        _rmdir_if_idle(tenant_dir, now)
+    return removed
 
 
 class CubeSandboxRuntime:
@@ -522,6 +760,7 @@ class CubeSandboxRuntime:
         secrets_host_path = secrets_host_dir / ".secrets.json"
         try:
             secrets_host_dir.mkdir(parents=True, exist_ok=True)
+            clear_run_collected(secrets_host_dir)
             secrets_host_path.write_text(
                 json.dumps(secret_file_payload, ensure_ascii=False),
                 encoding="utf-8",
@@ -982,6 +1221,13 @@ class CubeSandboxRuntime:
                 workspace_id = getattr(self, "_last_workspace_id", "") or ""
                 if workspace_id:
                     result["writeback_files"] = output["workspace_files"]
+                # Collected: the reaper removes the host dir after the grace.
+                # A paused run keeps it — the resumed sandbox reuses it.
+                ids = self._run_ids(data)
+                if ids is not None and str(worker_status or "").lower() != "paused":
+                    mark_run_collected(
+                        run_workspace_dir(self._settings.workspace_base, *ids),
+                    )
 
         return result
 
@@ -998,8 +1244,14 @@ class CubeSandboxRuntime:
         return str(tenant)
 
     # ---------------------------------------------------------------- cancel
-    def cancel_run(self, container_id: str) -> None:
+    def cancel_run(self, container_id: str, *, remove_workspace: bool = True) -> None:
         client = self._require_client()
+        # Resolve the VM's run ids BEFORE the delete: once the controller has
+        # forgotten the VM, the sandbox id no longer maps to its host dir.
+        try:
+            sandbox = self._resolve_sandbox(container_id)
+        except httpx.HTTPError:
+            sandbox = None
         try:
             resp = client.delete(f"/sandboxes/{container_id}")
         except httpx.HTTPError as exc:
@@ -1013,6 +1265,67 @@ class CubeSandboxRuntime:
                 "cube cancel returned non-404 error; treating as gone",
                 extra={"sandbox_id": container_id, "status": resp.status_code},
             )
+        if sandbox is not None and remove_workspace:
+            self._remove_cancelled_workspace(sandbox)
+
+    def _remove_cancelled_workspace(self, sandbox: dict[str, Any]) -> None:
+        """Delete a cancelled run's host dir unless a newer VM now owns it.
+
+        A resumed HITL run gets a fresh VM with the same run id and the same
+        dir; stopping the stale VM must not pull the workspace out from under
+        the live one.  If ownership cannot be established the dir is kept and
+        left to the reaper's max-age sweep.
+        """
+        ids = self._run_ids(sandbox)
+        run_dir = (
+            run_workspace_dir(self._settings.workspace_base, *ids) if ids else None
+        )
+        if run_dir is None:
+            return
+        cancelled_id = str(sandbox.get("sandboxID") or sandbox.get("sandbox_id") or "")
+        cancelled_started = _vm_started_at(sandbox)
+        try:
+            resp = self._require_client().get("/sandboxes")
+            records = _sandbox_records(resp.json()) if resp.status_code == 200 else None
+        except (httpx.HTTPError, ValueError):
+            records = None
+        if records is None or cancelled_started is None:
+            logger.info(
+                "cancel: cannot tell whether another sandbox owns the run "
+                "workspace; leaving it to the reaper",
+                extra={"run_id": run_dir.name},
+            )
+            return
+        for vm in records:
+            if (vm.get("metadata") or {}).get("agent-platform.run-id") != run_dir.name:
+                continue
+            sid = str(vm.get("sandboxID") or vm.get("sandbox_id") or "")
+            if not sid or sid == cancelled_id:
+                continue
+            started = _vm_started_at(vm)
+            if started is None or started >= cancelled_started:
+                logger.info(
+                    "cancel: a newer sandbox owns the run workspace; keeping it",
+                    extra={"run_id": run_dir.name, "sandbox_id": sid},
+                )
+                return
+        remove_run_workspace(self._settings.workspace_base, run_dir)
+
+    def _sweep_workspaces(self) -> None:
+        # A finished worker never writes again even while its VM idles on until
+        # the spawn timeout, so VM liveness does not gate this sweep.
+        try:
+            grace, max_age = workspace_gc_settings(self._settings)
+            removed = sweep_run_workspaces(
+                self._settings.workspace_base,
+                collected_grace_seconds=grace,
+                max_age_seconds=max_age,
+            )
+        except Exception:  # noqa: BLE001 -- the reaper must keep going
+            logger.exception("run workspace sweep failed")
+            return
+        if removed:
+            logger.info("removed %d run workspace dir(s)", removed)
 
     # ------------------------------------------------------------------ reap
     def reap_expired(self, *, max_age_seconds: int) -> int:
@@ -1035,8 +1348,11 @@ class CubeSandboxRuntime:
           abort the whole sweep;
         * 204 / 404 / 409 on the DELETE are all treated as success (already gone).
 
-        Returns the number of sandboxes deleted.
+        Returns the number of sandboxes deleted.  Each sweep also removes
+        collected and long-idle per-run host dirs (``sweep_run_workspaces``),
+        first, so a controller outage does not stall that cleanup.
         """
+        self._sweep_workspaces()
         client = self._require_client()
         # NO params: list ALL sandboxes across tenants (the leak is host-wide).
         resp = client.get("/sandboxes")
@@ -1053,18 +1369,9 @@ class CubeSandboxRuntime:
             sandbox_id = str(vm.get("sandboxID") or vm.get("sandbox_id") or "")
             if not sandbox_id:
                 continue
-            started_raw = vm.get("startedAt") or vm.get("started_at")
-            if not started_raw:
-                continue  # cannot establish age -> fail safe, skip
-            try:
-                # ISO8601 may end in ``Z``; fromisoformat needs +00:00.
-                started = datetime.fromisoformat(
-                    str(started_raw).replace("Z", "+00:00")
-                )
-            except ValueError:
-                continue  # unparseable -> fail safe, skip
-            if started.tzinfo is None:
-                started = started.replace(tzinfo=UTC)
+            started = _vm_started_at(vm)
+            if started is None:
+                continue  # missing/unparseable age -> fail safe, skip
             age = (now - started).total_seconds()
             if age <= max_age_seconds:
                 continue

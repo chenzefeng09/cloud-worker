@@ -37,6 +37,7 @@ from knowledge_ingest.schemas.document import (
     DocumentPatch,
     DocumentStatus,
     IngestResult,
+    SearchRequest,
     SearchResponse,
     SearchScope,
 )
@@ -364,12 +365,49 @@ async def search(
     # normalised to L1 when the header is absent (fail-closed retrieval), so an
     # unauthenticated-for-clearance caller only sees L1 knowledge.
     svc = _make_service(request, db, blob, embeddings, tenant_id, user_id)
+    return await _run_search(
+        svc,
+        SearchRequest(
+            q=q,
+            k=k,
+            scope=scope,
+            workspace_id=workspace_id,
+            exclude_origin_session_id=exclude_origin_session_id,
+        ),
+        clearance=clearance,
+    )
+
+
+@router.post("/search", response_model=SearchResponse,
+             dependencies=[Depends(require_permission("document.search", "document"))])
+async def search_post(
+    request: Request,
+    body: SearchRequest = Body(...),
+    db: AsyncSession = TDbSession,
+    blob: BlobStore = TBlobStore,
+    embeddings: EmbeddingClient = TEmbeddings,
+    tenant_id: str = TTenantId,
+    user_id: str = TUserId,
+    clearance: str | None = TClearance,
+) -> SearchResponse:
+    """``GET /search`` with the query in the body instead of the URL.
+
+    Same fields, defaults, gates and response.  Prefer this form: a prompt in
+    ``?q=`` ends up in access logs and traces.
+    """
+    svc = _make_service(request, db, blob, embeddings, tenant_id, user_id)
+    return await _run_search(svc, body, clearance=clearance)
+
+
+async def _run_search(
+    svc: IngestService, params: SearchRequest, *, clearance: str | None,
+) -> SearchResponse:
     hits = await svc.search(
-        q,
-        k=k,
-        scope=scope.value,
+        params.q,
+        k=params.k,
+        scope=params.scope.value,
         clearance=clearance or "L1",
-        exclude_origin_session_id=exclude_origin_session_id,
-        workspace_id=workspace_id,
+        exclude_origin_session_id=params.exclude_origin_session_id,
+        workspace_id=params.workspace_id,
     )
     return SearchResponse(hits=hits)

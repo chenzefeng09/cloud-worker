@@ -40,15 +40,19 @@ def _make_blob_store(settings: Settings):  # type: ignore[no-untyped-def]
         return None
 
 
-async def _retention_sweep_loop(settings: Settings) -> None:
-    """Periodically soft-delete sessions past the retention window.
+async def _retention_sweep_loop(settings: Settings, blob_store: object | None = None) -> None:
+    """Periodically soft-delete inactive sessions, then hard-purge the trash.
 
     Sleeps a short startup delay first (avoid boot-time stampede), then loops
     forever on ``session_retention_sweep_interval_seconds`` (default 24h).
-    Any error is logged and the loop keeps running so a single bad sweep does
-    not silently kill retention enforcement.
+    Each tick runs the inactivity sweep (``session_retention_days``) and then
+    physically purges data soft-deleted more than ``trash_grace_days`` ago
+    (rows + S3 blobs, see ``privacy_service.purge_trash``).  Any error is
+    logged and the loop keeps running so a single bad sweep does not silently
+    kill retention enforcement.
     """
     # Imported lazily to keep app import light and avoid import cycles.
+    from agent_session_orchestrator.services.privacy_service import purge_trash
     from agent_session_orchestrator.services.session_service import (
         purge_expired_sessions,
     )
@@ -59,6 +63,12 @@ async def _retention_sweep_loop(settings: Settings) -> None:
             await purge_expired_sessions(settings, settings.session_retention_days)
         except Exception:  # pragma: no cover — keep the loop alive
             logger.exception("retention sweep tick failed")
+        try:
+            await purge_trash(
+                settings, grace_days=settings.trash_grace_days, blob_store=blob_store,
+            )
+        except Exception:  # pragma: no cover — keep the loop alive
+            logger.exception("trash purge tick failed")
         await asyncio.sleep(settings.session_retention_sweep_interval_seconds)
 
 
@@ -71,7 +81,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     from agent_session_orchestrator.services.reconcile_sweeper import run_sweeper
 
     sweep_task = asyncio.create_task(
-        _retention_sweep_loop(settings), name="session-retention-sweep"
+        _retention_sweep_loop(settings, app.state.blob_store), name="session-retention-sweep"
     )
     reconcile_task = asyncio.create_task(
         run_sweeper(app), name="run-reconcile-sweep"
@@ -81,7 +91,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         run_version_cleanup_loop,
     )
     version_cleanup_task = asyncio.create_task(
-        run_version_cleanup_loop(settings), name="workspace-version-cleanup"
+        run_version_cleanup_loop(settings, blob_store=app.state.blob_store),
+        name="workspace-version-cleanup",
     )
 
     try:
@@ -113,6 +124,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.settings = settings
     app.state.blob_store = _make_blob_store(settings)
 
+    # Paths without ``app.state`` (reconcile writeback, rewind, session delete)
+    # find the settings + blob store through the privacy-service registry.
+    from agent_session_orchestrator.services import privacy_service
+    privacy_service.configure(settings=settings, blob_store=app.state.blob_store)
+
     from agent_session_orchestrator.services.quota_guard import QuotaGuard
     app.state.quota_guard = QuotaGuard(billing_url=settings.foundation_billing_url)
 
@@ -135,6 +151,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from agent_session_orchestrator.api.v1.runs import router as runs_router
     app.include_router(runs_router, prefix=settings.api_prefix)
+
+    from agent_session_orchestrator.api.v1.tasks import router as tasks_router
+    app.include_router(tasks_router, prefix=settings.api_prefix)
+
+    from agent_session_orchestrator.api.v1.privacy import router as privacy_router
+    app.include_router(privacy_router, prefix=settings.api_prefix)
 
     from agent_session_orchestrator.api.v1.attachments import router as attachments_router
     app.include_router(attachments_router, prefix=settings.api_prefix)

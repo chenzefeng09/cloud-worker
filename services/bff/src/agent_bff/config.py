@@ -2,7 +2,87 @@
 
 from __future__ import annotations
 
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class PrivacyNoticePurpose(BaseModel):
+    """One processing purpose and its GDPR Art. 6 legal basis."""
+
+    purpose: str
+    legal_basis: str
+
+
+class PrivacyNoticeProcessor(BaseModel):
+    """One processor (or sub-processor) that receives personal data."""
+
+    name: str
+    role: str
+    country: str
+    transfer_mechanism: str
+
+
+# Defaults describe what this platform does out of the box.  Operators replace
+# them (JSON env vars) with their real purposes and the processors they have
+# configured — the defaults deliberately name no vendor.
+_DEFAULT_PRIVACY_PURPOSES: tuple[PrivacyNoticePurpose, ...] = (
+    PrivacyNoticePurpose(
+        purpose=(
+            "Provide the agent workspace: run your conversations and tasks and "
+            "store your files, workspaces and generated artifacts"
+        ),
+        legal_basis="Performance of a contract (GDPR Art. 6(1)(b))",
+    ),
+    PrivacyNoticePurpose(
+        purpose=(
+            "Session memory: keep short summaries of past conversations to "
+            "personalise later answers (you can switch this off)"
+        ),
+        legal_basis=(
+            "Legitimate interests (GDPR Art. 6(1)(f)); you can object at any "
+            "time by turning memory off"
+        ),
+    ),
+    PrivacyNoticePurpose(
+        purpose=(
+            "Security, abuse prevention and audit, including administrator "
+            "review of conversations"
+        ),
+        legal_basis="Legitimate interests (GDPR Art. 6(1)(f))",
+    ),
+    PrivacyNoticePurpose(
+        purpose="Usage metering, quotas and billing",
+        legal_basis="Performance of a contract (GDPR Art. 6(1)(b))",
+    ),
+    PrivacyNoticePurpose(
+        purpose="Answer data protection requests and keep the records the law requires",
+        legal_basis="Legal obligation (GDPR Art. 6(1)(c))",
+    ),
+)
+
+_DEFAULT_PRIVACY_PROCESSORS: tuple[PrivacyNoticeProcessor, ...] = (
+    PrivacyNoticeProcessor(
+        name="Configured LLM provider",
+        role=(
+            "Generates agent responses from your prompts, files and conversation "
+            "context, reached through the platform's LLM gateway"
+        ),
+        country="Not specified",
+        transfer_mechanism="Not specified",
+    ),
+    PrivacyNoticeProcessor(
+        name="Configured embeddings provider",
+        role="Turns documents and session memory into vectors for search",
+        country="Not specified",
+        transfer_mechanism="Not specified",
+    ),
+    PrivacyNoticeProcessor(
+        name="Configured object storage",
+        role="Stores uploaded files, knowledge documents and generated artifacts",
+        country="Not specified",
+        transfer_mechanism="Not specified",
+    ),
+)
 
 
 class Settings(BaseSettings):
@@ -150,3 +230,22 @@ class Settings(BaseSettings):
     # payloads before any parsing / upload.  25 MiB mirrors typical attachment
     # upload limits.
     webhook_max_body_bytes: int = 25 * 1024 * 1024
+
+    # ── Privacy notice (GDPR Art. 13) — served by GET /privacy/notice ───────
+    # The notice ``version`` is a short hash of the rendered content, so any
+    # change here (or in the retention the orchestrator reports) asks users to
+    # acknowledge again.  ``privacy_notice_version`` is an optional label
+    # prefixed to that hash (e.g. "2026-10" → "2026-10.3fa9c2d1e0ab").
+    privacy_notice_version: str = ""
+    privacy_controller_name: str = "Your organisation"
+    privacy_controller_contact_email: str = ""
+    privacy_dpo_email: str | None = None
+    # JSON lists, e.g. BFF_PRIVACY_NOTICE_PURPOSES='[{"purpose": "…",
+    # "legal_basis": "…"}]' and BFF_PRIVACY_NOTICE_PROCESSORS='[{"name": "…",
+    # "role": "…", "country": "…", "transfer_mechanism": "…"}]'.
+    privacy_notice_purposes: list[PrivacyNoticePurpose] = Field(
+        default_factory=lambda: list(_DEFAULT_PRIVACY_PURPOSES),
+    )
+    privacy_notice_processors: list[PrivacyNoticeProcessor] = Field(
+        default_factory=lambda: list(_DEFAULT_PRIVACY_PROCESSORS),
+    )

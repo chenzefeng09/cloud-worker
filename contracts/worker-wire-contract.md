@@ -107,16 +107,33 @@ scheduler 解析不到虚拟密钥时**直接让 spawn 失败**,不存在直连�
 
 orchestrator 的 `_stream_tokens` 从 `0-0` 全量重放——**重连/续跑会重放整段**,
 消费端(前端)靠 `run_started` 清块 + offset 水位实现幂等;worker 只管 append,不重写。
+每次写入都会刷新流的 TTL(30 分钟,暂停时改为 7 天),MAXLEN 约 100k。
 
 | 条目 `type` | 其余字段 | 语义 |
 |---|---|---|
-| `delta` | `text` | 助手正文增量 |
-| `thinking` | `text` | 推理文本(整块) |
-| `tool_call` | `tool_call_id`, `name`, `args`(JSON 字符串) | 工具调用(参数已完整) |
+| `delta` | `text` | 助手正文增量(一条可合并多个 token,约 50 ms / 512 字符) |
+| `thinking_delta` | `text` | 推理增量,实时流出 |
+| `thinking` | `text` | 推理整块——**只用于未流式输出过的块**,在该条消息正文之后到达 |
+| `tool_call` | `tool_call_id`, `name`, `args`(JSON 字符串) | 工具调用,参数完整;**同一 id 至多一条** |
 | `tool_result` | `tool_call_id`, `name`, `result`, `state` | 工具结果 |
 | `pending_confirmation` | `tool_call_id`, `name`, `args` | HITL:等用户批准(一个待批工具一条) |
 | `pending_question` | `tool_call_id`, `question` | HITL:ask_user 等用户回答 |
-| `end` | — | 回复正常结束。**暂停时不发 end** |
+| `error` | `message` | 失败原因(固定的、可展示给用户的短句),在 `end{failed}` 之前 |
+| `end` | `text: ""`, `status` | 每个 worker 进程**恰好一条**,之后不再写。`status` ∈ `completed` / `failed` / `cancelled` / `paused`;缺省视为未知(旧 worker) |
+
+暂停与续跑共用**同一条流**:`end{paused}` 写在 pending 条目之后;续跑腿在其后继续
+append,直到新的 `end`。因此读端遇到 `end{paused}` 必须继续读,不能当作结束。
+
+orchestrator 也会写两类条目:
+
+| 条目 `type` | 写入方 | 语义 |
+|---|---|---|
+| `pending_resolved` | `respond_run` | 用户已回应,`tool_call_id` 对应的卡片作废(该次暂停的每个 id 各一条);续跑时模型会以**新的** `tool_call_id` 重新发起调用 |
+| `end{status: cancelled}` | 取消 / 新一轮对话废弃暂停的 run | 让正在跟流的连接立即停止,重放时视为已结束 |
+
+orchestrator 还在 `agent:run:{run_id}:dispatch` 存放该 run 的原始派发载荷(模型、
+skills、MCP、文件、history、memory、system prompt、HITL;TTL 8 天),续跑时原样重派,
+run 进入终态后删除。
 
 ## 3. 输出②:`/workspace/result.json`(worker 写,scheduler `get_run_status` 透出)
 
@@ -150,25 +167,34 @@ scheduler 把 `status` 以顶层 `result_status` 透传;orchestrator reconcile �
 ```
 
 续跑:orchestrator `POST /sessions/{sid}/runs/{run_id}/respond` 读此 key →
-同一 Run 行 PAUSED→RUNNING → 重派 scheduler,`task.json["resume"]` 带回
-`agent_state` + 用户决定;worker 凭 state 还原并注入确认/答案事件续跑,
-token 续写**同一条**流(同 run_id)。同时 worker 更新热状态键
-`agent:run:{run_id}:state` 的 `status` 字段为 `"PAUSED"`。
+以条件更新抢占同一 Run 行(PAUSED→RUNNING;并发的取消先到则 409)→ 用存下的原始
+派发载荷重派 scheduler,`task.json["resume"]` 带回 `agent_state` + 用户决定;
+worker 凭 state 还原并注入确认/答案事件续跑,token 续写**同一条**流(同 run_id)。
+暂停时 worker 更新热状态键 `agent:run:{run_id}:state` 的 `status` 字段为 `"PAUSED"`。
+
+工具批准按「工具名 + 规范化参数(各层 key 排序)」匹配,且只用一次:参数不同或
+同参数的第二次调用都会再次暂停。
 
 ## 5. 平台 SSE 事件(orchestrator `GET /sessions/{id}/stream` → BFF relay → 前端)
 
 session-scoped、multiplex 该会话所有 run、5 分钟服务端 deadline(客户端自动重连)。
+重连带 `?after=<sequence>&after_id=<id>`(客户端最新的持久化行),只补发更新的行;
+该行若已不存在,服务端发 `transcript_reset`。一个会话同时只允许一个进行中的 run
+(第二个 `POST /runs` 返回 409)。
 
 | 事件 | payload | 备注 |
 |---|---|---|
 | `run_started` | `{run_id}` | 前端在此清该 run 的临时块+offset(重放幂等锚点) |
-| `token` / `thinking` | `{run_id, delta}` / `{run_id, text}` | |
+| `token` / `thinking_delta` / `thinking` | `{run_id, delta, offset}` / `{run_id, delta, offset}` / `{run_id, text, offset}` | |
 | `tool` | `{run_id, kind:"call"\|"result", tool_call_id, name, args?\|result?, state?}` | |
 | `plan` | `{run_id, plan_steps}` | |
-| `message` | 完整持久化消息行 | `addMessage` 按 id 去重 |
+| `message` | 完整持久化消息行 | 按 id 去重;助手/工具/推理行替换该 run 同类临时块 |
+| `transcript_reset` | `{session_id}` | 客户端持有的行已被删除(回退重发),重新拉取整段 transcript |
 | `pending_confirmation` / `pending_question` | 同 §2 字段 + `run_id` | 渲染确认/提问卡 |
+| `pending_resolved` | `{run_id, tool_call_id, offset}` | 卡片已被回应(可能在其他标签页),移除 |
 | `run_paused` | `{run_id}` | PAUSED run 对新连接会一次性重放(找回卡片) |
-| `run_complete` | `{run_id, status, result_summary}` | 助手消息已先落库 |
+| `run_stream_end` | `{run_id, paused}` | 本连接对该 run 的 token 跟流结束,**不代表 run 结束** |
+| `run_complete` | `{run_id, status, result_summary}` | 助手消息已先落库;失败的 run 另有一条 system 消息说明原因 |
 | `done` | `{}` | 仅表示本次连接周期结束,**不代表 run 结束** |
 | `error` | `{detail}` | detail 不含内部细节 |
 

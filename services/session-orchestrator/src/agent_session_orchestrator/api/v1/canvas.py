@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
 from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, TUserId
+from agent_session_orchestrator.api.ownership import require_canvas_owner, require_session_owner
 from agent_session_orchestrator.schemas.canvas import (
     CanvasCreate,
     CanvasOut,
@@ -81,7 +82,10 @@ async def _canvas_out(svc: CanvasService, canvas) -> CanvasOut:  # type: ignore[
     "/sessions/{session_id}/canvases",
     status_code=201,
     response_model=CanvasOut,
-    dependencies=[Depends(require_permission("session.message.create", "session"))],
+    dependencies=[
+        Depends(require_permission("session.message.create", "session")),
+        Depends(require_session_owner),
+    ],
 )
 async def create_canvas(
     session_id: str,
@@ -106,7 +110,10 @@ async def create_canvas(
 @router.get(
     "/sessions/{session_id}/canvases",
     response_model=CursorPage,
-    dependencies=[Depends(require_permission("session.message.read", "session"))],
+    dependencies=[
+        Depends(require_permission("session.message.read", "session")),
+        Depends(require_session_owner),
+    ],
 )
 async def list_canvases(
     session_id: str,
@@ -129,7 +136,10 @@ async def list_canvases(
 @router.get(
     "/canvases/{canvas_id}",
     response_model=CanvasOut,
-    dependencies=[Depends(require_permission("session.message.read", "session"))],
+    dependencies=[
+        Depends(require_permission("session.message.read", "session")),
+        Depends(require_canvas_owner),
+    ],
 )
 async def get_canvas(
     canvas_id: str,
@@ -144,7 +154,10 @@ async def get_canvas(
 @router.delete(
     "/canvases/{canvas_id}",
     status_code=204,
-    dependencies=[Depends(require_permission("session.message.create", "session"))],
+    dependencies=[
+        Depends(require_permission("session.message.create", "session")),
+        Depends(require_canvas_owner),
+    ],
 )
 async def delete_canvas(
     canvas_id: str,
@@ -165,7 +178,10 @@ async def delete_canvas(
 @router.get(
     "/canvases/{canvas_id}/versions",
     response_model=CursorPage,
-    dependencies=[Depends(require_permission("session.message.read", "session"))],
+    dependencies=[
+        Depends(require_permission("session.message.read", "session")),
+        Depends(require_canvas_owner),
+    ],
 )
 async def list_versions(
     canvas_id: str,
@@ -185,7 +201,10 @@ async def list_versions(
 @router.get(
     "/canvases/{canvas_id}/versions/{version}",
     response_model=VersionOut,
-    dependencies=[Depends(require_permission("session.message.read", "session"))],
+    dependencies=[
+        Depends(require_permission("session.message.read", "session")),
+        Depends(require_canvas_owner),
+    ],
 )
 async def get_version(
     canvas_id: str,
@@ -202,7 +221,10 @@ async def get_version(
     "/canvases/{canvas_id}/versions",
     status_code=201,
     response_model=CanvasOut,
-    dependencies=[Depends(require_permission("session.message.create", "session"))],
+    dependencies=[
+        Depends(require_permission("session.message.create", "session")),
+        Depends(require_canvas_owner),
+    ],
 )
 async def create_manual_version(
     canvas_id: str,
@@ -223,7 +245,10 @@ async def create_manual_version(
     "/canvases/{canvas_id}/revert",
     status_code=201,
     response_model=CanvasOut,
-    dependencies=[Depends(require_permission("session.message.create", "session"))],
+    dependencies=[
+        Depends(require_permission("session.message.create", "session")),
+        Depends(require_canvas_owner),
+    ],
 )
 async def revert_canvas(
     canvas_id: str,
@@ -243,7 +268,10 @@ async def revert_canvas(
     "/canvases/{canvas_id}/suggestions",
     status_code=201,
     response_model=SuggestionOut,
-    dependencies=[Depends(require_permission("session.message.create", "session"))],
+    dependencies=[
+        Depends(require_permission("session.message.create", "session")),
+        Depends(require_canvas_owner),
+    ],
 )
 async def create_suggestion(
     canvas_id: str,
@@ -265,7 +293,10 @@ async def create_suggestion(
 @router.post(
     "/canvases/{canvas_id}/suggestions/{suggestion_id}/accept",
     response_model=CanvasOut,
-    dependencies=[Depends(require_permission("session.message.create", "session"))],
+    dependencies=[
+        Depends(require_permission("session.message.create", "session")),
+        Depends(require_canvas_owner),
+    ],
 )
 async def accept_suggestion(
     canvas_id: str,
@@ -281,7 +312,10 @@ async def accept_suggestion(
 @router.post(
     "/canvases/{canvas_id}/suggestions/{suggestion_id}/reject",
     response_model=SuggestionOut,
-    dependencies=[Depends(require_permission("session.message.create", "session"))],
+    dependencies=[
+        Depends(require_permission("session.message.create", "session")),
+        Depends(require_canvas_owner),
+    ],
 )
 async def reject_suggestion(
     canvas_id: str,

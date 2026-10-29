@@ -44,12 +44,21 @@ def _is_envelope(value: Any) -> bool:
     return isinstance(obj, dict) and "ciphertext_b64" in obj
 
 
+def _reversible_encrypt(value: str) -> str:
+    return json.dumps({"ciphertext_b64": base64.b64encode(value.encode()).decode()})
+
+
+def _reversible_decrypt(value: str) -> str:
+    return base64.b64decode(json.loads(value)["ciphertext_b64"]).decode()
+
+
 async def _reversible_encrypt_auth(
     auth: dict[str, Any] | None,
     *,
     crypto_url: str,
     timeout: float,
     tenant_id: str,
+    allow_plaintext: bool = False,
 ) -> dict[str, Any] | None:
     """Test-only reversible encrypt: envelope = {"ciphertext_b64": b64(pt)}."""
     if not auth:
@@ -58,9 +67,7 @@ async def _reversible_encrypt_auth(
     for field in _SECRET_FIELDS:
         v = out.get(field)
         if isinstance(v, str) and v and not _is_envelope(v):
-            out[field] = json.dumps(
-                {"ciphertext_b64": base64.b64encode(v.encode()).decode()}
-            )
+            out[field] = _reversible_encrypt(v)
     return out
 
 
@@ -78,9 +85,28 @@ async def _reversible_decrypt_auth(
     for field in _SECRET_FIELDS:
         v = out.get(field)
         if isinstance(v, str) and v and _is_envelope(v):
-            obj = json.loads(v)
-            out[field] = base64.b64decode(obj["ciphertext_b64"]).decode()
+            out[field] = _reversible_decrypt(v)
     return out
+
+
+async def _reversible_encrypt_values(
+    values: dict[str, Any] | None, *, allow_plaintext: bool = False, **_ctx: Any,
+) -> dict[str, Any]:
+    """Test-only reversible ``encrypt_values`` (same envelope as above)."""
+    return {
+        k: _reversible_encrypt(v) if isinstance(v, str) and v and not _is_envelope(v) else v
+        for k, v in (values or {}).items()
+    }
+
+
+async def _reversible_decrypt_values(
+    values: dict[str, Any] | None, **_ctx: Any,
+) -> dict[str, Any]:
+    """Test-only reversible ``decrypt_values``."""
+    return {
+        k: _reversible_decrypt(v) if isinstance(v, str) and _is_envelope(v) else v
+        for k, v in (values or {}).items()
+    }
 
 
 
@@ -161,6 +187,8 @@ def mock_crypto_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(api_module, "encrypt_auth", _reversible_encrypt_auth)
     monkeypatch.setattr(api_module, "decrypt_auth", _reversible_decrypt_auth)
+    monkeypatch.setattr(api_module, "encrypt_values", _reversible_encrypt_values)
+    monkeypatch.setattr(api_module, "decrypt_values", _reversible_decrypt_values)
 
 
 @pytest.fixture

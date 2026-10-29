@@ -19,7 +19,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.config import Settings
@@ -45,7 +45,13 @@ def _now() -> dt.datetime:
 
 
 async def purge_expired_sessions(settings: Settings, retention_days: int) -> int:
-    """Soft-delete every session older than ``retention_days`` (all tenants).
+    """Soft-delete every session inactive for ``retention_days`` (all tenants).
+
+    Inactivity keys on ``updated_at`` (bumped by every run via
+    ``current_run_id``), not ``created_at`` — a long-lived session the user
+    still works in must not be swept.  ``retention_days <= 0`` disables the
+    sweep.  Soft-deleted sessions are physically purged later by
+    ``privacy_service.purge_trash`` once ``trash_grace_days`` has passed.
 
     Designed for the background retention sweep — there is no request and
     therefore no single tenant context.  RLS is FORCEd on ``app_user``
@@ -60,9 +66,11 @@ async def purge_expired_sessions(settings: Settings, retention_days: int) -> int
 
     Returns the number of sessions successfully soft-deleted.
     """
+    if retention_days <= 0:
+        return 0
     cutoff = _now() - dt.timedelta(days=retention_days)
 
-    # Cross-tenant read of expired, not-yet-deleted sessions.  We pull
+    # Cross-tenant read of inactive, not-yet-deleted sessions.  We pull
     # (tenant_id, id) so we can re-bind RLS correctly for each delete.  The
     # scalar helper returns one column, so encode the pair as "tenant_id\x1fid"
     # — tenant_id and session id are opaque slugs without control chars.
@@ -70,7 +78,7 @@ async def purge_expired_sessions(settings: Settings, retention_days: int) -> int
         settings,
         "SELECT tenant_id || '\x1f' || id"
         " FROM session_orchestrator.session"
-        " WHERE deleted_at IS NULL AND created_at < :cutoff"
+        " WHERE deleted_at IS NULL AND updated_at < :cutoff"
         " ORDER BY tenant_id",
         {"cutoff": cutoff},
     )
@@ -87,7 +95,11 @@ async def purge_expired_sessions(settings: Settings, retention_days: int) -> int
                 tenant_id=tenant_id, user_id="SYSTEM", actor="SYSTEM"
             ):
                 service = SessionService(db, tenant_id=tenant_id)
-                await service.delete_session(session_id)
+                await service.delete_session(
+                    session_id,
+                    as_admin=True,
+                    knowledge_ingest_url=settings.knowledge_ingest_url,
+                )
             purged += 1
         except Exception:  # noqa: BLE001 — one bad session must not abort the sweep
             logger.exception(
@@ -142,8 +154,10 @@ class SessionService:
 
         next_cursor: str | None = None
         if len(rows) > limit:
-            next_cursor = rows[-1].updated_at.isoformat()
+            # Trim the look-ahead row first: the cursor is the last row the
+            # caller actually received, so the next page starts right after it.
             rows = rows[:limit]
+            next_cursor = rows[-1].updated_at.isoformat()
         return rows, next_cursor
 
     async def create_session(
@@ -205,7 +219,24 @@ class SessionService:
         await self._db.flush()
         return session
 
-    async def delete_session(self, session_id: str) -> None:
+    async def delete_session(
+        self,
+        session_id: str,
+        *,
+        as_admin: bool = False,
+        knowledge_ingest_url: str | None = None,
+    ) -> None:
+        """Soft-delete a session and its canvases; purge its long-term memory.
+
+        The memory docs knowledge-ingest holds for this session are deleted
+        best-effort (``DELETE /memories?origin_session_id=…`` as the session
+        owner) — a ki outage never fails the delete.  ``as_admin`` marks a
+        system- or admin-initiated delete (retention sweep): the purge then
+        runs with ``X-Actor: ADMIN`` and removes every memory doc of the
+        session, not only the owner's.  ``knowledge_ingest_url`` defaults to
+        the registered app settings.  Physical deletion of the rows + blobs
+        happens later in ``privacy_service.purge_trash``.
+        """
         session = await self.get_session(session_id)
         now = _now()
         session.deleted_at = now
@@ -226,6 +257,18 @@ class SessionService:
             .values(deleted_at=now)
         )
         await self._db.flush()
+
+        from agent_session_orchestrator.services.privacy_service import (
+            delete_session_memories,
+        )
+
+        await delete_session_memories(
+            tenant_id=self._tenant_id,
+            session_id=session_id,
+            owner_user_id=session.user_id,
+            as_admin=as_admin,
+            knowledge_ingest_url=knowledge_ingest_url,
+        )
 
     async def create_message(
         self,
@@ -319,9 +362,35 @@ class SessionService:
 
         next_cursor: str | None = None
         if len(rows) > limit:
-            next_cursor = str(rows[-1].sequence)
+            # Trim the look-ahead row first (see list_sessions): a cursor taken
+            # from it would skip that message on the next page.
             rows = rows[:limit]
+            next_cursor = str(rows[-1].sequence)
         return rows, next_cursor
+
+    async def latest_message(self, session_id: str) -> Message | None:
+        """The session's highest-sequence message, or ``None`` when it has none."""
+        result = await self._db.execute(
+            select(Message)
+            .where(Message.session_id == session_id)
+            .order_by(Message.sequence.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
+
+    async def run_has_output(self, session_id: str, run_id: str) -> bool:
+        """True once assistant / tool / thinking rows exist for ``run_id``."""
+        stmt = (
+            select(Message.id)
+            .where(
+                Message.session_id == session_id,
+                Message.run_id == run_id,
+                func.lower(Message.role).in_(("assistant", "tool", "thinking")),
+            )
+            .limit(1)
+        )
+        result = await self._db.execute(stmt)
+        return result.first() is not None
 
     async def list_all_messages(self, session_id: str) -> list[Message]:
         """Return every message in the session, oldest first (no paging).
@@ -516,6 +585,7 @@ class SessionService:
         limit: int = 50,
         app_id: str | None = None,
         offset: int = 0,
+        user_id: str | None = None,
     ) -> list[Run]:
         """List all runs for the current tenant (across every session).
 
@@ -527,8 +597,16 @@ class SessionService:
         view is naturally free of chat noise.  Both ``app_id`` and ``status``
         default to ``None`` (no filter) so existing callers are unchanged.
         Ordered newest first, paged by ``limit`` + ``offset``.
+
+        ``user_id`` narrows to runs of sessions that user owns — the IDOR guard
+        for ordinary callers (a run's ``task_description`` is the user's
+        prompt).  ``None`` is reserved for the admin path.
         """
         stmt = select(Run).where(Run.tenant_id == self._tenant_id)
+        if user_id is not None:
+            stmt = stmt.join(Session, Session.id == Run.session_id).where(
+                Session.user_id == user_id,
+            )
         if status is not None:
             stmt = stmt.where(Run.status == status)
         if app_id is not None:
@@ -539,11 +617,16 @@ class SessionService:
         result = await self._db.execute(stmt)
         return list(result.scalars().all())
 
-    async def delete_messages_from_sequence(self, session_id: str, from_sequence: int) -> int:
+    async def delete_messages_from_sequence(
+        self, session_id: str, from_sequence: int, *, blob_store: object | None = None,
+    ) -> int:
         """Delete all messages with sequence >= from_sequence for this session.
 
         Also deletes output Attachment rows whose run_id matches any deleted
-        message's run_id (orphaned output attachments from truncated runs).
+        message's run_id (orphaned output attachments from truncated runs),
+        and the S3 objects behind them — reference-aware, so an object another
+        row still points at (e.g. a workspace file the same run wrote back) is
+        kept.  ``blob_store`` defaults to the registered app blob store.
 
         Returns the number of message rows deleted.
         """
@@ -567,27 +650,50 @@ class SessionService:
         result = await self._db.execute(del_stmt)
         deleted_count = result.rowcount
 
-        # Clean up orphaned output attachments for the deleted runs.
+        # Clean up orphaned output attachments for the deleted runs.  Runs in a
+        # SAVEPOINT so a cleanup error rolls back only the cleanup — without it
+        # the failed statement would abort the whole truncation transaction.
+        orphaned_keys: list[str] = []
         if run_ids:
             try:
-                att_del_stmt = delete(Attachment).where(
-                    Attachment.session_id == session_id,
-                    Attachment.tenant_id == self._tenant_id,
-                    Attachment.kind == "output",
-                    Attachment.run_id.in_(run_ids),
-                )
-                att_result = await self._db.execute(att_del_stmt)
+                async with self._db.begin_nested():
+                    att_del_stmt = (
+                        delete(Attachment)
+                        .where(
+                            Attachment.session_id == session_id,
+                            Attachment.tenant_id == self._tenant_id,
+                            Attachment.kind == "output",
+                            Attachment.run_id.in_(run_ids),
+                        )
+                        .returning(Attachment.blob_key)
+                        .execution_options(synchronize_session=False)
+                    )
+                    att_result = await self._db.execute(att_del_stmt)
+                    orphaned_keys = [k for k in att_result.scalars().all() if k]
                 logger.debug(
                     "truncate: deleted %d output attachment(s) for %d run(s)",
-                    att_result.rowcount,
+                    len(orphaned_keys),
                     len(run_ids),
                 )
             except Exception as exc:  # noqa: BLE001 — failure-open; don't block truncation
+                orphaned_keys = []
                 logger.warning(
                     "truncate: attachment cleanup failed (failure-open): %s", exc
                 )
 
         await self._db.flush()
+
+        if orphaned_keys:
+            from agent_session_orchestrator.services.privacy_service import (
+                delete_unreferenced_blobs,
+            )
+
+            await delete_unreferenced_blobs(
+                self._db,
+                tenant_id=self._tenant_id,
+                keys=orphaned_keys,
+                blob_store=blob_store,
+            )
         return deleted_count
 
     async def get_run(self, session_id: str, run_id: str) -> Run:
@@ -601,3 +707,44 @@ class SessionService:
         if run is None:
             raise RunNotFoundError(run_id)
         return run
+
+    async def claim_run_transition(
+        self,
+        run: Run,
+        *,
+        to_status: str,
+        from_statuses: tuple[str, ...] = ("RUNNING", "PENDING"),
+        match_sandbox: bool = True,
+    ) -> bool:
+        """Atomically move ``run`` to ``to_status``; ``False`` if it already moved.
+
+        Several reconcilers (each open tab's stream, ``list_messages``, the
+        sweeper) can observe the same RUNNING row at once.  Only the caller
+        whose conditional UPDATE matches may run the side effects (replaying
+        the reply into messages, artifacts, memory) — the others would
+        duplicate them.  Matching on ``sandbox_id`` as well rejects a stale
+        reconcile of a run that was resumed into a new sandbox meanwhile; a
+        cancel passes ``match_sandbox=False`` since it stops whichever leg runs.
+
+        The row stays locked until this transaction ends, so a concurrent
+        claimer blocks and then sees the committed status.  On a lost race the
+        in-memory ``run`` is refreshed to that status.
+        """
+        stmt = (
+            update(Run)
+            .where(
+                Run.id == run.id,
+                Run.tenant_id == self._tenant_id,
+                Run.status.in_(from_statuses),
+            )
+            .values(status=to_status)
+            .execution_options(synchronize_session=False)
+        )
+        if match_sandbox and run.sandbox_id is not None:
+            stmt = stmt.where(Run.sandbox_id == run.sandbox_id)
+        result = await self._db.execute(stmt)
+        if getattr(result, "rowcount", 0) == 0:  # an UPDATE: a CursorResult
+            await self._db.refresh(run)
+            return False
+        run.status = to_status
+        return True

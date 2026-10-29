@@ -276,7 +276,16 @@ ENDPOINTS = [
     ("POST",   "/admin/compliance/ropa", {"name": "n"}, 201),
     ("POST",   "/admin/compliance/dpia", {"name": "n"}, 201),
     ("POST",   "/admin/compliance/dpia/dpia_1/complete", {}, 200),
-    ("POST",   "/admin/compliance/dsar", {"subject": "s"}, 201),
+    (
+        "POST",
+        "/admin/compliance/dsar",
+        {
+            "user_id": "usr_01J5TEST0000000000000USER1",
+            "request_type": "access",
+            "details": "Copy of all personal data held about me",
+        },
+        201,
+    ),
     ("GET",    "/admin/compliance/dsar/dsar_1", None, 200),
     ("GET",    "/admin/compliance/reports", None, 200),
     ("POST",   "/admin/compliance/reports", {"kind": "k"}, 201),

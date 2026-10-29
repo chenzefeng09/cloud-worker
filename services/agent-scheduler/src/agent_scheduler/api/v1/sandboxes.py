@@ -54,5 +54,8 @@ async def stop_sandbox(
         # container cannot be probed by guessing IDs.
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="sandbox not found")
 
-    runtime.cancel_run(sandbox_id)
+    # An admin stop frees compute; it does not discard the user's files.  A
+    # paused run stopped here can still be resumed (into a new sandbox, same
+    # dir), so the dir is left to the reaper, which keeps it while it can.
+    runtime.cancel_run(sandbox_id, remove_workspace=False)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
