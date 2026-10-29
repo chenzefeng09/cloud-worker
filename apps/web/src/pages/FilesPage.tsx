@@ -5,7 +5,7 @@ import { useWorkspace } from '../lib/workspaceContext';
 import { api, ApiError } from '../api/client';
 import type { Attachment, KnowledgeDocument } from '../api/types';
 import { useChatStore } from '../stores/chatStore';
-import { formatRelativeTimeZh } from '../lib/format';
+import { formatRelativeTime } from '../lib/format';
 import { mimeToKind, FilePreviewBody } from '../components/filePreview';
 
 const KIND_GLYPH: Record<string, string> = {
@@ -26,11 +26,11 @@ const KIND_GLYPH: Record<string, string> = {
   folder: '▸',
 };
 
-const DOC_STATUS_ZH: Record<string, string> = {
-  PENDING: '待处理',
-  INGESTING: '摄入中',
-  READY: '就绪',
-  FAILED: '失败',
+const DOC_STATUS_LABELS: Record<string, string> = {
+  PENDING: 'Pending',
+  INGESTING: 'Ingesting',
+  READY: 'Ready',
+  FAILED: 'Failed',
 };
 
 function extFromFilename(name: string): string {
@@ -75,7 +75,7 @@ export function FilesPage() {
     api.library.listDocuments().then((res) => {
       setDocs(res.items);
     }).catch((e) => {
-      setDocsError(e instanceof ApiError ? e.message : '加载知识文档失败');
+      setDocsError(e instanceof ApiError ? e.message : 'Failed to load knowledge documents');
     }).finally(() => {
       setDocsLoading(false);
     });
@@ -102,7 +102,7 @@ export function FilesPage() {
       await api.library.ingestDocument(doc.id);
       loadDocs();
     } catch (e) {
-      setUploadError(e instanceof ApiError ? e.message : '上传文档失败');
+      setUploadError(e instanceof ApiError ? e.message : 'Failed to upload document');
     } finally {
       setUploading(false);
     }
@@ -122,7 +122,7 @@ export function FilesPage() {
       setSessionFiles(res.items);
     }).catch((e) => {
       if (cancelled) return;
-      setFilesError(e instanceof ApiError ? e.message : '加载会话文件失败');
+      setFilesError(e instanceof ApiError ? e.message : 'Failed to load session files');
     }).finally(() => {
       if (!cancelled) setFilesLoading(false);
     });
@@ -142,8 +142,8 @@ export function FilesPage() {
     <div className="flex flex-col h-full min-w-0 bg-paper">
       <PageHead
         crumbs={[
-          { label: '首页', to: '/home' },
-          { label: '我的工作区' },
+          { label: 'Home', to: '/home' },
+          { label: 'My workspace' },
         ]}
         actions={
           <>
@@ -158,7 +158,7 @@ export function FilesPage() {
               disabled={uploading}
               onClick={() => uploadInputRef.current?.click()}
             >
-              {uploading ? '上传中…' : '+ 上传'}
+              {uploading ? 'Uploading…' : '+ Upload'}
             </button>
           </>
         }
@@ -171,7 +171,7 @@ export function FilesPage() {
             <input
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="筛选文件…"
+              placeholder="Filter files…"
               className="flex-1 border-none bg-transparent outline-none font-mono text-[11.5px] text-ink"
             />
             <span className="font-mono text-[10px] text-dim">{totalCount}</span>
@@ -179,7 +179,7 @@ export function FilesPage() {
 
           <div className="cw-scroll flex-1 py-1.5">
             {(docsLoading || filesLoading) && (
-              <div className="px-3 py-2 font-mono text-[11px] text-dim">加载中…</div>
+              <div className="px-3 py-2 font-mono text-[11px] text-dim">Loading…</div>
             )}
             {docsError && (
               <div className="px-3 py-2 font-mono text-[11px] text-accent">{docsError}</div>
@@ -195,7 +195,7 @@ export function FilesPage() {
             {outputFiles.filter(filterAtt).length > 0 && (
               <>
                 <div className="cw-label px-3 pt-2 pb-1">
-                  Agent 产物 · {outputFiles.filter(filterAtt).length}
+                  Agent outputs · {outputFiles.filter(filterAtt).length}
                 </div>
                 {outputFiles.filter(filterAtt).map((att) => {
                   const isSel = selected?.type === 'att' && selected.att.id === att.id;
@@ -216,7 +216,7 @@ export function FilesPage() {
                       <span className={`font-mono text-[12px] truncate flex-1 ${isSel ? 'text-accent font-semibold' : 'text-ink'}`}>
                         {att.filename}
                       </span>
-                      <span className="font-mono text-[9px] text-dim">出</span>
+                      <span className="font-mono text-[9px] text-dim">out</span>
                     </div>
                   );
                 })}
@@ -227,7 +227,7 @@ export function FilesPage() {
             {inputFiles.filter(filterAtt).length > 0 && (
               <>
                 <div className="cw-label px-3 pt-2 pb-1">
-                  会话上传 · {inputFiles.filter(filterAtt).length}
+                  Session uploads · {inputFiles.filter(filterAtt).length}
                 </div>
                 {inputFiles.filter(filterAtt).map((att) => {
                   const isSel = selected?.type === 'att' && selected.att.id === att.id;
@@ -248,7 +248,7 @@ export function FilesPage() {
                       <span className={`font-mono text-[12px] truncate flex-1 ${isSel ? 'text-accent font-semibold' : 'text-ink'}`}>
                         {att.filename}
                       </span>
-                      <span className="font-mono text-[9px] text-dim">入</span>
+                      <span className="font-mono text-[9px] text-dim">in</span>
                     </div>
                   );
                 })}
@@ -259,7 +259,7 @@ export function FilesPage() {
             {!docsLoading && docs.filter(filterDoc).length > 0 && (
               <>
                 <div className="cw-label px-3 pt-2 pb-1">
-                  知识文档 · {docs.filter(filterDoc).length}
+                  Knowledge docs · {docs.filter(filterDoc).length}
                 </div>
                 {docs.filter(filterDoc).map((doc) => {
                   const isSel = selected?.type === 'doc' && selected.doc.id === doc.id;
@@ -288,7 +288,7 @@ export function FilesPage() {
 
             {totalCount === 0 && !docsLoading && !filesLoading && (
               <div className="px-3 py-2 font-mono italic text-dim text-[11px]">
-                {activeSessionId ? '无文件' : '请先选择一个会话'}
+                {activeSessionId ? 'No files' : 'Select a session first'}
               </div>
             )}
           </div>
@@ -298,9 +298,9 @@ export function FilesPage() {
               {ws.name}
             </div>
             {activeSessionId ? (
-              <div>{inputFiles.length} 个上传 · {outputFiles.length} 个产物 · {docs.length} 个知识文档</div>
+              <div>{inputFiles.length} uploads · {outputFiles.length} outputs · {docs.length} knowledge docs</div>
             ) : (
-              <div>{docs.length} 个知识文档</div>
+              <div>{docs.length} knowledge docs</div>
             )}
           </div>
         </aside>
@@ -314,7 +314,7 @@ export function FilesPage() {
             )
           ) : (
             <div className="flex-1 flex items-center justify-center text-dim text-[13px]">
-              从左侧选择一个文件查看详情
+              Select a file on the left to see details
             </div>
           )}
         </section>
@@ -333,19 +333,19 @@ function DocDetail({ doc }: { doc: KnowledgeDocument }) {
           accent={doc.status === 'FAILED'}
           dashed={doc.status !== 'READY' && doc.status !== 'FAILED'}
         >
-          {DOC_STATUS_ZH[doc.status] ?? doc.status}
+          {DOC_STATUS_LABELS[doc.status] ?? doc.status}
         </Chip>
         <div className="flex-1" />
-        <span className="font-mono text-[10.5px] text-dim">{formatRelativeTimeZh(doc.uploaded_at)}</span>
+        <span className="font-mono text-[10.5px] text-dim">{formatRelativeTime(doc.uploaded_at)}</span>
       </div>
       <div className="cw-scroll flex-1 px-6 py-6 bg-paper">
         <div className="max-w-[720px] flex flex-col gap-4">
           <div className="grid grid-cols-2 gap-px bg-line border border-line rounded-md overflow-hidden">
             {[
-              { label: 'MIME 类型', value: doc.mime },
-              { label: '分块数', value: `${doc.chunk_count} 块` },
-              { label: '摄入状态', value: DOC_STATUS_ZH[doc.status] ?? doc.status },
-              { label: '上传时间', value: formatRelativeTimeZh(doc.uploaded_at) },
+              { label: 'MIME type', value: doc.mime },
+              { label: 'Chunks', value: `${doc.chunk_count} chunks` },
+              { label: 'Ingestion status', value: DOC_STATUS_LABELS[doc.status] ?? doc.status },
+              { label: 'Uploaded', value: formatRelativeTime(doc.uploaded_at) },
             ].map((row) => (
               <div key={row.label} className="bg-surface px-4 py-3">
                 <div className="cw-label mb-1">{row.label}</div>
@@ -355,11 +355,11 @@ function DocDetail({ doc }: { doc: KnowledgeDocument }) {
           </div>
           {doc.source_uri && (
             <div className="bg-surface border border-line rounded-md px-4 py-3">
-              <div className="cw-label mb-1">来源 URI</div>
+              <div className="cw-label mb-1">Source URI</div>
               <div className="font-mono text-[12px] text-ink-2 break-all">{doc.source_uri}</div>
             </div>
           )}
-          <div className="font-mono text-[11px] text-dim italic">文档 ID · {doc.id}</div>
+          <div className="font-mono text-[11px] text-dim italic">Document ID · {doc.id}</div>
         </div>
       </div>
     </>
@@ -375,21 +375,21 @@ function AttDetail({ att }: { att: Attachment }) {
         <span className="font-mono text-[10px] text-dim">{KIND_GLYPH[ext] ?? '·'}</span>
         <span className="font-mono text-[12.5px] font-semibold">{att.filename}</span>
         <Chip accent={att.kind === 'output'} dashed={att.kind !== 'output'}>
-          {att.kind === 'output' ? 'Agent 产物' : '用户上传'}
+          {att.kind === 'output' ? 'Agent output' : 'User upload'}
         </Chip>
         <div className="flex-1" />
         <span className="font-mono text-[10.5px] text-dim">
-          {formatBytes(att.size_bytes)} · {formatRelativeTimeZh(att.created_at)}
+          {formatBytes(att.size_bytes)} · {formatRelativeTime(att.created_at)}
         </span>
       </div>
       <div className="cw-scroll flex-1 px-6 py-6 bg-paper">
         <div className="max-w-[720px] flex flex-col gap-4">
           <div className="grid grid-cols-2 gap-px bg-line border border-line rounded-md overflow-hidden">
             {[
-              { label: '文件名', value: att.filename },
-              { label: 'MIME 类型', value: att.mime },
-              { label: '大小', value: formatBytes(att.size_bytes) },
-              { label: '类型', value: att.kind === 'output' ? 'Agent 产物' : '用户上传' },
+              { label: 'Filename', value: att.filename },
+              { label: 'MIME type', value: att.mime },
+              { label: 'Size', value: formatBytes(att.size_bytes) },
+              { label: 'Type', value: att.kind === 'output' ? 'Agent output' : 'User upload' },
             ].map((row) => (
               <div key={row.label} className="bg-surface px-4 py-3">
                 <div className="cw-label mb-1">{row.label}</div>
@@ -406,7 +406,7 @@ function AttDetail({ att }: { att: Attachment }) {
             mime={att.mime}
           />
 
-          <div className="font-mono text-[11px] text-dim italic">附件 ID · {att.id}</div>
+          <div className="font-mono text-[11px] text-dim italic">Attachment ID · {att.id}</div>
           {att.run_id && (
             <div className="font-mono text-[11px] text-dim italic">Run ID · {att.run_id}</div>
           )}

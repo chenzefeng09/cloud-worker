@@ -3,7 +3,7 @@
  *
  * The card, when bound to a server canvas via `canvasId`, renders an active
  * suggestion in place (InlineCanvasSuggestion — the full document with the
- * changed blocks highlighted) and a "历史" dropdown that lists versions and
+ * changed blocks highlighted) and a "History" dropdown that lists versions and
  * reverts. `api.canvas.*` is mocked module-wide so the store's actions resolve
  * without real network I/O.
  */
@@ -122,13 +122,13 @@ describe('CanvasMessageCard canvasId mode — inline suggestion', () => {
     });
     render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
 
-    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    const editor = screen.getByRole('textbox', { name: 'Inline canvas body' });
     await waitFor(() => expect(editor).toHaveTextContent('正文内容'));
     selectText(editor, '内容');
     fireEvent.mouseUp(editor);
-    await user.click(await screen.findByText('要求更改'));
-    await user.type(screen.getByPlaceholderText('修改一下'), '改得更有力');
-    await user.click(screen.getByTitle('发送修改要求'));
+    await user.click(await screen.findByText('Request changes'));
+    await user.type(screen.getByPlaceholderText('Edit this'), '改得更有力');
+    await user.click(screen.getByTitle('Send edit request'));
 
     await waitFor(() => expect(mockEdit).toHaveBeenCalledTimes(1));
     expect(mockEdit).toHaveBeenCalledWith(
@@ -153,19 +153,19 @@ describe('CanvasMessageCard canvasId mode — inline suggestion', () => {
     ]);
     render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
 
-    const review = screen.getByLabelText('修改建议');
+    const review = screen.getByLabelText('Suggested edit');
     expect(review).toBeInTheDocument();
     expect(within(review).getByText('精简了正文')).toBeInTheDocument();
     // The suggestion renders the WHOLE document in context — the unchanged
     // heading block is still shown, not just the changed blocks.
     expect(within(review).getByText('标题')).toBeInTheDocument();
     // The replaced block shows its original struck through and the suggested
-    // text highlighted; the inserted block is marked 新增.
+    // text highlighted; the inserted block is marked "Added".
     expect(within(review).getByText('正文内容')).toHaveClass('canvas-magic-edit-orig');
     const suggs = Array.from(review.querySelectorAll('.canvas-magic-edit-sugg'));
     expect(suggs.some((el) => el.textContent === '精简后的正文')).toBe(true);
     expect(suggs.some((el) => el.textContent === '新增的一段')).toBe(true);
-    expect(within(review).getByText('新增')).toBeInTheDocument();
+    expect(within(review).getByText('Added')).toBeInTheDocument();
   });
 
   it('accepts the whole suggestion via the store', async () => {
@@ -189,7 +189,7 @@ describe('CanvasMessageCard canvasId mode — inline suggestion', () => {
     } satisfies CanvasDocument);
 
     render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
-    await user.click(screen.getByRole('button', { name: '接受' }));
+    await user.click(screen.getByRole('button', { name: 'Accept' }));
 
     await waitFor(() => expect(mockAccept).toHaveBeenCalledWith('cvs_1', 'csg_1'));
   });
@@ -211,13 +211,13 @@ describe('CanvasMessageCard canvasId mode — inline suggestion', () => {
 
     render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
 
-    const review = screen.getByLabelText('选区修改建议');
+    const review = screen.getByLabelText('Suggested edit (selection)');
     const orig = review.querySelector('[data-magic-edit-block="true"][data-me-role="orig"]');
     const sugg = review.querySelector('[data-magic-edit-block="true"][data-me-role="sugg"]');
     expect(orig).toHaveTextContent('内容');
     expect(orig).toHaveAttribute('data-me-id', 'csg_1');
     expect(sugg).toHaveTextContent('更有力');
-    expect(screen.queryByLabelText('修改建议')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Suggested edit')).not.toBeInTheDocument();
   });
 });
 
@@ -240,10 +240,10 @@ describe('CanvasMessageCard canvasId mode — executable HTML canvas', () => {
     expect(iframe?.getAttribute('sandbox')).not.toContain('allow-same-origin');
     expect(iframe?.getAttribute('srcdoc')).toBe(HTML);
 
-    // 预览 / 代码 toggle present; the prose editor is NOT rendered.
-    expect(screen.getByText('预览')).toBeInTheDocument();
-    expect(screen.getByText('代码')).toBeInTheDocument();
-    expect(screen.queryByRole('textbox', { name: '页内画布正文' })).not.toBeInTheDocument();
+    // Preview / Code toggle present; the prose editor is NOT rendered.
+    expect(screen.getByText('Preview')).toBeInTheDocument();
+    expect(screen.getByText('Code')).toBeInTheDocument();
+    expect(screen.queryByRole('textbox', { name: 'Inline canvas body' })).not.toBeInTheDocument();
   });
 
   it('shows the raw source (not an iframe) in code mode', async () => {
@@ -255,7 +255,7 @@ describe('CanvasMessageCard canvasId mode — executable HTML canvas', () => {
     });
     const { container } = render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
 
-    await user.click(screen.getByText('代码'));
+    await user.click(screen.getByText('Code'));
     expect(container.querySelector('iframe')).toBeNull();
     expect(container.querySelector('pre code')?.textContent).toBe(HTML);
   });
@@ -289,14 +289,14 @@ describe('CanvasMessageCard canvasId mode — version history', () => {
     mockVersions.mockResolvedValueOnce({ items: versionList, next_cursor: null });
 
     render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
-    await user.click(screen.getByRole('button', { name: '版本历史' }));
+    await user.click(screen.getByRole('button', { name: 'Version history' }));
 
     await waitFor(() => expect(mockVersions).toHaveBeenCalledWith('cvs_1'));
     expect(await screen.findByText('第三版改动')).toBeInTheDocument();
     expect(screen.getByText('v3')).toBeInTheDocument();
     expect(screen.getByText('v1')).toBeInTheDocument();
-    // created_by=user with no summary falls back to "手动编辑".
-    expect(screen.getByText('手动编辑')).toBeInTheDocument();
+    // created_by=user with no summary falls back to "Manual edit".
+    expect(screen.getByText('Manual edit')).toBeInTheDocument();
   });
 
   it('reverts to a chosen version after confirmation', async () => {
@@ -317,13 +317,13 @@ describe('CanvasMessageCard canvasId mode — version history', () => {
     } satisfies CanvasDocument);
 
     render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
-    await user.click(screen.getByRole('button', { name: '版本历史' }));
+    await user.click(screen.getByRole('button', { name: 'Version history' }));
     await screen.findByText('第三版改动');
 
-    await user.click(screen.getByTitle('回退到版本 1'));
+    await user.click(screen.getByTitle('Restore version 1'));
 
-    await screen.findByText('回退版本');
-    await user.click(screen.getByRole('button', { name: '回退' }));
+    await screen.findByText('Restore version');
+    await user.click(screen.getByRole('button', { name: 'Restore' }));
     await waitFor(() => expect(mockRevert).toHaveBeenCalledWith('cvs_1', 1));
   });
 
@@ -333,13 +333,13 @@ describe('CanvasMessageCard canvasId mode — version history', () => {
     mockVersions.mockResolvedValueOnce({ items: versionList, next_cursor: null });
 
     render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
-    await user.click(screen.getByRole('button', { name: '版本历史' }));
+    await user.click(screen.getByRole('button', { name: 'Version history' }));
     await screen.findByText('第三版改动');
 
-    await user.click(screen.getByTitle('回退到版本 3'));
+    await user.click(screen.getByTitle('Restore version 3'));
 
-    await screen.findByText('回退版本');
-    await user.click(screen.getByRole('button', { name: '取消' }));
+    await screen.findByText('Restore version');
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(mockRevert).not.toHaveBeenCalled();
   });
 });

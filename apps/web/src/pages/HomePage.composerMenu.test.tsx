@@ -21,12 +21,12 @@ const mocks = vi.hoisted(() => ({
 vi.mock('react-router-dom', () => ({ useNavigate: () => mocks.navigate }));
 vi.mock('../components/shell/PageHead', () => ({ PageHead: () => null }));
 vi.mock('../components/app/CreateAppModal', () => ({ CreateAppModal: () => null }));
-vi.mock('../i18n', () => ({ useTranslation: () => ({ lang: 'zh' }) }));
-vi.mock('../i18n/dates', () => ({ formatDate: () => '7 月 18 日' }));
+vi.mock('../i18n', () => ({ useTranslation: () => ({ lang: 'en' }) }));
+vi.mock('../i18n/dates', () => ({ formatDate: () => 'Saturday, July 18' }));
 vi.mock('../lib/workspaceContext', () => ({
   useWorkspace: () => ({
-    activeWorkspace: { id: 'ws_1', name: '工作区', sensitivity_level: 'L2' },
-    workspaces: [{ id: 'ws_1', name: '工作区', sensitivity_level: 'L2' }],
+    activeWorkspace: { id: 'ws_1', name: 'Workspace', sensitivity_level: 'L2' },
+    workspaces: [{ id: 'ws_1', name: 'Workspace', sensitivity_level: 'L2' }],
     setActiveWorkspaceId: vi.fn(),
   }),
 }));
@@ -76,14 +76,14 @@ vi.mock('../api/client', () => ({
 }));
 
 async function openMenu(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(screen.getByRole('button', { name: '添加文件、技能或工具' }));
+  await user.click(screen.getByRole('button', { name: 'Add files, skills, or tools' }));
 }
 
 // The "+" menu is a click-based flyout now: the skills chip cloud lives in a
-// secondary panel that opens to the right of the primary menu when the 技能
+// secondary panel that opens to the right of the primary menu when the Skills
 // row is clicked (it no longer starts expanded).
 async function openSkills(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(screen.getByRole('menuitem', { name: /技能/ }));
+  await user.click(screen.getByRole('menuitem', { name: /^Skills/ }));
 }
 
 beforeEach(() => {
@@ -97,20 +97,20 @@ describe('HomePage "+" menu', () => {
     const user = userEvent.setup();
     render(<HomePage />);
 
-    const trigger = screen.getByRole('button', { name: '添加文件、技能或工具' });
+    const trigger = screen.getByRole('button', { name: 'Add files, skills, or tools' });
     expect(trigger).toHaveAttribute('aria-haspopup', 'menu');
     await user.click(trigger);
 
-    expect(screen.getByRole('menuitem', { name: /上传文件 \/ 图片/ })).toBeInTheDocument();
-    expect(screen.getByRole('menuitem', { name: /技能/ })).toBeInTheDocument();
-    expect(screen.getByRole('menuitem', { name: /MCP 工具/ })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /Upload files \/ images/ })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /^Skills/ })).toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: /MCP tools/ })).toBeInTheDocument();
 
     // Open the skills flyout - chips reflect the install defaults.
     await openSkills(user);
     expect(screen.getByRole('button', { name: 'pdf-report' })).toHaveAttribute('data-accent', '1');
     expect(screen.getByRole('button', { name: 'excel-clean' })).toHaveAttribute('data-dashed', '1');
 
-    await user.click(screen.getByRole('menuitem', { name: /MCP 工具/ }));
+    await user.click(screen.getByRole('menuitem', { name: /MCP tools/ }));
     expect(screen.getByRole('menuitemcheckbox', { name: /files-mcp/ })).toHaveAttribute(
       'aria-checked',
       'true',
@@ -128,7 +128,7 @@ describe('HomePage "+" menu', () => {
     await openSkills(user);
 
     await user.click(screen.getByRole('button', { name: 'pdf-report' }));
-    await user.click(screen.getByRole('menuitem', { name: /MCP 工具/ }));
+    await user.click(screen.getByRole('menuitem', { name: /MCP tools/ }));
     await user.click(screen.getByRole('menuitemcheckbox', { name: /jira-mcp/ }));
 
     expect(mocks.createSession).not.toHaveBeenCalled();
@@ -147,11 +147,11 @@ describe('HomePage "+" menu', () => {
     await openMenu(user);
     await openSkills(user);
     await user.click(screen.getByRole('button', { name: 'excel-clean' }));
-    await user.click(screen.getByRole('menuitem', { name: /MCP 工具/ }));
+    await user.click(screen.getByRole('menuitem', { name: /MCP tools/ }));
     await user.click(screen.getByRole('menuitemcheckbox', { name: /files-mcp/ }));
 
-    await user.type(screen.getByRole('textbox'), '帮我规划明天');
-    await user.click(screen.getByRole('button', { name: '发送' }));
+    await user.type(screen.getByRole('textbox'), 'Plan my day tomorrow');
+    await user.click(screen.getByRole('button', { name: 'Send' }));
 
     await waitFor(() => expect(mocks.navigate).toHaveBeenCalled());
     const s = useChatStore.getState();
@@ -171,16 +171,16 @@ describe('HomePage "+" menu', () => {
     await openMenu(user);
     await openSkills(user);
     await user.click(screen.getByRole('button', { name: 'excel-clean' }));
-    await user.type(screen.getByRole('textbox'), '第一个任务');
-    await user.click(screen.getByRole('button', { name: '发送' }));
+    await user.type(screen.getByRole('textbox'), 'First task');
+    await user.click(screen.getByRole('button', { name: 'Send' }));
     await waitFor(() => expect(mocks.navigate).toHaveBeenCalled());
     first.unmount();
 
     // Back on the home page for a second task, menu untouched this time.
     mocks.createSession.mockResolvedValue({ id: 'ses_second' });
     render(<HomePage />);
-    await user.type(screen.getByRole('textbox'), '第二个任务');
-    await user.click(screen.getByRole('button', { name: '发送' }));
+    await user.type(screen.getByRole('textbox'), 'Second task');
+    await user.click(screen.getByRole('button', { name: 'Send' }));
     await waitFor(() => expect(mocks.navigate).toHaveBeenCalledTimes(2));
 
     const s = useChatStore.getState();

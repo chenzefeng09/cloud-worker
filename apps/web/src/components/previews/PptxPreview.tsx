@@ -24,7 +24,7 @@ export default function PptxPreview({ blob }: { blob: Blob }) {
       if (!cancelled) setStatus('done');
     })().catch((e) => {
       if (cancelled) return;
-      setError(e instanceof Error ? e.message : '未知错误');
+      setError(e instanceof Error ? e.message : 'Unknown error');
       setStatus('error');
     });
 
@@ -37,12 +37,12 @@ export default function PptxPreview({ blob }: { blob: Blob }) {
 
   return (
     <div className="border border-line rounded-md overflow-hidden bg-surface">
-      <div className="cw-label px-4 py-2 border-b border-line-2">演示文稿预览</div>
+      <div className="cw-label px-4 py-2 border-b border-line-2">Presentation preview</div>
       {status === 'loading' && (
-        <div className="px-4 py-3 font-mono text-[11px] text-dim">渲染演示文稿…</div>
+        <div className="px-4 py-3 font-mono text-[11px] text-dim">Rendering presentation…</div>
       )}
       {status === 'error' && (
-        <div className="px-4 py-3 font-mono text-[11px] text-accent">PPT 解析失败：{error}</div>
+        <div className="px-4 py-3 font-mono text-[11px] text-accent">Failed to parse presentation: {error}</div>
       )}
       <div
         ref={containerRef}

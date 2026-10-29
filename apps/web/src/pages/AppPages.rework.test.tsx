@@ -1,7 +1,7 @@
 /**
  * App pages interaction rework — guards the three regressions the redesign was
- * meant to fix: the 运行应用 CTA must live in the body (not the page head), the
- * 执行历史 entry point must appear once, and every confirm must be the in-app
+ * meant to fix: the Run CTA must live in the body (not the page head), the
+ * Run history entry point must appear once, and every confirm must be the in-app
  * dialog rather than window.confirm.
  */
 import { render, screen, waitFor, within } from '@testing-library/react';
@@ -109,8 +109,8 @@ describe('acceptance', () => {
 
     await screen.findByText('诗歌生成器');
 
-    // 运行 lives in the body, NOT the page head
-    const runBtns = screen.getAllByRole('button', { name: '运行' });
+    // Run lives in the body, NOT the page head
+    const runBtns = screen.getAllByRole('button', { name: 'Run' });
     expect(runBtns).toHaveLength(1);
     const head = screen.getByTestId('page-head');
     expect(head.contains(runBtns[0])).toBe(false);
@@ -121,33 +121,33 @@ describe('acceptance', () => {
     // page head only has the gear trigger
     const headBtns = within(head).getAllByRole('button');
     expect(headBtns).toHaveLength(1);
-    expect(headBtns[0]).toHaveAttribute('aria-label', '更多操作');
+    expect(headBtns[0]).toHaveAttribute('aria-label', 'More actions');
     expect(headBtns[0]).toHaveAttribute('aria-haspopup', 'menu');
     expect(headBtns[0]).toHaveAttribute('aria-expanded', 'false');
     // it's an icon button (square hit target), not the old bare ⋯ glyph
     expect(headBtns[0].querySelector('svg')).not.toBeNull();
     expect(headBtns[0].textContent).not.toContain('⋯');
 
-    // no duplicate 执行历史 entry point in the head
-    expect(screen.queryByRole('button', { name: '执行历史' })).toBeNull();
+    // no duplicate Run history entry point in the head
+    expect(screen.queryByRole('button', { name: 'Run history' })).toBeNull();
 
-    // gear opens 编辑应用 / 设置触发器 / 删除
+    // gear opens Edit app / Set up trigger / Delete
     await user.click(headBtns[0]);
     const menu = screen.getByRole('menu');
     const items = within(menu).getAllByRole('menuitem').map((b) => b.textContent);
-    expect(items).toEqual(['编辑应用', '设置触发器', '删除']);
-    // published app → 设置触发器 is actionable
-    expect(within(menu).getByRole('menuitem', { name: '设置触发器' })).not.toBeDisabled();
+    expect(items).toEqual(['Edit app', 'Set up trigger', 'Delete']);
+    // published app → Set up trigger is actionable
+    expect(within(menu).getByRole('menuitem', { name: 'Set up trigger' })).not.toBeDisabled();
 
-    // 删除 goes through the in-app confirm dialog (no window.confirm)
+    // Delete goes through the in-app confirm dialog (no window.confirm)
     const confirmSpy = vi.spyOn(window, 'confirm');
-    await user.click(within(menu).getByRole('menuitem', { name: '删除' }));
-    await screen.findByText('删除应用');
+    await user.click(within(menu).getByRole('menuitem', { name: 'Delete' }));
+    await screen.findByText('Delete app');
     expect(confirmSpy).not.toHaveBeenCalled();
     confirmSpy.mockRestore();
   });
 
-  it('detail page: unpublished app disables 运行 with visible hint', async () => {
+  it('detail page: unpublished app disables Run with visible hint', async () => {
     mocks.get.mockResolvedValue({
       ...APP,
       current_version_id: null,
@@ -156,11 +156,11 @@ describe('acceptance', () => {
     mocks.listRuns.mockResolvedValue({ items: [] });
     renderWithShell(<AppDetailPage />);
     await screen.findByText('诗歌生成器');
-    expect(screen.getByRole('button', { name: '运行' })).toBeDisabled();
-    expect(screen.getAllByText('该应用尚未发布').length).toBeGreaterThan(0);
+    expect(screen.getByRole('button', { name: 'Run' })).toBeDisabled();
+    expect(screen.getAllByText('This app hasn’t been published yet').length).toBeGreaterThan(0);
   });
 
-  it('detail page: 执行历史 card lists recent runs with a 查看更多 link', async () => {
+  it('detail page: Run history card lists recent runs with a View more link', async () => {
     mocks.get.mockResolvedValue(APP);
     mocks.listRuns.mockResolvedValue({ items: makeRuns(5) });
     renderWithShell(<AppDetailPage />);
@@ -170,21 +170,21 @@ describe('acceptance', () => {
     for (let i = 0; i < 5; i++) {
       expect(screen.getByText(`第 ${i} 次结果`)).toBeTruthy();
     }
-    expect(screen.getByRole('button', { name: '查看更多' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'View more' })).toBeTruthy();
   });
 
-  it('detail page: fewer than 5 runs hides 查看更多; zero runs shows the empty state', async () => {
+  it('detail page: fewer than 5 runs hides View more; zero runs shows the empty state', async () => {
     mocks.get.mockResolvedValue(APP);
     mocks.listRuns.mockResolvedValue({ items: makeRuns(2) });
     const { unmount } = renderWithShell(<AppDetailPage />);
     await screen.findByText('第 0 次结果');
-    expect(screen.queryByRole('button', { name: '查看更多' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'View more' })).toBeNull();
     unmount();
 
     mocks.listRuns.mockResolvedValue({ items: [] });
     renderWithShell(<AppDetailPage />);
-    await screen.findByText('暂无执行记录。');
-    expect(screen.queryByRole('button', { name: '查看更多' })).toBeNull();
+    await screen.findByText('No runs yet.');
+    expect(screen.queryByRole('button', { name: 'View more' })).toBeNull();
   });
 
   it('detail page: a runs-fetch failure degrades to an in-card message', async () => {
@@ -193,11 +193,11 @@ describe('acceptance', () => {
     renderWithShell(<AppDetailPage />);
     // the page itself still renders
     await screen.findByText('诗歌生成器');
-    await screen.findByText('加载执行记录失败');
-    expect(screen.getByRole('button', { name: '运行' })).toBeTruthy();
+    await screen.findByText('Failed to load run history');
+    expect(screen.getByRole('button', { name: 'Run' })).toBeTruthy();
   });
 
-  it('detail page: 版本历史 button opens a dialog listing versions', async () => {
+  it('detail page: Version history button opens a dialog listing versions', async () => {
     const user = userEvent.setup();
     mocks.get.mockResolvedValue(APP);
     mocks.listRuns.mockResolvedValue({ items: [] });
@@ -205,16 +205,16 @@ describe('acceptance', () => {
 
     await screen.findByText('诗歌生成器');
 
-    // 版本历史 entry lives in the hero (visible to all users, not just author/admin).
-    const historyBtn = screen.getByRole('button', { name: '版本历史' });
+    // Version history entry lives in the hero (visible to all users, not just author/admin).
+    const historyBtn = screen.getByRole('button', { name: 'Version history' });
     expect(historyBtn).not.toBeDisabled();
     await user.click(historyBtn);
 
-    const dialog = await screen.findByRole('dialog', { name: '版本历史' });
-    // the published v1 row renders with its status chip + 当前 marker
+    const dialog = await screen.findByRole('dialog', { name: 'Version history' });
+    // the published v1 row renders with its status chip + Current marker
     expect(within(dialog).getByText('v1')).toBeTruthy();
-    expect(within(dialog).getByText('已发布')).toBeTruthy();
-    expect(within(dialog).getByText('当前')).toBeTruthy();
+    expect(within(dialog).getByText('Published')).toBeTruthy();
+    expect(within(dialog).getByText('Current')).toBeTruthy();
   });
 
   it('editor page: step 1 shows the app-info block prefilled, saves meta before version', async () => {
@@ -225,24 +225,24 @@ describe('acceptance', () => {
     mocks.update.mockResolvedValue(APP);
     renderWithShell(<AppEditorPage />);
 
-    await screen.findByText('应用信息');
+    await screen.findByText('App info');
     const nameInput = screen.getByDisplayValue('诗歌生成器');
     expect(nameInput).toBeInstanceOf(HTMLInputElement);
     expect(screen.getByDisplayValue('写诗')).toBeInstanceOf(HTMLTextAreaElement);
 
-    // 取消 opens the in-app dialog, not window.confirm
+    // Cancel opens the in-app dialog, not window.confirm
     const confirmSpy = vi.spyOn(window, 'confirm');
-    await user.click(screen.getAllByRole('button', { name: '取消' })[0]);
-    await screen.findByText('放弃更改');
+    await user.click(screen.getAllByRole('button', { name: 'Cancel' })[0]);
+    await screen.findByText('Discard changes');
     expect(confirmSpy).not.toHaveBeenCalled();
-    const cancels = screen.getAllByRole('button', { name: '取消' });
+    const cancels = screen.getAllByRole('button', { name: 'Cancel' });
     await user.click(cancels[cancels.length - 1]);
     confirmSpy.mockRestore();
 
     // renaming then saving pushes api.apps.update first
     await user.clear(nameInput);
     await user.type(nameInput, '新名字');
-    await user.click(screen.getAllByRole('button', { name: '保存' })[0]);
+    await user.click(screen.getAllByRole('button', { name: 'Save' })[0]);
     await waitFor(() =>
       expect(mocks.update).toHaveBeenCalledWith('app_1', {
         name: '新名字',

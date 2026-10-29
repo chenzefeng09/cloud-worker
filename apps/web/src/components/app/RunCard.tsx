@@ -1,6 +1,6 @@
 import { Chip } from '../shell/Chip';
 import { StatusDot, type DesignStatus } from '../shell/StatusDot';
-import { formatAbsoluteTimeZh, formatRelativeTimeZh } from '../../lib/format';
+import { formatAbsoluteTime, formatRelativeTime } from '../../lib/format';
 import { modelLabel } from '../../lib/modelOptions';
 import type { AppRunHistoryItem, RunStatus } from '../../api/types';
 
@@ -34,20 +34,20 @@ export function runToDesignStatus(status: RunStatus): DesignStatus {
   }
 }
 
-export function runStatusZh(status: RunStatus): string {
+export function runStatusLabel(status: RunStatus): string {
   switch (status) {
     case 'PENDING':
-      return '排队中';
+      return 'Queued';
     case 'RUNNING':
-      return '运行中';
+      return 'Running';
     case 'PAUSED':
-      return '待确认';
+      return 'Awaiting confirmation';
     case 'COMPLETED':
-      return '已完成';
+      return 'Completed';
     case 'FAILED':
-      return '已失败';
+      return 'Failed';
     case 'CANCELLED':
-      return '已取消';
+      return 'Cancelled';
     default:
       return status;
   }
@@ -96,16 +96,16 @@ export function RunCard({
     >
       {/* Row 1: status + source + time */}
       <div className="flex items-center gap-2 flex-wrap">
-        <StatusDot status={runToDesignStatus(status)} label={runStatusZh(status)} />
-        {isSchedule && <Chip dashed>定时</Chip>}
+        <StatusDot status={runToDesignStatus(status)} label={runStatusLabel(status)} />
+        {isSchedule && <Chip dashed>Scheduled</Chip>}
         {otherSource && <Chip dashed>{otherSource}</Chip>}
-        {run.execution_mode === 'inline' && <Chip>对话模式</Chip>}
+        {run.execution_mode === 'inline' && <Chip>Chat (legacy)</Chip>}
         <span className="flex-1" />
         <span
           className="font-mono text-[10.5px] text-dim"
-          title={formatAbsoluteTimeZh(run.created_at)}
+          title={formatAbsoluteTime(run.created_at)}
         >
-          {formatRelativeTimeZh(run.created_at)}
+          {formatRelativeTime(run.created_at)}
         </span>
       </div>
 
@@ -116,7 +116,7 @@ export function RunCard({
             {run.app.app_name || '-'}
           </span>
           <Chip>v{run.app.app_version}</Chip>
-          <Chip>模型 · {modelLabel(run.app.model)}</Chip>
+          <Chip>Model · {modelLabel(run.app.model)}</Chip>
         </div>
       )}
 

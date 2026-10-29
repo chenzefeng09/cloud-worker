@@ -59,7 +59,7 @@ async def _proxy(
             )
             return JSONResponse(
                 status_code=502,
-                content={"detail": "画布服务暂时不可用，请稍后重试。", "error": str(exc)},
+                content={"detail": "The canvas service is temporarily unavailable. Please try again later.", "error": str(exc)},
             )
 
     try:

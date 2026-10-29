@@ -954,10 +954,6 @@ export function buildChatRequestBody(
   // Per-session model + reasoning effort, set via the composer dropdowns.
   const model = state.selectedModel[sessionId] || undefined;
   const effortSel = state.selectedEffort[sessionId] || '';
-  // Per-session execution mode (chat/inline vs agent/sandbox). Default to
-  // agent mode ('sandbox') so a session the user never toggled behaves exactly
-  // as before. Always sent explicitly so the choice is unambiguous.
-  const executionMode = state.executionMode[sessionId] || 'sandbox';
 
   return {
     message: opts.text,
@@ -967,7 +963,6 @@ export function buildChatRequestBody(
     ...(platformDefaultsDisabled ? { include_platform_defaults: false } : {}),
     ...(model ? { model } : {}),
     ...(effortSel ? { reasoning_effort: effortSel } : {}),
-    execution_mode: executionMode,
     // Workspace files referenced via "@" in the composer. Only sent when
     // non-empty; the backend contract field is `workspace_file_ids`.
     ...(opts.workspaceFileIds && opts.workspaceFileIds.length > 0
@@ -1124,7 +1119,7 @@ export function useChat() {
 
         if (!res.ok) {
           // Parse the JSON error body (backend now returns plain JSON on failure).
-          let detail = `请求失败 (${res.status})`;
+          let detail = `Request failed (${res.status})`;
           try {
             const errBody = await res.json();
             if (errBody?.detail) detail = String(errBody.detail);
@@ -1223,7 +1218,7 @@ export function useChat() {
       console.error('rewind failed', err);
       // Surface the failure inline; keep the modal open so the user notices.
       setRewindError(
-        err instanceof ApiError ? `回退失败：${err.message}` : '回退失败，请重试。',
+        err instanceof ApiError ? `Rewind failed: ${err.message}` : 'Rewind failed. Please try again.',
       );
     } finally {
       setRewindBusy(false);

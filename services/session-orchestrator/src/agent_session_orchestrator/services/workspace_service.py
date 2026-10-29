@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 _UPDATABLE_FIELDS = {"name", "description", "instructions", "skills", "meta", "sensitivity_level"}
 
 # Lazy-created default workspace presentation (glyph/accent consumed by the UI).
-_DEFAULT_WORKSPACE_NAME = "工作区"
+_DEFAULT_WORKSPACE_NAME = "Workspace"
 _DEFAULT_WORKSPACE_META = {"glyph": "◇", "accent": "#d23a1f"}
 
 
@@ -128,7 +128,7 @@ class WorkspaceService:
                     f"invalid sensitivity_level {new_level!r}",
                     code="AGENT.WORKSPACE.INVALID_LEVEL",
                     status=422,
-                    user_message="密级级别无效，必须是 L1 到 L5 之一。",
+                    user_message="Invalid sensitivity level; it must be one of L1 to L5.",
                 ) from exc
             # LOWERING the workspace level below an existing file's level would
             # violate file_level <= workspace_level.  Raise 409 (conflict) so the
@@ -146,7 +146,7 @@ class WorkspaceService:
                             "workspace sensitivity_level lowered below existing file level",
                             code="AGENT.WORKSPACE.LEVEL_LOWER_THAN_FILES",
                             status=409,
-                            user_message="工作区密级不能低于已有文件密级。",
+                            user_message="The workspace sensitivity level cannot be lower than that of its existing files.",
                         )
         for key, value in updates.items():
             if key in _UPDATABLE_FIELDS:
@@ -216,7 +216,7 @@ class WorkspaceService:
                 "file sensitivity_level exceeds workspace sensitivity_level",
                 code="AGENT.WORKSPACE.FILE_LEVEL_EXCEEDS_WORKSPACE",
                 status=422,
-                user_message="文件密级不能高于工作区密级。",
+                user_message="A file's sensitivity level cannot be higher than the workspace's.",
             )
         wsf = WorkspaceFile(
             tenant_id=self._tenant_id,

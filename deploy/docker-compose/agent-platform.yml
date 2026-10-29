@@ -56,40 +56,8 @@ networks:
     #  service's `networks: [foundation, sandbox_broker]`. sandbox->broker is
     #  container-to-container traffic on this bridge, which enable_icc:false would
     #  also block. So ICC-off is intentionally NOT applied here.)
-  # Converter-only network. doc-to-md has no authentication, so expose it only
-  # to session-orchestrator instead of every service on the foundation mesh.
-  document_internal:
-    driver: bridge
-    internal: true
 
 services:
-  # ===========================================================================
-  # doc-to-md — rich Word/PDF -> Markdown conversion (internal only)
-  #
-  # Build/publish this image from git@github.com:chenzefeng09/doc_to_markdown.git.
-  # It intentionally has no host port and lives on a converter-only network.
-  # The orchestrator treats it as optional and falls back to local extraction.
-  # ===========================================================================
-  doc-to-md:
-    image: ${DOC_TO_MD_IMAGE:-doc-to-md:latest}
-    platform: ${DOC_TO_MD_PLATFORM:-linux/amd64}
-    container_name: agent-doc-to-md
-    restart: unless-stopped
-    environment:
-      DOC_TO_MD_HOST: 0.0.0.0
-      DOC_TO_MD_PORT: "8000"
-      DOC_TO_MD_DATA_DIR: /data
-      DOC_TO_MD_RESULTS_MAX_BYTES: ${DOC_TO_MD_RESULTS_MAX_BYTES:-2147483648}
-      DOC_TO_MD_RESULT_TTL_SECONDS: ${DOC_TO_MD_RESULT_TTL_SECONDS:-86400}
-    volumes:
-      - doc_to_md_data:/data
-    networks: [document_internal]
-    healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz').read()\""]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
   # ===========================================================================
   # migrate — Alembic 迁移 sidecar(一次性 job,镜像复用各服务自身镜像)
   #
@@ -310,18 +278,9 @@ services:
       # user's installed skills whose enabled_by_default flag is true.
       SESSION_ORCHESTRATOR_SKILL_STORE_URL: ${SKILL_STORE_URL:-http://skill-store:8011/api/skills/v1}
       SESSION_ORCHESTRATOR_SKILL_STORE_SERVICE_SCOPES: ${SESSION_ORCHESTRATOR_SKILL_STORE_SERVICE_SCOPES:-skill.read_internal}
-      # Inline chat discovers enabled HTTP MCP tools directly from the registry.
-      # stdio MCP remains sandbox-only because it requires a process boundary.
-      SESSION_ORCHESTRATOR_MCP_REGISTRY_URL: ${MCP_REGISTRY_URL:-http://mcp-registry:8010/api/mcp/v1}
-      SESSION_ORCHESTRATOR_MCP_REGISTRY_SERVICE_SCOPES: ${SESSION_ORCHESTRATOR_MCP_REGISTRY_SERVICE_SCOPES:-mcp.read_internal}
-      SESSION_ORCHESTRATOR_INLINE_MCP_TIMEOUT: ${SESSION_ORCHESTRATOR_INLINE_MCP_TIMEOUT:-20}
       SESSION_ORCHESTRATOR_AUTHZ_URL: http://authz:8002/api/authz/v1
       SESSION_ORCHESTRATOR_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
       SESSION_ORCHESTRATOR_FEATURE_FLAG_URL: http://feature-flag:8012/api/feature-flag/v1
-      # Rich Word/PDF conversion. No hard depends_on: if this optional service
-      # is down, inline runs fall back to the bundled lightweight extractors.
-      SESSION_ORCHESTRATOR_DOC_TO_MD_URL: ${DOC_TO_MD_URL:-http://doc-to-md:8000}
-      SESSION_ORCHESTRATOR_DOC_TO_MD_TIMEOUT: ${DOC_TO_MD_TIMEOUT:-120}
       # Foundation DLP — attachment download check + upload scan/tag (fail-open).
       # Shared FOUNDATION_DLP_URL override aligns with scheduler/tool-broker; dev
       # DLP is the `dlp` service on the foundation network at :8007.
@@ -329,15 +288,9 @@ services:
       # Redis — reads agent run hot-state (plan/step/cursor) written by the sandbox.
       # Same Redis instance the scheduler forwards into sandboxes (SCHEDULER_REDIS_URL).
       SESSION_ORCHESTRATOR_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
-      # LLM gateway — chat-mode "inline" runs stream a plain chat completion
-      # directly from the gateway in-process (no sandbox).  Same gateway the
-      # scheduler/tool-broker use (LLM_GATEWAY_URL); the orchestrator mints an
-      # ephemeral per-run virtual key and calls /chat/completions with header
-      # auth (X-Tenant-Id / X-User-Id / X-LLM-Virtual-Key), no bearer needed.
-      SESSION_ORCHESTRATOR_LLM_GATEWAY_URL: ${LLM_GATEWAY_URL:-http://llm-gateway:8011/api/llm-gateway/v1}
     ports:
       - "${PORT_SESSION_ORCHESTRATOR:-8006}:8006"
-    networks: [foundation, document_internal]
+    networks: [foundation]
     depends_on:
       session-orchestrator-migrate:
         condition: service_completed_successfully
@@ -381,7 +334,7 @@ services:
       # Docker socket proxy — same sidecar the agent-scheduler uses.
       # The pool uses it to start/stop idle sandbox containers.
       DOCKER_HOST: tcp://docker-socket-proxy:2375
-      SANDBOX_POOL_SANDBOX_IMAGE: ${AGENT_IMAGE:-ghcr.io/agent-platform/agentscope-sandbox:0.1}
+      SANDBOX_POOL_SANDBOX_IMAGE: ${AGENT_IMAGE:-ghcr.io/agent-platform/claude-sdk-sandbox:0.1}
       # Prewarmed sandboxes join the internal sandbox_broker network (broker
       # egress mode), NOT the flat foundation network. Mirrors the scheduler's
       # SCHEDULER_SANDBOX_BROKER_NETWORK so warm + cold sandboxes land on the
@@ -429,7 +382,7 @@ services:
     networks: [agent_internal]
 
   # ===========================================================================
-  # Agent Scheduler — spawns sandbox containers running the AgentScope worker
+  # Agent Scheduler — spawns sandbox containers running the Claude SDK worker
   # ===========================================================================
   agent-scheduler:
     build:
@@ -475,27 +428,13 @@ services:
       # is the *only* way the docker SDK is configured here — there is NO
       # /var/run/docker.sock bind-mount on this container.
       DOCKER_HOST: tcp://docker-socket-proxy:2375
-      SCHEDULER_AGENT_IMAGE: ${AGENT_IMAGE:-ghcr.io/agent-platform/agentscope-sandbox:0.1}
-      # Phase 5: alternate Claude SDK worker image, selected per-run by the
-      # ``enable_claude_sdk_worker`` flag or globally by the default below.
-      SCHEDULER_CLAUDE_SDK_IMAGE: ${CLAUDE_SDK_IMAGE:-ghcr.io/agent-platform/claude-sdk-sandbox:0.1}
+      # Claude Agent SDK worker image (sandbox-images/claude-sdk.Dockerfile).
+      SCHEDULER_AGENT_IMAGE: ${AGENT_IMAGE:-ghcr.io/agent-platform/claude-sdk-sandbox:0.1}
       # Cube v0.6 fixes RAM on templates. These aliases may reference the same
       # OCI image while exposing small/large per-run memory tiers.
       SCHEDULER_CUBE_CLAUDE_SDK_TEMPLATE_SMALL: ${CUBE_CLAUDE_SDK_TEMPLATE_SMALL:-claude-sdk-matlab-aerospace-r2-2g}
       SCHEDULER_CUBE_CLAUDE_SDK_TEMPLATE_LARGE: ${CUBE_CLAUDE_SDK_TEMPLATE_LARGE:-claude-sdk-matlab-aerospace-r2-4g}
-      # Global fallback for Claude SDK worker selection.  Stays false so the
-      # committed default keeps routing to AgentScope unless the per-run flag
-      # enables the SDK worker; a deploy can flip every run by setting
-      # USE_CLAUDE_SDK_WORKER_DEFAULT=true.  The per-run flag still wins when on.
-      SCHEDULER_USE_CLAUDE_SDK_WORKER_DEFAULT: ${USE_CLAUDE_SDK_WORKER_DEFAULT:-false}
-      SCHEDULER_LLM_API_KEY: ${LLM_API_KEY:-}
       SCHEDULER_LLM_MODEL: ${LLM_MODEL:-claude-sonnet-4-20250514}
-      # Optional provider/base-URL overrides — forwarded by docker_runtime.py
-      # into the sandbox container as LLM_PROVIDER / LLM_BASE_URL so the
-      # AgentScope worker can target OpenAI-compatible endpoints (DeepSeek,
-      # vLLM, etc.) without rebuilding the image.  Empty = provider default.
-      SCHEDULER_LLM_PROVIDER: ${LLM_PROVIDER:-}
-      SCHEDULER_LLM_BASE_URL: ${LLM_BASE_URL:-}
       # WORKSPACE_BASE must resolve to the SAME path on both the scheduler
       # container and the Docker daemon's host filesystem -- the scheduler
       # creates the per-run dir at this path and then asks docker-socket-proxy
@@ -533,20 +472,6 @@ services:
       SCHEDULER_SKILLS_CACHE_BASE: ${AGENT_SKILLS_CACHE_BASE:-/tmp/agent-platform/skills_cache}
       # Service scopes the scheduler sends to skill-store /internal/skills/resolve.
       SCHEDULER_SKILL_STORE_SERVICE_SCOPES: ${SCHEDULER_SKILL_STORE_SERVICE_SCOPES:-skill.read_internal}
-      # Activate B-M3 extensions + web_fetch + knowledge_tool inside every
-      # sandbox container.  Order matters: mcp_tenant_injector first,
-      # skills_loader second, web_fetch third, knowledge_tool fourth
-      # (after all built-in tools / MCP / Skills are present so it can append
-      # search_knowledge to the assembled toolkit), llm_gateway_enforcer last.
-      # knowledge_tool is fail-open: it self-gates on KNOWLEDGE_INGEST_URL, so
-      # a deployment without knowledge-ingest simply doesn't register the tool.
-      # M1-P4: llm_gateway_enforcer routes all sandbox LLM traffic through the
-      # foundation llm-gateway (tenant virtual key + quota + audit).  With it
-      # present, the scheduler stops injecting the direct LLM_API_KEY into the
-      # sandbox (see docker_runtime.py).  One-line rollback: drop
-      # ``,llm_gateway_enforcer`` from this default (or set the RUNTIME_EXTENSIONS
-      # env) and restart the scheduler — direct-connect resumes.
-      SCHEDULER_RUNTIME_EXTENSIONS: ${RUNTIME_EXTENSIONS:-mcp_tenant_injector,skills_loader,web_fetch,knowledge_tool,event_audit_sink,llm_gateway_enforcer}
       # Web-fetch gateway — forwarded into sandbox as WEB_FETCH_GATEWAY_URL.
       SCHEDULER_WEB_FETCH_GATEWAY_URL: ${WEB_FETCH_GATEWAY_URL:-http://web-fetch-gateway:8013}
       # Foundation DLP — distributed to the sandbox worker as DLP_URL via
@@ -573,7 +498,6 @@ services:
       SCHEDULER_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
       SCHEDULER_AUTHZ_URL: http://authz:8002/api/authz/v1
       SCHEDULER_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
-      SCHEDULER_FEATURE_FLAG_URL: http://feature-flag:8012/api/feature-flag/v1
       SCHEDULER_SESSION_ORCHESTRATOR_URL: http://session-orchestrator:8006/api/session/v1
       # M1-P3: LLM gateway URL — scheduler queries GET /tenant-keys at spawn time
       # and injects LLM_GATEWAY_URL + LLM_VIRTUAL_KEY into sandbox env.
@@ -1091,4 +1015,3 @@ services:
 
 volumes:
   agent_workspaces:
-  doc_to_md_data:

@@ -327,7 +327,7 @@ def test_create_html_stores_verbatim_single_block() -> None:
     assert blocks[0]["text"] == html
     # No title supplied → generic executable-canvas label (not derived from the
     # HTML source, which has no heading).
-    assert canvas.title == "网页应用"
+    assert canvas.title == "Web app"
 
 
 def test_create_html_keeps_supplied_title() -> None:
@@ -474,7 +474,7 @@ def test_manual_version_advances_and_stamps_user() -> None:
     assert updated.current_version == 2
     v2 = [v for v in db.versions if v.version == 2][0]
     assert v2.created_by == "user"
-    assert v2.change_summary == "手动编辑"
+    assert v2.change_summary == "Manual edit"
     assert v2.base_version == 1
 
 
@@ -608,7 +608,7 @@ def test_revert_copies_old_blocks_into_new_version() -> None:
     v3 = [v for v in db.versions if v.version == 3][0]
     assert v3.blocks == v1_blocks
     assert v3.base_version == 1
-    assert "回退" in (v3.change_summary or "")
+    assert "Reverted" in (v3.change_summary or "")
 
 
 def test_revert_unknown_version_raises() -> None:

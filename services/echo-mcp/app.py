@@ -51,13 +51,13 @@ async def mcp(request: Request) -> Response:
                 "tools": [
                     {
                         "name": "echo",
-                        "description": "原样返回输入文本，用于验证 MCP 连接和工具调用。",
+                        "description": "Echo the input text back unchanged; used to verify MCP connectivity and tool calls.",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "message": {
                                     "type": "string",
-                                    "description": "需要回显的文本",
+                                    "description": "Text to echo back",
                                 }
                             },
                             "required": ["message"],
@@ -73,7 +73,7 @@ async def mcp(request: Request) -> Response:
             return _result(
                 request_id,
                 {
-                    "content": [{"type": "text", "text": "未知工具"}],
+                    "content": [{"type": "text", "text": "Unknown tool"}],
                     "isError": True,
                 },
             )

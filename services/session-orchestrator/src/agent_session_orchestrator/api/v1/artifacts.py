@@ -15,7 +15,7 @@ tenants).  No ``X-Actor: ADMIN`` widening here — the Artifacts panel is a
 self-service surface, never an admin replay path.
 
 Auth: ``require_permission("session.read", "session")`` on both reads, same
-guard the session list uses.  Errors are RFC 9457 problem+json with Chinese
+guard the session list uses.  Errors are RFC 9457 problem+json with English
 ``user_message`` where applicable (handled by the shared exception handlers).
 """
 

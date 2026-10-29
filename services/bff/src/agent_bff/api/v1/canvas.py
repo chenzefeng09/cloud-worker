@@ -12,7 +12,7 @@
     直接把替换文本返回给前端。
 
 错误处理遵守本仓 problem+json 惯例：``detail`` 里放结构化 problem，
-带 ``user_message``（中文、用户可读）；不把上游整坨 JSON 原样透传。
+带 ``user_message``（英文、用户可读）；不把上游整坨 JSON 原样透传。
 """
 
 from __future__ import annotations
@@ -109,42 +109,42 @@ def build_canvas_edit_prompt(req: CanvasEditRequest) -> str:
     标签内不放解释。
 
     与前端的唯一差异：前端按 ``kind`` 取对象 label（文章/报告/…），BFF 侧
-    不透传 kind 也不复制那张枚举表，统一用中性词「文档」，不影响修订质量。
+    不透传 kind 也不复制那张枚举表，统一用中性词 "document"，不影响修订质量。
     """
-    label = "文档"
+    label = "document"
     if req.scope == "selection" and req.selection is not None:
         target = (
-            f"选中片段（字符 {req.selection.start}-{req.selection.end}）：\n"
+            f"Selected fragment (characters {req.selection.start}-{req.selection.end}):\n"
             f"{req.selection.text}"
         )
     else:
-        target = f"整篇{label}：\n{req.content}"
+        target = f"Full {label}:\n{req.content}"
 
-    title = req.title or f"未命名{label}"
-    scope_desc = "只修改选中片段" if req.scope == "selection" else "整篇修改"
+    title = req.title or f"Untitled {label}"
+    scope_desc = "Edit only the selected fragment" if req.scope == "selection" else "Edit the whole document"
 
     if req.scope == "selection":
-        replacement_hint = "这里放【只替换选中片段】的改写结果"
+        replacement_hint = "Put the rewrite of [ONLY THE SELECTED FRAGMENT] here"
         format_rules = [
-            "请严格按下面格式返回：",
-            "- <canvas-replacement> 内只能是选中片段的改写结果，",
-            "  用它原地替换选中片段即可拼回完整文档。",
-            "- 禁止在 <canvas-replacement> 内包含选区之外的任何原文，",
-            "  禁止返回整篇全文或选区所在的整段上下文，禁止回显选区前后的句子。",
-            "- 不要在 <canvas-replacement> 内放解释。",
+            "Reply strictly in the format below:",
+            "- <canvas-replacement> must contain only the rewrite of the selected fragment,",
+            "  so that replacing the selection with it in place yields the complete document.",
+            "- Never include any original text from outside the selection in <canvas-replacement>;",
+            "  never return the whole document or the full surrounding paragraph, and never echo the sentences before or after the selection.",
+            "- Do not put explanations inside <canvas-replacement>.",
         ]
     else:
-        replacement_hint = "这里放可直接替换整篇的文本"
+        replacement_hint = "Put the text that directly replaces the whole document here"
         format_rules = [
-            "请严格按下面格式返回，不要在 <canvas-replacement> 内放解释：",
+            "Reply strictly in the format below, with no explanations inside <canvas-replacement>:",
         ]
 
     return "\n".join(
         [
-            f"请作为专业编辑，帮我修改下面这份{label}。",
-            f"标题：{title}",
-            f"修改范围：{scope_desc}",
-            f"修改要求：{req.instruction}",
+            f"As a professional editor, please revise the following {label}.",
+            f"Title: {title}",
+            f"Scope: {scope_desc}",
+            f"Edit request: {req.instruction}",
             "",
             target,
             "",
@@ -153,7 +153,7 @@ def build_canvas_edit_prompt(req: CanvasEditRequest) -> str:
             replacement_hint,
             "</canvas-replacement>",
             "<change-summary>",
-            "- 这里列出关键改动",
+            "- List the key changes here",
             "</change-summary>",
         ]
     )
@@ -470,7 +470,7 @@ async def canvas_edit(
 
     请求体见 ``CanvasEditRequest``。成功 200 返回
     ``{"replacement": "...", "summary": "..." | null}``。
-    失败走 problem+json，带中文 ``user_message``。
+    失败走 problem+json，带英文 ``user_message``。
     """
     tenant_id, user_id, access_token = _auth
     settings = request.app.state.settings
@@ -482,7 +482,7 @@ async def canvas_edit(
     except Exception:  # noqa: BLE001
         raise _problem(
             400,
-            "修订请求格式不正确，请检查后重试。",
+            "The edit request is malformed. Please check it and try again.",
             code="AGENT.BFF.CANVAS.BAD_REQUEST",
             detail="invalid canvas edit request body",
         ) from None
@@ -490,7 +490,7 @@ async def canvas_edit(
     if not req.instruction.strip():
         raise _problem(
             400,
-            "请填写修改要求后再提交。",
+            "Please describe the change you want (edit request) before submitting.",
             code="AGENT.BFF.CANVAS.NO_INSTRUCTION",
             detail="instruction is required",
         )
@@ -508,7 +508,7 @@ async def canvas_edit(
         if not virtual_key:
             raise _problem(
                 400,
-                "当前租户尚未配置可用的模型密钥，请联系管理员在模型管理中配置。",
+                "No model key is configured for this tenant. Please ask an administrator to set one up in Model Management.",
                 code="AGENT.BFF.CANVAS.NO_VIRTUAL_KEY",
                 detail="tenant has no enabled virtual key",
             )
@@ -526,7 +526,7 @@ async def canvas_edit(
         if not model:
             raise _problem(
                 400,
-                "未指定模型，且当前租户没有配置默认模型，请在会话中选择一个模型后重试。",
+                "No model was specified and this tenant has no default model. Please choose a model in the conversation and try again.",
                 code="AGENT.BFF.CANVAS.NO_MODEL",
                 detail="no model provided and tenant has no default model",
             )
@@ -551,7 +551,7 @@ async def canvas_edit(
             logger.warning("canvas edit gateway timeout for session %s: %s", session_id, exc)
             raise _problem(
                 502,
-                "模型响应超时，请稍后重试。",
+                "The model timed out. Please try again later.",
                 code="AGENT.BFF.CANVAS.GATEWAY_TIMEOUT",
                 detail="llm-gateway /chat/completions timed out",
             ) from exc
@@ -559,7 +559,7 @@ async def canvas_edit(
             logger.warning("canvas edit gateway error for session %s: %s", session_id, exc)
             raise _problem(
                 502,
-                "模型服务暂时不可用，请稍后重试。",
+                "The model service is temporarily unavailable. Please try again later.",
                 code="AGENT.BFF.CANVAS.GATEWAY_UNAVAILABLE",
                 detail=f"llm-gateway unreachable: {exc}",
             ) from exc
@@ -568,7 +568,7 @@ async def canvas_edit(
         logger.warning(
             "canvas edit gateway HTTP %s for session %s", resp.status_code, session_id
         )
-        # 尝试透出上游的 user_message（若有），否则给通用中文提示。
+        # 尝试透出上游的 user_message（若有），否则给通用英文提示。
         upstream_user_message: str | None = None
         try:
             body = resp.json()
@@ -580,7 +580,7 @@ async def canvas_edit(
             pass
         raise _problem(
             502,
-            upstream_user_message or "模型服务返回错误，请稍后重试。",
+            upstream_user_message or "The model service returned an error. Please try again later.",
             code="AGENT.BFF.CANVAS.GATEWAY_ERROR",
             detail=f"llm-gateway returned HTTP {resp.status_code}",
         )
@@ -595,7 +595,7 @@ async def canvas_edit(
         logger.warning("canvas edit: failed to parse gateway completion: %s", exc)
         raise _problem(
             502,
-            "模型返回内容无法解析，请重试。",
+            "The model response could not be parsed. Please try again.",
             code="AGENT.BFF.CANVAS.BAD_COMPLETION",
             detail="unexpected chat/completions response shape",
         ) from exc
@@ -616,7 +616,7 @@ async def canvas_edit(
     if not replacement.strip():
         raise _problem(
             502,
-            "模型未返回有效修订，请重试。",
+            "The model did not return a valid revision. Please try again.",
             code="AGENT.BFF.CANVAS.EMPTY_REPLACEMENT",
             detail="model returned empty replacement",
         )

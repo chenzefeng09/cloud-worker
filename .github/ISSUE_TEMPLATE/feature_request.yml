@@ -58,7 +58,7 @@ body:
         - "cron-runner"
         - "web-fetch-gateway"
         - "Web frontend (apps/web)"
-        - "Sandbox / agentscope-ext (runtime_worker, extensions, sandbox images)"
+        - "Agent worker / sandbox (worker-claude-sdk, sandbox images)"
         - "Deploy (docker-compose, Helm, operator, scripts)"
         - "Cross-cutting / multiple components"
         - "Other / not sure"

@@ -33,7 +33,7 @@ export function AppHistoryPage() {
   // ─── Initial load: fetch the app (for the header name) + first runs page ────
   useEffect(() => {
     if (!id) {
-      setError('未指定应用。');
+      setError('No app specified.');
       setLoadingInitial(false);
       return;
     }
@@ -51,7 +51,7 @@ export function AppHistoryPage() {
       })
       .catch((err) => {
         if (!alive) return;
-        setError(err instanceof ApiError ? err.message : '加载执行历史失败');
+        setError(err instanceof ApiError ? err.message : 'Failed to load run history');
       })
       .finally(() => {
         if (alive) setLoadingInitial(false);
@@ -72,7 +72,7 @@ export function AppHistoryPage() {
       setOffset((prev) => prev + resp.items.length);
       setHasMore(resp.items.length === PAGE_SIZE);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '加载更多失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to load more');
     } finally {
       setLoadingMore(false);
     }
@@ -121,10 +121,10 @@ export function AppHistoryPage() {
   };
 
   const crumbs = [
-    { label: '首页', to: '/home' },
-    { label: '应用', to: '/apps' },
-    { label: app?.name || '应用', to: id ? `/apps/${id}` : undefined },
-    { label: '执行历史' },
+    { label: 'Home', to: '/home' },
+    { label: 'Apps', to: '/apps' },
+    { label: app?.name || 'App', to: id ? `/apps/${id}` : undefined },
+    { label: 'Run history' },
   ];
 
   return (
@@ -138,7 +138,7 @@ export function AppHistoryPage() {
               onClick={() => navigate(`/apps/${id}`)}
               className="cw-btn cw-btn-ghost cw-btn-sm"
             >
-              返回应用
+              Back to app
             </button>
           ) : undefined
         }
@@ -149,7 +149,7 @@ export function AppHistoryPage() {
           {/* Header */}
           <div className="flex items-center gap-2">
             <h1 className="m-0 font-display font-normal tracking-[-0.01em] text-[20px] leading-[1.2]">
-              执行历史
+              Run history
             </h1>
             {app && (
               <span className="text-[13px] text-dim truncate">· {app.name}</span>
@@ -165,20 +165,20 @@ export function AppHistoryPage() {
 
           {/* Loading */}
           {loadingInitial && !error && (
-            <div className="font-mono text-[12px] text-dim">加载中…</div>
+            <div className="font-mono text-[12px] text-dim">Loading…</div>
           )}
 
           {/* Empty */}
           {!loadingInitial && !error && items.length === 0 && (
             <div className="border border-line border-dashed bg-surface rounded-md p-6 flex flex-col gap-3 items-center justify-center min-h-[200px]">
-              <div className="font-mono italic text-dim text-[12.5px]">还没有执行记录</div>
+              <div className="font-mono italic text-dim text-[12.5px]">No runs yet</div>
               {id && (
                 <button
                   type="button"
                   onClick={() => navigate(`/apps/${id}/run`)}
                   className="cw-btn cw-btn-primary cw-btn-sm"
                 >
-                  运行此应用
+                  Run this app
                 </button>
               )}
             </div>
@@ -202,7 +202,7 @@ export function AppHistoryPage() {
                 disabled={loadingMore}
                 className="cw-btn cw-btn-ghost cw-btn-sm disabled:opacity-50"
               >
-                {loadingMore ? '加载中…' : '加载更多'}
+                {loadingMore ? 'Loading…' : 'Load more'}
               </button>
             </div>
           )}

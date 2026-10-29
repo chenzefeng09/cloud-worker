@@ -27,8 +27,7 @@
 
 # Unrelated subtrees — none of these are COPYed by claude-sdk.Dockerfile.
 # (sandbox-images/ itself is NOT excluded so the Dockerfile + README stay
-# available; agentscope-ext/ is used by base.Dockerfile via --build-context,
-# not the primary context, so excluding it here is safe.)
+# available.)
 apps/
 services/
 libs/
@@ -37,8 +36,6 @@ docs/
 spikes/
 tests/
 deploy/
-agentscope-ext/
-sandbox-images/wheels/
 
 # Env / secrets / local artefacts
 *.env

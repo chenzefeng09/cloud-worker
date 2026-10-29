@@ -67,10 +67,11 @@ cloud·worker 是**业务层**，构建在
 - **沙箱化 Agent 运行** —— 每次运行分配全新隔离工作区。两种运行时：Docker（开发）与
   CubeSandbox microVM（生产，内核级隔离，见
   [ADR 0001](docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md)）。
-- **两套可互换的 Agent Worker** —— 基于
+- **单一 Agent 运行时** —— 每次运行都由基于
   [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview) 的 TypeScript
-  worker，以及基于 [AgentScope 2.x](https://github.com/agentscope-ai/agentscope) 的 Python
-  worker（见 [ADR 0002](docs/adr/0002-agent-kernel-agentscope-over-openhands.md)）。
+  worker 在沙箱内执行。模型流量全部经由 foundation LLM 网关并使用租户级虚拟密钥；worker 内置的
+  适配器把 Anthropic Messages 转换为网关的 OpenAI 兼容 API，模型厂商仍由网关决定（见
+  [ADR 0003](docs/adr/0003-claude-agent-sdk-sole-agent-runtime.md)）。
 - **人在回路（HITL）** —— Agent 可在运行中途暂停提问或请求确认；卡片在页面刷新后仍能恢复，
   并原地续跑。
 
@@ -83,13 +84,15 @@ cloud·worker 是**业务层**，构建在
   只读挂载进沙箱，单次运行零下载开销。内置一批平台级默认技能。
 - **MCP** —— 租户级 MCP 服务注册表，支持自定义 header、鉴权（含 OAuth）、超时与工具黑白名单。
   经 broker 转发，沙箱内不持有租户凭据。
-- **知识库** —— 文档 → 切块 → 向量化 → pgvector 的入库管道，运行期可作为工具检索。
+- **知识库** —— 文档 → 切块 → 向量化 → pgvector 的入库管道。编排器在每次运行前预取租户知识库的
+  top-k 命中并追加到 Agent 的系统提示中（暂不支持运行中按需检索的工具）。
 
 **文档与工作区**
 
 - **工作区与文件** —— 会话绑定的工作区、`@` 文件补全，以及 PDF / Word / Excel / PowerPoint /
   压缩包的内联预览。
-- **画布（Canvas）** —— 模型可在对话过程中创建与修订的文档面，支持可运行 HTML 在沙箱 iframe 中预览。
+- **画布（Canvas）** —— 用于草稿与可运行 HTML（在沙箱 iframe 中预览）的文档面。用户可创建与编辑画布；
+  Agent 目前不能在运行中创建画布（见 ADR 0003 的已知差距）。
 - **产物（Artifacts）** —— 运行产出以可下载卡片的形式呈现在对话流中。
 
 **运维**
@@ -180,8 +183,8 @@ agent-scheduler :8007 ───────────────▶ sandbox-p
               ▼
         ┌───────────────────────────────────────────────┐
         │  沙箱内的 Agent Worker                        │
-        │  • worker-claude-sdk   (TS, Claude Agent SDK) │
-        │  • agentscope-ext      (Py, AgentScope 2.x)   │
+        │  worker-claude-sdk  (TS, Claude Agent SDK)    │
+        │  适配器 → foundation llm-gateway（虚拟密钥）  │
         └───────┬───────────────────────────┬───────────┘
                 │                           │
                 ▼                           ▼
@@ -200,7 +203,7 @@ agent-scheduler :8007 ───────────────▶ sandbox-p
 |---|---|---|
 | `web` | 5173 | React 19 单页应用 —— 对话、应用、资源库、工作区、管理后台 |
 | `bff` | 8005 | 鉴权代理、API 聚合、SSE 中继、管理后台分发 |
-| `session-orchestrator` | 8006 | 会话、消息、运行、画布、工作区、会话内工具循环 |
+| `session-orchestrator` | 8006 | 会话、消息、运行、画布、工作区、知识库预取 |
 | `agent-scheduler` | 8007 | 拉起沙箱容器/microVM，注入凭据 |
 | `sandbox-pool` | 8008 | 预热的 CubeSandbox microVM 池 |
 | `mcp-registry` | 8010 | 租户 MCP 服务注册表（密钥加密、工具过滤） |
@@ -220,11 +223,8 @@ cloud-worker/
 ├── apps/web/              React 19 单页应用（Vite、Zustand、Tailwind）
 │   └── src/admin/         28 个模块的管理后台
 ├── services/              FastAPI 服务（Python 3.12、Poetry）—— 见上方清单
-├── worker-claude-sdk/     TypeScript Agent worker —— Claude Agent SDK
-├── agentscope-ext/        Python Agent worker + AgentScope 扩展
-│                          （画布/知识库/联网工具、网关强制器、
-│                            MCP 租户注入器、技能加载器、审计 sink）
-├── sandbox-images/        沙箱 Dockerfile —— base / office / MATLAB 分层
+├── worker-claude-sdk/     TypeScript Agent worker —— Claude Agent SDK（唯一运行时）
+├── sandbox-images/        沙箱 Dockerfile —— claude-sdk / claude-sdk-cube / MATLAB
 ├── libs/                  共享客户端库（特性开关、配额守卫）
 ├── contracts/             OpenAPI 3.1 契约 + worker 线协议
 ├── deploy/
@@ -308,7 +308,8 @@ make web-install && make web-dev
 | `FOUNDATION_SDK_PATH` | `../../../saas-foundation/sdks/python` | 兄弟目录的 SDK 源码，作为构建上下文注入 |
 | `BFF_COOKIE_SECRET` | *（空 —— 必须自行设置）* | 会话 Cookie 签名密钥，≥32 字符 |
 | `SCHEDULER_RUNTIME` | `docker` | 开发用 `docker`，microVM 隔离用 `cube` |
-| `CLAUDE_SDK_IMAGE` / `AGENT_IMAGE` | 见 `.env.example` | 各 worker 形态对应的沙箱镜像 |
+| `AGENT_IMAGE` | `ghcr.io/agent-platform/claude-sdk-sandbox:0.1` | 沙箱镜像（Claude Agent SDK worker） |
+| `LLM_MODEL` | 见 `.env.example` | 经 foundation LLM 网关路由的默认模型 |
 | `POOL_IDLE_LOW` / `POOL_IDLE_HIGH` / `POOL_MAX_TOTAL` | `2` / `10` / `50` | microVM 池容量 |
 | `CUBE_CONTROLLER_URL`、`CUBE_TLS_MODE`、`CUBE_API_KEY` | — | CubeSandbox controller（`SCHEDULER_RUNTIME=cube` 时必填） |
 
@@ -354,13 +355,15 @@ GitHub Actions 的分服务流水线位于 `.github/workflows/`。
 
 ## 沙箱镜像
 
-`sandbox-images/` 负责构建 Agent 运行所在的镜像，分层组织：
+`sandbox-images/` 负责构建 Agent 运行所在的镜像，全部运行 Claude Agent SDK worker
+（`node /app/dist/main.js`，非 root uid 1000）：
 
 ```
-base            Python 3.12 · Agent worker · 非 root uid 1000
-                办公文档库 · 科学计算 Python · Noto CJK 字体
-  └─ office     + LibreOffice headless（格式转换，如 docx → pdf）
-       └─ matlab  + MATLAB（Control System / Aerospace 工具箱分层）
+claude-sdk                Docker 运行时（开发）· Node 22 + Python 办公/数据库
+claude-sdk-cube           CubeSandbox 原生 · 科学计算 Python · CMake/原生构建工具
+  └─ claude-sdk-cube-matlab   + MATLAB 2019b（自备授权）
+       └─ Control / Aerospace 工具箱分层（构建脚本）
+claude-sdk-cube-worker-refresh   仅替换已有 Cube 镜像中的 worker
 ```
 
 **默认镜像本身就具备完整办公能力 —— 不需要额外分层，也不需要任何授权。**
@@ -371,9 +374,6 @@ Word / Excel / PowerPoint / PDF；另有 `pandas`、`numpy`、`matplotlib`、`gr
 中文标签能正常渲染而不是变成豆腐块。这些全部是开源包，来自 PyPI / apt。
 构建阶段会断言这些库和 CJK 字体确实可用 —— 镜像坏了会在 build 时失败，而不是运行到一半才炸。
 
-独立的 `office` 分层在此之上加 **LibreOffice headless**，只在需要真正的格式**转换**
-（docx → pdf、xlsx → csv，走 `unoconv`）时才用；单纯生成文档用默认镜像即可。
-
 ```bash
 make build-claude-sdk-image
 ```
@@ -383,10 +383,10 @@ make build-claude-sdk-cube-image
 ```
 
 > **MATLAB 分层需自备授权。** 本仓库不包含、也不得再分发任何 MATLAB 安装介质、许可证文件或
-> 二进制。`matlab*.Dockerfile` 相关目标要求你把 `MATLAB_ISO_DIR` 指向自己合法授权的安装介质。
+> 二进制。`claude-sdk-cube-matlab*` 相关目标要求你把 `MATLAB_ISO_DIR` 指向自己合法授权的安装介质。
 > 平台其余部分不依赖它们 —— 完全跳过这些构建目标，上面所有能力照常可用。
 
-完整分层矩阵见 [sandbox-images/README.md](sandbox-images/README.md)。
+完整镜像矩阵见 [sandbox-images/README.md](sandbox-images/README.md)。
 
 ---
 
@@ -417,7 +417,8 @@ make build-claude-sdk-cube-image
 | 主题 | 文档 |
 |---|---|
 | 沙箱运行时决策 | [ADR 0001 —— CubeSandbox 默认、Kata 兜底](docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md) |
-| Agent 内核决策 | [ADR 0002 —— 选 AgentScope 而非 OpenHands](docs/adr/0002-agent-kernel-agentscope-over-openhands.md) |
+| Agent 运行时决策 | [ADR 0003 —— Claude Agent SDK 作为唯一 Agent 运行时](docs/adr/0003-claude-agent-sdk-sole-agent-runtime.md) |
+| Agent 内核决策（已被取代） | [ADR 0002 —— 选 AgentScope 而非 OpenHands](docs/adr/0002-agent-kernel-agentscope-over-openhands.md) |
 | 沙箱运行时设计 | [docs/design/b-m2-sandbox-runtime-v1.md](docs/design/b-m2-sandbox-runtime-v1.md) |
 | foundation SDK 接入 | [docs/foundation-sdk-consumption.md](docs/foundation-sdk-consumption.md) |
 | 管理后台规格 | [docs/admin-console-v2-spec.md](docs/admin-console-v2-spec.md) |
@@ -464,7 +465,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-第三方组件遵循各自许可证。其中本项目集成了
-[AgentScope](https://github.com/agentscope-ai/agentscope)（Apache 2.0）与
+第三方组件遵循各自许可证。其中 Agent worker 依赖
 [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk)
 （条款由 Anthropic 规定）。若构建 MATLAB 分层镜像，需自行向 MathWorks 取得授权。

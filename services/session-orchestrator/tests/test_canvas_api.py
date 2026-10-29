@@ -131,7 +131,7 @@ def test_get_missing_canvas_404(client: TestClient) -> None:
     assert resp.status_code == 404
     body = resp.json()
     assert body["code"] == "AGENT.SESSION.CANVAS.NOT_FOUND"
-    assert body["user_message"]  # Chinese user_message present
+    assert body["user_message"]  # English user_message present
 
 
 # ── versions + optimistic lock ───────────────────────────────────────────────

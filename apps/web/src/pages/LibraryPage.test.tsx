@@ -99,24 +99,24 @@ describe('LibraryPage skill rows', () => {
     const user = userEvent.setup();
     render(<LibraryPage />);
 
-    await user.click(screen.getByRole('button', { name: /技能/ }));
+    await user.click(screen.getByRole('button', { name: /Skills/ }));
 
     const row = await screen.findByTestId('skill-row-sk_default');
     expect(row).toHaveClass('grid-cols-[minmax(0,1fr)_80px_100px_72px]');
     expect(row.querySelector('.min-w-0')).not.toBeNull();
-    expect(row).toHaveTextContent('默认启用');
-    expect(screen.getByTestId('skill-row-sk_ondemand')).toHaveTextContent('按需启用');
+    expect(row).toHaveTextContent('On by default');
+    expect(screen.getByTestId('skill-row-sk_ondemand')).toHaveTextContent('On demand');
   });
 
   it('explains default and per-session activation in the install dialog', async () => {
     const user = userEvent.setup();
     render(<LibraryPage />);
 
-    await user.click(screen.getByRole('button', { name: /技能/ }));
-    await user.click(await screen.findByRole('button', { name: '安装' }));
+    await user.click(screen.getByRole('button', { name: /Skills/ }));
+    await user.click(await screen.findByRole('button', { name: 'Install' }));
 
     expect(screen.getByRole('checkbox')).toBeChecked();
-    expect(screen.getByText('默认在新会话启用')).toBeInTheDocument();
-    expect(screen.getByText(/每个会话输入框的 ⊕ 菜单/)).toBeInTheDocument();
+    expect(screen.getByText('Enable by default in new sessions')).toBeInTheDocument();
+    expect(screen.getByText(/per session from the composer’s ⊕ menu/)).toBeInTheDocument();
   });
 });

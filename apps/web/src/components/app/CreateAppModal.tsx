@@ -51,7 +51,7 @@ export function CreateAppModal({ open, onClose, onCreated }: CreateAppModalProps
 
   const handleCreate = async () => {
     if (!name.trim()) {
-      setError('请填写应用名称');
+      setError('Enter an app name');
       return;
     }
     setSaving(true);
@@ -79,7 +79,7 @@ export function CreateAppModal({ open, onClose, onCreated }: CreateAppModalProps
       onClose();
       navigate(`/apps/${app.id}/edit`);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '创建应用失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to create app');
     } finally {
       setSaving(false);
     }
@@ -98,7 +98,7 @@ export function CreateAppModal({ open, onClose, onCreated }: CreateAppModalProps
       >
         {/* Header */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-line">
-          <div className="text-[13.5px] font-medium">创建应用</div>
+          <div className="text-[13.5px] font-medium">Create app</div>
           <button
             className="font-mono text-[12px] text-dim hover:text-ink transition-colors disabled:opacity-40"
             onClick={onClose}
@@ -119,16 +119,16 @@ export function CreateAppModal({ open, onClose, onCreated }: CreateAppModalProps
           {/* Name + Icon */}
           <div className="flex gap-3 items-end">
             <div className="flex flex-col gap-1">
-              <label className="cw-label">图标</label>
+              <label className="cw-label">Icon</label>
               <EmojiPicker value={icon} onChange={setIcon} />
             </div>
             <div className="flex-1 flex flex-col gap-1">
-              <label className="cw-label">名称 *</label>
+              <label className="cw-label">Name *</label>
               <input
                 className={inputCls}
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder="合同审查助手"
+                placeholder="Contract review assistant"
                 autoFocus
                 onKeyDown={(e) => {
                   if (e.key === 'Enter' && !saving) handleCreate();
@@ -139,24 +139,24 @@ export function CreateAppModal({ open, onClose, onCreated }: CreateAppModalProps
 
           {/* Description */}
           <div className="flex flex-col gap-1">
-            <label className="cw-label">描述</label>
+            <label className="cw-label">Description</label>
             <textarea
               className={`${inputCls} min-h-[60px] resize-y`}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="一句话说明这个应用做什么"
+              placeholder="One sentence on what this app does"
             />
           </div>
 
           {/* Visibility */}
           <div className="flex flex-col gap-1">
-            <label className="cw-label">可见性</label>
+            <label className="cw-label">Visibility</label>
             <VisibilitySelect value={visibility} onChange={setVisibility} />
           </div>
 
           {/* Tags */}
           <div className="flex flex-col gap-1">
-            <label className="cw-label">标签</label>
+            <label className="cw-label">Tags</label>
             <TagInput value={tags} onChange={setTags} />
           </div>
         </div>
@@ -164,14 +164,14 @@ export function CreateAppModal({ open, onClose, onCreated }: CreateAppModalProps
         {/* Footer */}
         <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-line">
           <button className="cw-btn cw-btn-sm" onClick={onClose} disabled={saving}>
-            取消
+            Cancel
           </button>
           <button
             className="cw-btn cw-btn-primary cw-btn-sm"
             onClick={handleCreate}
             disabled={saving || !name.trim()}
           >
-            {saving ? '创建中…' : '创建'}
+            {saving ? 'Creating…' : 'Create'}
           </button>
         </div>
       </div>

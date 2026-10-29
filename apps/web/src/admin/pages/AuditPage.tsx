@@ -66,7 +66,7 @@ function ActionMultiSelect({
       >
         <span className="flex-1 min-w-0 truncate">
           {selected.length === 0 ? (
-            <span className="text-dim">全部操作</span>
+            <span className="text-dim">All actions</span>
           ) : selected.length <= 2 ? (
             <span className="flex items-center gap-1 flex-wrap">
               {selectedOptions.map((o) => (
@@ -79,7 +79,7 @@ function ActionMultiSelect({
               ))}
             </span>
           ) : (
-            <span className="text-ink-2">已选 {selected.length} 项</span>
+            <span className="text-ink-2">{selected.length} selected</span>
           )}
         </span>
         <span className="font-mono text-[10px] text-dim shrink-0">{open ? '▲' : '▼'}</span>
@@ -93,7 +93,7 @@ function ActionMultiSelect({
               type="text"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="搜索操作名称或标识…"
+              placeholder="Search action name or ID…"
               className="w-full border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper focus:outline-none focus:border-accent"
             />
           </div>
@@ -103,11 +103,11 @@ function ActionMultiSelect({
               onClick={() => onChange([])}
               className="w-full text-left px-2 py-1 text-[11px] font-mono text-dim hover:text-ink hover:bg-paper-2 rounded-sm"
             >
-              清除已选 ({selected.length})
+              Clear selection ({selected.length})
             </button>
           )}
           {visibleGroups.length === 0 && (
-            <div className="px-2 py-3 text-[11.5px] text-dim italic">无匹配操作</div>
+            <div className="px-2 py-3 text-[11.5px] text-dim italic">No matching actions</div>
           )}
           {visibleGroups.map((groupKey) => (
             <div key={groupKey} className="mt-1">
@@ -156,10 +156,10 @@ function rangeForDays(days: number): [string, string] {
 }
 
 const QUICK_RANGES: { label: string; days: number }[] = [
-  { label: '近 24 小时', days: 1 },
-  { label: '近 7 天', days: 7 },
-  { label: '近 30 天', days: 30 },
-  { label: '近 90 天', days: 90 },
+  { label: 'Last 24 hours', days: 1 },
+  { label: 'Last 7 days', days: 7 },
+  { label: 'Last 30 days', days: 30 },
+  { label: 'Last 90 days', days: 90 },
 ];
 
 export function AuditPage() {
@@ -198,7 +198,7 @@ export function AuditPage() {
 
   const handleExportCsv = async () => {
     if (!tenantId) {
-      setError('请先选择一个租户后再导出。');
+      setError('Select a tenant before exporting.');
       return;
     }
     setExporting(true);
@@ -217,7 +217,7 @@ export function AuditPage() {
       a.remove();
       URL.revokeObjectURL(url);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '导出失败');
+      setError(err instanceof ApiError ? err.message : 'Export failed');
     } finally {
       setExporting(false);
     }
@@ -239,7 +239,7 @@ export function AuditPage() {
       if (err instanceof ApiError && (err.status === 404 || err.status === 501 || err.status === 502)) {
         setVerifyTodo(true);
       } else {
-        setVerifyError(err instanceof ApiError ? err.message : '校验失败');
+        setVerifyError(err instanceof ApiError ? err.message : 'Verification failed');
       }
     } finally {
       setVerifying(false);
@@ -264,7 +264,7 @@ export function AuditPage() {
       setEvents([]);
       setQueried(true);
       setIsTodoEndpoint(false);
-      setError('请先选择一个租户后再查询审计事件。');
+      setError('Select a tenant before querying audit events.');
       return;
     }
     setLoading(true);
@@ -283,7 +283,7 @@ export function AuditPage() {
         setIsTodoEndpoint(true);
         setEvents([]);
       } else {
-        setError(err instanceof ApiError ? err.message : '查询失败');
+        setError(err instanceof ApiError ? err.message : 'Query failed');
       }
     } finally {
       setLoading(false);
@@ -293,30 +293,30 @@ export function AuditPage() {
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">审计日志</h1>
-        <p className="text-[12px] text-dim mt-0.5">查询平台操作事件</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Audit log</h1>
+        <p className="text-[12px] text-dim mt-0.5">Search platform activity events</p>
       </div>
 
       {/* Query form */}
       <form onSubmit={handleQuery} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-3">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">查询条件</div>
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Filters</div>
         <div className="grid grid-cols-2 gap-3">
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] font-mono text-dim">租户</label>
+            <label className="text-[11px] font-mono text-dim">Tenant</label>
             <CustomSelect
               options={tenants.map((t) => ({ value: t.id, label: t.name }))}
               value={tenantId}
               onChange={(v) => setTenantId(v)}
-              placeholder={tenantsLoading ? '加载中…' : '请选择租户'}
+              placeholder={tenantsLoading ? 'Loading…' : 'Select a tenant'}
               disabled={tenantsLoading}
             />
           </div>
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] font-mono text-dim">操作 (action)</label>
+            <label className="text-[11px] font-mono text-dim">Action</label>
             <ActionMultiSelect selected={actions} onChange={setActions} />
           </div>
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] font-mono text-dim">开始时间</label>
+            <label className="text-[11px] font-mono text-dim">Start time</label>
             <input
               type="datetime-local"
               className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
@@ -328,7 +328,7 @@ export function AuditPage() {
             />
           </div>
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] font-mono text-dim">结束时间</label>
+            <label className="text-[11px] font-mono text-dim">End time</label>
             <input
               type="datetime-local"
               className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
@@ -341,7 +341,7 @@ export function AuditPage() {
           </div>
         </div>
         <div className="flex items-center gap-1.5 flex-wrap">
-          <span className="text-[11px] font-mono text-dim mr-0.5">快捷周期</span>
+          <span className="text-[11px] font-mono text-dim mr-0.5">Quick range</span>
           {QUICK_RANGES.map((r) => (
             <button
               key={r.days}
@@ -372,7 +372,7 @@ export function AuditPage() {
               }}
               className="px-2 py-0.5 text-[11px] font-mono rounded-sm border border-line bg-paper text-dim hover:text-ink hover:bg-paper-2"
             >
-              清除时间
+              Clear time
             </button>
           )}
         </div>
@@ -380,10 +380,10 @@ export function AuditPage() {
           <button
             type="submit"
             disabled={loading || !tenantId}
-            title={!tenantId ? '请先选择租户' : undefined}
+            title={!tenantId ? 'Select a tenant first' : undefined}
             className="px-3 py-1.5 bg-ink text-paper text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
           >
-            {loading ? '查询中…' : '查询'}
+            {loading ? 'Searching…' : 'Search'}
           </button>
           <button
             type="button"
@@ -391,19 +391,19 @@ export function AuditPage() {
             disabled={verifying}
             className="px-3 py-1.5 text-[12px] font-mono border border-line bg-paper rounded-sm hover:bg-paper-2 disabled:opacity-50"
           >
-            {verifying ? '校验中…' : '链完整性校验'}
+            {verifying ? 'Verifying…' : 'Verify chain integrity'}
           </button>
           <button
             type="button"
             onClick={handleExportCsv}
             disabled={exporting || !tenantId}
-            title={!tenantId ? '请先选择租户' : undefined}
+            title={!tenantId ? 'Select a tenant first' : undefined}
             className="px-3 py-1.5 text-[12px] font-mono border border-line bg-paper rounded-sm hover:bg-paper-2 disabled:opacity-50"
           >
-            {exporting ? '导出中…' : '导出 CSV'}
+            {exporting ? 'Exporting…' : 'Export CSV'}
           </button>
           <span className="text-[11px] text-dim">
-            校验所选租户的审计哈希链与 Merkle 签名（未选租户时校验当前管理员租户）
+            Verify the selected tenant’s audit hash chain and Merkle signatures (defaults to the current admin’s tenant)
           </span>
         </div>
       </form>
@@ -411,7 +411,7 @@ export function AuditPage() {
       {/* Chain integrity verification result */}
       {verifyTodo && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          该能力服务未启用（链校验代理端点不可达）。
+          This service isn’t enabled (the chain verification proxy endpoint is unreachable).
         </div>
       )}
       {verifyError && (
@@ -435,25 +435,25 @@ export function AuditPage() {
               {verifyResult.valid ? '✓' : '✗'}
             </span>
             <span className={`text-[14px] font-display ${verifyResult.valid ? 'text-green-800' : 'text-red-800'}`}>
-              {verifyResult.valid ? '哈希链完整' : '检测到链断裂'}
+              {verifyResult.valid ? 'Hash chain intact' : 'Chain break detected'}
             </span>
           </div>
           <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[11.5px]">
             {verifyResult.events_checked !== undefined && (
               <>
-                <span className="font-mono text-dim">已校验事件</span>
+                <span className="font-mono text-dim">Events verified</span>
                 <span className="font-mono text-ink-2">{verifyResult.events_checked.toLocaleString()}</span>
               </>
             )}
             {verifyResult.signatures_verified !== undefined && (
               <>
-                <span className="font-mono text-dim">签名验证通过</span>
+                <span className="font-mono text-dim">Signatures valid</span>
                 <span className="font-mono text-ink-2">{verifyResult.signatures_verified.toLocaleString()}</span>
               </>
             )}
             {verifyResult.signatures_failed !== undefined && (
               <>
-                <span className="font-mono text-dim">签名验证失败</span>
+                <span className="font-mono text-dim">Signatures invalid</span>
                 <span className={`font-mono ${verifyResult.signatures_failed > 0 ? 'text-red-700' : 'text-ink-2'}`}>
                   {verifyResult.signatures_failed.toLocaleString()}
                 </span>
@@ -461,19 +461,19 @@ export function AuditPage() {
             )}
             {verifyResult.tsa_present !== undefined && (
               <>
-                <span className="font-mono text-dim">含可信时间戳</span>
+                <span className="font-mono text-dim">With trusted timestamp</span>
                 <span className="font-mono text-ink-2">{verifyResult.tsa_present.toLocaleString()}</span>
               </>
             )}
             {verifyResult.effective_tenant_id && (
               <>
-                <span className="font-mono text-dim">校验租户</span>
+                <span className="font-mono text-dim">Tenant verified</span>
                 <span className="font-mono text-ink-2 truncate">{verifyResult.effective_tenant_id}</span>
               </>
             )}
             {!verifyResult.valid && verifyResult.first_break_event_id && (
               <>
-                <span className="font-mono text-red-700">首个断链事件</span>
+                <span className="font-mono text-red-700">First broken event</span>
                 <span className="font-mono text-red-800 truncate">{verifyResult.first_break_event_id}</span>
               </>
             )}
@@ -492,23 +492,23 @@ export function AuditPage() {
 
       {isTodoEndpoint && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          审计代理端点尚未就绪。接线后将自动展示查询结果。
+          The audit proxy endpoint isn’t ready yet. Results will appear here once it’s connected.
         </div>
       )}
 
       {!isTodoEndpoint && queried && !loading && (
         events.length === 0 ? (
-          <div className="font-mono text-[12px] text-dim italic">无匹配事件</div>
+          <div className="font-mono text-[12px] text-dim italic">No matching events</div>
         ) : (
           <div className="border border-line rounded-md overflow-hidden">
             <table className="w-full text-left border-collapse">
               <thead className="bg-paper-2 border-b border-line">
                 <tr>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">时间</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">操作</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">资源</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Time</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Action</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Resource</th>
                   <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Actor</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">租户</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Tenant</th>
                 </tr>
               </thead>
               <tbody>

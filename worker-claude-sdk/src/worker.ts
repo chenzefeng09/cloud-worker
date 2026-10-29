@@ -304,10 +304,10 @@ export function buildSystemPrompt(
   const parts: string[] = [];
 
   const memory = (task.memory ?? "").trim();
-  if (memory) parts.push(`## 相关历史记忆\n\n${memory}`);
+  if (memory) parts.push(`## Relevant memory\n\n${memory}`);
 
   const historyText = historyToText(task);
-  if (historyText) parts.push(`## 历史对话\n\n${historyText}`);
+  if (historyText) parts.push(`## Conversation history\n\n${historyText}`);
 
   const sysPrompt = (task.sys_prompt ?? "").trim();
   if (sysPrompt) parts.push(sysPrompt);
@@ -315,10 +315,10 @@ export function buildSystemPrompt(
   // Skills index (B.3): advertise name + SKILL.md path; the model Reads on demand.
   const skills = task.skills ?? [];
   if (skills.length > 0) {
-    const lines = ["## 可用技能（需要时用 Read 工具读取指令文件）"];
+    const lines = ["## Available skills (use the Read tool to load a skill's instructions when needed)"];
     for (const name of skills) {
       // description left empty in v1 (B.3); only the path is advertised.
-      lines.push(`- ${name}: 见 ${SKILLS_DIR}/${name}/SKILL.md`);
+      lines.push(`- ${name}: see ${SKILLS_DIR}/${name}/SKILL.md`);
     }
     parts.push(lines.join("\n"));
   }
@@ -326,8 +326,8 @@ export function buildSystemPrompt(
   if (downloadedFiles.length > 0) {
     const inputs = inputsDir();
     parts.push(
-      `用户上传了以下文件，位于 ${inputs}/：${downloadedFiles.join(", ")}\n` +
-        `请使用 Read 工具读取 ${inputs}/ 下的文件来完成任务。`,
+      `The user uploaded the following files to ${inputs}/: ${downloadedFiles.join(", ")}\n` +
+        `Use the Read tool to read the files under ${inputs}/ to complete the task.`,
     );
   }
 
@@ -336,8 +336,8 @@ export function buildSystemPrompt(
   // never become run artifacts, so the user never sees them. Static text — the
   // path is a constant, so this stays prefix-cache friendly.
   parts.push(
-    `## 输出文件\n\n生成的文件必须写在 ${workspaceDir()}/ 目录下` +
-      `（例如 ${workspaceDir()}/chart.png）。写到其他目录的文件不会被保存，用户也看不到。`,
+    `## Output files\n\nAny files you generate must be written under ${workspaceDir()}/` +
+      ` (for example ${workspaceDir()}/chart.png). Files written anywhere else are not saved and the user will never see them.`,
   );
 
   return parts.join("\n\n");
@@ -831,7 +831,7 @@ function parseToolFilter(
  * (not COMPLETED/FAILED), and (c) reflects real progress past the start marker.
  * The start-checkpoint (`cursor === "start"`) is written by the run loop itself
  * right before dispatch (main.ts) and carries no real progress — it must never
- * be mistaken for a resume, or every brand-new run gets a bogus "已完成 N 步"
+ * be mistaken for a resume, or every brand-new run gets a bogus "N steps already completed"
  * note prepended to its first prompt. This function is also called *before*
  * that write so it only ever sees a prior run's leftover checkpoint, but the
  * cursor guard keeps it correct regardless of call ordering.
@@ -851,8 +851,8 @@ export async function buildResumeContext(
   const step = checkpoint.step ?? 0;
   const plan = checkpoint.plan ?? "";
   return (
-    `[系统：本次运行从断点恢复，上次已完成 ${step} 步。` +
-    (plan ? `上次计划：${plan}` : "") +
+    `[System: this run is resuming from a checkpoint; ${step} step(s) were already completed.` +
+    (plan ? ` Previous plan: ${plan}` : "") +
     "]"
   );
 }
@@ -995,10 +995,12 @@ export function makeMcpAllowGate(
  * going instead of calling ask_user, so the pause/resume machinery never engages.
  */
 export const ASK_USER_PROMPT_BLOCK =
-  "## 向用户提问（ask_user）\n" +
-  "当你需要用户澄清需求、在多个方案中做选择，或缺少继续执行所必需的信息时，" +
-  "必须调用 ask_user 工具提问并等待用户回答；不要在正文里提问后自行猜测继续，" +
-  "也不要把问题作为最终回复结束任务。用户回答后会自动继续本次任务。";
+  "## Asking the user (ask_user)\n" +
+  "When you need the user to clarify the request, choose between options, or provide " +
+  "information you cannot proceed without, you must call the ask_user tool and wait for " +
+  "the answer. Do not ask in your reply text and then guess and carry on, and do not end " +
+  "the task with a question as your final reply. The task resumes automatically once the " +
+  "user answers.";
 
 /**
  * Build the in-process ask_user MCP server. The handler is NEVER invoked: the
@@ -1010,8 +1012,8 @@ export const ASK_USER_PROMPT_BLOCK =
 function buildAskUserServer(): McpServerConfig {
   const askUser = tool(
     ASK_USER_TOOL,
-    "向用户提出一个澄清问题并等待用户回答。当你需要用户提供信息、做选择或澄清需求时调用。",
-    { question: z.string().describe("要向用户提出的问题") },
+    "Ask the user a clarifying question and wait for their answer. Call this when you need the user to provide information, make a choice, or clarify the request.",
+    { question: z.string().describe("The question to ask the user") },
     async () => ({
       // Unreachable: canUseTool interrupts before the handler runs.
       content: [{ type: "text", text: "" }],
@@ -1162,18 +1164,19 @@ async function safeText(resp: Response): Promise<string> {
 function buildWebFetchServer(env: Env): McpServerConfig {
   const webFetch = tool(
     "web_fetch",
-    "抓取公开 HTTP/HTTPS 网页、API 或文档的内容。这是本沙盒唯一的联网方式：" +
-      "沙盒网络被隔离，无法直接 curl/访问外网，任何需要联网获取的信息（网页正文、" +
-      "公开 API 响应、在线文档等）都必须调用本工具，绝不要尝试用 Bash/curl 直连外网。" +
-      "返回网页文本内容（可能被截断）。",
+    "Fetch the content of a public HTTP/HTTPS web page, API, or document. This is the " +
+      "only way to reach the network from this sandbox: the sandbox network is isolated " +
+      "and cannot curl or reach the internet directly, so anything that requires going " +
+      "online (page text, public API responses, online docs, etc.) must use this tool. " +
+      "Never try to reach the internet with Bash/curl. Returns the page text (may be truncated).",
     {
       url: z
         .string()
-        .describe("要抓取的完整 http/https URL（必填）"),
+        .describe("The full http/https URL to fetch (required)"),
       max_bytes: z
         .number()
         .optional()
-        .describe("响应正文最大字节数（可选，默认 1048576 = 1 MiB）"),
+        .describe("Maximum response body size in bytes (optional, default 1048576 = 1 MiB)"),
     },
     async (args: { url: string; max_bytes?: number }) => {
       const text = await runWebFetch(env, args.url, args.max_bytes);

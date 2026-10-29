@@ -466,7 +466,7 @@ def _raise_for_upstream(resp: httpx.Response) -> None:
     speaks RFC7807 problem+json, its user-facing ``user_message`` is also
     lifted alongside the nested document so the SPA can show a friendly message
     without digging through the problem body. Note that header transport is
-    avoided on purpose: ``user_message`` is frequently non-ASCII (Chinese) and
+    avoided on purpose: ``user_message`` may be non-ASCII (upstream text) and
     HTTP header values are latin-1, which would crash on encode.
     """
     if resp.status_code >= 400:

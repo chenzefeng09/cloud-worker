@@ -215,10 +215,10 @@ describe("buildReplayPrompt", () => {
     });
     const text = await replayText(task);
     expect(text).toContain("原始需求");
-    expect(text).toContain("之前的对话回顾");
-    expect(text).toContain("已批准");
+    expect(text).toContain("Conversation so far");
+    expect(text).toContain("approved");
     expect(text).toContain("mcp__github__search_code");
-    expect(text).toContain("重新发起");
+    expect(text).toContain("Re-issue");
   });
 
   it("confirm-reject → injects denial guidance, tells the model to continue without it", async () => {
@@ -226,8 +226,8 @@ describe("buildReplayPrompt", () => {
       resume: { kind: "confirm", tool_call_id: "tu_old", confirmed: false, agent_state: replay },
     });
     const text = await replayText(task);
-    expect(text).toContain("拒绝");
-    expect(text).toContain("不要再尝试");
+    expect(text).toContain("rejected");
+    expect(text).toContain("Do not try to call that tool again");
   });
 
   it("answer leg (kind=answer) → delivers the human's answer", async () => {

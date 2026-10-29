@@ -1,4 +1,4 @@
-"""Docker runtime — spawns and manages sandbox containers (AgentScope worker).
+"""Docker runtime — spawns and manages sandbox containers (Claude SDK worker).
 
 Security posture for B-M1
 -------------------------
@@ -20,7 +20,7 @@ Three hardening rules apply until then:
    never appears in env or logs of the scheduler itself.
 
 3. **Task payload is a file, not argv.**  The user task is written to
-   ``/workspace/task.json`` (UTF-8 JSON) for the AgentScope worker to
+   ``/workspace/task.json`` (UTF-8 JSON) for the Claude SDK worker to
    read; we never splice user-controlled text into the container's
    command line.  The file lives inside the per-run workspace dir so
    it's cleaned up when the workspace is torn down (no stray files under
@@ -47,10 +47,6 @@ from agent_scheduler.config import (
 )
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
 from agent_scheduler.services import artifact_store, egress_policy
-from agent_scheduler.services.feature_flag import (
-    evaluate_flag,
-    runtime_extensions_for_run,
-)
 from agent_scheduler.services.runtime import RUNTIME_REGISTRY
 from agent_scheduler.services.skill_cache import MountedSkill, SkillCache
 
@@ -132,7 +128,6 @@ _SECRET_ENV_KEYS: frozenset[str] = frozenset(
         "FOUNDATION_API_TOKEN",
         "TOOL_BROKER_LEASE",
         "LLM_VIRTUAL_KEY",
-        "LLM_API_KEY",
         "S3_ACCESS_KEY_ID",
         "S3_SECRET_ACCESS_KEY",
         "REDIS_URL",
@@ -225,29 +220,29 @@ class DockerRuntime:
                 MUST be non-empty — passing the empty string defeats the
                 purpose of per-run tokens, so we reject it outright.
             skills: optional list of skill names to activate in the sandbox.
-                Embedded in task.json; consumed by ``skills_loader`` extension.
+                Embedded in task.json; the worker resolves them via skill-store.
             mcp_server_ids: optional per-run MCP server selection, carried with
                 PRESENCE semantics.  ``None`` -> the ``mcp_server_ids`` key is
-                OMITTED from task.json and the in-sandbox ``mcp_tenant_injector``
+                OMITTED from task.json and the in-sandbox worker
                 keeps injecting every enabled tenant server; ``[]`` -> the key is
                 written as ``[]``, meaning no MCP servers for this run; a
                 non-empty list -> only those server ids.  ``None`` is never
                 serialized as ``null``.
             files: optional list of ``{"key": s3key, "filename": name, "mime": mime}``
                 dicts describing user-uploaded attachments.  Written to task.json
-                ``files`` field; the runtime_worker downloads them to
+                ``files`` field; the worker downloads them to
                 ``/workspace/inputs/`` before starting the agent.
             llm_gateway_url: M1-P3 — LLM gateway base URL (with API prefix).
                 Injected as ``LLM_GATEWAY_URL``.  Defaults to
-                ``settings.llm_gateway_url`` when omitted.  The sandbox
-                ignores this env if ``llm_gateway_enforcer`` is not active.
-            llm_virtual_key: tenant virtual key from the gateway.  Required
-                when ``llm_gateway_enforcer`` is active; omitted only for an
-                explicit local direct-connect configuration.
+                ``settings.llm_gateway_url`` when omitted.  The worker sends
+                every model call through this gateway.
+            llm_virtual_key: tenant virtual key from the gateway.  Required:
+                a missing key raises :class:`SandboxSpawnError` (there is no
+                direct-connect fallback).
             user_clearance: the run's effective clearance (``min(user,
                 workspace)``), forwarded by the orchestrator.  Injected into
                 the sandbox env as ``FOUNDATION_USER_CLEARANCE`` so the
-                ``knowledge_tool`` extension can send ``X-User-Clearance`` to
+                worker's knowledge tool can send ``X-User-Clearance`` to
                 knowledge-ingest (foundation mode) and signed into the broker
                 lease so the broker re-injects it for the ki façade (broker
                 mode).  Not secret -> plain env, like tenant/user id.
@@ -271,7 +266,7 @@ class DockerRuntime:
 
         # The task arrives as a file the worker reads, not an argv arg,
         # so we never splice user-controlled text into a shell command.
-        # Schema is pinned by ``agentscope_ext.runtime_worker.__main__``.
+        # Schema is pinned by ``worker-claude-sdk/src/task.ts``.
         self._write_task_file(
             workspace_dir,
             task=task,
@@ -291,22 +286,14 @@ class DockerRuntime:
             workspace_writeback=bool(workspace_id),
         )
 
-        # When the ``llm_gateway_enforcer`` extension is active, the sandbox
-        # routes all LLM traffic through foundation llm-gateway using a
-        # per-tenant virtual key.  The real upstream provider key lives inside
-        # the gateway and must not be exposed to sandbox code.
-        _extensions = {
-            e.strip()
-            for e in (self._settings.runtime_extensions or "").split(",")
-            if e.strip()
-        }
-        _gateway_mode = "llm_gateway_enforcer" in _extensions
-        if _gateway_mode and not llm_virtual_key:
+        # The sandbox routes all LLM traffic through foundation llm-gateway
+        # using a per-tenant virtual key.  The real upstream provider key lives
+        # inside the gateway and must never be exposed to sandbox code.
+        if not llm_virtual_key:
             raise SandboxSpawnError(
-                "llm_gateway_enforcer is enabled but no tenant LLM virtual key "
-                "was provided; refusing direct-connect fallback",
+                "no tenant LLM virtual key was provided; refusing to spawn a "
+                "worker without gateway credentials",
             )
-        _sandbox_llm_api_key = "" if _gateway_mode else self._settings.llm_api_key
         try:
             service_env = egress_policy.service_env(
                 self._settings,
@@ -325,19 +312,6 @@ class DockerRuntime:
         except ValueError as exc:
             raise SandboxSpawnError(str(exc)) from exc
 
-        # Canvas v2 (Phase B): append ``canvas_tool`` to RUNTIME_EXTENSIONS when
-        # the per-run ``enable_canvas_tool`` flag is on.  Failure-open (handled
-        # inside ``evaluate_flag``): a down/slow flag service leaves the base
-        # extensions unchanged, so the flag-off path is byte-for-byte identical
-        # to pre-canvas behaviour.
-        runtime_extensions = runtime_extensions_for_run(
-            base_extensions=self._settings.runtime_extensions,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            flag_url=self._settings.feature_flag_url,
-            timeout_ms=self._settings.feature_flag_timeout_ms,
-        )
-
         # NOTE: this dict is assembled with every value (including secrets)
         # for clarity, but the ``_SECRET_ENV_KEYS`` subset is popped out below
         # (after the conditional appends) and delivered via
@@ -345,16 +319,9 @@ class DockerRuntime:
         # comment on ``_SECRET_ENV_KEYS``.  Only routing/metadata reaches the
         # container env.
         env_vars = {
-            "LLM_API_KEY": _sandbox_llm_api_key,
             "LLM_MODEL": self._settings.llm_model,
-            # Provider selector + base URL are forwarded so the in-sandbox
-            # worker can talk to OpenAI-compatible endpoints (DeepSeek, etc.)
-            # without bundling provider-specific knowledge in the image.
-            # The worker treats the empty string as "fall back to default".
-            "LLM_PROVIDER": self._settings.llm_provider,
-            "LLM_BASE_URL": self._settings.llm_base_url,
-            # LLM gateway env vars.  The enforcer is enabled by default and
-            # refuses to build a model if either URL or virtual key is absent.
+            # LLM gateway env vars.  The worker's adapter refuses to start if
+            # either the URL or the virtual key is absent.
             "LLM_GATEWAY_URL": service_env["LLM_GATEWAY_URL"],
             "WORKSPACE_BASE": str(workspace_dir),
             "FOUNDATION_API_URL": self._settings.foundation_api_url,
@@ -362,7 +329,7 @@ class DockerRuntime:
             "FOUNDATION_TENANT_ID": tenant_id,
             "FOUNDATION_USER_ID": user_id,
             # Effective clearance (min(user, workspace)) for the run.  The
-            # ``knowledge_tool`` extension sends this as X-User-Clearance to
+            # worker's knowledge tool sends this as X-User-Clearance to
             # knowledge-ingest so ki enforces the visibility gate; in broker
             # mode the same value is signed into the lease and the broker
             # re-injects it (trusted) for the ki façade.  Not secret -> plain
@@ -371,21 +338,17 @@ class DockerRuntime:
             "OTEL_EXPORTER_OTLP_ENDPOINT": self._settings.otel_exporter_endpoint,
             "SANDBOX_EGRESS_MODE": service_env["SANDBOX_EGRESS_MODE"],
             "TOOL_BROKER_URL": service_env["TOOL_BROKER_URL"],
-            # B-M3: service URLs for the in-sandbox extensions.
-            # mcp_tenant_injector reads MCP_REGISTRY_URL;
-            # skills_loader reads SKILL_STORE_URL.
-            # RUNTIME_EXTENSIONS activates them in declaration order.
+            # B-M3: service URLs for the worker's tenant MCP / skill lookups.
             "MCP_REGISTRY_URL": service_env["MCP_REGISTRY_URL"],
             "SKILL_STORE_URL": service_env["SKILL_STORE_URL"],
-            "RUNTIME_EXTENSIONS": runtime_extensions,
             # Dev-mode shim: in prod the API gateway translates the verified
             # Bearer JWT into X-Service-Scopes before requests reach internal
             # endpoints.  In this deployment (no gateway between sandbox and
             # these services) the scheduler injects the scopes directly so the
-            # mcp_tenant_injector / skills_loader extensions can set the header.
+            # worker's MCP / skill lookups can set the header.
             # TODO: remove once the gateway enforces scope injection in prod.
             "FOUNDATION_SERVICE_SCOPES": SANDBOX_SERVICE_SCOPES,
-            # S3/MinIO credentials — consumed by runtime_worker to download
+            # S3/MinIO credentials — consumed by the worker to download
             # user-uploaded attachments listed in task.json ``files``.  ALL of
             # these come from ``service_env`` (not ``self._settings``) so the
             # egress mode is the single source of truth: in broker mode the
@@ -400,7 +363,7 @@ class DockerRuntime:
             # in-sandbox worker can write step/plan/cursor checkpoints.
             "RUN_ID": run_id,
             "REDIS_URL": service_env["REDIS_URL"],
-            # Web-fetch gateway — the web_fetch extension reads this to
+            # Web-fetch gateway — the worker's web-fetch tool reads this to
             # POST fetch requests to the gateway sidecar.  The gateway is
             # either reached directly (foundation mode) or through tool-broker.
             "WEB_FETCH_GATEWAY_URL": service_env["WEB_FETCH_GATEWAY_URL"],
@@ -408,7 +371,7 @@ class DockerRuntime:
             # ${DLP_URL}/core/scan for scanning.  Reached directly (foundation
             # mode) or through the tool-broker /dlp façade (broker mode).
             "DLP_URL": service_env["DLP_URL"],
-            # Knowledge-ingest (KB v1) - the knowledge_tool extension GETs
+            # Knowledge-ingest (KB v1) - the worker's knowledge tool GETs
             # ${KNOWLEDGE_INGEST_URL}/search?scope=knowledge.  Reached directly
             # (foundation mode) or through the tool-broker /knowledge/v1
             # facade (broker mode, which re-injects X-User-Clearance from the
@@ -430,9 +393,7 @@ class DockerRuntime:
         # the kernel ``/proc/1/environ`` interface to any in-sandbox code.
         # ``pop`` preserves the existing conditional semantics: a key is only
         # written to the file if it was present in ``env_vars`` (so falsy
-        # LLM_VIRTUAL_KEY / TOOL_BROKER_LEASE are absent here too), while
-        # LLM_API_KEY — which is always present, possibly "" under the
-        # gateway enforcer — is carried through verbatim.
+        # TOOL_BROKER_LEASE is absent here too).
         secret_file_payload = {
             k: env_vars.pop(k) for k in _SECRET_ENV_KEYS if k in env_vars
         }
@@ -483,43 +444,12 @@ class DockerRuntime:
                 )
             )
 
-        # Phase 5: pick the worker image per-run via feature flag.  Failure-open
-        # (handled inside ``evaluate_flag``) means a down/slow flag service
-        # falls back to the AgentScope image, so the agentscope path here is
-        # byte-for-byte unchanged from before this feature landed.
-        use_claude_sdk = evaluate_flag(
-            "enable_claude_sdk_worker",
-            tenant_id=tenant_id,
-            user_id=user_id,
-            flag_url=self._settings.feature_flag_url,
-            timeout_ms=self._settings.feature_flag_timeout_ms,
-        )
-        # Global config fallback: when the per-run flag is False/unreachable, a
-        # deployment can still route every run to the Claude SDK worker via
-        # ``SCHEDULER_USE_CLAUDE_SDK_WORKER_DEFAULT``.  The flag wins when it
-        # returns True; the default only applies on the False branch.  Committed
-        # default is False, so this is a no-op for existing behaviour.
-        if not use_claude_sdk:
-            use_claude_sdk = self._settings.use_claude_sdk_worker_default
-        selected_image = (
-            self._settings.claude_sdk_image
-            if use_claude_sdk
-            else self._settings.agent_image
-        )
-        # ``command=None`` lets docker use the image ENTRYPOINT (the Claude SDK
-        # image's node entry).  AgentScope keeps its explicit argv unchanged.
-        selected_cmd = (
-            None
-            if use_claude_sdk
-            else ["python", "-m", "agentscope_ext.runtime_worker"]
-        )
         logger.info(
             "worker image selected",
             extra={
                 "run_id": run_id,
                 "tenant_id": tenant_id,
-                "image": selected_image,
-                "claude_sdk": use_claude_sdk,
+                "image": self._settings.agent_image,
             },
         )
 
@@ -533,11 +463,10 @@ class DockerRuntime:
 
         try:
             container = self.client.containers.run(
-                image=selected_image,
-                # AgentScope worker entrypoint — see agentscope-ext/README.md.
-                # Argv-only invocation; the task itself lives in workspace/task.json.
-                # Claude SDK path uses command=None to run the image ENTRYPOINT.
-                command=selected_cmd,
+                image=self._settings.agent_image,
+                # ``command=None`` runs the image ENTRYPOINT (the worker's node
+                # entry); the task itself lives in workspace/task.json.
+                command=None,
                 environment=env_vars,
                 mounts=mounts,
                 **network_kwargs,
@@ -558,8 +487,9 @@ class DockerRuntime:
             )
         except docker.errors.ImageNotFound as exc:
             raise SandboxSpawnError(
-                f"Sandbox image not found: {selected_image}. "
-                f"Build it from sandbox-images/base.Dockerfile or pull from the registry."
+                f"Sandbox image not found: {self._settings.agent_image}. "
+                "Build it with `make build-claude-sdk-image` "
+                "(sandbox-images/claude-sdk.Dockerfile) or pull from the registry."
             ) from exc
         except docker.errors.APIError as exc:
             raise SandboxSpawnError(f"Docker API error: {exc}") from exc
@@ -850,19 +780,19 @@ class DockerRuntime:
         resume: dict[str, Any] | None = None,
         workspace_writeback: bool = False,
     ) -> Path:
-        """Write the task payload ``runtime_worker`` will read.
+        """Write the task payload the worker will read.
 
-        Schema (pinned by ``agentscope_ext.runtime_worker.__main__``):
+        Schema (pinned by ``worker-claude-sdk/src/task.ts``):
 
             {
               "task": str,
-              "mcp_servers": [],   # always empty — mcp_tenant_injector fetches live
+              "mcp_servers": [],   # always empty — the worker fetches live
               "mcp_server_ids": [str, ...]  # OPTIONAL key — see below
-              "skills": [str, ...] # skill names; skills_loader fetches manifests
+              "skills": [str, ...] # skill names; the worker fetches manifests
               "files": [{"key": s3key, "filename": name, "mime": mime}, ...]
               "memory": str        # pre-fetched memory snippets (may be empty)
               "history": [...]     # prior-turn conversation the worker restores
-                                   # into AgentState.context for multi-turn memory;
+                                   # into the SDK prompt for multi-turn memory;
                                    # items: {"role","type",...} incl. tool calls
               "sys_prompt": str    # App-harness system prompt the worker appends
                                    # to identity/soul/user prompts (empty for chat)
@@ -871,8 +801,8 @@ class DockerRuntime:
                                    # chat runs; applied by the gateway model builder
             }
 
-        ``mcp_servers`` stays empty because the in-sandbox ``mcp_tenant_injector``
-        extension fetches the enabled server list directly from ``mcp-registry``
+        ``mcp_servers`` stays empty because the in-sandbox worker
+        fetches the enabled server list directly from ``mcp-registry``
         at runtime using ``MCP_REGISTRY_URL`` + ``FOUNDATION_TENANT_ID``.
 
         ``mcp_server_ids`` is the per-run narrowing of that live fetch, and it
@@ -889,10 +819,10 @@ class DockerRuntime:
         "no choice" and "disable everything".
 
         ``skills`` carries the caller-supplied list of skill names; the
-        ``skills_loader`` extension uses them to resolve manifests from
+        worker uses them to resolve manifests from
         ``skill-store`` at runtime.
 
-        ``files`` carries user-uploaded attachments; the runtime_worker
+        ``files`` carries user-uploaded attachments; the worker
         downloads them to ``/workspace/inputs/`` before starting the agent.
 
         ``memory`` carries pre-fetched relevant memory snippets retrieved by

@@ -15,7 +15,7 @@
  * (e.g. due to other state). Prefer the lang-param versions inside components.
  */
 
-import type { Lang } from './index';
+import { readStoredLang, type Lang } from './index';
 
 const LOCALE_MAP: Record<Lang, string> = {
   zh: 'zh-CN',
@@ -65,13 +65,7 @@ export function formatTime(
 // ─── Auto-detect (localStorage read, for non-hook call sites) ────────────────
 
 function detectLang(): Lang {
-  try {
-    const v = localStorage.getItem('app.lang');
-    if (v === 'zh' || v === 'en') return v;
-  } catch {
-    // ignore
-  }
-  return 'zh';
+  return readStoredLang();
 }
 
 export function formatDateTimeAuto(

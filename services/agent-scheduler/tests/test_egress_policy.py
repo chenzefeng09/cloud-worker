@@ -14,22 +14,22 @@ from agent_scheduler.services import egress_policy
 
 
 def _settings(**overrides: object) -> Settings:
-    base: dict[str, object] = dict(
-        env="test",
-        log_level="WARNING",
-        agent_image="hello-world:latest",
-        workspace_base="/tmp/agent-platform-test",
-        docker_network="none",
-        foundation_identity_url="http://identity-test/api/identity/v1",
-        scheduler_service_token="fake-service-token",
-        otel_enabled=False,
-        s3_endpoint_url="http://foundation-minio:9000",
-        s3_bucket="agent-platform",
-        s3_region="us-east-1",
-        s3_access_key_id="minio-root",
-        s3_secret_access_key="minio-root-secret",
-        redis_url="redis://:secret@foundation-redis:6379/0",
-    )
+    base: dict[str, object] = {
+        "env": "test",
+        "log_level": "WARNING",
+        "agent_image": "hello-world:latest",
+        "workspace_base": "/tmp/agent-platform-test",
+        "docker_network": "none",
+        "foundation_identity_url": "http://identity-test/api/identity/v1",
+        "scheduler_service_token": "fake-service-token",
+        "otel_enabled": False,
+        "s3_endpoint_url": "http://foundation-minio:9000",
+        "s3_bucket": "agent-platform",
+        "s3_region": "us-east-1",
+        "s3_access_key_id": "minio-root",
+        "s3_secret_access_key": "minio-root-secret",
+        "redis_url": "redis://:secret@foundation-redis:6379/0",
+    }
     base.update(overrides)
     return Settings(**base)  # type: ignore[arg-type]
 

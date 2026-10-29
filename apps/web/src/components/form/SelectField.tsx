@@ -95,7 +95,7 @@ export function SelectField({
           className={`w-full flex items-center gap-2 bg-surface border rounded-md px-3 py-2 text-left transition-colors focus:outline-none focus-visible:border-accent ${borderCls} ${stateCls}`}
         >
           <span className={`${textCls} flex-1 truncate ${selected ? 'text-ink' : 'text-dim'}`}>
-            {selected?.label ?? placeholder ?? '请选择…'}
+            {selected?.label ?? placeholder ?? 'Select…'}
           </span>
           <span aria-hidden className="text-[9px] text-dim shrink-0 leading-none">
             ▾

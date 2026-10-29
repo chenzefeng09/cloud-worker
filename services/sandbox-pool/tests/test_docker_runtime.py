@@ -18,13 +18,13 @@ from sandbox_pool.docker_runtime import PoolDockerRuntime
 
 
 def _settings(**over: object) -> Settings:
-    base: dict[str, object] = dict(
-        env="test",
-        log_level="WARNING",
-        sandbox_image="test-image:latest",
-        docker_network="test_net",
-        otel_enabled=False,
-    )
+    base: dict[str, object] = {
+        "env": "test",
+        "log_level": "WARNING",
+        "sandbox_image": "test-image:latest",
+        "docker_network": "test_net",
+        "otel_enabled": False,
+    }
     base.update(over)
     return Settings(**base)  # type: ignore[arg-type]
 

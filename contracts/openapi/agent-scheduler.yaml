@@ -18,7 +18,9 @@ openapi: 3.1.0
 
 info:
   title: Agent Platform — Agent Scheduler
-  description: Sandbox orchestration — spawns containers/microVMs running the AgentScope worker. Endpoints: spawn / status / cancel.
+  description: >-
+    Sandbox orchestration — spawns containers/microVMs running the Claude Agent
+    SDK worker (worker-claude-sdk). Endpoints: spawn / status / cancel.
   version: 0.1.0
 
 servers:
@@ -35,7 +37,7 @@ paths:
   /api/scheduler/v1/runs:
     post:
       operationId: scheduler_runs_create
-      summary: Create and start a new run (spawn sandbox with the AgentScope worker)
+      summary: Create and start a new run (spawn sandbox with the Claude Agent SDK worker)
       tags: [Runs]
       parameters:
         - $ref: '#/components/parameters/TenantIdHeader'

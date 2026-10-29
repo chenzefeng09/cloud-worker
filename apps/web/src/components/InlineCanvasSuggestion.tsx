@@ -116,7 +116,7 @@ function renderBlockRow(
         data-op="delete"
       >
         <span className="canvas-magic-edit-tag" data-op="delete">
-          删除
+          Deleted
         </span>
         {diff.orig != null && (
           <div className="canvas-magic-edit-orig" data-me-role="orig" data-me-id={suggestionId}>
@@ -147,7 +147,7 @@ function renderBlockRow(
   );
 }
 
-/** A brand-new block inserted after its anchor (highlighted, marked 新增). */
+/** A brand-new block inserted after its anchor (highlighted, marked "Added"). */
 function renderInsertRow(key: string, diff: CanvasDiff, suggestionId: string): ReactNode {
   return (
     <div
@@ -157,7 +157,7 @@ function renderInsertRow(key: string, diff: CanvasDiff, suggestionId: string): R
       data-op="insert_after"
     >
       <span className="canvas-magic-edit-tag" data-op="insert_after">
-        新增
+        Added
       </span>
       {diff.sugg != null && (
         <div
@@ -225,7 +225,7 @@ export function InlineCanvasSuggestion({
   busy = false,
 }: InlineCanvasSuggestionProps) {
   const selectionScoped = isSelectionScopedSuggestion(suggestion);
-  const label = selectionScoped ? '选区修改建议' : '修改建议';
+  const label = selectionScoped ? 'Suggested edit (selection)' : 'Suggested edit';
   const summary = suggestion.change_summary?.trim() || suggestion.instruction;
 
   return (
@@ -237,10 +237,10 @@ export function InlineCanvasSuggestion({
         </div>
         <div className="canvas-suggestion-actions">
           <button type="button" className="canvas-suggestion-reject" onClick={onReject} disabled={busy}>
-            撤销
+            Discard
           </button>
           <button type="button" className="canvas-suggestion-accept" onClick={onAccept} disabled={busy}>
-            接受
+            Accept
           </button>
         </div>
       </header>

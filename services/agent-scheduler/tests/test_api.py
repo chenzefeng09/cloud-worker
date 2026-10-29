@@ -109,7 +109,8 @@ def test_create_run_mints_token_then_spawns(
     )
     assert secrets["FOUNDATION_API_TOKEN"] == "minted-jwt"
     assert secrets["LLM_VIRTUAL_KEY"] == "vk-test-default"
-    assert secrets["LLM_API_KEY"] == ""
+    # Gateway-only: no direct provider key is ever handed to the sandbox.
+    assert "LLM_API_KEY" not in secrets
 
 
 def test_create_run_forwards_effective_clearance_to_sandbox_env(
@@ -120,7 +121,7 @@ def test_create_run_forwards_effective_clearance_to_sandbox_env(
 ) -> None:
     """``effective_clearance`` in the request body must land in the sandbox env
     as FOUNDATION_USER_CLEARANCE (plain env, not the secrets file) so the
-    in-sandbox knowledge_tool can send X-User-Clearance to knowledge-ingest."""
+    in-sandbox worker's knowledge tool can send X-User-Clearance to knowledge-ingest."""
     spawned = MagicMock()
     spawned.id = "container-clearance"
     mock_docker_client.containers.run.return_value = spawned
@@ -139,9 +140,8 @@ def test_create_run_forwards_effective_clearance_to_sandbox_env(
 
     spawn_env = mock_docker_client.containers.run.call_args.kwargs["environment"]
     assert spawn_env["FOUNDATION_USER_CLEARANCE"] == "L3"
-    # Also wired: the ki URL + the knowledge_tool extension name.
+    # Also wired: the knowledge-ingest URL.
     assert "KNOWLEDGE_INGEST_URL" in spawn_env
-    assert "knowledge_tool" in spawn_env["RUNTIME_EXTENSIONS"]
     # Clearance is NOT secret -> must not ride in the secrets file.
     secrets = _read_run_secrets(
         "/tmp/agent-platform-test",

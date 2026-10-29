@@ -53,7 +53,7 @@ class CronJobCreate(BaseModel):
     # Optional now: required for trigger_type="schedule", must be absent for
     # "webhook". Enforced in the handler so we can return a clear 4xx.
     cron_expression: str | None = None
-    timezone: str = "Asia/Shanghai"
+    timezone: str = "UTC"
     input_values: dict[str, Any] = {}
     enabled: bool = True
     source: str = "USER"

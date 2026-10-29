@@ -16,12 +16,12 @@ const mocks = vi.hoisted(() => ({
 vi.mock('react-router-dom', () => ({ useNavigate: () => mocks.navigate }));
 vi.mock('../components/shell/PageHead', () => ({ PageHead: () => null }));
 vi.mock('../components/app/CreateAppModal', () => ({ CreateAppModal: () => null }));
-vi.mock('../i18n', () => ({ useTranslation: () => ({ lang: 'zh' }) }));
-vi.mock('../i18n/dates', () => ({ formatDate: () => '7 月 18 日' }));
+vi.mock('../i18n', () => ({ useTranslation: () => ({ lang: 'en' }) }));
+vi.mock('../i18n/dates', () => ({ formatDate: () => 'Saturday, July 18' }));
 vi.mock('../lib/workspaceContext', () => ({
   useWorkspace: () => ({
-    activeWorkspace: { id: 'ws_1', name: '工作区', sensitivity_level: 'L2' },
-    workspaces: [{ id: 'ws_1', name: '工作区', sensitivity_level: 'L2' }],
+    activeWorkspace: { id: 'ws_1', name: 'Workspace', sensitivity_level: 'L2' },
+    workspaces: [{ id: 'ws_1', name: 'Workspace', sensitivity_level: 'L2' }],
     setActiveWorkspaceId: mocks.setActiveWorkspaceId,
   }),
 }));
@@ -83,19 +83,18 @@ describe('HomePage composer toolbar', () => {
     const toolbar = screen.getByTestId('home-composer-toolbar');
     expect(toolbar).not.toHaveClass('border-t', 'bg-paper');
 
-    const addButton = screen.getByRole('button', { name: '添加文件、技能或工具' });
+    const addButton = screen.getByRole('button', { name: 'Add files, skills, or tools' });
     expect(addButton).toHaveClass('rounded-full', 'w-9', 'h-9');
 
-    expect(screen.queryByRole('radiogroup', { name: '运行模式' })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: '选择工作区' })).toHaveTextContent('工作区（内部）');
-    expect(screen.getByRole('button', { name: '选择运行模式' })).toHaveTextContent('智能体');
-    expect(screen.getByRole('tooltip', { name: '选择智能体或对话模式' })).toBeInTheDocument();
+    // The execution-mode picker was removed: every run uses the sandbox agent.
+    expect(screen.queryByRole('button', { name: /execution mode|run mode/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Select workspace' })).toHaveTextContent('Workspace (Internal)');
 
-    const sendButton = screen.getByRole('button', { name: '发送' });
+    const sendButton = screen.getByRole('button', { name: 'Send' });
     expect(sendButton).toHaveClass('rounded-full', 'w-10', 'h-10');
     expect(sendButton).toBeDisabled();
 
-    await user.type(screen.getByRole('textbox'), '帮我规划明天');
+    await user.type(screen.getByRole('textbox'), 'Plan my day tomorrow');
     expect(sendButton).toBeEnabled();
   });
 
@@ -106,10 +105,10 @@ describe('HomePage composer toolbar', () => {
     render(<HomePage />);
 
     fireEvent.change(screen.getByRole('textbox'), { target: { value: longPrompt } });
-    await user.click(screen.getByRole('button', { name: '发送' }));
+    await user.click(screen.getByRole('button', { name: 'Send' }));
 
     await waitFor(() => expect(mocks.navigate).toHaveBeenCalled());
-    expect(mocks.createSession.mock.calls[0][0]).toBe('新任务');
+    expect(mocks.createSession.mock.calls[0][0]).toBe('New task');
     expect(mocks.navigate).toHaveBeenCalledWith(
       '/tasks/ses_long?mode=friendly',
       expect.objectContaining({
@@ -125,11 +124,11 @@ describe('HomePage composer toolbar', () => {
     render(<HomePage />);
 
     const textbox = screen.getByRole('textbox');
-    await user.type(textbox, '保留这段任务');
-    await user.click(screen.getByRole('button', { name: '发送' }));
+    await user.type(textbox, 'Keep this task draft');
+    await user.click(screen.getByRole('button', { name: 'Send' }));
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('创建任务失败');
-    expect(textbox).toHaveValue('保留这段任务');
+    expect(await screen.findByRole('alert')).toHaveTextContent('Couldn’t create the task');
+    expect(textbox).toHaveValue('Keep this task draft');
     expect(mocks.navigate).not.toHaveBeenCalled();
     warnSpy.mockRestore();
   });

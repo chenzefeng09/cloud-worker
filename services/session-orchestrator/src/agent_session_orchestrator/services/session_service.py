@@ -168,7 +168,7 @@ class SessionService:
                     "workspace not found or not owned",
                     code="AGENT.SESSION.WORKSPACE_INVALID",
                     status=422,
-                    user_message="所选工作区不存在或无权访问。",
+                    user_message="The selected workspace does not exist or you do not have access to it.",
                 )
 
         session = Session(

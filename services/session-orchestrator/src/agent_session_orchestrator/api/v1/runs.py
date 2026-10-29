@@ -48,13 +48,8 @@ from agent_session_orchestrator.api.dependencies import TClearance, TDbSession, 
 # duplicating any of its logic.
 from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
 from agent_session_orchestrator.domain.models import Run
-from agent_session_orchestrator.services import inline_knowledge_client
+from agent_session_orchestrator.services import knowledge_client
 from agent_session_orchestrator.services.clearance import clearance_rank
-from agent_session_orchestrator.services.inline_run_executor import (
-    cancel_inline_run,
-    has_inline_task,
-    start_inline_run,
-)
 from agent_session_orchestrator.services.session_service import SessionService
 
 router = APIRouter(tags=["Runs"])
@@ -213,33 +208,6 @@ async def _fetch_memory(
         return ""
 
 
-async def _fetch_knowledge(
-    *,
-    knowledge_ingest_url: str,
-    tenant_id: str,
-    user_id: str,
-    query: str,
-    clearance: str,
-) -> str:
-    """Prefetch top-K tenant-knowledge hits → the "知识库资料" injection block.
-
-    Delegates the ``GET /search?scope=knowledge`` call + 【文档名 | 文件夹路径】
-    provenance formatting to :mod:`inline_knowledge_client` (the same code the
-    inline ``search_knowledge`` tool uses, so prefetch and tool stay consistent).
-    Carries the run's **effective clearance** in ``X-User-Clearance`` so ki
-    enforces the visibility gate.  Failure-open: any error → ``""``.
-    """
-    if not query.strip() or not knowledge_ingest_url:
-        return ""
-    return await inline_knowledge_client.fetch_knowledge_prefetch(
-        base_url=knowledge_ingest_url,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        clearance=clearance,
-        query=query,
-        k=_KNOWLEDGE_SEARCH_K,
-    )
-
 
 async def _fetch_default_installed_skills(
     *,
@@ -352,6 +320,33 @@ async def _fetch_platform_default_skills(
         return []
 
 
+async def _fetch_knowledge(
+    *,
+    knowledge_ingest_url: str,
+    tenant_id: str,
+    user_id: str,
+    query: str,
+    clearance: str,
+) -> str:
+    """Prefetch top-K tenant-knowledge hits for the worker's system prompt.
+
+    Delegates the ``GET /search?scope=knowledge`` call + ``[Document | folder/path]``
+    provenance formatting to :mod:`knowledge_client`.  Carries the run's
+    **effective clearance** in ``X-User-Clearance`` so ki enforces the
+    visibility gate.  Failure-open: any error → ``""``.
+    """
+    if not query.strip() or not knowledge_ingest_url:
+        return ""
+    return await knowledge_client.fetch_knowledge_prefetch(
+        base_url=knowledge_ingest_url,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        clearance=clearance,
+        query=query,
+        k=_KNOWLEDGE_SEARCH_K,
+    )
+
+
 async def _assemble_history(
     svc: SessionService, session_id: str, *, current_task: str
 ) -> list[dict[str, Any]]:
@@ -460,54 +455,21 @@ async def create_run(
             detail=f"invalid source {source!r}; must be one of {sorted(_VALID_SOURCES)}",
         )
 
-    # Execution mode — "sandbox" (default) relays to the agent-scheduler and
-    # spawns an agent worker container; "inline" streams a plain chat completion
-    # directly from the LLM gateway in-process (chat mode, no sandbox, no
-    # scheduler).  Defaulting to "sandbox" keeps the existing behaviour intact
-    # for every caller that omits the field.
-    _VALID_EXECUTION_MODES = {"inline", "sandbox"}
+    # Execution mode — every run relays to the agent-scheduler, which spawns a
+    # Claude Agent SDK worker sandbox.  The legacy ``inline`` (in-process chat
+    # completion) mode was removed; an old client still sending it is coerced
+    # to ``sandbox`` rather than rejected so it keeps working.
     execution_mode: str = body.get("execution_mode") or "sandbox"
-    if execution_mode not in _VALID_EXECUTION_MODES:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"invalid execution_mode {execution_mode!r}; "
-                f"must be one of {sorted(_VALID_EXECUTION_MODES)}"
-            ),
-        )
-
-    # ── Sandbox hard-guard for App / scheduled runs ─────────────────────────
-    # The inline (chat-mode) path is an interactive, in-process conversation
-    # turn with no sandbox isolation.  App-harness runs (carry ``app_snapshot``)
-    # and scheduled runs (``source != "user"``) MUST run inside a sandbox: they
-    # execute untrusted, published-app or unattended workloads and rely on the
-    # scheduler's isolation + resource limits.  Silently force them back to
-    # ``sandbox`` (never 400 — an over-eager caller should still succeed) and
-    # warn so the downgrade is visible in the logs.
-    if execution_mode == "inline" and (source != "user" or app_snapshot is not None):
-        logger.warning(
-            "forcing execution_mode=sandbox for a non-interactive run "
-            "(App/scheduled runs may not use inline chat mode)",
-            extra={
-                "session_id": session_id,
-                "source": source,
-                "has_app_snapshot": app_snapshot is not None,
-            },
+    if execution_mode == "inline":
+        logger.info(
+            "execution_mode=inline is no longer supported; using sandbox",
+            extra={"session_id": session_id},
         )
         execution_mode = "sandbox"
-
-    # ── Inline quota check (fail-closed) ────────────────────────────────────
-    # Inline runs bypass the scheduler entirely, so the scheduler's QuotaGuard
-    # never sees them.  Enforce the same ``agent_sessions`` dimension here,
-    # BEFORE the run row is created, so a rejected check leaves no RUNNING
-    # orphan behind.  402 (quota exceeded) / 502 (billing bad status) / 503
-    # (billing unreachable) propagate straight to the caller via the shared
-    # problem+json channel.  The sandbox path is untouched — its quota is still
-    # metered by the scheduler, so metering it here too would double-count.
-    if execution_mode == "inline":
-        quota_guard = request.app.state.quota_guard
-        await quota_guard.check(
-            tenant_id=tenant_id, dimension="agent_sessions", requested=1,
+    if execution_mode != "sandbox":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid execution_mode {execution_mode!r}; must be 'sandbox'",
         )
 
     # Persist the snapshot, source and execution_mode atomically with the run
@@ -565,11 +527,10 @@ async def create_run(
         workspace_sensitivity = None
     effective_clearance = _effective_clearance(clearance, workspace_sensitivity)
 
-    # Pre-fetch relevant memory from knowledge-ingest; failure-open.  ``scope``
-    # splits the two sources: memory (this user's own [memory] docs) is fetched
-    # here for both execution modes; the tenant knowledge base (scope=knowledge)
-    # is prefetched inside the inline branch below (the knowledge tools are
-    # inline-only, so a sandbox run would fetch it only to discard it).
+    # Pre-fetch relevant memory (this user's own [memory] docs) from
+    # knowledge-ingest; failure-open.  The tenant knowledge base
+    # (scope=knowledge) is prefetched separately below and folded into
+    # sys_prompt.
     knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
     memory_snippets = await _fetch_memory(
         knowledge_ingest_url=knowledge_ingest_url,
@@ -589,10 +550,8 @@ async def create_run(
     # Skill selection has presence semantics, not truthiness semantics:
     # explicitly sending ``skills`` (including ``[]`` or ``null``) suppresses
     # automatic defaults.  Only a truly omitted key loads the user's installed
-    # skills whose install relation has ``enabled_by_default=true``.  Resolved
-    # here — BEFORE the inline branch returns — so both the inline and sandbox
-    # branches consume the same result (inline threads the names into the
-    # in-process skill loop; sandbox writes them into task.json).
+    # skills whose install relation has ``enabled_by_default=true``.  The
+    # resolved names are written into task.json for the worker.
     if "skills" in body:
         run_skills = body.get("skills") or []
     else:
@@ -618,12 +577,10 @@ async def create_run(
         _raw_mcp_ids = body.get("mcp_server_ids") or []
         run_mcp_server_ids = [str(s) for s in _raw_mcp_ids if s]
 
-    # ── Workspace context (both execution modes) ────────────────────────────
+    # ── Workspace context ───────────────────────────────────────────────────
     # A session created against a workspace inherits its instructions / base
-    # files / skills on every run.  Loaded here — before the inline branch
-    # returns — so both branches consume the same resolution.  Values are
-    # extracted into plain str/dicts immediately: the inline executor runs as a
-    # background task outside this request transaction and must never receive
+    # files / skills on every run.  Values are
+    # extracted into plain str/dicts immediately so nothing downstream holds
     # ORM rows.  Gated on the ``workspace_context_injection`` flag (fail-open
     # ON) and fail-open throughout — a workspace hiccup never blocks a run.
     from agent_session_orchestrator.services.workspace_context import (
@@ -632,9 +589,7 @@ async def create_run(
     )
 
     # ``None`` = session not workspace-bound (or context injection unavailable);
-    # ``[]`` = workspace bound but it has no base files.  The inline executor
-    # uses the distinction to tell the model the workspace is empty instead of
-    # letting it hallucinate a missing tool.
+    # ``[]`` = workspace bound but it has no base files.
     ws_instructions: str | None = None
     ws_files: list[dict[str, Any]] | None = None
     if session.workspace_id and await workspace_context_injection_enabled(tenant_id):
@@ -692,98 +647,6 @@ async def create_run(
         )
         run_skills = _merge_skills(list(run_skills), _platform_defaults)
 
-    # ── Inline (chat-mode) branch ───────────────────────────────────────────
-    # No scheduler, no sandbox: flip the run to RUNNING in THIS transaction so
-    # the session SSE multiplex poll can select it the instant the response
-    # returns, then launch the in-process executor as a background task.  The
-    # executor streams a plain chat completion from the LLM gateway into the
-    # same Redis token stream the sandbox worker uses, finalizes the run in its
-    # own transaction, and persists the assistant/thinking rows itself (the
-    # scheduler reconciler short-circuits on sandbox_id=None and never would).
-    if execution_mode == "inline":
-        run.status = "RUNNING"
-        run.started_at = _now()
-        session.current_run_id = run.id
-        # ``sandbox_id`` stays NULL — the sentinel for an inline run everywhere
-        # downstream (reconcile short-circuit, sweeper orphan branch, cancel).
-        await db.flush()
-
-        # Prefetch the tenant knowledge base (scope=knowledge) for the "知识库资料"
-        # system block.  Inline-only: the knowledge tools live in the in-process
-        # loop, so a sandbox run would never consume this.  Carries the effective
-        # clearance; failure-open (empty block).
-        knowledge_snippets = await _fetch_knowledge(
-            knowledge_ingest_url=knowledge_ingest_url,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            query=task,
-            clearance=effective_clearance,
-        )
-
-        settings = request.app.state.settings
-        start_inline_run(
-            settings=settings,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            session_id=session_id,
-            run_id=run.id,
-            task=task,
-            model_hint=body.get("model"),
-            # reasoning_effort: original passthrough (None omits the field).  The
-            # current dev gateway parses /chat/completions into a typed
-            # ChatCompletionRequest without a reasoning_effort field and rebuilds
-            # the upstream payload field-by-field, so it *accepts* the field
-            # (HTTP 200, extra="ignore") but silently drops it before forwarding.
-            # Threading it here is therefore a forward-compatible no-op: it starts
-            # taking effect the moment the gateway adds the field to its model, and
-            # never regresses the request today.
-            reasoning_effort=body.get("reasoning_effort"),
-            sys_prompt=sys_prompt,
-            memory=memory_snippets,
-            # Tenant knowledge prefetch ("知识库资料" block) + the effective
-            # clearance the in-process knowledge tools carry on every ki call.
-            knowledge=knowledge_snippets,
-            effective_clearance=effective_clearance,
-            history=history,
-            sampling_params=sampling_params,
-            # Same presence-resolved skill set the sandbox branch relays (already
-            # unioned with the workspace's skills); the executor resolves these
-            # to a catalog and runs the in-process read_skill loop
-            # (empty/omitted → no skill loop, prior behaviour).
-            skills=run_skills,
-            # Presence-resolved MCP selection: ``None`` = use the tenant's
-            # enabled set, ``[]`` = no MCP for this run, list = only these ids.
-            mcp_server_ids=run_mcp_server_ids,
-            # Workspace context as plain values (str / dicts) — the executor
-            # builds the "# 工作区指令" block and the base-files block itself.
-            workspace_instructions=ws_instructions,
-            workspace_files=ws_files,
-        )
-
-        # Record inline-run usage against the ``agent_sessions`` quota dimension
-        # (matches the scheduler's "spawn succeeded → record" semantics: we bill
-        # for the launched run, not the completed one).  Best-effort — the guard
-        # swallows all record errors, so a billing hiccup never fails an already
-        # started run.
-        await request.app.state.quota_guard.record(
-            tenant_id=tenant_id,
-            dimension="agent_sessions",
-            amount=1.0,
-            description=f"inline run {run.id}",
-        )
-
-        # Same response shape as the sandbox branch (sandbox_id is null).
-        return {
-            "id": run.id,
-            "session_id": session_id,
-            "sandbox_id": None,
-            "status": run.status,
-            "task_description": run.task_description,
-            "source": run.source,
-            "execution_mode": run.execution_mode,
-            "created_at": run.created_at.isoformat(),
-        }
-
     # ── Workspace context, sandbox shape ────────────────────────────────────
     # Base files ride the ordinary files[] channel (the worker lands each entry
     # at /workspace/inputs/<filename>); a workspace file whose name collides
@@ -811,8 +674,24 @@ async def create_run(
     if ws_instructions:
         sys_prompt = (
             (sys_prompt + "\n\n" if sys_prompt else "")
-            + "# 工作区指令\n"
+            + "# Workspace instructions\n"
             + ws_instructions
+        )
+
+    # Tenant knowledge base: top-K hits for this task, gated by the effective
+    # clearance, appended to sys_prompt.  Failure-open (empty → no block).
+    knowledge_snippets = await _fetch_knowledge(
+        knowledge_ingest_url=knowledge_ingest_url,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        query=task,
+        clearance=effective_clearance,
+    )
+    if knowledge_snippets.strip():
+        sys_prompt = (
+            (sys_prompt + "\n\n" if sys_prompt else "")
+            + "Knowledge base excerpts:\n"
+            + knowledge_snippets.strip()
         )
 
     scheduler_body: dict[str, Any] = {
@@ -1463,28 +1342,16 @@ async def _do_cancel_run(
     svc = SessionService(db, tenant_id=tenant_id)
     run = await svc.get_run(session_id, run_id)
 
-    # ── Inline (chat-mode) run cancel ───────────────────────────────────────
-    # An inline run has no sandbox / scheduler container: cancel the in-process
-    # asyncio task, push the ``end`` marker so the SSE tail closes, and revoke
-    # the ephemeral key.  We detect inline by execution_mode (authoritative)
-    # OR a live in-process task handle (belt-and-braces).  Never call the
-    # scheduler for these.
-    is_inline = run.execution_mode == "inline" or has_inline_task(run_id)
-    if is_inline:
-        settings = request.app.state.settings
-        await cancel_inline_run(
-            settings=settings,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            run_id=run_id,
-        )
+    # Legacy inline (chat-mode) runs have no sandbox / scheduler container, so
+    # there is nothing to stop — just mark the row cancelled.
+    if run.execution_mode == "inline":
         run.status = "CANCELLED"
         run.finished_at = _now()
         await db.flush()
         await svc.create_message(
             session_id,
             role="system",
-            content="任务已取消",
+            content="Task cancelled",
             run_id=run_id,
         )
         return {"id": run.id, "status": "CANCELLED"}
@@ -1516,7 +1383,7 @@ async def _do_cancel_run(
     await svc.create_message(
         session_id,
         role="system",
-        content="任务已取消",
+        content="Task cancelled",
         run_id=run_id,
     )
 

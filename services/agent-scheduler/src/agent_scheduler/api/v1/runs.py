@@ -4,7 +4,7 @@ Per-run token minting
 ---------------------
 Every ``POST /runs`` mints a fresh, short-lived, scope-limited token via the
 foundation identity service before spawning the container.  The token is
-the only foundation credential the in-sandbox AgentScope worker ever sees,
+the only foundation credential the in-sandbox Claude SDK worker ever sees,
 and its lifetime is capped at ``Settings.sandbox_timeout`` so a leak from
 an arbitrarily-long-running container expires on its own.
 
@@ -32,13 +32,13 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
-logger = logging.getLogger(__name__)
-
 from agent_scheduler.api.authz_guard import require_permission
 from agent_scheduler.api.dependencies import TRuntime, TTenantId, TUserId
 from agent_scheduler.config import SANDBOX_TOKEN_SCOPES, Settings
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
 from agent_scheduler.services.docker_runtime import DockerRuntime
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Runs"])
 
@@ -276,7 +276,11 @@ async def _fetch_tenant_virtual_key(
                 if isinstance(items, list):
                     for item in items:
                         if isinstance(item, dict) and item.get("enabled", True):
-                            key_val = item.get("key") or item.get("virtual_key") or item.get("value")
+                            key_val = (
+                                item.get("key")
+                                or item.get("virtual_key")
+                                or item.get("value")
+                            )
                             if key_val:
                                 return str(key_val)
     except Exception as exc:  # noqa: BLE001
@@ -427,7 +431,7 @@ async def create_run(
     run_id = body.get("run_id", "")
     task = body.get("task", "")
     # Optional: list of skill names to activate in the sandbox.
-    # The skills_loader extension fetches their manifests from skill-store.
+    # The worker resolves their manifests from skill-store.
     skills_raw = body.get("skills")
     skills: list[str] = (
         [str(s) for s in skills_raw if s]
@@ -437,7 +441,7 @@ async def create_run(
     # Optional: per-run MCP server selection, carried with PRESENCE semantics
     # (never truthiness — ``[]`` and "absent" are different instructions):
     #   * key absent      -> None -> task.json omits the key -> the in-sandbox
-    #     mcp_tenant_injector keeps its historical "inject every enabled
+    #     worker keeps its historical "inject every enabled
     #     tenant server" behaviour.
     #   * explicit ``[]`` -> []   -> task.json carries [] -> no MCP servers.
     #   * non-empty list  -> only those server ids.
@@ -448,7 +452,7 @@ async def create_run(
             [str(s) for s in _mcp_raw if s] if isinstance(_mcp_raw, list) else []
         )
     # Optional: list of attachment file dicts {"key", "filename", "mime"}.
-    # Written to task.json; the runtime_worker downloads them to /workspace/inputs/.
+    # Written to task.json; the worker downloads them to /workspace/inputs/.
     files_raw = body.get("files")
     files: list[dict[str, Any]] = (
         [f for f in files_raw if isinstance(f, dict)]
@@ -457,11 +461,11 @@ async def create_run(
     )
     # Optional: pre-fetched memory snippets from knowledge-ingest (forwarded
     # from the orchestrator's create_run).  Written to task.json["memory"] so
-    # the runtime_worker can prepend them to the agent's system prompt.
+    # the worker can prepend them to the agent's system prompt.
     memory: str = str(body.get("memory") or "")
     # Optional: prior-turn conversation history (forwarded from the
     # orchestrator's create_run).  Written to task.json["history"]; the
-    # runtime_worker restores it into AgentState.context for multi-turn memory.
+    # worker replays it into the SDK prompt for multi-turn memory.
     history_raw = body.get("history")
     history: list[dict[str, Any]] = (
         [h for h in history_raw if isinstance(h, dict) and h.get("role")]
@@ -601,12 +605,7 @@ async def create_run(
             tenant_id=tenant_id,
             bearer=scheduler_bearer,
         )
-    extensions = {
-        e.strip()
-        for e in (_settings.runtime_extensions or "").split(",")
-        if e.strip()
-    }
-    if "llm_gateway_enforcer" in extensions and not virtual_key:
+    if not virtual_key:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail="LLM gateway virtual key unavailable for tenant",

@@ -26,33 +26,33 @@ import type {
 const SENSITIVITIES: DlpSensitivity[] = ['L1', 'L2', 'L3', 'L4', 'L5'];
 
 const RESOURCE_TYPES: { value: string; label: string }[] = [
-  { value: 'document', label: 'document（文档）' },
-  { value: 'attachment', label: 'attachment（附件）' },
-  { value: 'message', label: 'message（消息）' },
-  { value: 'knowledge_base', label: 'knowledge_base（知识库）' },
-  { value: 'skill', label: 'skill（技能）' },
-  { value: 'run', label: 'run（运行）' },
+  { value: 'document', label: 'document (Document)' },
+  { value: 'attachment', label: 'attachment (Attachment)' },
+  { value: 'message', label: 'message (Message)' },
+  { value: 'knowledge_base', label: 'knowledge_base (Knowledge base)' },
+  { value: 'skill', label: 'skill (Skill)' },
+  { value: 'run', label: 'run (Run)' },
 ];
 
-// Filter dropdowns include an explicit "全部" option ('' = no filter).
+// Filter dropdowns include an explicit "All" option ('' = no filter).
 const CHECK_TYPE_OPTIONS = [
-  { value: '', label: '全部检查类型' },
-  { value: 'scan', label: 'scan（内容扫描）' },
-  { value: 'read', label: 'read（读取门禁）' },
-  { value: 'download', label: 'download（下载门禁）' },
+  { value: '', label: 'All check types' },
+  { value: 'scan', label: 'scan (Content scan)' },
+  { value: 'read', label: 'read (Read gate)' },
+  { value: 'download', label: 'download (Download gate)' },
 ];
 
 const DECISION_OPTIONS = [
-  { value: '', label: '全部决策' },
-  { value: 'ALLOW', label: 'ALLOW（放行）' },
-  { value: 'DENY', label: 'DENY（拒绝）' },
-  { value: 'QUARANTINE', label: 'QUARANTINE（隔离）' },
-  { value: 'SCAN_REQUIRED', label: 'SCAN_REQUIRED（需扫描）' },
+  { value: '', label: 'All decisions' },
+  { value: 'ALLOW', label: 'ALLOW (Allow)' },
+  { value: 'DENY', label: 'DENY (Deny)' },
+  { value: 'QUARANTINE', label: 'QUARANTINE (Quarantine)' },
+  { value: 'SCAN_REQUIRED', label: 'SCAN_REQUIRED (Scan required)' },
 ];
 
-const RESOURCE_TYPE_FILTER = [{ value: '', label: '全部资源类型' }, ...RESOURCE_TYPES];
+const RESOURCE_TYPE_FILTER = [{ value: '', label: 'All resource types' }, ...RESOURCE_TYPES];
 const SENSITIVITY_FILTER = [
-  { value: '', label: '全部密级' },
+  { value: '', label: 'All classifications' },
   ...SENSITIVITIES.map((s) => ({ value: s, label: s })),
 ];
 
@@ -159,7 +159,7 @@ export function DlpPage() {
     api.admin.dlp
       .stats({}, tid)
       .then(setStats)
-      .catch((err) => setStatsError(err instanceof ApiError ? err.message : '统计加载失败'))
+      .catch((err) => setStatsError(err instanceof ApiError ? err.message : 'Failed to load stats'))
       .finally(() => setStatsLoading(false));
   }, [tid]);
 
@@ -181,7 +181,7 @@ export function DlpPage() {
           setEvents((prev) => (before ? [...prev, ...res.items] : res.items));
           setEventsNextBefore(res.next_before);
         })
-        .catch((err) => setEventsError(err instanceof ApiError ? err.message : '历史加载失败'))
+        .catch((err) => setEventsError(err instanceof ApiError ? err.message : 'Failed to load history'))
         .finally(() => setEventsLoading(false));
     },
     [tid, evCheckType, evDecision],
@@ -205,7 +205,7 @@ export function DlpPage() {
           setRows((prev) => (before ? [...prev, ...res.items] : res.items));
           setRowsNextBefore(res.next_before);
         })
-        .catch((err) => setRowsError(err instanceof ApiError ? err.message : '密级资源加载失败'))
+        .catch((err) => setRowsError(err instanceof ApiError ? err.message : 'Failed to load classified resources'))
         .finally(() => setRowsLoading(false));
     },
     [tid, clSensitivity, clResourceType],
@@ -229,7 +229,7 @@ export function DlpPage() {
 
   const handleScan = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!content.trim()) { setScanError('请填写待扫描内容'); return; }
+    if (!content.trim()) { setScanError('Enter content to scan'); return; }
     setScanning(true);
     setScanError(null);
     setScanResult(null);
@@ -240,7 +240,7 @@ export function DlpPage() {
       );
       setScanResult(res);
     } catch (err) {
-      setScanError(err instanceof ApiError ? err.message : '扫描失败');
+      setScanError(err instanceof ApiError ? err.message : 'Scan failed');
     } finally {
       setScanning(false);
     }
@@ -248,7 +248,7 @@ export function DlpPage() {
 
   const handleTag = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!tagRid.trim()) { setTagError('请填写资源 ID'); return; }
+    if (!tagRid.trim()) { setTagError('Enter a resource ID'); return; }
     setTagging(true);
     setTagError(null);
     try {
@@ -262,12 +262,12 @@ export function DlpPage() {
         },
         tid,
       );
-      toast.success('已标注密级');
+      toast.success('Classification applied');
       setTags(''); setReason('');
       loadRows();
       loadStats();
     } catch (err) {
-      setTagError(err instanceof ApiError ? err.message : '标注失败');
+      setTagError(err instanceof ApiError ? err.message : 'Classification failed');
     } finally {
       setTagging(false);
     }
@@ -275,7 +275,7 @@ export function DlpPage() {
 
   const handleGet = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!getRid.trim()) { setGetError('请填写资源 ID'); return; }
+    if (!getRid.trim()) { setGetError('Enter a resource ID'); return; }
     setGetting(true);
     setGetError(null);
     setClassification(null);
@@ -283,7 +283,7 @@ export function DlpPage() {
       const res = await api.admin.dlp.getClassification(getRt.trim(), getRid.trim(), tid);
       setClassification(res);
     } catch (err) {
-      setGetError(err instanceof ApiError ? err.message : '查询失败');
+      setGetError(err instanceof ApiError ? err.message : 'Lookup failed');
     } finally {
       setGetting(false);
     }
@@ -302,15 +302,15 @@ export function DlpPage() {
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">数据防泄漏</h1>
-        <p className="text-[12px] text-dim mt-0.5">治理面板：决策统计、扫描/决策历史、已标密级资源（→ dlp）</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Data loss prevention</h1>
+        <p className="text-[12px] text-dim mt-0.5">Governance panel: decision stats, scan/decision history and classified resources (→ dlp)</p>
       </div>
 
       {/* Tenant selector */}
       <div className="flex items-center gap-3">
-        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
+        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">Tenant</label>
         <CustomSelect
-          options={[{ value: '', label: '（默认 / 当前租户）' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+          options={[{ value: '', label: '(Default / current tenant)' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
           value={selectedTenantId ?? ''}
           onChange={(v) => setSelectedTenantId(v || null)}
           disabled={tenantsLoading}
@@ -321,14 +321,14 @@ export function DlpPage() {
       {/* ── 1. Overview stats ───────────────────────────────────────────────── */}
       <section className="flex flex-col gap-2">
         <div className="flex items-center justify-between">
-          <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">统计概览</div>
+          <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Overview</div>
           <button
             type="button"
             onClick={loadStats}
             disabled={statsLoading}
             className="px-2 py-0.5 text-[11px] font-mono border border-line bg-paper rounded-sm hover:bg-paper-2 disabled:opacity-50"
           >
-            {statsLoading ? '刷新中…' : '刷新'}
+            {statsLoading ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>
         {statsError && (
@@ -337,13 +337,13 @@ export function DlpPage() {
           </div>
         )}
         {statsLoading && !stats && (
-          <div className="font-mono text-[12px] text-dim">加载统计…</div>
+          <div className="font-mono text-[12px] text-dim">Loading stats…</div>
         )}
         {stats && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
             {/* Total events card */}
             <div className="border border-line rounded-md p-4 bg-surface flex flex-col gap-1 justify-center">
-              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">事件总数（近 30 天）</div>
+              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">Total events (last 30 days)</div>
               <div className="text-[32px] font-display text-ink leading-none">
                 {stats.total_events.toLocaleString()}
               </div>
@@ -361,14 +361,14 @@ export function DlpPage() {
                   </div>
                 ))}
                 {DECISION_KEYS.every((k) => (stats.by_decision?.[k] ?? 0) === 0) && (
-                  <span className="text-[11px] text-dim italic">暂无决策记录</span>
+                  <span className="text-[11px] text-dim italic">No decisions yet</span>
                 )}
               </div>
             </div>
 
             {/* By decision chart */}
             <div className="border border-line rounded-md p-3 bg-surface flex flex-col gap-1">
-              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">按决策分布</div>
+              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">By decision</div>
               <div className="h-[160px]">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={decisionData} margin={{ top: 8, right: 8, bottom: 0, left: -16 }}>
@@ -376,7 +376,7 @@ export function DlpPage() {
                     <YAxis fontSize={9} allowDecimals={false} width={32} />
                     <Tooltip
                       cursor={{ fill: 'rgba(0,0,0,0.04)' }}
-                      formatter={(v) => [Number(v).toLocaleString(), '事件数']}
+                      formatter={(v) => [Number(v).toLocaleString(), 'Events']}
                     />
                     <Bar dataKey="value" radius={[2, 2, 0, 0]}>
                       {decisionData.map((d) => (
@@ -390,7 +390,7 @@ export function DlpPage() {
 
             {/* By sensitivity chart */}
             <div className="border border-line rounded-md p-3 bg-surface flex flex-col gap-1">
-              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">按密级分布</div>
+              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">By classification</div>
               <div className="h-[160px]">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={sensitivityData} margin={{ top: 8, right: 8, bottom: 0, left: -16 }}>
@@ -398,7 +398,7 @@ export function DlpPage() {
                     <YAxis fontSize={9} allowDecimals={false} width={32} />
                     <Tooltip
                       cursor={{ fill: 'rgba(0,0,0,0.04)' }}
-                      formatter={(v) => [Number(v).toLocaleString(), '资源数']}
+                      formatter={(v) => [Number(v).toLocaleString(), 'Resources']}
                     />
                     <Bar dataKey="value" radius={[2, 2, 0, 0]}>
                       {sensitivityData.map((d) => (
@@ -415,7 +415,7 @@ export function DlpPage() {
 
       {/* ── 2. Events: scan / decision history ──────────────────────────────── */}
       <section className="flex flex-col gap-2">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">扫描 / 决策历史</div>
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Scan / decision history</div>
         <div className="flex items-center gap-2 flex-wrap">
           <CustomSelect
             options={CHECK_TYPE_OPTIONS}
@@ -440,12 +440,12 @@ export function DlpPage() {
             <table className="w-full text-left border-collapse">
               <thead className="bg-paper-2 border-b border-line">
                 <tr>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">时间</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">检查类型</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">决策</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">资源</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">用户</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">原因码</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Time</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Check type</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Decision</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Resource</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">User</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Reason code</th>
                 </tr>
               </thead>
               <tbody>
@@ -476,7 +476,7 @@ export function DlpPage() {
                 {events.length === 0 && !eventsLoading && (
                   <tr>
                     <td colSpan={6} className="px-3 py-6 text-center font-mono text-[12px] text-dim italic">
-                      无匹配事件
+                      No matching events
                     </td>
                   </tr>
                 )}
@@ -485,7 +485,7 @@ export function DlpPage() {
           </div>
         )}
         <div className="flex items-center gap-3">
-          {eventsLoading && <span className="font-mono text-[11px] text-dim">加载中…</span>}
+          {eventsLoading && <span className="font-mono text-[11px] text-dim">Loading…</span>}
           {eventsNextBefore && (
             <button
               type="button"
@@ -493,7 +493,7 @@ export function DlpPage() {
               disabled={eventsLoading}
               className="px-3 py-1.5 text-[12px] font-mono border border-line bg-paper rounded-sm hover:bg-paper-2 disabled:opacity-50"
             >
-              加载更多
+              Load more
             </button>
           )}
         </div>
@@ -501,7 +501,7 @@ export function DlpPage() {
 
       {/* ── 3. Classified resources ─────────────────────────────────────────── */}
       <section className="flex flex-col gap-2">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">已标密级资源</div>
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Classified resources</div>
         <div className="flex items-center gap-2 flex-wrap">
           <CustomSelect
             options={SENSITIVITY_FILTER}
@@ -526,12 +526,12 @@ export function DlpPage() {
             <table className="w-full text-left border-collapse">
               <thead className="bg-paper-2 border-b border-line">
                 <tr>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">资源类型</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">资源 ID</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">密级</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">标签</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">标注人</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">标注时间</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Resource type</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Resource ID</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Classification</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Tags</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Classified by</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Classified at</th>
                 </tr>
               </thead>
               <tbody>
@@ -566,7 +566,7 @@ export function DlpPage() {
                 {rows.length === 0 && !rowsLoading && (
                   <tr>
                     <td colSpan={6} className="px-3 py-6 text-center font-mono text-[12px] text-dim italic">
-                      暂无已标密级资源
+                      No classified resources yet
                     </td>
                   </tr>
                 )}
@@ -575,7 +575,7 @@ export function DlpPage() {
           </div>
         )}
         <div className="flex items-center gap-3">
-          {rowsLoading && <span className="font-mono text-[11px] text-dim">加载中…</span>}
+          {rowsLoading && <span className="font-mono text-[11px] text-dim">Loading…</span>}
           {rowsNextBefore && (
             <button
               type="button"
@@ -583,7 +583,7 @@ export function DlpPage() {
               disabled={rowsLoading}
               className="px-3 py-1.5 text-[12px] font-mono border border-line bg-paper rounded-sm hover:bg-paper-2 disabled:opacity-50"
             >
-              加载更多
+              Load more
             </button>
           )}
         </div>
@@ -597,43 +597,43 @@ export function DlpPage() {
           className="flex items-center gap-2 self-start font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim hover:text-ink"
         >
           <span className="text-[10px]">{toolsOpen ? '▼' : '▶'}</span>
-          手动工具（内容扫描 / 密级标注 / 查询密级）
+          Manual tools (content scan / classify / look up classification)
         </button>
 
         {toolsOpen && (
           <div className="flex flex-col gap-4">
             {/* Content scan */}
             <div className="flex flex-col gap-2">
-              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">内容扫描</div>
+              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">Content scan</div>
               <form onSubmit={handleScan} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 max-w-2xl">
                 {scanError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{scanError}</div>}
                 <div className="flex flex-col gap-1">
-                  <label className="text-[11px] text-dim font-mono">待扫描内容</label>
+                  <label className="text-[11px] text-dim font-mono">Content to scan</label>
                   <textarea
                     className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent resize-y min-h-[100px] font-mono"
                     value={content}
                     onChange={(e) => setContent(e.target.value)}
-                    placeholder="粘贴待检测的文本…"
+                    placeholder="Paste the text to check…"
                   />
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <div className="flex flex-col gap-1">
-                    <label className="text-[11px] text-dim font-mono">资源类型</label>
+                    <label className="text-[11px] text-dim font-mono">Resource type</label>
                     <CustomSelect options={RESOURCE_TYPES} value={scanRt} onChange={setScanRt} />
                   </div>
                   <div className="flex flex-col gap-1">
-                    <label className="text-[11px] text-dim font-mono">资源 ID（可选）</label>
-                    <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={scanRid} onChange={(e) => setScanRid(e.target.value)} placeholder="留空即可，或填 doc-123" />
-                    <span className="text-[10.5px] text-dim">留空将以 adhoc-scan 记录；填写则为平台内某文档/附件/技能等的唯一 ID</span>
+                    <label className="text-[11px] text-dim font-mono">Resource ID (optional)</label>
+                    <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={scanRid} onChange={(e) => setScanRid(e.target.value)} placeholder="Leave blank, or e.g. doc-123" />
+                    <span className="text-[10.5px] text-dim">Blank records as adhoc-scan; otherwise the unique ID of a document, attachment, skill, etc. on the platform</span>
                   </div>
                 </div>
                 <div>
-                  <button type="submit" disabled={scanning} className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50">{scanning ? '扫描中…' : '开始扫描'}</button>
+                  <button type="submit" disabled={scanning} className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50">{scanning ? 'Scanning…' : 'Start scan'}</button>
                 </div>
               </form>
               {scanResult && (
                 <div className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 max-w-2xl">
-                  <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">扫描结果</div>
+                  <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Scan result</div>
                   <pre className="text-[11px] font-mono text-ink-2 whitespace-pre-wrap break-all bg-paper-2 rounded-sm p-2 overflow-auto max-h-[280px]">
                     {JSON.stringify(scanResult, null, 2)}
                   </pre>
@@ -643,20 +643,20 @@ export function DlpPage() {
 
             {/* Classification tag */}
             <div className="flex flex-col gap-2">
-              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">资源密级标注</div>
+              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">Classify resource</div>
               <form onSubmit={handleTag} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 max-w-2xl">
                 {tagError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{tagError}</div>}
                 <div className="grid grid-cols-3 gap-2">
                   <div className="flex flex-col gap-1">
-                    <label className="text-[11px] text-dim font-mono">资源类型</label>
+                    <label className="text-[11px] text-dim font-mono">Resource type</label>
                     <CustomSelect options={RESOURCE_TYPES} value={tagRt} onChange={setTagRt} />
                   </div>
                   <div className="flex flex-col gap-1">
-                    <label className="text-[11px] text-dim font-mono">资源 ID</label>
+                    <label className="text-[11px] text-dim font-mono">Resource ID</label>
                     <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={tagRid} onChange={(e) => setTagRid(e.target.value)} placeholder="doc-123" />
                   </div>
                   <div className="flex flex-col gap-1">
-                    <label className="text-[11px] text-dim font-mono">密级</label>
+                    <label className="text-[11px] text-dim font-mono">Classification</label>
                     <CustomSelect
                       options={SENSITIVITIES.map((s) => ({ value: s, label: s }))}
                       value={sensitivity}
@@ -666,44 +666,44 @@ export function DlpPage() {
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <div className="flex flex-col gap-1">
-                    <label className="text-[11px] text-dim font-mono">标签 (逗号分隔, 可选)</label>
+                    <label className="text-[11px] text-dim font-mono">Tags (comma-separated, optional)</label>
                     <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={tags} onChange={(e) => setTags(e.target.value)} placeholder="pii, finance" />
                   </div>
                   <div className="flex flex-col gap-1">
-                    <label className="text-[11px] text-dim font-mono">原因 (可选)</label>
+                    <label className="text-[11px] text-dim font-mono">Reason (optional)</label>
                     <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent" value={reason} onChange={(e) => setReason(e.target.value)} />
                   </div>
                 </div>
                 <div>
-                  <button type="submit" disabled={tagging} className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50">{tagging ? '标注中…' : '标注密级'}</button>
+                  <button type="submit" disabled={tagging} className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50">{tagging ? 'Classifying…' : 'Classify'}</button>
                 </div>
               </form>
 
               {/* Query classification */}
               <form onSubmit={handleGet} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 max-w-2xl">
-                <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">查询密级</div>
+                <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">Look up classification</div>
                 {getError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{getError}</div>}
                 <div className="grid grid-cols-2 gap-2">
                   <div className="flex flex-col gap-1">
-                    <label className="text-[11px] text-dim font-mono">资源类型</label>
+                    <label className="text-[11px] text-dim font-mono">Resource type</label>
                     <CustomSelect options={RESOURCE_TYPES} value={getRt} onChange={setGetRt} />
                   </div>
                   <div className="flex flex-col gap-1">
-                    <label className="text-[11px] text-dim font-mono">资源 ID</label>
+                    <label className="text-[11px] text-dim font-mono">Resource ID</label>
                     <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={getRid} onChange={(e) => setGetRid(e.target.value)} placeholder="doc-123" />
                   </div>
                 </div>
                 <div>
-                  <button type="submit" disabled={getting} className="px-3 py-1.5 text-[12px] font-mono border border-line bg-paper rounded-sm hover:bg-paper-2 disabled:opacity-50">{getting ? '查询中…' : '查询'}</button>
+                  <button type="submit" disabled={getting} className="px-3 py-1.5 text-[12px] font-mono border border-line bg-paper rounded-sm hover:bg-paper-2 disabled:opacity-50">{getting ? 'Looking up…' : 'Look up'}</button>
                 </div>
                 {classification && (
                   <div className="border-t border-line-2 pt-2 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[12px]">
-                    <span className="font-mono text-dim">密级</span>
+                    <span className="font-mono text-dim">Classification</span>
                     <span className="font-mono text-ink-2">{classification.sensitivity ?? '—'}</span>
-                    <span className="font-mono text-dim">标签</span>
+                    <span className="font-mono text-dim">Tags</span>
                     <span className="font-mono text-ink-2">{classification.tags?.join(', ') || '—'}</span>
-                    <span className="font-mono text-dim">可降级</span>
-                    <span className="font-mono text-ink-2">{classification.downgradable === undefined ? '—' : classification.downgradable ? '是' : '否'}</span>
+                    <span className="font-mono text-dim">Downgradable</span>
+                    <span className="font-mono text-ink-2">{classification.downgradable === undefined ? '—' : classification.downgradable ? 'Yes' : 'No'}</span>
                   </div>
                 )}
               </form>

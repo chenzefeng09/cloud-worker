@@ -36,9 +36,9 @@ export default function PdfPreview({ url }: { url: string }) {
   return (
     <div className="border border-line rounded-md overflow-hidden bg-surface">
       <div className="cw-label px-4 py-2 border-b border-line-2 flex items-center gap-2">
-        PDF 预览
+        PDF preview
         {numPages != null && (
-          <span className="font-mono text-[10px] text-dim">共 {numPages} 页</span>
+          <span className="font-mono text-[10px] text-dim">{numPages} {numPages === 1 ? 'page' : 'pages'}</span>
         )}
       </div>
       <div ref={scrollRef} className="cw-scroll px-3 py-3 max-h-[640px] overflow-auto flex flex-col items-center gap-3 bg-paper-2">
@@ -49,9 +49,9 @@ export default function PdfPreview({ url }: { url: string }) {
             file={url}
             options={DOC_OPTIONS}
             onLoadSuccess={({ numPages: n }) => setNumPages(n)}
-            onLoadError={(e) => setError(`PDF 加载失败：${e.message}`)}
-            loading={<div className="font-mono text-[11px] text-dim py-4">加载 PDF…</div>}
-            error={<div className="font-mono text-[11px] text-accent py-4">无法渲染该 PDF</div>}
+            onLoadError={(e) => setError(`Failed to load PDF: ${e.message}`)}
+            loading={<div className="font-mono text-[11px] text-dim py-4">Loading PDF…</div>}
+            error={<div className="font-mono text-[11px] text-accent py-4">Unable to render this PDF</div>}
           >
             {pageWidth != null &&
               Array.from({ length: numPages ?? 0 }, (_, i) => (

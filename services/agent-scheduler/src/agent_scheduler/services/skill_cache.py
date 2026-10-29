@@ -304,10 +304,10 @@ def _target_ready(target: Path) -> bool:
         return False
     if (target / "SKILL.md").is_file():
         return True
-    for child in target.iterdir():
-        if child.is_dir() and (child / "SKILL.md").is_file():
-            return True
-    return False
+    return any(
+        child.is_dir() and (child / "SKILL.md").is_file()
+        for child in target.iterdir()
+    )
 
 
 def _safe_extract(data: bytes, dest: Path) -> bool:

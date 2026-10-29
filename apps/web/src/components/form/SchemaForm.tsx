@@ -90,7 +90,7 @@ export function SchemaForm({
   if (schema.length === 0) {
     return (
       <div className="font-mono italic text-dim text-[12px]">
-        该应用无需输入，直接执行即可。
+        This app needs no input — just run it.
       </div>
     );
   }
@@ -113,7 +113,7 @@ export function SchemaForm({
                   <div className="text-[11.5px] text-dim leading-[1.45] -mt-0.5">{field.help}</div>
                 )}
                 <div className="font-mono text-[11px] text-dim italic">
-                  定时任务不支持文件输入
+                  Scheduled triggers don’t support file inputs
                 </div>
                 {err && <div className="text-[11.5px] text-accent">{err}</div>}
               </div>
@@ -159,12 +159,12 @@ export function SchemaForm({
                       disabled={isUploading}
                       className="cw-btn cw-btn-ghost cw-btn-sm disabled:opacity-50"
                     >
-                      <span className="font-mono">⊕</span> 选择文件
+                      <span className="font-mono">⊕</span> Choose file
                     </button>
                   )}
                   {isUploading && (
                     <span className="font-mono text-[11px] text-dim animate-pulse">
-                      上传中…
+                      Uploading…
                     </span>
                   )}
                   {field.file?.max_size_bytes && (
@@ -174,7 +174,7 @@ export function SchemaForm({
                   )}
                   {typeof field.default === 'string' && field.default && (
                     <span className="font-mono text-[10.5px] text-dim truncate">
-                      默认 {field.default}
+                      Default: {field.default}
                     </span>
                   )}
                 </div>
@@ -192,7 +192,7 @@ export function SchemaForm({
                             type="button"
                             onClick={() => onFileRemove(field, att.id)}
                             className="font-mono text-dim hover:text-ink ml-0.5 leading-none"
-                            aria-label="移除附件"
+                            aria-label="Remove attachment"
                           >
                             ×
                           </button>

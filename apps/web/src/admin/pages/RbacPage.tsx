@@ -41,7 +41,7 @@ function permKey(p: PermissionExtra): string {
 }
 
 function permService(p: PermissionExtra): string {
-  return p.service || p.owner_service || '其他';
+  return p.service || p.owner_service || 'Other';
 }
 
 function riskColor(level?: string): string {
@@ -83,13 +83,13 @@ function PermissionPicker({
     <div className="flex flex-col gap-1">
       <input
         className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper focus:outline-none focus:border-accent font-mono"
-        placeholder="搜索权限…"
+        placeholder="Search permissions…"
         value={filter}
         onChange={(e) => setFilter(e.target.value)}
       />
       <div className="border border-line rounded-sm max-h-[220px] overflow-y-auto bg-paper">
         {filtered.length === 0 ? (
-          <div className="px-2 py-2 text-[11px] text-dim italic">无匹配权限</div>
+          <div className="px-2 py-2 text-[11px] text-dim italic">No matching permissions</div>
         ) : (
           filtered.map((p) => (
             <label
@@ -107,7 +107,7 @@ function PermissionPicker({
           ))
         )}
       </div>
-      <div className="text-[10.5px] text-dim font-mono">已选 {selected.size} 项</div>
+      <div className="text-[10.5px] text-dim font-mono">Selected: {selected.size}</div>
     </div>
   );
 }
@@ -153,11 +153,11 @@ function CreateRoleForm({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!nameValid) {
-      setError('角色名须匹配 ^[a-z][a-z0-9_]{1,99}$');
+      setError('Role name must match ^[a-z][a-z0-9_]{1,99}$');
       return;
     }
     if (!displayNameValid) {
-      setError('请填写显示名称');
+      setError('Enter a display name');
       return;
     }
     setLoading(true);
@@ -174,7 +174,7 @@ function CreateRoleForm({
       setOpen(false);
       onCreated();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '创建失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to create');
     } finally {
       setLoading(false);
     }
@@ -188,14 +188,14 @@ function CreateRoleForm({
         onClick={() => setOpen(true)}
         className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 self-start"
       >
-        + 新建角色
+        + New role
       </button>
       {open && (
-        <Dialog title="新建角色" onClose={close} dismissable={!loading} className="w-full max-w-lg">
+        <Dialog title="New role" onClose={close} dismissable={!loading} className="w-full max-w-lg">
           <form onSubmit={handleSubmit} className="flex flex-col gap-3">
             {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">角色名 (小写技术标识)</label>
+              <label className="text-[11px] text-dim font-mono">Role name (lowercase identifier)</label>
               <input
                 className={`border rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none font-mono ${
                   name && !nameValid ? 'border-accent focus:border-accent' : 'border-line focus:border-accent'
@@ -206,21 +206,21 @@ function CreateRoleForm({
                 required
               />
               {name && !nameValid && (
-                <span className="text-[10.5px] text-accent">须以小写字母开头，仅含小写字母/数字/下划线</span>
+                <span className="text-[10.5px] text-accent">Must start with a lowercase letter and contain only lowercase letters, digits or underscores</span>
               )}
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">显示名称</label>
+              <label className="text-[11px] text-dim font-mono">Display name</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
                 value={displayName}
                 onChange={(e) => setDisplayName(e.target.value)}
-                placeholder="知识库编辑员"
+                placeholder="Knowledge base editor"
                 required
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">描述 (可选)</label>
+              <label className="text-[11px] text-dim font-mono">Description (optional)</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
                 value={description}
@@ -228,7 +228,7 @@ function CreateRoleForm({
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">权限 (从权限目录多选)</label>
+              <label className="text-[11px] text-dim font-mono">Permissions (select from catalog)</label>
               <PermissionPicker permissions={permissions} selected={selected} onToggle={toggle} />
             </div>
             <div className="flex items-center justify-end gap-2 pt-1">
@@ -238,14 +238,14 @@ function CreateRoleForm({
                 disabled={loading}
                 className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
               >
-                取消
+                Cancel
               </button>
               <button
                 type="submit"
                 disabled={loading || !nameValid || !displayNameValid}
                 className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
               >
-                {loading ? '创建中…' : '创建'}
+                {loading ? 'Creating…' : 'Create'}
               </button>
             </div>
           </form>
@@ -294,7 +294,7 @@ function EditRolePermissions({
       onSaved();
       onClose();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '保存失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to save');
     } finally {
       setLoading(false);
     }
@@ -302,12 +302,12 @@ function EditRolePermissions({
 
   return (
     <Dialog
-      title={`编辑权限 · ${role.display_name || role.name}`}
+      title={`Edit permissions · ${role.display_name || role.name}`}
       onClose={onClose}
       dismissable={!loading}
       className="w-full max-w-lg"
     >
-      <p className="text-[11px] text-dim -mt-1">调整该角色的权限集合</p>
+      <p className="text-[11px] text-dim -mt-1">Adjust this role’s permission set</p>
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
       <PermissionPicker permissions={permissions} selected={selected} onToggle={toggle} />
       <div className="flex items-center justify-end gap-2 pt-1">
@@ -316,14 +316,14 @@ function EditRolePermissions({
           disabled={loading}
           className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
         >
-          取消
+          Cancel
         </button>
         <button
           onClick={handleSave}
           disabled={loading}
           className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
         >
-          {loading ? '保存中…' : '保存'}
+          {loading ? 'Saving…' : 'Save'}
         </button>
       </div>
     </Dialog>
@@ -351,14 +351,14 @@ function RolesTab({
 
   const handleDelete = async (role: AdminRole) => {
     if (role.is_system) return;
-    if (!(await confirm({ title: '删除角色', message: `确定删除角色「${role.display_name || role.name}」吗？`, tone: 'danger', confirmText: '删除' }))) return;
+    if (!(await confirm({ title: 'Delete role', message: `Delete role "${role.display_name || role.name}"?`, tone: 'danger', confirmText: 'Delete' }))) return;
     setDeleting(role.id);
     onError('');
     try {
       await api.admin.authz.roles.delete(role.id, tenantId ?? undefined);
       onReload();
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : '删除失败');
+      onError(err instanceof ApiError ? err.message : 'Failed to delete');
     } finally {
       setDeleting(null);
     }
@@ -368,16 +368,16 @@ function RolesTab({
     <div className="flex flex-col gap-4">
       <CreateRoleForm tenantId={tenantId} permissions={permissions} onCreated={onReload} />
       {roles.length === 0 ? (
-        <div className="font-mono text-[12px] text-dim italic">暂无角色</div>
+        <div className="font-mono text-[12px] text-dim italic">No roles</div>
       ) : (
         <div className="border border-line rounded-md overflow-hidden">
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
               <tr>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">名称</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">权限数</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">类型</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">操作</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Name</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Permissions</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Type</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -393,11 +393,11 @@ function RolesTab({
                   <td className="px-3 py-2">
                     {r.is_system ? (
                       <span className="font-mono text-[10px] text-dim border border-line rounded-sm px-1.5 py-0.5">
-                        系统
+                        System
                       </span>
                     ) : (
                       <span className="font-mono text-[10px] text-ink-2 border border-line rounded-sm px-1.5 py-0.5">
-                        自定义
+                        Custom
                       </span>
                     )}
                   </td>
@@ -408,15 +408,15 @@ function RolesTab({
                         disabled={r.is_system}
                         className="text-[11px] font-mono text-dim border border-line rounded-sm px-2 py-0.5 hover:text-ink hover:bg-paper-2 disabled:opacity-40 disabled:cursor-not-allowed"
                       >
-                        编辑权限
+                        Edit permissions
                       </button>
                       <button
                         onClick={() => handleDelete(r)}
                         disabled={r.is_system || deleting === r.id}
                         className="text-[11px] font-mono text-red-600 border border-red-200 rounded-sm px-2 py-0.5 hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed"
-                        title={r.is_system ? '系统角色不可删除' : undefined}
+                        title={r.is_system ? 'System roles can’t be deleted' : undefined}
                       >
-                        {deleting === r.id ? '…' : '删除'}
+                        {deleting === r.id ? '…' : 'Delete'}
                       </button>
                     </div>
                   </td>
@@ -443,43 +443,43 @@ function RolesTab({
 // ─── Permissions Tab ──────────────────────────────────────────────────────────
 
 const PERM_DESC_ZH: Record<string, string> = {
-  'app.create': '创建应用记录',
-  'app.publish': '发布已审核通过的应用版本（仅管理员/审核员）',
-  'app.read': '查看应用列表与版本详情',
-  'app.review': '审核提交的应用（批准/驳回，仅管理员/审核员）',
-  'app.run': '从应用定义发起运行',
-  'app.update': '更新应用元数据或发布新版本',
-  'document.create': '上传文档到知识库',
-  'document.delete': '删除知识库文档及其分块',
-  'document.read': '查看知识库文档列表与详情',
-  'document.search': '搜索知识库文档',
-  'document.update': '更新知识库文档',
-  'mcp_server.create': '注册新的 MCP 服务器',
-  'mcp_server.delete': '删除 MCP 服务器',
-  'mcp_server.read': '查看 MCP 服务器列表与详情',
-  'mcp_server.update': '更新 MCP 服务器配置',
-  'model.read': '查看可用模型列表',
-  'model.admin': '管理模型配置与默认设置',
-  'quota.read': '查看配额与用量',
-  'quota.admin': '管理配额限制',
-  'run.cancel': '取消正在执行的运行',
-  'run.create': '创建并发起新的运行',
-  'run.read': '查看运行记录与详情',
-  'sandbox.read': '查看沙箱状态',
-  'sandbox.stop': '停止运行中的沙箱',
-  'session.attachment.create': '上传会话附件',
-  'session.attachment.read': '查看会话附件',
-  'session.create': '创建新会话',
-  'session.delete': '删除会话',
-  'session.message.create': '发送会话消息',
-  'session.message.delete': '删除会话消息',
-  'session.message.read': '查看会话消息',
-  'session.read': '查看会话列表与详情',
-  'session.update': '更新会话设置',
-  'skill.create': '创建新技能',
-  'skill.delete': '删除技能',
-  'skill.read': '查看技能列表与详情',
-  'skill.update': '更新技能配置',
+  'app.create': 'Create app records',
+  'app.publish': 'Publish approved app versions (admins/reviewers only)',
+  'app.read': 'View apps and version details',
+  'app.review': 'Review submitted apps (approve/reject; admins/reviewers only)',
+  'app.run': 'Start runs from an app definition',
+  'app.update': 'Update app metadata or publish new versions',
+  'document.create': 'Upload documents to the knowledge base',
+  'document.delete': 'Delete knowledge base documents and their chunks',
+  'document.read': 'View knowledge base documents and details',
+  'document.search': 'Search knowledge base documents',
+  'document.update': 'Update knowledge base documents',
+  'mcp_server.create': 'Register new MCP servers',
+  'mcp_server.delete': 'Delete MCP servers',
+  'mcp_server.read': 'View MCP servers and details',
+  'mcp_server.update': 'Update MCP server configuration',
+  'model.read': 'View available models',
+  'model.admin': 'Manage model configuration and defaults',
+  'quota.read': 'View quotas and usage',
+  'quota.admin': 'Manage quota limits',
+  'run.cancel': 'Cancel in-progress runs',
+  'run.create': 'Create and start new runs',
+  'run.read': 'View runs and details',
+  'sandbox.read': 'View sandbox status',
+  'sandbox.stop': 'Stop running sandboxes',
+  'session.attachment.create': 'Upload session attachments',
+  'session.attachment.read': 'View session attachments',
+  'session.create': 'Create sessions',
+  'session.delete': 'Delete sessions',
+  'session.message.create': 'Send session messages',
+  'session.message.delete': 'Delete session messages',
+  'session.message.read': 'View session messages',
+  'session.read': 'View sessions and details',
+  'session.update': 'Update session settings',
+  'skill.create': 'Create skills',
+  'skill.delete': 'Delete skills',
+  'skill.read': 'View skills and details',
+  'skill.update': 'Update skill configuration',
 };
 
 function PermissionsTab({ permissions }: { permissions: PermissionExtra[] }) {
@@ -518,20 +518,20 @@ function PermissionsTab({ permissions }: { permissions: PermissionExtra[] }) {
     <div className="flex flex-col gap-4">
       <div className="flex items-center gap-3 flex-wrap">
         <CustomSelect
-          options={[{ value: '', label: '全部服务' }, ...services.map((s) => ({ value: s, label: s }))]}
+          options={[{ value: '', label: 'All services' }, ...services.map((s) => ({ value: s, label: s }))]}
           value={serviceFilter}
           onChange={(v) => setServiceFilter(v)}
         />
         <input
           className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper focus:outline-none focus:border-accent font-mono flex-1 min-w-[180px]"
-          placeholder="搜索权限名/描述…"
+          placeholder="Search permission name/description…"
           value={search}
           onChange={(e) => setSearch(e.target.value)}
         />
       </div>
 
       {grouped.length === 0 ? (
-        <div className="font-mono text-[12px] text-dim italic">无匹配权限</div>
+        <div className="font-mono text-[12px] text-dim italic">No matching permissions</div>
       ) : (
         grouped.map(([svc, perms]) => (
           <div key={svc} className="border border-line rounded-md overflow-hidden">
@@ -562,7 +562,7 @@ function PermissionsTab({ permissions }: { permissions: PermissionExtra[] }) {
                     )}
                     {p.requires_4eyes && (
                       <span className="font-mono text-[9.5px] text-amber-700 bg-amber-50 border border-amber-200 rounded-sm px-1.5 py-0.5">
-                        双人
+                        Dual control
                       </span>
                     )}
                     {p.requires_policy && (
@@ -628,7 +628,7 @@ function CreateBindingForm({
       setOpen(false);
       onCreated();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '创建失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to create');
     } finally {
       setLoading(false);
     }
@@ -642,15 +642,15 @@ function CreateBindingForm({
         onClick={() => setOpen(true)}
         className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 self-start"
       >
-        + 新建绑定
+        + New binding
       </button>
       {open && (
-        <Dialog title="新建角色绑定" onClose={close} dismissable={!loading} className="w-full max-w-md">
+        <Dialog title="New role binding" onClose={close} dismissable={!loading} className="w-full max-w-md">
           <form onSubmit={handleSubmit} className="flex flex-col gap-3">
             {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
             <div className="grid grid-cols-2 gap-3">
               <div className="flex flex-col gap-1">
-                <label className="text-[11px] text-dim font-mono">主体类型</label>
+                <label className="text-[11px] text-dim font-mono">Subject type</label>
                 <CustomSelect
                   options={SUBJECT_TYPES.map((s) => ({ value: s, label: s }))}
                   value={subjectType}
@@ -658,16 +658,16 @@ function CreateBindingForm({
                 />
               </div>
               <div className="flex flex-col gap-1">
-                <label className="text-[11px] text-dim font-mono">角色</label>
+                <label className="text-[11px] text-dim font-mono">Role</label>
                 <CustomSelect
-                  options={[{ value: '', label: '— 选择角色 —' }, ...roles.map((r) => ({ value: r.id, label: r.display_name || r.name }))]}
+                  options={[{ value: '', label: '— Select role —' }, ...roles.map((r) => ({ value: r.id, label: r.display_name || r.name }))]}
                   value={roleId}
                   onChange={(v) => setRoleId(v)}
                 />
               </div>
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">主体 ID</label>
+              <label className="text-[11px] text-dim font-mono">Subject ID</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
                 value={subjectId}
@@ -677,7 +677,7 @@ function CreateBindingForm({
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">过期时间 (可选 · 临时授权)</label>
+              <label className="text-[11px] text-dim font-mono">Expires at (optional · temporary grant)</label>
               <input
                 type="datetime-local"
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
@@ -686,7 +686,7 @@ function CreateBindingForm({
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">原因 (可选)</label>
+              <label className="text-[11px] text-dim font-mono">Reason (optional)</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
                 value={reason}
@@ -700,14 +700,14 @@ function CreateBindingForm({
                 disabled={loading}
                 className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
               >
-                取消
+                Cancel
               </button>
               <button
                 type="submit"
                 disabled={loading || !subjectId.trim() || !roleId}
                 className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
               >
-                {loading ? '创建中…' : '创建'}
+                {loading ? 'Creating…' : 'Create'}
               </button>
             </div>
           </form>
@@ -738,14 +738,14 @@ function BindingsTab({
   const confirm = useConfirm();
 
   const handleDelete = async (b: RoleBinding) => {
-    if (!(await confirm({ title: '删除角色绑定', message: '确定删除此角色绑定吗？', tone: 'danger', confirmText: '删除' }))) return;
+    if (!(await confirm({ title: 'Delete role binding', message: 'Delete this role binding?', tone: 'danger', confirmText: 'Delete' }))) return;
     setDeleting(b.id);
     onError('');
     try {
       await api.admin.authz.bindings.delete(b.id, tenantId ?? undefined);
       onReload();
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : '删除失败');
+      onError(err instanceof ApiError ? err.message : 'Failed to delete');
     } finally {
       setDeleting(null);
     }
@@ -755,17 +755,17 @@ function BindingsTab({
     <div className="flex flex-col gap-4">
       <CreateBindingForm tenantId={tenantId} roles={roles} onCreated={onReload} />
       {bindings.length === 0 ? (
-        <div className="font-mono text-[12px] text-dim italic">暂无绑定</div>
+        <div className="font-mono text-[12px] text-dim italic">No bindings</div>
       ) : (
         <div className="border border-line rounded-md overflow-hidden">
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
               <tr>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">主体类型</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">主体 ID</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">角色</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">过期时间</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">操作</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Subject type</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Subject ID</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Role</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Expires at</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -780,7 +780,7 @@ function BindingsTab({
                     {b.expires_at ? (
                       <span className="text-amber-700">{formatDateTimeAuto(new Date(b.expires_at))}</span>
                     ) : (
-                      '永久'
+                      'Never'
                     )}
                   </td>
                   <td className="px-3 py-2">
@@ -789,7 +789,7 @@ function BindingsTab({
                       disabled={deleting === b.id}
                       className="text-[11px] font-mono text-red-600 border border-red-200 rounded-sm px-2 py-0.5 hover:bg-red-50 disabled:opacity-50"
                     >
-                      {deleting === b.id ? '…' : '删除'}
+                      {deleting === b.id ? '…' : 'Delete'}
                     </button>
                   </td>
                 </tr>
@@ -812,7 +812,7 @@ export function RbacPage() {
   // tenant (selectedTenantId stays null → BFF omits ?tenant_id= → own tenant).
   const canSwitchTenant = isPlatformAdmin(userProfile?.permissions);
   const ownTenantName =
-    tenants.find((t) => t.id === userProfile?.tenant_id)?.name ?? userProfile?.tenant_id ?? '当前租户';
+    tenants.find((t) => t.id === userProfile?.tenant_id)?.name ?? userProfile?.tenant_id ?? 'Current tenant';
 
   const [tab, setTab] = useState<Tab>('roles');
   const [roles, setRoles] = useState<AdminRole[]>([]);
@@ -851,7 +851,7 @@ export function RbacPage() {
       if (err instanceof ApiError && (err.status === 404 || err.status === 501)) {
         setIsTodoEndpoint(true);
       } else {
-        setError(err instanceof ApiError ? err.message : '加载失败');
+        setError(err instanceof ApiError ? err.message : 'Failed to load');
       }
     } finally {
       setLoading(false);
@@ -871,27 +871,27 @@ export function RbacPage() {
   }, [load]);
 
   const TABS: { key: Tab; label: string }[] = [
-    { key: 'roles', label: `角色 (${roles.length})` },
-    { key: 'permissions', label: `权限目录 (${permissions.length})` },
-    { key: 'bindings', label: `角色绑定 (${bindings.length})` },
+    { key: 'roles', label: `Roles (${roles.length})` },
+    { key: 'permissions', label: `Permission catalog (${permissions.length})` },
+    { key: 'bindings', label: `Role bindings (${bindings.length})` },
   ];
 
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">角色与权限</h1>
-        <p className="text-[12px] text-dim mt-0.5">管理 RBAC 角色、权限目录与角色绑定</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Roles & permissions</h1>
+        <p className="text-[12px] text-dim mt-0.5">Manage RBAC roles, the permission catalog and role bindings</p>
       </div>
 
       {/* Tenant selector — only platform admins may switch; tenant admins are
           locked to their own tenant (shown read-only). */}
       <div className="flex items-center gap-3">
         <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">
-          {canSwitchTenant ? '选择租户' : '当前租户'}
+          {canSwitchTenant ? 'Tenant' : 'Current tenant'}
         </label>
         {canSwitchTenant ? (
           <CustomSelect
-            options={[{ value: '', label: '（默认 / 当前租户）' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+            options={[{ value: '', label: '(Default / current tenant)' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
             value={selectedTenantId ?? ''}
             onChange={(v) => setSelectedTenantId(v || null)}
             disabled={tenantsLoading}
@@ -929,12 +929,12 @@ export function RbacPage() {
 
       {isTodoEndpoint && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          该能力服务未启用（RBAC 代理端点尚未就绪）。接线后将自动展示。
+          This service isn’t enabled yet (the RBAC proxy endpoint isn’t ready). Data will appear here once it’s connected.
         </div>
       )}
 
       {loading ? (
-        <div className="font-mono text-[12px] text-dim">加载中…</div>
+        <div className="font-mono text-[12px] text-dim">Loading…</div>
       ) : (
         !isTodoEndpoint && (
           <>

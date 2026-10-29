@@ -106,7 +106,7 @@ export default function DocxPreview({ blob }: { blob: Blob }) {
       })
       .catch((e) => {
         if (cancelled) return;
-        setError(e instanceof Error ? e.message : '渲染失败');
+        setError(e instanceof Error ? e.message : 'Render failed');
         setStatus('error');
       });
 
@@ -126,12 +126,12 @@ export default function DocxPreview({ blob }: { blob: Blob }) {
 
   return (
     <div className="border border-line rounded-md overflow-hidden bg-surface">
-      <div className="cw-label px-4 py-2 border-b border-line-2">文档预览</div>
+      <div className="cw-label px-4 py-2 border-b border-line-2">Document preview</div>
       {status === 'loading' && (
-        <div className="px-4 py-3 font-mono text-[11px] text-dim">渲染文档…</div>
+        <div className="px-4 py-3 font-mono text-[11px] text-dim">Rendering document…</div>
       )}
       {status === 'error' && (
-        <div className="px-4 py-3 font-mono text-[11px] text-accent">文档渲染失败：{error}</div>
+        <div className="px-4 py-3 font-mono text-[11px] text-accent">Failed to render document: {error}</div>
       )}
       {/* Tall viewport-relative cap so most of the panel is used; the full doc
           is rendered, scroll to read it all (docx-preview has no pagination). */}

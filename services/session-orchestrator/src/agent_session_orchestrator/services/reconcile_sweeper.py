@@ -38,6 +38,7 @@ Failure-open
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime as dt
 import logging
 
@@ -57,13 +58,11 @@ SWEEP_INTERVAL_SECONDS: int = 60
 # freshly-created runs that are still cold-starting their sandbox.
 STALE_AFTER_SECONDS: int = 120
 
-# Inline (chat-mode) runs have no sandbox and no scheduler container, so the
-# scheduler reconciler can never resolve them — a process restart mid-stream
-# would otherwise leave the run RUNNING forever.  After this window an inline
-# run still stuck RUNNING/PENDING is force-FAILED (its executor task died with
-# the process; the registry that held its handle is gone).  Generous so a
-# genuinely slow reasoning completion is never killed out from under a live
-# executor — that completes on its own and finalizes the row before this fires.
+# Legacy inline (chat-mode) runs — a mode that has since been removed — have no
+# sandbox and no scheduler container, so the scheduler reconciler can never
+# resolve them; any such row left RUNNING would otherwise stay RUNNING forever.
+# After this window a legacy inline run still stuck RUNNING/PENDING is
+# force-FAILED.
 INLINE_ORPHAN_AFTER_SECONDS: int = 20 * 60
 
 # Short startup delay so a fleet of pods restarting together does not all hit
@@ -110,11 +109,26 @@ async def _fail_orphaned_inline_run(
 
     if redis_url:
         try:
-            from agent_session_orchestrator.services.inline_run_executor import (
-                _push_end,  # noqa: PLC0415
+            import redis.asyncio as aioredis  # noqa: PLC0415
+
+            from agent_session_orchestrator.api.v1.messages import (  # noqa: PLC0415
+                _run_token_stream_key,
             )
 
-            await _push_end(redis_url, run_obj.id)  # type: ignore[attr-defined]
+            client = aioredis.Redis.from_url(
+                redis_url,
+                socket_connect_timeout=2,
+                socket_timeout=2,
+                decode_responses=True,
+            )
+            try:
+                await client.xadd(
+                    _run_token_stream_key(run_obj.id),  # type: ignore[attr-defined]
+                    {"type": "end"},
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    await client.aclose()
         except Exception:  # noqa: BLE001 — end marker is best-effort
             logger.debug(
                 "reconcile_sweeper: end marker push failed for orphaned inline run",

@@ -1,5 +1,10 @@
 # Claude Code Web Gap Plan
 
+> **Note (2026-10):** this roadmap predates [ADR 0003](../adr/0003-claude-agent-sdk-sole-agent-runtime.md).
+> AgentScope and `agentscope_ext` have been removed; read references to them
+> below as "the agent worker", which is now the Claude Agent SDK worker
+> (`worker-claude-sdk/`).
+
 > Status: draft roadmap
 >
 > Goal: move agent-platform from a generic isolated cloud agent runtime to a

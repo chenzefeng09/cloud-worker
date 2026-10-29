@@ -13,8 +13,49 @@ checkout of it (see [`CONTRIBUTING.md`](./CONTRIBUTING.md)).
 
 ## [Unreleased]
 
+### Breaking changes
+
+- **Claude Agent SDK is the only agent runtime** ([ADR 0003](./docs/adr/0003-claude-agent-sdk-sole-agent-runtime.md),
+  superseding ADR 0002). The AgentScope 2.x Python worker and its extensions
+  (`agentscope-ext/`: `runtime_worker`, `canvas_tool`, `event_audit_sink`, `knowledge_tool`,
+  `llm_gateway_enforcer`, `mcp_tenant_injector`, `skills_loader`, `web_fetch`) are removed,
+  as are the `base` / `bootstrap` / `overlay` / `office` / `matlab` sandbox Dockerfiles and
+  `sandbox-images/wheels/`. Every run executes `node /app/dist/main.js` from
+  `ghcr.io/agent-platform/claude-sdk-sandbox:0.1` (`sandbox-images/claude-sdk.Dockerfile`)
+  or a `claude-sdk-cube*` image; `sandbox-pool` pre-warms the Claude SDK image.
+- **Inline chat mode removed.** The session-orchestrator's in-process tool loop
+  (`execution_mode='inline'`, with inline MCP / skills / knowledge / canvas tools,
+  attachment text extraction and the optional `doc-to-md` converter) is gone; every run is
+  sandboxed. `execution_mode` is still returned on runs for legacy rows, an incoming
+  `inline` is coerced to `sandbox`, and the BFF no longer forwards the field. The
+  `doc-to-md` service is removed from docker-compose.
+- **Configuration keys removed:** `LLM_API_KEY`, `LLM_PROVIDER`, `LLM_BASE_URL`,
+  `RUNTIME_EXTENSIONS`, `SCHEDULER_CLAUDE_SDK_IMAGE`, `USE_CLAUDE_SDK_WORKER_DEFAULT`, and the
+  scheduler's per-run `enable_claude_sdk_worker` routing flag. `AGENT_IMAGE` /
+  `SCHEDULER_AGENT_IMAGE` now point at the Claude SDK image.
+- **LLM gateway is mandatory.** All model traffic goes through the foundation LLM gateway
+  with a per-tenant virtual key (the worker's adapter translates Anthropic Messages to the
+  gateway's OpenAI-compatible API). A missing virtual key now always fails the spawn.
+- **Sandbox token scopes** no longer include `audit.write`.
+- **Compliance targets international regimes only.** GDPR remains (ROPA, DPIA, DSAR,
+  GDPR Art. 6 lawful bases). China-specific PIPL lawful bases / reports, the national
+  cryptography feature flags (GMTLS, SM2/SM3/SM4) and MLPS references are removed.
+- **English is the default UI and agent-facing language.** Chinese remains available as
+  an optional UI locale.
+
+### Changed
+
+- Tenant knowledge-base top-k hits are prefetched by the orchestrator and appended to the
+  worker's system prompt.
+
+### Known gaps
+
+- The Claude SDK worker has no canvas tool (the agent cannot create canvases), no
+  on-demand knowledge search tool, and no in-sandbox audit sink. See ADR 0003.
+
 ### Added
 
+- `docs/adr/0003-claude-agent-sdk-sole-agent-runtime.md`.
 - Community and project files: `CONTRIBUTING.md`, `SECURITY.md`, `GOVERNANCE.md`, and this
   changelog.
 

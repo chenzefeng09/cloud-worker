@@ -16,7 +16,7 @@ import type {
 
 // ─── Shared MCP server create / edit form dialog ──────────────────────────────
 //
-// Extracted from admin/pages/McpServersPage.tsx so the library "安装 MCP 工具"
+// Extracted from admin/pages/McpServersPage.tsx so the library "Install MCP tool"
 // surface can reuse the exact same field set (transport / endpoint / headers /
 // auth / timeout / tool_filter / enabled, plus stdio command/args/env) without
 // duplicating the form. The dialog is transport-agnostic and API-agnostic:
@@ -101,7 +101,7 @@ function KeyValueEditor({
             type="button"
             onClick={() => onChange(pairs.filter((_, idx) => idx !== i))}
             className="text-[14px] leading-none text-dim hover:text-accent px-1"
-            aria-label="删除该行"
+            aria-label="Delete row"
           >
             ×
           </button>
@@ -112,7 +112,7 @@ function KeyValueEditor({
         onClick={() => onChange([...pairs, { key: '', value: '' }])}
         className="self-start text-[11px] font-mono text-dim hover:text-ink border border-dashed border-line rounded-sm px-2 py-0.5"
       >
-        + 添加一行
+        + Add row
       </button>
     </div>
   );
@@ -158,7 +158,7 @@ function TagInput({
                 type="button"
                 onClick={() => onChange(value.filter((x) => x !== v))}
                 className="text-dim hover:text-ink ml-0.5"
-                aria-label={`移除 ${v}`}
+                aria-label={`Remove ${v}`}
               >
                 ×
               </button>
@@ -181,7 +181,7 @@ function TagInput({
         onBlur={() => {
           if (draft.trim()) commit(draft);
         }}
-        placeholder={placeholder ?? '输入后回车添加'}
+        placeholder={placeholder ?? 'Type and press Enter to add'}
       />
     </div>
   );
@@ -206,9 +206,9 @@ function TagInput({
 type ToolFilterMode = 'none' | 'allow' | 'block';
 
 const TOOL_FILTER_MODES: { value: ToolFilterMode; label: string }[] = [
-  { value: 'none', label: '不限制（全部工具可用）' },
-  { value: 'allow', label: '仅允许勾选的（白名单）' },
-  { value: 'block', label: '禁用勾选的（黑名单）' },
+  { value: 'none', label: 'No restriction (all tools available)' },
+  { value: 'allow', label: 'Allow only checked (allowlist)' },
+  { value: 'block', label: 'Block checked (blocklist)' },
 ];
 
 interface DisplayTool extends McpTestTool {
@@ -249,14 +249,14 @@ function ToolFilterEditor({
       const r = await fetchTools();
       if (!r.ok) {
         setTools(null);
-        setFetchError(r.error || '探测失败：上游未返回工具列表');
+        setFetchError(r.error || 'Probe failed: upstream returned no tool list');
         return;
       }
       setTools(r.tools ?? []);
       setManual(false);
     } catch (err) {
       setTools(null);
-      setFetchError(err instanceof ApiError ? err.message : '拉取工具列表失败');
+      setFetchError(err instanceof ApiError ? err.message : 'Failed to fetch tool list');
     } finally {
       setFetching(false);
     }
@@ -275,7 +275,7 @@ function ToolFilterEditor({
 
   return (
     <div className="flex flex-col gap-1.5">
-      <label className={labelCls}>工具过滤</label>
+      <label className={labelCls}>Tool filter</label>
       <CustomSelect
         options={TOOL_FILTER_MODES}
         value={mode}
@@ -283,13 +283,13 @@ function ToolFilterEditor({
       />
 
       {mode === 'none' ? (
-        <span className="text-[11px] text-dim italic">该服务器的全部工具都可被调用。</span>
+        <span className="text-[11px] text-dim italic">All tools on this server can be called.</span>
       ) : (
         <>
           {conflict && (
             <div className="text-[11px] text-accent bg-accent-soft border border-accent-line rounded-sm px-2 py-1 leading-relaxed">
-              该服务器同时配置了白名单与黑名单（allow：{conflict.allow.join('、')}；block：
-              {conflict.block.join('、')}）。已按白名单模式载入，保存后只会保留当前模式对应的列表，另一侧将被清空。
+              This server has both an allowlist and a blocklist (allow: {conflict.allow.join(', ')}; block:{' '}
+              {conflict.block.join(', ')}). Loaded in allowlist mode — saving keeps only the list for the current mode and clears the other.
             </div>
           )}
 
@@ -298,19 +298,19 @@ function ToolFilterEditor({
               type="button"
               onClick={run}
               disabled={!canFetch || fetching}
-              title={canFetch ? '连接该服务器并列出它提供的工具' : fetchDisabledTitle}
+              title={canFetch ? 'Connect to the server and list its tools' : fetchDisabledTitle}
               className="text-[11px] font-mono border border-line rounded-sm px-2 py-1 text-ink-2 hover:text-ink disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              {fetching ? '拉取中…' : '拉取工具列表'}
+              {fetching ? 'Fetching…' : 'Fetch tool list'}
             </button>
-            <span className="text-[11px] text-dim font-mono">已选 {selected.length}</span>
+            <span className="text-[11px] text-dim font-mono">{selected.length} selected</span>
             {tools !== null && (
               <button
                 type="button"
                 onClick={() => setManual((m) => !m)}
                 className="text-[11px] font-mono text-dim hover:text-ink"
               >
-                {manual ? '改为勾选' : '手动输入'}
+                {manual ? 'Use checklist' : 'Enter manually'}
               </button>
             )}
             {showChecklist && (
@@ -320,14 +320,14 @@ function ToolFilterEditor({
                   onClick={() => onSelectedChange(displayTools.map((t) => t.name))}
                   className="text-[11px] font-mono text-dim hover:text-ink"
                 >
-                  全选
+                  Select all
                 </button>
                 <button
                   type="button"
                   onClick={() => onSelectedChange([])}
                   className="text-[11px] font-mono text-dim hover:text-ink"
                 >
-                  清空
+                  Clear
                 </button>
               </>
             )}
@@ -337,14 +337,14 @@ function ToolFilterEditor({
             <div className="text-[11px] text-accent font-mono break-all bg-accent-soft rounded-sm px-2 py-1">
               {fetchError}
               <div className="text-[10px] text-dim font-sans mt-0.5 not-italic">
-                无法拉取时可直接手动输入工具名，配置照常生效。
+                If fetching fails, you can enter tool names manually — the config still works.
               </div>
             </div>
           )}
 
           {tools !== null && fetched.length === 0 && !fetchError && (
             <span className="text-[11px] text-dim italic">
-              上游未返回任何工具，可手动输入工具名。
+              Upstream returned no tools; you can enter tool names manually.
             </span>
           )}
 
@@ -366,7 +366,7 @@ function ToolFilterEditor({
                       {t.name}
                       {t.missing && (
                         <span className="ml-1.5 text-[10px] font-sans text-accent">
-                          未在当前工具列表中
+                          Not in current tool list
                         </span>
                       )}
                     </span>
@@ -383,7 +383,7 @@ function ToolFilterEditor({
             <TagInput
               value={selected}
               onChange={onSelectedChange}
-              placeholder="工具名，回车或逗号分隔"
+              placeholder="Tool names, separated by Enter or comma"
             />
           )}
         </>
@@ -430,9 +430,9 @@ export function McpServerFormDialog({
   onSubmit: (body: RegisterMcpServerRequest | PatchMcpServerRequest) => Promise<McpServer>;
   /** Optional tool-list discovery surface; see McpServerFormProbe. */
   probe?: McpServerFormProbe;
-  /** Override the dialog title (defaults to "注册/编辑 MCP 服务器"). */
+  /** Override the dialog title (defaults to "Register/Edit MCP server"). */
   title?: string;
-  /** Override the submit button label (defaults to "注册"/"保存"). */
+  /** Override the submit button label (defaults to "Register"/"Save"). */
   submitLabel?: string;
 }) {
   const isEdit = mode === 'edit';
@@ -546,10 +546,10 @@ export function McpServerFormDialog({
   const builtInCanProbe = transport === 'http' && !needsEndpoint;
   const builtInProbeDisabledTitle =
     transport === 'sse'
-      ? 'sse 仅在 worker 直连模式可用，注册探测器暂不支持'
+      ? 'SSE is only available in worker direct-connect mode; the registration probe doesn’t support it yet'
       : transport === 'stdio'
-        ? 'stdio 需本地进程，暂不支持探测；请手动输入工具名'
-        : '请先填写 Endpoint';
+        ? 'stdio needs a local process and can’t be probed; enter tool names manually'
+        : 'Enter an endpoint first';
 
   // Caller-supplied probe wins over the built-in admin logic.
   const effFetchTools = probe?.fetchTools ?? builtInProbeTools;
@@ -562,11 +562,11 @@ export function McpServerFormDialog({
     const trimmedTimeout = timeoutSeconds.trim();
     const timeoutNum = trimmedTimeout === '' ? null : Number(trimmedTimeout);
     if (timeoutNum != null && !Number.isFinite(timeoutNum)) {
-      setError('超时秒数需为数字');
+      setError('Timeout must be a number');
       return;
     }
     if (timeoutNum != null && timeoutNum <= 0) {
-      setError('超时秒数需大于 0');
+      setError('Timeout must be greater than 0');
       return;
     }
     // Map mode + checklist back onto the wire shape; the non-active side is
@@ -620,14 +620,14 @@ export function McpServerFormDialog({
       onSaved(saved);
       onClose();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : isEdit ? '更新失败' : '注册失败');
+      setError(err instanceof ApiError ? err.message : isEdit ? 'Update failed' : 'Registration failed');
     } finally {
       setLoading(false);
     }
   };
 
-  const dialogTitle = title ?? (isEdit ? '编辑 MCP 服务器' : '注册 MCP 服务器');
-  const submitText = submitLabel ?? (isEdit ? '保存' : '注册');
+  const dialogTitle = title ?? (isEdit ? 'Edit MCP server' : 'Register MCP server');
+  const submitText = submitLabel ?? (isEdit ? 'Save' : 'Register');
 
   return (
     <Dialog
@@ -642,7 +642,7 @@ export function McpServerFormDialog({
         )}
 
         <div className="flex flex-col gap-1">
-          <label className={labelCls}>名称</label>
+          <label className={labelCls}>Name</label>
           <input
             className={inputCls}
             value={name}
@@ -654,13 +654,13 @@ export function McpServerFormDialog({
         </div>
 
         <div className="flex flex-col gap-1">
-          <label className={labelCls}>传输方式</label>
+          <label className={labelCls}>Transport</label>
           <CustomSelect
             options={TRANSPORTS.map((t) => ({ value: t, label: t }))}
             value={transport}
             onChange={(v) => setTransport(v as McpTransport)}
           />
-          {isEdit && <span className="text-[10px] text-dim italic">传输方式创建后不可修改</span>}
+          {isEdit && <span className="text-[10px] text-dim italic">Transport can’t be changed after creation</span>}
         </div>
 
         {isHttpLike ? (
@@ -676,15 +676,15 @@ export function McpServerFormDialog({
             </div>
 
             <div className="flex flex-col gap-1">
-              <label className={labelCls}>自定义 Headers</label>
+              <label className={labelCls}>Custom headers</label>
               <KeyValueEditor pairs={headersPairs} onChange={setHeadersPairs} />
             </div>
 
             <div className="flex flex-col gap-1">
-              <label className={labelCls}>鉴权</label>
+              <label className={labelCls}>Authentication</label>
               <CustomSelect
                 options={[
-                  { value: 'none', label: '无' },
+                  { value: 'none', label: 'None' },
                   { value: 'bearer', label: 'Bearer Token' },
                   { value: 'api_key', label: 'API Key' },
                   { value: 'oauth', label: 'OAuth' },
@@ -742,7 +742,7 @@ export function McpServerFormDialog({
                   <TagInput
                     value={authOauthScopes}
                     onChange={setAuthOauthScopes}
-                    placeholder="scope，回车或逗号分隔"
+                    placeholder="Scopes, separated by Enter or comma"
                   />
                 </div>
               )}
@@ -766,7 +766,7 @@ export function McpServerFormDialog({
                 value={args}
                 onChange={setArgs}
                 separator=" "
-                placeholder="输入参数后回车或空格分隔"
+                placeholder="Arguments, separated by Enter or space"
               />
             </div>
 
@@ -778,14 +778,14 @@ export function McpServerFormDialog({
         )}
 
         <div className="flex flex-col gap-1">
-          <label className={labelCls}>超时（秒，留空 = 默认）</label>
+          <label className={labelCls}>Timeout (seconds, blank = default)</label>
           <input
             type="number"
             min={1}
             className={`${inputCls} font-mono`}
             value={timeoutSeconds}
             onChange={(e) => setTimeoutSeconds(e.target.value)}
-            placeholder="如 30"
+            placeholder="e.g. 30"
           />
         </div>
 
@@ -802,7 +802,7 @@ export function McpServerFormDialog({
 
         <label className="flex items-center gap-2 text-[12px] text-ink-2">
           <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
-          启用
+          Enabled
         </label>
 
         <div className="flex gap-2 pt-1">
@@ -811,7 +811,7 @@ export function McpServerFormDialog({
             disabled={loading}
             className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
           >
-            {loading ? (isEdit ? '保存中…' : '注册中…') : submitText}
+            {loading ? (isEdit ? 'Saving…' : 'Registering…') : submitText}
           </button>
           <button
             type="button"
@@ -819,7 +819,7 @@ export function McpServerFormDialog({
             disabled={loading}
             className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
           >
-            取消
+            Cancel
           </button>
         </div>
       </form>

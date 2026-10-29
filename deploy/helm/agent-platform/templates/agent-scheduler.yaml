@@ -89,10 +89,6 @@ spec:
               value: {{ .Values.agentScheduler.config.agentImage | quote }}
             - name: SCHEDULER_LLM_MODEL
               value: {{ .Values.agentScheduler.config.llmModel | quote }}
-            - name: SCHEDULER_LLM_PROVIDER
-              value: {{ .Values.agentScheduler.config.llmProvider | quote }}
-            - name: SCHEDULER_LLM_BASE_URL
-              value: {{ .Values.agentScheduler.config.llmBaseUrl | quote }}
             - name: SCHEDULER_WORKSPACE_BASE
               value: {{ .Values.agentScheduler.config.workspaceBase | default "/tmp/agent-workspaces" | quote }}
             - name: SCHEDULER_SANDBOX_MEMORY_LIMIT
@@ -101,8 +97,6 @@ spec:
               value: {{ .Values.agentScheduler.config.sandboxCpuShares | quote }}
             - name: SCHEDULER_SANDBOX_TIMEOUT
               value: {{ .Values.agentScheduler.config.sandboxTimeout | quote }}
-            - name: SCHEDULER_RUNTIME_EXTENSIONS
-              value: {{ .Values.agentScheduler.config.runtimeExtensions | quote }}
             - name: SCHEDULER_KEYCLOAK_URL
               value: {{ .Values.global.foundation.keycloak.url | quote }}
             - name: SCHEDULER_KEYCLOAK_REALM
@@ -119,11 +113,6 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.agentScheduler.existingSecret | default "ap-agent-scheduler-secrets" }}
                   key: SCHEDULER_SERVICE_TOKEN
-            - name: SCHEDULER_LLM_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.agentScheduler.existingSecret | default "ap-agent-scheduler-secrets" }}
-                  key: LLM_API_KEY
             # MCP / Skill Store / Web Fetch URLs (forwarded into sandbox)
             - name: SCHEDULER_MCP_REGISTRY_URL
               valueFrom:

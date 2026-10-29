@@ -1,82 +1,56 @@
-# sandbox-images — agent-side container/microVM images
+# sandbox-images — agent sandbox images
 
-> **Smoke-test note (B-M1):** ``base.Dockerfile`` is the *only* image
-> required to run the local end-to-end smoke (login → session → LLM
-> reply).  It currently ships AgentScope 2.x + httpx + pydantic + pypdf
-> and intentionally omits Chromium/Playwright to keep the image ~700 MB
-> and the smoke-build under 6 minutes.  ``office.Dockerfile`` and
-> ``matlab.Dockerfile`` are layered tiers used by later milestones and
-> are not required for the smoke flow.
-
-Three layers, each adds capability on top of the previous:
+Every image here runs the **Claude Agent SDK worker** (`worker-claude-sdk/`,
+TypeScript, entrypoint `node /app/dist/main.js`) — the platform's only agent
+runtime (see [ADR 0003](../docs/adr/0003-claude-agent-sdk-sole-agent-runtime.md)).
+The AgentScope `base` / `bootstrap` / `overlay` / `office` / `matlab` images and
+the pre-fetched `wheels/` directory have been removed.
 
 ```
-agentscope-sandbox-base    ─── always pre-warmed
-       ▲
-       │
-agentscope-sandbox-office  ─── + LibreOffice headless (Word/Excel/PPT IO)
-       ▲
-       │
-agentscope-sandbox-matlab  ─── + MATLAB Runtime
-                                (compiled applications only)
+claude-sdk.Dockerfile                    ghcr.io/agent-platform/claude-sdk-sandbox:0.1
+                                         docker runtime (dev/CI) · always pre-warmed
+
+claude-sdk-cube.Dockerfile               claude-sdk-cube:0.2-scientific
+  │                                      CubeSandbox-native · scientific Python · CMake
+  └─ claude-sdk-cube-matlab.Dockerfile   claude-sdk-cube:0.2-matlab-*
+       └─ build-matlab-control-layer.sh      + Control System Toolbox
+            └─ build-matlab-aerospace-layer.sh + Simulink / Aerospace products
+
+claude-sdk-cube-worker-refresh.Dockerfile   swap only /app/dist + node_modules
+                                            into an existing Cube image
 ```
 
-The image the scheduler launches is controlled by the ``SCHEDULER_AGENT_IMAGE``
-env var (per-deployment) and the ``template`` field of the
-``sandbox-pool::acquire`` payload (per-run, B-M3).
+## The runtime contract every image honours
 
-## What ships in every image
+* Reads the task from `/workspace/task.json` (docker) or the `AGENT_TASK_JSON`
+  env var (cube).
+* Reads `/workspace/.secrets.json` (mode `0600`) into the worker's environment,
+  then unlinks it.
+* Writes `/workspace/result.json` + `/workspace/events.jsonl`; streams token
+  deltas and hot-state to Redis (or the tool-broker `/state` façade).
+* Skills are host-mounted read-only under `/home/skills/<name>`.
+* Non-root `agent` user, **uid/gid 1000** — the scheduler bind-mounts
+  `/workspace` files owned by uid 1000, so a different uid makes
+  `result.json` writes fail with `EACCES`.
+* All model traffic goes through the worker's in-process adapter to the
+  foundation LLM gateway with a per-tenant virtual key. No provider API key is
+  baked into or passed to any image.
 
-* Python 3.12 + ``pip``
-* Pinned [AgentScope 2.x](https://github.com/agentscope-ai/agentscope)
-* Our extensions: ``agentscope-ext/runtime_worker`` + ``event_audit_sink``
-  + ``llm_gateway_enforcer`` + ``mcp_tenant_injector`` + ``skills_loader``
-  (installed from the repo as editable wheels; pinned by image tag)
-* Entrypoint: ``python -m agentscope_ext.runtime_worker``  (contract in
-  ``docs/design/b-m2-sandbox-runtime-v1.md § 2.2``)
-* Non-root ``agent`` user (uid 1000) — top-plan §安全要求, mirrors the
-  agent-platform services convention.
+The full wire format is [contracts/worker-wire-contract.md](../contracts/worker-wire-contract.md).
 
-## Per-tier additions
+## Default image: `claude-sdk.Dockerfile`
 
-| Image | Adds | Why this tier exists | Approx size |
-|---|---|---|---|
-| ``base``   | NumPy / Pandas / Polars / Requests / Node 20 / Playwright + Chromium | Default agent workload — data wrangling, web scraping, code gen | ~1.6 GiB |
-| ``office`` | LibreOffice headless + ``unoconv`` | Generate / read .docx / .xlsx / .pptx for document agents | ~2.4 GiB |
-| ``matlab`` | MATLAB Runtime | Runs applications built with MATLAB Compiler; Runtime itself does not check out a MATLAB license | ~5 GiB |
+`ghcr.io/agent-platform/claude-sdk-sandbox:0.1` — `node:22-slim` plus a
+production-only `node_modules` and the prebuilt worker `dist/`. It also installs
+a Python toolchain the agent can call through Bash for office and data work:
+`python-docx`, `openpyxl`, `python-pptx`, `pypdf`, `Pillow`, `lxml`,
+`xlsxwriter`, `pandas`, `numpy`, `matplotlib`, `graphviz`, `diagrams`, with
+`fonts-noto-cjk` wired into `matplotlibrc`. The build asserts these imports and
+the CJK font resolve, so a broken image fails at build time.
 
-## How to build
-
-```bash
-# base — everyone needs this
-docker build -t agentscope-sandbox-base:0.1 -f base.Dockerfile ..
-
-# office — layered on base
-docker build -t agentscope-sandbox-office:0.1 -f office.Dockerfile ..
-
-# matlab — layered on base; MATLAB R2024a runtime installer must be
-# present at build time (NOT included in repo — see matlab.Dockerfile)
-docker build -t agentscope-sandbox-matlab:0.1 -f matlab.Dockerfile ..
-```
-
-> All three build contexts are the agent-platform repo root (note the
-> trailing ``..``) so the Dockerfiles can ``COPY agentscope-ext/`` into
-> the image without a separate vendor step.
-
-## Claude SDK worker image (separate lineage)
-
-``claude-sdk.Dockerfile`` builds ``ghcr.io/agent-platform/claude-sdk-sandbox:0.1``
-— a **TypeScript/Node.js** worker, NOT part of the AgentScope/Python lineage
-above.  It runs the ``worker-claude-sdk/`` worker (Claude Agent SDK ⇄
-llm-gateway) on ``node:22-slim`` and honours the same runtime contract:
-reads ``/workspace/task.json`` or ``AGENT_TASK_JSON``, writes
-``/workspace/result.json`` + ``/workspace/events.jsonl``, skills under
-``/home/skills/``.  Same non-root ``agent`` user (uid/gid 1000) so the
-scheduler's bind-mounted ``/workspace`` files are writable.
-
-**Two-step build (compile, then containerise).**  The Dockerfile copies a
-*prebuilt* ``dist/`` — it does not run ``tsc``.  So ``worker-claude-sdk/dist/``
-must exist before ``docker build``.  Ordered command:
+**Two-step build (compile, then containerise).** The Dockerfile copies a
+*prebuilt* `dist/` — it does not run `tsc` — so `worker-claude-sdk/dist/` must
+exist before `docker build`:
 
 ```bash
 # from the repo root — build context is the repo ROOT (note trailing ".")
@@ -87,18 +61,13 @@ docker build \
   .
 ```
 
-Or just ``make build-claude-sdk-image`` (runs both steps) and
-``make push-claude-sdk-image`` from the repo root.
+Or just `make build-claude-sdk-image` (runs both steps) and
+`make push-claude-sdk-image` from the repo root.
 
-> Prerequisite: ``worker-claude-sdk/dist/main.js`` is produced by
-> ``npm run build`` (``tsc``).  If you build before the worker code's
-> ``dist/`` exists, the ``COPY worker-claude-sdk/dist/`` step fails.
+> CI note: `ci-worker-claude-sdk.yml` typechecks, tests and builds the worker;
+> the sandbox images themselves are built manually via the Makefile targets.
 
-> CI note: sandbox images are not built in ``.github/workflows`` today (those
-> are per-service lint/test only); images are built manually via the Makefile
-> targets above, matching the AgentScope image workflow.
-
-### Cube-native scientific image
+## Cube-native scientific image
 
 ``claude-sdk-cube.Dockerfile`` layers the compiled Claude worker onto Cube's
 native code-interpreter base. It keeps Cube's envd and ``/health`` probe while
@@ -111,8 +80,9 @@ make build-claude-sdk-cube-image \
 ```
 
 Cube v0.6 fixes memory on a template, so one image can back multiple resource
-tiers. The development deployment uses the same image digest for
-``claude-sdk-unified-2g`` and ``claude-sdk-unified-4g``. Configure their aliases
+tiers. The development deployment uses the same image digest for both
+template aliases (``.env.example`` ships ``claude-sdk-matlab-aerospace-r2-2g`` /
+``claude-sdk-matlab-aerospace-r2-4g``). Configure their aliases
 with ``CUBE_CLAUDE_SDK_TEMPLATE_SMALL`` / ``CUBE_CLAUDE_SDK_TEMPLATE_LARGE``.
 Runs default to the small tier, switch automatically for large attachments, or
 can request the large tier explicitly with
@@ -124,7 +94,7 @@ the Python Engine require a full licensed MATLAB installation. Keep either
 variant in a separate private image layer because the installer is multi-GB
 and subject to MathWorks distribution terms.
 
-### Add Control System Toolbox to the Cube MATLAB image
+## Add Control System Toolbox to the Cube MATLAB image
 
 For an existing R2019b image, prepare a minimal installer directory from the
 full ISO and build an incremental layer. The prepared directory is roughly
@@ -149,7 +119,7 @@ Keep the prior Cube templates until the new image and both memory-tier
 templates have passed the same smoke test, so rollback only requires restoring
 the old template aliases.
 
-### Add the core aerospace products
+## Add the core aerospace products
 
 The aerospace media resolver reads MathWorks' R2019b `productdata` metadata and
 extracts only the payloads for Simulink, Aerospace Toolbox, Aerospace Blockset,
@@ -171,26 +141,31 @@ Simulink Control Design's operating-point API before committing the image.
 ## How the scheduler picks an image
 
 For the docker runtime, the image is set globally per deployment via
-``SCHEDULER_AGENT_IMAGE``.  Per-run template selection lives in the
-``cube`` runtime (B-M2): the pool service warms multiple templates and
-the scheduler asks for the right one based on the agent config.
+`AGENT_IMAGE` / `SCHEDULER_AGENT_IMAGE` (Helm: `agentScheduler.config.agentImage`,
+`sandboxPool.config.sandboxImage`); `sandbox-pool` pre-warms that image. For the
+cube runtime the scheduler picks a Cube template alias
+(`CUBE_CLAUDE_SDK_TEMPLATE_SMALL` / `CUBE_CLAUDE_SDK_TEMPLATE_LARGE`) per run.
+There is no per-run worker selection any more — every image runs the same
+worker.
 
 ## Pinning + upgrade
 
-The image tag controls the AgentScope version inside.  Bumping
-AgentScope is a coordinated change:
+The image tag pins the worker build and, through
+`worker-claude-sdk/package-lock.json`, the Claude Agent SDK version. Bumping
+the SDK is a coordinated change:
 
-1. Update ``base.Dockerfile`` ``AGENTSCOPE_VERSION`` arg.
-2. Rebuild + retag (e.g. ``0.1`` → ``0.2``).
+1. Update `@anthropic-ai/claude-agent-sdk` in `worker-claude-sdk/` and run
+   `npm run typecheck && npm test`.
+2. Rebuild + retag (e.g. `0.1` → `0.2`); for Cube images with heavy layers use
+   `make build-claude-sdk-cube-worker-refresh-image`.
 3. Run the conformance suite against the new image.
-4. Bump ``SCHEDULER_AGENT_IMAGE`` default in
-   ``services/agent-scheduler/src/agent_scheduler/config.py``.
-5. Update ADR 0002 follow-ups if the upgrade required code changes in
-   ``runtime_worker``.
+4. Bump the `AGENT_IMAGE` / `SCHEDULER_AGENT_IMAGE` default (compose
+   `.env.example`, Helm values, scheduler config) or the Cube template aliases.
 
 ## Compliance notes
 
-* Images are built reproducibly (pinned base image digest, pinned pip
-  dependencies via ``constraints.txt`` — B-M2 follow-up).
-* CI signs the image via cosign (B-M3 follow-up).
-* SBOM emitted via syft (top-plan §SBOM).
+* The Cube images pin their base image digests; the worker is installed with
+  `npm ci` from the committed lockfile.
+* Image signing via cosign and SBOM generation via syft are planned follow-ups.
+* MATLAB installer media, license files and binaries are never committed
+  (`license.lic` / `*.so` are git-ignored) and must not be redistributed.

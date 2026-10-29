@@ -25,9 +25,9 @@ function fmt(iso?: string | null): string {
 }
 
 const SUBJECT_TYPE_LABELS: Record<LargeAttachmentSubjectType, string> = {
-  USER: '用户',
-  TEAM: '用户组',
-  ORG_UNIT: '组织单元',
+  USER: 'User',
+  TEAM: 'Group',
+  ORG_UNIT: 'Org unit',
 };
 
 export function LargeAttachmentPage() {
@@ -48,7 +48,7 @@ export function LargeAttachmentPage() {
   // platform-admin session, so we never trust selectedTenantId for a tenant_admin.
   const canSwitchTenant = isPlatformAdmin(userProfile?.permissions);
   const ownTenantId = userProfile?.tenant_id ?? null;
-  const ownTenantName = tenants.find((t) => t.id === ownTenantId)?.name ?? ownTenantId ?? '当前租户';
+  const ownTenantName = tenants.find((t) => t.id === ownTenantId)?.name ?? ownTenantId ?? 'Current tenant';
 
   // Which tenant we manage: platform-admins follow the selector; tenant-admins
   // are pinned to their own tenant (so the page loads immediately).
@@ -113,7 +113,7 @@ export function LargeAttachmentPage() {
       })
       .catch((err) => {
         if (isTodo(err)) setTodo(true);
-        else setError(err instanceof ApiError ? err.message : '加载失败');
+        else setError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => setLoading(false));
   }, [tid, apiTid]);
@@ -219,9 +219,9 @@ export function LargeAttachmentPage() {
     try {
       const updated = await api.admin.largeAttachment.setTenantSetting(next, apiTid);
       setSetting(updated);
-      toast.success(next ? '已开启租户大附件能力' : '已关闭租户大附件能力');
+      toast.success(next ? 'Large attachments enabled for tenant' : 'Large attachments disabled for tenant');
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '操作失败');
+      toast.error(err instanceof ApiError ? err.message : 'Operation failed');
     } finally {
       setToggleBusy(false);
     }
@@ -234,11 +234,11 @@ export function LargeAttachmentPage() {
     setAddError(null);
     try {
       await api.admin.largeAttachment.setSubjectAllow(newSubjectType, newSubjectId.trim(), true, apiTid);
-      toast.success('已加入准入白名单');
+      toast.success('Added to allowlist');
       setNewSubjectId('');
       load();
     } catch (err) {
-      setAddError(err instanceof ApiError ? err.message : '添加失败');
+      setAddError(err instanceof ApiError ? err.message : 'Failed to add');
     } finally {
       setAddBusy(false);
     }
@@ -248,10 +248,10 @@ export function LargeAttachmentPage() {
     if (!tid) return;
     try {
       await api.admin.largeAttachment.setSubjectAllow(row.subject_type, row.subject_id, !row.allowed, apiTid);
-      toast.success('已更新');
+      toast.success('Updated');
       load();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '操作失败');
+      toast.error(err instanceof ApiError ? err.message : 'Operation failed');
     }
   };
 
@@ -260,19 +260,19 @@ export function LargeAttachmentPage() {
     const label = SUBJECT_TYPE_LABELS[row.subject_type];
     if (
       !(await confirm({
-        title: '移除准入白名单',
-        message: `确定将${label} ${resolveSubjectName(row)} 从大附件准入白名单移除吗？`,
+        title: 'Remove from allowlist',
+        message: `Remove ${label.toLowerCase()} ${resolveSubjectName(row)} from the large-attachment allowlist?`,
         tone: 'danger',
-        confirmText: '移除',
+        confirmText: 'Remove',
       }))
     )
       return;
     try {
       await api.admin.largeAttachment.removeSubjectAllow(row.subject_type, row.subject_id, apiTid);
-      toast.success('已移除');
+      toast.success('Removed');
       load();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '移除失败');
+      toast.error(err instanceof ApiError ? err.message : 'Failed to remove');
     }
   };
 
@@ -290,9 +290,9 @@ export function LargeAttachmentPage() {
           <SearchableSelect
             {...sharedProps}
             options={userOptions}
-            placeholder="选择用户…"
-            searchPlaceholder="按姓名 / 邮箱 / ID 搜索…"
-            emptyText={users.length === 0 ? '该租户暂无可选用户' : '无匹配用户'}
+            placeholder="Select a user…"
+            searchPlaceholder="Search by name / email / ID…"
+            emptyText={users.length === 0 ? 'No users in this tenant' : 'No matching users'}
           />
         );
       case 'TEAM':
@@ -300,9 +300,9 @@ export function LargeAttachmentPage() {
           <SearchableSelect
             {...sharedProps}
             options={teamOptions}
-            placeholder="选择用户组…"
-            searchPlaceholder="按名称 / ID 搜索…"
-            emptyText={teams.length === 0 ? '该租户暂无可选用户组' : '无匹配用户组'}
+            placeholder="Select a group…"
+            searchPlaceholder="Search by name / ID…"
+            emptyText={teams.length === 0 ? 'No groups in this tenant' : 'No matching groups'}
           />
         );
       case 'ORG_UNIT':
@@ -310,9 +310,9 @@ export function LargeAttachmentPage() {
           <SearchableSelect
             {...sharedProps}
             options={orgUnitOptions}
-            placeholder="选择组织单元…"
-            searchPlaceholder="按路径 / 名称 / ID 搜索…"
-            emptyText={orgUnits.length === 0 ? '该租户暂无可选组织单元' : '无匹配组织单元'}
+            placeholder="Select an org unit…"
+            searchPlaceholder="Search by path / name / ID…"
+            emptyText={orgUnits.length === 0 ? 'No org units in this tenant' : 'No matching org units'}
           />
         );
     }
@@ -321,9 +321,9 @@ export function LargeAttachmentPage() {
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">大附件能力</h1>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Large attachments</h1>
         <p className="text-[12px] text-dim mt-0.5">
-          两层准入：租户级开关 + 主体准入白名单。开启后，命中阈值的大附件将进入大内存沙箱档位。
+          Two-layer access: a tenant-level switch plus a subject allowlist. When enabled, attachments above the threshold run in the high-memory sandbox tier.
         </p>
       </div>
 
@@ -338,11 +338,11 @@ export function LargeAttachmentPage() {
           own tenant (shown read-only). */}
       <div className="flex items-center gap-3">
         <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">
-          {canSwitchTenant ? '选择租户' : '当前租户'}
+          {canSwitchTenant ? 'Select tenant' : 'Current tenant'}
         </label>
         {canSwitchTenant ? (
           <CustomSelect
-            options={[{ value: '', label: '— 请选择 —' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+            options={[{ value: '', label: '— Select —' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
             value={selectedTenantId ?? ''}
             onChange={(v) => {
               setSelectedTenantId(v || null);
@@ -360,30 +360,30 @@ export function LargeAttachmentPage() {
       </div>
 
       {canSwitchTenant && !tid && (
-        <div className="font-mono text-[12px] text-dim italic">选择一个租户以管理其大附件能力</div>
+        <div className="font-mono text-[12px] text-dim italic">Select a tenant to manage its large-attachment access</div>
       )}
 
       {tid && todo && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          该能力服务未启用（大附件代理端点不可达）。
+          This service isn’t enabled (the large-attachment proxy endpoint is unreachable).
         </div>
       )}
 
       {tid && !todo && (
         <>
-          {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+          {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
 
           {/* ─── Section 1: 租户大附件开关 ─────────────────────── */}
           {!loading && (
             <section className="flex flex-col gap-2">
-              <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">租户大附件开关</div>
+              <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Tenant switch</div>
               <div className="border border-line rounded-md p-4 bg-surface flex items-center justify-between gap-4">
                 <div className="flex flex-col gap-1">
                   <div className="text-[14px] text-ink">
-                    {enabled ? '已开启' : '已关闭'}
+                    {enabled ? 'Enabled' : 'Disabled'}
                   </div>
                   <div className="font-mono text-[11px] text-dim">
-                    更新时间 {fmt(setting?.updated_at)} · 操作人 {setting?.updated_by || '—'}
+                    Updated {fmt(setting?.updated_at)} · by {setting?.updated_by || '—'}
                   </div>
                 </div>
                 <button
@@ -411,8 +411,8 @@ export function LargeAttachmentPage() {
           {!loading && (
             <section className={`flex flex-col gap-2 ${enabled ? '' : 'opacity-50 pointer-events-none select-none'}`}>
               <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim flex items-center gap-2">
-                准入白名单
-                {!enabled && <span className="text-dim normal-case tracking-normal">（需先开启租户开关）</span>}
+                Allowlist
+                {!enabled && <span className="text-dim normal-case tracking-normal">(enable the tenant switch first)</span>}
               </div>
 
               <form onSubmit={handleAdd} className="flex items-end gap-2 flex-wrap">
@@ -420,12 +420,12 @@ export function LargeAttachmentPage() {
                   <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm w-full">{addError}</div>
                 )}
                 <label className="flex flex-col gap-1">
-                  <span className="font-mono text-[10px] text-dim uppercase tracking-[0.08em]">主体类型</span>
+                  <span className="font-mono text-[10px] text-dim uppercase tracking-[0.08em]">Subject type</span>
                   <CustomSelect
                     options={[
-                      { value: 'USER', label: '用户' },
-                      { value: 'TEAM', label: '用户组' },
-                      { value: 'ORG_UNIT', label: '组织单元' },
+                      { value: 'USER', label: 'User' },
+                      { value: 'TEAM', label: 'Group' },
+                      { value: 'ORG_UNIT', label: 'Org unit' },
                     ]}
                     value={newSubjectType}
                     onChange={(v) => {
@@ -447,23 +447,23 @@ export function LargeAttachmentPage() {
                   disabled={addBusy || !enabled || !newSubjectId.trim()}
                   className="px-3 py-1.5 text-[11px] font-mono bg-ink text-surface rounded-sm hover:opacity-90 disabled:opacity-50"
                 >
-                  {addBusy ? '添加中…' : '加入白名单'}
+                  {addBusy ? 'Adding…' : 'Add to allowlist'}
                 </button>
               </form>
 
               <div className="border border-line rounded-md overflow-hidden">
                 <div className="bg-paper-2 px-3 py-2 border-b border-line font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  准入白名单（{allows.length}）
+                  Allowlist ({allows.length})
                 </div>
                 {allows.length > 0 ? (
                   <table className="w-full text-left border-collapse">
                     <thead className="border-b border-line-2">
                       <tr>
-                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">类型</th>
-                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">主体</th>
-                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">状态</th>
-                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">更新时间</th>
-                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim text-right">操作</th>
+                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">Type</th>
+                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">Subject</th>
+                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">Status</th>
+                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">Updated</th>
+                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim text-right">Actions</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -486,7 +486,7 @@ export function LargeAttachmentPage() {
                                   : 'text-gray-600 bg-gray-50 border-gray-200'
                               }`}
                             >
-                              {row.allowed ? '允许' : '禁用'}
+                              {row.allowed ? 'Allowed' : 'Blocked'}
                             </span>
                           </td>
                           <td className="px-3 py-2 font-mono text-[11px] text-dim">{fmt(row.updated_at)}</td>
@@ -495,13 +495,13 @@ export function LargeAttachmentPage() {
                               onClick={() => handleToggleAllow(row)}
                               className="px-2 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2 mr-2"
                             >
-                              {row.allowed ? '禁用' : '允许'}
+                              {row.allowed ? 'Block' : 'Allow'}
                             </button>
                             <button
                               onClick={() => handleRemove(row)}
                               className="px-2 py-1 text-[11px] font-mono border border-red-200 text-red-600 rounded-sm hover:bg-red-50"
                             >
-                              移除
+                              Remove
                             </button>
                           </td>
                         </tr>
@@ -509,7 +509,7 @@ export function LargeAttachmentPage() {
                     </tbody>
                   </table>
                 ) : (
-                  <div className="px-3 py-4 font-mono text-[12px] text-dim italic">暂无准入白名单主体</div>
+                  <div className="px-3 py-4 font-mono text-[12px] text-dim italic">No subjects on the allowlist</div>
                 )}
               </div>
             </section>

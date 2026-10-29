@@ -17,6 +17,21 @@ from agent_scheduler.services.docker_runtime import DockerRuntime
 _TENANT = "tnt_01J5TEST00000000000000TNT1"
 _USER = "usr_01J5TEST0000000000000USER1"
 
+_PROXY_ENV_VARS = (
+    "ALL_PROXY", "all_proxy",
+    "HTTP_PROXY", "http_proxy",
+    "HTTPS_PROXY", "https_proxy",
+)
+
+
+@pytest.fixture(autouse=True)
+def _no_host_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests hermetic: httpx reads *_PROXY env on client construction,
+    and a developer shell proxy (e.g. ``socks5h://``) would otherwise make
+    ``httpx.Client()`` raise before any stubbed transport is reached."""
+    for var in _PROXY_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
 
 @pytest.fixture
 def settings() -> Settings:
@@ -165,8 +180,8 @@ def fake_identity(monkeypatch: pytest.MonkeyPatch) -> FakeIdentity:
             return None
 
         async def get(self, url: str, **kw) -> httpx.Response:
-            # Enterprise default: a successful create_run path needs a tenant
-            # virtual key because llm_gateway_enforcer is enabled by default.
+            # A successful create_run path always needs a tenant virtual key:
+            # the sandbox reaches the LLM only via the gateway.
             # Tests that need a missing/down key path patch httpx.AsyncClient
             # directly rather than relying on fake_identity.
             if "/tenant-keys" in url:

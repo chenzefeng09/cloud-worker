@@ -10,7 +10,7 @@ Fan-out uses one shared ``httpx.AsyncClient`` (one connection pool) with
 ``asyncio.gather`` so the two calls overlap.  Failure posture matches the
 other BFF proxies: an orchestrator non-2xx is forwarded as-is via
 ``_proxy_json``-style status passthrough; an unreachable orchestrator returns
-502 with a Chinese ``user_message``.
+502 with an English ``user_message``.
 
 Auth: ``require_auth()`` — the BFF re-resolves ``(tenant_id, user_id,
 access_token)`` from the cookie session and forwards them as
@@ -106,8 +106,8 @@ async def list_artifacts(
         return JSONResponse(
             status_code=502,
             content={
-                "detail": "产物服务暂时不可用，请稍后重试。",
-                "user_message": "产物服务暂时不可用，请稍后重试。",
+                "detail": "The artifacts service is temporarily unavailable. Please try again later.",
+                "user_message": "The artifacts service is temporarily unavailable. Please try again later.",
                 "error": str(exc),
             },
         )

@@ -171,16 +171,11 @@ def test_spawn_posts_to_e2b_endpoint_and_returns_sandbox_id() -> None:
         ("8g", "claude-sdk-unified-4g", "large"),
     ],
 )
-def test_spawn_claude_selects_cube_template_by_memory_tier(
-    monkeypatch: pytest.MonkeyPatch,
+def test_spawn_selects_cube_template_by_memory_tier(
     memory_limit: str,
     expected_template: str,
     expected_tier: str,
 ) -> None:
-    monkeypatch.setattr(
-        "agent_scheduler.services.cube_runtime.evaluate_flag",
-        lambda *args, **kwargs: False,
-    )
     client = MagicMock()
     client.post.return_value = _ok_response({"sandboxID": "sb_tier"}, status=201)
     rt = _make_runtime(client)
@@ -192,8 +187,6 @@ def test_spawn_claude_selects_cube_template_by_memory_tier(
         cube_controller_url="http://cube-test:8443",
         cube_sandbox_allow_out="10.96.0.10/32",
         workspace_base=_WORKSPACE_BASE,
-        use_claude_sdk_worker_default=True,
-        claude_sdk_image="claude-sdk-fallback",
         cube_claude_sdk_template_small="claude-sdk-unified-2g",
         cube_claude_sdk_template_large="claude-sdk-unified-4g",
         sandbox_memory_limit_small="2g",
@@ -215,6 +208,34 @@ def test_spawn_claude_selects_cube_template_by_memory_tier(
     body = kwargs["json"]
     assert body["templateID"] == expected_template
     assert body["metadata"]["agent-platform.memory-tier"] == expected_tier
+
+
+def test_spawn_uses_agent_image_and_node_entrypoint() -> None:
+    """Every cube run boots the Claude SDK worker image with its node entry.
+
+    CubeSandbox's behaviour with an empty cmd is unspecified, so the worker
+    entry is passed explicitly to the post-create envd exec.
+    """
+    client = MagicMock()
+    client.post.return_value = _ok_response({"sandboxID": "sb_img"}, status=201)
+    rt = _make_runtime(client)
+
+    rt.spawn_run(
+        run_id="run_img",
+        session_id="ses_img",
+        task="hello",
+        tenant_id="tnt_img",
+        user_id="usr_img",
+        foundation_token="ft",
+        llm_virtual_key="vk-test",
+    )
+
+    _, kwargs = client.post.call_args
+    body = kwargs["json"]
+    assert body["templateID"] == "ghcr.io/agent-platform/claude-sdk-sandbox:0.1"
+    assert "agent-platform.memory-tier" not in body["metadata"]
+    exec_args = rt._exec_start_worker.call_args  # type: ignore[attr-defined]  # noqa: SLF001
+    assert exec_args.args[1] == ["node", "/app/dist/main.js"]
 
 
 def test_spawn_broker_egress_posts_broker_metadata_and_urls() -> None:
@@ -639,7 +660,6 @@ _SECRET_KEYS = (
     "FOUNDATION_API_TOKEN",
     "TOOL_BROKER_LEASE",
     "LLM_VIRTUAL_KEY",
-    "LLM_API_KEY",
     "S3_ACCESS_KEY_ID",
     "S3_SECRET_ACCESS_KEY",
     "REDIS_URL",
@@ -651,10 +671,7 @@ def _make_runtime_with_workspace(client: object, workspace_base: Path) -> CubeSa
 
     The secret-file path writes a 0600 file under ``workspace_base``; point it
     at a tmp dir so the write actually lands and we can inspect it.  Foundation
-    egress mode avoids needing an allow_out CIDR list, and we drop the
-    ``llm_gateway_enforcer`` extension so ``LLM_API_KEY`` stays populated (the
-    enforcer blanks it) — that gives a non-trivial secrets payload AND removes
-    the gateway guard that would otherwise require a per-run virtual key.
+    egress mode avoids needing an allow_out CIDR list.
     """
     settings = Settings(
         env="test",
@@ -665,8 +682,6 @@ def _make_runtime_with_workspace(client: object, workspace_base: Path) -> CubeSa
         sandbox_egress_mode="foundation",
         cube_sandbox_allow_out="",
         workspace_base=str(workspace_base),
-        llm_api_key="sk-real-llm-key",
-        runtime_extensions="mcp_tenant_injector,skills_loader,web_fetch",
     )
     rt = CubeSandboxRuntime.__new__(CubeSandboxRuntime)
     rt._settings = settings  # noqa: SLF001
@@ -692,6 +707,7 @@ def test_spawn_uses_v060_autopause_lifecycle(tmp_path: Path) -> None:
         tenant_id="tnt_01J5TNT0000000000000000001",
         user_id="usr_01J5USR0000000000000000001",
         foundation_token="ft-secret",
+        llm_virtual_key="vk-secret",
     )
 
     assert sid == "sb_lifecycle"
@@ -751,6 +767,7 @@ def test_spawn_keeps_large_task_out_of_create_env_but_passes_it_to_worker(
         tenant_id="tnt_long",
         user_id="usr_long",
         foundation_token="ft-secret",
+        llm_virtual_key="vk-secret",
     )
 
     create_env = client.post.call_args.kwargs["json"]["envVars"]
@@ -802,19 +819,20 @@ def test_spawn_writes_and_mounts_secrets_file(tmp_path: Path) -> None:
     assert stat.S_IMODE(os.stat(host_path).st_mode) == 0o600
 
     # 3. The file content carries the real secret values that were stripped
-    #    from env (present-only: FOUNDATION_API_TOKEN, LLM_API_KEY,
-    #    LLM_VIRTUAL_KEY, TOOL_BROKER_LEASE in foundation mode; no S3_/REDIS).
+    #    from env (present-only: FOUNDATION_API_TOKEN, LLM_VIRTUAL_KEY,
+    #    TOOL_BROKER_LEASE when issued; no S3_/REDIS).
     payload = json.loads(host_path.read_text(encoding="utf-8"))
     assert payload["FOUNDATION_API_TOKEN"] == "ft-secret"
     assert payload["LLM_VIRTUAL_KEY"] == "vk-secret"
-    assert payload["LLM_API_KEY"] == "sk-real-llm-key"
+    # The real upstream provider key never reaches the sandbox.
+    assert "LLM_API_KEY" not in payload
     # Keys never set on the Cube path must not be invented into the file.
     assert "S3_ACCESS_KEY_ID" not in payload
     assert "REDIS_URL" not in payload
 
 
 def test_spawn_omits_absent_optional_secrets_from_file(tmp_path: Path) -> None:
-    """Optional secrets (LLM_VIRTUAL_KEY) absent from env stay out of the file."""
+    """Optional secrets (TOOL_BROKER_LEASE) absent from env stay out of the file."""
     client = MagicMock()
     client.post.return_value = _ok_response({"sandboxID": "sb_sec3"}, status=201)
     rt = _make_runtime_with_workspace(client, tmp_path)
@@ -826,7 +844,8 @@ def test_spawn_omits_absent_optional_secrets_from_file(tmp_path: Path) -> None:
         tenant_id="tnt_01J5TNT0000000000000000001",
         user_id="usr_01J5USR0000000000000000001",
         foundation_token="ft-secret",
-        # no llm_virtual_key -> not set in env -> must not be in the file
+        llm_virtual_key="vk-secret",
+        # no tool_broker_lease -> not set in env -> must not be in the file
     )
 
     _, kwargs = client.post.call_args
@@ -839,8 +858,28 @@ def test_spawn_omits_absent_optional_secrets_from_file(tmp_path: Path) -> None:
         )
     ) / ".secrets.json"
     payload = json.loads(host_path.read_text(encoding="utf-8"))
-    assert "LLM_VIRTUAL_KEY" not in payload
+    assert "TOOL_BROKER_LEASE" not in payload
     assert payload["FOUNDATION_API_TOKEN"] == "ft-secret"
+    assert payload["LLM_VIRTUAL_KEY"] == "vk-secret"
+
+
+def test_spawn_rejects_missing_virtual_key(tmp_path: Path) -> None:
+    """No tenant LLM virtual key -> refuse to spawn; nothing is POSTed or written."""
+    client = MagicMock()
+    rt = _make_runtime_with_workspace(client, tmp_path)
+
+    with pytest.raises(SandboxSpawnError, match="virtual key"):
+        rt.spawn_run(
+            run_id="run_01J5RUN0000000000000000013",
+            session_id="ses_01J5SES0000000000000000013",
+            task="no key",
+            tenant_id="tnt_01J5TNT0000000000000000001",
+            user_id="usr_01J5USR0000000000000000001",
+            foundation_token="ft-secret",
+        )
+
+    client.post.assert_not_called()
+    assert not list(tmp_path.rglob(".secrets.json"))
 
 
 # --------------------------------------------------------------------------- #
@@ -864,14 +903,17 @@ def _seed_run_dir(workspace_base: Path) -> Path:
         / _ARTIFACT_META["agent-platform.run-id"]
     )
     (run_dir / "inputs").mkdir(parents=True)
-    (run_dir / "chart.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
-    (run_dir / "report.md").write_text("# report", encoding="utf-8")
+    (run_dir / "outputs").mkdir()
+    (run_dir / "outputs" / "chart.png").write_bytes(b"\x89PNG\r\n\x1a\n fake")
+    (run_dir / "outputs" / "report.md").write_text("# report", encoding="utf-8")
     (run_dir / "result.json").write_text(
         json.dumps({"status": "OK", "summary": "done"}), encoding="utf-8"
     )
     (run_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
     (run_dir / "worker.log").write_text("noise", encoding="utf-8")
-    (run_dir / ".secrets.json").write_text('{"LLM_API_KEY": "sk-leak"}', encoding="utf-8")
+    (run_dir / ".secrets.json").write_text(
+        '{"FOUNDATION_API_TOKEN": "ft-leak"}', encoding="utf-8"
+    )
     (run_dir / "inputs" / "upload.csv").write_text("a,b\n", encoding="utf-8")
     return run_dir
 
@@ -898,7 +940,9 @@ def test_get_run_status_publishes_output_files(tmp_path: Path) -> None:
     assert {"result.json", "events.jsonl", "worker.log", ".secrets.json",
             "upload.csv"}.isdisjoint(names)
     keys = {c.kwargs["Key"] for c in s3.put_object.call_args_list}
-    assert any(k.endswith("/artifacts/chart.png") for k in keys)
+    assert any(k.endswith("/artifacts/outputs/chart.png") for k in keys)
+    # Control-plane files (incl. the secrets file) are never uploaded.
+    assert not any(k.endswith(".secrets.json") for k in keys)
     assert all(
         k.startswith(
             f"tenant/{_ARTIFACT_META['agent-platform.tenant-id']}"

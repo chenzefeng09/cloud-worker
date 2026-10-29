@@ -4,7 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import { markdownRemarkPlugins, markdownRehypePlugins, normalizeMathDelimiters } from '../lib/markdownPlugins';
 import { ToolRow, ThinkingBlock, markdownComponents } from './chatStepRenderers';
 import { useCopied, CopyIcon } from './CopyButton';
-import { formatRelativeTimeZh, formatAbsoluteTimeZh } from '../lib/format';
+import { formatRelativeTime, formatAbsoluteTime } from '../lib/format';
 import { sanitizeStreamingMarkdown } from '../lib/sanitizeStreamingMarkdown';
 import { useFeatureFlag } from '../hooks/useFeatureFlags';
 
@@ -135,18 +135,18 @@ export function MessageBubble({ message, friendly, onPreviewFile, onRewind, show
             persisted messages. Mirrors the assistant copy-button style. */}
         <div
           className="opacity-0 group-hover:opacity-100 transition-opacity duration-150 flex items-center gap-1"
-          aria-label="消息操作"
+          aria-label="Message actions"
         >
           <button
             onClick={() => copyUser(message.content)}
-            aria-label="复制消息"
-            title="复制消息"
+            aria-label="Copy message"
+            title="Copy message"
             style={userActionBtnStyle}
             onMouseEnter={userActionBtnHoverIn}
             onMouseLeave={userActionBtnHoverOut}
           >
             {userCopied ? (
-              <span style={{ fontSize: 11, color: 'var(--accent)' }}>已复制</span>
+              <span style={{ fontSize: 11, color: 'var(--accent)' }}>Copied</span>
             ) : (
               <CopyIcon />
             )}
@@ -154,8 +154,8 @@ export function MessageBubble({ message, friendly, onPreviewFile, onRewind, show
           {canRewind && (
             <button
               onClick={() => onRewind(message)}
-              aria-label="回退到这一步"
-              title="回退到这一步（删除此消息及之后的内容，重新编辑）"
+              aria-label="Rewind to here"
+              title="Rewind to here (deletes this message and everything after it so you can edit it)"
               style={userActionBtnStyle}
               onMouseEnter={userActionBtnHoverIn}
               onMouseLeave={userActionBtnHoverOut}
@@ -326,13 +326,13 @@ function AssistantTextBlock({
       {showCopy && (
       <div
         className="opacity-0 group-hover:opacity-100 transition-opacity duration-150 flex items-center gap-1 mt-1"
-        aria-label="消息操作"
+        aria-label="Message actions"
       >
         {/* Copy button */}
         <button
           onClick={() => copy(copyText ?? content)}
-          aria-label={copied ? '已复制' : '复制消息'}
-          title={copied ? '已复制' : '复制消息'}
+          aria-label={copied ? 'Copied' : 'Copy message'}
+          title={copied ? 'Copied' : 'Copy message'}
           style={{
             display: 'flex',
             alignItems: 'center',
@@ -364,7 +364,7 @@ function AssistantTextBlock({
                 whiteSpace: 'nowrap',
               }}
             >
-              已复制
+              Copied
             </span>
           ) : (
             <CopyIcon />
@@ -374,7 +374,7 @@ function AssistantTextBlock({
         {createdAt && (
           <time
             dateTime={createdAt}
-            title={formatAbsoluteTimeZh(createdAt)}
+            title={formatAbsoluteTime(createdAt)}
             style={{
               fontSize: 11,
               color: 'var(--dim)',
@@ -382,7 +382,7 @@ function AssistantTextBlock({
               cursor: 'default',
             }}
           >
-            {formatRelativeTimeZh(createdAt)}
+            {formatRelativeTime(createdAt)}
           </time>
         )}
       </div>

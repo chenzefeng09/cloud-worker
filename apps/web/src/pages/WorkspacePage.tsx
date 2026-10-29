@@ -9,7 +9,7 @@ import type { FileContentSource } from '../components/filePreview';
 import { useWorkspace } from '../lib/workspaceContext';
 import { api, ApiError } from '../api/client';
 import { toWorkspaceView } from '../lib/workspaceData';
-import { formatRelativeTimeZh } from '../lib/format';
+import { formatRelativeTime } from '../lib/format';
 import {
   LevelBadge,
   SENSITIVITY_LABELS,
@@ -335,11 +335,11 @@ export function WorkspacePage() {
     setUploadLevel(activeWorkspace?.sensitivity_level ?? DEFAULT_SENSITIVITY);
   }, [activeWorkspace?.id]);
 
-  // Distinct extensions for the type-filter dropdown (extension = '' -> "其他").
+  // Distinct extensions for the type-filter dropdown (extension = '' -> "Other").
   const extensions = useMemo(() => {
     const counts = new Map<string, number>();
     for (const f of files) {
-      const key = extOf(f.filename) || '其他';
+      const key = extOf(f.filename) || 'Other';
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
     return Array.from(counts.entries()).sort((a, b) => a[0].localeCompare(b[0]));
@@ -360,7 +360,7 @@ export function WorkspacePage() {
   // Files surviving the type filter. Search is applied on top in searchResults.
   const typeFilteredFiles = useMemo(() => {
     if (typeFilter === 'all') return files;
-    return files.filter((f) => (extOf(f.filename) || '其他') === typeFilter);
+    return files.filter((f) => (extOf(f.filename) || 'Other') === typeFilter);
   }, [files, typeFilter]);
 
   // Empty folders that are NOT yet backed by real data (a folder is "backed"
@@ -477,7 +477,7 @@ export function WorkspacePage() {
     try {
       for (const f of arr) await uploadFile(f, undefined, currentFolder, uploadLevel);
     } catch (err) {
-      setFileError(err instanceof ApiError ? err.message : '文件上传失败，请稍后重试。');
+      setFileError(err instanceof ApiError ? err.message : 'File upload failed. Please try again later.');
     } finally {
       setUploading(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
@@ -486,10 +486,10 @@ export function WorkspacePage() {
 
   const handleDelete = async (file: WorkspaceFile) => {
     const ok = await confirm({
-      title: '删除文件',
-      message: `确定删除「${file.filename}」？此操作不可撤销。`,
+      title: 'Delete file',
+      message: `Delete “${file.filename}”? This can’t be undone.`,
       tone: 'danger',
-      confirmText: '删除',
+      confirmText: 'Delete',
     });
     if (!ok) return;
     setFileError(null);
@@ -497,7 +497,7 @@ export function WorkspacePage() {
     try {
       await deleteFile(file.id);
     } catch (err) {
-      setFileError(err instanceof ApiError ? err.message : '删除失败，请稍后重试。');
+      setFileError(err instanceof ApiError ? err.message : 'Delete failed. Please try again later.');
     }
   };
 
@@ -535,7 +535,7 @@ export function WorkspacePage() {
         <LevelBadge level={f.sensitivity_level} small />
       </div>
       <span className="font-mono text-[11px] text-dim text-right">
-        {formatRelativeTimeZh(f.created_at)}
+        {formatRelativeTime(f.created_at)}
       </span>
       <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
         {f.current_version != null && f.current_version > 1 && (
@@ -546,8 +546,8 @@ export function WorkspacePage() {
               setVersionFile(f);
             }}
             className="inline-flex items-center justify-center w-[26px] h-[26px] rounded-md text-dim hover:text-ink hover:bg-line-2 transition-colors"
-            title="历史版本"
-            aria-label="历史版本"
+            title="Version history"
+            aria-label="Version history"
           >
             <svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M8 3v5l3 2" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round"/><circle cx="8" cy="8" r="6" stroke="currentColor" strokeWidth="1.5"/></svg>
           </button>
@@ -559,8 +559,8 @@ export function WorkspacePage() {
             handleDownload(f);
           }}
           className="inline-flex items-center justify-center w-[26px] h-[26px] rounded-md text-dim hover:text-ink hover:bg-line-2 transition-colors"
-          title="下载"
-          aria-label="下载"
+          title="Download"
+          aria-label="Download"
         >
           <DownloadIcon />
         </button>
@@ -571,8 +571,8 @@ export function WorkspacePage() {
             handleDelete(f);
           }}
           className="inline-flex items-center justify-center w-[26px] h-[26px] rounded-md text-dim hover:text-accent hover:bg-accent-soft transition-colors"
-          title="删除"
-          aria-label="删除"
+          title="Delete"
+          aria-label="Delete"
         >
           <TrashIcon />
         </button>
@@ -613,8 +613,8 @@ export function WorkspacePage() {
                   navigateInto(node.path);
                 }}
                 className="inline-flex items-center justify-center w-[26px] h-[26px] rounded-md text-dim hover:text-ink hover:bg-line-2 transition-colors"
-                title="设为上传目录"
-                aria-label="设为上传目录"
+                title="Set as upload folder"
+                aria-label="Set as upload folder"
               >
                 <EnterFolderIcon />
               </button>
@@ -639,7 +639,7 @@ export function WorkspacePage() {
 
   return (
     <div className="flex flex-col h-full min-w-0 bg-paper">
-      <PageHead crumbs={[{ label: '首页', to: '/home' }, { label: '工作区' }]} />
+      <PageHead crumbs={[{ label: 'Home', to: '/home' }, { label: 'Workspace' }]} />
 
       <div
         ref={splitContainerRef}
@@ -683,11 +683,11 @@ export function WorkspacePage() {
                     onClick={() => setWsMenuOpen((o) => !o)}
                     aria-haspopup="menu"
                     aria-expanded={wsMenuOpen}
-                    title="切换工作区"
+                    title="Switch workspace"
                     className="group inline-flex items-center gap-1.5 min-w-0 max-w-full -mx-1 px-1 py-0.5 rounded-sm hover:bg-paper-2 transition-colors cursor-pointer"
                   >
                     <span className="font-display text-[18px] font-normal tracking-[-0.02em] truncate">
-                      {activeWorkspace?.name ?? '工作区'}
+                      {activeWorkspace?.name ?? 'Workspace'}
                     </span>
                     <span
                       aria-hidden
@@ -737,13 +737,13 @@ export function WorkspacePage() {
                                 <span className="truncate">{w.name}</span>
                                 {w.is_default && (
                                   <span className="font-mono text-[9px] text-dim shrink-0">
-                                    默认
+                                    Default
                                   </span>
                                 )}
                                 <LevelBadge level={w.sensitivity_level} small />
                               </div>
                               <div className="font-mono text-[10px] text-dim truncate">
-                                {w.file_count} 个文件
+                                {w.file_count} {w.file_count === 1 ? 'file' : 'files'}
                               </div>
                             </div>
                             {active && (
@@ -767,25 +767,25 @@ export function WorkspacePage() {
                         }}
                         className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left text-[12.5px] text-ink-2 hover:bg-paper-2 hover:text-ink transition-colors"
                       >
-                        <span className="font-mono">+</span> 新建工作区
+                        <span className="font-mono">+</span> New workspace
                       </button>
                     </div>
                   )}
                 </div>
                 {activeWorkspace?.is_default && (
                   <span className="font-mono text-[9.5px] tracking-[0.06em] px-1.5 py-0.5 rounded border border-line-2 text-dim shrink-0">
-                    默认
+                    Default
                   </span>
                 )}
                 <LevelBadge level={activeWorkspace?.sensitivity_level} />
                 {loading && (
                   <span className="font-mono text-[10px] text-dim animate-pulse shrink-0">
-                    加载中…
+                    Loading…
                   </span>
                 )}
               </div>
               <div className="font-mono text-[11px] text-dim">
-                共 {activeWorkspace?.file_count ?? 0} 个文件
+                {activeWorkspace?.file_count ?? 0} files total
               </div>
             </div>
 
@@ -797,10 +797,10 @@ export function WorkspacePage() {
                 aria-haspopup="menu"
                 aria-expanded={menuOpen}
                 disabled={!activeWorkspace}
-                title={activeWorkspace ? '工作区设置' : '暂无活动工作区'}
+                title={activeWorkspace ? 'Workspace settings' : 'No active workspace'}
                 className="inline-flex items-center gap-1.5 px-2.5 py-1.5 border border-line bg-surface rounded-sm text-[12.5px] text-ink-2 hover:border-ink-2 hover:text-ink hover:bg-paper-2 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                设置 <span aria-hidden className="font-mono text-[9px]">▾</span>
+                Settings <span aria-hidden className="font-mono text-[9px]">▾</span>
               </button>
 
               {menuOpen && (
@@ -814,7 +814,7 @@ export function WorkspacePage() {
                     onClick={() => openDialog('detail')}
                     className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left text-[12.5px] text-ink-2 hover:bg-paper-2 hover:text-ink transition-colors"
                   >
-                    工作区详情
+                    Workspace details
                   </button>
                   <button
                     type="button"
@@ -822,7 +822,7 @@ export function WorkspacePage() {
                     onClick={() => openDialog('instructions')}
                     className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left text-[12.5px] text-ink-2 hover:bg-paper-2 hover:text-ink transition-colors"
                   >
-                    工作区指令
+                    Workspace instructions
                   </button>
                   <div className="my-1 border-t border-line-2" />
                   <button
@@ -830,10 +830,10 @@ export function WorkspacePage() {
                     role="menuitem"
                     onClick={() => openDialog('delete')}
                     disabled={activeWorkspace?.is_default}
-                    title={activeWorkspace?.is_default ? '默认工作区不可删除' : '删除此工作区'}
+                    title={activeWorkspace?.is_default ? 'The default workspace can’t be deleted' : 'Delete this workspace'}
                     className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-left text-[12.5px] text-accent hover:bg-accent-soft transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:text-dim disabled:hover:bg-transparent"
                   >
-                    删除工作区
+                    Delete workspace
                   </button>
                 </div>
               )}
@@ -843,13 +843,13 @@ export function WorkspacePage() {
           <div className="px-[22px] py-3.5 border-b border-line-2">
             <div className="flex items-baseline gap-2.5 mb-1.5 flex-wrap">
               <h1 className="m-0 font-display text-[22px] font-normal tracking-[-0.02em] whitespace-nowrap">
-                我的工作区
+                My workspace
               </h1>
-              <Chip dashed>始终作为上下文载入</Chip>
+              <Chip dashed>Always loaded as context</Chip>
             </div>
             <p className="m-0 text-[12.5px] text-dim leading-[1.5]">
-              在 <b className="text-ink-2">{activeWorkspace?.name ?? '工作区'}</b>{' '}
-              中启动的每个任务都会将这些文件作为基础上下文--加上任务开始时上传的文件。
+              Every task started in <b className="text-ink-2">{activeWorkspace?.name ?? 'Workspace'}</b>{' '}
+              gets these files as base context — plus any files uploaded when the task starts.
             </p>
           </div>
 
@@ -882,10 +882,10 @@ export function WorkspacePage() {
             } ${uploading || !activeWorkspace ? 'opacity-60 cursor-not-allowed' : ''}`}
           >
             {uploading ? (
-              <span className="animate-pulse">上传中…</span>
+              <span className="animate-pulse">Uploading…</span>
             ) : (
               <span className="flex items-center gap-2">
-                拖入文件到「{currentFolder || '根目录'}」，或点击选择上传
+                Drop files into “{currentFolder || 'Root'}”, or click to upload
                 {currentFolder && (
                   <button
                     type="button"
@@ -894,7 +894,7 @@ export function WorkspacePage() {
                       setCurrentFolder('');
                     }}
                     className="text-dim hover:text-accent transition-colors"
-                    title="返回根目录"
+                    title="Back to root"
                   >
                     ✕
                   </button>
@@ -908,16 +908,16 @@ export function WorkspacePage() {
             <input
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="搜索文件…"
+              placeholder="Search files…"
               className="flex-1 min-w-[140px] border border-line bg-paper rounded-sm px-2.5 py-1.5 text-[12.5px] font-mono text-ink placeholder:text-dim focus:outline-none focus:border-accent"
             />
             <select
               value={typeFilter}
               onChange={(e) => setTypeFilter(e.target.value)}
               className="border border-line bg-paper rounded-sm px-2 py-1.5 text-[12px] font-mono text-ink-2 focus:outline-none focus:border-accent cursor-pointer"
-              title="按文件类型筛选"
+              title="Filter by file type"
             >
-              <option value="all">全部类型</option>
+              <option value="all">All types</option>
               {extensions.map(([ext, count]) => (
                 <option key={ext} value={ext}>
                   {ext} ({count})
@@ -928,10 +928,10 @@ export function WorkspacePage() {
               type="button"
               onClick={handleCreateFolder}
               disabled={!activeWorkspace}
-              title="在当前文件夹下新建空文件夹"
-              className="cw-btn cw-btn-sm rounded-sm shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
+              title="Create an empty folder in the current folder"
+              className="inline-flex items-center px-2.5 py-1.5 border border-line bg-surface rounded-sm text-[12.5px] text-ink-2 hover:border-ink-2 hover:text-ink hover:bg-paper-2 transition-colors shrink-0 disabled:opacity-40 disabled:cursor-not-allowed"
             >
-              新建文件夹
+              New folder
             </button>
             <div className="min-w-[120px] shrink-0">
               <Dropdown
@@ -939,7 +939,7 @@ export function WorkspacePage() {
                 options={uploadLevelOptions}
                 onChange={(id) => setUploadLevel(id as DlpSensitivity)}
                 disabled={!activeWorkspace}
-                title="上传文件的密级（不能高于工作区密级）"
+                title="Sensitivity level for uploaded files (can’t exceed the workspace level)"
                 dropDirection="down"
                 fullWidth
               />
@@ -958,10 +958,10 @@ export function WorkspacePage() {
               className="grid px-[22px] py-1.5 border-b border-line-2 gap-[10px] items-center sticky top-0 bg-paper z-10"
               style={{ gridTemplateColumns: '1fr 88px 64px 72px 56px' }}
             >
-              <span className="cw-label">名称 · 描述</span>
-              <span className="cw-label text-right">大小</span>
-              <span className="cw-label text-right">密级</span>
-              <span className="cw-label text-right">更新</span>
+              <span className="cw-label">Name · Description</span>
+              <span className="cw-label text-right">Size</span>
+              <span className="cw-label text-right">Level</span>
+              <span className="cw-label text-right">Updated</span>
               <span />
             </div>
 
@@ -969,14 +969,14 @@ export function WorkspacePage() {
               // ── Search active: flat list of matches with full path ──
               searchResults.length === 0 ? (
                 <div className="px-[22px] py-8 text-center text-dim text-[12.5px] font-mono">
-                  未找到匹配文件
+                  No matching files
                 </div>
               ) : (
                 searchResults.map((f) => renderFileRow(f, f.filename, 22))
               )
             ) : files.length === 0 && effectiveEmptyFolders.length === 0 && !uploading ? (
               <div className="px-[22px] py-8 text-center text-dim text-[12.5px] font-mono">
-                此工作区暂无文件
+                No files in this workspace yet
               </div>
             ) : (
               // ── Tree view (folders expand/collapse; files are leaves) ──
@@ -987,7 +987,7 @@ export function WorkspacePage() {
           </div>
 
           <div className="px-[22px] py-2 border-t border-line-2 bg-paper">
-            <span className="cw-label">我的工作区 · {files.length}</span>
+            <span className="cw-label">My workspace · {files.length}</span>
           </div>
         </section>
 
@@ -998,8 +998,8 @@ export function WorkspacePage() {
               onMouseDown={startPreviewDrag}
               role="separator"
               aria-orientation="vertical"
-              aria-label="拖动调整预览栏宽度"
-              title="拖动调整预览栏宽度"
+              aria-label="Drag to resize the preview pane"
+              title="Drag to resize the preview pane"
               className="relative flex items-center justify-center"
               style={{ cursor: 'col-resize', userSelect: 'none' }}
               onMouseEnter={(e) => {
@@ -1029,7 +1029,7 @@ export function WorkspacePage() {
 
       {/* ── Editor dialogs (launched from 设置) ────────────────────────── */}
       {dialog === 'detail' && activeWorkspace && (
-        <Dialog title="工作区详情" onClose={() => setDialog(null)} className="w-full max-w-[520px]">
+        <Dialog title="Workspace details" onClose={() => setDialog(null)} className="w-full max-w-[520px]">
           <DetailRail
             key={activeWorkspace.id}
             name={activeWorkspace.name}
@@ -1048,7 +1048,7 @@ export function WorkspacePage() {
       )}
 
       {dialog === 'instructions' && activeWorkspace && (
-        <Dialog title="工作区指令" onClose={() => setDialog(null)} className="w-full max-w-[560px]">
+        <Dialog title="Workspace instructions" onClose={() => setDialog(null)} className="w-full max-w-[560px]">
           <InstructionsCard
             key={activeWorkspace.id}
             initial={activeWorkspace.instructions ?? ''}
@@ -1071,7 +1071,7 @@ export function WorkspacePage() {
               return true;
             } catch (err) {
               toast.error(
-                err instanceof ApiError ? err.message : '删除工作区失败，请稍后重试。',
+                err instanceof ApiError ? err.message : 'Failed to delete the workspace. Please try again later.',
               );
               return false;
             }
@@ -1090,7 +1090,7 @@ export function WorkspacePage() {
       )}
 
       {newFolderOpen && activeWorkspace && (
-        <Dialog title="新建文件夹" onClose={() => setNewFolderOpen(false)} className="w-full max-w-[420px]">
+        <Dialog title="New folder" onClose={() => setNewFolderOpen(false)} className="w-full max-w-[420px]">
           <div className="flex flex-col gap-3">
             <input
               autoFocus
@@ -1099,12 +1099,12 @@ export function WorkspacePage() {
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && newFolderName.trim()) confirmNewFolder();
               }}
-              placeholder="文件夹名称（可用 / 分层，如 docs/子目录）"
+              placeholder="Folder name (use / for nesting, e.g. docs/subfolder)"
               className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
             />
             <div className="flex justify-end gap-2">
               <button type="button" onClick={() => setNewFolderOpen(false)} className="cw-btn cw-btn-sm">
-                取消
+                Cancel
               </button>
               <button
                 type="button"
@@ -1112,7 +1112,7 @@ export function WorkspacePage() {
                 disabled={!newFolderName.trim()}
                 className="cw-btn cw-btn-primary cw-btn-sm disabled:opacity-50"
               >
-                创建
+                Create
               </button>
             </div>
           </div>
@@ -1126,7 +1126,7 @@ export function WorkspacePage() {
           onClose={() => setVersionFile(null)}
           onRestored={() => {
             setVersionFile(null);
-            toast.success('版本已恢复');
+            toast.success('Version restored');
           }}
         />
       )}
@@ -1161,11 +1161,11 @@ function InstructionsCard({
 
   return (
     <div className="flex flex-col gap-2.5">
-      <Chip dashed>每个任务开始时注入</Chip>
+      <Chip dashed>Injected at the start of every task</Chip>
       <textarea
         value={value}
         onChange={(e) => setValue(e.target.value)}
-        placeholder="例如：所有回复使用中文，代码需附带注释，优先复用现有组件…"
+        placeholder="e.g. Reply in English, comment all code, prefer reusing existing components…"
         className="w-full min-h-[140px] resize-y border border-line rounded-sm px-2.5 py-2 text-[13px] leading-[1.55] bg-paper focus:outline-none focus:border-accent"
       />
       <div className="flex items-center gap-2">
@@ -1175,9 +1175,9 @@ function InstructionsCard({
           disabled={saving || !dirty}
           className="cw-btn cw-btn-primary cw-btn-sm disabled:opacity-50"
         >
-          {saving ? '保存中…' : '保存指令'}
+          {saving ? 'Saving…' : 'Save instructions'}
         </button>
-        {saved && <span className="font-mono text-[11px] text-dim">已保存 ✓</span>}
+        {saved && <span className="font-mono text-[11px] text-dim">Saved ✓</span>}
       </div>
     </div>
   );
@@ -1237,7 +1237,7 @@ function DetailRail({
       setSaved(true);
       setTimeout(() => setSaved(false), 1800);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '保存失败，请稍后重试。');
+      setError(err instanceof ApiError ? err.message : 'Save failed. Please try again later.');
     } finally {
       setSaving(false);
     }
@@ -1262,7 +1262,7 @@ function DetailRail({
           <div className="font-display text-[17px] tracking-[-0.02em] truncate">{n || name}</div>
           {isDefault && (
             <span className="font-mono text-[9.5px] tracking-[0.06em] px-1.5 py-0.5 rounded border border-line-2 text-dim shrink-0">
-              默认
+              Default
             </span>
           )}
         </div>
@@ -1271,7 +1271,7 @@ function DetailRail({
       {/* Editable name/description */}
       <div className="flex flex-col gap-2">
         <div className="flex flex-col gap-1">
-          <label className="cw-label">名称</label>
+          <label className="cw-label">Name</label>
           <input
             value={n}
             onChange={(e) => setN(e.target.value)}
@@ -1279,7 +1279,7 @@ function DetailRail({
           />
         </div>
         <div className="flex flex-col gap-1">
-          <label className="cw-label">描述</label>
+          <label className="cw-label">Description</label>
           <textarea
             value={d}
             onChange={(e) => setD(e.target.value)}
@@ -1287,17 +1287,17 @@ function DetailRail({
           />
         </div>
         <div className="flex flex-col gap-1">
-          <label className="cw-label">密级</label>
+          <label className="cw-label">Sensitivity level</label>
           <Dropdown
             value={level}
             options={levelOptions}
             onChange={(id) => setLevel(id as DlpSensitivity)}
-            title="工作区密级"
+            title="Workspace sensitivity level"
             dropDirection="down"
             fullWidth
           />
           {clearance && (
-            <span className="font-mono text-[10px] text-dim">可选密级受当前用户许可限制</span>
+            <span className="font-mono text-[10px] text-dim">Available levels are limited by your clearance</span>
           )}
         </div>
         <div className="flex items-center gap-2">
@@ -1307,15 +1307,15 @@ function DetailRail({
             disabled={saving || !dirty || !n.trim()}
             className="cw-btn cw-btn-primary cw-btn-sm disabled:opacity-50"
           >
-            {saving ? '保存中…' : '保存'}
+            {saving ? 'Saving…' : 'Save'}
           </button>
-          {saved && <span className="font-mono text-[11px] text-dim">已保存 ✓</span>}
+          {saved && <span className="font-mono text-[11px] text-dim">Saved ✓</span>}
         </div>
       </div>
 
       {/* Workspace id (read-only) */}
       <div className="pt-3 border-t border-line-2">
-        <div className="cw-label mb-2">工作区 ID</div>
+        <div className="cw-label mb-2">Workspace ID</div>
         <code className="font-mono text-[11px] text-dim bg-paper-2 border border-line rounded px-1.5 py-0.5 select-all break-all">
           {wsId}
         </code>
@@ -1349,13 +1349,13 @@ function DeleteWorkspaceDialog({
 
   return (
     <Dialog
-      title="删除工作区"
+      title="Delete workspace"
       onClose={() => !deleting && onClose()}
       dismissable={!deleting}
       className="w-full max-w-[420px]"
     >
       <div className="text-[13px] text-ink leading-relaxed">
-        确定删除工作区「<b>{name}</b>」？此操作不可撤销。
+        Delete workspace “<b>{name}</b>”? This can’t be undone.
       </div>
       <div className="flex justify-end gap-2 pt-1">
         <button
@@ -1364,7 +1364,7 @@ function DeleteWorkspaceDialog({
           disabled={deleting}
           className="cw-btn cw-btn-sm"
         >
-          取消
+          Cancel
         </button>
         <button
           type="button"
@@ -1372,7 +1372,7 @@ function DeleteWorkspaceDialog({
           disabled={deleting}
           className="cw-btn cw-btn-accent cw-btn-sm"
         >
-          {deleting ? '删除中…' : '删除'}
+          {deleting ? 'Deleting…' : 'Delete'}
         </button>
       </div>
     </Dialog>
@@ -1414,7 +1414,7 @@ function CreateWorkspaceDialog({
 
   const create = async () => {
     if (!name.trim()) {
-      setError('请填写工作区名称');
+      setError('Please enter a workspace name');
       return;
     }
     setSaving(true);
@@ -1422,7 +1422,7 @@ function CreateWorkspaceDialog({
     try {
       await onCreate(name.trim(), description.trim(), level);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '创建工作区失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to create workspace');
       setSaving(false);
     }
   };
@@ -1439,7 +1439,7 @@ function CreateWorkspaceDialog({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-line">
-          <div className="text-[13.5px] font-medium">新建工作区</div>
+          <div className="text-[13.5px] font-medium">New workspace</div>
           <button
             className="font-mono text-[12px] text-dim hover:text-ink transition-colors disabled:opacity-40"
             onClick={onClose}
@@ -1456,12 +1456,12 @@ function CreateWorkspaceDialog({
             </div>
           )}
           <div className="flex flex-col gap-1">
-            <label className="cw-label">名称 *</label>
+            <label className="cw-label">Name *</label>
             <input
               className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="例如：合同审查"
+              placeholder="e.g. Contract review"
               autoFocus
               onKeyDown={(e) => {
                 if (e.key === 'Enter' && !saving) create();
@@ -1469,21 +1469,21 @@ function CreateWorkspaceDialog({
             />
           </div>
           <div className="flex flex-col gap-1">
-            <label className="cw-label">描述</label>
+            <label className="cw-label">Description</label>
             <textarea
               className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper min-h-[60px] resize-y focus:outline-none focus:border-accent"
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="一句话说明这个工作区的用途"
+              placeholder="One line on what this workspace is for"
             />
           </div>
           <div className="flex flex-col gap-1">
-            <label className="cw-label">密级</label>
+            <label className="cw-label">Sensitivity level</label>
             <Dropdown
               value={level}
               options={levelOptions}
               onChange={(id) => setLevel(id as DlpSensitivity)}
-              title="工作区密级"
+              title="Workspace sensitivity level"
               dropDirection="down"
               fullWidth
             />
@@ -1492,14 +1492,14 @@ function CreateWorkspaceDialog({
 
         <div className="flex items-center justify-end gap-2 px-4 py-3 border-t border-line">
           <button className="cw-btn cw-btn-sm" onClick={onClose} disabled={saving}>
-            取消
+            Cancel
           </button>
           <button
             className="cw-btn cw-btn-primary cw-btn-sm"
             onClick={create}
             disabled={saving || !name.trim()}
           >
-            {saving ? '创建中…' : '创建'}
+            {saving ? 'Creating…' : 'Create'}
           </button>
         </div>
       </div>
@@ -1539,7 +1539,7 @@ function VersionHistoryDialog({
   }, [workspaceId, file.id]);
 
   const handleRestore = async (ver: WorkspaceFileVersion) => {
-    const ok = await confirm({ message: `确定恢复到版本 ${ver.version}？当前内容将成为新的历史版本。` });
+    const ok = await confirm({ message: `Restore version ${ver.version}? The current content will be saved as a new version.` });
     if (!ok) return;
     setRestoring(ver.id);
     try {
@@ -1556,15 +1556,15 @@ function VersionHistoryDialog({
   const retentionDays = 90;
   const expiryHint = (createdAt: string) => {
     const expiry = new Date(new Date(createdAt).getTime() + retentionDays * 86400000);
-    return `将于 ${expiry.toLocaleDateString('zh-CN')} 过期`;
+    return `Expires ${expiry.toLocaleDateString('en-US')}`;
   };
 
   return (
-    <Dialog title={`历史版本 · ${file.filename}`} onClose={onClose} className="w-full max-w-[520px]">
+    <Dialog title={`Version history · ${file.filename}`} onClose={onClose} className="w-full max-w-[520px]">
       {loading ? (
-        <div className="text-center text-dim text-[13px] py-6">加载中…</div>
+        <div className="text-center text-dim text-[13px] py-6">Loading…</div>
       ) : versions.length === 0 ? (
-        <div className="text-center text-dim text-[13px] py-6">暂无历史版本</div>
+        <div className="text-center text-dim text-[13px] py-6">No version history</div>
       ) : (
         <div className="flex flex-col gap-0 max-h-[400px] overflow-y-auto">
           {versions.map((ver) => (
@@ -1578,7 +1578,7 @@ function VersionHistoryDialog({
                   <span className="text-dim ml-2">{formatBytes(ver.size_bytes)}</span>
                 </div>
                 <div className="font-mono text-[11px] text-dim mt-0.5">
-                  {formatRelativeTimeZh(ver.created_at)}
+                  {formatRelativeTime(ver.created_at)}
                   {ver.created_by && <span className="ml-1.5">· {ver.created_by}</span>}
                 </div>
                 <div className="font-mono text-[10px] text-dim mt-0.5 opacity-60">
@@ -1591,7 +1591,7 @@ function VersionHistoryDialog({
                 disabled={restoring === ver.id}
                 className="cw-btn cw-btn-sm text-[11px] ml-2 shrink-0"
               >
-                {restoring === ver.id ? '恢复中…' : '恢复'}
+                {restoring === ver.id ? 'Restoring…' : 'Restore'}
               </button>
             </div>
           ))}

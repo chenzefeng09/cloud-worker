@@ -237,7 +237,7 @@ describe("worker", () => {
     // The resume note must NOT appear in the system prompt: it varies per run and
     // would break DeepSeek prefix-cache hits. It now rides on the user prompt
     // (see the runQuery resume test below).
-    expect(prompt).not.toContain("断点恢复");
+    expect(prompt).not.toContain("resuming from a checkpoint");
     expect(prompt).toContain("用户上次说他叫张三");
     expect(prompt).toContain("你是助手");
     // skills index, with the SKILL.md path
@@ -268,14 +268,14 @@ describe("worker", () => {
       systemPrompt: "sys",
       mcpServers: {},
       redis: noopRedis(),
-      resumeNote: "[系统：本次运行从断点恢复，上次已完成 3 步。]",
+      resumeNote: "[System: this run is resuming from a checkpoint; 3 step(s) were already completed.]",
       deps: { queryFn: capturingQuery as never },
     });
 
     // The resume note is prepended to the user task prompt, ahead of the task.
     expect(typeof seenPrompt).toBe("string");
-    expect(seenPrompt as string).toContain("断点恢复");
-    expect((seenPrompt as string).indexOf("断点恢复")).toBeLessThan(
+    expect(seenPrompt as string).toContain("resuming from a checkpoint");
+    expect((seenPrompt as string).indexOf("resuming from a checkpoint")).toBeLessThan(
       (seenPrompt as string).indexOf("do the thing"),
     );
   });
@@ -995,12 +995,12 @@ describe("worker", () => {
   it("buildResumeContext returns '' for the start-checkpoint of a brand-new run", async () => {
     // Regression: the run loop writes {cursor:"start", status:"RUNNING", step:1}
     // right before dispatch. That self-written marker must NOT be mistaken for a
-    // prior-run resume — otherwise every fresh run gets a bogus "已完成 1 步" note.
+    // prior-run resume — otherwise every fresh run gets a bogus "1 step already completed" note.
     const note = await worker.buildResumeContext(
       checkpointRedis({ status: "RUNNING", cursor: "start", step: 1, plan: "" }),
     );
     expect(note).toBe("");
-    expect(note).not.toContain("断点恢复");
+    expect(note).not.toContain("resuming from a checkpoint");
   });
 
   it("buildResumeContext returns '' for terminal (COMPLETED / FAILED) checkpoints", async () => {
@@ -1027,8 +1027,8 @@ describe("worker", () => {
         plan: "调研后写报告",
       }),
     );
-    expect(note).toContain("断点恢复");
-    expect(note).toContain("已完成 3 步");
+    expect(note).toContain("resuming from a checkpoint");
+    expect(note).toContain("3 step(s) were already completed");
     expect(note).toContain("调研后写报告");
   });
 

@@ -1,7 +1,8 @@
 # =============================================================================
 # Agent Platform — MCP Registry OpenAPI 3.1
 #
-# Tenant MCP server registry — backs the agentscope-ext/mcp_tenant_injector.
+# Tenant MCP server registry — the in-sandbox Claude Agent SDK worker loads the
+# tenant's MCP servers from the internal listing (via tool-broker in broker mode).
 # =============================================================================
 openapi: 3.1.0
 

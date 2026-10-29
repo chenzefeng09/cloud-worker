@@ -97,8 +97,9 @@ class Settings(BaseSettings):
     # docker_host is picked up by the docker SDK via DOCKER_HOST env var when
     # empty; set explicitly here only for tests or non-standard deployments.
     docker_host: str = ""  # empty → SDK picks up DOCKER_HOST from env
-    # Sandbox image to run as idle containers.
-    sandbox_image: str = "ghcr.io/agent-platform/agentscope-sandbox:0.1"
+    # Sandbox image to run as idle containers — the Claude Agent SDK worker
+    # image (``worker-claude-sdk``); matches agent-scheduler's ``agent_image``.
+    sandbox_image: str = "ghcr.io/agent-platform/claude-sdk-sandbox:0.1"
     # Docker network the pool-managed containers join (must match compose network).
     # Prewarmed sandboxes must NOT sit on the flat foundation network: like
     # scheduler-spawned sandboxes in broker egress mode, they join the internal

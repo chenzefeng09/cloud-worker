@@ -62,7 +62,7 @@ def _default_title(blocks: list[dict]) -> str:
         text = str(block.get("text") or "").strip()
         if text:
             return text.split("\n", 1)[0][:200]
-    return "未命名画布"
+    return "Untitled canvas"
 
 
 class CanvasService:
@@ -300,7 +300,7 @@ class CanvasService:
         if bool(source_message_id) == bool(content):
             raise CanvasBadRequestError(
                 "exactly one of source_message_id / content is required",
-                user_message="创建画布需要提供来源消息或内容其一。",
+                user_message="Creating a canvas requires either a source message or content.",
             )
 
         source_message: Message | None = None
@@ -318,13 +318,13 @@ class CanvasService:
         if not blocks:
             raise CanvasBadRequestError(
                 "no content to materialize into a canvas",
-                user_message="内容为空，无法创建画布。",
+                user_message="The content is empty, so the canvas cannot be created.",
             )
 
         if content_type == "html":
             # An HTML block carries no heading/first-line to derive a name from,
             # so fall back to a generic label when the model omitted the title.
-            resolved_title = (title or "").strip() or "网页应用"
+            resolved_title = (title or "").strip() or "Web app"
         else:
             resolved_title = (title or "").strip() or _default_title(blocks)
 
@@ -346,7 +346,7 @@ class CanvasService:
             canvas_id=canvas.id,
             version=1,
             blocks=blocks,
-            change_summary="初始版本",
+            change_summary="Initial version",
             created_by="model" if source_message_id else "user",
             base_version=None,
         )
@@ -372,7 +372,7 @@ class CanvasService:
         if msg is None:
             raise CanvasBadRequestError(
                 f"source message {message_id} not found in session {session_id}",
-                user_message="来源消息不存在。",
+                user_message="The source message does not exist.",
             )
         return msg
 
@@ -397,7 +397,7 @@ class CanvasService:
         await self._append_version(
             canvas,
             blocks=blocks,
-            change_summary="手动编辑",
+            change_summary="Manual edit",
             created_by="user",
             base_version=base_version,
         )
@@ -413,7 +413,7 @@ class CanvasService:
         await self._append_version(
             canvas,
             blocks=list(source.blocks or []),
-            change_summary=f"回退到版本 {to_version}",
+            change_summary=f"Reverted to version {to_version}",
             created_by="user",
             base_version=to_version,
         )

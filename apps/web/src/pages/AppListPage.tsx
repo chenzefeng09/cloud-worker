@@ -17,9 +17,9 @@ type AppTab = 'mine' | 'published' | 'schedules';
 const TAB_ORDER: AppTab[] = ['mine', 'published', 'schedules'];
 
 const TAB_LABELS: Record<AppTab, string> = {
-  mine: '我的应用',
-  published: '应用中心',
-  schedules: '触发器',
+  mine: 'My apps',
+  published: 'App Center',
+  schedules: 'Triggers',
 };
 
 /** `?tab=` is the source of truth so `/apps?tab=schedules` is linkable. */
@@ -58,11 +58,11 @@ function AppCard({
         <span className="font-mono text-[10.5px] text-dim">-&gt;</span>
       </div>
       <div className="text-[12px] text-dim leading-[1.45] line-clamp-2">
-        {app.description || '运行此应用'}
+        {app.description || 'Run this app'}
       </div>
       <div className="flex-1" />
       <div className="flex items-center gap-1.5 flex-wrap">
-        {children ?? <Chip>应用</Chip>}
+        {children ?? <Chip>App</Chip>}
         {tags.map((t) => (
           <span key={t} className="cw-chip text-[9px] text-dim">#{t}</span>
         ))}
@@ -135,16 +135,16 @@ export function AppListPage() {
   return (
     <div className="flex flex-col h-full min-w-0 bg-paper">
       <PageHead
-        crumbs={[{ label: '首页', to: '/home' }, { label: '应用' }]}
+        crumbs={[{ label: 'Home', to: '/home' }, { label: 'Apps' }]}
         actions={
           tab === 'schedules' ? null : (
             <button
               type="button"
               onClick={() => setShowCreateModal(true)}
               className="cw-btn cw-btn-ghost cw-btn-sm"
-              title="从零创建一个应用"
+              title="Create an app from scratch"
             >
-              <span className="font-mono">+</span> 创建应用
+              <span className="font-mono">+</span> Create app
             </button>
           )
         }
@@ -181,13 +181,13 @@ export function AppListPage() {
                 className="border border-line rounded-sm px-2.5 py-1.5 text-[13px] bg-surface focus:outline-none focus:border-accent"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
-                placeholder="搜索应用名称或描述…"
+                placeholder="Search apps by name or description…"
               />
 
               {/* Tag filter - only when the current tab has apps with tags */}
               {currentApps.length > 0 && allTags.length > 0 && (
                 <div className="flex items-center gap-1.5 flex-wrap">
-                  <span className="cw-label mr-0.5">标签</span>
+                  <span className="cw-label mr-0.5">Tags</span>
                   {allTags.map((t) => {
                     const on = selectedTags.includes(t);
                     return (
@@ -209,7 +209,7 @@ export function AppListPage() {
                       onClick={() => setSelectedTags([])}
                       className="font-mono text-[10.5px] text-dim hover:text-accent transition-colors ml-1"
                     >
-                      清除
+                      Clear
                     </button>
                   )}
                 </div>
@@ -217,17 +217,17 @@ export function AppListPage() {
 
               {/* List */}
               {currentLoading ? (
-                <div className="font-mono text-[12px] text-dim">加载中…</div>
+                <div className="font-mono text-[12px] text-dim">Loading…</div>
               ) : filteredApps.length === 0 ? (
                 <div className="border border-line border-dashed bg-surface rounded-md p-4 flex flex-col gap-2 items-center justify-center min-h-[120px]">
                   <div className="font-mono italic text-dim text-[12px]">
                     {hasFilter
                       ? tab === 'published'
-                        ? '没有匹配的已发布应用'
-                        : '没有匹配的应用'
+                        ? 'No matching published apps'
+                        : 'No matching apps'
                       : tab === 'published'
-                        ? '暂无已发布应用'
-                        : '你还没有创建应用'}
+                        ? 'No published apps yet'
+                        : 'You haven’t created any apps yet'}
                   </div>
                   {!hasFilter && tab === 'mine' && (
                     <button
@@ -235,7 +235,7 @@ export function AppListPage() {
                       onClick={() => setShowCreateModal(true)}
                       className="cw-btn cw-btn-ghost cw-btn-sm"
                     >
-                      <span className="font-mono">+</span> 创建应用
+                      <span className="font-mono">+</span> Create app
                     </button>
                   )}
                 </div>
@@ -246,7 +246,7 @@ export function AppListPage() {
                       const canRun = Boolean(app.current_version_id);
                       return (
                         <AppCard key={app.id} app={app} onClick={() => navigate(`/apps/${app.id}`)}>
-                          <Chip>应用</Chip>
+                          <Chip>App</Chip>
                           <button
                             type="button"
                             onClick={(e) => {
@@ -254,10 +254,10 @@ export function AppListPage() {
                               navigate(`/apps/${app.id}/run`);
                             }}
                             disabled={!canRun}
-                            title={canRun ? '运行此应用' : '该应用尚未发布'}
+                            title={canRun ? 'Run this app' : 'This app hasn’t been published yet'}
                             className="cw-btn cw-btn-primary cw-btn-sm ml-auto disabled:opacity-40 disabled:cursor-not-allowed"
                           >
-                            运行
+                            Run
                           </button>
                         </AppCard>
                       );
@@ -265,7 +265,7 @@ export function AppListPage() {
                     const lv = latestVersion(app);
                     return (
                       <AppCard key={app.id} app={app} onClick={() => navigate(`/apps/${app.id}`)}>
-                        {lv ? <VersionStatusChip status={lv.status} /> : <Chip>草稿</Chip>}
+                        {lv ? <VersionStatusChip status={lv.status} /> : <Chip>Draft</Chip>}
                       </AppCard>
                     );
                   })}

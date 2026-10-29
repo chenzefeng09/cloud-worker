@@ -1,13 +1,13 @@
 /**
- * ProfilePage — token usage dashboard tests (用量与账单 tab).
+ * ProfilePage — token usage dashboard tests (Usage & billing tab).
  *
  * Verifies the multi-dimensional breakdown built on
  * api.runs.tokenUsageBreakdown():
  * 1. Stacked daily chart renders one bar per day with MM-DD labels
- * 2. "近 N 天无 Token 用量" empty state shown when all totals are 0
+ * 2. "No token usage in the last N days" empty state shown when all totals are 0
  * 3. Loading placeholder shown while the breakdown API resolves
  * 4. Total token count shown in the section title (reflecting the window)
- * 5. 按来源 section renders localized source rows with percent-of-total
+ * 5. By source section renders localized source rows with percent-of-total
  * 6. Time-range segmented control refetches with the chosen window
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -26,7 +26,7 @@ vi.mock('../lib/workspaceContext', () => ({
 
 // Mock i18n — the page reads useTranslation() for the 语言 switcher
 vi.mock('../i18n', () => ({
-  useTranslation: () => ({ lang: 'zh', setLang: vi.fn(), t: (k: string) => k }),
+  useTranslation: () => ({ lang: 'en', setLang: vi.fn(), t: (k: string) => k }),
 }));
 
 // Mock chatStore
@@ -171,28 +171,28 @@ describe('ProfilePage — token usage dashboard', () => {
     mockNotifPreferences.mockResolvedValue({ items: [] });
   });
 
-  it('renders chart section title on 用量与账单 tab (default 30-day window)', async () => {
+  it('renders chart section title on Usage & billing tab (default 30-day window)', async () => {
     render(<ProfilePage />);
-    await userEvent.click(screen.getByText('用量与账单'));
+    await userEvent.click(screen.getByText('Usage & billing'));
 
     await waitFor(() => {
-      expect(screen.getByText(/Token 用量（近 30 天）/)).toBeInTheDocument();
+      expect(screen.getByText(/Token usage \(last 30 days\)/)).toBeInTheDocument();
     });
   });
 
   it('shows total token count in section title', async () => {
     render(<ProfilePage />);
-    await userEvent.click(screen.getByText('用量与账单'));
+    await userEvent.click(screen.getByText('Usage & billing'));
 
     // Total = 0+100+200+150+300+50+420 = 1220
     await waitFor(() => {
-      expect(screen.getByText(/1,220 tokens 合计/)).toBeInTheDocument();
+      expect(screen.getByText(/1,220 tokens total/)).toBeInTheDocument();
     });
   });
 
   it('renders stacked-bar tooltips with MM-DD labels', async () => {
     render(<ProfilePage />);
-    await userEvent.click(screen.getByText('用量与账单'));
+    await userEvent.click(screen.getByText('Usage & billing'));
 
     await waitFor(() => {
       // StackedBars renders date labels sliced to MM-DD (d.day.slice(5))
@@ -200,27 +200,27 @@ describe('ProfilePage — token usage dashboard', () => {
     });
   });
 
-  it('shows "近 30 天无 Token 用量" when all totals are 0', async () => {
+  it('shows "No token usage in the last 30 days" when all totals are 0', async () => {
     mockTokenUsageBreakdown.mockResolvedValue(BREAKDOWN_ALL_ZERO);
     render(<ProfilePage />);
-    await userEvent.click(screen.getByText('用量与账单'));
+    await userEvent.click(screen.getByText('Usage & billing'));
 
     await waitFor(() => {
-      expect(screen.getByText(/近 30 天无 Token 用量/)).toBeInTheDocument();
+      expect(screen.getByText(/No token usage in the last 30 days/)).toBeInTheDocument();
     });
   });
 
   it('shows loading placeholder before breakdown data resolves', async () => {
     mockTokenUsageBreakdown.mockReturnValue(new Promise(() => {})); // never resolves
     render(<ProfilePage />);
-    await userEvent.click(screen.getByText('用量与账单'));
+    await userEvent.click(screen.getByText('Usage & billing'));
 
-    expect(screen.getByText('加载中…')).toBeInTheDocument();
+    expect(screen.getByText('Loading…')).toBeInTheDocument();
   });
 
   it('renders one bar entry per day', async () => {
     render(<ProfilePage />);
-    await userEvent.click(screen.getByText('用量与账单'));
+    await userEvent.click(screen.getByText('Usage & billing'));
 
     await waitFor(() => {
       // Each day renders a div with a title attribute containing "tokens"
@@ -229,40 +229,40 @@ describe('ProfilePage — token usage dashboard', () => {
     });
   });
 
-  it('renders 按来源 rows with localized labels and percent-of-total', async () => {
+  it('renders By source rows with localized labels and percent-of-total', async () => {
     render(<ProfilePage />);
-    await userEvent.click(screen.getByText('用量与账单'));
+    await userEvent.click(screen.getByText('Usage & billing'));
 
     await waitFor(() => {
-      expect(screen.getByText('按来源')).toBeInTheDocument();
+      expect(screen.getByText('By source')).toBeInTheDocument();
     });
-    // user → 手动, schedule → 定时
-    expect(screen.getByText('手动')).toBeInTheDocument();
-    expect(screen.getByText('定时')).toBeInTheDocument();
+    // user → Manual, schedule → Scheduled
+    expect(screen.getByText('Manual')).toBeInTheDocument();
+    expect(screen.getByText('Scheduled')).toBeInTheDocument();
     // total = 900 + 320 = 1220 → user 73.8%, schedule 26.2%
     expect(screen.getByText('73.8%')).toBeInTheDocument();
     expect(screen.getByText('26.2%')).toBeInTheDocument();
   });
 
-  it('shows "暂无用量数据" when by_source is empty', async () => {
+  it('shows "No usage data yet" when by_source is empty', async () => {
     mockTokenUsageBreakdown.mockResolvedValue(BREAKDOWN_ALL_ZERO);
     render(<ProfilePage />);
-    await userEvent.click(screen.getByText('用量与账单'));
+    await userEvent.click(screen.getByText('Usage & billing'));
 
     await waitFor(() => {
-      expect(screen.getByText(/暂无用量数据/)).toBeInTheDocument();
+      expect(screen.getByText(/No usage data yet/)).toBeInTheDocument();
     });
   });
 
   it('refetches with the chosen window when time-range changes', async () => {
     render(<ProfilePage />);
-    await userEvent.click(screen.getByText('用量与账单'));
+    await userEvent.click(screen.getByText('Usage & billing'));
 
     await waitFor(() => {
       expect(mockTokenUsageBreakdown).toHaveBeenCalledWith(30);
     });
 
-    await userEvent.click(screen.getByText('近 7 天'));
+    await userEvent.click(screen.getByText('Last 7 days'));
     await waitFor(() => {
       expect(mockTokenUsageBreakdown).toHaveBeenCalledWith(7);
     });

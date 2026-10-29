@@ -383,8 +383,8 @@ export function ChatWindow({
     [outputAttachmentsKey, sessionId, onPreviewFile],
   );
 
-  // "@ file" mention candidates: workspace base files (labelled 工作区) + this
-  // session's input attachments (labelled 附件). Best-effort — any fetch that
+  // "@ file" mention candidates: workspace base files (labelled Workspace) + this
+  // session's input attachments (labelled Attachment). Best-effort — any fetch that
   // fails degrades silently to whatever loaded. Refreshed on a run-completion
   // edge so files uploaded/added earlier in the session surface without a page
   // reload.
@@ -452,8 +452,6 @@ export function ChatWindow({
   const setSessionEffort = useChatStore((s) => s.setSessionEffort);
   // Per-session chat/agent mode. Atomic selector (no new object) so the snapshot
   // stays reference-stable; defaults applied at render, not in the selector.
-  const executionMode = useChatStore((s) => s.executionMode[sessionId]);
-  const setSessionExecutionMode = useChatStore((s) => s.setSessionExecutionMode);
   // Per-session opt-out of the platform-global default skills (default on).
   const platformDefaultsEnabled =
     useChatStore((s) => s.platformDefaultsEnabled[sessionId]) !== false;
@@ -809,7 +807,7 @@ export function ChatWindow({
               !inlineCanvasV2Id && (
               <div className="flex-1 flex items-center justify-center py-16">
                 <span className="font-mono italic text-dim text-[12px]">
-                  开始与 AI Agent 对话
+                  Start a conversation with the AI agent
                 </span>
               </div>
             )}
@@ -854,8 +852,8 @@ export function ChatWindow({
             type="button"
             className="chat-scroll-to-bottom"
             onClick={() => scrollToBottom('smooth')}
-            aria-label="滚动到最新消息"
-            title="滚动到最新消息"
+            aria-label="Scroll to latest message"
+            title="Scroll to latest message"
           >
             ↓
           </button>
@@ -897,8 +895,6 @@ export function ChatWindow({
           effort={selectedEffort ?? DEFAULT_EFFORT}
           onModelChange={showThinkingUi ? (m) => setSessionModel(sessionId, m) : undefined}
           onEffortChange={showThinkingUi ? (e) => setSessionEffort(sessionId, e) : undefined}
-          executionMode={executionMode ?? 'sandbox'}
-          onExecutionModeChange={(mode) => setSessionExecutionMode(sessionId, mode)}
           platformDefaults={{
             enabled: platformDefaultsEnabled,
             onToggle: () => setPlatformDefaultsEnabled(sessionId, !platformDefaultsEnabled),

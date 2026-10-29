@@ -11,16 +11,16 @@ describe('Dropdown', () => {
       <Dropdown
         value="ws_internal"
         options={[
-          { id: 'ws_internal', label: '工作区 · 内部' },
-          { id: 'ws_contract', label: '合同审查 · 内部' },
+          { id: 'ws_internal', label: 'Workspace · Internal' },
+          { id: 'ws_contract', label: 'Contract review · Internal' },
         ]}
         onChange={vi.fn()}
-        title="选择工作区"
+        title="Select workspace"
         align="left"
       />,
     );
 
-    const trigger = screen.getByTitle('选择工作区');
+    const trigger = screen.getByTitle('Select workspace');
     expect(trigger).toHaveClass('whitespace-nowrap');
     await user.click(trigger);
 

@@ -19,7 +19,7 @@ global:
   imagePullSecrets: []
 
   # 时区
-  timezone: Asia/Shanghai
+  timezone: UTC
 
   # 全局 nodeSelector / tolerations / affinity（每个服务可按需覆盖）
   nodeSelector: {}
@@ -166,8 +166,6 @@ sessionOrchestrator:
     dbMaxOverflow: "10"
     dbPoolRecycle: "1800"
     skillStoreServiceScopes: "skill.read_internal"
-    mcpRegistryServiceScopes: "mcp.read_internal"
-    inlineMcpTimeout: "20"
   env: []
 
 # ---------------------------------------------------------------------------
@@ -200,15 +198,13 @@ agentScheduler:
     # cube:   通过 cube-controller 启动 microVM（staging/production）
     #         cube-controller 端点由 W6 staging 物料提供（见 deploy/operator/）
     runtime: docker
-    agentImage: ghcr.io/agent-platform/agentscope-sandbox:0.1
+    # Claude Agent SDK worker image (sandbox-images/claude-sdk.Dockerfile)
+    agentImage: ghcr.io/agent-platform/claude-sdk-sandbox:0.1
     llmModel: claude-sonnet-4-20250514
-    llmProvider: ""
-    llmBaseUrl: ""
     workspaceBase: /tmp/agent-workspaces
     sandboxMemoryLimit: "2g"
     sandboxCpuShares: "1024"
     sandboxTimeout: "600"
-    runtimeExtensions: "mcp_tenant_injector,skills_loader,web_fetch,event_audit_sink,llm_gateway_enforcer"
     # ----- Sandbox egress mode -----------------------------------------------
     # broker (默认): 沙箱仅经 tool-broker 触达 infra（每 run 签名 lease）。
     # foundation: 旧/兼容模式，沙箱直连 foundation 服务网段。
@@ -271,7 +267,7 @@ sandboxPool:
     idleLowWatermark: "2"
     idleHighWatermark: "10"
     maxTotal: "50"
-    sandboxImage: ghcr.io/agent-platform/agentscope-sandbox:0.1
+    sandboxImage: ghcr.io/agent-platform/claude-sdk-sandbox:0.1
   podDisruptionBudget:
     enabled: false
     minAvailable: 1

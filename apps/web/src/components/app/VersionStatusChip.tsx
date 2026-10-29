@@ -10,10 +10,10 @@ import type { AppVersionStatus } from '../../api/types';
 // published, accent = rejected.
 
 const STATUS_LABEL: Record<AppVersionStatus, string> = {
-  draft: '草稿',
-  pending_review: '待审核',
-  published: '已发布',
-  rejected: '已拒绝',
+  draft: 'Draft',
+  pending_review: 'In review',
+  published: 'Published',
+  rejected: 'Rejected',
 };
 
 const STATUS_DOT: Record<AppVersionStatus, string> = {

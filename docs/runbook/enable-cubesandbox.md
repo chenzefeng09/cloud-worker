@@ -90,7 +90,7 @@ export CUBE_CERTS_DIR=/path/to/certs
 # export CUBE_CONTROLLER_URL=https://cube-controller:8443
 ```
 
-All remaining variables (`LLM_API_KEY`, `BFF_COOKIE_SECRET`, etc.) are the
+All remaining variables (`BFF_COOKIE_SECRET`, `AGENT_IMAGE`, etc.) are the
 same as for the standard docker-backed stack — see `.env.example`.
 
 ---

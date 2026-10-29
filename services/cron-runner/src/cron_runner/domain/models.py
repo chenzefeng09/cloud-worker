@@ -40,7 +40,7 @@ class CronJob(Base):
     )
     # Nullable now: webhook triggers have no cron expression.
     cron_expression: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="Asia/Shanghai")
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="UTC")
 
     # Fixed non-file App inputs: {"field_key": value, ...}
     input_values: Mapped[dict[str, Any]] = mapped_column(

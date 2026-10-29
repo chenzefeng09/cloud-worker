@@ -80,11 +80,15 @@ git-ignored. Open it and fill in the required secrets before starting the stack:
 |---|---|---|
 | `BFF_COOKIE_SECRET` | Signs the browser session cookie. `foundation_sdk.CookieSigner` validates it at startup and **refuses to boot** on an empty or placeholder value (must be ≥ 32 chars, no `change-me`). | `python3 -c "import secrets; print(secrets.token_urlsafe(48))"` |
 | `TOOL_BROKER_LEASE_SECRET` and `SCHEDULER_TOOL_BROKER_LEASE_SECRET` | Shared HMAC secret that signs per-run sandbox capability leases. The scheduler signs with it; the tool-broker verifies with it. **Both must be set to the same value.** | `python3 -c "import secrets; print(secrets.token_urlsafe(48))"` |
-| `LLM_API_KEY` | Upstream model key used by the LLM gateway path for local runs. | Provider-issued key. |
 | `SCHEDULER_SERVICE_TOKEN` | Lets the scheduler mint short-lived per-run sandbox tokens from Foundation Identity. | Issued by the foundation identity service (scope limited to service-account token issuance). |
 
 The remaining defaults (ports, pool watermarks, `FOUNDATION_NETWORK`,
 `FOUNDATION_SDK_PATH`) work as-is for a sibling-checkout layout.
+
+No model provider key goes in this file: agent runs reach models only through
+the foundation LLM gateway with a per-tenant virtual key, so make sure your
+tenant has one configured on the foundation side — a run for a tenant without a
+virtual key fails at spawn.
 
 ---
 
@@ -120,6 +124,13 @@ the agent services:
 
 ```bash
 make agent-up
+```
+
+Build the sandbox image the scheduler launches for every run (the Claude Agent
+SDK worker, `AGENT_IMAGE=ghcr.io/agent-platform/claude-sdk-sandbox:0.1`):
+
+```bash
+make build-claude-sdk-image
 ```
 
 Useful companions while the stack runs:
@@ -222,7 +233,7 @@ Once the stack is up and you are signed in at `http://localhost:5173`:
 1. **From the UI** — open a session (the `/tasks/:id` AgentPage), type a prompt,
    and send it. The BFF relays your message to the session-orchestrator, which
    starts a run via the scheduler; the scheduler spawns a Docker sandbox running
-   the AgentScope worker. Token deltas and plan/step state stream back to the
+   the Claude Agent SDK worker. Token deltas and plan/step state stream back to the
    browser over SSE until the run reaches `done`.
 
 2. **From the API** — drive the scheduler directly with a valid session bearer

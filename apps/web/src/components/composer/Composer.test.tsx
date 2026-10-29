@@ -52,40 +52,37 @@ describe('Composer - session variant', () => {
         effort="medium"
         onModelChange={vi.fn()}
         onEffortChange={vi.fn()}
-        executionMode="sandbox"
-        onExecutionModeChange={vi.fn()}
       />,
     );
 
     expect(screen.getByTestId('session-composer')).toHaveClass('rounded-[20px]');
-    expect(screen.queryByRole('radiogroup', { name: '运行模式' })).not.toBeInTheDocument();
+    // The execution-mode picker was removed: every run uses the sandbox agent.
+    expect(screen.queryByRole('button', { name: /execution mode|run mode/i })).not.toBeInTheDocument();
 
     // Only uploads are wired in this render, so the trigger names just that -
     // but it is still a menu, never a bare file-picker shortcut.
-    const addButton = screen.getByRole('button', { name: '添加文件' });
+    const addButton = screen.getByRole('button', { name: 'Add files' });
     expect(addButton).toHaveClass('rounded-full', 'w-9', 'h-9');
     expect(addButton).toHaveAttribute('aria-haspopup', 'menu');
-    expect(screen.getByRole('button', { name: '选择运行模式' })).toHaveTextContent('智能体');
 
-    expect(screen.getByRole('tooltip', { name: '添加文件' })).toBeInTheDocument();
-    expect(screen.getByRole('tooltip', { name: '选择智能体或对话模式' })).toBeInTheDocument();
-    expect(screen.getByRole('tooltip', { name: '选择本次会话使用的模型' })).toBeInTheDocument();
-    expect(screen.getByRole('tooltip', { name: '调整模型的思考深度' })).toBeInTheDocument();
-    expect(screen.getByRole('tooltip', { name: '发送消息（Enter）' })).toBeInTheDocument();
+    expect(screen.getByRole('tooltip', { name: 'Add files' })).toBeInTheDocument();
+    expect(screen.getByRole('tooltip', { name: 'Choose the model for this session' })).toBeInTheDocument();
+    expect(screen.getByRole('tooltip', { name: 'Adjust how deeply the model thinks' })).toBeInTheDocument();
+    expect(screen.getByRole('tooltip', { name: 'Send message (Enter)' })).toBeInTheDocument();
 
-    const sendButton = screen.getByRole('button', { name: '发送消息' });
+    const sendButton = screen.getByRole('button', { name: 'Send message' });
     expect(sendButton).toHaveClass('rounded-full', 'w-10', 'h-10');
     expect(sendButton).toBeDisabled();
 
-    await user.type(screen.getByRole('textbox'), '继续完善方案');
+    await user.type(screen.getByRole('textbox'), 'Keep refining the plan');
     expect(sendButton).toBeEnabled();
     await user.click(sendButton);
-    expect(onSend).toHaveBeenCalledWith('继续完善方案', [], [], undefined);
+    expect(onSend).toHaveBeenCalledWith('Keep refining the plan', [], [], undefined);
   });
 
   it('hides the workspace picker - an existing session cannot be rebound', async () => {
     render(<Composer onSend={vi.fn()} onUpload={vi.fn()} />);
-    expect(screen.queryByRole('button', { name: '选择工作区' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Select workspace' })).not.toBeInTheDocument();
     // Flush the useModelOptions catalogue fetch so its state update settles
     // within act() instead of leaking out of this (otherwise sync) test.
     await waitFor(() => expect(apiMocks.listModels).toHaveBeenCalled());
@@ -103,12 +100,12 @@ describe('Composer - home variant', () => {
         variant="home"
         text=""
         onTextChange={onTextChange}
-        placeholder="帮我安排明天的团队站会…"
+        placeholder="Plan tomorrow’s team stand-up…"
         onSend={onSend}
         onUpload={vi.fn()}
         workspace={{
           value: 'ws_1',
-          options: [{ id: 'ws_1', label: '工作区（内部）' }],
+          options: [{ id: 'ws_1', label: 'Workspace (Internal)' }],
           onChange: vi.fn(),
         }}
         model="deepseek-v4-flash"
@@ -117,21 +114,21 @@ describe('Composer - home variant', () => {
     );
 
     expect(screen.getByTestId('home-composer-toolbar')).not.toHaveClass('border-t', 'bg-paper');
-    expect(screen.getByRole('button', { name: '选择工作区' })).toHaveTextContent('工作区（内部）');
+    expect(screen.getByRole('button', { name: 'Select workspace' })).toHaveTextContent('Workspace (Internal)');
     // Effort handler omitted -> the control stays hidden.
-    expect(screen.queryByRole('button', { name: '调整推理强度' })).not.toBeInTheDocument();
-    expect(screen.getByRole('tooltip', { name: '发送并创建任务（Enter）' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Adjust reasoning effort' })).not.toBeInTheDocument();
+    expect(screen.getByRole('tooltip', { name: 'Send and create task (Enter)' })).toBeInTheDocument();
 
-    expect(screen.getByRole('button', { name: '发送' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
 
     // Controlled text: typing goes out through onTextChange, not internal state.
-    await user.type(screen.getByRole('textbox'), '帮');
-    expect(onTextChange).toHaveBeenCalledWith('帮');
+    await user.type(screen.getByRole('textbox'), 'P');
+    expect(onTextChange).toHaveBeenCalledWith('P');
 
     rerender(
       <Composer
         variant="home"
-        text="帮我规划明天"
+        text="Plan my day tomorrow"
         onTextChange={onTextChange}
         onSend={onSend}
         onUpload={vi.fn()}
@@ -139,8 +136,8 @@ describe('Composer - home variant', () => {
         onModelChange={vi.fn()}
       />,
     );
-    await user.click(screen.getByRole('button', { name: '发送' }));
-    expect(onSend).toHaveBeenCalledWith('帮我规划明天', [], [], undefined);
+    await user.click(screen.getByRole('button', { name: 'Send' }));
+    expect(onSend).toHaveBeenCalledWith('Plan my day tomorrow', [], [], undefined);
   });
 
   it('shows a clear empty workspace state without a dead dropdown arrow', async () => {
@@ -153,14 +150,14 @@ describe('Composer - home variant', () => {
           options: [],
           onChange: vi.fn(),
           disabled: true,
-          emptyLabel: '无工作区',
+          emptyLabel: 'No workspaces',
         }}
       />,
     );
 
-    const workspace = screen.getByRole('button', { name: '选择工作区' });
+    const workspace = screen.getByRole('button', { name: 'Select workspace' });
     expect(workspace).toBeDisabled();
-    expect(workspace).toHaveTextContent('无工作区');
+    expect(workspace).toHaveTextContent('No workspaces');
     expect(workspace).not.toHaveTextContent('▾');
     await waitFor(() => expect(apiMocks.listModels).toHaveBeenCalled());
   });
@@ -173,7 +170,7 @@ describe('Composer - home variant', () => {
 
     const textbox = screen.getByRole('textbox');
     await user.type(textbox, 'do not lose this long task');
-    await user.click(screen.getByRole('button', { name: '发送' }));
+    await user.click(screen.getByRole('button', { name: 'Send' }));
 
     await waitFor(() => expect(onSend).toHaveBeenCalled());
     expect(textbox).toHaveValue('do not lose this long task');
@@ -190,7 +187,7 @@ describe('Composer - model catalogue', () => {
     );
 
     // The trigger reflects the selected real model once the catalogue resolves.
-    const trigger = screen.getByRole('button', { name: '选择模型' });
+    const trigger = screen.getByRole('button', { name: 'Select model' });
     await waitFor(() => expect(trigger).toHaveTextContent('deepseek-chat (DeepSeek)'));
 
     // Open the menu and confirm both real models are offered (not the
@@ -214,10 +211,10 @@ describe('Composer - model catalogue', () => {
     );
 
     // 'deepseek-v4-flash' resolves to the 'V4 Flash' label in MODEL_OPTIONS.
-    const trigger = screen.getByRole('button', { name: '选择模型' });
+    const trigger = screen.getByRole('button', { name: 'Select model' });
     await waitFor(() => expect(trigger).toHaveTextContent('V4 Flash'));
     // The hook logs the failure (and still falls back) rather than throwing.
-    expect(warnSpy).toHaveBeenCalledWith('加载模型列表失败', expect.any(Error));
+    expect(warnSpy).toHaveBeenCalledWith('Failed to load model list', expect.any(Error));
     warnSpy.mockRestore();
   });
 
@@ -232,7 +229,7 @@ describe('Composer - model catalogue', () => {
     }
     render(<Harness />);
 
-    const trigger = screen.getByRole('button', { name: '选择模型' });
+    const trigger = screen.getByRole('button', { name: 'Select model' });
     // Once the catalogue resolves, the fictional 'deepseek-v4-flash' is no
     // longer a valid option, so the composer snaps to the first real model.
     await waitFor(() => expect(trigger).toHaveTextContent('deepseek-chat (DeepSeek)'));

@@ -5,7 +5,7 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](../LICENSE)
 [![Language: Python](https://img.shields.io/badge/backend-Python%203.12-3776AB.svg)](https://www.python.org/)
 [![Frontend: React](https://img.shields.io/badge/frontend-React%2019%20%2B%20Vite-61DAFB.svg)](https://react.dev/)
-[![Agent kernel: AgentScope](https://img.shields.io/badge/agent%20kernel-AgentScope%202.x-success.svg)](https://github.com/agentscope-ai/agentscope)
+[![Agent runtime: Claude Agent SDK](https://img.shields.io/badge/agent%20runtime-Claude%20Agent%20SDK-success.svg)](https://docs.claude.com/en/api/agent-sdk/overview)
 
 Agent Platform 在按运行隔离的 microVM（微虚拟机）中执行不可信的、由模型生成的 agent 代码，
 并为每次运行提供一个默认拒绝（default-deny）的网络与单一的受控出口路径。它**构建于**
@@ -60,7 +60,7 @@ flowchart TB
     subgraph sandboxLayer["沙盒层（不可信）"]
         broker["tool-broker :8024\n受租约控制的出口门面"]
         webfetch["web-fetch-gateway :8013c\nSSRF 过滤的互联网出口"]
-        sbx["沙盒 microVM / 容器\nruntime_worker (AgentScope ReActAgent)"]
+        sbx["沙盒 microVM / 容器\nworker-claude-sdk (Claude Agent SDK)"]
     end
 
     subgraph foundation["SaaS Foundation (../saas-foundation)"]
@@ -127,10 +127,9 @@ sequenceDiagram
     participant P as sandbox-pool :8008
     participant FID as foundation identity
     participant FLLM as foundation llm-gateway
-    participant SBX as 沙盒 (runtime_worker)
+    participant SBX as 沙盒 (worker-claude-sdk)
     participant TB as tool-broker :8024
     participant R as Redis
-    participant FA as foundation audit
 
     U->>B: GET /auth/me（签名 ap_session cookie）
     B->>FID: 校验内嵌 access token（JWKS）
@@ -138,20 +137,20 @@ sequenceDiagram
     U->>B: POST /sessions/{id}/chat
     B->>O: 转发（会话/消息/运行 CRUD + RLS）
     O->>O: QuotaGuard + DLP 扫描钩子
+    O->>O: 预取知识库 top-k 写入 sys_prompt
     O->>S: POST /runs (create_run)
     S->>FID: 铸造短时按运行的 foundation JWT
     S->>FLLM: GET /tenant-keys（解析 LLM 虚拟密钥）
     S->>P: 领取一个预热沙盒槽位
     S->>SBX: 生成（docker-socket-proxy / cube-controller mTLS）
-    Note over S,SBX: 投递身份+LLM+OTEL 环境变量、task.json，<br/>以及 mode-0600 /workspace/.secrets.json（7 个密钥）
+    Note over S,SBX: 投递身份+LLM+OTEL 环境变量、task.json，<br/>以及 mode-0600 /workspace/.secrets.json（6 个密钥）
     SBX->>SBX: 将 .secrets.json 载入用户态环境后立即 unlink
-    SBX->>SBX: 构建 ReActAgent + Toolkit<br/>(mcp_tenant_injector, skills_loader, web_fetch)
+    SBX->>SBX: 启动网关适配器、组装提示，<br/>加载租户 MCP 服务器、技能、web_fetch
     loop agent 步骤
         SBX->>TB: LLM 调用（携带签名的按运行 HMAC 租约）
         TB->>FLLM: 以虚拟密钥代理（配额 + 审计）
         FLLM-->>SBX: token 增量（流式）
         SBX->>R: 流式 token 增量 + plan/step 状态（经 /state 门面）
-        SBX->>FA: event_audit_sink 上报每个事件
     end
     SBX->>SBX: 写出 /workspace/result.json（+ events.jsonl）
     SBX-->>S: 以编码状态退出 (0/1/2/137)
@@ -167,24 +166,24 @@ sequenceDiagram
    的 access token 转发给 Foundation identity 做 JWKS 校验。
 2. **聊天/运行请求。** SPA 向 BFF（鉴权网关 + API 聚合 + SSE 中继）发起 POST，BFF 转发给
    **session-orchestrator** 在 RLS 下完成会话/消息/运行 CRUD。orchestrator 负责 DLP
-   `check:download` / 扫描钩子，并用计费 `QuotaGuard` 强制配额。
+   `check:download` / 扫描钩子，用计费 `QuotaGuard` 强制配额，并预取租户知识库的 top-k 命中追加到
+   该运行的 `sys_prompt`。
 3. **create_run。** orchestrator（经 scheduler 路径）铸造一个短时按运行的 Foundation JWT 并调用
    **agent-scheduler**。
-4. **解析 + 生成。** scheduler 解析租户 LLM 虚拟密钥（`llm-gateway GET /tenant-keys`），并经所选的
+4. **解析 + 生成。** scheduler 解析租户 LLM 虚拟密钥（`llm-gateway GET /tenant-keys`；解析不到即令生成失败），并经所选的
    `SandboxRuntime` 实现（Docker 经 docker-socket-proxy，或 Cube 经 cube-controller 在 `:8443` 上的
    mTLS）从一个预热 **sandbox-pool** 槽位生成沙盒。它投递身份 + LLM + OTEL 环境变量、`task.json`
-   （`{task, mcp_servers, skills}`），以及一个 mode-`0600` 的 `/workspace/.secrets.json`，承载 7 个
-   控制面密钥。
-5. **构建 agent。** 在沙盒内，`runtime_worker` 载入并立即 unlink 该密钥文件，然后构建一个全新的
-   `ReActAgent` + `Toolkit`：`mcp_tenant_injector` 从 `mcp-registry` 拉取租户 MCP 服务器，
-   `skills_loader` 挂载打包的技能，`web_fetch` 加入 `WebFetch` 工具。
+   （`{task, mcp_server_ids, skills, files, sys_prompt, …}`），以及一个 mode-`0600` 的
+   `/workspace/.secrets.json`，承载 6 个控制面密钥。
+5. **构建 agent。** 在沙盒内，Claude SDK worker 载入并立即 unlink 该密钥文件，启动本地网关适配器，
+   组装系统提示，从 `mcp-registry` 拉取租户 MCP 服务器，索引挂载在 `/home/skills` 下的技能，并注册
+   进程内 `web_fetch` 工具。
 6. **运行（broker 出口）。** 在 broker 模式下，沙盒**只能**访问 tool-broker 门面 + DNS。LLM 调用走
-   `llm_gateway_enforcer -> tool-broker -> Foundation llm-gateway`（虚拟密钥 + 配额 + 审计）；Redis
+   `SDK -> adapter.ts -> tool-broker -> Foundation llm-gateway`（虚拟密钥 + 配额 + 审计）；Redis
    热状态/令牌流与 S3 产物走 tool-broker 的 `/state` 与 `/s3` 门面；网页抓取走
    `web_fetch -> web-fetch-gateway`（SSRF 过滤）。每个调用都携带签名的按运行租约。
 7. **持久化 + 退出。** worker 将 token 增量 + plan/step 状态流入 Redis，写出
-   `/workspace/result.json`（+ `events.jsonl`），并以编码状态退出。`event_audit_sink` 同时把每个
-   事件上报给 Foundation audit。
+   `/workspace/result.json`（+ `events.jsonl`），并以编码状态退出。
 8. **对账 + 中继。** scheduler 轮询运行状态；orchestrator 对账完成（`reconcile_sweeper`），持久化
    产物（DLP 扫描 + 分类标签），施加输出/转录 DLP，并把 SSE 流经 BFF 中继回浏览器直到 `done`。
    **cron-runner** 可经 BFF 服务令牌按计划驱动 App 运行。
@@ -198,7 +197,7 @@ Agent Platform 由 11 个服务组成。除非另有说明，均为 Python 3.12�
 | 服务 | 端口（容器 / 开发主机） | 一句话 |
 |---|---|---|
 | [bff](#bff) | 8005 | 鉴权网关、cookie 会话、API 聚合、SSE 中继 |
-| [session-orchestrator](#session-orchestrator) | 8006 | 会话 / 消息 / 运行生命周期、附件、运行 SSE |
+| [session-orchestrator](#session-orchestrator) | 8006 | 会话 / 消息 / 运行生命周期、附件、知识预取、运行 SSE |
 | [agent-scheduler](#agent-scheduler) | 8007 | 按运行生成并管理沙盒 |
 | [sandbox-pool](#sandbox-pool) | 8008 | 预热空闲沙盒槽位 |
 | [skill-store](#skill-store) | 8011 | 带版本的技能包注册 |
@@ -236,7 +235,8 @@ Agent Platform 由 11 个服务组成。除非另有说明，均为 Python 3.12�
 前缀 `/api/session/v1`。它在自有的 `session_orchestrator` Postgres schema 中持久化会话、消息与运行，
 把附件存入 S3/MinIO，并从 Redis 读取 agent 运行热状态（plan/step/cursor）。它通过调用 agent-scheduler
 启动运行，运行会话保留清扫与运行对账的后台循环，并以计费 `QuotaGuard` 加附件路径上的 DLP 检查来强制
-配额。
+配额。每次运行都派发到沙盒：`execution_mode` 仍在运行上存储并返回（兼容历史行），但传入的 `inline`
+会被强制改为 `sandbox`。
 
 - **关键端点：** `GET/POST /sessions`、`GET/PATCH/DELETE /sessions/{session_id}`；
   `GET/POST /sessions/{session_id}/messages`；`POST /sessions/{session_id}/runs`、
@@ -246,7 +246,7 @@ Agent Platform 由 11 个服务组成。除非另有说明，均为 Python 3.12�
   `POST/GET /sessions/{session_id}/attachments`、
   `GET /sessions/{session_id}/files/{file_id}/content`；
   `GET /runs/token-usage/daily`；`GET /healthz`。
-- **依赖：** `foundation_sdk`；agent-scheduler；knowledge-ingest（记忆预取 + 回写）；Foundation
+- **依赖：** `foundation_sdk`；agent-scheduler；knowledge-ingest（记忆与知识库 top-k 预取、记忆回写）；Foundation
   authz / billing / feature-flag / dlp；Postgres；Redis（运行热状态）；S3/MinIO（附件）。
 
 ### agent-scheduler
@@ -254,9 +254,9 @@ Agent Platform 由 11 个服务组成。除非另有说明，均为 Python 3.12�
 **生成并管理沙盒 —— 端口 8007。** FastAPI 标题 *Agent Scheduler*，API 前缀 `/api/scheduler/v1`。它在
 启动时构建可插拔沙盒运行时（`docker` 或 `cube`），并在 `POST /runs` 时从 Foundation identity 铸造一个
 按运行的、限定作用域的租户令牌，签发一个 HMAC tool-broker 能力租约，并以配置的出口模式（`broker` /
-`foundation` / `none`）经 docker-socket-proxy 启动沙盒。它注入运行时扩展（`mcp_tenant_injector`、
-`skills_loader`、`web_fetch`、`event_audit_sink`、`llm_gateway_enforcer`），转发注册/网关 URL，并以
-`QuotaGuard` 强制计费配额。
+`foundation` / `none`）经 docker-socket-proxy 启动沙盒。每个沙盒都运行 Claude SDK 镜像
+（`AGENT_IMAGE` / `SCHEDULER_AGENT_IMAGE`）；scheduler 转发注册/网关 URL，投递租户 LLM 虚拟密钥
+（解析不到即令生成失败），并以 `QuotaGuard` 强制计费配额。
 
 - **关键端点：** `POST /runs`、`GET /runs`、`GET /runs/{run_id}`、`POST /runs/{run_id}/cancel`、
   `GET /runs/{run_id}/events`（SSE）；`GET /sandboxes`、`POST /sandboxes/{sandbox_id}/stop`；
@@ -284,7 +284,7 @@ operator 替换内存中的骨架实现。
 **带版本的技能包注册 —— 端口 8011。** FastAPI 标题 *Skill Store*，API 前缀 `/api/skills/v1`。它在
 Postgres 中管理技能元数据，并把带版本的技能 tarball 存入可插拔的 blob 后端（默认 S3/MinIO，测试用内存）。
 它支持列出/安装/卸载技能、上传新版本、下载版本 tarball，以及内部解析端点（`skill.read_internal`
-作用域），供 scheduler 的 `skills_loader` 用内容寻址方式将技能绑定挂载进沙盒。计费经 `QuotaGuard` 强制。
+作用域），供 scheduler 用内容寻址方式将技能绑定挂载进沙盒。计费经 `QuotaGuard` 强制。
 
 - **关键端点：** `GET /skills`、`GET /skills/installed`、`GET/DELETE /skills/{skill_id}`、
   `GET /skills/{skill_id}/versions`、`GET /skills/{skill_id}/versions/{version}/download`；
@@ -296,8 +296,8 @@ Postgres 中管理技能元数据，并把带版本的技能 tarball 存入可�
 
 **按租户的 MCP 服务器注册 —— 端口 8010。** FastAPI 标题 *MCP Registry*，API 前缀 `/api/mcp/v1`。它在
 Postgres（`public` schema）中提供按租户作用域的 MCP 服务器记录 CRUD，并暴露一个由
-`mcp.read_internal` 服务作用域守护的内部列表端点，供 scheduler 的 `mcp_tenant_injector`（经
-tool-broker）调用，以将租户的 MCP 服务器注入每个沙盒。
+`mcp.read_internal` 服务作用域守护的内部列表端点，供沙盒内 worker（经
+tool-broker）调用，为每次运行加载租户的 MCP 服务器。
 
 - **关键端点：** `GET/POST /mcp-servers`、`GET /mcp-servers/{server_id}`、
   `PATCH /mcp-servers/{server_id}`、`DELETE /mcp-servers/{server_id}`；
@@ -309,7 +309,7 @@ tool-broker）调用，以将租户的 MCP 服务器注入每个沙盒。
 **文档 → 嵌入 → pgvector 流水线 —— 端口 8012。** FastAPI 标题 *Knowledge Ingest*，API 前缀
 `/api/knowledge/v1`。它摄取上传的文档（存入可插拔 blob 后端：S3/MinIO 或内存），经可插拔客户端
 （默认本地，或 Foundation llm-gateway）生成嵌入，并用 `pgvector` 扩展把向量写入 Postgres。它提供文档
-CRUD 与向量 `/search` 端点，供 session-orchestrator 用于记忆预取/回写。计费经 `QuotaGuard` 强制。
+CRUD 与向量 `/search` 端点，供 session-orchestrator 用于记忆与知识预取以及记忆回写。计费经 `QuotaGuard` 强制。
 
 - **关键端点：** `GET/POST /documents`（摄取）、`GET /documents/{document_id}`、
   `DELETE /documents/{document_id}`、`POST /documents/{document_id}/...`（重新摄取）；
@@ -381,77 +381,68 @@ web-fetch-gateway 的路径白名单子集，并以沙盒永不可见的凭据�
 
 ## Agent 运行时
 
-agent 内核是 **[AgentScope 2.x](https://github.com/agentscope-ai/agentscope)**（Apache-2.0：
-`ReActAgent` + `Toolkit` + `MsgHub` + Model/Formatter 抽象）。它**未被 fork** —— 之所以选它而非
-OpenHands，是因为我们已拥有平台层，需要的是一个框架而非一个平台。完整理由与 OpenHands → AgentScope
-映射表见 [ADR 0002](adr/0002-agent-kernel-agentscope-over-openhands.md)。
+Agent 运行时是 [`worker-claude-sdk/`](../worker-claude-sdk/) 中的
+**[Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview)** worker —— 一个
+TypeScript/Node 22 程序，也是平台中**唯一**的 agent 循环。每次运行（聊天或 App）都是一次沙盒内的
+Claude SDK 运行；不存在进程内（"inline"）执行路径。决策见
+[ADR 0003](adr/0003-claude-agent-sdk-sole-agent-runtime.md)（它取代了选择 AgentScope 的
+[ADR 0002](adr/0002-agent-kernel-agentscope-over-openhands.md)）。
 
-集成形态是**一沙盒一 agent、一 agent 一任务**。长驻多租户 agent 服务会破坏按运行的 microVM 隔离边界，
-因此每次运行都是一个一次性 worker，干净地映射到一行 `run` 以便审计与计费。
+集成形态是**一沙盒一 agent、一 agent 一任务**。长驻的多租户 agent 服务会破坏按运行的 microVM 隔离
+边界，因此每次运行都是一个一次性 worker，可干净地映射到一条 `run` 行以便审计与计费。
 
-### agentscope-ext 模块
+### worker-claude-sdk 模块
 
-集成以独立的 Python 3.12 包形式交付，由沙盒镜像与固定版本的 AgentScope 一并 `pip install`。测试经
-`sys.modules` 桩接 AgentScope，从而无需真实依赖即可运行。参见
-[`agentscope-ext/README.md`](../agentscope-ext/README.md)。
-
-| 模块 | 用途 |
+| 模块 | 作用 |
 |---|---|
-| `runtime_worker` | 沙盒入口 —— 启动一个 `ReActAgent` + `Toolkit`，运行一个任务，持久化结果 + 审计轨迹，以编码状态退出。 |
-| `llm_gateway_enforcer` | 自定义 `OpenAIChatModel` 子类，将每个沙盒 LLM 调用经 Foundation llm-gateway 路由，而非持有原始 provider 密钥。注入 `Authorization: Bearer <按运行 foundation JWT>`、`X-LLM-Virtual-Key`、`X-Tenant-Id`、`X-User-Id`、`X-Tool-Broker-Lease`。保留原生 streaming/tool-call/thinking；支持来自 `task.json` 的按运行 model/reasoning/sampling 覆写。 |
-| `mcp_tenant_injector` | 将来自 `mcp-registry` 的租户 MCP 服务器列表解析进 `Toolkit`。 |
-| `skills_loader` | 将打包技能（内容寻址缓存，按 SHA 绑定挂载到 `/home/skills`）物化进 `Toolkit`。 |
-| `event_audit_sink` | 注册第二个 `post_print` 钩子，将每个 agent 事件 POST 给 Foundation audit（磁盘日志 + 审计 POST 都会执行）。 |
-| `web_fetch` | 沙盒内 `WebFetch` 工具，将 AgentScope 的 `ToolBase` 适配到 web-fetch-gateway HTTP API。 |
+| `main.ts` | 入口（`node /app/dist/main.js`）：载入并 unlink `.secrets.json`，校验必需环境变量，启动网关适配器，执行查询，写出 `result.json`，以编码状态退出。 |
+| `adapter.ts` | 进程内 HTTP 适配器，SDK 经 `ANTHROPIC_BASE_URL=http://localhost:<port>` 访问它。在 Anthropic Messages 与 Foundation llm-gateway 的 OpenAI 兼容 `chat/completions` 之间双向转换（流式、工具调用、thinking、结构化输出），并注入 `Authorization: Bearer <按运行 foundation JWT>`、`X-Tenant-Id`、`X-User-Id`、`X-LLM-Virtual-Key`，broker 模式下另带 `X-Tool-Broker-Lease`。 |
+| `worker.ts` | 运行循环：把附件下载到 `/workspace/inputs`，组装系统提示（续跑说明、记忆、历史、含预取知识命中的 `sys_prompt`、技能索引），从 `mcp-registry` 解析租户 MCP 服务器，注册进程内 `web_fetch` 工具（经 web-fetch-gateway），并驱动 SDK `query()`。 |
+| `event_translator.ts` | 把 SDK 消息流转换为平台事件词汇（`events.jsonl` + Redis 令牌流）。 |
+| `hitl.ts` | 人在回路的暂停/续跑（`pending_confirmation` / `pending_question`）。 |
+| `dlp.ts` | 调用 Foundation DLP `core/scan` 的 `PreToolUse` 钩子（fail-open）。 |
+| `redis_state.ts` | 热状态 + 令牌流写入（直连，或经 tool-broker `/state` 门面）。 |
 
-### runtime_worker 契约
+**知识库。** orchestrator 为每次运行预取租户知识库的 top-k 命中，并追加到 worker 的 `sys_prompt`。
+沙盒内暂无按需检索知识库的工具。
 
-`runtime_worker` 是沙盒入口（`python -m agentscope_ext.runtime_worker`）。它按运行从 `task.json` 加
-Foundation 环境变量启动一个 `ReActAgent` + `Toolkit`，运行一个任务，并通过文件与退出码报告结果。该契约
-是**承重的**：两个运行时（docker、cube）与备选的 `worker-claude-sdk`（一个跑在 `node:22-slim` 上的
-TypeScript/Node Claude Agent SDK worker）都依赖它。修改它是跨多个包的协同变更。
+**相对已移除的 AgentScope worker 的已知差距**（见 ADR 0003）：没有画布工具（agent 不能创建画布）、
+没有按需知识检索工具、没有沙盒内审计 sink。
+
+### Worker 契约
+
+沙盒入口从文件/环境变量读取任务，并通过文件、Redis 与退出码报告结果。该契约是**承重的**：两种沙盒运行时
+（docker、cube）都依赖它。完整线上格式见
+[`contracts/worker-wire-contract.md`](../contracts/worker-wire-contract.md)。
 
 | 方向 | 产物 | 说明 |
 |---|---|---|
-| **入** | `/workspace/task.json`（docker）或 `AGENT_TASK_JSON` 环境变量（cube） | `{ task, mcp_servers, skills }` 加按运行 model/reasoning/sampling 覆写 |
-| **入** | Foundation 环境变量 | `FOUNDATION_API_TOKEN`、`FOUNDATION_TENANT_ID`、注册/网关 URL、OTEL 配置 |
-| **入** | `/workspace/.secrets.json`（mode `0600`） | 7 个白名单控制面密钥；载入用户态 `os.environ` 后即 **unlink** |
+| **入** | `/workspace/task.json`（docker）或 `AGENT_TASK_JSON` 环境变量（cube） | `{ task, mcp_server_ids, skills, files, memory, history, sys_prompt, … }` 加按运行的 model/reasoning/sampling 覆写 |
+| **入** | Foundation 环境变量 | `FOUNDATION_API_URL`、`FOUNDATION_TENANT_ID`、`FOUNDATION_USER_ID`、注册/网关 URL、`LLM_MODEL`、OTEL 配置 |
+| **入** | `/workspace/.secrets.json`（mode `0600`） | 6 个白名单控制面密钥；载入 worker 的 `process.env` 后即 **unlink** |
 | **出** | `/workspace/result.json` | scheduler 读取的运行结果 |
-| **出** | `/workspace/events.jsonl` | 每条打印的 `Msg` 一行 JSON（磁盘日志可在网关故障时存活） |
-| **出** | Redis 热状态 + 令牌流 | plan/step/cursor + 流式 token 增量（broker 模式经 `/state` 门面） |
+| **出** | `/workspace/events.jsonl` | 每个平台事件一行 JSON（磁盘日志在网关故障时仍保留） |
+| **出** | Redis 热状态 + 令牌流 | plan/step/cursor + 流式 token 增量（broker 模式下经 `/state` 门面） |
 | **出** | 退出码 | 编码状态（见下） |
 
 **编码退出状态**
 
 | 码 | 含义 |
 |---|---|
-| `0` | OK —— 任务完成 |
-| `1` | 基础设施错误 |
-| `2` | 错误任务（载荷不合法） |
+| `0` | 运行结束（OK、FAILED 或 paused 记录在 `result.json` 中） |
+| `1` | 基础设施错误（缺必需环境变量、worker 崩溃） |
+| `2` | 错误任务（缺失 / 畸形载荷） |
 | `137` | OOM（被杀） |
 
-**安全加固。** `_load_secret_file_into_env` 读取 `/workspace/.secrets.json`（7 个白名单键）进用户态
-`os.environ`，随后 **unlink** 该文件 —— 使密钥既不出现在 `/proc/1/environ`，也不出现在 agent 的
+**安全加固。** worker 把 `/workspace/.secrets.json` 读入自身 `process.env` 后即 **unlink** 该文件，并在
+任何工具子进程运行前清理控制面环境变量 —— 使密钥不出现在 `/proc/1/environ`，也不留在 agent 的
 `Read`/`Bash` 工具可见的可写工作区中。
-
-### 四个钩子覆写点
-
-`runtime_worker` 在 `agentscope_ext.runtime_worker.hooks` 中暴露四个模块级函数。每个兄弟扩展拥有其中一
-（或二）个并在 import 时 monkey-patch；入口在每次调用时经属性访问解析函数，因此单向依赖箭头让冒烟测试镜像
-可以不带扩展发布。
-
-| 钩子 | 默认行为 | 拥有扩展 |
-|---|---|---|
-| `build_model(task, env) -> ModelBase` | 依 `LLM_PROVIDER` 选 `AnthropicChatModel` / `OpenAIChatModel`，直接读 `LLM_API_KEY` | `llm_gateway_enforcer` —— 返回一个用 foundation JWT POST 到 Foundation llm-gateway 的网关模型 |
-| `build_formatter(task, env) -> FormatterBase` | 与上面的 provider 匹配 | `llm_gateway_enforcer`（与模型成对） |
-| `build_toolkit(task, tenant_id, env) -> Toolkit` | 空 `Toolkit()`（无 foundation 栈的冒烟测试） | 先 `mcp_tenant_injector` 后 `skills_loader`（链式：先 MCP 服务器，再叠加技能） |
-| `attach_hooks(agent, *, events_path, env) -> None` | 注册一个把每条 `Msg` 追加到 `events.jsonl` 的 `post_print` 钩子 | `event_audit_sink` —— 注册**第二个** `post_print` 钩子把每个事件 POST 给 Foundation audit（两者都跑） |
 
 ## 沙盒运行时
 
 三个实现位于 `SandboxRuntime` 协议之后（`spawn_run` / `get_run_status` /
 `get_container_tenant` / `cancel_run` / `list_containers`），由 `SCHEDULER_RUNTIME` 环境变量选择。三者都
-运行**同一 OCI 镜像**与**同一 `runtime_worker` 契约**，因此切换运行时是一行配置变更 —— 其理由与风险表见
+运行**同一 OCI 镜像**与**同一 worker 契约**，因此切换运行时是一行配置变更 —— 其理由与风险表见
 [ADR 0001](adr/0001-sandbox-runtime-cube-default-kata-fallback.md)。
 
 | 运行时 | `SCHEDULER_RUNTIME` | 隔离 | 角色 | 说明 |
@@ -472,7 +463,8 @@ TypeScript/Node Claude Agent SDK worker）都依赖它。修改它是跨多个�
 - **内核级隔离。** 不可信的、模型生成的代码在 CubeSandbox microVM（默认）或 Kata microVM（回退）中运行
   —— 而非共享主机内核的容器；Docker 仅用于开发/CI。一沙盒一 agent、一 agent 一任务 —— 按运行的 microVM
   是租户隔离 + 审计 + 计费边界（[ADR 0001](adr/0001-sandbox-runtime-cube-default-kata-fallback.md) /
-  [ADR 0002](adr/0002-agent-kernel-agentscope-over-openhands.md)）。
+  [ADR 0003](adr/0003-claude-agent-sdk-sole-agent-runtime.md)）。不存在进程内执行路径：工具调用从不在
+  orchestrator 内运行。
 - **默认拒绝出口。** 在 broker 模式下，沙盒只接入内部 `sandbox_broker` 网络，且**只能**访问 tool-broker
   门面 + DNS。已验证被拒集合包括 Redis、MinIO、Keycloak、mcp-registry、公网、云元数据
   `169.254.169.254` 以及其他 RFC-1918 段。在 microVM 层经 CubeVS（eBPF `allow_out` 叠加，
@@ -483,13 +475,13 @@ TypeScript/Node Claude Agent SDK worker）都依赖它。修改它是跨多个�
 - **按运行令牌铸造。** `create_run` 按运行铸造一个短时、限定作用域的 Foundation JWT
   （`FOUNDATION_API_TOKEN`）注入沙盒；scheduler 经 Keycloak OIDC `client_credentials` 自举其自身的
   服务账号令牌。令牌预期在运行结束 / TTL 到期时被吊销。
-- **密钥投递加固。** 7 个控制面密钥被写入 mode-`0600` 的 `/workspace/.secrets.json`（白名单键：
-  `FOUNDATION_API_TOKEN`、`TOOL_BROKER_LEASE`、`LLM_VIRTUAL_KEY` 等），由 `runtime_worker` 载入用户态
-  `os.environ` 后立即 unlink —— 既不在容器的 `environment=` 块或 `/proc/1/environ` 中，也从 agent 的
+- **密钥投递加固。** 6 个控制面密钥被写入 mode-`0600` 的 `/workspace/.secrets.json`（白名单键：
+  `FOUNDATION_API_TOKEN`、`TOOL_BROKER_LEASE`、`LLM_VIRTUAL_KEY` 等），由 worker 载入 `process.env`
+  后立即 unlink —— 既不在容器的 `environment=` 块或 `/proc/1/environ` 中，也从 agent 的
   `Read`/`Bash` 工具可见的可写工作区中移除。
-- **LLM 网关强制。** `llm_gateway_enforcer` 用租户虚拟密钥（配额 + 审计 + 模型路由）将所有沙盒 LLM 流量
-  经 Foundation llm-gateway 路由。启用时，scheduler 不再注入任何直接 provider 密钥，且缺失虚拟密钥会
-  **令生成失败**，而非回退到直接凭据。
+- **LLM 网关强制。** worker 的 `adapter.ts` 用租户虚拟密钥（配额 + 审计 + 模型路由）将所有沙盒 LLM
+  流量经 Foundation llm-gateway 路由。Agent 栈中不存在任何 provider API 密钥，缺失虚拟密钥会
+  **令生成失败**。按运行的沙盒令牌不含 `audit.write`。
 - **DLP（真实防线，而非测试页）。** 一个默认全局正则规则库（身份证 / 电话 / 银行卡 / 邮箱 / AWS 密钥 /
   私钥 / api-key，敏感度 L2–L4）驱动强制：session-orchestrator 在送出字节前强制 `check:download`，并在
   上传与运行产物持久化时 `scan` + 自动分类；输出/转录 DLP 在运行完成路径上执行。扫描结果持久化到
@@ -502,7 +494,7 @@ TypeScript/Node Claude Agent SDK worker）都依赖它。修改它是跨多个�
 - **Docker 运行时最小权限。** scheduler 仅经 docker-socket-proxy 触达 Docker（无 `/var/run/docker.sock`
   绑定挂载）；`exec` / `volumes` / `privileged` 动词被拒；容器 cap 被丢弃，配以 2 GB 内存 / cpu-share /
   600 s 超时限制；沙盒 S3 桶被锁定。
-- **镜像供应链。** 非 root agent 用户（uid 1000），可复现的固定基础 digest + pip 约束，cosign 签名 +
+- **镜像供应链。** 非 root agent 用户（uid 1000），Cube 镜像固定基础 digest，并以 `npm ci` 按提交的锁文件安装，cosign 签名 +
   syft SBOM 为**计划中**。合规控制（审计轨迹、microVM 隔离、镜像完整性、按运行数据最小化）在沙盒运行时
   设计文档中映射。
 
@@ -549,10 +541,11 @@ tool-broker 8024、web-fetch 主机 8023、web 5173。**无需 KVM。**
 ## 延伸阅读
 
 - **[ADR 0001 —— 沙盒运行时：CubeSandbox 默认、Kata 回退](adr/0001-sandbox-runtime-cube-default-kata-fallback.md)** —— 为何 CubeSandbox 为默认、Kata 为回退，`SandboxRuntime` 逃生口环境变量，以及风险表。
-- **[ADR 0002 —— Agent 内核：AgentScope，而非 OpenHands](adr/0002-agent-kernel-agentscope-over-openhands.md)** —— 为何内核选 AgentScope 2.x（框架）而非 OpenHands（平台）：许可证、一沙盒一 agent，以及映射表。
-- **[沙盒运行时设计](design/b-m2-sandbox-runtime-v1.md)** —— 承重契约：`SandboxRuntime` 协议、沙盒 ↔ worker 线缆契约（`task.json` / `result.json` / 退出码）、运行状态机、池水位线、部署档位与合规映射。
-- **[agentscope-ext README](../agentscope-ext/README.md)** —— 扩展模块与四个 `runtime_worker` 钩子覆写点，以及为何不 fork AgentScope。
-- **[沙盒镜像 README](../sandbox-images/README.md)** —— base/office/matlab 镜像档（各自承载内容、大小）、独立的 claude-sdk Node worker 镜像，以及两步构建 / 版本固定升级流程。
+- **[ADR 0003 —— Claude Agent SDK 作为唯一 Agent 运行时](adr/0003-claude-agent-sdk-sole-agent-runtime.md)** —— 为何收敛到单一 worker、移除了什么（AgentScope、inline 模式）、已知差距与回滚方式。
+- **[ADR 0002 —— Agent 内核：AgentScope，而非 OpenHands](adr/0002-agent-kernel-agentscope-over-openhands.md)** —— *已被 ADR 0003 取代*；作为最初内核选择的历史记录保留。
+- **[Worker 线上契约](../contracts/worker-wire-contract.md)** —— `task.json`、`.secrets.json`、Redis 令牌流、`result.json`、暂停状态、平台 SSE 事件以及出口 / tool-broker 契约。
+- **[沙盒运行时设计](design/b-m2-sandbox-runtime-v1.md)** —— `SandboxRuntime` 协议、运行状态机、池水位线、部署档位与合规映射（按 AgentScope worker 撰写；运行时层面的契约仍然成立）。
+- **[沙盒镜像 README](../sandbox-images/README.md)** —— `claude-sdk*` 镜像（各自承载内容）、MATLAB 分层与构建流程。
 - **[CubeSandbox 出口隔离 README](../deploy/cube/README.md)** —— 按 microVM 的出口隔离：CubeVS `allow_out` 叠加对主机 `nftables` 回退、RFC-1918 硬拒绝的注意点，以及隔离验证清单。
 
 ## 许可证

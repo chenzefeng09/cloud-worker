@@ -218,6 +218,25 @@ def _patch(fake: FakeBackends, monkeypatch: pytest.MonkeyPatch) -> None:
         async def post(self, url: str, **kw: Any) -> httpx.Response:
             return fake.route("POST", url, **kw)
 
+        def stream(self, method: str, url: str, **kw: Any) -> Any:
+            # The edit endpoint streams /chat/completions (SSE); re-encode the
+            # fake's non-streaming completion body as SSE deltas.
+            resp = fake.route(method, url, **kw)
+
+            class _Stream:
+                async def __aenter__(self_inner) -> httpx.Response:
+                    if resp.status_code != 200:
+                        return resp
+                    content = resp.json()["choices"][0]["message"]["content"]
+                    chunk = {"choices": [{"delta": {"content": content}}]}
+                    sse = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+                    return httpx.Response(200, content=sse.encode())
+
+                async def __aexit__(self_inner, *a: Any) -> None:
+                    pass
+
+            return _Stream()
+
     monkeypatch.setattr(httpx, "AsyncClient", _AC)
 
 
@@ -323,10 +342,10 @@ def test_canvas_v2_happy_blocks(
     assert fake.last_completion_payload["response_format"] == {"type": "json_object"}
     prompt = fake.last_completion_payload["messages"][0]["content"]
     # target block rendered as可改.
-    assert "[blk_00000002] 【可改】" in prompt
+    assert "[blk_00000002] [EDITABLE]" in prompt
     # neighbour blocks rendered as read-only context.
-    assert "[blk_00000001] 【只读上下文】" in prompt
-    assert "[blk_00000003] 【只读上下文】" in prompt
+    assert "[blk_00000001] [READ-ONLY CONTEXT]" in prompt
+    assert "[blk_00000003] [READ-ONLY CONTEXT]" in prompt
 
     # no runs / messages touched.
     assert not any("/runs" in u or "/messages" in u for _, u, _ in fake.calls)
@@ -355,7 +374,7 @@ def test_canvas_v2_happy_character_selection(
 
     prompt = fake.last_completion_payload["messages"][0]["content"]
     assert '"selected_text": "原文"' in prompt
-    assert "不要返回完整段落或完整文档" in prompt
+    assert "do not return whole paragraphs or the whole document" in prompt
 
     diff = fake.last_suggestion_body["diffs"][0]
     assert diff["orig"] == "第一段原文内容。"
@@ -425,8 +444,8 @@ def test_canvas_v2_document_scope(
     for b in _DEFAULT_BLOCKS:
         assert b["id"] in prompt
         # every rendered block line carries the可改 role, none is read-only context.
-        assert f"[{b['id']}] 【可改】" in prompt
-        assert f"[{b['id']}] 【只读上下文】" not in prompt
+        assert f"[{b['id']}] [EDITABLE]" in prompt
+        assert f"[{b['id']}] [READ-ONLY CONTEXT]" not in prompt
 
     diffs = fake.last_suggestion_body["diffs"]
     delete_diff = next(d for d in diffs if d.get("op") == "delete")
@@ -457,7 +476,7 @@ def test_canvas_v2_retry_then_success(
     completion_calls = [c for c in fake.calls if "/chat/completions" in c[1]]
     assert len(completion_calls) == 2
     retry_prompt = fake.completion_payloads[1]["messages"][0]["content"]
-    assert "未通过校验" in retry_prompt
+    assert "failed validation" in retry_prompt
 
 
 def test_canvas_v2_retry_exhausted_502(
@@ -583,7 +602,7 @@ def test_canvas_v2_no_virtual_key_400(
 
     resp = client.post(_url(), cookies=authed_cookie, json=_body())
     assert resp.status_code == 400
-    assert "模型密钥" in resp.json()["detail"]["user_message"]
+    assert "model key" in resp.json()["detail"]["user_message"]
 
 
 def test_canvas_v2_resolves_default_model_when_omitted(
@@ -752,11 +771,11 @@ def test_build_prompt_marks_target_and_context() -> None:
         blocks=_DEFAULT_BLOCKS,
         target_ids=["blk_00000002"],
     )
-    assert "修改要求：改第二段" in prompt
-    assert "[blk_00000002] 【可改】" in prompt
+    assert "Edit request: 改第二段" in prompt
+    assert "[blk_00000002] [EDITABLE]" in prompt
     # neighbours of block 2 are blocks 1 and 3, rendered read-only.
-    assert "[blk_00000001] 【只读上下文】" in prompt
-    assert "[blk_00000003] 【只读上下文】" in prompt
+    assert "[blk_00000001] [READ-ONLY CONTEXT]" in prompt
+    assert "[blk_00000003] [READ-ONLY CONTEXT]" in prompt
 
 
 def test_build_prompt_retry_error_prepended() -> None:
@@ -766,5 +785,5 @@ def test_build_prompt_retry_error_prepended() -> None:
         target_ids=["blk_00000002"],
         retry_error="edits[0].op 非法",
     )
-    assert "未通过校验" in prompt
+    assert "failed validation" in prompt
     assert "edits[0].op 非法" in prompt

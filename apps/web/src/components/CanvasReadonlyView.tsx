@@ -41,7 +41,7 @@ export function CanvasReadonlyView({ canvasId, onClose }: CanvasReadonlyViewProp
       })
       .catch((e) => {
         if (cancelled) return;
-        setError(e instanceof ApiError ? e.message : '加载画布失败，请稍后重试。');
+        setError(e instanceof ApiError ? e.message : 'Couldn’t load the canvas. Please try again later.');
       })
       .finally(() => {
         if (cancelled) return;
@@ -54,7 +54,7 @@ export function CanvasReadonlyView({ canvasId, onClose }: CanvasReadonlyViewProp
 
   if (!canvasId) return null;
 
-  const title = canvas?.title || '画布';
+  const title = canvas?.title || 'Canvas';
   // Executable canvas → live sandbox preview; prose → rich-text render. Only
   // build the prose HTML for prose canvases (canvasBlocksToHtml would escape an
   // html block into unusable text).
@@ -70,8 +70,8 @@ export function CanvasReadonlyView({ canvasId, onClose }: CanvasReadonlyViewProp
       <div className="flex items-center gap-2 px-3 py-2.5 border-b border-line shrink-0">
         <button
           onClick={onClose}
-          aria-label="返回"
-          title="返回"
+          aria-label="Back"
+          title="Back"
           className="h-8 inline-flex items-center gap-1.5 px-2.5 rounded-md border border-line bg-paper text-ink-2 hover:text-ink hover:bg-paper-2 hover:border-ink-2 transition-colors shrink-0 font-mono text-[12px]"
         >
           <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
@@ -89,7 +89,7 @@ export function CanvasReadonlyView({ canvasId, onClose }: CanvasReadonlyViewProp
       {/* Body */}
       <div className="cw-scroll flex-1 px-4 py-4">
         {loading && (
-          <div className="font-mono text-[11px] text-dim">加载中…</div>
+          <div className="font-mono text-[11px] text-dim">Loading…</div>
         )}
         {error && (
           <div className="px-3 py-2 border border-accent-line bg-accent-soft rounded-md text-[12px] text-accent">

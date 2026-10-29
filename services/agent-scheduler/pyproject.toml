@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "agent-scheduler"
 version = "0.1.0a1"
-description = "Sandbox orchestration — spawns containers/microVMs running the AgentScope worker"
+description = "Sandbox orchestration — spawns containers/microVMs running the Claude Agent SDK worker"
 authors = ["Agent Platform Team"]
 packages = [{ include = "agent_scheduler", from = "src" }]
 

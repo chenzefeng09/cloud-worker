@@ -57,7 +57,7 @@ export function AppRunPage() {
   useEffect(() => {
     let alive = true;
     if (!id) {
-      setLoadError('未指定应用。');
+      setLoadError('No app specified.');
       setLoading(false);
       return;
     }
@@ -115,14 +115,14 @@ export function AppRunPage() {
           return file.type === a;
         });
         if (!ok) {
-          setFieldErrors((prev) => ({ ...prev, [field.key]: `文件类型不支持：${file.name}` }));
+          setFieldErrors((prev) => ({ ...prev, [field.key]: `Unsupported file type: ${file.name}` }));
           return;
         }
       }
       if (constraint?.max_size_bytes && file.size > constraint.max_size_bytes) {
         setFieldErrors((prev) => ({
           ...prev,
-          [field.key]: `文件超过大小上限（${humanSize(constraint.max_size_bytes)}）：${file.name}`,
+          [field.key]: `File exceeds the size limit (${humanSize(constraint.max_size_bytes)}): ${file.name}`,
         }));
         return;
       }
@@ -132,7 +132,7 @@ export function AppRunPage() {
     try {
       const sid = await ensureSession();
       if (!sid) {
-        setFieldErrors((prev) => ({ ...prev, [field.key]: '创建上传会话失败，请重试。' }));
+        setFieldErrors((prev) => ({ ...prev, [field.key]: 'Couldn’t start the upload. Please try again.' }));
         return;
       }
       const single = !constraint?.multiple;
@@ -144,7 +144,7 @@ export function AppRunPage() {
         if (!gate.allowed) {
           setFieldErrors((prev) => ({
             ...prev,
-            [field.key]: '该文件较大，需要管理员授予大附件权限后才能上传，请联系管理员。',
+            [field.key]: 'This file is large and needs the large-attachment permission to upload. Please contact your administrator.',
           }));
           return;
         }
@@ -158,7 +158,7 @@ export function AppRunPage() {
         });
       }
     } catch (err) {
-      setFieldErrors((prev) => ({ ...prev, [field.key]: '附件上传失败，请重试。' }));
+      setFieldErrors((prev) => ({ ...prev, [field.key]: 'Attachment upload failed. Please try again.' }));
       console.warn('app input upload failed', err);
     } finally {
       setUploadingKey(null);
@@ -181,18 +181,18 @@ export function AppRunPage() {
       if (f.type === 'file') {
         const files = formValue.file[f.key] ?? [];
         const hasDefault = typeof f.default === 'string' && f.default.trim() !== '';
-        if (f.required && files.length === 0 && !hasDefault) errs[f.key] = '此项为必填。';
+        if (f.required && files.length === 0 && !hasDefault) errs[f.key] = 'This field is required.';
       } else if (f.type === 'multiselect') {
         const vals = formValue.multi[f.key] ?? [];
         const allowed = new Set((f.options ?? []).map((o) => o.value));
-        if (f.required && vals.length === 0) errs[f.key] = '此项为必填。';
-        else if (vals.some((v) => !allowed.has(v))) errs[f.key] = '存在无效的选项。';
+        if (f.required && vals.length === 0) errs[f.key] = 'This field is required.';
+        else if (vals.some((v) => !allowed.has(v))) errs[f.key] = 'Contains an invalid option.';
       } else {
         const val = (formValue.text[f.key] ?? '').trim();
-        if (f.required && !val) errs[f.key] = '此项为必填。';
+        if (f.required && !val) errs[f.key] = 'This field is required.';
         else if (f.type === 'select' && val) {
           const allowed = new Set((f.options ?? []).map((o) => o.value));
-          if (!allowed.has(val)) errs[f.key] = '存在无效的选项。';
+          if (!allowed.has(val)) errs[f.key] = 'Contains an invalid option.';
         }
       }
     }
@@ -235,27 +235,27 @@ export function AppRunPage() {
             };
             if (parsed.errors && !Array.isArray(parsed.errors)) {
               setFieldErrors(parsed.errors);
-              setSubmitError('输入校验未通过，请检查表单。');
+              setSubmitError('Input validation failed. Please check the form.');
               return;
             }
             if (Array.isArray(parsed.errors)) {
-              setSubmitError(`输入校验未通过：${parsed.errors.join('；')}`);
+              setSubmitError(`Input validation failed: ${parsed.errors.join('; ')}`);
               return;
             }
           } catch {
             /* fall through to generic message */
           }
-          setSubmitError('输入校验未通过，请检查表单。');
+          setSubmitError('Input validation failed. Please check the form.');
           return;
         }
         if (err.status === 409) {
-          setSubmitError('该应用当前不可运行（未发布）。');
+          setSubmitError('This app can’t be run right now (not published).');
           return;
         }
-        setSubmitError(err.message || '执行失败，请稍后重试。');
+        setSubmitError(err.message || 'Run failed. Please try again later.');
         return;
       }
-      setSubmitError('执行失败，请稍后重试。');
+      setSubmitError('Run failed. Please try again later.');
       console.warn('app run failed', err);
     } finally {
       setSubmitting(false);
@@ -265,9 +265,9 @@ export function AppRunPage() {
   // ─── Render ────────────────────────────────────────────────────────────────
 
   const crumbs = [
-    { label: '首页', to: '/home' },
-    { label: '应用' },
-    { label: app?.name || '应用' },
+    { label: 'Home', to: '/home' },
+    { label: 'Apps' },
+    { label: app?.name || 'App' },
   ];
 
   if (loading) {
@@ -275,7 +275,7 @@ export function AppRunPage() {
       <div className="flex flex-col h-full min-w-0 bg-paper">
         <PageHead crumbs={crumbs} />
         <div className="flex-1 flex items-center justify-center font-mono text-[12px] text-dim">
-          加载中…
+          Loading…
         </div>
       </div>
     );
@@ -286,7 +286,7 @@ export function AppRunPage() {
       <div className="flex flex-col h-full min-w-0 bg-paper">
         <PageHead crumbs={crumbs} />
         <div className="flex-1 flex items-center justify-center text-dim text-[13px]">
-          {loadError || '未找到应用。'}
+          {loadError || 'App not found.'}
         </div>
       </div>
     );
@@ -297,8 +297,8 @@ export function AppRunPage() {
       <div className="flex flex-col h-full min-w-0 bg-paper">
         <PageHead crumbs={crumbs} />
         <div className="flex-1 flex flex-col items-center justify-center gap-2 text-dim">
-          <div className="text-[14px] text-ink font-medium">该应用尚未发布</div>
-          <div className="text-[12.5px]">暂无可运行的已发布版本。</div>
+          <div className="text-[14px] text-ink font-medium">This app hasn’t been published yet</div>
+          <div className="text-[12.5px]">There’s no published version to run.</div>
         </div>
       </div>
     );
@@ -327,11 +327,11 @@ export function AppRunPage() {
 
           {/* Read-only harness chips (single-turn — no selectors) */}
           <div className="flex flex-wrap items-center gap-1.5">
-            <Chip>模型 · {modelLabel(version.model)}</Chip>
+            <Chip>Model · {modelLabel(version.model)}</Chip>
             {version.reasoning_effort != null && version.reasoning_effort !== '' && (
-              <Chip>推理 · {effortLabel(version.reasoning_effort)}</Chip>
+              <Chip>Reasoning · {effortLabel(version.reasoning_effort)}</Chip>
             )}
-            <Chip>版本 v{version.version}</Chip>
+            <Chip>Version v{version.version}</Chip>
             {version.forced_skills.map((s) => (
               <Chip key={s} dashed>
                 {s}
@@ -365,9 +365,9 @@ export function AppRunPage() {
               disabled={submitting || uploadingKey !== null}
               className="cw-btn cw-btn-accent disabled:opacity-50"
             >
-              {submitting ? '执行中…' : '开始执行'}
+              {submitting ? 'Running…' : 'Run'}
             </button>
-            <span className="font-mono text-[10.5px] text-dim">单轮运行 · 执行后查看进度与产出</span>
+            <span className="font-mono text-[10.5px] text-dim">Single-turn run · view progress and output after it starts</span>
           </div>
         </div>
       </div>

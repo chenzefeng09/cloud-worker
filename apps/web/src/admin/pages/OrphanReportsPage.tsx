@@ -60,7 +60,7 @@ export function OrphanReportsPage() {
       })
       .catch((err) => {
         if (isTodo(err)) setTodo(true);
-        else setError(err instanceof ApiError ? err.message : '加载失败');
+        else setError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => setLoading(false));
   }, []);
@@ -80,7 +80,7 @@ export function OrphanReportsPage() {
       setItems((prev) => [...prev, ...(res.items ?? [])]);
       setNextCursor(res.next_cursor ?? null);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '加载更多失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to load more');
     } finally {
       setLoadingMore(false);
     }
@@ -90,29 +90,29 @@ export function OrphanReportsPage() {
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
         <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">
-          存储管理 / 孤儿对账
+          Storage / Orphan reconciliation
         </h1>
         <p className="text-[12px] text-dim mt-0.5">
-          DB ↔ S3 双向对账历史报告（→ lifecycle / orphan_reports）
+          History of bidirectional DB ↔ S3 reconciliation reports (→ lifecycle / orphan_reports)
         </p>
       </div>
 
       {/* Intro card */}
       <div className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 text-[12px] text-ink-2">
         <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-          对账说明
+          How reconciliation works
         </div>
         <div>
-          <span className="font-mono text-[11px] text-accent">方向 A</span>
-          ：扫描对象存储中存在但数据库无记录的对象（"裸对象"），超过宽限期后自动删除。
+          <span className="font-mono text-[11px] text-accent">Direction A</span>
+          : finds objects in object storage with no database record ("bare objects") and deletes them automatically after the grace period.
         </div>
         <div>
-          <span className="font-mono text-[11px] text-accent">方向 B</span>
-          ：扫描数据库中标记存在但对象存储已消失的资源（"幽灵记录"），仅记录不修复，需人工介入。
+          <span className="font-mono text-[11px] text-accent">Direction B</span>
+          : finds resources the database marks as present but that are missing from object storage ("ghost records"). These are only reported, not repaired — manual follow-up is required.
         </div>
         <div>
           <span className="font-mono text-[11px] text-amber-700">dry_run</span>
-          ：标记为 dry_run 的报告不会真正删除任何对象，仅统计。生产环境的报告应为 dry_run=false。
+          : reports marked dry_run only count objects and delete nothing. Production reports should be dry_run=false.
         </div>
       </div>
 
@@ -123,14 +123,14 @@ export function OrphanReportsPage() {
       )}
       {todo && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          该能力暂未启用：孤儿对账端点不可达，接线后将自动展示。
+          Not available yet: the orphan reconciliation endpoint is unreachable. Reports will appear here once it’s connected.
         </div>
       )}
 
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
 
       {!todo && !loading && items.length === 0 && (
-        <div className="font-mono text-[12px] text-dim italic">暂无对账记录</div>
+        <div className="font-mono text-[12px] text-dim italic">No reconciliation reports</div>
       )}
 
       {!todo && items.length > 0 && (
@@ -139,25 +139,25 @@ export function OrphanReportsPage() {
             <thead className="bg-paper-2 border-b border-line">
               <tr>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  开始时间
+                  Started
                 </th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  模式
+                  Mode
                 </th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  宽限期
+                  Grace period
                 </th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  方向 A · 孤儿
+                  Direction A · Orphans
                 </th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  方向 A · 删除
+                  Direction A · Deleted
                 </th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  方向 B · 缺失
+                  Direction B · Missing
                 </th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  耗时
+                  Duration
                 </th>
               </tr>
             </thead>
@@ -179,7 +179,7 @@ export function OrphanReportsPage() {
                     )}
                   </td>
                   <td className="px-3 py-2 font-mono text-[11px] text-dim">
-                    {r.grace_period_days} 天
+                    {r.grace_period_days} days
                   </td>
                   <td className="px-3 py-2 font-mono text-[11px] text-ink-2">
                     {r.direction_a_orphans}
@@ -207,7 +207,7 @@ export function OrphanReportsPage() {
             disabled={loadingMore}
             className="px-3 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2 disabled:opacity-50"
           >
-            {loadingMore ? '加载中…' : '加载更多'}
+            {loadingMore ? 'Loading…' : 'Load more'}
           </button>
         </div>
       )}
@@ -224,7 +224,7 @@ export function OrphanReportsPage() {
           >
             <div className="flex items-center justify-between">
               <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                对账报告详情
+                Reconciliation report
               </div>
               <button
                 onClick={() => setSelected(null)}
@@ -235,34 +235,34 @@ export function OrphanReportsPage() {
             </div>
             <div className="text-[12px] text-ink font-mono">{selected.id}</div>
 
-            <DetailRow label="开始时间" value={fmt(selected.started_at)} />
-            <DetailRow label="结束时间" value={fmt(selected.completed_at)} />
-            <DetailRow label="耗时" value={fmtDuration(selected.duration_ms)} />
+            <DetailRow label="Started" value={fmt(selected.started_at)} />
+            <DetailRow label="Completed" value={fmt(selected.completed_at)} />
+            <DetailRow label="Duration" value={fmtDuration(selected.duration_ms)} />
             <DetailRow
-              label="模式"
-              value={selected.dry_run ? 'dry_run（仅统计）' : 'live（执行删除）'}
+              label="Mode"
+              value={selected.dry_run ? 'dry_run (count only)' : 'live (deletes objects)'}
             />
-            <DetailRow label="宽限期" value={`${selected.grace_period_days} 天`} />
+            <DetailRow label="Grace period" value={`${selected.grace_period_days} days`} />
 
             <div className="border-t border-line pt-2 mt-1" />
 
             <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-              方向 A — 孤儿对象（S3 → DB）
+              Direction A — Orphaned objects (S3 → DB)
             </div>
-            <DetailRow label="检出孤儿" value={String(selected.direction_a_orphans)} />
-            <DetailRow label="已删除" value={String(selected.direction_a_deleted)} />
+            <DetailRow label="Orphans found" value={String(selected.direction_a_orphans)} />
+            <DetailRow label="Deleted" value={String(selected.direction_a_deleted)} />
 
             <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim mt-2">
-              方向 B — 幽灵记录（DB → S3）
+              Direction B — Ghost records (DB → S3)
             </div>
-            <DetailRow label="缺失对象" value={String(selected.direction_b_missing)} />
+            <DetailRow label="Missing objects" value={String(selected.direction_b_missing)} />
 
             <div className="flex justify-end mt-2">
               <button
                 onClick={() => setSelected(null)}
                 className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink"
               >
-                关闭
+                Close
               </button>
             </div>
           </div>

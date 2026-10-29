@@ -183,8 +183,7 @@ def _canvas_created_event(*, canvas_id: str, run_id: str, message_id: str | None
 
     Shape ``{canvas_id, run_id, message_id?}`` — ``message_id`` is omitted when no
     assistant row was anchored yet (the frontend still renders the card from
-    ``canvas_id``).  Shared so the sandbox reconcile path and the inline path emit
-    byte-identical events.
+    ``canvas_id``).
     """
     payload: dict[str, Any] = {"canvas_id": canvas_id, "run_id": run_id}
     if message_id is not None:
@@ -402,22 +401,6 @@ async def _stream_tokens(
                                 "thinking_delta",
                                 {"run_id": run_id, "delta": text, "offset": last_id},
                             )
-                    elif entry_type == "canvas":
-                        # Inline path: the executor materialized a canvas in-process
-                        # from a model ``create_canvas`` tool call and wrote a
-                        # ``canvas`` entry here so the live tail relays it.  Emit the
-                        # exact ``canvas_created`` event the sandbox reconcile path
-                        # synthesizes ({canvas_id, run_id, message_id?}) so the
-                        # frontend handler is mode-agnostic.  (The sandbox path never
-                        # writes this entry type — it materializes off the separate
-                        # ``:canvas`` key and yields the event from a buffered list.)
-                        canvas_id = entry.get("canvas_id") or ""
-                        if canvas_id:
-                            yield _canvas_created_event(
-                                canvas_id=str(canvas_id),
-                                run_id=run_id,
-                                message_id=entry.get("message_id") or None,
-                            )
                     elif entry_type == "pending_confirmation":
                         # HITL: worker paused waiting for user to confirm a tool call.
                         # Relay verbatim so the frontend can render the confirmation card.
@@ -602,7 +585,7 @@ async def _write_memory(
     # Truncate to keep the document small.
     snippet_task = task_description[:300].strip()
     snippet_summary = summary[:600].strip()
-    content = f"用户任务：{snippet_task}\n\n助理回答：{snippet_summary}"
+    content = f"User task: {snippet_task}\n\nAssistant answer: {snippet_summary}"
     title = f"[memory] {snippet_task[:80]}"
 
     upload_data = {"title": title, "mime": "text/plain"}

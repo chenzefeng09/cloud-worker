@@ -1,8 +1,9 @@
 # =============================================================================
 # Agent Platform — Skill Store OpenAPI 3.1
 #
-# Versioned skill-package registry (skill.yaml + Python tarballs).  Backs
-# the agentscope-ext/skills_loader.
+# Versioned skill-package registry (SKILL.md packages as tarballs).  The
+# agent-scheduler resolves installed skills through the internal endpoints and
+# bind-mounts them under /home/skills in the sandbox.
 # =============================================================================
 openapi: 3.1.0
 
@@ -192,9 +193,10 @@ paths:
       description: >-
         Returns a single file from the resolved version of an installed skill
         (same version-resolution as the internal resolve path) as UTF-8 text, so
-        the session-orchestrator's inline mode can read a skill's SKILL.md body
-        or a references/ file in-process without downloading and unpacking the
-        whole tarball.  `path` is resolved relative to the skill root (the
+        a trusted platform service can read a skill's SKILL.md body or a
+        references/ file without downloading and unpacking the whole tarball.
+        (Its original consumer, the session-orchestrator's inline mode, has been
+        removed; sandboxed runs read skills from the /home/skills mount.)  `path` is resolved relative to the skill root (the
         directory containing SKILL.md).
       tags: [Internal]
       parameters:

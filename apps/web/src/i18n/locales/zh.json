@@ -114,7 +114,9 @@
     "delete.confirm": "删除",
     "delete.cancel": "取消",
     "delete.deleting": "删除中…",
-    "toggle.error": "切换失败，请稍后重试"
+    "toggle.error": "切换失败，请稍后重试",
+    "error.createFailed": "创建失败，请稍后重试",
+    "error.deleteFailed": "删除失败，请稍后重试"
   },
   "audit": {
     "group.identity": "身份认证与用户",

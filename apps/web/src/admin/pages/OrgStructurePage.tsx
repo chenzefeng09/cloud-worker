@@ -23,9 +23,9 @@ import type {
 // reasons that reach the user are genuine occupants; map each to a concrete
 // hint, falling back to the localised `user_message` carried on the error.
 const ORG_DELETE_REASON_HINT: Record<string, string> = {
-  has_children: '该部门下仍有子部门，请先删除子部门。',
-  has_teams: '该部门下仍有团队，请先移除或删除团队。',
-  has_members: '该部门下仍有成员，请先把成员移出该部门。',
+  has_children: 'This department still has sub-departments. Delete them first.',
+  has_teams: 'This department still has teams. Move or delete them first.',
+  has_members: 'This department still has members. Move them out first.',
 };
 
 function deleteErrorMessage(err: unknown): string {
@@ -35,7 +35,7 @@ function deleteErrorMessage(err: unknown): string {
     }
     return err.message;
   }
-  return '操作失败';
+  return 'Operation failed';
 }
 
 interface OrgNode extends OrgUnit {
@@ -109,7 +109,7 @@ function MoveTreeNode({
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
       >
         <span className="text-[13px] text-ink truncate">{node.name}</span>
-        {isCurrent && <span className="text-[10px] font-mono text-dim ml-1">（当前）</span>}
+        {isCurrent && <span className="text-[10px] font-mono text-dim ml-1"> (current)</span>}
       </button>
       {node.children.map((c) => (
         <MoveTreeNode
@@ -157,7 +157,7 @@ function MoveOrgUnitDialog({
       await api.admin.org.orgUnits.move(node.id, { new_parent_id: selectedId ?? null }, tenantId ?? undefined);
       onDone();
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : '移动失败');
+      onError(err instanceof ApiError ? err.message : 'Move failed');
       onCancel();
     } finally {
       setBusy(false);
@@ -165,8 +165,8 @@ function MoveOrgUnitDialog({
   };
 
   return (
-    <Dialog title={`移动「${node.name}」`} onClose={onCancel} className="w-full max-w-sm">
-      <div className="text-[12px] text-dim mb-1">选择目标父部门：</div>
+    <Dialog title={`Move “${node.name}”`} onClose={onCancel} className="w-full max-w-sm">
+      <div className="text-[12px] text-dim mb-1">Choose the new parent department:</div>
       <div className="border border-line rounded-md bg-paper max-h-[320px] overflow-y-auto p-1">
         {/* Move to root option */}
         <button
@@ -176,8 +176,8 @@ function MoveOrgUnitDialog({
             isRoot ? 'bg-accent-soft' : 'hover:bg-paper-2'
           }`}
         >
-          <span className="text-[13px] text-ink">（根级 — 顶级部门）</span>
-          {!node.parent_id && <span className="text-[10px] font-mono text-dim ml-1">（当前）</span>}
+          <span className="text-[13px] text-ink">(Root — top-level department)</span>
+          {!node.parent_id && <span className="text-[10px] font-mono text-dim ml-1"> (current)</span>}
         </button>
         <div className="border-b border-line-2 my-1" />
         {tree.map((n) => (
@@ -198,7 +198,7 @@ function MoveOrgUnitDialog({
           onClick={onCancel}
           className="px-3 py-1.5 text-[13px] rounded-sm border border-line text-dim hover:bg-paper-2"
         >
-          取消
+          Cancel
         </button>
         <button
           type="button"
@@ -206,7 +206,7 @@ function MoveOrgUnitDialog({
           onClick={handleConfirm}
           className="px-3 py-1.5 text-[13px] rounded-sm bg-ink text-paper hover:opacity-90 disabled:opacity-50"
         >
-          {busy ? '移动中…' : '确定'}
+          {busy ? 'Moving…' : 'Confirm'}
         </button>
       </div>
     </Dialog>
@@ -230,7 +230,7 @@ function CreateOrgUnitForm({
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     const n = name.trim();
-    if (!n) { setErr('请填写部门名称'); return; }
+    if (!n) { setErr('Enter a department name'); return; }
     setErr(null);
     onSubmit(n);
   };
@@ -240,13 +240,13 @@ function CreateOrgUnitForm({
       <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">{title}</div>
       {err && <div className="text-[11px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{err}</div>}
       <div className="flex flex-col gap-1">
-        <label className="text-[11px] text-dim font-mono">部门名称</label>
+        <label className="text-[11px] text-dim font-mono">Department name</label>
         <input
           autoFocus
           className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
           value={name}
           onChange={(e) => { setName(e.target.value); if (err) setErr(null); }}
-          placeholder="研发部"
+          placeholder="Engineering"
         />
       </div>
       <div className="flex gap-2">
@@ -255,14 +255,14 @@ function CreateOrgUnitForm({
           disabled={busy}
           className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50"
         >
-          {busy ? '创建中…' : '创建'}
+          {busy ? 'Creating…' : 'Create'}
         </button>
         <button
           type="button"
           onClick={onCancel}
           className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink"
         >
-          取消
+          Cancel
         </button>
       </div>
     </form>
@@ -303,7 +303,7 @@ function OrgUnitNode({
       await fn();
       onReload();
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : '操作失败');
+      onError(err instanceof ApiError ? err.message : 'Operation failed');
     } finally {
       setBusy(false);
     }
@@ -320,8 +320,8 @@ function OrgUnitNode({
 
   const handleRename = async () => {
     const name = await prompt({
-      title: '重命名部门',
-      label: '新名称',
+      title: 'Rename department',
+      label: 'New name',
       defaultValue: node.name,
       required: true,
     });
@@ -333,18 +333,18 @@ function OrgUnitNode({
 
   const handleDelete = async () => {
     if (node.children.length > 0) {
-      onError('该部门下仍有子部门，请先删除子部门。');
+      onError('This department still has sub-departments. Delete them first.');
       return;
     }
     const input = await prompt({
-      title: '删除部门',
-      description: `此操作会先归档再删除。请输入部门名称「${node.name}」以确认删除。`,
-      label: '部门名称',
+      title: 'Delete department',
+      description: `The department will be archived and then deleted. Type the department name “${node.name}” to confirm.`,
+      label: 'Department name',
       placeholder: node.name,
-      confirmText: '删除',
+      confirmText: 'Delete',
       required: true,
       validate: (value) =>
-        value.trim() === node.name ? null : '输入的部门名称不一致，请重新输入。',
+        value.trim() === node.name ? null : 'The department name doesn’t match. Try again.',
     });
     if (input === null) return;
     setBusy(true);
@@ -380,13 +380,13 @@ function OrgUnitNode({
         )}
         <span className="text-[13px] text-ink truncate flex-1">{node.name}</span>
         {typeof node.members_count === 'number' && (
-          <span className="font-mono text-[10px] text-dim">{node.members_count} 人</span>
+          <span className="font-mono text-[10px] text-dim">{node.members_count} members</span>
         )}
         <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-          <button onClick={() => setAddingChild((v) => !v)} disabled={busy} className="text-[10.5px] font-mono text-dim hover:text-ink px-1">＋子</button>
-          <button onClick={handleRename} disabled={busy} className="text-[10.5px] font-mono text-dim hover:text-ink px-1">改名</button>
-          <button onClick={handleMove} disabled={busy} className="text-[10.5px] font-mono text-dim hover:text-ink px-1">移动</button>
-          <button onClick={handleDelete} disabled={busy} className="text-[10.5px] font-mono text-red-500 hover:text-red-700 px-1">删除</button>
+          <button onClick={() => setAddingChild((v) => !v)} disabled={busy} className="text-[10.5px] font-mono text-dim hover:text-ink px-1">+ Sub</button>
+          <button onClick={handleRename} disabled={busy} className="text-[10.5px] font-mono text-dim hover:text-ink px-1">Rename</button>
+          <button onClick={handleMove} disabled={busy} className="text-[10.5px] font-mono text-dim hover:text-ink px-1">Move</button>
+          <button onClick={handleDelete} disabled={busy} className="text-[10.5px] font-mono text-red-500 hover:text-red-700 px-1">Delete</button>
         </div>
       </div>
       {showMoveDialog && (
@@ -402,7 +402,7 @@ function OrgUnitNode({
       {addingChild && (
         <div style={{ paddingLeft: `${(depth + 1) * 16 + 8}px` }} className="py-1.5 pr-2">
           <CreateOrgUnitForm
-            title={`在「${node.name}」下新建子部门`}
+            title={`New sub-department under “${node.name}”`}
             busy={busy}
             onSubmit={handleAddChild}
             onCancel={() => setAddingChild(false)}
@@ -454,26 +454,26 @@ function OrgUnitPanel({
     api.admin.org.orgUnits
       .create({ name }, tenantId ?? undefined)
       .then(() => { setAddingRoot(false); onReload(); })
-      .catch((err) => onError(err instanceof ApiError ? err.message : '创建失败'))
+      .catch((err) => onError(err instanceof ApiError ? err.message : 'Create failed'))
       .finally(() => setBusy(false));
   };
 
   return (
     <div className="flex flex-col gap-3 flex-1 min-w-0">
       <div className="flex items-center justify-between">
-        <h2 className="text-[13px] font-mono text-ink-2 uppercase tracking-[0.08em]">组织架构</h2>
+        <h2 className="text-[13px] font-mono text-ink-2 uppercase tracking-[0.08em]">Organization</h2>
         <button
           onClick={() => setAddingRoot((v) => !v)}
           disabled={busy}
           className="px-2 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2 disabled:opacity-50"
         >
-          + 顶级部门
+          + Top-level department
         </button>
       </div>
 
       {addingRoot && (
         <CreateOrgUnitForm
-          title="新建顶级部门"
+          title="New top-level department"
           busy={busy}
           onSubmit={handleAddRoot}
           onCancel={() => setAddingRoot(false)}
@@ -481,7 +481,7 @@ function OrgUnitPanel({
       )}
       <div className="border border-line rounded-md p-2 bg-paper min-h-[200px]">
         {tree.length === 0 ? (
-          <div className="font-mono text-[12px] text-dim italic p-2">暂无部门</div>
+          <div className="font-mono text-[12px] text-dim italic p-2">No departments yet</div>
         ) : (
           tree.map((n) => (
             <OrgUnitNode
@@ -527,7 +527,7 @@ function TeamMembersPanel({
     api.admin.org.teams.members
       .list(team.id, tenantId ?? undefined)
       .then((data) => setMembers(Array.isArray(data) ? data : []))
-      .catch((err) => onError(err instanceof ApiError ? err.message : '加载成员失败'))
+      .catch((err) => onError(err instanceof ApiError ? err.message : 'Failed to load members'))
       .finally(() => setLoading(false));
   }, [team.id, tenantId, onError]);
 
@@ -545,21 +545,21 @@ function TeamMembersPanel({
       setSearch('');
       loadMembers();
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : '添加成员失败');
+      onError(err instanceof ApiError ? err.message : 'Failed to add member');
     } finally {
       setBusy(false);
     }
   };
 
   const handleRemove = async (userId: string) => {
-    if (!(await confirm({ title: '移除成员', message: '确定移除该成员吗？', tone: 'danger', confirmText: '移除' }))) return;
+    if (!(await confirm({ title: 'Remove member', message: 'Remove this member?', tone: 'danger', confirmText: 'Remove' }))) return;
     setBusy(true);
     onError('');
     try {
       await api.admin.org.teams.members.remove(team.id, userId, tenantId ?? undefined);
       loadMembers();
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : '移除成员失败');
+      onError(err instanceof ApiError ? err.message : 'Failed to remove member');
     } finally {
       setBusy(false);
     }
@@ -581,28 +581,28 @@ function TeamMembersPanel({
   return (
     <div className="border border-line rounded-md bg-surface flex flex-col">
       <div className="px-3 py-2 border-b border-line bg-paper-2 flex items-center justify-between">
-        <div className="text-[13px] text-ink font-semibold">{team.name} · 成员</div>
+        <div className="text-[13px] text-ink font-semibold">{team.name} · Members</div>
         <button
           onClick={() => { setShowPicker(true); setSearch(''); }}
           disabled={busy}
           className="px-2 py-0.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper disabled:opacity-50"
         >
-          + 添加成员
+          + Add member
         </button>
       </div>
 
       {showPicker && (
-        <Dialog title="添加成员" onClose={() => { setShowPicker(false); setSearch(''); }} dismissable={!busy}>
+        <Dialog title="Add member" onClose={() => { setShowPicker(false); setSearch(''); }} dismissable={!busy}>
           <input
             autoFocus
             className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent w-full"
-            placeholder="搜索邮箱或姓名…"
+            placeholder="Search by email or name…"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
           />
           <div className="max-h-[300px] overflow-auto -mx-1">
             {filteredUsers.length === 0 ? (
-              <div className="px-3 py-3 text-[12px] text-dim italic">无匹配用户</div>
+              <div className="px-3 py-3 text-[12px] text-dim italic">No matching users</div>
             ) : (
               filteredUsers.map((u) => (
                 <button
@@ -621,9 +621,9 @@ function TeamMembersPanel({
       )}
 
       {loading ? (
-        <div className="px-3 py-3 font-mono text-[12px] text-dim">加载中…</div>
+        <div className="px-3 py-3 font-mono text-[12px] text-dim">Loading…</div>
       ) : members.length === 0 ? (
-        <div className="px-3 py-3 font-mono text-[12px] text-dim italic">暂无成员</div>
+        <div className="px-3 py-3 font-mono text-[12px] text-dim italic">No members yet</div>
       ) : (
         <div className="divide-y divide-line-2">
           {members.map((m) => (
@@ -637,7 +637,7 @@ function TeamMembersPanel({
                 disabled={busy}
                 className="text-[11px] font-mono text-red-600 border border-red-200 rounded-sm px-2 py-0.5 hover:bg-red-50 disabled:opacity-50"
               >
-                移除
+                Remove
               </button>
             </div>
           ))}
@@ -698,7 +698,7 @@ function TeamsPanel({
       setCreating(false);
       onReload();
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : '创建团队失败');
+      onError(err instanceof ApiError ? err.message : 'Failed to create team');
     } finally {
       setBusy(false);
     }
@@ -706,14 +706,14 @@ function TeamsPanel({
 
   const handleDelete = async (team: Team) => {
     const input = await prompt({
-      title: '删除团队',
-      description: `此操作不可撤销。请输入团队名称「${team.name}」以确认删除。`,
-      label: '团队名称',
+      title: 'Delete team',
+      description: `This cannot be undone. Type the team name “${team.name}” to confirm.`,
+      label: 'Team name',
       placeholder: team.name,
-      confirmText: '删除',
+      confirmText: 'Delete',
       required: true,
       validate: (value) =>
-        value.trim() === team.name ? null : '输入的团队名称不一致，请重新输入。',
+        value.trim() === team.name ? null : 'The team name doesn’t match. Try again.',
     });
     if (input === null) return;
     setBusy(true);
@@ -723,7 +723,7 @@ function TeamsPanel({
       if (selectedTeamId === team.id) onSelectTeam(null);
       onReload();
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : '删除团队失败');
+      onError(err instanceof ApiError ? err.message : 'Failed to delete team');
     } finally {
       setBusy(false);
     }
@@ -732,9 +732,9 @@ function TeamsPanel({
   if (!selectedOuId) {
     return (
       <div className="flex flex-col gap-3 flex-1 min-w-0">
-        <h2 className="text-[13px] font-mono text-ink-2 uppercase tracking-[0.08em]">团队</h2>
+        <h2 className="text-[13px] font-mono text-ink-2 uppercase tracking-[0.08em]">Teams</h2>
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          请先在左侧选择一个部门，查看该部门牵头的团队
+          Select a department on the left to see the teams it leads
         </div>
       </div>
     );
@@ -744,20 +744,20 @@ function TeamsPanel({
     <div className="flex flex-col gap-3 flex-1 min-w-0">
       <div className="flex items-center justify-between">
         <h2 className="text-[13px] font-mono text-ink-2 uppercase tracking-[0.08em]">
-          团队
+          Teams
           {selectedOuName && <span className="text-dim ml-1.5 normal-case tracking-normal">— {selectedOuName}</span>}
         </h2>
         <button
           onClick={() => setCreating(true)}
           className="px-2 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2"
         >
-          + 新建团队
+          + New team
         </button>
       </div>
 
       {creating && (
         <Dialog
-          title="新建团队"
+          title="New team"
           onClose={() => { setCreating(false); setName(''); }}
           dismissable={!busy}
           className="w-full max-w-[440px]"
@@ -766,7 +766,7 @@ function TeamsPanel({
             <input
               autoFocus
               className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
-              placeholder="团队名称"
+              placeholder="Team name"
               value={name}
               onChange={(e) => setName(e.target.value)}
               required
@@ -778,14 +778,14 @@ function TeamsPanel({
                 disabled={busy}
                 className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
               >
-                取消
+                Cancel
               </button>
               <button
                 type="submit"
                 disabled={busy || !name.trim()}
                 className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
               >
-                {busy ? '创建中…' : '创建'}
+                {busy ? 'Creating…' : 'Create'}
               </button>
             </div>
           </form>
@@ -795,7 +795,7 @@ function TeamsPanel({
       {/* Team list */}
       <div className="border border-line rounded-md bg-paper overflow-hidden">
         {filteredTeams.length === 0 ? (
-          <div className="font-mono text-[12px] text-dim italic p-3">暂无团队</div>
+          <div className="font-mono text-[12px] text-dim italic p-3">No teams yet</div>
         ) : (
           filteredTeams.map((t) => (
             <div
@@ -807,14 +807,14 @@ function TeamsPanel({
             >
               <span className="text-[13px] text-ink flex-1 truncate">{t.name}</span>
               {typeof t.members_count === 'number' && (
-                <span className="font-mono text-[10px] text-dim">{t.members_count} 人</span>
+                <span className="font-mono text-[10px] text-dim">{t.members_count} members</span>
               )}
               <button
                 onClick={(e) => { e.stopPropagation(); handleDelete(t); }}
                 disabled={busy}
                 className="text-[10.5px] font-mono text-red-500 hover:text-red-700 px-1 opacity-0 group-hover:opacity-100 transition-opacity"
               >
-                删除
+                Delete
               </button>
             </div>
           ))
@@ -839,7 +839,7 @@ export function OrgStructurePage() {
   // tenant (selectedTenantId stays null → BFF omits ?tenant_id= → own tenant).
   const canSwitchTenant = isPlatformAdmin(userProfile?.permissions);
   const ownTenantName =
-    tenants.find((t) => t.id === userProfile?.tenant_id)?.name ?? userProfile?.tenant_id ?? '当前租户';
+    tenants.find((t) => t.id === userProfile?.tenant_id)?.name ?? userProfile?.tenant_id ?? 'Current tenant';
 
   const [units, setUnits] = useState<OrgUnit[]>([]);
   const [teams, setTeams] = useState<Team[]>([]);
@@ -882,7 +882,7 @@ export function OrgStructurePage() {
       if (err instanceof ApiError && (err.status === 404 || err.status === 501)) {
         setIsTodoEndpoint(true);
       } else {
-        setError(err instanceof ApiError ? err.message : '加载失败');
+        setError(err instanceof ApiError ? err.message : 'Failed to load');
       }
     } finally {
       setLoading(false);
@@ -905,21 +905,21 @@ export function OrgStructurePage() {
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">组织架构</h1>
-        <p className="text-[12px] text-dim mt-0.5">管理部门层级与团队成员</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Organization</h1>
+        <p className="text-[12px] text-dim mt-0.5">Manage the department hierarchy and team members</p>
       </div>
 
       {/* Tenant selector — only platform admins may switch; tenant admins are
           locked to their own tenant (shown read-only). */}
       <div className="flex items-center gap-3">
         <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">
-          {canSwitchTenant ? '选择租户' : '当前租户'}
+          {canSwitchTenant ? 'Tenant' : 'Current tenant'}
         </label>
         {canSwitchTenant ? (
           <CustomSelect
             className="min-w-[200px]"
             options={[
-              { value: '', label: '（默认 / 当前租户）' },
+              { value: '', label: '(Default / current tenant)' },
               ...tenants.map((t) => ({ value: t.id, label: t.name })),
             ]}
             value={selectedTenantId ?? ''}
@@ -941,12 +941,12 @@ export function OrgStructurePage() {
 
       {isTodoEndpoint && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          该能力服务未启用（组织架构代理端点尚未就绪）。接线后将自动展示。
+          This service isn't enabled yet (the organization proxy endpoint isn't ready). It appears automatically once wired up.
         </div>
       )}
 
       {loading ? (
-        <div className="font-mono text-[12px] text-dim">加载中…</div>
+        <div className="font-mono text-[12px] text-dim">Loading…</div>
       ) : (
         !isTodoEndpoint && (
           <div className="flex gap-6 items-start">

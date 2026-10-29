@@ -154,7 +154,7 @@ export default function ArchivePreview({ blob, filename }: { blob: Blob; filenam
         if (!cancelled) {
           setState({
             loading: false,
-            error: `压缩包过大（${formatBytes(blob.size)}），暂不在线列出内容，请下载查看。`,
+            error: `Archive is too large (${formatBytes(blob.size)}) to list online. Download it to view.`,
             encrypted: false,
             entries: [],
           });
@@ -194,7 +194,7 @@ export default function ArchivePreview({ blob, filename }: { blob: Blob; filenam
         if (!cancelled) {
           setState({
             loading: false,
-            error: '无法读取压缩包内容（可能格式不受支持，或头部已加密）。可下载后用本地工具打开。',
+            error: 'Couldn’t read the archive (the format may be unsupported or the headers encrypted). Download it and open it with a local tool.',
             encrypted: false,
             entries: [],
           });
@@ -221,25 +221,25 @@ export default function ArchivePreview({ blob, filename }: { blob: Blob; filenam
       <div className="flex items-center gap-2 flex-wrap">
         <span className="font-mono text-[11px] text-dim">
           {state.loading
-            ? '读取压缩包目录…'
+            ? 'Reading archive index…'
             : state.error
-              ? '压缩包'
-              : `${state.entries.length} 个文件 · 解压后共 ${formatBytes(totalBytes)}`}
+              ? 'Archive'
+              : `${state.entries.length} ${state.entries.length === 1 ? 'file' : 'files'} · ${formatBytes(totalBytes)} uncompressed`}
         </span>
         {state.encrypted && (
           <span className="font-mono text-[10px] px-1.5 py-0.5 rounded border border-accent-line bg-accent-soft text-accent">
-            含加密内容
+            Contains encrypted entries
           </span>
         )}
-        <span className="font-mono text-[10px] text-dim italic">— 仅列出目录，未解压文件内容 —</span>
+        <span className="font-mono text-[10px] text-dim italic">— Listing only; file contents are not extracted —</span>
       </div>
 
       {state.loading ? (
-        <div className="font-mono text-[11px] text-dim animate-pulse">读取中…</div>
+        <div className="font-mono text-[11px] text-dim animate-pulse">Reading…</div>
       ) : state.error ? (
         <div className="font-mono text-[11px] text-dim">{state.error}</div>
       ) : state.entries.length === 0 ? (
-        <div className="font-mono text-[11px] text-dim italic">压缩包为空或无可列出的文件。</div>
+        <div className="font-mono text-[11px] text-dim italic">The archive is empty or has no listable files.</div>
       ) : (
         <div className="flex-1 overflow-auto cw-scroll border border-line rounded-md bg-surface px-2 py-1.5">
           {renderNodes(tree, 0)}

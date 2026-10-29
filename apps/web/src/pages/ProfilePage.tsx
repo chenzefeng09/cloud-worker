@@ -7,21 +7,19 @@ import { useChatStore } from '../stores/chatStore';
 import { useWorkspace } from '../lib/workspaceContext';
 import { useTranslation } from '../i18n';
 import { api } from '../api/client';
-import { formatRelativeTimeZh } from '../lib/format';
+import { formatRelativeTime } from '../lib/format';
 import type { ActiveSession, ApiKey, ApiKeyCreated, DailyTokenBreakdown, FeatureFlag, MfaMethod, ModelCatalogProvider, ModelPurpose, NotifPreferenceItem, QuotaInfo, TokenUsage, TokenUsageBreakdown, UserModelPreference, UserProfile } from '../api/types';
 import { useDefaultModel, clearModelCache } from '../hooks/useDefaultModel';
 import { MODEL_OPTIONS, SYSTEM_FALLBACK_MODEL, modelLabel } from '../lib/modelOptions';
 import { findProviderForModel, getModelsForTypes } from '../lib/providerModels';
 
 const FLAG_DESCRIPTIONS: Record<string, string> = {
-  'ai.thinking_ui': 'AI 思考过程',
-  'billing.saas_mode': 'SaaS 计费模式',
-  'auth.social_login.google': 'Google 社交登录',
-  'auth.social_login.github': 'GitHub 社交登录',
-  'auth.social_login.wechat': '微信社交登录',
-  'compliance.gmtls_enabled': '国密 TLS',
-  'compliance.sm_algorithms': '国密算法 SM2/SM3/SM4',
-  'export.allow_l4_download': 'L4 数据下载',
+  'ai.thinking_ui': 'AI thinking process',
+  'billing.saas_mode': 'SaaS billing mode',
+  'auth.social_login.google': 'Google social login',
+  'auth.social_login.github': 'GitHub social login',
+  'auth.social_login.wechat': 'WeChat social login',
+  'export.allow_l4_download': 'L4 data download',
 };
 
 // ── Local sub-components ──────────────────────────────────────────
@@ -182,9 +180,9 @@ function PfToggle({ on, onChange }: PfToggleProps) {
 
 // Map a backend run-source code to its Chinese label; unknown codes pass through.
 const SOURCE_LABELS: Record<string, string> = {
-  user: '手动',
-  schedule: '定时',
-  app: '应用',
+  user: 'Manual',
+  schedule: 'Scheduled',
+  app: 'App',
 };
 function sourceLabel(source: string): string {
   return SOURCE_LABELS[source] ?? source;
@@ -211,7 +209,7 @@ function StackedBars({ days }: StackedBarsProps) {
         return (
           <div
             key={d.day}
-            title={`${d.day}\n输入 ${d.input_tokens.toLocaleString()} · 输出 ${d.output_tokens.toLocaleString()} · 合计 ${d.total_tokens.toLocaleString()} tokens`}
+            title={`${d.day}\nInput ${d.input_tokens.toLocaleString()} · Output ${d.output_tokens.toLocaleString()} · Total ${d.total_tokens.toLocaleString()} tokens`}
             style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 5 }}
           >
             <div style={{
@@ -259,8 +257,8 @@ function ChartLegend() {
   );
   return (
     <div style={{ display: 'flex', gap: 14, marginTop: 10 }}>
-      {item('var(--accent)', 0.78, '输出')}
-      {item('var(--line)', 1, '输入')}
+      {item('var(--accent)', 0.78, 'Output')}
+      {item('var(--line)', 1, 'Input')}
     </div>
   );
 }
@@ -271,10 +269,10 @@ function ChartLegend() {
 type TabId = 'account' | 'usage' | 'security' | 'notifications';
 
 const TABS: { id: TabId; label: string }[] = [
-  { id: 'account',       label: '账户' },
-  { id: 'usage',         label: '用量与账单' },
-  { id: 'security',      label: '安全' },
-  { id: 'notifications', label: '通知' },
+  { id: 'account',       label: 'Account' },
+  { id: 'usage',         label: 'Usage & billing' },
+  { id: 'security',      label: 'Security' },
+  { id: 'notifications', label: 'Notifications' },
 ];
 
 export function ProfilePage() {
@@ -399,7 +397,7 @@ export function ProfilePage() {
     api.apiKeys.list().then((keys) => {
       setApiKeys(keys);
     }).catch(() => {
-      setApiKeysError('加载 API 密钥失败');
+      setApiKeysError('Failed to load API keys');
     }).finally(() => {
       setApiKeysLoading(false);
     });
@@ -418,7 +416,7 @@ export function ProfilePage() {
       setNewKeyName('');
       fetchApiKeys();
     } catch {
-      setApiKeysError('创建 API 密钥失败');
+      setApiKeysError('Failed to create API key');
     }
   };
 
@@ -427,7 +425,7 @@ export function ProfilePage() {
       await api.apiKeys.revoke(id);
       setApiKeys((prev) => prev.filter((k) => k.id !== id));
     } catch {
-      setApiKeysError('吊销 API 密钥失败');
+      setApiKeysError('Failed to revoke API key');
     }
   };
 
@@ -485,11 +483,11 @@ export function ProfilePage() {
       setLiveProfile(updated);
       setUserProfile(updated); // refresh sidebar / account-menu avatar immediately
       setEditingProfile(false);
-      setProfileMsg('已保存');
+      setProfileMsg('Saved');
       setTimeout(() => setProfileMsg(null), 2000);
     } catch {
       // Stay in edit mode so the user can retry.
-      setProfileMsg('保存失败');
+      setProfileMsg('Save failed');
       setTimeout(() => setProfileMsg(null), 2000);
     } finally {
       setSavingProfile(false);
@@ -512,7 +510,7 @@ export function ProfilePage() {
       const match = prefs.find((p) => p.purpose === purpose);
       setUserPref(match ?? null);
     }).catch(() => {
-      setUserPrefError('加载模型偏好失败');
+      setUserPrefError('Failed to load model preference');
     }).finally(() => {
       setUserPrefLoading(false);
     });
@@ -533,8 +531,8 @@ export function ProfilePage() {
     }).catch((err) => {
       // Don't fail silently — the dropdown falls back to MODEL_OPTIONS, but a
       // failure here also breaks findProviderForModel, so surface it.
-      console.warn('加载模型列表失败', err);
-      setProvidersError('加载模型列表失败，已使用内置模型列表');
+      console.warn('Failed to load model list', err);
+      setProvidersError('Failed to load model list; using the built-in list');
     });
   }, []);
 
@@ -572,7 +570,7 @@ export function ProfilePage() {
     // resolvable provider must not be saved with an empty provider_id.
     const providerId = findProviderForModel(providers, modelId, ['llm']);
     if (!providerId) {
-      setSaveMsg('无法确定该模型所属的 Provider');
+      setSaveMsg('Couldn’t determine the provider for this model');
       setTimeout(() => setSaveMsg(null), 3000);
       return;
     }
@@ -588,10 +586,10 @@ export function ProfilePage() {
       draftTouched.current = false; // re-sync draft from the refreshed data
       refetchDefault();
       fetchUserPref();
-      setSaveMsg('已保存');
+      setSaveMsg('Saved');
       setTimeout(() => setSaveMsg(null), 2000);
     } catch {
-      setSaveMsg('保存失败');
+      setSaveMsg('Save failed');
       setTimeout(() => setSaveMsg(null), 3000);
     } finally {
       setSavingModel(false);
@@ -607,7 +605,7 @@ export function ProfilePage() {
     api.notifications.preferences().then((data) => {
       if (!cancelled) setNotifPrefs(data.items);
     }).catch((_e: unknown) => {
-      if (!cancelled) setNotifPrefsErr('通知偏好加载失败');
+      if (!cancelled) setNotifPrefsErr('Failed to load notification preferences');
     });
     return () => { cancelled = true; };
   }, []);
@@ -624,7 +622,7 @@ export function ProfilePage() {
           email_enabled: changed.email_enabled,
           push_enabled: changed.push_enabled,
         }]).catch((_e: unknown) => {
-          setNotifPrefsErr('保存通知偏好失败');
+          setNotifPrefsErr('Failed to save notification preferences');
         });
       }
       return updated;
@@ -639,7 +637,7 @@ export function ProfilePage() {
   const fetchFlags = () => {
     api.featureFlags.list()
       .then(setFeatureFlags)
-      .catch(() => setFfError('加载功能设置失败'));
+      .catch(() => setFfError('Failed to load feature settings'));
   };
   useEffect(() => { fetchFlags(); }, []);
 
@@ -652,7 +650,7 @@ export function ProfilePage() {
       await api.userFlagOverrides.put(key, { enabled: !currentEnabled });
       fetchFlags();
     } catch {
-      setFfError('保存失败');
+      setFfError('Save failed');
       setTimeout(() => setFfError(null), 3000);
     } finally {
       setFfSaving(null);
@@ -666,7 +664,7 @@ export function ProfilePage() {
       await api.userFlagOverrides.delete(key);
       fetchFlags();
     } catch {
-      setFfError('重置失败');
+      setFfError('Reset failed');
       setTimeout(() => setFfError(null), 3000);
     } finally {
       setFfSaving(null);
@@ -685,7 +683,7 @@ export function ProfilePage() {
 
   return (
     <div className="flex flex-col h-full" data-screen-label="Profile">
-      <PageHead crumbs={[{ label: '首页', to: '/home' }, { label: '个人' }]} />
+      <PageHead crumbs={[{ label: 'Home', to: '/home' }, { label: 'Profile' }]} />
 
       <div className="flex-1 overflow-y-auto" style={{ padding: '28px 32px 52px' }}>
         <div style={{ maxWidth: 860, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
@@ -749,12 +747,12 @@ export function ProfilePage() {
                 {email}
               </div>
 
-              {/* stat tiles — 运行任务数 and Token 累计 from real API */}
+              {/* stat tiles — run count and cumulative tokens from real API */}
               <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                 {[
-                  { l: '运行任务数', v: runsCount !== null ? String(runsCount) : '…' },
+                  { l: 'Runs', v: runsCount !== null ? String(runsCount) : '…' },
                   {
-                    l: 'Token 累计',
+                    l: 'Total tokens',
                     v: tokenUsage !== null
                       ? tokenUsage.total_tokens.toLocaleString()
                       : '…',
@@ -789,7 +787,7 @@ export function ProfilePage() {
               className="cw-btn cw-btn-sm cw-btn-ghost"
               onClick={() => { setTab('account'); enterProfileEdit(); }}
             >
-              编辑资料
+              Edit profile
             </button>
           </div>
 
@@ -825,12 +823,12 @@ export function ProfilePage() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
 
               <PfSection
-                title="个人信息"
+                title="Profile"
                 action={
                   editingProfile ? (
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       {profileMsg && (
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: profileMsg.includes('失败') ? 'var(--accent)' : 'var(--ink-2)' }}>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: profileMsg.includes('failed') ? 'var(--accent)' : 'var(--ink-2)' }}>
                           {profileMsg}
                         </span>
                       )}
@@ -839,25 +837,25 @@ export function ProfilePage() {
                         onClick={cancelProfileEdit}
                         disabled={savingProfile}
                       >
-                        取消
+                        Cancel
                       </button>
                       <button
                         className="cw-btn cw-btn-sm cw-btn-primary"
                         onClick={handleSaveProfile}
                         disabled={savingProfile}
                       >
-                        {savingProfile ? '保存中…' : '保存更改'}
+                        {savingProfile ? 'Saving…' : 'Save changes'}
                       </button>
                     </div>
                   ) : (
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       {profileMsg && (
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: profileMsg.includes('失败') ? 'var(--accent)' : 'var(--ink-2)' }}>
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: profileMsg.includes('failed') ? 'var(--accent)' : 'var(--ink-2)' }}>
                           {profileMsg}
                         </span>
                       )}
                       <button className="cw-btn cw-btn-sm" onClick={enterProfileEdit}>
-                        编辑
+                        Edit
                       </button>
                     </div>
                   )
@@ -865,17 +863,17 @@ export function ProfilePage() {
               >
                 <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14 }}>
                   <PfField
-                    label="显示名称"
+                    label="Display name"
                     value={name}
                     onChange={editingProfile ? setName : undefined}
                     readonly={!editingProfile}
                     inputRef={nameInputRef}
                     onEnter={editingProfile ? handleSaveProfile : undefined}
                   />
-                  <PfField label="邮箱地址"    value={email}              readonly />
-                  <PfField label="时区"        value="Asia / Shanghai (GMT+8)" readonly />
+                  <PfField label="Email address" value={email}              readonly />
+                  <PfField label="Time zone"   value={Intl.DateTimeFormat().resolvedOptions().timeZone} readonly />
                   <PfSelectField
-                    label="语言"
+                    label="Language"
                     value={lang}
                     onChange={(v) => setLang(v as 'zh' | 'en')}
                     options={[
@@ -886,14 +884,14 @@ export function ProfilePage() {
                 </div>
               </PfSection>
 
-              <PfSection title="工作节点默认设置">
+              <PfSection title="Worker defaults">
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
-                  <PfRow label="默认模型" sub={
-                    userPrefLoading ? '加载中…'
-                      : userPref ? `来源：用户偏好 (${modelLabel(userPref.model_id)})`
-                      : modelSource === 'tenant' ? '来源：租户默认'
-                      : modelSource === 'system' ? '来源：系统默认'
-                      : '未指定模板时使用的模型'
+                  <PfRow label="Default model" sub={
+                    userPrefLoading ? 'Loading…'
+                      : userPref ? `Source: your preference (${modelLabel(userPref.model_id)})`
+                      : modelSource === 'tenant' ? 'Source: tenant default'
+                      : modelSource === 'system' ? 'Source: system default'
+                      : 'Model used when no template specifies one'
                   }>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <select
@@ -918,8 +916,8 @@ export function ProfilePage() {
                         ))}
                       </select>
                       {(savingModel || saveMsg) && (
-                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: saveMsg?.includes('失败') ? 'var(--accent)' : 'var(--ink-2)' }}>
-                          {savingModel ? '保存中…' : saveMsg}
+                        <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: saveMsg?.includes('failed') ? 'var(--accent)' : 'var(--ink-2)' }}>
+                          {savingModel ? 'Saving…' : saveMsg}
                         </span>
                       )}
                     </div>
@@ -938,7 +936,7 @@ export function ProfilePage() {
               </PfSection>
 
               {overridableFlags.length > 0 && (
-                <PfSection title="功能设置">
+                <PfSection title="Features">
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
                     {ffError && (
                       <div style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--accent)' }}>
@@ -964,12 +962,12 @@ export function ProfilePage() {
                                 onClick={() => handleResetFlag(flag.key)}
                                 disabled={ffSaving === flag.key}
                               >
-                                恢复默认
+                                Reset to default
                               </button>
                             )}
                             {ffSaving === flag.key && (
                               <span style={{ fontFamily: 'var(--font-mono)', fontSize: 10, color: 'var(--dim)' }}>
-                                保存中…
+                                Saving…
                               </span>
                             )}
                           </div>
@@ -980,7 +978,7 @@ export function ProfilePage() {
                 </PfSection>
               )}
 
-              <PfSection title="工作空间">
+              <PfSection title="Workspaces">
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
                   {allWs.map((w) => (
                     <div key={w.id} style={{
@@ -1027,7 +1025,7 @@ export function ProfilePage() {
 
               {/* ── Time-range segmented control ───────────────── */}
               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <span className="cw-label">时间范围</span>
+                <span className="cw-label">Time range</span>
                 <div style={{ flex: 1 }} />
                 <div style={{
                   display: 'inline-flex',
@@ -1036,9 +1034,9 @@ export function ProfilePage() {
                   overflow: 'hidden',
                 }}>
                   {[
-                    { d: 7,  label: '近 7 天' },
-                    { d: 30, label: '近 30 天' },
-                    { d: 90, label: '近 90 天' },
+                    { d: 7,  label: 'Last 7 days' },
+                    { d: 30, label: 'Last 30 days' },
+                    { d: 90, label: 'Last 90 days' },
                   ].map((opt, i) => {
                     const active = usageDays === opt.d;
                     return (
@@ -1067,25 +1065,25 @@ export function ProfilePage() {
 
               {/* ── 每日 Token 用量（输入/输出堆叠）— GET /runs/token-usage/breakdown ── */}
               {breakdownError ? (
-                <PfSection title={`Token 用量（近 ${usageDays} 天）`}>
-                  <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>用量数据加载失败</span>
+                <PfSection title={`Token usage (last ${usageDays} days)`}>
+                  <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>Failed to load usage data</span>
                 </PfSection>
               ) : breakdown === null ? (
-                <PfSection title={`Token 用量（近 ${usageDays} 天）`}>
-                  <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>加载中…</span>
+                <PfSection title={`Token usage (last ${usageDays} days)`}>
+                  <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>Loading…</span>
                 </PfSection>
               ) : (() => {
                 const total = breakdown.daily.reduce((a, d) => a + d.total_tokens, 0);
                 const allZero = breakdown.daily.every((d) => d.total_tokens === 0);
                 return (
                   <PfSection
-                    title={`Token 用量（近 ${usageDays} 天）— ${total.toLocaleString()} tokens 合计`}
+                    title={`Token usage (last ${usageDays} days) — ${total.toLocaleString()} tokens total`}
                   >
                     {allZero ? (
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                         <StackedBars days={breakdown.daily} />
                         <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)', textAlign: 'center' }}>
-                          近 {usageDays} 天无 Token 用量
+                          No token usage in the last {usageDays} days
                         </span>
                       </div>
                     ) : (
@@ -1104,9 +1102,9 @@ export function ProfilePage() {
                 const sourceTotal = sources.reduce((a, s) => a + s.total_tokens, 0);
                 const maxSource = Math.max(...sources.map((s) => s.total_tokens), 1);
                 return (
-                  <PfSection title="按来源">
+                  <PfSection title="By source">
                     {sources.length === 0 ? (
-                      <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>暂无用量数据</span>
+                      <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>No usage data yet</span>
                     ) : (
                       <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                         {sources.map((s) => {
@@ -1119,7 +1117,7 @@ export function ProfilePage() {
                                   {sourceLabel(s.source)}
                                 </span>
                                 <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)' }}>
-                                  {s.run_count.toLocaleString()} 次运行
+                                  {s.run_count.toLocaleString()} {s.run_count === 1 ? 'run' : 'runs'}
                                 </span>
                                 <div style={{ flex: 1 }} />
                                 <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--ink-2)' }}>
@@ -1154,13 +1152,13 @@ export function ProfilePage() {
               })()}
 
               {/* 套餐 — read-only display, real data from GET /billing/me */}
-              <PfSection title="套餐">
+              <PfSection title="Plan">
                 {billingError ? (
-                  <span className="cw-label" style={{ fontStyle: 'italic' }}>套餐数据暂不可用</span>
+                  <span className="cw-label" style={{ fontStyle: 'italic' }}>Plan data is unavailable</span>
                 ) : billingInfo === null ? (
-                  <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>加载中…</span>
+                  <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>Loading…</span>
                 ) : billingInfo.plan === null ? (
-                  <span className="cw-label" style={{ fontStyle: 'italic' }}>暂无活跃订阅</span>
+                  <span className="cw-label" style={{ fontStyle: 'italic' }}>No active subscription</span>
                 ) : (
                   <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
                     <div style={{
@@ -1199,7 +1197,7 @@ export function ProfilePage() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
 
               {/* API keys — DESIGN FIXTURE (no backend API key management endpoint) */}
-              <PfSection title="API 密钥">
+              <PfSection title="API keys">
                 {/* Newly created key — shown once, then discarded */}
                 {createdKey && (
                   <div style={{
@@ -1210,7 +1208,7 @@ export function ProfilePage() {
                     background: 'var(--accent-soft)',
                   }}>
                     <div className="cw-label" style={{ marginBottom: 6 }}>
-                      新密钥（仅显示一次，请立即复制保存）
+                      New key (shown only once — copy and store it now)
                     </div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                       <code style={{
@@ -1226,13 +1224,13 @@ export function ProfilePage() {
                         className="cw-btn cw-btn-sm"
                         onClick={handleCopyKey}
                       >
-                        {copyDone ? '已复制' : '复制'}
+                        {copyDone ? 'Copied' : 'Copy'}
                       </button>
                       <button
                         className="cw-btn cw-btn-sm cw-btn-ghost"
                         onClick={() => setCreatedKey(null)}
                       >
-                        关闭
+                        Close
                       </button>
                     </div>
                   </div>
@@ -1243,7 +1241,7 @@ export function ProfilePage() {
                   <input
                     value={newKeyName}
                     onChange={(e) => setNewKeyName(e.target.value)}
-                    placeholder="新密钥名称，例如 Production"
+                    placeholder="New key name, e.g. Production"
                     onKeyDown={(e) => { if (e.key === 'Enter') handleCreateKey(); }}
                     style={{
                       flex: 1,
@@ -1260,7 +1258,7 @@ export function ProfilePage() {
                     onClick={handleCreateKey}
                     disabled={!newKeyName.trim()}
                   >
-                    + 新建密钥
+                    + New key
                   </button>
                 </div>
 
@@ -1278,20 +1276,20 @@ export function ProfilePage() {
                     padding: '5px 4px 9px',
                     borderBottom: '1px solid var(--line-2)',
                   }}>
-                    {['名称', '前缀', '创建时间', '最近使用', ''].map((h) => (
+                    {['Name', 'Prefix', 'Created', 'Last used', ''].map((h) => (
                       <span key={h} className="cw-label">{h}</span>
                     ))}
                   </div>
 
                   {apiKeysLoading && (
                     <div style={{ padding: '12px 4px', fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)' }}>
-                      加载中…
+                      Loading…
                     </div>
                   )}
 
                   {!apiKeysLoading && apiKeys.length === 0 && (
                     <div style={{ padding: '12px 4px', fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)', fontStyle: 'italic' }}>
-                      暂无 API 密钥
+                      No API keys yet
                     </div>
                   )}
 
@@ -1309,17 +1307,17 @@ export function ProfilePage() {
                         {k.key_prefix}…
                       </span>
                       <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)' }}>
-                        {formatRelativeTimeZh(k.created_at)}
+                        {formatRelativeTime(k.created_at)}
                       </span>
                       <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--dim)' }}>
-                        {k.last_used_at ? formatRelativeTimeZh(k.last_used_at) : '从未'}
+                        {k.last_used_at ? formatRelativeTime(k.last_used_at) : 'Never'}
                       </span>
                       <button
                         className="cw-btn cw-btn-sm cw-btn-ghost"
                         style={{ fontSize: 11, color: 'var(--dim)', padding: '3px 8px' }}
                         onClick={() => handleRevokeKey(k.id)}
                       >
-                        撤销
+                        Revoke
                       </button>
                     </div>
                   ))}
@@ -1328,7 +1326,7 @@ export function ProfilePage() {
 
               {/* Active sessions — real data from identity GET /sessions */}
               {authSessions !== null && authSessions.length > 0 && (
-                <PfSection title="活跃会话">
+                <PfSection title="Active sessions">
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                     {authSessions.map((s) => {
                       const isMobile = s.device.includes('iOS') || s.device.includes('Android');
@@ -1377,7 +1375,7 @@ export function ProfilePage() {
                                   color: 'var(--accent)',
                                   letterSpacing: '0.06em',
                                 }}>
-                                  当前设备
+                                  This device
                                 </span>
                               )}
                             </div>
@@ -1392,36 +1390,36 @@ export function ProfilePage() {
                 </PfSection>
               )}
               {authSessions !== null && authSessions.length === 0 && (
-                <PfSection title="活跃会话">
-                  <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>无活跃会话记录</span>
+                <PfSection title="Active sessions">
+                  <span className="cw-label" style={{ fontStyle: 'italic', color: 'var(--dim)' }}>No active sessions</span>
                 </PfSection>
               )}
 
-              <PfSection title="身份验证">
+              <PfSection title="Authentication">
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
-                  <PfRow label="密码" sub="设置或更新登录密码">
-                    <button className="cw-btn cw-btn-sm">修改密码</button>
+                  <PfRow label="Password" sub="Set or update your sign-in password">
+                    <button className="cw-btn cw-btn-sm">Change password</button>
                   </PfRow>
                   <div className="cw-divider" />
-                  <PfRow label="双因素认证" sub="为账户添加额外验证层">
+                  <PfRow label="Two-factor authentication" sub="Add an extra layer of verification to your account">
                     {mfaMethods === null ? null : mfaMethods.length > 0 ? (
-                      <Chip accent>已启用</Chip>
+                      <Chip accent>Enabled</Chip>
                     ) : (
-                      <button className="cw-btn cw-btn-sm">启用</button>
+                      <button className="cw-btn cw-btn-sm">Enable</button>
                     )}
                   </PfRow>
                   <div className="cw-divider" />
-                  <PfRow label="通行密钥" sub="无需密码登录 — 使用设备生物识别">
-                    <button className="cw-btn cw-btn-sm">添加通行密钥</button>
+                  <PfRow label="Passkeys" sub="Sign in without a password — use your device’s biometrics">
+                    <button className="cw-btn cw-btn-sm">Add passkey</button>
                   </PfRow>
                   <div className="cw-divider" />
-                  <PfRow label="退出登录" sub="清除本地会话并返回登录页">
+                  <PfRow label="Sign out" sub="Clear the local session and return to the sign-in page">
                     <button
                       className="cw-btn cw-btn-sm"
                       style={{ color: 'var(--accent)' }}
                       onClick={handleLogout}
                     >
-                      登出
+                      Sign out
                     </button>
                   </PfRow>
                 </div>
@@ -1435,11 +1433,11 @@ export function ProfilePage() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
 
               {/* Event notifications — real data from api.notifications.preferences() */}
-              <PfSection title="事件通知">
+              <PfSection title="Event notifications">
                 {notifPrefsErr ? (
                   <div style={{ fontSize: 12.5, color: 'var(--dim)', padding: '6px 0' }}>{notifPrefsErr}</div>
                 ) : notifPrefs.length === 0 ? (
-                  <div style={{ fontSize: 12.5, color: 'var(--dim)', padding: '6px 0' }}>加载中…</div>
+                  <div style={{ fontSize: 12.5, color: 'var(--dim)', padding: '6px 0' }}>Loading…</div>
                 ) : (
                   <div style={{ display: 'flex', flexDirection: 'column' }}>
                     <div style={{
@@ -1448,9 +1446,9 @@ export function ProfilePage() {
                       padding: '5px 4px 9px',
                       borderBottom: '1px solid var(--line-2)',
                     }}>
-                      <span className="cw-label">事件</span>
-                      <span className="cw-label" style={{ textAlign: 'center' }}>邮件</span>
-                      <span className="cw-label" style={{ textAlign: 'center' }}>推送</span>
+                      <span className="cw-label">Event</span>
+                      <span className="cw-label" style={{ textAlign: 'center' }}>Email</span>
+                      <span className="cw-label" style={{ textAlign: 'center' }}>Push</span>
                     </div>
                     {notifPrefs.map((n) => (
                       <div key={n.event_key} style={{
@@ -1479,13 +1477,13 @@ export function ProfilePage() {
               </PfSection>
 
               {/* Weekly digest — uses real email from api.auth.me(), digest toggle is UI-only for now */}
-              <PfSection title="每周摘要">
+              <PfSection title="Weekly digest">
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
-                  <PfRow label="发送每周报告" sub="任务、消费与工作节点汇总 — 每周一上午 9 点">
+                  <PfRow label="Send weekly report" sub="Summary of tasks, spend and workers — Mondays at 9 AM">
                     <PfToggle on={digestOn} onChange={() => setDigest((v) => !v)} />
                   </PfRow>
                   <div className="cw-divider" />
-                  <PfRow label="摘要收件地址" sub="摘要邮件发送至">
+                  <PfRow label="Digest recipient" sub="Digest emails are sent to">
                     <span style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--ink-2)' }}>
                       {email}
                     </span>

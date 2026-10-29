@@ -62,14 +62,14 @@ describe('composer "+" menu', () => {
     );
 
     // The trigger names exactly the sections that are wired.
-    const trigger = screen.getByRole('button', { name: '添加文件、技能或工具' });
+    const trigger = screen.getByRole('button', { name: 'Add files, skills, or tools' });
     expect(trigger).toHaveAttribute('aria-haspopup', 'menu');
     await user.click(trigger);
 
     // Primary menu: 3 rows, no flyout open yet.
-    expect(screen.getByRole('menuitem', { name: /上传文件 \/ 图片/ })).toBeInTheDocument();
-    const skillsHeader = screen.getByRole('menuitem', { name: /技能/ });
-    const mcpHeader = screen.getByRole('menuitem', { name: /MCP 工具/ });
+    expect(screen.getByRole('menuitem', { name: /Upload files \/ images/ })).toBeInTheDocument();
+    const skillsHeader = screen.getByRole('menuitem', { name: /^Skills/ });
+    const mcpHeader = screen.getByRole('menuitem', { name: /MCP tools/ });
     expect(skillsHeader).toHaveAttribute('aria-expanded', 'false');
     expect(mcpHeader).toHaveAttribute('aria-expanded', 'false');
 
@@ -85,8 +85,8 @@ describe('composer "+" menu', () => {
     expect(skillsHeader).toHaveAttribute('aria-expanded', 'false');
     const row = screen.getByRole('menuitemcheckbox', { name: /server-mcp_1/ });
     // Tools come from the persisted discovery result - never a live probe.
-    expect(row).toHaveAttribute('title', '工具：echo');
-    expect(row).toHaveTextContent('工具：echo');
+    expect(row).toHaveAttribute('title', 'Tools: echo');
+    expect(row).toHaveTextContent('Tools: echo');
 
     // Click MCP again -> collapses its own flyout (toggle).
     await user.click(mcpHeader);
@@ -102,12 +102,12 @@ describe('composer "+" menu', () => {
         skills={{ skills: [skill('a')], onToggle: vi.fn() }}
       />,
     );
-    await user.click(screen.getByRole('button', { name: /^添加/ }));
-    await user.click(screen.getByRole('menuitem', { name: /上传文件 \/ 图片/ }));
+    await user.click(screen.getByRole('button', { name: /^Add/ }));
+    await user.click(screen.getByRole('menuitem', { name: /Upload files \/ images/ }));
 
     expect(onPickFiles).toHaveBeenCalledOnce();
     // Menu closed: primary rows gone.
-    expect(screen.queryByRole('menuitem', { name: /技能/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: /^Skills/ })).not.toBeInTheDocument();
   });
 
   it('closes the whole menu on outside click (single outside-click owner)', async () => {
@@ -122,13 +122,13 @@ describe('composer "+" menu', () => {
         <button>outside</button>
       </div>,
     );
-    await user.click(screen.getByRole('button', { name: /^添加/ }));
+    await user.click(screen.getByRole('button', { name: /^Add/ }));
     // Open the MCP flyout so we also prove it does not keep its own listener.
-    await user.click(screen.getByRole('menuitem', { name: /MCP 工具/ }));
+    await user.click(screen.getByRole('menuitem', { name: /MCP tools/ }));
     expect(screen.getByRole('menuitemcheckbox', { name: /server-mcp_1/ })).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: 'outside' }));
-    expect(screen.queryByRole('menuitem', { name: /技能/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: /^Skills/ })).not.toBeInTheDocument();
     expect(screen.queryByRole('menuitemcheckbox', { name: /server-mcp_1/ })).not.toBeInTheDocument();
   });
 
@@ -140,12 +140,12 @@ describe('composer "+" menu', () => {
         skills={{ skills: [skill('a')], onToggle: vi.fn() }}
       />,
     );
-    await user.click(screen.getByRole('button', { name: /^添加/ }));
-    await user.click(screen.getByRole('menuitem', { name: /技能/ }));
+    await user.click(screen.getByRole('button', { name: /^Add/ }));
+    await user.click(screen.getByRole('menuitem', { name: /^Skills/ }));
     expect(screen.getByRole('button', { name: 'a' })).toBeInTheDocument();
 
     await user.keyboard('{Escape}');
-    expect(screen.queryByRole('menuitem', { name: /技能/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('menuitem', { name: /^Skills/ })).not.toBeInTheDocument();
   });
 
   it('falls back to the tenant `enabled` flag until the session picks its own set', async () => {
@@ -160,8 +160,8 @@ describe('composer "+" menu', () => {
         }}
       />,
     );
-    await user.click(screen.getByRole('button', { name: /^添加/ }));
-    await user.click(screen.getByRole('menuitem', { name: /MCP 工具/ }));
+    await user.click(screen.getByRole('button', { name: /^Add/ }));
+    await user.click(screen.getByRole('menuitem', { name: /MCP tools/ }));
 
     expect(screen.getByRole('menuitemcheckbox', { name: /server-mcp_on/ })).toHaveAttribute(
       'aria-checked',
@@ -181,8 +181,8 @@ describe('composer "+" menu', () => {
         mcp={{ servers: [server('mcp_on')], selected: [], onToggle: vi.fn() }}
       />,
     );
-    await user.click(screen.getByRole('button', { name: /^添加/ }));
-    await user.click(screen.getByRole('menuitem', { name: /MCP 工具/ }));
+    await user.click(screen.getByRole('button', { name: /^Add/ }));
+    await user.click(screen.getByRole('menuitem', { name: /MCP tools/ }));
 
     expect(screen.getByRole('menuitemcheckbox', { name: /server-mcp_on/ })).toHaveAttribute(
       'aria-checked',
@@ -223,8 +223,8 @@ describe('MCP selection -> chat store', () => {
   it('leaves the session untouched until the user actually toggles', async () => {
     const user = userEvent.setup();
     renderComposer();
-    await user.click(screen.getByRole('button', { name: /^添加/ }));
-    await user.click(screen.getByRole('menuitem', { name: /MCP 工具/ }));
+    await user.click(screen.getByRole('button', { name: /^Add/ }));
+    await user.click(screen.getByRole('menuitem', { name: /MCP tools/ }));
 
     expect(useChatStore.getState().selectedMcpServerIds[sessionId]).toBeUndefined();
   });
@@ -232,8 +232,8 @@ describe('MCP selection -> chat store', () => {
   it('seeds the tenant defaults then removes the toggled server', async () => {
     const user = userEvent.setup();
     renderComposer();
-    await user.click(screen.getByRole('button', { name: /^添加/ }));
-    await user.click(screen.getByRole('menuitem', { name: /MCP 工具/ }));
+    await user.click(screen.getByRole('button', { name: /^Add/ }));
+    await user.click(screen.getByRole('menuitem', { name: /MCP tools/ }));
     await user.click(screen.getByRole('menuitemcheckbox', { name: /server-mcp_a/ }));
 
     // Seeded from `enabled` (a + b), then a flipped off.
@@ -243,8 +243,8 @@ describe('MCP selection -> chat store', () => {
   it('turns an off-by-default server on without dropping the defaults', async () => {
     const user = userEvent.setup();
     renderComposer();
-    await user.click(screen.getByRole('button', { name: /^添加/ }));
-    await user.click(screen.getByRole('menuitem', { name: /MCP 工具/ }));
+    await user.click(screen.getByRole('button', { name: /^Add/ }));
+    await user.click(screen.getByRole('menuitem', { name: /MCP tools/ }));
     await user.click(screen.getByRole('menuitemcheckbox', { name: /server-mcp_c/ }));
 
     expect(useChatStore.getState().selectedMcpServerIds[sessionId]).toEqual([

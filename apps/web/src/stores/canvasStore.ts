@@ -31,10 +31,10 @@ function errorMessage(err: unknown): string {
     const message = (err as { message?: unknown }).message;
     if (typeof message === 'string' && message) return message;
   }
-  return '请求失败';
+  return 'Request failed';
 }
 
-const REFRESH_STALE_MESSAGE = '画布已被更新，请刷新后重试';
+const REFRESH_STALE_MESSAGE = 'This canvas was updated elsewhere. Refresh and try again.';
 
 export interface CanvasState {
   // server object cache, keyed by canvas id
@@ -165,7 +165,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     } catch (err) {
       const status = errorStatus(err);
       const upstreamMessage = errorMessage(err);
-      const message = status === 409 && upstreamMessage === '请求失败'
+      const message = status === 409 && upstreamMessage === 'Request failed'
         ? REFRESH_STALE_MESSAGE
         : upstreamMessage;
       set((s) => ({
@@ -227,7 +227,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => ({
     } catch (err) {
       const status = errorStatus(err);
       const upstreamMessage = errorMessage(err);
-      const message = status === 409 && upstreamMessage === '请求失败'
+      const message = status === 409 && upstreamMessage === 'Request failed'
         ? REFRESH_STALE_MESSAGE
         : upstreamMessage;
       set((s) => ({

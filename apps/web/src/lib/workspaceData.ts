@@ -41,9 +41,9 @@ export const DEFAULT_GLYPH = '◇';
  */
 export const DEFAULT_WORKSPACE: WorkspaceView = {
   id: 'default',
-  name: '工作区',
+  name: 'Workspace',
   glyph: DEFAULT_GLYPH,
-  desc: '上下文 · 文件 · 技能',
+  desc: 'Context · Files · Skills',
   accent: DEFAULT_ACCENT,
 };
 
@@ -53,6 +53,6 @@ export function toWorkspaceView(ws: Workspace): WorkspaceView {
   const accent = ws.meta?.accent?.trim() || DEFAULT_ACCENT;
   const desc =
     ws.description?.trim() ||
-    (ws.file_count > 0 ? `${ws.file_count} 个文件` : '上下文 · 文件 · 技能');
+    (ws.file_count > 0 ? `${ws.file_count} ${ws.file_count === 1 ? 'file' : 'files'}` : 'Context · Files · Skills');
   return { id: ws.id, name: ws.name, glyph, desc, accent };
 }

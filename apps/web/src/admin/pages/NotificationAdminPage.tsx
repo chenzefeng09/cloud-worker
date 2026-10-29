@@ -47,7 +47,7 @@ export function NotificationAdminPage() {
       .then((items) => setTemplates(items))
       .catch((err) => {
         if (isTodo(err)) setTodo(true);
-        else setError(err instanceof ApiError ? err.message : '加载失败');
+        else setError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => setLoading(false));
   }, [selectedTenantId]);
@@ -86,7 +86,7 @@ export function NotificationAdminPage() {
     e.preventDefault();
     const recipientList = recipients.split(',').map((r) => r.trim()).filter(Boolean);
     if (!eventType.trim() || recipientList.length === 0) {
-      setSendError('请填写事件类型与至少一个接收人');
+      setSendError('Enter an event type and at least one recipient');
       return;
     }
     setSending(true);
@@ -100,10 +100,10 @@ export function NotificationAdminPage() {
       };
       if (template.trim()) body.template = template.trim();
       await api.admin.notification.send(body, selectedTenantId ?? undefined);
-      toast.success('测试通知已提交');
+      toast.success('Test notification submitted');
       setRecipients('');
     } catch (err) {
-      setSendError(err instanceof ApiError ? err.message : '发送失败');
+      setSendError(err instanceof ApiError ? err.message : 'Send failed');
     } finally {
       setSending(false);
     }
@@ -112,15 +112,15 @@ export function NotificationAdminPage() {
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">通知中心</h1>
-        <p className="text-[12px] text-dim mt-0.5">通知模板与测试发送（→ notification）</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Notifications</h1>
+        <p className="text-[12px] text-dim mt-0.5">Notification templates and test sends (→ notification)</p>
       </div>
 
       {/* Tenant selector */}
       <div className="flex items-center gap-3">
-        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
+        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">Tenant</label>
         <CustomSelect
-          options={[{ value: '', label: '（默认 / 当前租户）' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+          options={[{ value: '', label: '(Default / current tenant)' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
           value={selectedTenantId ?? ''}
           onChange={(v) => setSelectedTenantId(v || null)}
           disabled={tenantsLoading}
@@ -134,26 +134,26 @@ export function NotificationAdminPage() {
 
       {/* Templates */}
       <section className="flex flex-col gap-2">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">通知模板</div>
-        {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Notification templates</div>
+        {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
         {todo && (
           <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-            该能力暂未启用：通知模板端点不可达，接线后将自动展示。
+            Not available yet: the notification template endpoint is unreachable. Templates will appear here once it's connected.
           </div>
         )}
         {!loading && !todo && templates.length === 0 && (
-          <div className="font-mono text-[12px] text-dim italic">暂无模板</div>
+          <div className="font-mono text-[12px] text-dim italic">No templates</div>
         )}
         {!loading && !todo && templates.length > 0 && (
           <div className="border border-line rounded-md overflow-hidden">
             <table className="w-full text-left border-collapse">
               <thead className="bg-paper-2 border-b border-line">
                 <tr>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">标识</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">事件类型</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">语言</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">主题模板</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">启用状态</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Key</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Event type</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Locale</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Subject template</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
                 </tr>
               </thead>
               <tbody>
@@ -172,9 +172,9 @@ export function NotificationAdminPage() {
                       {t.enabled === undefined ? (
                         <span className="text-dim">—</span>
                       ) : t.enabled ? (
-                        <span className="text-green-700">已启用</span>
+                        <span className="text-green-700">Enabled</span>
                       ) : (
-                        <span className="text-dim">已停用</span>
+                        <span className="text-dim">Disabled</span>
                       )}
                     </td>
                   </tr>
@@ -187,12 +187,12 @@ export function NotificationAdminPage() {
 
       {/* Send test notification */}
       <section className="flex flex-col gap-2">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">发送测试通知</div>
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Send test notification</div>
         <form onSubmit={handleSend} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-3 max-w-xl">
           {sendError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{sendError}</div>}
           <div className="grid grid-cols-2 gap-3">
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">事件类型 (event_type)</label>
+              <label className="text-[11px] text-dim font-mono">Event type (event_type)</label>
               <ComboBox
                 options={eventTypeOptions}
                 value={eventType}
@@ -201,7 +201,7 @@ export function NotificationAdminPage() {
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">渠道 (channel)</label>
+              <label className="text-[11px] text-dim font-mono">Channel (channel)</label>
               <CustomSelect
                 options={[
                   { value: 'email', label: 'email' },
@@ -215,7 +215,7 @@ export function NotificationAdminPage() {
             </div>
           </div>
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">接收人 (逗号分隔)</label>
+            <label className="text-[11px] text-dim font-mono">Recipients (comma-separated)</label>
             <input
               className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
               value={recipients}
@@ -225,7 +225,7 @@ export function NotificationAdminPage() {
           </div>
           <div className="grid grid-cols-2 gap-3">
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">模板 (可选)</label>
+              <label className="text-[11px] text-dim font-mono">Template (optional)</label>
               <ComboBox
                 options={templateOptions}
                 value={template}
@@ -234,7 +234,7 @@ export function NotificationAdminPage() {
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">优先级 (priority)</label>
+              <label className="text-[11px] text-dim font-mono">Priority (priority)</label>
               <CustomSelect
                 options={[
                   { value: 'low', label: 'low' },
@@ -252,7 +252,7 @@ export function NotificationAdminPage() {
               disabled={sending}
               className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
             >
-              {sending ? '发送中…' : '发送测试通知'}
+              {sending ? 'Sending…' : 'Send test notification'}
             </button>
           </div>
         </form>

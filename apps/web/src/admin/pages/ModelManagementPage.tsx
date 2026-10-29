@@ -20,25 +20,25 @@ import type {
 // ─── Constants ───────────────────────────────────────────────────────────────
 
 const PROVIDER_OPTIONS: { value: ProviderType; label: string }[] = [
-  { value: 'openai_compatible', label: 'OpenAI 兼容' },
+  { value: 'openai_compatible', label: 'OpenAI compatible' },
   { value: 'anthropic', label: 'Anthropic' },
   { value: 'vllm', label: 'vLLM' },
   { value: 'ollama', label: 'Ollama' },
   { value: 'bedrock', label: 'AWS Bedrock' },
   { value: 'azure', label: 'Azure OpenAI' },
-  { value: 'zhipu', label: '智谱AI' },
+  { value: 'zhipu', label: 'Zhipu AI' },
   { value: 'deepseek', label: 'DeepSeek' },
-  { value: 'moonshot', label: 'Moonshot (月之暗面)' },
+  { value: 'moonshot', label: 'Moonshot' },
   { value: 'minimax', label: 'MiniMax' },
-  { value: 'aliyun', label: '阿里云百炼' },
-  { value: 'baidu', label: '百度智能云 (千帆)' },
-  { value: 'tencent', label: '腾讯云 (混元)' },
+  { value: 'aliyun', label: 'Alibaba Cloud Bailian' },
+  { value: 'baidu', label: 'Baidu AI Cloud (Qianfan)' },
+  { value: 'tencent', label: 'Tencent Cloud (Hunyuan)' },
 ];
 
 const MODEL_TYPES: { value: ModelType; label: string; desc: string }[] = [
-  { value: 'llm', label: 'LLM', desc: '语言模型 (对话/推理)' },
-  { value: 'text_embedding', label: '嵌入模型', desc: '文本向量化 (检索/RAG)' },
-  { value: 'rerank', label: '重排序模型', desc: '搜索结果重排序' },
+  { value: 'llm', label: 'LLM', desc: 'Language model (chat / reasoning)' },
+  { value: 'text_embedding', label: 'Embedding model', desc: 'Text embeddings (retrieval / RAG)' },
+  { value: 'rerank', label: 'Rerank model', desc: 'Search result reranking' },
 ];
 
 function providerKindLabel(kind: string): string {
@@ -94,7 +94,7 @@ function EnabledDot({ enabled }: { enabled: boolean }) {
   return (
     <span
       className={`inline-block w-1.5 h-1.5 rounded-full ${enabled ? 'bg-green-500' : 'bg-gray-300'}`}
-      title={enabled ? '已启用' : '已停用'}
+      title={enabled ? 'Enabled' : 'Disabled'}
     />
   );
 }
@@ -192,7 +192,7 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
         }
       }
     } catch (err) {
-      setProbeError(err instanceof ApiError ? err.message : '验证失败');
+      setProbeError(err instanceof ApiError ? err.message : 'Verification failed');
     } finally {
       setProbing(false);
     }
@@ -226,7 +226,7 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
     if (!name.trim() || !apiBase.trim() || !apiKey.trim()) return;
 
     if (selectedModels.length === 0) {
-      setSubmitError('请至少配置一个模型');
+      setSubmitError('Configure at least one model');
       return;
     }
 
@@ -266,7 +266,7 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
       onAdded();
       onClose();
     } catch (err) {
-      setSubmitError(err instanceof ApiError ? err.message : '注册失败');
+      setSubmitError(err instanceof ApiError ? err.message : 'Registration failed');
     } finally {
       setSubmitting(false);
     }
@@ -284,24 +284,24 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-5 pt-5 pb-3 border-b border-line shrink-0">
-          <h2 className="text-[15px] font-display text-ink tracking-[-0.02em]">添加 Provider</h2>
-          <p className="text-[11px] text-dim mt-0.5">配置模型供应商的连接信息和可用模型</p>
+          <h2 className="text-[15px] font-display text-ink tracking-[-0.02em]">Add provider</h2>
+          <p className="text-[11px] text-dim mt-0.5">Configure the provider's connection details and available models</p>
         </div>
 
         <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-5">
           <div className="grid grid-cols-2 gap-4">
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] font-mono text-dim">名称</label>
+              <label className="text-[11px] font-mono text-dim">Name</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
-                placeholder="如 DeepSeek Production"
+                placeholder="e.g. DeepSeek Production"
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 required
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] font-mono text-dim">Provider 类型</label>
+              <label className="text-[11px] font-mono text-dim">Provider type</label>
               <CustomSelect
                 options={PROVIDER_OPTIONS}
                 value={providerType}
@@ -312,7 +312,7 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
               <label className="text-[11px] font-mono text-dim">Base URL</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
-                placeholder="如 https://api.deepseek.com/v1"
+                placeholder="e.g. https://api.deepseek.com/v1"
                 value={apiBase}
                 onChange={(e) => setApiBase(e.target.value)}
                 required
@@ -340,16 +340,16 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
                 onClick={handleProbe}
                 className="px-3 py-1.5 text-[12px] font-mono border border-line bg-paper rounded-sm hover:bg-surface disabled:opacity-50"
               >
-                {probing ? '验证中…' : '验证连接并刷新模型'}
+                {probing ? 'Verifying…' : 'Verify connection and refresh models'}
               </button>
               {probeOk && (
                 <span className="text-[11px] text-green-700 font-mono">
-                  ✓ 连接成功 · 发现 {fetchedModels.length || probeReport.results.model_count || '?'} 个模型
+                  ✓ Connected · found {fetchedModels.length || probeReport.results.model_count || '?'} models
                 </span>
               )}
               {probeReport && !probeOk && (
                 <span className="text-[11px] text-amber-700 font-mono">
-                  ⚠ 部分能力不支持
+                  ⚠ Some capabilities are not supported
                 </span>
               )}
             </div>
@@ -359,11 +359,11 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
             {probeReport && (
               <div className="mt-3 grid grid-cols-2 gap-1 text-[10.5px] font-mono">
                 {[
-                  ['模型列表', probeReport.results.list_models],
+                  ['Model list', probeReport.results.list_models],
                   ['Function Calling', probeReport.results.function_calling],
-                  ['流式输出', probeReport.results.streaming],
-                  ['上下文 ≥32K', probeReport.results.context_window_32k],
-                  ['并行工具', probeReport.results.parallel_tool_calls],
+                  ['Streaming', probeReport.results.streaming],
+                  ['Context ≥32K', probeReport.results.context_window_32k],
+                  ['Parallel tools', probeReport.results.parallel_tool_calls],
                 ].map(([label, val]) => (
                   <div key={label as string} className="flex items-center gap-1.5">
                     <span className={isProbePass(val as ProbeCapabilityResult) ? 'text-green-600' : isProbeUnknown(val as ProbeCapabilityResult) ? 'text-amber-600' : 'text-red-500'}>
@@ -378,7 +378,7 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
 
           <div className="flex flex-col gap-3">
             <div className="flex items-center justify-between">
-              <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-ink font-semibold">模型配置 ({selectedModels.length})</div>
+              <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-ink font-semibold">Models ({selectedModels.length})</div>
             </div>
 
             <div className="flex items-center gap-2">
@@ -386,7 +386,7 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
                 <input
                   list="fetched-models-list"
                   className="w-full border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper focus:outline-none focus:border-accent font-mono"
-                  placeholder="输入模型 ID 或从列表中选择..."
+                  placeholder="Enter a model ID or pick from the list…"
                   value={newModelId}
                   onChange={(e) => setNewModelId(e.target.value)}
                   onKeyDown={(e) => {
@@ -408,7 +408,7 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
                 disabled={!newModelId.trim()}
                 className="px-3 py-1.5 text-[12px] bg-paper border border-line rounded-sm hover:bg-paper-2 disabled:opacity-50"
               >
-                添加
+                Add
               </button>
             </div>
 
@@ -418,12 +418,12 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
                   <div key={idx} className="border border-line rounded-sm bg-surface p-3 flex flex-col gap-3">
                     <div className="flex items-center justify-between">
                       <span className="text-[13px] font-mono text-ink font-semibold">{sm.id}</span>
-                      <button type="button" onClick={() => removeSelectedModel(idx)} className="text-[11px] text-red-500 hover:text-red-700">移除</button>
+                      <button type="button" onClick={() => removeSelectedModel(idx)} className="text-[11px] text-red-500 hover:text-red-700">Remove</button>
                     </div>
                     
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-start">
                       <div className="flex flex-col gap-1">
-                        <label className="text-[10px] text-dim">类型</label>
+                        <label className="text-[10px] text-dim">Type</label>
                         <CustomSelect
                           options={MODEL_TYPES}
                           value={sm.model_type}
@@ -431,11 +431,11 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
                         />
                       </div>
                       <div className="flex flex-col gap-1">
-                        <label className="text-[10px] text-dim">上下文长度</label>
+                        <label className="text-[10px] text-dim">Context length</label>
                         <input
                           type="number"
                           className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper font-mono"
-                          placeholder="例如: 128000"
+                          placeholder="e.g. 128000"
                           value={sm.context_length}
                           onChange={(e) => updateSelectedModel(idx, 'context_length', e.target.value)}
                         />
@@ -445,7 +445,7 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
                         <input
                           type="number"
                           className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper font-mono"
-                          placeholder="例如: 4096"
+                          placeholder="e.g. 4096"
                           value={sm.max_tokens}
                           onChange={(e) => updateSelectedModel(idx, 'max_tokens', e.target.value)}
                         />
@@ -458,7 +458,7 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
                           checked={sm.vision_support}
                           onChange={(e) => updateSelectedModel(idx, 'vision_support', e.target.checked)}
                         />
-                        <span className="text-[11px] text-ink-2">支持视觉</span>
+                        <span className="text-[11px] text-ink-2">Vision</span>
                       </label>
                       <label className="flex items-center gap-1.5 cursor-pointer">
                         <input
@@ -466,7 +466,7 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
                           checked={sm.structured_output}
                           onChange={(e) => updateSelectedModel(idx, 'structured_output', e.target.checked)}
                         />
-                        <span className="text-[11px] text-ink-2">格式化输出</span>
+                        <span className="text-[11px] text-ink-2">Structured output</span>
                       </label>
                     </div>
                   </div>
@@ -484,7 +484,7 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
               onClick={onClose}
               className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm hover:bg-paper-2"
             >
-              取消
+              Cancel
             </button>
             <button
               type="button"
@@ -492,7 +492,7 @@ function AddProviderDialog({ open, onClose, onAdded }: AddProviderDialogProps) {
               disabled={submitting || !name.trim() || !apiBase.trim() || !apiKey.trim()}
               className="px-4 py-1.5 bg-ink text-paper text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
             >
-              {submitting ? '保存中…' : '保存 Provider'}
+              {submitting ? 'Saving…' : 'Save provider'}
             </button>
           </div>
         </div>
@@ -593,7 +593,7 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
     if (!provider || !name.trim()) return;
 
     if (selectedModels.length === 0) {
-      setSubmitError('请至少配置一个模型');
+      setSubmitError('Configure at least one model');
       return;
     }
 
@@ -630,7 +630,7 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
       onUpdated();
       onClose();
     } catch (err) {
-      setSubmitError(err instanceof ApiError ? err.message : '更新失败');
+      setSubmitError(err instanceof ApiError ? err.message : 'Update failed');
     } finally {
       setSubmitting(false);
     }
@@ -645,14 +645,14 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
         onClick={(e) => e.stopPropagation()}
       >
         <div className="px-5 pt-5 pb-3 border-b border-line shrink-0">
-          <h2 className="text-[15px] font-display text-ink tracking-[-0.02em]">编辑 Provider</h2>
-          <p className="text-[11px] text-dim mt-0.5">修改 {providerKindLabel(provider.kind)} 供应商配置与模型列表</p>
+          <h2 className="text-[15px] font-display text-ink tracking-[-0.02em]">Edit provider</h2>
+          <p className="text-[11px] text-dim mt-0.5">Edit the {providerKindLabel(provider.kind)} provider configuration and model list</p>
         </div>
 
         <div className="flex-1 overflow-y-auto px-5 py-4 flex flex-col gap-5">
           <div className="grid grid-cols-2 gap-4">
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] font-mono text-dim">名称</label>
+              <label className="text-[11px] font-mono text-dim">Name</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
                 value={name}
@@ -661,7 +661,7 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
               />
             </div>
             <div className="flex flex-col gap-1 col-span-2 md:col-span-1">
-              <label className="text-[11px] font-mono text-dim">Base URL (只读)</label>
+              <label className="text-[11px] font-mono text-dim">Base URL (read-only)</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper-2 text-dim font-mono cursor-not-allowed"
                 value={provider.base_url}
@@ -672,14 +672,14 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
 
           <div className="flex flex-col gap-3">
             <div className="flex items-center justify-between">
-              <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-ink font-semibold">模型配置 ({selectedModels.length})</div>
+              <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-ink font-semibold">Models ({selectedModels.length})</div>
             </div>
 
             <div className="flex items-center gap-2">
               <div className="relative flex-1">
                 <input
                   className="w-full border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper focus:outline-none focus:border-accent font-mono"
-                  placeholder="手动输入新模型 ID..."
+                  placeholder="Enter a new model ID…"
                   value={newModelId}
                   onChange={(e) => setNewModelId(e.target.value)}
                   onKeyDown={(e) => {
@@ -696,7 +696,7 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
                 disabled={!newModelId.trim()}
                 className="px-3 py-1.5 text-[12px] bg-paper border border-line rounded-sm hover:bg-paper-2 disabled:opacity-50"
               >
-                添加
+                Add
               </button>
             </div>
 
@@ -706,12 +706,12 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
                   <div key={idx} className="border border-line rounded-sm bg-surface p-3 flex flex-col gap-3">
                     <div className="flex items-center justify-between">
                       <span className="text-[13px] font-mono text-ink font-semibold">{sm.id}</span>
-                      <button type="button" onClick={() => removeSelectedModel(idx)} className="text-[11px] text-red-500 hover:text-red-700">移除</button>
+                      <button type="button" onClick={() => removeSelectedModel(idx)} className="text-[11px] text-red-500 hover:text-red-700">Remove</button>
                     </div>
                     
                     <div className="grid grid-cols-1 md:grid-cols-3 gap-3 items-start">
                       <div className="flex flex-col gap-1">
-                        <label className="text-[10px] text-dim">类型</label>
+                        <label className="text-[10px] text-dim">Type</label>
                         <CustomSelect
                           options={MODEL_TYPES}
                           value={sm.model_type}
@@ -719,11 +719,11 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
                         />
                       </div>
                       <div className="flex flex-col gap-1">
-                        <label className="text-[10px] text-dim">上下文长度</label>
+                        <label className="text-[10px] text-dim">Context length</label>
                         <input
                           type="number"
                           className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper font-mono"
-                          placeholder="例如: 128000"
+                          placeholder="e.g. 128000"
                           value={sm.context_length}
                           onChange={(e) => updateSelectedModel(idx, 'context_length', e.target.value)}
                         />
@@ -733,7 +733,7 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
                         <input
                           type="number"
                           className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper font-mono"
-                          placeholder="例如: 4096"
+                          placeholder="e.g. 4096"
                           value={sm.max_tokens}
                           onChange={(e) => updateSelectedModel(idx, 'max_tokens', e.target.value)}
                         />
@@ -746,7 +746,7 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
                           checked={sm.vision_support}
                           onChange={(e) => updateSelectedModel(idx, 'vision_support', e.target.checked)}
                         />
-                        <span className="text-[11px] text-ink-2">支持视觉</span>
+                        <span className="text-[11px] text-ink-2">Vision</span>
                       </label>
                       <label className="flex items-center gap-1.5 cursor-pointer">
                         <input
@@ -754,7 +754,7 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
                           checked={sm.structured_output}
                           onChange={(e) => updateSelectedModel(idx, 'structured_output', e.target.checked)}
                         />
-                        <span className="text-[11px] text-ink-2">格式化输出</span>
+                        <span className="text-[11px] text-ink-2">Structured output</span>
                       </label>
                     </div>
                   </div>
@@ -772,7 +772,7 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
               onClick={onClose}
               className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm hover:bg-paper-2"
             >
-              取消
+              Cancel
             </button>
             <button
               type="button"
@@ -780,7 +780,7 @@ function EditProviderDialog({ open, provider, onClose, onUpdated }: EditProvider
               disabled={submitting || !name.trim()}
               className="px-4 py-1.5 bg-ink text-paper text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
             >
-              {submitting ? '保存中…' : '保存修改'}
+              {submitting ? 'Saving…' : 'Save changes'}
             </button>
           </div>
         </div>
@@ -830,7 +830,7 @@ function ProviderCard({ provider, expanded, onToggleExpand, onToggleEnabled, onD
             {activeTypes.map((t) => (
               <ModelTypeBadge key={t} type={t} />
             ))}
-            <span className="text-[10.5px] text-dim font-mono">{modelCount} 个模型</span>
+            <span className="text-[10.5px] text-dim font-mono">{modelCount} models</span>
           </div>
         </div>
         <span className="text-[10px] text-dim font-mono">{expanded ? '▲' : '▼'}</span>
@@ -843,7 +843,7 @@ function ProviderCard({ provider, expanded, onToggleExpand, onToggleEnabled, onD
           <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[11px]">
             <span className="font-mono text-dim">Base URL</span>
             <span className="font-mono text-ink-2 truncate">{provider.base_url}</span>
-            <span className="font-mono text-dim">默认模型</span>
+            <span className="font-mono text-dim">Default model</span>
             <span className="font-mono text-ink-2">{provider.default_model || '—'}</span>
           </div>
 
@@ -856,7 +856,7 @@ function ProviderCard({ provider, expanded, onToggleExpand, onToggleEnabled, onD
                   <div key={t}>
                     <div className="flex items-center gap-1.5 mb-1">
                       <ModelTypeBadge type={t} />
-                      <span className="text-[10.5px] text-dim font-mono">{models.length} 个</span>
+                      <span className="text-[10.5px] text-dim font-mono">{models.length}</span>
                     </div>
                     <div className="flex flex-wrap gap-1">
                       {models.map((m) => {
@@ -867,8 +867,8 @@ function ProviderCard({ provider, expanded, onToggleExpand, onToggleEnabled, onD
                             className="inline-flex items-center gap-1 text-[11px] font-mono text-ink-2 bg-paper-2 border border-line rounded-sm px-1.5 py-0.5"
                           >
                             {m}
-                            {s?.vision_support && <span className="text-[9px] bg-blue-100 text-blue-700 px-0.5 rounded border border-blue-200 leading-none py-[2px]" title="支持视觉">👁</span>}
-                            {s?.structured_output && <span className="text-[9px] bg-purple-100 text-purple-700 px-0.5 rounded border border-purple-200 leading-none py-[2px]" title="结构化输出">JSON</span>}
+                            {s?.vision_support && <span className="text-[9px] bg-blue-100 text-blue-700 px-0.5 rounded border border-blue-200 leading-none py-[2px]" title="Supports vision">👁</span>}
+                            {s?.structured_output && <span className="text-[9px] bg-purple-100 text-purple-700 px-0.5 rounded border border-purple-200 leading-none py-[2px]" title="Structured output">JSON</span>}
                           </span>
                         );
                       })}
@@ -882,7 +882,7 @@ function ProviderCard({ provider, expanded, onToggleExpand, onToggleEnabled, onD
           {/* Fallback: show raw models array if no type map */}
           {activeTypes.length === 0 && provider.models && provider.models.length > 0 && (
             <div>
-              <div className="text-[10.5px] font-mono text-dim mb-1">模型列表</div>
+              <div className="text-[10.5px] font-mono text-dim mb-1">Models</div>
               <div className="flex flex-wrap gap-1">
                 {provider.models.map((m) => {
                   const s = settingsMap[m];
@@ -892,8 +892,8 @@ function ProviderCard({ provider, expanded, onToggleExpand, onToggleEnabled, onD
                       className="inline-flex items-center gap-1 text-[11px] font-mono text-ink-2 bg-paper-2 border border-line rounded-sm px-1.5 py-0.5"
                     >
                       {m}
-                      {s?.vision_support && <span className="text-[9px] bg-blue-100 text-blue-700 px-0.5 rounded border border-blue-200 leading-none py-[2px]" title="支持视觉">👁</span>}
-                      {s?.structured_output && <span className="text-[9px] bg-purple-100 text-purple-700 px-0.5 rounded border border-purple-200 leading-none py-[2px]" title="结构化输出">JSON</span>}
+                      {s?.vision_support && <span className="text-[9px] bg-blue-100 text-blue-700 px-0.5 rounded border border-blue-200 leading-none py-[2px]" title="Supports vision">👁</span>}
+                      {s?.structured_output && <span className="text-[9px] bg-purple-100 text-purple-700 px-0.5 rounded border border-purple-200 leading-none py-[2px]" title="Structured output">JSON</span>}
                     </span>
                   );
                 })}
@@ -911,7 +911,7 @@ function ProviderCard({ provider, expanded, onToggleExpand, onToggleEnabled, onD
               }}
               className="px-2.5 py-1 text-[11px] font-mono text-ink border border-line rounded-sm hover:bg-paper-2"
             >
-              编辑
+              Edit
             </button>
 
             <button
@@ -927,7 +927,7 @@ function ProviderCard({ provider, expanded, onToggleExpand, onToggleEnabled, onD
                   : 'text-green-700 border-green-200 hover:bg-green-50',
               ].join(' ')}
             >
-              {provider.enabled ? '停用' : '启用'}
+              {provider.enabled ? 'Disable' : 'Enable'}
             </button>
             <button
               type="button"
@@ -937,7 +937,7 @@ function ProviderCard({ provider, expanded, onToggleExpand, onToggleEnabled, onD
               }}
               className="px-2.5 py-1 text-[11px] font-mono text-red-600 border border-red-200 rounded-sm hover:bg-red-50"
             >
-              删除
+              Delete
             </button>
           </div>
         </div>
@@ -977,7 +977,7 @@ export function ModelManagementPage() {
       const data = await api.admin.llm.listProviders();
       setProviders(data.items);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '加载失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to load');
     } finally {
       setLoading(false);
     }
@@ -1000,10 +1000,10 @@ export function ModelManagementPage() {
     if (
       provider.enabled &&
       !(await confirm({
-        title: '停用 Provider',
-        message: `确定要停用 Provider "${provider.name}" 吗？停用后其下所有模型将不可用。`,
+        title: 'Disable provider',
+        message: `Disable provider "${provider.name}"? All of its models will become unavailable.`,
         tone: 'danger',
-        confirmText: '停用',
+        confirmText: 'Disable',
       }))
     )
       return;
@@ -1012,7 +1012,7 @@ export function ModelManagementPage() {
       await api.admin.llm.updateProvider(provider.id, { enabled: !provider.enabled });
       await loadProviders();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '操作失败');
+      setError(err instanceof ApiError ? err.message : 'Operation failed');
     } finally {
       setToggling(null);
     }
@@ -1021,10 +1021,10 @@ export function ModelManagementPage() {
   const handleDelete = async (provider: ModelProvider) => {
     if (
       !(await confirm({
-        title: '删除 Provider',
-        message: `确定要删除 Provider "${provider.name}" 吗？此操作不可恢复。`,
+        title: 'Delete provider',
+        message: `Delete provider "${provider.name}"? This cannot be undone.`,
         tone: 'danger',
-        confirmText: '删除',
+        confirmText: 'Delete',
       }))
     )
       return;
@@ -1034,7 +1034,7 @@ export function ModelManagementPage() {
       if (expandedId === provider.id) setExpandedId(null);
       await loadProviders();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '删除失败');
+      setError(err instanceof ApiError ? err.message : 'Delete failed');
     } finally {
       setDeleting(null);
     }
@@ -1062,11 +1062,11 @@ export function ModelManagementPage() {
       {/* Header */}
       <div className="flex items-start justify-between">
         <div>
-          <h1 className="text-[22px] font-display text-ink tracking-[-0.02em]">模型管理</h1>
+          <h1 className="text-[22px] font-display text-ink tracking-[-0.02em]">Model management</h1>
           <p className="text-[12px] text-dim mt-0.5">
             {canManageProviders
-              ? '管理 LLM、嵌入和重排序模型的 Provider 接入配置'
-              : '配置本租户的默认模型偏好'}
+              ? 'Manage provider connections for LLM, embedding and rerank models'
+              : 'Configure this tenant’s default model preferences'}
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -1075,7 +1075,7 @@ export function ModelManagementPage() {
             onClick={() => setShowDefaults(true)}
             className="px-4 py-2 border border-line bg-paper text-ink text-[13px] font-mono rounded-md shadow-sm hover:bg-paper-2 transition-colors"
           >
-            默认模型设置
+            Default model settings
           </button>
           {/* Adding a Provider mutates the shared platform directory → super_admin only. */}
           {canManageProviders && providers.length > 0 && (
@@ -1084,7 +1084,7 @@ export function ModelManagementPage() {
               onClick={() => setShowAdd(true)}
               className="px-4 py-2 bg-ink text-paper text-[13px] font-mono rounded-md shadow hover:bg-ink-2 transition-colors"
             >
-              + 添加 Provider
+              + Add provider
             </button>
           )}
         </div>
@@ -1121,22 +1121,22 @@ export function ModelManagementPage() {
 
           {/* Loading */}
           {loading && (
-            <div className="text-[13px] text-dim py-8 text-center">加载中…</div>
+            <div className="text-[13px] text-dim py-8 text-center">Loading…</div>
           )}
 
           {/* Empty state */}
           {!loading && providers.length === 0 && (
             <div className="border border-line border-dashed rounded-md px-6 py-10 text-center">
-              <div className="text-[14px] text-dim">尚未配置任何模型 Provider</div>
+              <div className="text-[14px] text-dim">No model providers configured yet</div>
               <p className="text-[12px] text-dim mt-1">
-                添加 Provider 以接入 LLM、嵌入模型、重排序模型等
+                Add a provider to connect LLM, embedding and rerank models
               </p>
               <button
                 type="button"
                 onClick={() => setShowAdd(true)}
                 className="mt-3 px-3 py-1.5 bg-ink text-paper text-[12px] font-mono rounded-sm hover:opacity-90"
               >
-                + 添加 Provider
+                + Add provider
               </button>
             </div>
           )}
@@ -1162,17 +1162,17 @@ export function ModelManagementPage() {
         /* Tenant-admin landing: explain the scoped surface + a clear entry to
            the default-model picker (which is also auto-opened on mount). */
         <div className="border border-line rounded-lg px-6 py-8 bg-paper shadow-sm flex flex-col items-start gap-3">
-          <div className="text-[14px] text-ink font-semibold">默认模型偏好</div>
+          <div className="text-[14px] text-ink font-semibold">Default model preferences</div>
           <p className="text-[12px] text-dim leading-relaxed max-w-[640px]">
-            为本租户下的所有用户配置默认模型。当用户未自行设置偏好时，将使用此处配置的默认模型。
-            模型接入点（Provider）目录由平台管理员统一维护。
+            Set default models for every user in this tenant. They apply whenever a user hasn’t set their own preference.
+            The provider directory is maintained by platform administrators.
           </p>
           <button
             type="button"
             onClick={() => setShowDefaults(true)}
             className="px-4 py-2 bg-ink text-paper text-[13px] font-mono rounded-md shadow hover:bg-ink-2 transition-colors"
           >
-            配置默认模型
+            Configure default models
           </button>
         </div>
       )}
@@ -1180,7 +1180,7 @@ export function ModelManagementPage() {
       {/* Disabled overlay indicators (provider mutations → super_admin only) */}
       {canManageProviders && (deleting || toggling) && (
         <div className="fixed bottom-4 right-4 bg-ink text-paper px-3 py-2 rounded-md text-[12px] font-mono shadow-lg">
-          {deleting ? '删除中…' : '更新中…'}
+          {deleting ? 'Deleting…' : 'Updating…'}
         </div>
       )}
 

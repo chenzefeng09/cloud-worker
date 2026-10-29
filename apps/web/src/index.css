@@ -177,7 +177,7 @@ body {
 }
 
 .canvas-rich-editor:empty::before {
-  content: '开始写作…';
+  content: 'Start writing…';
   color: var(--dim);
 }
 

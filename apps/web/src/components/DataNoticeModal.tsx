@@ -14,17 +14,17 @@ import { Dialog } from '../admin/components/Dialog';
 export function DataNoticeModal({ onAck }: { onAck: () => void }) {
   return (
     <Dialog
-      title="数据使用告知"
+      title="Data usage notice"
       onClose={onAck}
       className="w-full max-w-[440px]"
     >
       <p className="text-[13px] leading-[1.6] text-ink-2">
-        为保障服务质量与安全审计，你与智能体的对话内容会被保留，并可能用于管理员审计回放。保留期为 30 天。
+        To ensure service quality and support security audits, your conversations with the agent are retained and may be replayed by administrators for auditing. Retention period: 30 days.
       </p>
 
       <div className="flex items-center justify-end gap-2 pt-1">
         <button className="cw-btn cw-btn-accent cw-btn-sm" onClick={onAck}>
-          知道了
+          Got it
         </button>
       </div>
     </Dialog>

@@ -66,7 +66,7 @@ Usage: {{ include "agent-platform.commonEnv" (dict "svcName" "bff" "root" .) }}
 - name: AP_PROFILE
   value: {{ .root.Values.global.profile | default "small" | quote }}
 - name: TZ
-  value: {{ .root.Values.global.timezone | default "Asia/Shanghai" | quote }}
+  value: {{ .root.Values.global.timezone | default "UTC" | quote }}
 # OTEL
 - name: OTEL_SERVICE_NAME
   value: {{ printf "ap-%s" .svcName | quote }}

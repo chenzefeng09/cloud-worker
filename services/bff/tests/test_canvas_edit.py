@@ -180,8 +180,8 @@ def test_canvas_edit_happy_selection(
     assert fake.last_completion_payload["model"] == "deepseek-chat"
     assert fake.last_completion_payload["stream"] is False
     prompt = fake.last_completion_payload["messages"][0]["content"]
-    assert "只修改选中片段" in prompt
-    assert "字符 5-12" in prompt
+    assert "Edit only the selected fragment" in prompt
+    assert "characters 5-12" in prompt
 
     # No run / message endpoints touched.
     assert not any("/runs" in u or "/messages" in u for _, u, _ in fake.calls)
@@ -200,8 +200,8 @@ def test_canvas_edit_document_scope(
     )
     assert resp.status_code == 200
     prompt = fake.last_completion_payload["messages"][0]["content"]  # type: ignore[index]
-    assert "整篇修改" in prompt
-    assert "整篇文档" in prompt
+    assert "Edit the whole document" in prompt
+    assert "Full document" in prompt
 
 
 def test_canvas_edit_resolves_default_model_when_omitted(
@@ -236,7 +236,7 @@ def test_canvas_edit_no_virtual_key_400(
     )
     assert resp.status_code == 400
     detail = resp.json()["detail"]
-    assert "模型密钥" in detail["user_message"]
+    assert "model key" in detail["user_message"]
 
 
 def test_canvas_edit_no_model_no_default_400(
@@ -252,7 +252,7 @@ def test_canvas_edit_no_model_no_default_400(
     )
     assert resp.status_code == 400
     detail = resp.json()["detail"]
-    assert "默认模型" in detail["user_message"]
+    assert "default model" in detail["user_message"]
 
 
 def test_canvas_edit_missing_instruction_400(
@@ -267,7 +267,7 @@ def test_canvas_edit_missing_instruction_400(
         json=_body(instruction="   "),
     )
     assert resp.status_code == 400
-    assert "修改要求" in resp.json()["detail"]["user_message"]
+    assert "edit request" in resp.json()["detail"]["user_message"]
 
 
 def test_canvas_edit_gateway_error_502(
@@ -295,7 +295,7 @@ def test_canvas_edit_gateway_timeout_502(
         f"{PREFIX}/sessions/ses_abc/canvas/edit", cookies=authed_cookie, json=_body()
     )
     assert resp.status_code == 502
-    assert "超时" in resp.json()["detail"]["user_message"]
+    assert "timed out" in resp.json()["detail"]["user_message"]
 
 
 def test_canvas_edit_empty_replacement_502(
@@ -310,7 +310,7 @@ def test_canvas_edit_empty_replacement_502(
         f"{PREFIX}/sessions/ses_abc/canvas/edit", cookies=authed_cookie, json=_body()
     )
     assert resp.status_code == 502
-    assert "有效修订" in resp.json()["detail"]["user_message"]
+    assert "valid revision" in resp.json()["detail"]["user_message"]
 
 
 def test_canvas_edit_no_tag_fallback(
@@ -338,11 +338,11 @@ def test_canvas_edit_no_tag_fallback(
 def test_build_prompt_selection() -> None:
     req = CanvasEditRequest.model_validate(_body())
     prompt = build_canvas_edit_prompt(req)
-    assert "请作为专业编辑" in prompt
-    assert "标题：文章标题" in prompt
-    assert "修改范围：只修改选中片段" in prompt
-    assert "修改要求：把这句改得更专业一些" in prompt
-    assert "选中片段（字符 5-12）" in prompt
+    assert "As a professional editor" in prompt
+    assert "Title: 文章标题" in prompt
+    assert "Scope: Edit only the selected fragment" in prompt
+    assert "Edit request: 把这句改得更专业一些" in prompt
+    assert "Selected fragment (characters 5-12)" in prompt
     assert "<canvas-replacement>" in prompt
     assert "<change-summary>" in prompt
 
@@ -350,24 +350,24 @@ def test_build_prompt_selection() -> None:
 def test_build_prompt_document() -> None:
     req = CanvasEditRequest.model_validate(_body(scope="document", selection=None))
     prompt = build_canvas_edit_prompt(req)
-    assert "修改范围：整篇修改" in prompt
-    assert "整篇文档：" in prompt
+    assert "Scope: Edit the whole document" in prompt
+    assert "Full document:" in prompt
     assert "画布全文" in prompt
 
 
 def test_build_prompt_default_title() -> None:
     req = CanvasEditRequest.model_validate(_body(title=""))
     prompt = build_canvas_edit_prompt(req)
-    assert "标题：未命名文档" in prompt
+    assert "Title: Untitled document" in prompt
 
 
 def test_build_prompt_selection_forbids_echoing_context() -> None:
     """Selection-scoped prompt must forbid returning full text / surrounding原文."""
     req = CanvasEditRequest.model_validate(_body())
     prompt = build_canvas_edit_prompt(req)
-    assert "只能是选中片段的改写结果" in prompt
-    assert "禁止返回整篇全文" in prompt or "禁止返回整篇" in prompt
-    assert "选区之外" in prompt
+    assert "only the rewrite of the selected fragment" in prompt
+    assert "never return the whole document" in prompt
+    assert "outside the selection" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -685,4 +685,4 @@ def test_canvas_edit_trim_to_empty_yields_502(
         ),
     )
     assert resp.status_code == 502
-    assert "有效修订" in resp.json()["detail"]["user_message"]
+    assert "valid revision" in resp.json()["detail"]["user_message"]

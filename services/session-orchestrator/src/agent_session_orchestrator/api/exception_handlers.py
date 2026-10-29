@@ -29,7 +29,7 @@ def register_exception_handlers(app: FastAPI) -> None:
                 "detail": exc.detail,
                 "instance": str(request.url.path),
                 "code": exc.code,
-                # User-facing Chinese message (defaults to ``detail``).  The
+                # User-facing English message (defaults to ``detail``).  The
                 # frontend reads this directly instead of stringifying the whole
                 # problem body — matches the BFF canvas.py convention.
                 "user_message": exc.user_message,

@@ -456,7 +456,7 @@ export function CanvasMessageCard({
           .then((res) => setVersions(res.items))
           .catch((err) => {
             setVersionsError(
-              err instanceof Error && err.message ? err.message : '无法加载版本历史。',
+              err instanceof Error && err.message ? err.message : 'Couldn’t load version history.',
             );
           })
           .finally(() => setVersionsLoading(false));
@@ -469,9 +469,9 @@ export function CanvasMessageCard({
     async (toVersion: number) => {
       if (!canvasId) return;
       const ok = await confirm({
-        title: '回退版本',
-        message: `确定回退到版本 ${toVersion}？将基于该版本创建一个新版本。`,
-        confirmText: '回退',
+        title: 'Restore version',
+        message: `Restore version ${toVersion}? A new version will be created from it.`,
+        confirmText: 'Restore',
       });
       if (!ok) return;
       const reverted = await revertAction(canvasId, toVersion);
@@ -754,9 +754,9 @@ export function CanvasMessageCard({
         <article className="canvas-message-card">
           <header className="canvas-message-card-head">
             <div className="flex items-center gap-2 min-w-0">
-              <span className="canvas-card-edit-chip" title="可运行网页">
+              <span className="canvas-card-edit-chip" title="Runnable web page">
                 <span className="font-mono">▶</span>
-                <span>网页</span>
+                <span>Web page</span>
               </span>
               <span
                 className="truncate text-[13px] font-medium text-ink"
@@ -770,18 +770,18 @@ export function CanvasMessageCard({
                 type="button"
                 className="cw-btn cw-btn-ghost cw-btn-sm"
                 onClick={() => copy(htmlSource)}
-                title="复制源码"
-                aria-label="复制源码"
+                title="Copy source"
+                aria-label="Copy source"
               >
-                {copied ? <span className="font-mono text-[10px]">已复制</span> : <CopyIcon />}
+                {copied ? <span className="font-mono text-[10px]">Copied</span> : <CopyIcon />}
               </button>
               {onOpenPanel && (
                 <button
                   type="button"
                   className="cw-btn cw-btn-ghost cw-btn-sm"
                   onClick={onOpenPanel}
-                  title="在侧栏打开"
-                  aria-label="在侧栏打开"
+                  title="Open in side panel"
+                  aria-label="Open in side panel"
                 >
                   ⛶
                 </button>
@@ -809,13 +809,13 @@ export function CanvasMessageCard({
               onClick={() => editorRef.current?.focus()}
             >
               <span className="font-mono">✎</span>
-              <span>编辑</span>
+              <span>Edit</span>
             </button>
             <select
               value={draft.kind}
               onChange={(event) => handleKindChange(event.target.value as CanvasObjectKind)}
               className="canvas-card-kind-select"
-              title="对象类型"
+              title="Object type"
             >
               {CANVAS_OBJECTS.map((item) => (
                 <option key={item.kind} value={item.kind}>
@@ -831,17 +831,17 @@ export function CanvasMessageCard({
                   type="button"
                   className="cw-btn cw-btn-ghost cw-btn-sm"
                   onClick={toggleVersions}
-                  title="版本历史"
-                  aria-label="版本历史"
+                  title="Version history"
+                  aria-label="Version history"
                   aria-expanded={versionsOpen}
                 >
-                  历史
+                  History
                 </button>
                 {versionsOpen && (
-                  <div className="canvas-card-history-pop" role="menu" aria-label="版本历史">
-                    <div className="canvas-card-history-head">版本历史</div>
+                  <div className="canvas-card-history-pop" role="menu" aria-label="Version history">
+                    <div className="canvas-card-history-head">Version history</div>
                     {versionsLoading && (
-                      <div className="canvas-card-history-empty">加载中…</div>
+                      <div className="canvas-card-history-empty">Loading…</div>
                     )}
                     {versionsError && (
                       <div className="canvas-card-history-error" role="alert">
@@ -849,7 +849,7 @@ export function CanvasMessageCard({
                       </div>
                     )}
                     {!versionsLoading && !versionsError && versions && versions.length === 0 && (
-                      <div className="canvas-card-history-empty">暂无历史版本。</div>
+                      <div className="canvas-card-history-empty">No previous versions.</div>
                     )}
                     {!versionsLoading &&
                       !versionsError &&
@@ -862,13 +862,13 @@ export function CanvasMessageCard({
                           className="canvas-card-history-item"
                           onClick={() => void handleRevert(v.version)}
                           disabled={revisingEffective}
-                          title={`回退到版本 ${v.version}`}
+                          title={`Restore version ${v.version}`}
                         >
                           <span className="canvas-card-history-ver">v{v.version}</span>
                           <span className="canvas-card-history-meta">
                             <span className="canvas-card-history-summary">
                               {v.change_summary?.trim() ||
-                                (v.created_by === 'user' ? '手动编辑' : '模型修改')}
+                                (v.created_by === 'user' ? 'Manual edit' : 'AI edit')}
                             </span>
                             <span className="canvas-card-history-sub">
                               {new Date(v.created_at).toLocaleString()} · {v.created_by}
@@ -884,18 +884,18 @@ export function CanvasMessageCard({
               type="button"
               className="cw-btn cw-btn-ghost cw-btn-sm"
               onClick={() => copy(draft.content)}
-              title="复制"
-              aria-label="复制"
+              title="Copy"
+              aria-label="Copy"
             >
-              {copied ? <span className="font-mono text-[10px]">已复制</span> : <CopyIcon />}
+              {copied ? <span className="font-mono text-[10px]">Copied</span> : <CopyIcon />}
             </button>
             {onOpenPanel && (
               <button
                 type="button"
                 className="cw-btn cw-btn-ghost cw-btn-sm"
                 onClick={onOpenPanel}
-                title="在侧栏打开"
-                aria-label="在侧栏打开"
+                title="Open in side panel"
+                aria-label="Open in side panel"
               >
                 ⛶
               </button>
@@ -904,10 +904,10 @@ export function CanvasMessageCard({
         </header>
 
         <div className="canvas-message-card-toolbar">
-          <button type="button" className="cw-btn cw-btn-ghost cw-btn-sm" onClick={undo} disabled={history.length === 0} title="撤销">
+          <button type="button" className="cw-btn cw-btn-ghost cw-btn-sm" onClick={undo} disabled={history.length === 0} title="Undo">
             ↶
           </button>
-          <button type="button" className="cw-btn cw-btn-ghost cw-btn-sm" onClick={redo} disabled={future.length === 0} title="恢复">
+          <button type="button" className="cw-btn cw-btn-ghost cw-btn-sm" onClick={redo} disabled={future.length === 0} title="Redo">
             ↷
           </button>
           <span className="h-5 w-px bg-line mx-1 shrink-0" />
@@ -916,7 +916,7 @@ export function CanvasMessageCard({
             className="cw-btn cw-btn-ghost cw-btn-sm font-semibold"
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => applyRichCommand('bold')}
-            title="加粗"
+            title="Bold"
           >
             B
           </button>
@@ -925,7 +925,7 @@ export function CanvasMessageCard({
             className="cw-btn cw-btn-ghost cw-btn-sm italic"
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => applyRichCommand('italic')}
-            title="斜体"
+            title="Italic"
           >
             I
           </button>
@@ -934,7 +934,7 @@ export function CanvasMessageCard({
             className="cw-btn cw-btn-ghost cw-btn-sm"
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => applyBlockCommand('h1')}
-            title="标题 1"
+            title="Heading 1"
           >
             H1
           </button>
@@ -943,7 +943,7 @@ export function CanvasMessageCard({
             className="cw-btn cw-btn-ghost cw-btn-sm"
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => applyBlockCommand('h2')}
-            title="标题 2"
+            title="Heading 2"
           >
             H2
           </button>
@@ -952,13 +952,13 @@ export function CanvasMessageCard({
             className="cw-btn cw-btn-ghost cw-btn-sm"
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => applyBlockCommand('blockquote')}
-            title="引用"
+            title="Quote"
           >
             “
           </button>
           <div className="flex-1" />
           <span className="font-mono text-[10.5px] text-dim whitespace-nowrap">
-            {draft.content.length} 字符 · {wordCount} 词
+            {draft.content.length} chars · {wordCount} words
           </span>
         </div>
 
@@ -967,17 +967,17 @@ export function CanvasMessageCard({
             value={draft.title}
             onChange={(event) => updateDraft({ title: event.target.value })}
             className="canvas-card-title-input"
-            aria-label={`${object.label}标题`}
+            aria-label={`${object.label} title`}
           />
           {showDocumentSuggestion && suggestion && (
             <section
               className="canvas-suggestion-review"
-              aria-label={suggestion.request.scope === 'selection' ? '选区修改建议' : '整篇修改建议'}
+              aria-label={suggestion.request.scope === 'selection' ? 'Suggested edit (selection)' : 'Suggested edit (whole document)'}
             >
               <div className="canvas-suggestion-review-head">
                 <div className="min-w-0">
                   <div className="canvas-suggestion-kicker">
-                    {suggestion.request.scope === 'selection' ? '选区修改建议' : '整篇修改建议'}
+                    {suggestion.request.scope === 'selection' ? 'Suggested edit (selection)' : 'Suggested edit (whole document)'}
                   </div>
                   <div className="canvas-suggestion-instruction">{suggestion.request.instruction}</div>
                 </div>
@@ -988,7 +988,7 @@ export function CanvasMessageCard({
                     onClick={onRejectSuggestion}
                     disabled={!onRejectSuggestion}
                   >
-                    撤销
+                    Discard
                   </button>
                   <button
                     type="button"
@@ -996,7 +996,7 @@ export function CanvasMessageCard({
                     onClick={acceptSuggestion}
                     disabled={!onAcceptSuggestion}
                   >
-                    接受
+                    Accept
                   </button>
                 </div>
               </div>
@@ -1023,10 +1023,10 @@ export function CanvasMessageCard({
                 className="canvas-suggestion-preview-segment"
                 dangerouslySetInnerHTML={{ __html: inlineSuggestionPreview.beforeHtml }}
               />
-              <section className="canvas-inline-suggestion-card" aria-label="选区修改建议">
+              <section className="canvas-inline-suggestion-card" aria-label="Suggested edit (selection)">
                 <div className="canvas-inline-suggestion-head">
                   <div className="min-w-0">
-                    <div className="canvas-suggestion-kicker">选区修改建议</div>
+                    <div className="canvas-suggestion-kicker">Suggested edit (selection)</div>
                     <div className="canvas-suggestion-instruction">{suggestion.request.instruction}</div>
                   </div>
                   <div className="canvas-suggestion-actions">
@@ -1036,7 +1036,7 @@ export function CanvasMessageCard({
                       onClick={onRejectSuggestion}
                       disabled={!onRejectSuggestion}
                     >
-                      撤销
+                      Discard
                     </button>
                     <button
                       type="button"
@@ -1044,7 +1044,7 @@ export function CanvasMessageCard({
                       onClick={acceptSuggestion}
                       disabled={!onAcceptSuggestion}
                     >
-                      接受
+                      Accept
                     </button>
                   </div>
                 </div>
@@ -1069,7 +1069,7 @@ export function CanvasMessageCard({
               suppressContentEditableWarning
               className="canvas-rich-editor canvas-inline-editor outline-none text-ink break-words"
               role="textbox"
-              aria-label="页内画布正文"
+              aria-label="Inline canvas body"
               data-writing-block-fullscreen-editor-region="true"
               data-writing-block-fullscreen-editor-layout="inline"
               onInput={handleInput}
@@ -1083,13 +1083,13 @@ export function CanvasMessageCard({
           {pending && (
             <div className="canvas-card-pending">
               <span className="cw-blip" />
-              <span>正在写入…</span>
+              <span>Writing…</span>
             </div>
           )}
           {isRevising && !pending && (
             <div className="canvas-card-pending" role="status" aria-live="polite">
               <span className="cw-blip" />
-              <span>修订中…</span>
+              <span>Revising…</span>
             </div>
           )}
           {editErrorEffective && (
@@ -1100,7 +1100,7 @@ export function CanvasMessageCard({
                   type="button"
                   className="canvas-card-edit-error-dismiss"
                   onClick={handleDismissEditError}
-                  aria-label="关闭错误提示"
+                  aria-label="Dismiss error"
                 >
                   ✕
                 </button>
@@ -1128,7 +1128,7 @@ export function CanvasMessageCard({
               value={instruction}
               onChange={(event) => setInstruction(event.target.value)}
               className="canvas-card-request-input"
-              placeholder={isRevising ? '修订中…' : '输入修改要求…'}
+              placeholder={isRevising ? 'Revising…' : 'Describe the changes you want…'}
               disabled={aiDisabled || isRevising}
             />
             <button
@@ -1137,7 +1137,7 @@ export function CanvasMessageCard({
               disabled={!canRequestDocument}
               onClick={() => requestEdit('document')}
             >
-              修改
+              Revise
             </button>
           </div>
         </footer>
@@ -1164,17 +1164,17 @@ export function CanvasMessageCard({
                 className="canvas-selection-command"
                 onClick={() => setToolbar((current) => current && { ...current, mode: 'input' })}
               >
-                要求更改
+                Request changes
               </button>
               <span className="canvas-selection-divider" />
-              <button type="button" className="canvas-selection-icon" onClick={() => applyRichCommand('bold')} title="加粗">
+              <button type="button" className="canvas-selection-icon" onClick={() => applyRichCommand('bold')} title="Bold">
                 B
               </button>
-              <button type="button" className="canvas-selection-icon italic" onClick={() => applyRichCommand('italic')} title="斜体">
+              <button type="button" className="canvas-selection-icon italic" onClick={() => applyRichCommand('italic')} title="Italic">
                 I
               </button>
               <button type="button" className="canvas-selection-command" onClick={() => applyBlockCommand('h2')}>
-                文本
+                Text
               </button>
             </>
           ) : (
@@ -1189,7 +1189,7 @@ export function CanvasMessageCard({
                 ref={inputRef}
                 value={popupInstruction}
                 onChange={(event) => setPopupInstruction(event.target.value)}
-                placeholder={isRevising ? '修订中…' : '修改一下'}
+                placeholder={isRevising ? 'Revising…' : 'Edit this'}
                 className="canvas-selection-input"
                 disabled={aiDisabled || isRevising}
               />
@@ -1197,7 +1197,7 @@ export function CanvasMessageCard({
                 type="submit"
                 className="canvas-selection-send"
                 disabled={!canRequestPopupEdit}
-                title="发送修改要求"
+                title="Send edit request"
               >
                 ↑
               </button>

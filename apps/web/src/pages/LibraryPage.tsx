@@ -11,7 +11,7 @@ import type {
   Skill,
   SkillVersion,
 } from '../api/types';
-import { formatRelativeTimeZh } from '../lib/format';
+import { formatRelativeTime } from '../lib/format';
 import { sha256Hex } from '../lib/sha256';
 import { useInstalledSkills } from '../hooks/useInstalledSkills';
 import { KnowledgeSourceTab } from '../components/KnowledgeSourceTab';
@@ -29,17 +29,17 @@ function preflightSkillFile(file: File): string | null {
   const okExt = name.endsWith('.tar.gz') || name.endsWith('.tgz');
   const okMime =
     file.type === 'application/gzip' || file.type === 'application/x-gzip';
-  if (!okExt && !okMime) return '请上传 .tar.gz 格式的技能包';
-  if (file.size > SKILL_MAX_BYTES) return '技能包超过大小上限 20 MB';
+  if (!okExt && !okMime) return 'Please upload a skill package in .tar.gz format';
+  if (file.size > SKILL_MAX_BYTES) return 'The skill package exceeds the 20 MB size limit';
   return null;
 }
 
 type Tab = 'mcp' | 'skills' | 'docs';
 
 const TAB_LABELS: Record<Tab, string> = {
-  mcp: 'MCP 工具',
-  skills: '技能',
-  docs: '知识源',
+  mcp: 'MCP tools',
+  skills: 'Skills',
+  docs: 'Knowledge sources',
 };
 
 export function LibraryPage() {
@@ -77,7 +77,7 @@ export function LibraryPage() {
       setMcpServers(mcpRes.items);
       setSkills(skillRes.items);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : '加载资源库失败，请稍后重试。');
+      setError(e instanceof ApiError ? e.message : 'Failed to load the library. Please try again later.');
     } finally {
       setLoading(false);
     }
@@ -98,7 +98,7 @@ export function LibraryPage() {
   return (
     <div className="flex flex-col h-full min-w-0 bg-paper">
       <PageHead
-        crumbs={[{ label: '首页', to: '/home' }, { label: '资源库' }]}
+        crumbs={[{ label: 'Home', to: '/home' }, { label: 'Library' }]}
       />
 
       <div className="cw-scroll flex-1 px-8 py-5">
@@ -152,8 +152,8 @@ export function LibraryPage() {
             {tab !== 'docs' && (
               <button
                 onClick={() => setInstallOpen(true)}
-                title={`添加${TAB_LABELS[tab]}`}
-                aria-label={`添加${TAB_LABELS[tab]}`}
+                title={`Add to ${TAB_LABELS[tab]}`}
+                aria-label={`Add to ${TAB_LABELS[tab]}`}
                 className="ml-auto shrink-0 px-2.5 py-1.5 font-mono text-[15px] leading-none text-ink-2 hover:text-accent transition-colors"
               >
                 +
@@ -163,14 +163,14 @@ export function LibraryPage() {
 
           {/* loading (mcp/skills only; docs tab self-loads) */}
           {loading && tab !== 'docs' && (
-            <div className="font-mono text-[11px] text-dim">加载中…</div>
+            <div className="font-mono text-[11px] text-dim">Loading…</div>
           )}
 
           {/* MCP servers */}
           {!loading && tab === 'mcp' && (
             <>
               {mcpServers.length === 0 ? (
-                <div className="font-mono italic text-dim text-[12px]">暂无 MCP 工具</div>
+                <div className="font-mono italic text-dim text-[12px]">No MCP tools yet</div>
               ) : (
                 <div className="flex flex-col gap-1.5">
                   {mcpServers.map((s) => (
@@ -186,10 +186,10 @@ export function LibraryPage() {
                       </div>
                       <span className="font-mono text-[11px] text-ink-2 uppercase">{s.transport}</span>
                       <Chip accent={s.enabled} dashed={!s.enabled}>
-                        {s.enabled ? '已启用' : '已禁用'}
+                        {s.enabled ? 'Enabled' : 'Disabled'}
                       </Chip>
                       <span className="font-mono text-[11px] text-dim text-right">
-                        {formatRelativeTimeZh(s.updated_at)}
+                        {formatRelativeTime(s.updated_at)}
                       </span>
                     </div>
                   ))}
@@ -202,7 +202,7 @@ export function LibraryPage() {
           {!loading && tab === 'skills' && (
             <>
               {skills.length === 0 ? (
-                <div className="font-mono italic text-dim text-[12px]">暂无技能</div>
+                <div className="font-mono italic text-dim text-[12px]">No skills yet</div>
               ) : (
                 <div className="flex flex-col gap-1.5">
                   {skills.map((sk) => {
@@ -228,14 +228,14 @@ export function LibraryPage() {
                           {sk.owner ?? '—'}
                         </span>
                         <span className="font-mono text-[11px] text-dim">
-                          {formatRelativeTimeZh(sk.created_at)}
+                          {formatRelativeTime(sk.created_at)}
                         </span>
                         {sk.is_platform_default ? (
                           <span
                             className="font-mono text-[11px] text-center px-2 py-1 border rounded-md cursor-default select-none text-accent border-accent-line bg-accent-soft"
-                            title="平台内置默认技能：随部署自带，每个组织和用户默认启用，无需安装（可在会话内关闭）"
+                            title="Built-in platform skill: ships with the deployment and is enabled by default for every organization and user, no install needed (can be turned off per session)"
                           >
-                            平台内置
+                            Built-in
                           </span>
                         ) : installed ? (
                           <span
@@ -246,18 +246,18 @@ export function LibraryPage() {
                             }`}
                             title={
                               installed.enabled_by_default
-                                ? '已安装；新会话默认启用，可在会话内关闭'
-                                : '已安装；新会话不自动启用，可在会话内开启'
+                                ? 'Installed; enabled by default in new sessions, can be turned off per session'
+                                : 'Installed; not enabled automatically in new sessions, can be turned on per session'
                             }
                           >
-                            {installed.enabled_by_default ? '默认启用' : '按需启用'}
+                            {installed.enabled_by_default ? 'On by default' : 'On demand'}
                           </span>
                         ) : (
                           <button
                             className="cw-btn cw-btn-sm"
                             onClick={() => setToolboxTarget(sk)}
                           >
-                            安装
+                            Install
                           </button>
                         )}
                       </div>
@@ -277,15 +277,15 @@ export function LibraryPage() {
       {installOpen && tab === 'mcp' && (
         <McpServerFormDialog
           mode="create"
-          title="安装 MCP 工具"
-          submitLabel="安装"
+          title="Install MCP tool"
+          submitLabel="Install"
           // The library install path has no id-less probe endpoint (that is an
           // admin-governance surface); disable the tool-list fetch so the
           // filter editor falls back to a manual tag input.
           probe={{
             fetchTools: async () => ({ ok: false }),
             canFetch: false,
-            disabledTitle: '资源库安装暂不支持探测工具列表，请手动输入工具名',
+            disabledTitle: 'Tool discovery isn’t supported for library installs yet — enter tool names manually',
           }}
           onSubmit={(body) => api.library.installMcpServer(body as RegisterMcpServerRequest)}
           onClose={() => setInstallOpen(false)}
@@ -358,15 +358,15 @@ function InstallModal({
   const [skFile, setSkFile] = useState<File | null>(null);
 
   const errMsg = (e: unknown) =>
-    e instanceof ApiError ? e.message : '安装失败，请稍后重试。';
+    e instanceof ApiError ? e.message : 'Install failed. Please try again later.';
 
   const submit = async () => {
     setErr(null);
     setSubmitting(true);
     try {
-      if (!skName.trim()) throw new ApiError(400, 'VALIDATION', '请填写名称');
-      if (!skVersion.trim()) throw new ApiError(400, 'VALIDATION', '请填写版本号');
-      if (!skFile) throw new ApiError(400, 'VALIDATION', '请选择技能包文件 (tarball)');
+      if (!skName.trim()) throw new ApiError(400, 'VALIDATION', 'Please enter a name');
+      if (!skVersion.trim()) throw new ApiError(400, 'VALIDATION', 'Please enter a version');
+      if (!skFile) throw new ApiError(400, 'VALIDATION', 'Please choose a skill package file (tarball)');
       // Local preflight: catch wrong format / oversized packages before any
       // network round-trip (and before we create the skill record).
       const preflightErr = preflightSkillFile(skFile);
@@ -402,7 +402,7 @@ function InstallModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-line">
-          <div className="text-[13.5px] font-medium">安装技能</div>
+          <div className="text-[13.5px] font-medium">Install skill</div>
           <button
             className="font-mono text-[12px] text-dim hover:text-ink transition-colors"
             onClick={onClose}
@@ -412,35 +412,35 @@ function InstallModal({
         </div>
 
         <div className="flex flex-col gap-3 px-4 py-4">
-          <Field label="名称">
+          <Field label="Name">
             <input
               className={inputCls}
               value={skName}
               onChange={(e) => setSkName(e.target.value)}
-              placeholder="例如 pdf-summarizer"
+              placeholder="e.g. pdf-summarizer"
             />
           </Field>
-          <Field label="描述（可选）">
+          <Field label="Description (optional)">
             <input
               className={inputCls}
               value={skDesc}
               maxLength={2000}
               onChange={(e) => setSkDesc(e.target.value)}
-              placeholder="简要说明该技能用途"
+              placeholder="Briefly describe what this skill does"
             />
           </Field>
-          <Field label="可见性">
+          <Field label="Visibility">
             <select
               className={inputCls}
               value={skVisibility}
               onChange={(e) => setSkVisibility(e.target.value as Skill['visibility'])}
             >
-              <option value="private">私有</option>
-              <option value="tenant">租户</option>
-              <option value="public">公开</option>
+              <option value="private">Private</option>
+              <option value="tenant">Tenant</option>
+              <option value="public">Public</option>
             </select>
           </Field>
-          <Field label="版本号">
+          <Field label="Version">
             <input
               className={inputCls}
               value={skVersion}
@@ -448,7 +448,7 @@ function InstallModal({
               placeholder="0.1.0"
             />
           </Field>
-          <Field label="技能包 (tarball)">
+          <Field label="Skill package (tarball)">
             <input
               type="file"
               className="text-[12px] text-ink-2 file:mr-2 file:px-2 file:py-1 file:text-[11px] file:font-mono file:border file:border-line file:rounded-md file:bg-paper file:cursor-pointer"
@@ -466,14 +466,14 @@ function InstallModal({
 
         <div className="flex justify-end gap-2 px-4 py-3 border-t border-line">
           <button className="cw-btn cw-btn-sm" onClick={onClose} disabled={submitting}>
-            取消
+            Cancel
           </button>
           <button
             className="cw-btn cw-btn-accent cw-btn-sm"
             onClick={submit}
             disabled={submitting}
           >
-            {submitting ? '安装中…' : '安装'}
+            {submitting ? 'Installing…' : 'Install'}
           </button>
         </div>
       </div>
@@ -514,7 +514,7 @@ function InstallToToolboxModal({
       })
       .catch((e) => {
         if (cancelled) return;
-        setErr(e instanceof ApiError ? e.message : '加载版本列表失败');
+        setErr(e instanceof ApiError ? e.message : 'Failed to load versions');
       })
       .finally(() => {
         if (cancelled) return;
@@ -528,7 +528,7 @@ function InstallToToolboxModal({
   // Dropdown options: "follow latest" first (id=''), then each concrete version.
   const versionOptions = useMemo(
     () => [
-      { id: '', label: '跟随 latest' },
+      { id: '', label: 'Track latest' },
       ...versions.map((v) => ({ id: v.version, label: v.version })),
     ],
     [versions],
@@ -545,7 +545,7 @@ function InstallToToolboxModal({
       );
       onInstalled();
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : '安装失败，请稍后重试。');
+      setErr(e instanceof ApiError ? e.message : 'Install failed. Please try again later.');
     } finally {
       setSubmitting(false);
     }
@@ -561,7 +561,7 @@ function InstallToToolboxModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between px-4 py-3 border-b border-line">
-          <div className="text-[13.5px] font-medium">安装技能</div>
+          <div className="text-[13.5px] font-medium">Install skill</div>
           <button
             className="font-mono text-[12px] text-dim hover:text-ink transition-colors"
             onClick={onClose}
@@ -571,15 +571,15 @@ function InstallToToolboxModal({
         </div>
 
         <div className="flex flex-col gap-3 px-4 py-4">
-          <Field label="技能">
+          <Field label="Skill">
             <div className={`${inputCls} bg-paper-2 text-ink-2 cursor-default`}>
               {skill.name}
             </div>
           </Field>
 
-          <Field label="版本">
+          <Field label="Version">
             {versionsLoading ? (
-              <div className="font-mono text-[11px] text-dim">加载中…</div>
+              <div className="font-mono text-[11px] text-dim">Loading…</div>
             ) : (
               <Dropdown
                 value={pickedVersion}
@@ -598,9 +598,9 @@ function InstallToToolboxModal({
               onChange={(e) => setEnabledByDefault(e.target.checked)}
             />
             <span className="flex flex-col gap-0.5">
-              <span className={labelCls}>默认在新会话启用</span>
+              <span className={labelCls}>Enable by default in new sessions</span>
               <span className="font-mono text-[10.5px] leading-4 text-dim">
-                之后仍可在每个会话输入框的 ⊕ 菜单中单独开启或关闭
+                You can still turn it on or off per session from the composer’s ⊕ menu
               </span>
             </span>
           </label>
@@ -614,14 +614,14 @@ function InstallToToolboxModal({
 
         <div className="flex justify-end gap-2 px-4 py-3 border-t border-line">
           <button className="cw-btn cw-btn-sm" onClick={onClose} disabled={submitting}>
-            取消
+            Cancel
           </button>
           <button
             className="cw-btn cw-btn-accent cw-btn-sm"
             onClick={submit}
             disabled={submitting || versionsLoading}
           >
-            {submitting ? '安装中…' : '安装'}
+            {submitting ? 'Installing…' : 'Install'}
           </button>
         </div>
       </div>

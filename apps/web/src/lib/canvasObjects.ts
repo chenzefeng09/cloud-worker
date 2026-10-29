@@ -94,87 +94,87 @@ export interface CanvasPersistenceAdapter {
 export const CANVAS_OBJECTS: CanvasObjectDefinition[] = [
   {
     kind: 'article',
-    label: '文章',
-    description: '公众号、博客、长文稿件',
-    defaultTitle: '未命名文章',
+    label: 'Article',
+    description: 'Blog posts, newsletters, long-form pieces',
+    defaultTitle: 'Untitled article',
     starter:
-      '标题\n\n开头：用一两句话说明这篇文章要解决的问题。\n\n一、核心观点\n\n二、展开分析\n\n三、行动建议\n\n结尾：给读者一个明确的收束。',
+      'Title\n\nOpening: state the problem this article solves in a sentence or two.\n\n1. Key point\n\n2. Analysis\n\n3. Recommendations\n\nClosing: give the reader a clear takeaway.',
     editIntents: [
-      { id: 'polish', label: '润色', instruction: '在保留原意的前提下，让表达更清晰、自然、有节奏。' },
-      { id: 'expand', label: '扩写', instruction: '补充论据和过渡，让内容更完整。' },
-      { id: 'shorten', label: '压缩', instruction: '删去冗余表达，保留关键信息。' },
+      { id: 'polish', label: 'Polish', instruction: 'Keep the meaning but make the writing clearer, more natural, and better paced.' },
+      { id: 'expand', label: 'Expand', instruction: 'Add supporting points and transitions to make the piece more complete.' },
+      { id: 'shorten', label: 'Shorten', instruction: 'Cut redundant phrasing and keep the key information.' },
     ],
   },
   {
     kind: 'brief',
-    label: '简报',
-    description: '会议纪要、项目同步、决策摘要',
-    defaultTitle: '工作简报',
+    label: 'Brief',
+    description: 'Meeting notes, project updates, decision summaries',
+    defaultTitle: 'Work brief',
     starter:
-      '背景\n\n关键进展\n\n风险与阻塞\n\n下一步\n\n需要决策',
+      'Background\n\nKey progress\n\nRisks and blockers\n\nNext steps\n\nDecisions needed',
     editIntents: [
-      { id: 'executive', label: '高管摘要', instruction: '改成高管可快速扫描的摘要，突出结论、风险和动作。' },
-      { id: 'actionable', label: '行动化', instruction: '把内容改成明确的负责人、动作和截止时间。' },
+      { id: 'executive', label: 'Executive summary', instruction: 'Turn this into a skimmable executive summary that highlights conclusions, risks, and actions.' },
+      { id: 'actionable', label: 'Make actionable', instruction: 'Rewrite the content as clear owners, actions, and deadlines.' },
     ],
   },
   {
     kind: 'email',
-    label: '邮件',
-    description: '客户、供应商、内部沟通',
-    defaultTitle: '邮件草稿',
+    label: 'Email',
+    description: 'Customers, suppliers, internal communication',
+    defaultTitle: 'Email draft',
     starter:
-      '主题：\n\n你好，\n\n正文\n\n谢谢，\n',
+      'Subject:\n\nHi,\n\nBody\n\nThanks,\n',
     editIntents: [
-      { id: 'warmer', label: '更友好', instruction: '语气更友好、专业，但不要啰嗦。' },
-      { id: 'firmer', label: '更坚定', instruction: '语气更明确坚定，同时保持礼貌。' },
+      { id: 'warmer', label: 'Warmer', instruction: 'Make the tone friendlier and professional without being wordy.' },
+      { id: 'firmer', label: 'Firmer', instruction: 'Make the tone clearer and more assertive while staying polite.' },
     ],
   },
   {
     kind: 'report',
-    label: '报告',
-    description: '调研、复盘、分析报告',
-    defaultTitle: '分析报告',
+    label: 'Report',
+    description: 'Research, retrospectives, analysis reports',
+    defaultTitle: 'Analysis report',
     starter:
-      '摘要\n\n背景\n\n发现\n\n分析\n\n建议\n\n附录',
+      'Summary\n\nBackground\n\nFindings\n\nAnalysis\n\nRecommendations\n\nAppendix',
     editIntents: [
-      { id: 'structured', label: '结构化', instruction: '重组结构，使标题层级、论证顺序和结论更清楚。' },
-      { id: 'evidence', label: '补证据', instruction: '指出哪里需要数据、案例或引用支撑，并补出可写入的表达。' },
+      { id: 'structured', label: 'Restructure', instruction: 'Reorganize so the heading hierarchy, line of argument, and conclusions are clearer.' },
+      { id: 'evidence', label: 'Add evidence', instruction: 'Point out where data, examples, or citations are needed and draft wording to fill them in.' },
     ],
   },
   {
     kind: 'proposal',
-    label: '方案',
-    description: '产品、项目、商业方案',
-    defaultTitle: '方案草稿',
+    label: 'Proposal',
+    description: 'Product, project, and business proposals',
+    defaultTitle: 'Proposal draft',
     starter:
-      '目标\n\n现状与问题\n\n方案设计\n\n实施路径\n\n成本与风险\n\n验收标准',
+      'Goals\n\nCurrent state and problems\n\nProposed design\n\nImplementation plan\n\nCosts and risks\n\nAcceptance criteria',
     editIntents: [
-      { id: 'sharpen', label: '强化说服力', instruction: '强化价值主张、取舍理由和落地路径。' },
-      { id: 'risks', label: '补风险', instruction: '补充风险、约束、前置条件和兜底方案。' },
+      { id: 'sharpen', label: 'More persuasive', instruction: 'Strengthen the value proposition, the reasoning behind trade-offs, and the rollout path.' },
+      { id: 'risks', label: 'Add risks', instruction: 'Add risks, constraints, prerequisites, and fallback plans.' },
     ],
   },
   {
     kind: 'social_post',
-    label: '短内容',
-    description: '小红书、朋友圈、社媒帖',
-    defaultTitle: '短内容草稿',
+    label: 'Social post',
+    description: 'Social media posts and short updates',
+    defaultTitle: 'Social post draft',
     starter:
-      '开头钩子：\n\n正文：\n\n互动问题：',
+      'Hook:\n\nBody:\n\nEngagement question:',
     editIntents: [
-      { id: 'hook', label: '强化开头', instruction: '改写开头，让前三秒更抓人，但不要夸张失真。' },
-      { id: 'punchy', label: '更短更有力', instruction: '改得更短、更口语、更有记忆点。' },
+      { id: 'hook', label: 'Stronger hook', instruction: 'Rewrite the opening so it grabs attention in the first few seconds, without exaggerating.' },
+      { id: 'punchy', label: 'Shorter and punchier', instruction: 'Make it shorter, more conversational, and more memorable.' },
     ],
   },
   {
     kind: 'code_note',
-    label: '技术说明',
-    description: 'README、设计说明、接口文档',
-    defaultTitle: '技术说明',
+    label: 'Tech note',
+    description: 'READMEs, design docs, API docs',
+    defaultTitle: 'Tech note',
     starter:
-      '背景\n\n目标\n\n接口/模块\n\n关键流程\n\n边界条件\n\n测试与验证',
+      'Background\n\nGoals\n\nAPIs / modules\n\nKey flows\n\nEdge cases\n\nTesting and verification',
     editIntents: [
-      { id: 'precise', label: '更精确', instruction: '修正含糊表述，让技术边界、输入输出和失败场景更明确。' },
-      { id: 'readme', label: 'README 化', instruction: '改成开发者容易上手的 README 风格。' },
+      { id: 'precise', label: 'More precise', instruction: 'Fix vague wording so technical boundaries, inputs/outputs, and failure cases are explicit.' },
+      { id: 'readme', label: 'README style', instruction: 'Rewrite in a README style that developers can pick up easily.' },
     ],
   },
 ];
@@ -220,7 +220,7 @@ function isHorizontalRule(line: string): boolean {
 function normalizeTitle(value: string): string {
   return value
     .replace(/^#{1,6}\s+/, '')
-    .replace(/^标题\s*[:：]\s*/, '')
+    .replace(/^(?:标题|title)\s*[:：]\s*/i, '')
     .replace(/[*_`~]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -246,6 +246,8 @@ function isGenericCanvasTitle(title: string | undefined, kind: CanvasObjectKind)
     '文章草稿',
     '草稿',
     'draft',
+    'aidraft',
+    'untitled',
   ].includes(normalized);
 }
 
@@ -293,6 +295,13 @@ function isLeadingMetaLine(line: string): boolean {
   if (/^如果.{0,30}(?:没有|未指定).{0,60}(?:我先|默认|先按)/.test(normalized)) {
     return true;
   }
+  // English assistant preludes ("Sure, here's a draft…", "Here is the email:").
+  if (/^(?:sure|of course|certainly|okay|ok|got it)[,.!\s]+(?:here(?:'s|’s| is| are)|i(?:'ll|’ll| will))\b/i.test(normalized)) {
+    return true;
+  }
+  if (/^here(?:'s|’s| is| are)\b.{0,40}\b(?:draft|article|email|report|proposal|version|post|brief)\b.{0,40}[:：]$/i.test(normalized)) {
+    return true;
+  }
   return false;
 }
 
@@ -337,6 +346,8 @@ const TRAILING_META_LABELS = [
   '修改建议',
   '可选调整',
   '温馨提示',
+  'Note',
+  'Notes',
 ];
 
 function hasTrailingMetaLabel(value: string): boolean {
@@ -415,7 +426,7 @@ function titleCandidateFromLine(line: string): string | null {
   const heading = trimmed.match(/^#{1,3}\s+(.+)$/);
   if (heading) return normalizeTitle(heading[1]);
 
-  const labelled = trimmed.match(/^标题\s*[:：]\s*(.+)$/);
+  const labelled = trimmed.match(/^(?:标题|title)\s*[:：]\s*(.+)$/i);
   if (labelled) return normalizeTitle(labelled[1]);
 
   const normalized = normalizeTitle(trimmed);

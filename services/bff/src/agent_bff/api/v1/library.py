@@ -326,7 +326,7 @@ async def create_skill_version(
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(
             status_code=413,
-            detail={"user_message": "技能包超过大小上限 20 MB"},
+            detail={"user_message": "The skill package exceeds the 20 MB size limit."},
         )
     files = {
         "file": (

@@ -1,6 +1,10 @@
 # ADR 0002 — Agent kernel: AgentScope, not OpenHands
 
-- **Status**: Accepted
+> **Superseded by [ADR 0003 — Claude Agent SDK as the sole agent runtime](0003-claude-agent-sdk-sole-agent-runtime.md).**
+> `agentscope-ext/` and the AgentScope sandbox images have been removed.
+> The body below is kept unchanged as a historical record.
+
+- **Status**: Superseded by ADR 0003 (originally Accepted)
 - **Date**: 2026-06
 - **Phase**: pre-B-M2 (decision belongs in B-M1's tail but lands here)
 - **Supersedes**: implicit choice in top-plan revision 1 (OpenHands)

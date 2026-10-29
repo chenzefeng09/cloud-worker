@@ -11,7 +11,7 @@ interface CanvasHtmlPreviewProps {
 
 /**
  * Runs an executable canvas (content_type="html") in an isolated sandbox iframe,
- * with a 预览 / 代码 toggle.
+ * with a Preview / Code toggle.
  *
  * Isolation contract — identical to filePreview's HtmlPreview:
  * `sandbox="allow-scripts"` WITHOUT `allow-same-origin`. With `srcDoc` this puts
@@ -25,7 +25,7 @@ export function CanvasHtmlPreview({ html, title, reloadKey }: CanvasHtmlPreviewP
   const [mode, setMode] = useState<'preview' | 'code'>('preview');
 
   if (!html.trim()) {
-    return <div className="px-4 py-6 font-mono text-[11px] text-dim">生成中…</div>;
+    return <div className="px-4 py-6 font-mono text-[11px] text-dim">Generating…</div>;
   }
 
   const seg = (active: boolean) =>
@@ -42,7 +42,7 @@ export function CanvasHtmlPreview({ html, title, reloadKey }: CanvasHtmlPreviewP
           style={mode === 'preview' ? { borderColor: 'var(--accent)' } : undefined}
           onClick={() => setMode('preview')}
         >
-          预览
+          Preview
         </button>
         <button
           type="button"
@@ -50,7 +50,7 @@ export function CanvasHtmlPreview({ html, title, reloadKey }: CanvasHtmlPreviewP
           style={mode === 'code' ? { borderColor: 'var(--accent)' } : undefined}
           onClick={() => setMode('code')}
         >
-          代码
+          Code
         </button>
       </div>
 
@@ -75,7 +75,7 @@ export function CanvasHtmlPreview({ html, title, reloadKey }: CanvasHtmlPreviewP
       )}
 
       <div className="font-mono text-[10.5px] text-dim">
-        在隔离沙箱中运行，无法访问站点数据。内容需为完整自包含 HTML（内联脚本/样式，勿引用外部资源）。
+        Runs in an isolated sandbox with no access to site data. Content must be complete, self-contained HTML (inline scripts and styles, no external resources).
       </div>
     </div>
   );

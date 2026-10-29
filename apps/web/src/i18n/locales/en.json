@@ -114,7 +114,9 @@
     "delete.confirm": "Delete",
     "delete.cancel": "Cancel",
     "delete.deleting": "Deleting…",
-    "toggle.error": "Toggle failed, please try again"
+    "toggle.error": "Toggle failed, please try again",
+    "error.createFailed": "Couldn’t create the trigger. Please try again later.",
+    "error.deleteFailed": "Couldn’t delete the trigger. Please try again later."
   },
   "audit": {
     "group.identity": "Identity & Users",

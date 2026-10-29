@@ -5,7 +5,7 @@ import { formatDateTimeAuto } from '../../i18n/dates';
 import { groupSteps } from '../../lib/groupSteps';
 import { MessageBubble } from '../../components/MessageBubble';
 import { StepGroup } from '../../components/StepGroup';
-import { formatRelativeTimeZh } from '../../lib/format';
+import { formatRelativeTime } from '../../lib/format';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -20,13 +20,13 @@ function fmtDate(iso: string | null | undefined): string {
   return formatDateTimeAuto(new Date(iso));
 }
 
-function runStatusZh(status: string | null | undefined): string {
+function runStatusLabel(status: string | null | undefined): string {
   switch (status) {
-    case 'PENDING':   return '待执行';
-    case 'RUNNING':   return '运行中';
-    case 'COMPLETED': return '已完成';
-    case 'FAILED':    return '失败';
-    case 'CANCELLED': return '已取消';
+    case 'PENDING':   return 'Pending';
+    case 'RUNNING':   return 'Running';
+    case 'COMPLETED': return 'Completed';
+    case 'FAILED':    return 'Failed';
+    case 'CANCELLED': return 'Cancelled';
     default:          return status ?? '—';
   }
 }
@@ -48,7 +48,7 @@ function ReplayMeta({ session, run }: { session: Session; run: Run }) {
         <b className="text-ink">{run.id.slice(0, 8)}…</b>
       </span>
       <span>
-        <span className="text-dim">状态 </span>
+        <span className="text-dim">Status </span>
         <b
           style={{
             color:
@@ -59,15 +59,15 @@ function ReplayMeta({ session, run }: { session: Session; run: Run }) {
                   : 'var(--ink)',
           }}
         >
-          {runStatusZh(run.status)}
+          {runStatusLabel(run.status)}
         </b>
       </span>
       <span>
-        <span className="text-dim">开始 </span>
+        <span className="text-dim">Started </span>
         {fmtDate(run.started_at)}
       </span>
       <span>
-        <span className="text-dim">结束 </span>
+        <span className="text-dim">Finished </span>
         {fmtDate(run.finished_at)}
       </span>
       <span>
@@ -78,7 +78,7 @@ function ReplayMeta({ session, run }: { session: Session; run: Run }) {
       </span>
       {session.title && (
         <span>
-          <span className="text-dim">标题 </span>
+          <span className="text-dim">Title </span>
           <b className="text-ink">{session.title}</b>
         </span>
       )}
@@ -93,7 +93,7 @@ function ReplayTranscript({ messages }: { messages: Message[] }) {
   if (units.length === 0) {
     return (
       <div className="flex-1 flex items-center justify-center text-dim font-mono text-[12px] italic">
-        该 run 无消息记录
+        This run has no messages
       </div>
     );
   }
@@ -132,7 +132,7 @@ function RunPicker({
 }) {
   if (runs.length === 0) {
     return (
-      <div className="font-mono text-[12px] italic text-dim px-1">该 session 暂无 run</div>
+      <div className="font-mono text-[12px] italic text-dim px-1">This session has no runs</div>
     );
   }
   return (
@@ -165,10 +165,10 @@ function RunPicker({
                 ●
               </span>
               <span className="text-dim text-[10.5px]">{r.id.slice(0, 8)}</span>
-              <span className="text-dim text-[10.5px] ml-auto">{formatRelativeTimeZh(r.created_at)}</span>
+              <span className="text-dim text-[10.5px] ml-auto">{formatRelativeTime(r.created_at)}</span>
             </div>
             <div className="text-[10.5px] text-dim mt-0.5 truncate">
-              {runStatusZh(r.status)} · {fmtTokens(r.total_tokens)} tok
+              {runStatusLabel(r.status)} · {fmtTokens(r.total_tokens)} tok
             </div>
           </button>
         );
@@ -204,12 +204,12 @@ function SessionSearch({
       <input
         value={searchText}
         onChange={(e) => onSearchChange(e.target.value)}
-        placeholder="搜索 session ID 或标题…"
+        placeholder="Search session ID or title…"
         className="w-full border border-line rounded-sm px-2 py-1.5 text-[12px] font-mono bg-paper focus:outline-none focus:border-accent"
       />
       <div className="flex flex-col gap-0.5 max-h-[220px] overflow-y-auto">
         {filtered.length === 0 && (
-          <div className="font-mono text-[11px] italic text-dim px-1">无匹配 session</div>
+          <div className="font-mono text-[11px] italic text-dim px-1">No matching sessions</div>
         )}
         {filtered.map((s) => {
           const active = s.id === selectedId;
@@ -225,10 +225,10 @@ function SessionSearch({
               }}
             >
               <div className="text-[12px] font-mono truncate">
-                {s.title || '未命名任务'}
+                {s.title || 'Untitled task'}
               </div>
               <div className="text-[10.5px] font-mono text-dim truncate">
-                {s.id.slice(0, 12)}… · {formatRelativeTimeZh(s.updated_at)}
+                {s.id.slice(0, 12)}… · {formatRelativeTime(s.updated_at)}
               </div>
             </button>
           );
@@ -336,7 +336,7 @@ export function SessionReplayPage() {
         );
         setMessages(filtered);
       } catch (err) {
-        setMessagesError((err as Error).message ?? '加载失败');
+        setMessagesError((err as Error).message ?? 'Failed to load');
         setMessages([]);
       } finally {
         setMessagesLoading(false);
@@ -357,10 +357,10 @@ export function SessionReplayPage() {
         {/* Header */}
         <div className="px-4 py-3 border-b border-line shrink-0">
           <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim mb-2.5">
-            会话回放
+            Session replay
           </div>
           {sessionsLoading ? (
-            <div className="font-mono text-[11px] text-dim animate-pulse">加载中…</div>
+            <div className="font-mono text-[11px] text-dim animate-pulse">Loading…</div>
           ) : (
             <SessionSearch
               sessions={sessions}
@@ -379,7 +379,7 @@ export function SessionReplayPage() {
               Runs
             </div>
             {runsLoading ? (
-              <div className="font-mono text-[11px] text-dim animate-pulse">加载中…</div>
+              <div className="font-mono text-[11px] text-dim animate-pulse">Loading…</div>
             ) : (
               <RunPicker
                 runs={runs}
@@ -396,7 +396,7 @@ export function SessionReplayPage() {
         {!selectedSessionId && (
           <div className="flex-1 flex flex-col items-center justify-center gap-2">
             <span className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-              选择左侧 session 开始回放
+              Select a session on the left to start replay
             </span>
           </div>
         )}
@@ -404,7 +404,7 @@ export function SessionReplayPage() {
         {selectedSessionId && !selectedRunId && (
           <div className="flex-1 flex flex-col items-center justify-center gap-2">
             <span className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-              选择左侧 run 加载对话记录
+              Select a run on the left to load its transcript
             </span>
           </div>
         )}
@@ -417,18 +417,18 @@ export function SessionReplayPage() {
             {/* Read-only tag */}
             <div className="px-5 py-1.5 shrink-0 flex items-center gap-2 border-b border-line-2 bg-paper">
               <span className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">
-                只读回放
+                Read-only replay
               </span>
               <span className="font-mono text-[10px] text-dim">·</span>
               <span className="font-mono text-[10px] text-dim">
-                {messages.length} 条消息
+                {messages.length} {messages.length === 1 ? 'message' : 'messages'}
               </span>
             </div>
 
             {/* Transcript */}
             {messagesLoading ? (
               <div className="flex-1 flex items-center justify-center font-mono text-[12px] text-dim animate-pulse">
-                加载对话记录…
+                Loading transcript…
               </div>
             ) : messagesError ? (
               <div className="flex-1 flex items-center justify-center px-8">

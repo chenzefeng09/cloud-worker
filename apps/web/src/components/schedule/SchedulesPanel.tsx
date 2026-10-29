@@ -198,7 +198,7 @@ export function SchedulesPanel() {
       setDeleteTarget(null);
       refresh();
     } catch (e) {
-      setDeleteError(e instanceof ApiError ? e.message : '删除失败，请稍后重试');
+      setDeleteError(e instanceof ApiError ? e.message : t('schedules.error.deleteFailed'));
     } finally {
       setDeleteBusy(false);
     }

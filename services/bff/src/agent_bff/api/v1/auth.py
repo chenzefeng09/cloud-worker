@@ -94,8 +94,8 @@ def _raise_for_upstream(resp: httpx.Response) -> None:
     document nested under ``detail["detail"]``).  This routes through the BFF's
     problem+json machinery so the SPA shows a friendly message (wrong current
     password, SSO account, weak password) instead of a raw JSON blob.  Header
-    transport is avoided on purpose — ``user_message`` is frequently non-ASCII
-    (Chinese) and HTTP header values are latin-1.
+    transport is avoided on purpose — ``user_message`` may be non-ASCII
+    (upstream text) and HTTP header values are latin-1.
     """
     if resp.status_code >= 400:
         try:
