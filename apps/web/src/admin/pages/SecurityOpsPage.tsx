@@ -74,14 +74,14 @@ function SlaTab({ tenantId }: { tenantId: string | null }) {
     api.admin.securityOps.vulnerabilities
       .slaDashboard(tenantId ?? undefined)
       .then(setData)
-      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : '加载失败'); })
+      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : 'Failed to load'); })
       .finally(() => setLoading(false));
   }, [tenantId]);
 
-  if (loading) return <div className="font-mono text-[12px] text-dim">加载中…</div>;
-  if (todo) return <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">该能力暂未启用：安全运营端点不可达。</div>;
+  if (loading) return <div className="font-mono text-[12px] text-dim">Loading…</div>;
+  if (todo) return <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">Not available yet: the security-ops endpoint is unreachable.</div>;
   if (error) return <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>;
-  if (!data) return <div className="font-mono text-[12px] text-dim italic">暂无数据</div>;
+  if (!data) return <div className="font-mono text-[12px] text-dim italic">No data</div>;
 
   const overdue = data.overdue_by_severity ?? {};
   const byOwner = data.by_owner ?? {};
@@ -91,7 +91,7 @@ function SlaTab({ tenantId }: { tenantId: string | null }) {
     <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
       {/* Overdue by severity */}
       <div className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">逾期分级</div>
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Overdue by severity</div>
         {SEVERITIES.map((s) => (
           <div key={s} className="flex items-center justify-between text-[13px]">
             <span className={`font-mono text-[11px] ${severityClass(s)}`}>{s}</span>
@@ -102,7 +102,7 @@ function SlaTab({ tenantId }: { tenantId: string | null }) {
 
       {/* MTTR */}
       <div className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">各级 MTTR（天）</div>
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">MTTR by severity (days)</div>
         {SEVERITIES.map((s) => (
           <div key={s} className="flex items-center justify-between text-[13px]">
             <span className={`font-mono text-[11px] ${severityClass(s)}`}>{s}</span>
@@ -115,9 +115,9 @@ function SlaTab({ tenantId }: { tenantId: string | null }) {
 
       {/* By owner */}
       <div className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">按责任人逾期</div>
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Overdue by owner</div>
         {Object.keys(byOwner).length === 0 ? (
-          <div className="font-mono text-[12px] text-dim italic">暂无</div>
+          <div className="font-mono text-[12px] text-dim italic">None</div>
         ) : (
           Object.entries(byOwner).map(([owner, sevs]) => (
             <div key={owner} className="flex items-center justify-between text-[12px]">
@@ -176,7 +176,7 @@ function VulnsTab({ tenantId }: { tenantId: string | null }) {
     api.admin.securityOps.vulnerabilities
       .list(params, tenantId ?? undefined)
       .then(setItems)
-      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : '加载失败'); })
+      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : 'Failed to load'); })
       .finally(() => setLoading(false));
   }, [tenantId, fSeverity, fStatus, fSource]);
 
@@ -200,11 +200,11 @@ function VulnsTab({ tenantId }: { tenantId: string | null }) {
         { status: editStatus.trim(), assignee: editAssignee.trim(), fix_pr_url: editPr.trim(), notes_md: editNotes },
         tenantId ?? undefined,
       );
-      toast.success('已更新漏洞');
+      toast.success('Vulnerability updated');
       setActive(null);
       refresh();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '更新失败');
+      toast.error(err instanceof ApiError ? err.message : 'Failed to update');
     } finally {
       setSaving(false);
     }
@@ -213,7 +213,7 @@ function VulnsTab({ tenantId }: { tenantId: string | null }) {
   const handleRiskAccept = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!raTarget?.id) return;
-    if (raRationale.trim().length < 20) { setRaError('理由至少需 20 个字符'); return; }
+    if (raRationale.trim().length < 20) { setRaError('Rationale must be at least 20 characters'); return; }
     setRaBusy(true);
     setRaError(null);
     try {
@@ -223,11 +223,11 @@ function VulnsTab({ tenantId }: { tenantId: string | null }) {
         expires_at: raExpires.trim() || null,
       };
       await api.admin.securityOps.vulnerabilities.riskAccept(raTarget.id, body, tenantId ?? undefined);
-      toast.success('已记录风险接受');
+      toast.success('Risk acceptance recorded');
       setRaTarget(null); setRaRationale(''); setRaMitigations(''); setRaExpires('');
       refresh();
     } catch (err) {
-      setRaError(err instanceof ApiError ? err.message : '操作失败');
+      setRaError(err instanceof ApiError ? err.message : 'Operation failed');
     } finally {
       setRaBusy(false);
     }
@@ -240,7 +240,7 @@ function VulnsTab({ tenantId }: { tenantId: string | null }) {
         <div className="flex flex-col gap-1">
           <label className="text-[11px] text-dim font-mono">severity</label>
           <CustomSelect
-            options={[{ value: '', label: '全部' }, ...SEVERITIES.map((s) => ({ value: s, label: s }))]}
+            options={[{ value: '', label: 'All' }, ...SEVERITIES.map((s) => ({ value: s, label: s }))]}
             value={fSeverity}
             onChange={(v) => setFSeverity(v)}
           />
@@ -253,24 +253,24 @@ function VulnsTab({ tenantId }: { tenantId: string | null }) {
           <label className="text-[11px] text-dim font-mono">source</label>
           <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono w-[140px]" value={fSource} onChange={(e) => setFSource(e.target.value)} placeholder="trivy" />
         </div>
-        <button onClick={refresh} className="px-2.5 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">应用过滤</button>
+        <button onClick={refresh} className="px-2.5 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">Apply filters</button>
       </div>
 
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
-      {todo && <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">该能力暂未启用：安全运营端点不可达。</div>}
-      {!loading && !todo && items.length === 0 && <div className="font-mono text-[12px] text-dim italic">暂无漏洞记录</div>}
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
+      {todo && <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">Not available yet: the security-ops endpoint is unreachable.</div>}
+      {!loading && !todo && items.length === 0 && <div className="font-mono text-[12px] text-dim italic">No vulnerabilities</div>}
       {!loading && !todo && items.length > 0 && (
         <div className="border border-line rounded-md overflow-hidden">
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
               <tr>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">CVE</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">标题</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">级别</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Title</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Severity</th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">CVSS</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">到期</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Due</th>
                 <th className="px-3 py-2 w-40"></th>
               </tr>
             </thead>
@@ -284,8 +284,8 @@ function VulnsTab({ tenantId }: { tenantId: string | null }) {
                   <td className="px-3 py-2 font-mono text-[11px] text-ink-2">{v.status ?? '—'}</td>
                   <td className="px-3 py-2 font-mono text-[11px] text-dim">{fmt(v.due_at)}</td>
                   <td className="px-3 py-2 flex items-center gap-2">
-                    <button onClick={() => openDetail(v)} className="text-[11px] font-mono text-ink-2 border border-line rounded-sm px-2 py-0.5 hover:bg-paper-2">详情</button>
-                    <button onClick={() => { setRaTarget(v); setRaError(null); }} className="text-[11px] font-mono text-amber-700 border border-amber-200 rounded-sm px-2 py-0.5 hover:bg-amber-50">风险接受</button>
+                    <button onClick={() => openDetail(v)} className="text-[11px] font-mono text-ink-2 border border-line rounded-sm px-2 py-0.5 hover:bg-paper-2">Details</button>
+                    <button onClick={() => { setRaTarget(v); setRaError(null); }} className="text-[11px] font-mono text-amber-700 border border-amber-200 rounded-sm px-2 py-0.5 hover:bg-amber-50">Accept risk</button>
                   </td>
                 </tr>
               ))}
@@ -298,31 +298,31 @@ function VulnsTab({ tenantId }: { tenantId: string | null }) {
       {active && (
         <div className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 max-w-2xl">
           <div className="flex items-center justify-between">
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">漏洞详情 · {active.cve_id ?? active.id}</div>
-            <button onClick={() => setActive(null)} className="text-[11px] font-mono text-dim hover:text-ink">关闭</button>
+            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Vulnerability · {active.cve_id ?? active.id}</div>
+            <button onClick={() => setActive(null)} className="text-[11px] font-mono text-dim hover:text-ink">Close</button>
           </div>
           <div className="text-[12px] text-ink-2">{active.title ?? '—'}</div>
-          <div className="font-mono text-[11px] text-dim">受影响包：{active.package_affected ?? '—'}</div>
+          <div className="font-mono text-[11px] text-dim">Affected package: {active.package_affected ?? '—'}</div>
           <div className="grid grid-cols-2 gap-2">
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">状态</label>
+              <label className="text-[11px] text-dim font-mono">Status</label>
               <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={editStatus} onChange={(e) => setEditStatus(e.target.value)} />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">负责人</label>
+              <label className="text-[11px] text-dim font-mono">Owner</label>
               <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={editAssignee} onChange={(e) => setEditAssignee(e.target.value)} />
             </div>
           </div>
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">修复 PR 链接</label>
+            <label className="text-[11px] text-dim font-mono">Fix PR link</label>
             <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={editPr} onChange={(e) => setEditPr(e.target.value)} />
           </div>
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">备注 (Markdown)</label>
+            <label className="text-[11px] text-dim font-mono">Notes (Markdown)</label>
             <textarea className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent resize-y min-h-[80px] font-mono" value={editNotes} onChange={(e) => setEditNotes(e.target.value)} />
           </div>
           <div>
-            <button onClick={handleSave} disabled={saving} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{saving ? '保存中…' : '保存'}</button>
+            <button onClick={handleSave} disabled={saving} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{saving ? 'Saving…' : 'Save'}</button>
           </div>
         </div>
       )}
@@ -331,26 +331,26 @@ function VulnsTab({ tenantId }: { tenantId: string | null }) {
       {raTarget && (
         <form onSubmit={handleRiskAccept} className="border border-amber-200 bg-amber-50/40 rounded-md p-4 flex flex-col gap-2 max-w-2xl">
           <div className="flex items-center justify-between">
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">风险接受 · {raTarget.cve_id ?? raTarget.id}</div>
-            <button type="button" onClick={() => setRaTarget(null)} className="text-[11px] font-mono text-dim hover:text-ink">取消</button>
+            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Accept risk · {raTarget.cve_id ?? raTarget.id}</div>
+            <button type="button" onClick={() => setRaTarget(null)} className="text-[11px] font-mono text-dim hover:text-ink">Cancel</button>
           </div>
           {raError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{raError}</div>}
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">接受理由 (≥20 字符)</label>
-            <textarea className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent resize-y min-h-[60px]" value={raRationale} onChange={(e) => setRaRationale(e.target.value)} placeholder="说明为何接受该风险…" />
+            <label className="text-[11px] text-dim font-mono">Rationale (≥20 characters)</label>
+            <textarea className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent resize-y min-h-[60px]" value={raRationale} onChange={(e) => setRaRationale(e.target.value)} placeholder="Explain why this risk is being accepted…" />
           </div>
           <div className="grid grid-cols-2 gap-2">
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">缓解措施 (逗号分隔)</label>
-              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={raMitigations} onChange={(e) => setRaMitigations(e.target.value)} placeholder="WAF 规则, 监控告警" />
+              <label className="text-[11px] text-dim font-mono">Mitigations (comma-separated)</label>
+              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={raMitigations} onChange={(e) => setRaMitigations(e.target.value)} placeholder="WAF rule, monitoring alert" />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">到期时间 (可选, ISO)</label>
+              <label className="text-[11px] text-dim font-mono">Expires at (optional, ISO)</label>
               <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={raExpires} onChange={(e) => setRaExpires(e.target.value)} placeholder="2026-12-31T00:00:00Z" />
             </div>
           </div>
           <div>
-            <button type="submit" disabled={raBusy} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{raBusy ? '提交中…' : '确认接受'}</button>
+            <button type="submit" disabled={raBusy} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{raBusy ? 'Submitting…' : 'Accept risk'}</button>
           </div>
         </form>
       )}
@@ -399,7 +399,7 @@ function IncidentsTab({ tenantId }: { tenantId: string | null }) {
     api.admin.securityOps.incidents
       .list(tenantId ?? undefined)
       .then(setItems)
-      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : '加载失败'); })
+      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : 'Failed to load'); })
       .finally(() => setLoading(false));
   }, [tenantId]);
 
@@ -416,11 +416,11 @@ function IncidentsTab({ tenantId }: { tenantId: string | null }) {
         { severity, category, title: title.trim(), ic: ic.trim() || null, affected_tenants: csv(affected) },
         tenantId ?? undefined,
       );
-      toast.success('已创建安全事件');
+      toast.success('Incident created');
       setTitle(''); setIc(''); setAffected(''); setCreating(false);
       refresh();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '创建失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to create');
     } finally {
       setBusy(false);
     }
@@ -443,11 +443,11 @@ function IncidentsTab({ tenantId }: { tenantId: string | null }) {
         { status: eStatus.trim(), ic: eIc.trim(), customers_notified: eCust, regulators_notified: eReg },
         tenantId ?? undefined,
       );
-      toast.success('已更新事件');
+      toast.success('Incident updated');
       setActive(null);
       refresh();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '更新失败');
+      toast.error(err instanceof ApiError ? err.message : 'Failed to update');
     } finally {
       setSaving(false);
     }
@@ -456,8 +456,8 @@ function IncidentsTab({ tenantId }: { tenantId: string | null }) {
   const handleResolve = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!resTarget?.id) return;
-    if (rootCause.trim().length < 20) { setResError('根因描述至少需 20 个字符'); return; }
-    if (!pirKey.trim()) { setResError('请填写 PIR S3 Key'); return; }
+    if (rootCause.trim().length < 20) { setResError('Root cause must be at least 20 characters'); return; }
+    if (!pirKey.trim()) { setResError('Enter the PIR S3 key'); return; }
     setResBusy(true);
     setResError(null);
     try {
@@ -466,11 +466,11 @@ function IncidentsTab({ tenantId }: { tenantId: string | null }) {
         { root_cause: rootCause.trim(), pir_s3_key: pirKey.trim() },
         tenantId ?? undefined,
       );
-      toast.success('事件已闭环');
+      toast.success('Incident resolved');
       setResTarget(null); setRootCause(''); setPirKey('');
       refresh();
     } catch (err) {
-      setResError(err instanceof ApiError ? err.message : '操作失败');
+      setResError(err instanceof ApiError ? err.message : 'Operation failed');
     } finally {
       setResBusy(false);
     }
@@ -479,16 +479,16 @@ function IncidentsTab({ tenantId }: { tenantId: string | null }) {
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">安全事件</div>
-        {!creating && <button onClick={() => setCreating(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ 新建事件</button>}
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Security incidents</div>
+        {!creating && <button onClick={() => setCreating(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ New incident</button>}
       </div>
 
       {creating && (
-        <Dialog title="新建安全事件" onClose={() => setCreating(false)} dismissable={!busy} className="w-full max-w-2xl">
+        <Dialog title="New security incident" onClose={() => setCreating(false)} dismissable={!busy} className="w-full max-w-2xl">
           <form onSubmit={handleCreate} className="flex flex-col gap-2">
             <div className="grid grid-cols-2 gap-2">
               <div className="flex flex-col gap-1">
-                <label className="text-[11px] text-dim font-mono">级别</label>
+                <label className="text-[11px] text-dim font-mono">Severity</label>
                 <CustomSelect
                   options={SEVERITIES.map((s) => ({ value: s, label: s }))}
                   value={severity}
@@ -496,7 +496,7 @@ function IncidentsTab({ tenantId }: { tenantId: string | null }) {
                 />
               </div>
               <div className="flex flex-col gap-1">
-                <label className="text-[11px] text-dim font-mono">类别</label>
+                <label className="text-[11px] text-dim font-mono">Category</label>
                 <CustomSelect
                   options={INCIDENT_CATEGORIES.map((c) => ({ value: c, label: c }))}
                   value={category}
@@ -505,41 +505,41 @@ function IncidentsTab({ tenantId }: { tenantId: string | null }) {
               </div>
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">标题</label>
-              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="生产数据库异常访问" />
+              <label className="text-[11px] text-dim font-mono">Title</label>
+              <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Unusual access to production database" />
             </div>
             <div className="grid grid-cols-2 gap-2">
               <div className="flex flex-col gap-1">
-                <label className="text-[11px] text-dim font-mono">事件指挥 (IC, 可选)</label>
+                <label className="text-[11px] text-dim font-mono">Incident commander (IC, optional)</label>
                 <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={ic} onChange={(e) => setIc(e.target.value)} />
               </div>
               <div className="flex flex-col gap-1">
-                <label className="text-[11px] text-dim font-mono">受影响租户 (逗号分隔)</label>
+                <label className="text-[11px] text-dim font-mono">Affected tenants (comma-separated)</label>
                 <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={affected} onChange={(e) => setAffected(e.target.value)} />
               </div>
             </div>
             <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setCreating(false)} disabled={busy} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50">取消</button>
-              <button type="submit" disabled={busy || !title.trim()} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{busy ? '创建中…' : '创建'}</button>
+              <button type="button" onClick={() => setCreating(false)} disabled={busy} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50">Cancel</button>
+              <button type="submit" disabled={busy || !title.trim()} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{busy ? 'Creating…' : 'Create'}</button>
             </div>
           </form>
         </Dialog>
       )}
 
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
-      {todo && <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">该能力暂未启用：安全运营端点不可达。</div>}
-      {!loading && !todo && items.length === 0 && <div className="font-mono text-[12px] text-dim italic">暂无安全事件</div>}
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
+      {todo && <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">Not available yet: the security-ops endpoint is unreachable.</div>}
+      {!loading && !todo && items.length === 0 && <div className="font-mono text-[12px] text-dim italic">No security incidents</div>}
       {!loading && !todo && items.length > 0 && (
         <div className="border border-line rounded-md overflow-hidden">
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
               <tr>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">级别</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">类别</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">标题</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">发现时间</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Severity</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Category</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Title</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Detected at</th>
                 <th className="px-3 py-2 w-40"></th>
               </tr>
             </thead>
@@ -552,8 +552,8 @@ function IncidentsTab({ tenantId }: { tenantId: string | null }) {
                   <td className="px-3 py-2 font-mono text-[11px] text-ink-2">{inc.status ?? '—'}</td>
                   <td className="px-3 py-2 font-mono text-[11px] text-dim">{fmt(inc.detected_at)}</td>
                   <td className="px-3 py-2 flex items-center gap-2">
-                    <button onClick={() => openDetail(inc)} className="text-[11px] font-mono text-ink-2 border border-line rounded-sm px-2 py-0.5 hover:bg-paper-2">详情</button>
-                    <button onClick={() => { setResTarget(inc); setResError(null); }} className="text-[11px] font-mono text-green-700 border border-green-200 rounded-sm px-2 py-0.5 hover:bg-green-50">闭环</button>
+                    <button onClick={() => openDetail(inc)} className="text-[11px] font-mono text-ink-2 border border-line rounded-sm px-2 py-0.5 hover:bg-paper-2">Details</button>
+                    <button onClick={() => { setResTarget(inc); setResError(null); }} className="text-[11px] font-mono text-green-700 border border-green-200 rounded-sm px-2 py-0.5 hover:bg-green-50">Resolve</button>
                   </td>
                 </tr>
               ))}
@@ -566,27 +566,27 @@ function IncidentsTab({ tenantId }: { tenantId: string | null }) {
       {active && (
         <div className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 max-w-2xl">
           <div className="flex items-center justify-between">
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">事件详情 · {active.title}</div>
-            <button onClick={() => setActive(null)} className="text-[11px] font-mono text-dim hover:text-ink">关闭</button>
+            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Incident · {active.title}</div>
+            <button onClick={() => setActive(null)} className="text-[11px] font-mono text-dim hover:text-ink">Close</button>
           </div>
           <div className="grid grid-cols-2 gap-2">
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">状态</label>
+              <label className="text-[11px] text-dim font-mono">Status</label>
               <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={eStatus} onChange={(e) => setEStatus(e.target.value)} />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">事件指挥 (IC)</label>
+              <label className="text-[11px] text-dim font-mono">Incident commander (IC)</label>
               <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={eIc} onChange={(e) => setEIc(e.target.value)} />
             </div>
           </div>
           <label className="flex items-center gap-2 text-[12px] text-ink-2">
-            <input type="checkbox" checked={eCust} onChange={(e) => setECust(e.target.checked)} /> 已通知客户
+            <input type="checkbox" checked={eCust} onChange={(e) => setECust(e.target.checked)} /> Customers notified
           </label>
           <label className="flex items-center gap-2 text-[12px] text-ink-2">
-            <input type="checkbox" checked={eReg} onChange={(e) => setEReg(e.target.checked)} /> 已通知监管
+            <input type="checkbox" checked={eReg} onChange={(e) => setEReg(e.target.checked)} /> Regulators notified
           </label>
           <div>
-            <button onClick={handleSave} disabled={saving} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{saving ? '保存中…' : '保存'}</button>
+            <button onClick={handleSave} disabled={saving} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{saving ? 'Saving…' : 'Save'}</button>
           </div>
         </div>
       )}
@@ -595,20 +595,20 @@ function IncidentsTab({ tenantId }: { tenantId: string | null }) {
       {resTarget && (
         <form onSubmit={handleResolve} className="border border-green-200 bg-green-50/40 rounded-md p-4 flex flex-col gap-2 max-w-2xl">
           <div className="flex items-center justify-between">
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">闭环事件 · {resTarget.title}</div>
-            <button type="button" onClick={() => setResTarget(null)} className="text-[11px] font-mono text-dim hover:text-ink">取消</button>
+            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Resolve incident · {resTarget.title}</div>
+            <button type="button" onClick={() => setResTarget(null)} className="text-[11px] font-mono text-dim hover:text-ink">Cancel</button>
           </div>
           {resError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{resError}</div>}
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">根因 (≥20 字符)</label>
+            <label className="text-[11px] text-dim font-mono">Root cause (≥20 characters)</label>
             <textarea className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent resize-y min-h-[60px]" value={rootCause} onChange={(e) => setRootCause(e.target.value)} />
           </div>
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">PIR 报告 S3 Key</label>
+            <label className="text-[11px] text-dim font-mono">PIR report S3 key</label>
             <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={pirKey} onChange={(e) => setPirKey(e.target.value)} placeholder="pir/2026/inc-123.md" />
           </div>
           <div>
-            <button type="submit" disabled={resBusy} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{resBusy ? '提交中…' : '确认闭环'}</button>
+            <button type="submit" disabled={resBusy} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{resBusy ? 'Submitting…' : 'Resolve'}</button>
           </div>
         </form>
       )}
@@ -631,26 +631,26 @@ function ScansTab({ tenantId }: { tenantId: string | null }) {
     api.admin.securityOps.scans
       .runs(tenantId ?? undefined)
       .then(setItems)
-      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : '加载失败'); })
+      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : 'Failed to load'); })
       .finally(() => setLoading(false));
   }, [tenantId]);
 
-  if (loading) return <div className="font-mono text-[12px] text-dim">加载中…</div>;
-  if (todo) return <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">该能力暂未启用：安全运营端点不可达。</div>;
+  if (loading) return <div className="font-mono text-[12px] text-dim">Loading…</div>;
+  if (todo) return <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">Not available yet: the security-ops endpoint is unreachable.</div>;
   if (error) return <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>;
-  if (items.length === 0) return <div className="font-mono text-[12px] text-dim italic">暂无扫描记录</div>;
+  if (items.length === 0) return <div className="font-mono text-[12px] text-dim italic">No scans</div>;
 
   return (
     <div className="border border-line rounded-md overflow-hidden">
       <table className="w-full text-left border-collapse">
         <thead className="bg-paper-2 border-b border-line">
           <tr>
-            <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">类型</th>
-            <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">工具</th>
-            <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">目标</th>
-            <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
-            <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">开始时间</th>
-            <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">发现数</th>
+            <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Type</th>
+            <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Tool</th>
+            <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Target</th>
+            <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
+            <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Started at</th>
+            <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Findings</th>
           </tr>
         </thead>
         <tbody>
@@ -692,7 +692,7 @@ function SbomTab({ tenantId }: { tenantId: string | null }) {
     api.admin.securityOps.sbom
       .watchList(tenantId ?? undefined)
       .then(setItems)
-      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : '加载失败'); })
+      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : 'Failed to load'); })
       .finally(() => setLoading(false));
   }, [tenantId]);
 
@@ -709,11 +709,11 @@ function SbomTab({ tenantId }: { tenantId: string | null }) {
         { image_ref: imageRef.trim(), notify: csv(notify) },
         tenantId ?? undefined,
       );
-      toast.success('已注册 SBOM 监控');
+      toast.success('SBOM monitor registered');
       setImageRef(''); setNotify(''); setCreating(false);
       refresh();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '注册失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to register');
     } finally {
       setBusy(false);
     }
@@ -722,42 +722,42 @@ function SbomTab({ tenantId }: { tenantId: string | null }) {
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">SBOM 监控</div>
-        {!creating && <button onClick={() => setCreating(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ 注册镜像</button>}
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">SBOM monitoring</div>
+        {!creating && <button onClick={() => setCreating(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ Register image</button>}
       </div>
 
       {creating && (
-        <Dialog title="注册镜像" onClose={() => setCreating(false)} dismissable={!busy} className="w-full max-w-xl">
+        <Dialog title="Register image" onClose={() => setCreating(false)} dismissable={!busy} className="w-full max-w-xl">
           <form onSubmit={handleCreate} className="flex flex-col gap-2">
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">镜像引用</label>
+              <label className="text-[11px] text-dim font-mono">Image reference</label>
               <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={imageRef} onChange={(e) => setImageRef(e.target.value)} placeholder="registry.acme.co/app:1.2.3" />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">通知对象 (逗号分隔)</label>
+              <label className="text-[11px] text-dim font-mono">Notify (comma-separated)</label>
               <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={notify} onChange={(e) => setNotify(e.target.value)} placeholder="secops@acme.co" />
             </div>
             <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setCreating(false)} disabled={busy} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50">取消</button>
-              <button type="submit" disabled={busy || !imageRef.trim()} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{busy ? '注册中…' : '注册'}</button>
+              <button type="button" onClick={() => setCreating(false)} disabled={busy} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50">Cancel</button>
+              <button type="submit" disabled={busy || !imageRef.trim()} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{busy ? 'Registering…' : 'Register'}</button>
             </div>
           </form>
         </Dialog>
       )}
 
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
-      {todo && <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">该能力暂未启用：安全运营端点不可达。</div>}
-      {!loading && !todo && items.length === 0 && <div className="font-mono text-[12px] text-dim italic">暂无监控镜像</div>}
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
+      {todo && <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">Not available yet: the security-ops endpoint is unreachable.</div>}
+      {!loading && !todo && items.length === 0 && <div className="font-mono text-[12px] text-dim italic">No monitored images</div>}
       {!loading && !todo && items.length > 0 && (
         <div className="border border-line rounded-md overflow-hidden">
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
               <tr>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">镜像</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">注册时间</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">上次扫描</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">新增 CVE</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Image</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Registered at</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Last scan</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">New CVEs</th>
               </tr>
             </thead>
             <tbody>
@@ -801,7 +801,7 @@ function DrillsTab({ tenantId }: { tenantId: string | null }) {
     api.admin.securityOps.drills
       .list(tenantId ?? undefined)
       .then(setItems)
-      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : '加载失败'); })
+      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : 'Failed to load'); })
       .finally(() => setLoading(false));
   }, [tenantId]);
 
@@ -810,7 +810,7 @@ function DrillsTab({ tenantId }: { tenantId: string | null }) {
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!scheduledAt.trim()) { setError('请填写计划时间'); return; }
+    if (!scheduledAt.trim()) { setError('Enter a scheduled time'); return; }
     setBusy(true);
     setError(null);
     try {
@@ -823,11 +823,11 @@ function DrillsTab({ tenantId }: { tenantId: string | null }) {
         },
         tenantId ?? undefined,
       );
-      toast.success('已安排演练');
+      toast.success('Drill scheduled');
       setScheduledAt(''); setParticipants(''); setRunbook(''); setCreating(false);
       refresh();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '安排失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to schedule');
     } finally {
       setBusy(false);
     }
@@ -836,16 +836,16 @@ function DrillsTab({ tenantId }: { tenantId: string | null }) {
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">演练</div>
-        {!creating && <button onClick={() => setCreating(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ 安排演练</button>}
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Drills</div>
+        {!creating && <button onClick={() => setCreating(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ Schedule drill</button>}
       </div>
 
       {creating && (
-        <Dialog title="安排演练" onClose={() => setCreating(false)} dismissable={!busy} className="w-full max-w-2xl">
+        <Dialog title="Schedule drill" onClose={() => setCreating(false)} dismissable={!busy} className="w-full max-w-2xl">
           <form onSubmit={handleCreate} className="flex flex-col gap-2">
             <div className="grid grid-cols-2 gap-2">
               <div className="flex flex-col gap-1">
-                <label className="text-[11px] text-dim font-mono">类型</label>
+                <label className="text-[11px] text-dim font-mono">Type</label>
                 <CustomSelect
                   options={DRILL_KINDS.map((k) => ({ value: k, label: k }))}
                   value={kind}
@@ -853,39 +853,39 @@ function DrillsTab({ tenantId }: { tenantId: string | null }) {
                 />
               </div>
               <div className="flex flex-col gap-1">
-                <label className="text-[11px] text-dim font-mono">计划时间 (ISO)</label>
+                <label className="text-[11px] text-dim font-mono">Scheduled at (ISO)</label>
                 <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={scheduledAt} onChange={(e) => setScheduledAt(e.target.value)} placeholder="2026-07-01T10:00:00Z" />
               </div>
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">参与者 (逗号分隔)</label>
+              <label className="text-[11px] text-dim font-mono">Participants (comma-separated)</label>
               <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={participants} onChange={(e) => setParticipants(e.target.value)} placeholder="alice, bob" />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">场景 Runbook (可选)</label>
+              <label className="text-[11px] text-dim font-mono">Scenario runbook (optional)</label>
               <input className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono" value={runbook} onChange={(e) => setRunbook(e.target.value)} />
             </div>
             <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setCreating(false)} disabled={busy} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50">取消</button>
-              <button type="submit" disabled={busy} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{busy ? '提交中…' : '安排'}</button>
+              <button type="button" onClick={() => setCreating(false)} disabled={busy} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50">Cancel</button>
+              <button type="submit" disabled={busy} className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50">{busy ? 'Submitting…' : 'Schedule'}</button>
             </div>
           </form>
         </Dialog>
       )}
 
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
-      {todo && <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">该能力暂未启用：安全运营端点不可达。</div>}
-      {!loading && !todo && items.length === 0 && <div className="font-mono text-[12px] text-dim italic">暂无演练计划</div>}
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
+      {todo && <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">Not available yet: the security-ops endpoint is unreachable.</div>}
+      {!loading && !todo && items.length === 0 && <div className="font-mono text-[12px] text-dim italic">No drills scheduled</div>}
       {!loading && !todo && items.length > 0 && (
         <div className="border border-line rounded-md overflow-hidden">
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
               <tr>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">类型</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">计划时间</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">参与者</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Type</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Scheduled at</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Participants</th>
               </tr>
             </thead>
             <tbody>
@@ -923,26 +923,26 @@ export function SecurityOpsPage() {
   }, [tenants.length, setTenants, setTenantsLoading]);
 
   const tabs: { id: Tab; label: string }[] = [
-    { id: 'sla', label: 'SLA 看板' },
-    { id: 'vulns', label: '漏洞列表' },
-    { id: 'incidents', label: '安全事件' },
-    { id: 'scans', label: '扫描记录' },
-    { id: 'sbom', label: 'SBOM 监控' },
-    { id: 'drills', label: '演练' },
+    { id: 'sla', label: 'SLA dashboard' },
+    { id: 'vulns', label: 'Vulnerabilities' },
+    { id: 'incidents', label: 'Security incidents' },
+    { id: 'scans', label: 'Scans' },
+    { id: 'sbom', label: 'SBOM monitoring' },
+    { id: 'drills', label: 'Drills' },
   ];
 
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">安全运营</h1>
-        <p className="text-[12px] text-dim mt-0.5">漏洞 SLA、安全事件、扫描、SBOM 与演练（→ security-ops）</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Security operations</h1>
+        <p className="text-[12px] text-dim mt-0.5">Vulnerability SLAs, incidents, scans, SBOM and drills (→ security-ops)</p>
       </div>
 
       {/* Tenant selector (optional — platform-level service) */}
       <div className="flex items-center gap-3">
-        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
+        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">Tenant</label>
         <CustomSelect
-          options={[{ value: '', label: '（全平台 / 不限租户）' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+          options={[{ value: '', label: '(Platform-wide / all tenants)' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
           value={selectedTenantId ?? ''}
           onChange={(v) => setSelectedTenantId(v || null)}
           disabled={tenantsLoading}

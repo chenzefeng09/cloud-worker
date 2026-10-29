@@ -1330,66 +1330,6 @@ def test_stream_tokens_yields_delta_events_and_stops_on_end() -> None:
     )
 
 
-def test_stream_tokens_relays_canvas_entry_as_canvas_created() -> None:
-    """A ``canvas`` token-stream entry (written by the inline executor) is relayed
-    as the exact ``canvas_created`` SSE the sandbox path yields, so the frontend is
-    mode-agnostic.  ``message_id`` is passed through when present."""
-    from agent_session_orchestrator.api.v1.messages import _stream_tokens
-
-    fake_entries = [
-        ("1-0", {"type": "delta", "text": "已为你创作。"}),
-        (
-            "2-0",
-            {
-                "type": "canvas",
-                "canvas_id": "cvs_abc",
-                "run_id": "run_cvs",
-                "message_id": "msg_1",
-            },
-        ),
-        ("3-0", {"type": "end", "text": ""}),
-    ]
-
-    class _FakeRedis:
-        _call_count = 0
-
-        @classmethod
-        def from_url(cls, *a, **kw):
-            return cls()
-
-        async def xread(self, streams, block=0, count=None):
-            key = list(streams.keys())[0]
-            if self._call_count == 0:
-                self.__class__._call_count += 1
-                return [(key, fake_entries)]
-            return []
-
-        async def aclose(self): pass
-
-    async def _run():
-        with _patch_redis_asyncio(_FakeRedis):
-            _FakeRedis._call_count = 0
-            deadline = asyncio.get_event_loop().time() + 10.0
-            events = []
-            async for ev in _stream_tokens(
-                redis_url="redis://localhost:6379",
-                run_id="run_cvs",
-                deadline=deadline,
-            ):
-                events.append(ev)
-        return events
-
-    events = asyncio.get_event_loop().run_until_complete(_run())
-    parsed = [
-        (event_name, json.loads(data))
-        for event_name, data in _parse_sse_events("".join(events))
-    ]
-    canvas_events = [p for name, p in parsed if name == "canvas_created"]
-    assert canvas_events == [
-        {"canvas_id": "cvs_abc", "run_id": "run_cvs", "message_id": "msg_1"}
-    ]
-
-
 def test_stream_tokens_waits_through_worker_coldstart() -> None:
     """Regression: with wait_for_worker=True the tail must NOT bail out while the
     worker is still cold-starting (empty xreads), and must yield the deltas once
@@ -3166,7 +3106,7 @@ def test_fetch_memory_sends_scope_memory_and_clearance_header() -> None:
 
 def test_fetch_knowledge_formats_with_provenance_and_scope() -> None:
     """_fetch_knowledge hits ki with scope=knowledge + clearance and formats
-    each hit with a 【文档名 | 文件夹路径】 provenance header."""
+    each hit with a ``[Document | folder/path]`` provenance header."""
     import httpx
 
     from agent_session_orchestrator.api.v1.runs import _fetch_knowledge
@@ -3207,7 +3147,7 @@ def test_fetch_knowledge_formats_with_provenance_and_scope() -> None:
         )
     assert captured["params"].get("scope") == "knowledge"
     assert captured["headers"].get("X-User-Clearance") == "L2"
-    assert "【报销规定 | 行政】" in result
+    assert "[报销规定 | 行政]" in result
     assert "差旅报销标准" in result
 
 

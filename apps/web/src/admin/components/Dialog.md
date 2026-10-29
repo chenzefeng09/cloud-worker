@@ -1,34 +1,34 @@
-# Dialog 弹窗约定
+# Dialog conventions
 
-`Dialog`（`./Dialog.tsx`）是 admin 后台所有模态弹窗的统一基座。它已内置 backdrop（`bg-black/40`）、ESC 关闭、背景滚动锁、初始 focus、`role="dialog"` / `aria-modal` 等无障碍属性。调用方**不要重复实现**这些。
+`Dialog` (`./Dialog.tsx`) is the shared base for every modal in the admin console. It already provides the backdrop (`bg-black/40`), ESC to close, background scroll lock, initial focus, and accessibility attributes such as `role="dialog"` / `aria-modal`. Callers must **not re-implement** any of these.
 
-## 1. 约定
+## 1. Convention
 
-admin 后台所有「创建 / 编辑实体」类表单交互，一律用 `Dialog` 弹窗承载：
+Every "create / edit entity" form in the admin console must be hosted in a `Dialog`:
 
-- 禁止把创建 / 编辑表单内联铺在页面区块里。
-- 禁止再手搓 `fixed inset-0 ... bg-black/...` overlay + onClick 关闭 + 自写 ESC 逻辑。这些 Dialog 已经做了。
+- Don't lay create / edit forms out inline in a page section.
+- Don't hand-roll a `fixed inset-0 ... bg-black/...` overlay + onClick-to-close + custom ESC handling. Dialog already does all of that.
 
-`Dialog` 接口要点（以 `Dialog.tsx` 为准，别猜）：
+Key points of the `Dialog` API (`Dialog.tsx` is the source of truth — don't guess):
 
-- `title: string`（必填）—— 渲染成顶部 mono 大写小标题。
+- `title: string` (required) — rendered as the small mono uppercase heading at the top.
 - `onClose: () => void`。
-- `dismissable?: boolean`（默认 `true`）—— 异步进行中传 `false`，禁止 backdrop / ESC 关闭。
-- `initialFocusRef?`、`className?`（默认 `'w-full max-w-md'`，控宽用）、`children`。
-- **没有 `open` prop**：用 `{open && <Dialog .../>}` 条件渲染控制显隐。
-- **没有 `footer` prop**：取消 / 提交按钮直接写进 `children` 底部。
+- `dismissable?: boolean` (default `true`) — pass `false` while an async action is in flight to block closing via backdrop / ESC.
+- `initialFocusRef?`, `className?` (default `'w-full max-w-md'`, controls width), `children`.
+- **No `open` prop**: control visibility with conditional rendering, `{open && <Dialog .../>}`.
+- **No `footer` prop**: put the cancel / submit buttons at the bottom of `children`.
 
-## 2. 例外
+## 2. Exceptions
 
-以下场景不强制使用 `Dialog`：
+`Dialog` is not required in these cases:
 
-- **(a) 表格行内编辑**：点「编辑」让某行单元格就地可编辑，允许保留，不必弹窗。
-- **(b) 纯展示 / 详情类 overlay**：不强制走 `Dialog`。
-- **(c) 确认 / 文本输入提示**：用 `./dialogs` 提供的 `useConfirm`（确认类）、`usePrompt`（文本输入提示），**不要**用 `Dialog` 手搓 confirm 弹窗。
+- **(a) Inline table-row editing**: clicking "Edit" to make a row's cells editable in place is fine; no modal needed.
+- **(b) Read-only / detail overlays**: `Dialog` is not required.
+- **(c) Confirmations / text prompts**: use `useConfirm` (confirmations) and `usePrompt` (text input prompts) from `./dialogs`; do **not** hand-roll a confirm modal with `Dialog`.
 
-## 3. 标准用法
+## 3. Standard usage
 
-state 控显隐 + 条件渲染。表单内容作为 `children`，异步进行中用 `dismissable={!busy}` 锁住关闭：
+State controls visibility + conditional rendering. The form goes in `children`; use `dismissable={!busy}` to lock closing while an async action runs:
 
 ```tsx
 import { useState } from 'react';
@@ -48,14 +48,14 @@ function InviteUserDialog({ onClose, onInvited }: { onClose: () => void; onInvit
       onInvited();
       onClose();
     } catch (err) {
-      setError('邀请失败');
+      setError('Invite failed');
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <Dialog title="邀请用户" onClose={onClose} dismissable={!busy} className="w-full max-w-[440px]">
+    <Dialog title="Invite user" onClose={onClose} dismissable={!busy} className="w-full max-w-[440px]">
       <form onSubmit={handleSubmit} className="flex flex-col gap-3">
         {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
         <input
@@ -72,14 +72,14 @@ function InviteUserDialog({ onClose, onInvited }: { onClose: () => void; onInvit
             disabled={busy}
             className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
           >
-            取消
+            Cancel
           </button>
           <button
             type="submit"
             disabled={busy}
             className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
           >
-            {busy ? '邀请中…' : '发送邀请'}
+            {busy ? 'Inviting…' : 'Send invite'}
           </button>
         </div>
       </form>
@@ -87,20 +87,20 @@ function InviteUserDialog({ onClose, onInvited }: { onClose: () => void; onInvit
   );
 }
 
-// 调用方：用 state + 条件渲染控制显隐
+// Caller: state + conditional rendering controls visibility
 {showInvite && <InviteUserDialog onClose={() => setShowInvite(false)} onInvited={refresh} />}
 ```
 
-要点：
+Key points:
 
-- 显隐由调用方的 state（如 `showInvite`）+ `{showInvite && <Dialog .../>}` 控制，`Dialog` 自身不管显隐。
-- 按钮放在 `<form>` / `children` 底部，沿用 `cw-btn` / `border-line` / `bg-accent` 等页面既有类名风格。
-- backdrop / ESC / 滚动锁 / focus 全由 `Dialog` 提供，调用方不要再写。
+- Visibility is controlled by the caller's state (e.g. `showInvite`) + `{showInvite && <Dialog .../>}`; `Dialog` itself doesn't manage visibility.
+- Put buttons at the bottom of the `<form>` / `children`, reusing existing page class styles such as `cw-btn` / `border-line` / `bg-accent`.
+- Backdrop / ESC / scroll lock / focus are all provided by `Dialog`; callers must not add them again.
 
-## 4. 当前已正确复用 Dialog 的参考文件
+## 4. Reference files that already use Dialog correctly
 
 - `apps/web/src/admin/pages/ApiPlatformPage.tsx`
-- `apps/web/src/admin/pages/TenantsPage.tsx`（CreateTenantForm 创建租户）
+- `apps/web/src/admin/pages/TenantsPage.tsx`(CreateTenantForm — create tenant)
 - `apps/web/src/admin/pages/SsoPage.tsx`
-- `apps/web/src/admin/pages/OrgStructurePage.tsx`（移动节点 / 添加成员）
-- `apps/web/src/admin/pages/UsersPage.tsx`（InviteUserDialog 邀请用户，标准样板）
+- `apps/web/src/admin/pages/OrgStructurePage.tsx`(move node / add member)
+- `apps/web/src/admin/pages/UsersPage.tsx`(InviteUserDialog — invite user, the canonical example)

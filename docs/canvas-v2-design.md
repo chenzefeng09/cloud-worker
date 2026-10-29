@@ -1,5 +1,10 @@
 # 画布 v2 设计：一等对象化 + 作用域编辑 + 建议-确认制
 
+> **历史说明（2026-10）**：本文 Phase B 设想的 worker 侧 `create_canvas` 工具是基于已移除的 AgentScope
+> worker（`hooks.build_toolkit`）设计的。当前唯一的运行时 Claude Agent SDK worker **尚无画布工具**，Agent
+> 不能在运行中创建画布（见 [ADR 0003](adr/0003-claude-agent-sdk-sole-agent-runtime.md) 已知差距）；
+> 用户侧的画布创建与编辑不受影响。
+
 状态：设计定稿待评审 · 2026-07-10
 作者：架构会话（对标 ChatGPT Writing Block 实测结论 + 本仓真栈取证）
 

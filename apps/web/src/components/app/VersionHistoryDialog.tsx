@@ -1,13 +1,13 @@
 /**
- * VersionHistoryDialog - 「版本历史」弹窗。
+ * VersionHistoryDialog - the "Version history" dialog.
  *
- * AppDetailPage hero 的「版本历史」按钮打开此弹窗，承载原来铺在页面上的版本列表。
- * 入口对所有用户可见（不限于作者/管理员），纯展示，无写操作。
+ * Opened from the "Version history" button in the AppDetailPage hero; hosts the version list that used to live on the page.
+ * Visible to all users (not just authors/admins); read-only, no write actions.
  */
 import { Dialog } from '../../admin/components/Dialog';
 import { Chip } from '../shell/Chip';
 import { VersionStatusChip } from './VersionStatusChip';
-import { formatAbsoluteTimeZh } from '../../lib/format';
+import { formatAbsoluteTime } from '../../lib/format';
 import type { App } from '../../api/types';
 
 interface Props {
@@ -24,9 +24,9 @@ export function VersionHistoryDialog({ app, open, onClose }: Props) {
   const versions = [...(app.versions ?? [])].reverse();
 
   return (
-    <Dialog title="版本历史" onClose={onClose} className="w-full max-w-[560px]">
+    <Dialog title="Version history" onClose={onClose} className="w-full max-w-[560px]">
       {versions.length === 0 ? (
-        <div className="font-mono italic text-dim text-[12px]">暂无版本。</div>
+        <div className="font-mono italic text-dim text-[12px]">No versions yet.</div>
       ) : (
         <div className="flex flex-col gap-1.5">
           {versions.map((v) => (
@@ -37,25 +37,25 @@ export function VersionHistoryDialog({ app, open, onClose }: Props) {
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="font-mono text-[12.5px] text-ink">v{v.version}</span>
                 <VersionStatusChip status={v.status} />
-                {app.current_version_id === v.id && <Chip>当前</Chip>}
+                {app.current_version_id === v.id && <Chip>Current</Chip>}
                 <span className="font-mono text-[10.5px] text-dim ml-auto">
-                  {formatAbsoluteTimeZh(v.created_at)}
+                  {formatAbsoluteTime(v.created_at)}
                 </span>
               </div>
               <div className="font-mono text-[10.5px] text-dim flex flex-col gap-0.5">
                 {v.submitted_by && (
                   <span>
-                    提交人 {v.submitted_by}
-                    {v.submitted_at ? ` · ${formatAbsoluteTimeZh(v.submitted_at)}` : ''}
+                    Submitted by {v.submitted_by}
+                    {v.submitted_at ? ` · ${formatAbsoluteTime(v.submitted_at)}` : ''}
                   </span>
                 )}
                 {v.reviewed_by && (
                   <span>
-                    审核人 {v.reviewed_by}
-                    {v.reviewed_at ? ` · ${formatAbsoluteTimeZh(v.reviewed_at)}` : ''}
+                    Reviewed by {v.reviewed_by}
+                    {v.reviewed_at ? ` · ${formatAbsoluteTime(v.reviewed_at)}` : ''}
                   </span>
                 )}
-                {v.review_note && <span className="text-ink-2">备注：{v.review_note}</span>}
+                {v.review_note && <span className="text-ink-2">Note: {v.review_note}</span>}
               </div>
             </div>
           ))}

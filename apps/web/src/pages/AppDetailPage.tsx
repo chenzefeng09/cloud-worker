@@ -24,8 +24,8 @@ const RECENT_RUNS_LIMIT = 5;
 const DEFAULT_APP_GLYPH = '▤';
 
 const VISIBILITY_LABEL: Record<AppVisibility, string> = {
-  private: '私有',
-  tenant: '租户',
+  private: 'Private',
+  tenant: 'Tenant',
 };
 
 /** Resolve the published version of an App (the one current_version_id points at). */
@@ -99,7 +99,7 @@ export function AppDetailPage() {
       .get(id)
       .then((a) => { if (!cancelled) setApp(a); })
       .catch((err) => {
-        if (!cancelled) setError(err instanceof ApiError ? err.message : '加载应用失败');
+        if (!cancelled) setError(err instanceof ApiError ? err.message : 'Failed to load app');
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
@@ -116,7 +116,7 @@ export function AppDetailPage() {
       .listRuns(id, { limit: RECENT_RUNS_LIMIT, offset: 0 })
       .then((resp) => { if (!cancelled) setRuns(resp.items); })
       .catch((err) => {
-        if (!cancelled) setRunsError(err instanceof ApiError ? err.message : '加载执行记录失败');
+        if (!cancelled) setRunsError(err instanceof ApiError ? err.message : 'Failed to load run history');
       })
       .finally(() => { if (!cancelled) setRunsLoading(false); });
     return () => { cancelled = true; };
@@ -135,10 +135,10 @@ export function AppDetailPage() {
   const handleDelete = async () => {
     if (!app) return;
     const ok = await confirm({
-      title: '删除应用',
-      message: `确定删除应用「${app.name}」吗？该操作不可恢复，所有版本与运行历史将一并移除。`,
+      title: 'Delete app',
+      message: `Delete the app “${app.name}”? This can’t be undone — all versions and run history will be removed.`,
       tone: 'danger',
-      confirmText: '删除',
+      confirmText: 'Delete',
     });
     if (!ok) return;
     setDeleting(true);
@@ -146,16 +146,16 @@ export function AppDetailPage() {
       await api.apps.remove(app.id);
       navigate('/apps', { replace: true });
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '删除失败');
+      setError(err instanceof ApiError ? err.message : 'Delete failed');
     } finally {
       setDeleting(false);
     }
   };
 
   const crumbs = [
-    { label: '首页', to: '/home' },
-    { label: '应用', to: '/apps' },
-    { label: app?.name || '应用' },
+    { label: 'Home', to: '/home' },
+    { label: 'Apps', to: '/apps' },
+    { label: app?.name || 'App' },
   ];
 
   // Secondary/destructive commands live behind the page-head ⋯ so the primary
@@ -165,18 +165,18 @@ export function AppDetailPage() {
       ? [
           {
             id: 'edit',
-            label: '编辑应用',
+            label: 'Edit app',
             disabled: deleting,
             onSelect: () => navigate(`/apps/${app.id}/edit`),
           },
           {
             id: 'schedule',
-            label: '设置触发器',
+            label: 'Set up trigger',
             disabled: deleting || !canSchedule,
-            title: canSchedule ? undefined : '应用发布后才能设置触发器',
+            title: canSchedule ? undefined : 'Publish the app before setting up a trigger',
             onSelect: () => setScheduleOpen(true),
           },
-          { id: 'delete', label: '删除', danger: true, disabled: deleting, onSelect: handleDelete },
+          { id: 'delete', label: 'Delete', danger: true, disabled: deleting, onSelect: handleDelete },
         ]
       : [];
 
@@ -185,7 +185,7 @@ export function AppDetailPage() {
       <div className="flex flex-col h-full min-w-0 bg-paper">
         <PageHead crumbs={crumbs} />
         <div className="flex-1 flex items-center justify-center font-mono text-[12px] text-dim">
-          加载中…
+          Loading…
         </div>
       </div>
     );
@@ -196,8 +196,8 @@ export function AppDetailPage() {
       <div className="flex flex-col h-full min-w-0 bg-paper">
         <PageHead crumbs={crumbs} />
         <div className="flex-1 flex flex-col items-center justify-center gap-2 text-dim">
-          <div className="text-[14px] text-ink font-medium">加载应用失败</div>
-          <div className="text-[12.5px]">{error || '未找到应用。'}</div>
+          <div className="text-[14px] text-ink font-medium">Failed to load app</div>
+          <div className="text-[12.5px]">{error || 'App not found.'}</div>
         </div>
       </div>
     );
@@ -232,8 +232,8 @@ export function AppDetailPage() {
                   <p className="mt-1 mb-0 text-[13px] text-dim leading-[1.5]">{app.description}</p>
                 )}
                 <div className="mt-1 font-mono text-[10.5px] text-dim">
-                  作者 {app.author_id}
-                  {published && <span className="ml-2">· 当前版本 v{published.version}</span>}
+                  Author {app.author_id}
+                  {published && <span className="ml-2">· Current version v{published.version}</span>}
                 </div>
               </div>
             </div>
@@ -245,11 +245,11 @@ export function AppDetailPage() {
                 aria-describedby={canRun ? undefined : 'app-run-disabled-hint'}
                 className="cw-btn cw-btn-primary px-6 py-1.5 text-[13px] justify-center disabled:opacity-40 disabled:cursor-not-allowed"
               >
-                运行
+                Run
               </button>
               {!canRun && (
                 <p id="app-run-disabled-hint" className="m-0 text-[11.5px] text-dim text-center">
-                  该应用尚未发布
+                  This app hasn’t been published yet
                 </p>
               )}
               {/* 版本历史 entry is visible to all users (not just author/admin);
@@ -259,13 +259,13 @@ export function AppDetailPage() {
                 onClick={() => setVersionHistoryOpen(true)}
                 className="cw-btn cw-btn-ghost cw-btn-sm justify-center"
               >
-                版本历史
+                Version history
               </button>
             </div>
           </div>
 
           {/* Execution history — most recent runs inline, full list one click away */}
-          <Section title="执行历史" hint={`最近 ${RECENT_RUNS_LIMIT} 次执行记录。`}>
+          <Section title="Run history" hint={`The last ${RECENT_RUNS_LIMIT} runs.`}>
             {runsError && (
               <div className="px-3 py-2 border border-accent-line bg-accent-soft rounded-md text-[12.5px] text-accent">
                 {runsError}
@@ -273,11 +273,11 @@ export function AppDetailPage() {
             )}
 
             {runsLoading && !runsError && (
-              <div className="font-mono text-[12px] text-dim">加载中…</div>
+              <div className="font-mono text-[12px] text-dim">Loading…</div>
             )}
 
             {!runsLoading && !runsError && runs.length === 0 && (
-              <div className="font-mono italic text-dim text-[12px]">暂无执行记录。</div>
+              <div className="font-mono italic text-dim text-[12px]">No runs yet.</div>
             )}
 
             {!runsLoading && runs.length > 0 && (
@@ -300,7 +300,7 @@ export function AppDetailPage() {
                   onClick={() => navigate(`/apps/${app.id}/history`)}
                   className="cw-btn cw-btn-ghost cw-btn-sm"
                 >
-                  查看更多
+                  View more
                 </button>
               </div>
             )}

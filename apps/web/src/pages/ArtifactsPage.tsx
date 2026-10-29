@@ -3,7 +3,7 @@ import { PageHead } from '../components/shell/PageHead';
 import { Chip } from '../components/shell/Chip';
 import { api, ApiError } from '../api/client';
 import type { Artifact, ArtifactKind } from '../api/types';
-import { formatRelativeTimeZh } from '../lib/format';
+import { formatRelativeTime } from '../lib/format';
 import { FilePreviewPanel } from '../components/FilePreviewPanel';
 import type { FilePreviewPanelFile } from '../components/FilePreviewPanel';
 import { CanvasReadonlyView } from '../components/CanvasReadonlyView';
@@ -12,14 +12,14 @@ import { Dialog } from '../admin/components/Dialog';
 type KindFilter = 'all' | 'canvas' | 'file';
 
 const KIND_TABS: { key: KindFilter; label: string }[] = [
-  { key: 'all', label: '全部' },
-  { key: 'canvas', label: '画布' },
-  { key: 'file', label: '文件' },
+  { key: 'all', label: 'All' },
+  { key: 'canvas', label: 'Canvas' },
+  { key: 'file', label: 'Files' },
 ];
 
 const KIND_LABEL: Record<ArtifactKind, string> = {
-  canvas: '画布',
-  file: '文件',
+  canvas: 'Canvas',
+  file: 'File',
 };
 
 /** Shorten a UUID / ID to first 8 chars for display. */
@@ -51,7 +51,7 @@ export function ArtifactsPage() {
       const res = await api.artifacts.list();
       setItems(res.items);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : '加载产物列表失败，请稍后重试。');
+      setError(e instanceof ApiError ? e.message : 'Failed to load artifacts. Please try again later.');
     } finally {
       setLoading(false);
     }
@@ -90,7 +90,7 @@ export function ArtifactsPage() {
         await fetchItems();
         setDeleteTarget(null);
       } catch (e) {
-        setDeleteError(e instanceof ApiError ? e.message : '删除失败，请稍后重试。');
+        setDeleteError(e instanceof ApiError ? e.message : 'Delete failed. Please try again later.');
       } finally {
         setDeleting(false);
       }
@@ -145,7 +145,7 @@ export function ArtifactsPage() {
   return (
     <div className="flex flex-col h-full min-w-0 bg-paper">
       <PageHead
-        crumbs={[{ label: '首页', to: '/home' }, { label: '产物' }]}
+        crumbs={[{ label: 'Home', to: '/home' }, { label: 'Artifacts' }]}
       />
 
       <div
@@ -182,7 +182,7 @@ export function ArtifactsPage() {
           {/* search */}
           <input
             className="border border-line bg-paper rounded-sm px-2.5 py-1.5 text-[12.5px] font-mono focus:outline-none focus:border-accent transition-colors"
-            placeholder="搜索产物…"
+            placeholder="Search artifacts…"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
           />
@@ -196,13 +196,13 @@ export function ArtifactsPage() {
 
           {/* loading */}
           {loading && (
-            <div className="font-mono text-[11px] text-dim">加载中…</div>
+            <div className="font-mono text-[11px] text-dim">Loading…</div>
           )}
 
           {/* list */}
           {!loading && (
             filtered.length === 0 ? (
-              <div className="font-mono italic text-dim text-[12px]">暂无产物</div>
+              <div className="font-mono italic text-dim text-[12px]">No artifacts yet</div>
             ) : (
               <div className="flex flex-col gap-1.5">
                 {filtered.map((a) => (
@@ -235,7 +235,7 @@ export function ArtifactsPage() {
                     {/* time + delete */}
                     <div className="flex items-center justify-end gap-1.5">
                       <span className="font-mono text-[11px] text-dim">
-                        {formatRelativeTimeZh(a.updated_at ?? a.created_at)}
+                        {formatRelativeTime(a.updated_at ?? a.created_at)}
                       </span>
                       <button
                         onClick={(e) => {
@@ -244,7 +244,7 @@ export function ArtifactsPage() {
                           setDeleteTarget(a);
                         }}
                         className="font-mono text-[11px] text-dim hover:text-accent transition-colors px-0.5"
-                        title="删除"
+                        title="Delete"
                       >
                         ✕
                       </button>
@@ -263,8 +263,8 @@ export function ArtifactsPage() {
             onMouseDown={startPreviewDrag}
             role="separator"
             aria-orientation="vertical"
-            aria-label="拖动调整预览栏宽度"
-            title="拖动调整预览栏宽度"
+            aria-label="Drag to resize the preview panel"
+            title="Drag to resize the preview panel"
             className="relative flex items-center justify-center"
             style={{ cursor: 'col-resize', userSelect: 'none' }}
             onMouseEnter={(e) => {
@@ -309,7 +309,7 @@ export function ArtifactsPage() {
 
       {deleteTarget && (
         <Dialog
-          title="删除产物"
+          title="Delete artifact"
           onClose={() => {
             if (deleting) return;
             setDeleteTarget(null);
@@ -319,7 +319,7 @@ export function ArtifactsPage() {
           className="w-full max-w-[420px]"
         >
           <div className="text-[13px] text-ink leading-relaxed">
-            确定删除「{deleteTarget.title}」？此操作不可撤销。
+            Delete “{deleteTarget.title}”? This can’t be undone.
           </div>
           {deleteError && (
             <div className="px-3 py-2 border border-accent-line bg-accent-soft rounded-md text-[12px] text-accent">
@@ -336,7 +336,7 @@ export function ArtifactsPage() {
               }}
               className="cw-btn cw-btn-ghost cw-btn-sm disabled:opacity-50"
             >
-              取消
+              Cancel
             </button>
             <button
               type="button"
@@ -344,7 +344,7 @@ export function ArtifactsPage() {
               onClick={() => void handleDelete(deleteTarget)}
               className="cw-btn cw-btn-accent cw-btn-sm disabled:opacity-50"
             >
-              {deleting ? '删除中…' : '删除'}
+              {deleting ? 'Deleting…' : 'Delete'}
             </button>
           </div>
         </Dialog>

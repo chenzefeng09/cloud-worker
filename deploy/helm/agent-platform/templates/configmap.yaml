@@ -13,7 +13,7 @@ metadata:
     agent-platform.example.com/profile: {{ .Values.global.profile | default "small" }}
 data:
   AP_PROFILE: {{ .Values.global.profile | default "small" | quote }}
-  TZ: {{ .Values.global.timezone | default "Asia/Shanghai" | quote }}
+  TZ: {{ .Values.global.timezone | default "UTC" | quote }}
 
   # Foundation service URLs
   FOUNDATION_IDENTITY_URL:  {{ .Values.global.foundation.identityUrl | quote }}
@@ -57,12 +57,9 @@ data:
   # Agent scheduler config (non-sensitive)
   AGENT_IMAGE:               {{ .Values.agentScheduler.config.agentImage | quote }}
   LLM_MODEL:                 {{ .Values.agentScheduler.config.llmModel | quote }}
-  LLM_PROVIDER:              {{ .Values.agentScheduler.config.llmProvider | quote }}
-  LLM_BASE_URL:              {{ .Values.agentScheduler.config.llmBaseUrl | quote }}
   SANDBOX_MEMORY_LIMIT:      {{ .Values.agentScheduler.config.sandboxMemoryLimit | quote }}
   SANDBOX_CPU_SHARES:        {{ .Values.agentScheduler.config.sandboxCpuShares | quote }}
   SANDBOX_TIMEOUT:           {{ .Values.agentScheduler.config.sandboxTimeout | quote }}
-  RUNTIME_EXTENSIONS:        {{ .Values.agentScheduler.config.runtimeExtensions | quote }}
   SCHEDULER_KEYCLOAK_REALM:  {{ .Values.agentScheduler.config.keycloakRealm | quote }}
   SCHEDULER_KEYCLOAK_CLIENT_ID: {{ .Values.agentScheduler.config.keycloakClientId | quote }}
   {{- if eq .Values.agentScheduler.config.runtime "cube" }}
@@ -102,9 +99,6 @@ data:
   SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL: {{ .Values.global.foundation.dlpUrl | quote }}
   SESSION_ORCHESTRATOR_SKILL_STORE_URL: {{ printf "http://ap-skill-store:%d/api/skills/v1" (int .Values.skillStore.port) | quote }}
   SESSION_ORCHESTRATOR_SKILL_STORE_SERVICE_SCOPES: {{ .Values.sessionOrchestrator.config.skillStoreServiceScopes | quote }}
-  SESSION_ORCHESTRATOR_MCP_REGISTRY_URL: {{ printf "http://ap-mcp-registry:%d/api/mcp/v1" (int .Values.mcpRegistry.port) | quote }}
-  SESSION_ORCHESTRATOR_MCP_REGISTRY_SERVICE_SCOPES: {{ .Values.sessionOrchestrator.config.mcpRegistryServiceScopes | quote }}
-  SESSION_ORCHESTRATOR_INLINE_MCP_TIMEOUT: {{ .Values.sessionOrchestrator.config.inlineMcpTimeout | quote }}
 
   # DB pool sizes (per-service env picked up by each service's own config.py)
   SESSION_ORCHESTRATOR_DB_POOL_SIZE:     {{ .Values.sessionOrchestrator.config.dbPoolSize | quote }}

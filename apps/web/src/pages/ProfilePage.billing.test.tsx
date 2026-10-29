@@ -5,8 +5,8 @@
  * 1. Plan section renders real data from api.billing.me()
  * 2. Plan section renders null state when plan is null
  * 3. Plan section renders error state when billing call fails
- * 4. 2FA row renders "已启用" chip when MFA methods list is non-empty
- * 5. 2FA row renders "启用" button when MFA methods list is empty
+ * 4. 2FA row renders "Enabled" chip when MFA methods list is non-empty
+ * 5. 2FA row renders "Enable" button when MFA methods list is empty
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
@@ -24,7 +24,7 @@ vi.mock('../lib/workspaceContext', () => ({
 
 // Mock i18n — the page reads useTranslation() for the 语言 switcher
 vi.mock('../i18n', () => ({
-  useTranslation: () => ({ lang: 'zh', setLang: vi.fn(), t: (k: string) => k }),
+  useTranslation: () => ({ lang: 'en', setLang: vi.fn(), t: (k: string) => k }),
 }));
 
 // Mock chatStore
@@ -174,22 +174,22 @@ describe('ProfilePage — billing & MFA wiring', () => {
     mockApiKeysList.mockResolvedValue([]);
     mockNotifPreferences.mockResolvedValue({
       items: [
-        { event_key: 'task_completed', label: '任务完成', sub: 'Worker 完成任务时', email_enabled: true, push_enabled: true },
-        { event_key: 'needs_review',   label: '需要审查', sub: 'Worker 暂停等待确认', email_enabled: true, push_enabled: false },
+        { event_key: 'task_completed', label: 'Task completed', sub: 'When a worker completes a task', email_enabled: true, push_enabled: true },
+        { event_key: 'needs_review',   label: 'Needs review', sub: 'Worker paused awaiting confirmation', email_enabled: true, push_enabled: false },
       ],
     });
   });
 
-  // ── Token 累计 stat tile ──────────────────────────────────────────────────
+  // ── Total tokens stat tile ──────────────────────────────────────────────────
 
-  it('renders Token 累计 stat tile with real token total', async () => {
+  it('renders Total tokens stat tile with real token total', async () => {
     render(<ProfilePage />);
 
     await waitFor(() => {
       // total_tokens = 40, formatted as "40"
       expect(screen.getByText('40')).toBeInTheDocument();
     });
-    expect(screen.getByText('Token 累计')).toBeInTheDocument();
+    expect(screen.getByText('Total tokens')).toBeInTheDocument();
   });
 
   it('shows … while token usage is loading', () => {
@@ -198,17 +198,17 @@ describe('ProfilePage — billing & MFA wiring', () => {
 
     // While loading, the token tile shows "…" as the value.
     // We check the label is present but the resolved value is not yet shown.
-    expect(screen.getByText('Token 累计')).toBeInTheDocument();
+    expect(screen.getByText('Total tokens')).toBeInTheDocument();
     // The "…" placeholder may appear in multiple tiles; just ensure the label rendered.
   });
 
-  // ── 套餐 ─────────────────────────────────────────────────────────────────
+  // ── Plan ─────────────────────────────────────────────────────────────────
 
   it('renders plan name from real billing data', async () => {
     render(<ProfilePage />);
 
     // Switch to usage tab
-    await userEvent.click(screen.getByText('用量与账单'));
+    await userEvent.click(screen.getByText('Usage & billing'));
 
     await waitFor(() => {
       // "Pro" may appear as both the plan name and the header chip;
@@ -219,14 +219,14 @@ describe('ProfilePage — billing & MFA wiring', () => {
     expect(screen.getAllByText('PRO').length).toBeGreaterThan(0);
   });
 
-  it('renders "暂无活跃订阅" when plan is null', async () => {
+  it('renders "No active subscription" when plan is null', async () => {
     mockBillingMe.mockResolvedValue(NO_PLAN_RESPONSE);
     render(<ProfilePage />);
 
-    await userEvent.click(screen.getByText('用量与账单'));
+    await userEvent.click(screen.getByText('Usage & billing'));
 
     await waitFor(() =>
-      expect(screen.getByText(/暂无活跃订阅/)).toBeInTheDocument(),
+      expect(screen.getByText(/No active subscription/)).toBeInTheDocument(),
     );
   });
 
@@ -234,16 +234,16 @@ describe('ProfilePage — billing & MFA wiring', () => {
     mockBillingMe.mockRejectedValue(new Error('network error'));
     render(<ProfilePage />);
 
-    await userEvent.click(screen.getByText('用量与账单'));
+    await userEvent.click(screen.getByText('Usage & billing'));
 
     await waitFor(() =>
-      expect(screen.getByText(/套餐数据暂不可用/)).toBeInTheDocument(),
+      expect(screen.getByText(/Plan data is unavailable/)).toBeInTheDocument(),
     );
   });
 
-  // ── 双因素认证 ────────────────────────────────────────────────────────────
+  // ── Two-factor authentication ────────────────────────────────────────────────────────────
 
-  it('shows "已启用" chip when MFA methods is non-empty', async () => {
+  it('shows "Enabled" chip when MFA methods is non-empty', async () => {
     mockMfaMethods.mockResolvedValue([
       {
         id: 'mfa_01',
@@ -255,36 +255,36 @@ describe('ProfilePage — billing & MFA wiring', () => {
     ]);
     render(<ProfilePage />);
 
-    await userEvent.click(screen.getByText('安全'));
+    await userEvent.click(screen.getByText('Security'));
 
     await waitFor(() =>
-      expect(screen.getByText('已启用')).toBeInTheDocument(),
+      expect(screen.getByText('Enabled')).toBeInTheDocument(),
     );
   });
 
-  it('shows "启用" button when MFA methods is empty', async () => {
+  it('shows "Enable" button when MFA methods is empty', async () => {
     mockMfaMethods.mockResolvedValue([]);
     render(<ProfilePage />);
 
-    await userEvent.click(screen.getByText('安全'));
+    await userEvent.click(screen.getByText('Security'));
 
     await waitFor(() => {
-      // Find the 启用 button in the 2FA row context
-      const buttons = screen.getAllByRole('button', { name: '启用' });
+      // Find the Enable button in the 2FA row context
+      const buttons = screen.getAllByRole('button', { name: 'Enable' });
       expect(buttons.length).toBeGreaterThan(0);
     });
   });
 
-  // ── 通知偏好 ──────────────────────────────────────────────────────────────
+  // ── Notification preferences ──────────────────────────────────────────────────────────────
 
   it('renders notification preference rows from api.notifications.preferences()', async () => {
     render(<ProfilePage />);
 
-    await userEvent.click(screen.getByText('通知'));
+    await userEvent.click(screen.getByText('Notifications'));
 
     await waitFor(() => {
-      expect(screen.getByText('任务完成')).toBeInTheDocument();
-      expect(screen.getByText('需要审查')).toBeInTheDocument();
+      expect(screen.getByText('Task completed')).toBeInTheDocument();
+      expect(screen.getByText('Needs review')).toBeInTheDocument();
     });
   });
 
@@ -293,9 +293,9 @@ describe('ProfilePage — billing & MFA wiring', () => {
     mockNotifPreferences.mockReturnValue(new Promise(() => {}));
     render(<ProfilePage />);
 
-    await userEvent.click(screen.getByText('通知'));
+    await userEvent.click(screen.getByText('Notifications'));
 
     // Before the promise resolves, we should see the loading state
-    expect(screen.getByText('加载中…')).toBeInTheDocument();
+    expect(screen.getByText('Loading…')).toBeInTheDocument();
   });
 });

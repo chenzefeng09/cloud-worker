@@ -1,0 +1,21 @@
+name: CI - Claude SDK worker
+on:
+  push:
+    paths: ['worker-claude-sdk/**', '.github/workflows/ci-worker-claude-sdk.yml']
+  pull_request:
+    paths: ['worker-claude-sdk/**']
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: worker-claude-sdk/package-lock.json
+      - run: cd worker-claude-sdk && npm ci
+      - run: cd worker-claude-sdk && npm run typecheck
+      - run: cd worker-claude-sdk && npm test
+      - run: cd worker-claude-sdk && npm run build

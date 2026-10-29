@@ -44,8 +44,8 @@ export function useModelOptions(): UseModelOptionsResult {
         if (cancelled) return;
         // Don't fail silently - the dropdown falls back to MODEL_OPTIONS, but a
         // failure here also breaks findProviderForModel, so surface it.
-        console.warn('加载模型列表失败', err);
-        setError('加载模型列表失败，已使用内置模型列表');
+        console.warn('Failed to load model list', err);
+        setError('Failed to load the model list; using the built-in list instead.');
       })
       .finally(() => {
         if (cancelled) return;

@@ -94,7 +94,7 @@ def build_scoped_edit_prompt(
 ) -> str:
     """组作用域编辑 prompt。
 
-    * 目标块标 ``[block_id]``，明确「可改」。
+    * 目标块标 ``[block_id] [EDITABLE]``。
     * scope=blocks 时相邻块（各 ``_CONTEXT_NEIGHBORS`` 个）作**只读上下文**带上，
       指令要求禁止改动/复述上下文块。
     * 要求模型只返回 JSON（``response_format=json_object`` 已在 payload 里声明）。
@@ -123,7 +123,7 @@ def build_scoped_edit_prompt(
     if retry_error:
         lines.extend(
             [
-                "上一次的输出未通过校验，错误如下，请修正后重新只返回 JSON：",
+                "Your previous output failed validation with the error below. Fix it and return only JSON:",
                 retry_error,
                 "",
             ]
@@ -131,38 +131,38 @@ def build_scoped_edit_prompt(
 
     lines.extend(
         [
-            "你是专业编辑。下面是一篇文档的若干块（block），每块带一个稳定的 block_id。",
-            "请按「修改要求」修改**标记为【可改】的目标块**。",
+            "You are a professional editor. Below are several blocks of a document, each with a stable block_id.",
+            "Apply the \"Edit request\" to the **target blocks marked [EDITABLE]** only.",
             "",
-            "严格约束：",
-            "- 只返回一个 JSON 对象，不要有任何 JSON 以外的文字、解释或代码围栏。",
-            "- edits 里的 block_id 只能是【可改】的目标块 id，禁止改动【只读上下文】块。",
-            "- 只输出需要改动的块；未改动的块不要出现在 edits 里，禁止复述其原文。",
-            "- op=replace 时 new_text 为该块的完整新内容；"
-            "op=delete 时删除该块（不需要 new_text）。",
-            "- 需要新增块时放进 insertions，after_block_id 指明插在哪个块之后。",
+            "Strict rules:",
+            "- Return exactly one JSON object, with no text, explanation, or code fences outside the JSON.",
+            "- Every block_id in edits must be an [EDITABLE] target block id; never modify [READ-ONLY CONTEXT] blocks.",
+            "- Only output blocks that change; leave unchanged blocks out of edits and never repeat their original text.",
+            "- For op=replace, new_text is the complete new content of the block; "
+            "op=delete removes the block (no new_text needed).",
+            "- To add new blocks, put them in insertions; after_block_id names the block to insert after.",
             "",
-            "输出 JSON schema：",
+            "Output JSON schema:",
             json.dumps(
                 {
                     "edits": [
                         {"block_id": "blk_xxx", "op": "replace|delete", "new_text": "…"}
                     ],
                     "insertions": [{"after_block_id": "blk_xxx", "new_text": "…"}],
-                    "change_summary": "一句话变更说明",
+                    "change_summary": "One-sentence summary of the change",
                 },
                 ensure_ascii=False,
             ),
             "",
-            f"修改要求：{instruction}",
+            f"Edit request: {instruction}",
             "",
-            "文档块：",
+            "Document blocks:",
         ]
     )
 
     for idx in sorted(show_indices):
         b = blocks[idx]
-        role = "【可改】" if b["id"] in target_set else "【只读上下文】"
+        role = "[EDITABLE]" if b["id"] in target_set else "[READ-ONLY CONTEXT]"
         lines.append(f"[{b['id']}] {role}")
         lines.append(str(b.get("text", "")))
         lines.append("")
@@ -201,33 +201,33 @@ def build_selection_edit_prompt(
     if retry_error:
         lines.extend(
             [
-                "上一次的输出未通过校验，错误如下，请修正后重新只返回 JSON：",
+                "Your previous output failed validation with the error below. Fix it and return only JSON:",
                 retry_error,
                 "",
             ]
         )
     lines.extend(
         [
-            "你是文档局部改写器。每个 slot 中只有 selected_text 可修改，",
-            "before_context 与 after_context 均为只读上下文，绝不能复述或改写。",
-            "每个 slot 必须返回且只返回一个对应的替换片段；不要返回完整段落或完整文档。",
-            "new_text 可以是空字符串（表示删除选区）。",
-            "只返回 JSON 对象，不要解释、代码围栏或 JSON 之外的文字。",
+            "You rewrite fragments of a document. In each slot only selected_text may be changed; ",
+            "before_context and after_context are read-only context and must never be repeated or rewritten.",
+            "Return exactly one replacement fragment per slot; do not return whole paragraphs or the whole document.",
+            "new_text may be an empty string (meaning the selection is deleted).",
+            "Return only the JSON object, with no explanation, code fences, or text outside the JSON.",
             "",
-            "输出 JSON schema：",
+            "Output JSON schema:",
             json.dumps(
                 {
                     "replacements": [
-                        {"block_id": "blk_xxx", "new_text": "仅选区的新文本"}
+                        {"block_id": "blk_xxx", "new_text": "New text for the selection only"}
                     ],
-                    "change_summary": "一句话变更说明",
+                    "change_summary": "One-sentence summary of the change",
                 },
                 ensure_ascii=False,
             ),
             "",
-            f"修改要求：{instruction}",
+            f"Edit request: {instruction}",
             "",
-            "选区 slots（JSON）：",
+            "Selection slots (JSON):",
             json.dumps(slots, ensure_ascii=False),
         ]
     )
@@ -274,10 +274,10 @@ def parse_and_validate_output(
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, ValueError) as exc:
-        raise ModelOutputError(f"输出不是合法 JSON：{exc}") from exc
+        raise ModelOutputError(f"Output is not valid JSON: {exc}") from exc
 
     if not isinstance(data, dict):
-        raise ModelOutputError("输出顶层必须是 JSON 对象。")
+        raise ModelOutputError("The top level of the output must be a JSON object.")
 
     target_set = set(target_ids)
 
@@ -286,27 +286,27 @@ def parse_and_validate_output(
     change_summary = data.get("change_summary")
 
     if not isinstance(edits_raw, list):
-        raise ModelOutputError("edits 必须是数组。")
+        raise ModelOutputError("edits must be an array.")
     if not isinstance(insertions_raw, list):
-        raise ModelOutputError("insertions 必须是数组。")
+        raise ModelOutputError("insertions must be an array.")
 
     edits: list[dict] = []
     for i, item in enumerate(edits_raw):
         if not isinstance(item, dict):
-            raise ModelOutputError(f"edits[{i}] 必须是对象。")
+            raise ModelOutputError(f"edits[{i}] must be an object.")
         bid = item.get("block_id")
         op = item.get("op")
         if not isinstance(bid, str) or bid not in target_set:
             raise ModelOutputError(
-                f"edits[{i}].block_id={bid!r} 不在可编辑目标块范围内，"
-                f"只能是 {sorted(target_set)} 之一。"
+                f"edits[{i}].block_id={bid!r} is not one of the editable target blocks; "
+                f"it must be one of {sorted(target_set)}."
             )
         if op not in ("replace", "delete"):
-            raise ModelOutputError(f"edits[{i}].op={op!r} 必须是 'replace' 或 'delete'。")
+            raise ModelOutputError(f"edits[{i}].op={op!r} must be 'replace' or 'delete'.")
         new_text = item.get("new_text")
         if op == "replace":
             if not isinstance(new_text, str) or not new_text.strip():
-                raise ModelOutputError(f"edits[{i}] op=replace 必须带非空 new_text。")
+                raise ModelOutputError(f"edits[{i}] op=replace requires a non-empty new_text.")
             edits.append({"block_id": bid, "op": "replace", "new_text": new_text})
         else:  # delete
             edits.append({"block_id": bid, "op": "delete"})
@@ -314,23 +314,23 @@ def parse_and_validate_output(
     insertions: list[dict] = []
     for i, item in enumerate(insertions_raw):
         if not isinstance(item, dict):
-            raise ModelOutputError(f"insertions[{i}] 必须是对象。")
+            raise ModelOutputError(f"insertions[{i}] must be an object.")
         after = item.get("after_block_id")
         new_text = item.get("new_text")
         if not isinstance(after, str) or after not in target_set:
             raise ModelOutputError(
-                f"insertions[{i}].after_block_id={after!r} 不在可编辑目标块范围内，"
-                f"只能是 {sorted(target_set)} 之一。"
+                f"insertions[{i}].after_block_id={after!r} is not one of the editable target blocks; "
+                f"it must be one of {sorted(target_set)}."
             )
         if not isinstance(new_text, str) or not new_text.strip():
-            raise ModelOutputError(f"insertions[{i}] 必须带非空 new_text。")
+            raise ModelOutputError(f"insertions[{i}] requires a non-empty new_text.")
         insertions.append({"after_block_id": after, "new_text": new_text})
 
     if change_summary is not None and not isinstance(change_summary, str):
-        raise ModelOutputError("change_summary 必须是字符串或省略。")
+        raise ModelOutputError("change_summary must be a string or omitted.")
 
     if not edits and not insertions:
-        raise ModelOutputError("edits 与 insertions 均为空，未产生任何修改。")
+        raise ModelOutputError("edits and insertions are both empty; no change was produced.")
 
     summary = change_summary.strip() if isinstance(change_summary, str) else None
     return edits, insertions, (summary or None)
@@ -348,40 +348,40 @@ def parse_selection_output(
     try:
         data = json.loads(raw)
     except (json.JSONDecodeError, ValueError) as exc:
-        raise ModelOutputError(f"输出不是合法 JSON：{exc}") from exc
+        raise ModelOutputError(f"Output is not valid JSON: {exc}") from exc
     if not isinstance(data, dict):
-        raise ModelOutputError("输出顶层必须是 JSON 对象。")
+        raise ModelOutputError("The top level of the output must be a JSON object.")
 
     replacements_raw = data.get("replacements")
     if not isinstance(replacements_raw, list):
-        raise ModelOutputError("replacements 必须是数组。")
+        raise ModelOutputError("replacements must be an array.")
 
     target_set = set(target_ids)
     seen: set[str] = set()
     replacements: list[dict] = []
     for i, item in enumerate(replacements_raw):
         if not isinstance(item, dict):
-            raise ModelOutputError(f"replacements[{i}] 必须是对象。")
+            raise ModelOutputError(f"replacements[{i}] must be an object.")
         block_id = item.get("block_id")
         new_text = item.get("new_text")
         if not isinstance(block_id, str) or block_id not in target_set:
             raise ModelOutputError(
-                f"replacements[{i}].block_id={block_id!r} 不在选区范围内。"
+                f"replacements[{i}].block_id={block_id!r} is not part of the selection."
             )
         if block_id in seen:
-            raise ModelOutputError(f"block_id={block_id!r} 重复出现。")
+            raise ModelOutputError(f"block_id={block_id!r} appears more than once.")
         if not isinstance(new_text, str):
-            raise ModelOutputError(f"replacements[{i}].new_text 必须是字符串。")
+            raise ModelOutputError(f"replacements[{i}].new_text must be a string.")
         seen.add(block_id)
         replacements.append({"block_id": block_id, "new_text": new_text})
 
     missing = target_set - seen
     if missing:
-        raise ModelOutputError(f"缺少选区块的替换结果：{sorted(missing)}。")
+        raise ModelOutputError(f"Missing replacements for selected blocks: {sorted(missing)}.")
 
     change_summary = data.get("change_summary")
     if change_summary is not None and not isinstance(change_summary, str):
-        raise ModelOutputError("change_summary 必须是字符串或省略。")
+        raise ModelOutputError("change_summary must be a string or omitted.")
     summary = change_summary.strip() if isinstance(change_summary, str) else None
     return replacements, (summary or None)
 
@@ -409,7 +409,7 @@ def validate_selection_replacements(
         echoes_long_suffix = len(after) >= 12 and new_text.endswith(after)
         if echoes_both_sides or echoes_long_prefix or echoes_long_suffix:
             raise ModelOutputError(
-                f"block_id={block_id!r} 返回了包含只读上下文的完整段落；只允许返回选区替换片段。"
+                f"block_id={block_id!r} returned a full paragraph including read-only context; only the replacement fragment for the selection is allowed."
             )
 
 
@@ -518,7 +518,7 @@ async def canvas_v2_edit(
     """作用域编辑：拉当前版本 → 组 prompt → gateway 结构化输出 → 落建议。
 
     请求体见 ``CanvasV2EditRequest``。成功 200 返回 ``{"suggestion": {...}}``
-    （orchestrator 落库返回体）。失败走 problem+json，带中文 ``user_message``。
+    （orchestrator 落库返回体）。失败走 problem+json，带英文 ``user_message``。
     """
     tenant_id, user_id, access_token = _auth
     settings = request.app.state.settings
@@ -531,7 +531,7 @@ async def canvas_v2_edit(
     except Exception:  # noqa: BLE001
         raise _problem(
             400,
-            "修订请求格式不正确，请检查后重试。",
+            "The edit request is malformed. Please check it and try again.",
             code="AGENT.BFF.CANVAS.BAD_REQUEST",
             detail="invalid canvas v2 edit request body",
         ) from None
@@ -539,7 +539,7 @@ async def canvas_v2_edit(
     if not req.instruction.strip():
         raise _problem(
             400,
-            "请填写修改要求后再提交。",
+            "Please describe the change you want before submitting.",
             code="AGENT.BFF.CANVAS.NO_INSTRUCTION",
             detail="instruction is required",
         )
@@ -547,14 +547,14 @@ async def canvas_v2_edit(
     if req.scope.type == "blocks" and not (req.scope.block_ids or []):
         raise _problem(
             400,
-            "请先选择要修改的段落。",
+            "Please select the paragraphs you want to edit first.",
             code="AGENT.BFF.CANVAS.NO_BLOCK_IDS",
             detail="scope=blocks requires non-empty block_ids",
         )
     if req.scope.type == "selection" and not (req.scope.segments or []):
         raise _problem(
             400,
-            "请先选择要修改的文字。",
+            "Please select the text you want to edit first.",
             code="AGENT.BFF.CANVAS.NO_SELECTION",
             detail="scope=selection requires non-empty segments",
         )
@@ -572,7 +572,7 @@ async def canvas_v2_edit(
             logger.warning("canvas v2 edit: orchestrator unreachable (GET canvas): %s", exc)
             raise _problem(
                 502,
-                "画布服务暂时不可用，请稍后重试。",
+                "The canvas service is temporarily unavailable. Please try again later.",
                 code="AGENT.BFF.CANVAS.ORCH_UNAVAILABLE",
                 detail=f"orchestrator unreachable: {exc}",
             ) from exc
@@ -580,14 +580,14 @@ async def canvas_v2_edit(
     if canvas_resp.status_code == 404:
         raise _problem(
             404,
-            "画布不存在或已被删除。",
+            "This canvas does not exist or has been deleted.",
             code="AGENT.BFF.CANVAS.NOT_FOUND",
             detail="orchestrator returned 404 for canvas",
         )
     if canvas_resp.status_code != 200:
         raise _problem(
             502,
-            "读取画布失败，请稍后重试。",
+            "Failed to load the canvas. Please try again later.",
             code="AGENT.BFF.CANVAS.ORCH_ERROR",
             detail=f"orchestrator GET canvas returned HTTP {canvas_resp.status_code}",
         )
@@ -602,7 +602,7 @@ async def canvas_v2_edit(
         logger.warning("canvas v2 edit: bad canvas payload from orchestrator: %s", exc)
         raise _problem(
             502,
-            "读取画布失败，请稍后重试。",
+            "Failed to load the canvas. Please try again later.",
             code="AGENT.BFF.CANVAS.ORCH_BAD_PAYLOAD",
             detail="unexpected canvas detail response shape",
         ) from exc
@@ -612,7 +612,7 @@ async def canvas_v2_edit(
     if req.base_version is not None and req.base_version != base_version:
         raise _problem(
             409,
-            "画布已被更新，请刷新后再修改。",
+            "The canvas has been updated. Please refresh before editing.",
             code="AGENT.BFF.CANVAS.VERSION_CONFLICT",
             detail=f"client base_version {req.base_version} != current {base_version}",
         )
@@ -626,7 +626,7 @@ async def canvas_v2_edit(
         if missing:
             raise _problem(
                 422,
-                "选中的段落已不在当前画布版本中，请刷新后重试。",
+                "The selected paragraphs are no longer in the current canvas version. Please refresh and try again.",
                 code="AGENT.BFF.CANVAS.BLOCK_NOT_FOUND",
                 detail=f"block_ids not in current version: {missing}",
             )
@@ -636,7 +636,7 @@ async def canvas_v2_edit(
         if len(set(target_ids)) != len(target_ids):
             raise _problem(
                 422,
-                "同一段落包含重复选区，请重新选择后重试。",
+                "The same paragraph has overlapping selections. Please reselect and try again.",
                 code="AGENT.BFF.CANVAS.DUPLICATE_SELECTION",
                 detail="selection contains duplicate block ids",
             )
@@ -644,7 +644,7 @@ async def canvas_v2_edit(
         if missing:
             raise _problem(
                 422,
-                "选中的段落已不在当前画布版本中，请刷新后重试。",
+                "The selected paragraphs are no longer in the current canvas version. Please refresh and try again.",
                 code="AGENT.BFF.CANVAS.BLOCK_NOT_FOUND",
                 detail=f"selection block ids not in current version: {missing}",
             )
@@ -656,7 +656,7 @@ async def canvas_v2_edit(
             if start < 0 or end <= start or end > len(current_text):
                 raise _problem(
                     422,
-                    "选区位置无效，请重新选择后重试。",
+                    "The selection range is invalid. Please reselect and try again.",
                     code="AGENT.BFF.CANVAS.BAD_SELECTION_RANGE",
                     detail=(
                         f"invalid range {start}:{end} for block {segment['block_id']} "
@@ -666,7 +666,7 @@ async def canvas_v2_edit(
             if current_text[start:end] != segment["text"]:
                 raise _problem(
                     409,
-                    "画布内容已变化，请重新选择文字后再修改。",
+                    "The canvas content has changed. Please reselect the text before editing.",
                     code="AGENT.BFF.CANVAS.SELECTION_STALE",
                     detail=f"selected text mismatch for block {segment['block_id']}",
                 )
@@ -676,7 +676,7 @@ async def canvas_v2_edit(
     if not target_ids:
         raise _problem(
             422,
-            "当前画布没有可编辑的内容。",
+            "This canvas has no editable content.",
             code="AGENT.BFF.CANVAS.EMPTY_CANVAS",
             detail="canvas has no blocks to edit",
         )
@@ -692,7 +692,7 @@ async def canvas_v2_edit(
         if not virtual_key:
             raise _problem(
                 400,
-                "当前租户尚未配置可用的模型密钥，请联系管理员在模型管理中配置。",
+                "No model key is configured for this tenant. Please ask an administrator to set one up in Model Management.",
                 code="AGENT.BFF.CANVAS.NO_VIRTUAL_KEY",
                 detail="tenant has no enabled virtual key",
             )
@@ -709,7 +709,7 @@ async def canvas_v2_edit(
         if not model:
             raise _problem(
                 400,
-                "未指定模型，且当前租户没有配置默认模型，请在会话中选择一个模型后重试。",
+                "No model was specified and this tenant has no default model. Please choose a model in the conversation and try again.",
                 code="AGENT.BFF.CANVAS.NO_MODEL",
                 detail="no model provided and tenant has no default model",
             )
@@ -768,7 +768,7 @@ async def canvas_v2_edit(
                             pass
                         raise _problem(
                             502,
-                            upstream_user_message or "模型服务返回错误，请稍后重试。",
+                            upstream_user_message or "The model service returned an error. Please try again later.",
                             code="AGENT.BFF.CANVAS.GATEWAY_ERROR",
                             detail=f"llm-gateway returned HTTP {resp.status_code}",
                         )
@@ -793,7 +793,7 @@ async def canvas_v2_edit(
                         logger.warning("canvas v2 edit: empty streamed content (session %s)", session_id)
                         raise _problem(
                             502,
-                            "模型返回内容为空，请重试。",
+                            "The model returned an empty response. Please try again.",
                             code="AGENT.BFF.CANVAS.BAD_COMPLETION",
                             detail="streamed completion yielded no content",
                         )
@@ -801,7 +801,7 @@ async def canvas_v2_edit(
                 logger.warning("canvas v2 edit gateway timeout (session %s): %s", session_id, exc)
                 raise _problem(
                     502,
-                    "模型响应超时，请稍后重试。",
+                    "The model timed out. Please try again later.",
                     code="AGENT.BFF.CANVAS.GATEWAY_TIMEOUT",
                     detail="llm-gateway /chat/completions timed out",
                 ) from exc
@@ -809,7 +809,7 @@ async def canvas_v2_edit(
                 logger.warning("canvas v2 edit gateway error (session %s): %s", session_id, exc)
                 raise _problem(
                     502,
-                    "模型服务暂时不可用，请稍后重试。",
+                    "The model service is temporarily unavailable. Please try again later.",
                     code="AGENT.BFF.CANVAS.GATEWAY_UNAVAILABLE",
                     detail=f"llm-gateway unreachable: {exc}",
                 ) from exc
@@ -844,7 +844,7 @@ async def canvas_v2_edit(
     if edits is None:
         raise _problem(
             502,
-            "模型未能给出可用的修改建议，请调整指令后重试。",
+            "The model could not produce a usable edit suggestion. Please adjust your instruction and try again.",
             code="AGENT.BFF.CANVAS.BAD_MODEL_OUTPUT",
             detail=f"model output failed schema validation after retry: {retry_error}",
         )
@@ -877,7 +877,7 @@ async def canvas_v2_edit(
             logger.warning("canvas v2 edit: orchestrator unreachable (POST suggestion): %s", exc)
             raise _problem(
                 502,
-                "保存修改建议失败，请稍后重试。",
+                "Failed to save the edit suggestion. Please try again later.",
                 code="AGENT.BFF.CANVAS.ORCH_UNAVAILABLE",
                 detail=f"orchestrator unreachable: {exc}",
             ) from exc
@@ -885,7 +885,7 @@ async def canvas_v2_edit(
     if sugg_resp.status_code == 404:
         raise _problem(
             404,
-            "画布不存在或已被删除。",
+            "This canvas does not exist or has been deleted.",
             code="AGENT.BFF.CANVAS.NOT_FOUND",
             detail="orchestrator returned 404 for suggestion",
         )
@@ -905,14 +905,14 @@ async def canvas_v2_edit(
             pass
         raise _problem(
             409,
-            upstream_user_message or "画布已被他人更新，请刷新后重新提交修改。",
+            upstream_user_message or "Someone else has updated the canvas. Please refresh and resubmit your edit.",
             code="AGENT.BFF.CANVAS.VERSION_CONFLICT",
             detail="orchestrator returned 409 (base_version conflict)",
         )
     if sugg_resp.status_code not in (200, 201):
         raise _problem(
             502,
-            "保存修改建议失败，请稍后重试。",
+            "Failed to save the edit suggestion. Please try again later.",
             code="AGENT.BFF.CANVAS.ORCH_ERROR",
             detail=f"orchestrator POST suggestion returned HTTP {sugg_resp.status_code}",
         )
@@ -923,7 +923,7 @@ async def canvas_v2_edit(
         logger.warning("canvas v2 edit: bad suggestion payload from orchestrator: %s", exc)
         raise _problem(
             502,
-            "保存修改建议失败，请稍后重试。",
+            "Failed to save the edit suggestion. Please try again later.",
             code="AGENT.BFF.CANVAS.ORCH_BAD_PAYLOAD",
             detail="unexpected suggestion response shape",
         ) from exc

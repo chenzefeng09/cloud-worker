@@ -5,7 +5,7 @@ import { ChatWindow } from '../components/ChatWindow';
 import { useChat } from '../hooks/useChat';
 import { useChatStore } from '../stores/chatStore';
 import { useSessions } from '../hooks/useSessions';
-import { sessionStatusZh } from '../lib/format';
+import { sessionStatusLabel } from '../lib/format';
 import { FilePreviewPanel } from '../components/FilePreviewPanel';
 import type { FileContentSource } from '../components/filePreview';
 import { FilePreviewProvider } from '../lib/filePreviewContext';
@@ -138,8 +138,8 @@ export function AgentPage() {
   if (!id) {
     return (
       <div className="flex flex-col h-full min-w-0 bg-paper">
-        <PageHead crumbs={[{ label: '首页', to: '/home' }, { label: '会话' }]} />
-        <div className="flex-1 flex items-center justify-center text-dim">未指定任务。</div>
+        <PageHead crumbs={[{ label: 'Home', to: '/home' }, { label: 'Sessions' }]} />
+        <div className="flex-1 flex items-center justify-center text-dim">No task specified.</div>
       </div>
     );
   }
@@ -148,9 +148,9 @@ export function AgentPage() {
     <div className="flex flex-col h-full min-w-0 bg-paper">
       <PageHead
         crumbs={[
-          { label: '首页', to: '/home' },
-          { label: friendly ? 'Chat' : '会话', to: '/home' },
-          { label: session?.title || '未命名任务' },
+          { label: 'Home', to: '/home' },
+          { label: friendly ? 'Chat' : 'Sessions', to: '/home' },
+          { label: session?.title || 'Untitled task' },
         ]}
         status={
           <span className="flex items-center gap-2">
@@ -162,7 +162,7 @@ export function AgentPage() {
             )}
             {session && (
               <span className="font-mono text-[11px] text-ink-2">
-                · {sessionStatusZh(session.status)}
+                · {sessionStatusLabel(session.status)}
               </span>
             )}
           </span>
@@ -174,7 +174,7 @@ export function AgentPage() {
                 onClick={() => navigate('/files')}
                 className="cw-btn cw-btn-ghost cw-btn-sm"
               >
-                <span className="font-mono">⌗</span> 文件
+                <span className="font-mono">⌗</span> Files
               </button>
             )}
           </>
@@ -242,8 +242,8 @@ export function AgentPage() {
                   onMouseDown={startPreviewDrag}
                   role="separator"
                   aria-orientation="vertical"
-                  aria-label="拖动调整预览栏宽度"
-                  title="拖动调整预览栏宽度"
+                  aria-label="Drag to resize the preview panel"
+                  title="Drag to resize the preview panel"
                   className="relative flex items-center justify-center"
                   style={{ cursor: 'col-resize', userSelect: 'none' }}
                   onMouseEnter={(e) => {
@@ -280,7 +280,7 @@ export function AgentPage() {
 }
 
 /**
- * Read-only workspace badge for the session header. Shows `◇ <工作区名>` and, on
+ * Read-only workspace badge for the session header. Shows `◇ <workspace name>` and, on
  * click, a small downward popover describing the workspace the session was bound
  * to at creation time: a truncated instructions preview and the list of base
  * files (lazy-loaded once). Clicking a file opens it in the session's preview
@@ -314,14 +314,14 @@ function WorkspaceBadge({
         if (alive) setFetched(w);
       })
       .catch(() => {
-        /* silent — badge falls back to the generic「工作区」label */
+        /* silent — badge falls back to the generic “Workspace” label */
       });
     return () => {
       alive = false;
     };
   }, [known, workspaceId]);
 
-  const name = ws?.name ?? '工作区';
+  const name = ws?.name ?? 'Workspace';
   const instructions = ws?.instructions?.trim() || null;
   const instructionsPreview =
     instructions && instructions.length > 200
@@ -361,7 +361,7 @@ function WorkspaceBadge({
         onClick={() => setOpen((o) => !o)}
         aria-haspopup="dialog"
         aria-expanded={open}
-        title="此会话绑定的工作区（只读）"
+        title="Workspace bound to this session (read-only)"
         className="inline-flex items-center gap-1.5 px-2 py-0.5 border border-line rounded-full bg-surface font-mono text-[11px] text-ink-2 hover:border-ink-2 hover:text-ink hover:bg-paper-2 transition-colors cursor-pointer max-w-[220px]"
       >
         <span aria-hidden className="text-accent">◇</span>
@@ -375,7 +375,7 @@ function WorkspaceBadge({
           className="absolute top-full left-0 mt-1.5 z-40 w-[300px] bg-surface border border-line rounded-lg shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-2.5"
         >
           <div className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim mb-1.5">
-            工作区 · 只读
+            Workspace · read-only
           </div>
           <div className="flex items-center gap-1.5 mb-2">
             <span className="text-[13px] font-semibold tracking-[-0.01em] text-ink truncate">
@@ -386,18 +386,18 @@ function WorkspaceBadge({
 
           {instructionsPreview && (
             <div className="mb-2.5 pb-2.5 border-b border-line-2">
-              <div className="cw-label mb-1">工作区指令</div>
+              <div className="cw-label mb-1">Workspace instructions</div>
               <div className="text-[12px] leading-[1.5] text-ink-2 whitespace-pre-wrap break-words">
                 {instructionsPreview}
               </div>
             </div>
           )}
 
-          <div className="cw-label mb-1">我的工作区</div>
+          <div className="cw-label mb-1">My workspace</div>
           <div className="max-h-[220px] overflow-auto cw-scroll -mx-0.5">
             {filesLoading ? (
               <div className="px-1 py-1.5 font-mono text-[11px] text-dim animate-pulse">
-                加载中…
+                Loading…
               </div>
             ) : files && files.length > 0 ? (
               files.map((f) => (
@@ -419,7 +419,7 @@ function WorkspaceBadge({
               ))
             ) : (
               <div className="px-1 py-1.5 font-mono text-[11px] italic text-dim">
-                暂无文件
+                No files yet
               </div>
             )}
           </div>

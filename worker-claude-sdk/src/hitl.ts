@@ -325,17 +325,17 @@ function renderReplayText(
 
   const original = state?.original_task ?? task.task;
   if (original) {
-    parts.push(`[原始任务] ${original}`);
+    parts.push(`[Original task] ${original}`);
   }
 
   const turns = state?.transcript ?? [];
   if (turns.length > 0) {
-    const lines = ["[之前的对话回顾]"];
+    const lines = ["[Conversation so far]"];
     for (const t of turns) {
       if (t.role === "assistant" && t.text) {
-        lines.push(`助手: ${t.text}`);
+        lines.push(`Assistant: ${t.text}`);
       } else if (t.role === "tool") {
-        lines.push(`工具调用 ${t.name}(${t.args ?? ""}) -> ${t.result ?? ""}`);
+        lines.push(`Tool call ${t.name}(${t.args ?? ""}) -> ${t.result ?? ""}`);
       }
     }
     parts.push(lines.join("\n"));
@@ -356,7 +356,7 @@ function renderDecision(
   state: ReplayState | null,
 ): string {
   if (!resume) {
-    return "[系统] 请继续完成任务。";
+    return "[System] Please continue with the task.";
   }
 
   // The ask_user leg arrives as kind "answer" (orchestrator) or "question"
@@ -364,26 +364,26 @@ function renderDecision(
   if (resume.kind === "answer" || resume.kind === "question") {
     const answer = resume.answer ?? "";
     return (
-      `[系统] 用户已回答你之前通过 ask_user 提出的问题。用户的回答是：${answer}\n` +
-      `请基于这个回答继续完成任务，不要再次提出相同的问题。`
+      `[System] The user has answered the question you asked earlier via ask_user. The user's answer is: ${answer}\n` +
+      `Continue the task based on this answer, and do not ask the same question again.`
     );
   }
 
   // confirm leg
   const pending = state?.pending ?? [];
   const first = pending[0];
-  const toolDesc = first ? `${first.name}(${first.args})` : "之前请求的工具调用";
+  const toolDesc = first ? `${first.name}(${first.args})` : "the previously requested tool call";
 
   if (resume.confirmed === true) {
     return (
-      `[系统] 用户已批准你之前请求的工具调用 ${toolDesc}。\n` +
-      `请立即重新发起该工具调用以执行它，然后继续完成任务。`
+      `[System] The user has approved the tool call you requested earlier: ${toolDesc}.\n` +
+      `Re-issue that tool call now to execute it, then continue with the task.`
     );
   }
   // rejected (confirmed false/null) — inject denial guidance, do NOT execute.
   return (
-    `[系统] 用户拒绝了你之前请求的工具调用 ${toolDesc}。\n` +
-    `请不要再尝试调用该工具，改用其他方式或在没有它的情况下继续完成任务。`
+    `[System] The user rejected the tool call you requested earlier: ${toolDesc}.\n` +
+    `Do not try to call that tool again; continue the task another way or without it.`
   );
 }
 

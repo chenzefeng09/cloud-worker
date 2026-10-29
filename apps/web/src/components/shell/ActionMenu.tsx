@@ -66,7 +66,7 @@ interface Props {
 export function ActionMenu({
   items,
   align = 'right',
-  ariaLabel = '更多操作',
+  ariaLabel = 'More actions',
   disabled,
   icon = 'ellipsis',
   floating = false,

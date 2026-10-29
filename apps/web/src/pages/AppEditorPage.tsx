@@ -203,8 +203,8 @@ function StepTabs({
   return (
     <div className="grid grid-cols-2 gap-2">
       {[
-        { id: 1 as const, title: '1 定义任务输入', sub: '应用信息、用户填写项、文件限制' },
-        { id: 2 as const, title: '2 定义执行环境', sub: '固定流程、Skills、MCP、发布权限' },
+        { id: 1 as const, title: '1 Define task inputs', sub: 'App info, user fields, file limits' },
+        { id: 2 as const, title: '2 Define execution environment', sub: 'Fixed flow, skills, MCP, publishing' },
       ].map((item) => {
         const active = step === item.id;
         return (
@@ -518,11 +518,11 @@ function PromptTemplateEditor({
       <div className="flex flex-wrap gap-1.5">
         {fields.map((f) => (
           <Chip key={f.key} dashed onClick={() => handleChipClick(f)}>
-            {f.type === 'file' ? `/${f.key} \u00b7 文件路径` : f.type === 'multiselect' ? `/${f.key} \u00b7 多选值` : `/${f.key}`}
+            {f.type === 'file' ? `/${f.key} \u00b7 file path` : f.type === 'multiselect' ? `/${f.key} \u00b7 multi-select values` : `/${f.key}`}
           </Chip>
         ))}
         {fields.length === 0 && (
-          <span className="font-mono text-[11px] text-dim">先在上一步定义参数后，可在这里用 / 引用。</span>
+          <span className="font-mono text-[11px] text-dim">Define parameters in the previous step, then reference them here with /.</span>
         )}
       </div>
       {slashQuery !== null && matches.length > 0 && popupPos && (
@@ -550,7 +550,7 @@ function PromptTemplateEditor({
         </div>
       )}
       <span className="text-[11px] text-dim">
-        输入 <code className="font-mono">/</code> 选择参数。文件字段会渲染为沙盒路径，例如 <code className="font-mono">/workspace/inputs/file.pdf</code>。
+        Type <code className="font-mono">/</code> to pick a parameter. File fields render as sandbox paths, e.g. <code className="font-mono">/workspace/inputs/file.pdf</code>.
       </span>
     </div>
   );
@@ -644,7 +644,7 @@ export function AppEditorPage() {
       })
       .catch((err) => {
         if (!cancelled)
-          setError(err instanceof ApiError ? err.message : '加载应用失败');
+          setError(err instanceof ApiError ? err.message : 'Failed to load app');
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
@@ -683,8 +683,8 @@ export function AppEditorPage() {
   // step-1 gate checks them together.
   const validateInputStep = (): boolean => {
     if (!meta.name.trim()) {
-      setMetaError('请填写应用名称');
-      setError('应用信息有误，请检查标红项');
+      setMetaError('Please enter an app name');
+      setError('App info has errors — check the highlighted fields');
       setStep(1);
       return false;
     }
@@ -692,7 +692,7 @@ export function AppEditorPage() {
     const { errors, ok } = validateSchema(harness.input_schema);
     setFieldErrors(errors);
     if (!ok) {
-      setError('输入字段定义有误，请检查标红项');
+      setError('Input field definitions have errors — check the highlighted fields');
       setStep(1);
       return false;
     }
@@ -710,29 +710,29 @@ export function AppEditorPage() {
     // system_prompt is optional — leaving it empty falls back to the worker's
     // default persona.
     if (!harness.user_prompt_template.trim()) {
-      he.user_prompt_template = '请填写用户提示词模板';
+      he.user_prompt_template = 'Please enter a user prompt template';
       ok = false;
     }
     const t = harness.temperature ? parseFloat(harness.temperature) : undefined;
     const p = harness.top_p ? parseFloat(harness.top_p) : undefined;
     const m = harness.max_tokens ? parseInt(harness.max_tokens, 10) : undefined;
     if (t != null && (!Number.isFinite(t) || t < 0)) {
-      he.temperature = 'temperature 必须为大于等于 0 的数字';
+      he.temperature = 'temperature must be a number ≥ 0';
       ok = false;
     }
     if (p != null && (!Number.isFinite(p) || p < 0 || p > 1)) {
-      he.top_p = 'top_p 必须在 0 到 1 之间';
+      he.top_p = 'top_p must be between 0 and 1';
       ok = false;
     }
     if (m != null && (!Number.isFinite(m) || m < 1)) {
-      he.max_tokens = 'max_tokens 必须为大于 0 的整数';
+      he.max_tokens = 'max_tokens must be an integer > 0';
       ok = false;
     }
     
     setHarnessErrors(he);
 
     if (!ok) {
-      setError('运行配置有误，请检查标红项');
+      setError('Run configuration has errors — check the highlighted fields');
       if (he.temperature || he.top_p || he.max_tokens) {
         setShowAdvanced(true);
       }
@@ -791,9 +791,9 @@ export function AppEditorPage() {
     setSaving(true);
     try {
       await persist();
-      toast.success('已保存为草稿。版本内容需发布后才生效。');
+      toast.success('Saved as draft. Version content takes effect once published.');
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '保存失败');
+      setError(err instanceof ApiError ? err.message : 'Save failed');
     } finally {
       setSaving(false);
     }
@@ -801,10 +801,10 @@ export function AppEditorPage() {
 
   const handleCancel = async () => {
     const ok = await confirm({
-      title: '放弃更改',
-      message: '你所做的更改不会被保存，确认离开吗？',
+      title: 'Discard changes',
+      message: 'Your changes won’t be saved. Leave anyway?',
       tone: 'danger',
-      confirmText: '离开',
+      confirmText: 'Leave',
     });
     if (ok) navigate('/home');
   };
@@ -819,7 +819,7 @@ export function AppEditorPage() {
         navigate('/home');
       }
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '提交审核失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to submit for review');
     } finally {
       setSaving(false);
     }
@@ -836,9 +836,9 @@ export function AppEditorPage() {
       }
     } catch (err) {
       if (err instanceof ApiError && err.status === 403) {
-        setError('没有发布权限（仅管理员可直接发布）');
+        setError('You don’t have permission to publish (only admins can publish directly)');
       } else {
-        setError(err instanceof ApiError ? err.message : '发布失败');
+        setError(err instanceof ApiError ? err.message : 'Publish failed');
       }
     } finally {
       setSaving(false);
@@ -848,8 +848,8 @@ export function AppEditorPage() {
   if (loading) {
     return (
       <div className="flex flex-col h-full bg-paper">
-        <PageHead crumbs={[{ label: '首页', to: '/home' }, { label: '编辑应用' }]} />
-        <div className="font-mono text-[12px] text-dim p-6">加载中…</div>
+        <PageHead crumbs={[{ label: 'Home', to: '/home' }, { label: 'Edit app' }]} />
+        <div className="font-mono text-[12px] text-dim p-6">Loading…</div>
       </div>
     );
   }
@@ -859,8 +859,8 @@ export function AppEditorPage() {
     <div className="flex flex-col h-full min-w-0 bg-paper">
       <PageHead
         crumbs={[
-          { label: '首页', to: '/home' },
-          { label: metaBaseline.name || '编辑应用' },
+          { label: 'Home', to: '/home' },
+          { label: metaBaseline.name || 'Edit app' },
         ]}
         actions={
           <>
@@ -869,14 +869,14 @@ export function AppEditorPage() {
               className="cw-btn cw-btn-ghost cw-btn-sm"
               disabled={saving}
             >
-              取消
+              Cancel
             </button>
             <button
               onClick={handleSaveDraft}
               className="cw-btn cw-btn-sm"
               disabled={saving}
             >
-              {saving ? '保存中…' : '保存'}
+              {saving ? 'Saving…' : 'Save'}
             </button>
             {step === 1 ? (
               <button
@@ -884,7 +884,7 @@ export function AppEditorPage() {
                 className="cw-btn cw-btn-primary cw-btn-sm"
                 disabled={saving}
               >
-                下一步
+                Next
               </button>
             ) : (
               <>
@@ -893,14 +893,14 @@ export function AppEditorPage() {
                   className="cw-btn cw-btn-ghost cw-btn-sm"
                   disabled={saving}
                 >
-                  上一步
+                  Back
                 </button>
                 <button
                   onClick={isAdmin ? handlePublish : handleSubmit}
                   className="cw-btn cw-btn-primary cw-btn-sm"
                   disabled={saving}
                 >
-                  {saving ? '发布中…' : '发布'}
+                  {saving ? 'Publishing…' : 'Publish'}
                 </button>
               </>
             )}
@@ -928,36 +928,36 @@ export function AppEditorPage() {
             <>
           {/* ── Harness ── */}
           <Section
-            title="运行配置 (Harness)"
-            hint={!draftEditable ? '当前配置不可改，保存将创建新草稿' : ''}
+            title="Run configuration (harness)"
+            hint={!draftEditable ? 'This configuration is read-only; saving creates a new draft' : ''}
           >
             <PromptTemplateEditor
-              label="系统提示词 (system prompt, 可选)"
+              label="System prompt (optional)"
               value={harness.system_prompt}
               onChange={(system_prompt) => patchHarness({ system_prompt })}
               fields={harness.input_schema}
-              placeholder="你是一名严谨的合同审查专家。必须按组织标准输出审查摘要、风险清单和修改建议…"
+              placeholder="You are a meticulous contract reviewer. Always output a review summary, risk list and suggested edits per our standards…"
               error={harnessErrors.system_prompt}
             />
             <PromptTemplateEditor
-              label="用户提示词模板 (user prompt template)"
+              label="User prompt template"
               value={harness.user_prompt_template}
               onChange={(user_prompt_template) => patchHarness({ user_prompt_template })}
               fields={harness.input_schema}
-              placeholder="请审查 /contract，重点关注 /focus。若有附件，请读取 /attachment。"
+              placeholder="Review /contract, focusing on /focus. If there is an attachment, read /attachment."
               minHeight={140}
               error={harnessErrors.user_prompt_template}
             />
 
             <div className="flex flex-col gap-1 max-w-xs">
-              <label className="cw-label">模型</label>
+              <label className="cw-label">Model</label>
               <div className="border border-line rounded-sm px-2 py-1.5 bg-paper inline-flex items-center">
                 <Dropdown
                   value={harness.model}
                   options={MODEL_OPTIONS}
                   onChange={(m) => patchHarness({ model: m })}
                   align="left"
-                  title="模型"
+                  title="Model"
                   fullWidth
                 />
               </div>
@@ -969,19 +969,19 @@ export function AppEditorPage() {
                 onClick={() => setShowAdvanced(!showAdvanced)}
                 className="flex items-center gap-1.5 text-[12px] text-dim hover:text-ink font-medium select-none"
               >
-                <span>{showAdvanced ? '▼' : '▶'}</span> 高级设置
+                <span>{showAdvanced ? '▼' : '▶'}</span> Advanced settings
               </button>
               {showAdvanced && (
                 <div className="mt-3 flex flex-col gap-4">
                   <div className="flex flex-col gap-1 max-w-xs">
-                    <label className="cw-label">推理强度</label>
+                    <label className="cw-label">Reasoning effort</label>
                     <div className="border border-line rounded-sm px-2 py-1.5 bg-paper inline-flex items-center">
                       <Dropdown
                         value={harness.reasoning_effort}
                         options={EFFORT_OPTIONS}
                         onChange={(e) => patchHarness({ reasoning_effort: e })}
                         align="left"
-                        title="推理强度"
+                        title="Reasoning effort"
                         fullWidth
                       />
                     </div>
@@ -996,7 +996,7 @@ export function AppEditorPage() {
                         className={harnessErrors.temperature ? inputCls.replace('border-line', 'border-accent') : inputCls}
                         value={harness.temperature}
                         onChange={(e) => patchHarness({ temperature: e.target.value })}
-                        placeholder="（默认）"
+                        placeholder="(default)"
                       />
                       {harnessErrors.temperature && (
                         <span className="text-[10.5px] text-accent">{harnessErrors.temperature}</span>
@@ -1010,7 +1010,7 @@ export function AppEditorPage() {
                         className={harnessErrors.top_p ? inputCls.replace('border-line', 'border-accent') : inputCls}
                         value={harness.top_p}
                         onChange={(e) => patchHarness({ top_p: e.target.value })}
-                        placeholder="（默认）"
+                        placeholder="(default)"
                       />
                       {harnessErrors.top_p && (
                         <span className="text-[10.5px] text-accent">{harnessErrors.top_p}</span>
@@ -1024,7 +1024,7 @@ export function AppEditorPage() {
                         className={harnessErrors.max_tokens ? inputCls.replace('border-line', 'border-accent') : inputCls}
                         value={harness.max_tokens}
                         onChange={(e) => patchHarness({ max_tokens: e.target.value })}
-                        placeholder="（默认）"
+                        placeholder="(default)"
                       />
                       {harnessErrors.max_tokens && (
                         <span className="text-[10.5px] text-accent">{harnessErrors.max_tokens}</span>
@@ -1038,12 +1038,12 @@ export function AppEditorPage() {
 
           {/* ── Skills ── */}
           <Section
-            title="配置技能 (Skills)"
-            hint="运行该应用时固定开启这些技能。"
+            title="Skills"
+            hint="These skills are always enabled when the app runs."
           >
             {skills.length === 0 ? (
               <span className="text-[12px] text-dim italic font-mono">
-                无可用技能
+                No skills available
               </span>
             ) : (
               <div className="flex flex-wrap gap-1.5">
@@ -1063,12 +1063,12 @@ export function AppEditorPage() {
 
           {/* ── MCP servers ── */}
           <Section
-            title="MCP 服务配置（前向兼容，仅记录）"
-            hint="v1 仅存储不进行过滤，运行时仍由租户全局注入。"
+            title="MCP servers (forward-compatible, recorded only)"
+            hint="v1 only stores this without filtering; at run time servers are still injected tenant-wide."
           >
             {mcpServers.length === 0 ? (
               <span className="text-[12px] text-dim italic font-mono">
-                无可用 MCP 服务
+                No MCP servers available
               </span>
             ) : (
               <div className="flex flex-wrap gap-1.5">
@@ -1091,19 +1091,19 @@ export function AppEditorPage() {
           {/* ── App info (immediate effect, unlike the version below) ── */}
           {step === 1 && (
             <Section
-              title="应用信息"
-              hint="名称、图标与简介保存后立即生效；下方的输入字段与提示词属于版本内容，需发布后才生效。"
+              title="App info"
+              hint="Name, icon and description take effect as soon as you save. Input fields and prompts below are version content and take effect once published."
             >
               <div className="flex gap-3 items-end">
                 <div className="flex flex-col gap-1">
-                  <label className="cw-label">图标</label>
+                  <label className="cw-label">Icon</label>
                   <EmojiPicker
                     value={meta.icon}
                     onChange={(icon) => setMeta((m) => ({ ...m, icon }))}
                   />
                 </div>
                 <div className="flex-1 flex flex-col gap-1 min-w-0">
-                  <label className="cw-label">名称 *</label>
+                  <label className="cw-label">Name *</label>
                   <input
                     className={metaError ? appInputCls.replace('border-line', 'border-accent') : appInputCls}
                     value={meta.name}
@@ -1111,24 +1111,24 @@ export function AppEditorPage() {
                       setMeta((m) => ({ ...m, name: e.target.value }));
                       if (metaError) setMetaError(null);
                     }}
-                    placeholder="合同审查助手"
+                    placeholder="Contract review assistant"
                   />
                   {metaError && <span className="text-[10.5px] text-accent">{metaError}</span>}
                 </div>
               </div>
 
               <div className="flex flex-col gap-1">
-                <label className="cw-label">简介</label>
+                <label className="cw-label">Description</label>
                 <textarea
                   className={`${appInputCls} min-h-[60px] resize-y`}
                   value={meta.description}
                   onChange={(e) => setMeta((m) => ({ ...m, description: e.target.value }))}
-                  placeholder="一句话说明这个应用做什么"
+                  placeholder="One line on what this app does"
                 />
               </div>
 
               <div className="flex flex-col gap-1">
-                <label className="cw-label">可见性</label>
+                <label className="cw-label">Visibility</label>
                 <VisibilitySelect
                   value={meta.visibility}
                   onChange={(visibility) => setMeta((m) => ({ ...m, visibility }))}
@@ -1140,8 +1140,8 @@ export function AppEditorPage() {
           {/* ── Input schema builder ── */}
           {step === 1 && (
             <Section
-              title="输入表单字段"
-              hint="定义用户运行该应用时需要填写的字段，后续 Prompt 中可用 /字段标识 引用。"
+              title="Input form fields"
+              hint="Define the fields users fill in when running this app. Reference them in prompts with /field_key."
             >
               <InputSchemaBuilder
                 fields={harness.input_schema}
@@ -1158,14 +1158,14 @@ export function AppEditorPage() {
               className="cw-btn cw-btn-ghost cw-btn-sm"
               disabled={saving}
             >
-              取消
+              Cancel
             </button>
             <button
               onClick={handleSaveDraft}
               className="cw-btn cw-btn-sm"
               disabled={saving}
             >
-              {saving ? '保存中…' : '保存'}
+              {saving ? 'Saving…' : 'Save'}
             </button>
             {step === 1 ? (
               <button
@@ -1173,7 +1173,7 @@ export function AppEditorPage() {
                 className="cw-btn cw-btn-primary cw-btn-sm"
                 disabled={saving}
               >
-                下一步
+                Next
               </button>
             ) : (
               <>
@@ -1182,14 +1182,14 @@ export function AppEditorPage() {
                   className="cw-btn cw-btn-ghost cw-btn-sm"
                   disabled={saving}
                 >
-                  上一步
+                  Back
                 </button>
                 <button
                   onClick={isAdmin ? handlePublish : handleSubmit}
                   className="cw-btn cw-btn-primary cw-btn-sm"
                   disabled={saving}
                 >
-                  {saving ? '发布中…' : '发布'}
+                  {saving ? 'Publishing…' : 'Publish'}
                 </button>
               </>
             )}

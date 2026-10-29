@@ -50,7 +50,7 @@ IMPORTANT — before the platform starts correctly:
    - {{ .Values.global.foundation.redis.existingSecret }} (key: password OR url)
    - {{ .Values.global.foundation.s3.existingSecret }} (keys: access_key_id, secret_access_key)
    - ap-bff-secrets (key: BFF_COOKIE_SECRET) — or set bff.existingSecret
-   - ap-agent-scheduler-secrets (keys: SCHEDULER_SERVICE_TOKEN, SCHEDULER_KEYCLOAK_CLIENT_SECRET, LLM_API_KEY)
+   - ap-agent-scheduler-secrets (keys: SCHEDULER_SERVICE_TOKEN, SCHEDULER_KEYCLOAK_CLIENT_SECRET)
      — or set agentScheduler.existingSecret
 
 2. Ensure saas-foundation services are reachable at:

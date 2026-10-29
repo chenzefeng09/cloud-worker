@@ -41,11 +41,28 @@ _LEADING_META_RES = (
         r"^(?:下面|以下|这里|这是|为你|给你).{0,30}"
         r"(?:文章|稿件|讲话|草稿|正文|版本|内容|邮件|报告|方案)"
     ),
+    # "Sure, here's…" / "Of course! Below is…" / "Okay, I'll…" acknowledgements.
+    re.compile(
+        r"^(?:sure|certainly|of course|okay|ok|absolutely|got it)[,.!\s]+"
+        r"(?:here(?:'s| is| are)|below is|i'll|i will|let me)\b",
+        re.IGNORECASE,
+    ),
+    # "Here is the revised article:" / "Below is the draft:" hand-offs (the
+    # trailing colon keeps genuine body sentences from matching).
+    re.compile(
+        r"^(?:here(?:'s| is| are)|below is|below are)\b.{0,40}"
+        r"(?:article|draft|speech|body|version|content|email|report|proposal|document)"
+        r"[^\n]{0,20}:\s*$",
+        re.IGNORECASE,
+    ),
 )
 
-# Trailing meta labels the model appends after the body ("说明：…", "备注：…").
+# Trailing meta labels the model appends after the body ("说明：…", "备注：…",
+# "Notes: …").
 _TRAILING_META_LABEL_RE = re.compile(
     r"^(?:说明|备注|注|使用建议|修改建议|温馨提示)\s*[:：]"
+    r"|^(?:notes?|usage notes|suggested edits|tips?)\s*:",
+    re.IGNORECASE,
 )
 
 

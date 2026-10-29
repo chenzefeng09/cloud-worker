@@ -503,7 +503,7 @@ def test_create_skill_version_rejects_oversized_upload(
         files={"file": ("huge.tar.gz", oversized, "application/gzip")},
     )
     assert resp.status_code == 413
-    assert resp.json()["detail"]["user_message"] == "技能包超过大小上限 20 MB"
+    assert resp.json()["detail"]["user_message"] == "The skill package exceeds the 20 MB size limit."
     # Upstream must never be reached for an oversized payload.
     assert fake.calls == []
 

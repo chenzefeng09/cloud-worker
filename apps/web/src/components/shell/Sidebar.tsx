@@ -5,7 +5,7 @@ import { useSessions } from '../../hooks/useSessions';
 import { useWorkspace } from '../../lib/workspaceContext';
 import { AccountMenu } from './AccountMenu';
 import { canAccessAdmin } from '../../admin/AdminLayout';
-import { formatAbsoluteTimeZh } from '../../lib/format';
+import { formatAbsoluteTime } from '../../lib/format';
 import type { Session } from '../../api/types';
 
 interface NavSpec {
@@ -16,11 +16,11 @@ interface NavSpec {
 }
 
 const NAV: NavSpec[] = [
-  { to: '/home', label: '新任务', glyph: '◇' },
-  { to: '/apps', label: '应用', glyph: '▦' },
-  { to: '/workspace', label: '我的工作区', glyph: '⌗' },
-  { to: '/library', label: '资源库', glyph: '✦' },
-  { to: '/artifacts', label: '产物', glyph: '◈' },
+  { to: '/home', label: 'New task', glyph: '◇' },
+  { to: '/apps', label: 'Apps', glyph: '▦' },
+  { to: '/workspace', label: 'My workspace', glyph: '⌗' },
+  { to: '/library', label: 'Library', glyph: '✦' },
+  { to: '/artifacts', label: 'Artifacts', glyph: '◈' },
 ];
 
 const UNGROUPED = '__ungrouped__';
@@ -73,7 +73,7 @@ export function Sidebar() {
       result.push({ key, label: wsNameMap.get(key) ?? key, items });
     }
     if (ungrouped && ungrouped.length > 0) {
-      result.push({ key: UNGROUPED, label: '未分组', items: ungrouped });
+      result.push({ key: UNGROUPED, label: 'Ungrouped', items: ungrouped });
     }
     return result;
   }, [sessions, wsNameMap]);
@@ -141,10 +141,10 @@ export function Sidebar() {
         </div>
 
         <div className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim px-2 pt-3 pb-0.5 shrink-0">
-          最近
+          Recent
         </div>
         {sessions.length === 0 && (
-          <div className="font-mono italic text-dim text-[11px] px-2.5 py-1 shrink-0">暂无任务</div>
+          <div className="font-mono italic text-dim text-[11px] px-2.5 py-1 shrink-0">No tasks yet</div>
         )}
         <div className="flex-1 min-h-0 overflow-y-auto cw-scroll -mx-0.5 px-0.5">
           {groups.map((g) => (
@@ -161,7 +161,7 @@ export function Sidebar() {
               disabled={loadingMore}
               className="mt-1 w-full px-2 py-1.5 text-left font-mono text-[10px] text-dim hover:text-ink-2 disabled:opacity-50"
             >
-              {loadingMore ? '加载中…' : '显示更多'}
+              {loadingMore ? 'Loading…' : 'Show more'}
             </button>
           )}
         </div>
@@ -192,7 +192,7 @@ export function Sidebar() {
                 >
                   ⊞
                 </span>
-                <span className="flex-1 truncate">管理后台</span>
+                <span className="flex-1 truncate">Admin console</span>
               </>
             )}
           </NavLink>
@@ -253,7 +253,7 @@ function RecentItem({ session }: { session: Session }) {
   return (
     <NavLink
       to={`/tasks/${session.id}`}
-      title={formatAbsoluteTimeZh(session.updated_at)}
+      title={formatAbsoluteTime(session.updated_at)}
       className={({ isActive }) =>
         [
           'block px-2 py-1.5 rounded-sm text-[12.5px] cursor-pointer no-underline truncate',
@@ -263,7 +263,7 @@ function RecentItem({ session }: { session: Session }) {
         ].join(' ')
       }
     >
-      {session.title || '未命名任务'}
+      {session.title || 'Untitled task'}
     </NavLink>
   );
 }

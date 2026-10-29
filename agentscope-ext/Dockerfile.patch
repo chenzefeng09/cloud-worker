@@ -1,4 +1,0 @@
-# Overlay patch: copy locally-updated agentscope_ext source over the editable
-# install inside the prebuilt sandbox image so token-streaming changes take effect.
-FROM ghcr.io/agent-platform/agentscope-sandbox:0.1
-COPY agentscope_ext /opt/agentscope-ext/agentscope_ext

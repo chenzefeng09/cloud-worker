@@ -60,7 +60,7 @@ export function PamPage() {
         for (const usr of u.items) m.set(usr.id, usr.display_name || usr.email);
         setUserMap(m);
       })
-      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : '加载失败'); })
+      .catch((err) => { if (isTodo(err)) setTodo(true); else setError(err instanceof ApiError ? err.message : 'Failed to load'); })
       .finally(() => setLoading(false));
   }, [selectedTenantId]);
 
@@ -71,41 +71,41 @@ export function PamPage() {
 
   const handleApprove = async (id?: string) => {
     if (!id) return;
-    const justification = await prompt({ title: '批准升权', label: '审批说明 (可选)', placeholder: '已核实工单' });
+    const justification = await prompt({ title: 'Approve elevation', label: 'Approval note (optional)', placeholder: 'Ticket verified' });
     if (justification === null) return;
     try {
       await api.admin.pam.approveElevation(id, { justification: justification.trim() }, selectedTenantId ?? undefined);
-      toast.success('已批准');
+      toast.success('Approved');
       refresh();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '批准失败');
+      toast.error(err instanceof ApiError ? err.message : 'Approval failed');
     }
   };
 
   const handleRevoke = async (id?: string) => {
     if (!id) return;
-    if (!(await confirm({ title: '拒绝 / 吊销升权', message: '确定拒绝或吊销该升权请求？', tone: 'danger', confirmText: '确认' }))) return;
+    if (!(await confirm({ title: 'Reject / revoke elevation', message: 'Reject or revoke this elevation request?', tone: 'danger', confirmText: 'Confirm' }))) return;
     try {
       await api.admin.pam.revokeElevation(id, selectedTenantId ?? undefined);
-      toast.success('已处理');
+      toast.success('Done');
       refresh();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '操作失败');
+      toast.error(err instanceof ApiError ? err.message : 'Action failed');
     }
   };
 
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">特权访问</h1>
-        <p className="text-[12px] text-dim mt-0.5">升权审批、历史与活跃会话（→ pam）</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Privileged access</h1>
+        <p className="text-[12px] text-dim mt-0.5">Elevation approvals, history and active sessions (→ pam)</p>
       </div>
 
       {/* Tenant selector */}
       <div className="flex items-center gap-3">
-        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
+        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">Tenant</label>
         <CustomSelect
-          options={[{ value: '', label: '（默认 / 当前租户）' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+          options={[{ value: '', label: '(Default / current tenant)' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
           value={selectedTenantId ?? ''}
           onChange={(v) => setSelectedTenantId(v || null)}
           disabled={tenantsLoading}
@@ -114,24 +114,24 @@ export function PamPage() {
       </div>
 
       {error && <div className="border border-accent-line rounded-md px-4 py-3 bg-accent-soft text-[13px] text-accent">{error}</div>}
-      {todo && <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">该能力暂未启用：PAM 端点不可达，接线后将自动展示。</div>}
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+      {todo && <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">Not available yet: the PAM endpoint is unreachable. Data will appear here once it's connected.</div>}
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
 
       {!todo && !loading && (
         <>
           {/* Pending */}
           <section className="flex flex-col gap-2">
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">待审批升权</div>
+            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Pending elevations</div>
             {pending.length === 0 ? (
-              <div className="font-mono text-[12px] text-dim italic">暂无待审批请求</div>
+              <div className="font-mono text-[12px] text-dim italic">No pending requests</div>
             ) : (
               <div className="border border-line rounded-md overflow-hidden">
                 <table className="w-full text-left border-collapse">
                   <thead className="bg-paper-2 border-b border-line">
                     <tr>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">用户</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">理由</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">User</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Reason</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
                       <th className="px-3 py-2 w-32"></th>
                     </tr>
                   </thead>
@@ -142,8 +142,8 @@ export function PamPage() {
                         <td className="px-3 py-2 text-[12px] text-ink truncate max-w-[260px]">{p.reason ?? '—'}</td>
                         <td className="px-3 py-2 font-mono text-[11px] text-warn">{p.status ?? '—'}</td>
                         <td className="px-3 py-2 flex items-center gap-2">
-                          <button onClick={() => handleApprove(p.id)} className="text-[11px] font-mono text-green-700 border border-green-200 rounded-sm px-2 py-0.5 hover:bg-green-50">批准</button>
-                          <button onClick={() => handleRevoke(p.id)} className="text-[11px] font-mono text-red-600 border border-red-200 rounded-sm px-2 py-0.5 hover:bg-red-50">拒绝</button>
+                          <button onClick={() => handleApprove(p.id)} className="text-[11px] font-mono text-green-700 border border-green-200 rounded-sm px-2 py-0.5 hover:bg-green-50">Approve</button>
+                          <button onClick={() => handleRevoke(p.id)} className="text-[11px] font-mono text-red-600 border border-red-200 rounded-sm px-2 py-0.5 hover:bg-red-50">Reject</button>
                         </td>
                       </tr>
                     ))}
@@ -155,18 +155,18 @@ export function PamPage() {
 
           {/* Active sessions */}
           <section className="flex flex-col gap-2">
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">活跃会话</div>
+            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Active sessions</div>
             {sessions.length === 0 ? (
-              <div className="font-mono text-[12px] text-dim italic">暂无活跃升权会话</div>
+              <div className="font-mono text-[12px] text-dim italic">No active elevated sessions</div>
             ) : (
               <div className="border border-line rounded-md overflow-hidden">
                 <table className="w-full text-left border-collapse">
                   <thead className="bg-paper-2 border-b border-line">
                     <tr>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">会话 ID</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">用户</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">权限</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">到期</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Session ID</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">User</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Permission</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Expires</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -186,18 +186,18 @@ export function PamPage() {
 
           {/* History */}
           <section className="flex flex-col gap-2">
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">历史记录</div>
+            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">History</div>
             {history.length === 0 ? (
-              <div className="font-mono text-[12px] text-dim italic">暂无历史记录</div>
+              <div className="font-mono text-[12px] text-dim italic">No history</div>
             ) : (
               <div className="border border-line rounded-md overflow-hidden">
                 <table className="w-full text-left border-collapse">
                   <thead className="bg-paper-2 border-b border-line">
                     <tr>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">用户</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">理由</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">申请时间</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">User</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Reason</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Requested</th>
                     </tr>
                   </thead>
                   <tbody>

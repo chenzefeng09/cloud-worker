@@ -32,10 +32,10 @@ const STATUS_COLOR: Record<DocumentStatus, string> = {
 };
 
 const DOC_STATUS_ZH: Record<DocumentStatus, string> = {
-  PENDING: '待处理',
-  INGESTING: '摄入中',
-  READY: '就绪',
-  FAILED: '失败',
+  PENDING: 'Pending',
+  INGESTING: 'Ingesting',
+  READY: 'Ready',
+  FAILED: 'Failed',
 };
 
 const SENSITIVITY_OPTIONS = SENSITIVITY_ORDER.map((l) => ({
@@ -68,7 +68,7 @@ function flattenTree(
   depth = 0,
 ): { node: FolderNode; depth: number }[] {
   const out: { node: FolderNode; depth: number }[] = [];
-  const sorted = [...nodes].sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+  const sorted = [...nodes].sort((a, b) => a.name.localeCompare(b.name, 'en'));
   for (const n of sorted) {
     out.push({ node: n, depth });
     out.push(...flattenTree(n.children, depth + 1));
@@ -143,7 +143,7 @@ function DocDetailPanel({
     api.admin.knowledge.documents
       .get(doc.id, apiTenantId)
       .then((data) => { if (!cancelled) setDetail(data); })
-      .catch((err) => { if (!cancelled) setError(err instanceof ApiError ? err.message : '加载失败'); })
+      .catch((err) => { if (!cancelled) setError(err instanceof ApiError ? err.message : 'Failed to load'); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [doc.id, apiTenantId]);
@@ -151,7 +151,7 @@ function DocDetailPanel({
   const d = detail ?? doc;
 
   return (
-    <Dialog title="文档详情" onClose={onClose} className="w-full max-w-lg">
+    <Dialog title="Document details" onClose={onClose} className="w-full max-w-lg">
       <div className="flex items-center gap-2 mb-3">
         {d.source_uri && (
           <button
@@ -159,26 +159,26 @@ function DocDetailPanel({
             onClick={() => onPreview({ id: d.id, filename: d.title, mime: d.mime ?? undefined })}
             className="cw-btn cw-btn-ghost cw-btn-sm text-[11px] font-mono"
           >
-            预览
+            Preview
           </button>
         )}
       </div>
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
       <div className="grid grid-cols-[120px_1fr] gap-y-2 gap-x-3 text-[12px]">
         <span className="font-mono text-dim">ID</span>
         <span className="font-mono text-ink-2 break-all">{d.id}</span>
-        <span className="font-mono text-dim">文件名</span>
+        <span className="font-mono text-dim">File name</span>
         <span className="text-ink">{d.title}</span>
         <span className="font-mono text-dim">MIME</span>
         <span className="font-mono text-ink-2">{d.mime}</span>
-        <span className="font-mono text-dim">状态</span>
+        <span className="font-mono text-dim">Status</span>
         <span className={`font-mono ${STATUS_COLOR[d.status]}`}>{d.status}</span>
-        <span className="font-mono text-dim">Chunk 数</span>
+        <span className="font-mono text-dim">Chunks</span>
         <span className="font-mono text-ink-2">{d.chunk_count}</span>
-        <span className="font-mono text-dim">来源</span>
+        <span className="font-mono text-dim">Source</span>
         <span className="font-mono text-ink-2 break-all">{d.source_uri || '-'}</span>
-        <span className="font-mono text-dim">上传时间</span>
+        <span className="font-mono text-dim">Uploaded at</span>
         <span className="font-mono text-ink-2">{formatDateTimeAuto(new Date(d.uploaded_at))}</span>
       </div>
     </Dialog>
@@ -208,14 +208,14 @@ function AuditDocRow({
 
   const reingest = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!(await confirm({ title: '重新摄取', message: `确认重新摄取文档「${doc.title}」？`, confirmText: '确认' }))) return;
+    if (!(await confirm({ title: 'Re-ingest', message: `Re-ingest document "${doc.title}"?`, confirmText: 'Confirm' }))) return;
     setReingesting(true);
     setMsg(null);
     try {
       const res: IngestResult = await api.admin.knowledge.documents.reingest(doc.id, apiTenantId);
-      setMsg(`已触发：${res.status}，生成 ${res.chunks_created} 个 chunk`);
+      setMsg(`Triggered: ${res.status}, ${res.chunks_created} chunks created`);
     } catch (err) {
-      setMsg(err instanceof ApiError ? `失败：${err.message}` : '重新摄取失败');
+      setMsg(err instanceof ApiError ? `Failed: ${err.message}` : 'Re-ingest failed');
     } finally {
       setReingesting(false);
     }
@@ -225,20 +225,20 @@ function AuditDocRow({
     e.stopPropagation();
     if (
       !(await confirm({
-        title: '删除文档',
-        message: `确定删除文档「${doc.title}」吗？此操作不可撤销。`,
+        title: 'Delete document',
+        message: `Delete document "${doc.title}"? This can’t be undone.`,
         tone: 'danger',
-        confirmText: '删除',
+        confirmText: 'Delete',
       }))
     )
       return;
     setDeleting(true);
     try {
       await api.admin.knowledge.documents.delete(doc.id, apiTenantId);
-      toast.success('已删除文档');
+      toast.success('Document deleted');
       onDeleted();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '删除失败');
+      toast.error(err instanceof ApiError ? err.message : 'Failed to delete');
       setDeleting(false);
     }
   };
@@ -264,21 +264,21 @@ function AuditDocRow({
             onClick={(e) => { e.stopPropagation(); onSelect(doc); }}
             className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-dim hover:text-ink transition-opacity"
           >
-            详情
+            Details
           </button>
           <button
             onClick={reingest}
             disabled={reingesting || deleting}
             className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-dim hover:text-ink transition-opacity disabled:opacity-50"
           >
-            {reingesting ? '摄取中…' : '重新摄取'}
+            {reingesting ? 'Ingesting…' : 'Re-ingest'}
           </button>
           <button
             onClick={remove}
             disabled={reingesting || deleting}
             className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-red-600 hover:text-red-700 transition-opacity disabled:opacity-50"
           >
-            {deleting ? '删除中…' : '删除'}
+            {deleting ? 'Deleting…' : 'Delete'}
           </button>
         </div>
       </td>
@@ -305,7 +305,7 @@ function CreateFolderDialog({
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) {
-      setErr('请填写文件夹名称');
+      setErr('Enter a folder name');
       return;
     }
     setSubmitting(true);
@@ -318,27 +318,27 @@ function CreateFolderDialog({
       });
       onCreated();
     } catch (e2) {
-      setErr(e2 instanceof ApiError ? e2.message : '创建失败');
+      setErr(e2 instanceof ApiError ? e2.message : 'Failed to create');
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <Dialog title="新建文件夹" onClose={onClose} className="w-full max-w-md">
+    <Dialog title="New folder" onClose={onClose} className="w-full max-w-md">
       <form onSubmit={submit} className="flex flex-col gap-3">
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[11px] text-dim">名称</span>
+          <span className="font-mono text-[11px] text-dim">Name</span>
           <input
             className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="例如 产品文档"
+            placeholder="e.g. Product docs"
             autoFocus
           />
         </label>
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[11px] text-dim">默认密级（新上传文档未指定时采用）</span>
+          <span className="font-mono text-[11px] text-dim">Default classification (used when a new upload doesn’t specify one)</span>
           <CustomSelect
             options={SENSITIVITY_OPTIONS}
             value={sens}
@@ -353,14 +353,14 @@ function CreateFolderDialog({
             disabled={submitting}
             className="px-3 py-1.5 text-[13px] rounded-sm border border-line text-dim hover:bg-paper-2"
           >
-            取消
+            Cancel
           </button>
           <button
             type="submit"
             disabled={submitting}
             className="px-3 py-1.5 text-[13px] rounded-sm bg-ink text-paper hover:opacity-90 disabled:opacity-50"
           >
-            {submitting ? '创建中…' : '创建'}
+            {submitting ? 'Creating…' : 'Create'}
           </button>
         </div>
       </form>
@@ -388,7 +388,7 @@ function UploadDialog({
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!file) {
-      setErr('请选择文件');
+      setErr('Select a file');
       return;
     }
     setSubmitting(true);
@@ -410,26 +410,26 @@ function UploadDialog({
       }
       onUploaded();
     } catch (e2) {
-      setErr(e2 instanceof ApiError ? e2.message : '上传失败');
+      setErr(e2 instanceof ApiError ? e2.message : 'Upload failed');
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <Dialog title="上传文档" onClose={onClose} className="w-full max-w-md">
+    <Dialog title="Upload document" onClose={onClose} className="w-full max-w-md">
       <form onSubmit={submit} className="flex flex-col gap-3">
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[11px] text-dim">标题（可选，默认取文件名）</span>
+          <span className="font-mono text-[11px] text-dim">Title (optional, defaults to file name)</span>
           <input
             className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            placeholder="文档标题"
+            placeholder="Document title"
           />
         </label>
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[11px] text-dim">文件</span>
+          <span className="font-mono text-[11px] text-dim">File</span>
           <input
             type="file"
             className="text-[12px] text-ink-2 file:mr-2 file:px-2 file:py-1 file:text-[11px] file:font-mono file:border file:border-line file:rounded-sm file:bg-paper file:cursor-pointer"
@@ -438,7 +438,7 @@ function UploadDialog({
           />
         </label>
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[11px] text-dim">密级</span>
+          <span className="font-mono text-[11px] text-dim">Classification</span>
           <CustomSelect
             options={SENSITIVITY_OPTIONS}
             value={sens}
@@ -453,14 +453,14 @@ function UploadDialog({
             disabled={submitting}
             className="px-3 py-1.5 text-[13px] rounded-sm border border-line text-dim hover:bg-paper-2"
           >
-            取消
+            Cancel
           </button>
           <button
             type="submit"
             disabled={submitting}
             className="px-3 py-1.5 text-[13px] rounded-sm bg-accent text-surface hover:opacity-90 disabled:opacity-50"
           >
-            {submitting ? '上传中…' : '上传'}
+            {submitting ? 'Uploading…' : 'Upload'}
           </button>
         </div>
       </form>
@@ -489,18 +489,18 @@ function EditSensitivityDialog({
       await api.library.updateDocument(doc.id, { sensitivity: sens });
       onDone();
     } catch (e2) {
-      setErr(e2 instanceof ApiError ? e2.message : '修改失败');
+      setErr(e2 instanceof ApiError ? e2.message : 'Failed to update');
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <Dialog title="修改文档密级" onClose={onClose} className="w-full max-w-md">
+    <Dialog title="Change document classification" onClose={onClose} className="w-full max-w-md">
       <form onSubmit={submit} className="flex flex-col gap-3">
-        <div className="text-[12px] text-dim">文档：{doc.title}</div>
+        <div className="text-[12px] text-dim">Document: {doc.title}</div>
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[11px] text-dim">密级</span>
+          <span className="font-mono text-[11px] text-dim">Classification</span>
           <CustomSelect
             options={SENSITIVITY_OPTIONS}
             value={sens}
@@ -515,14 +515,14 @@ function EditSensitivityDialog({
             disabled={submitting}
             className="px-3 py-1.5 text-[13px] rounded-sm border border-line text-dim hover:bg-paper-2"
           >
-            取消
+            Cancel
           </button>
           <button
             type="submit"
             disabled={submitting}
             className="px-3 py-1.5 text-[13px] rounded-sm bg-ink text-paper hover:opacity-90 disabled:opacity-50"
           >
-            {submitting ? '保存中…' : '保存'}
+            {submitting ? 'Saving…' : 'Save'}
           </button>
         </div>
       </form>
@@ -551,8 +551,8 @@ function MoveDocDialog({
   const options = useMemo(() => {
     const opts = folders
       .map((f) => ({ value: f.id, label: folderPathLabel(folders, f.id) }))
-      .sort((a, b) => a.label.localeCompare(b.label, 'zh'));
-    return [{ value: '', label: '根目录' }, ...opts];
+      .sort((a, b) => a.label.localeCompare(b.label, 'en'));
+    return [{ value: '', label: 'Root' }, ...opts];
   }, [folders]);
 
   const submit = async (e: React.FormEvent) => {
@@ -565,18 +565,18 @@ function MoveDocDialog({
       });
       onDone();
     } catch (e2) {
-      setErr(e2 instanceof ApiError ? e2.message : '移动失败');
+      setErr(e2 instanceof ApiError ? e2.message : 'Failed to move');
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <Dialog title="移动文档" onClose={onClose} className="w-full max-w-md">
+    <Dialog title="Move document" onClose={onClose} className="w-full max-w-md">
       <form onSubmit={submit} className="flex flex-col gap-3">
-        <div className="text-[12px] text-dim">文档：{doc.title}</div>
+        <div className="text-[12px] text-dim">Document: {doc.title}</div>
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[11px] text-dim">目标文件夹</span>
+          <span className="font-mono text-[11px] text-dim">Target folder</span>
           <CustomSelect options={options} value={target} onChange={setTarget} />
         </label>
         {err && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{err}</div>}
@@ -587,14 +587,14 @@ function MoveDocDialog({
             disabled={submitting}
             className="px-3 py-1.5 text-[13px] rounded-sm border border-line text-dim hover:bg-paper-2"
           >
-            取消
+            Cancel
           </button>
           <button
             type="submit"
             disabled={submitting}
             className="px-3 py-1.5 text-[13px] rounded-sm bg-ink text-paper hover:opacity-90 disabled:opacity-50"
           >
-            {submitting ? '移动中…' : '移动'}
+            {submitting ? 'Moving…' : 'Move'}
           </button>
         </div>
       </form>
@@ -623,8 +623,8 @@ function MoveFolderDialog({
     const opts = folders
       .filter((f) => !blocked.has(f.id))
       .map((f) => ({ value: f.id, label: folderPathLabel(folders, f.id) }))
-      .sort((a, b) => a.label.localeCompare(b.label, 'zh'));
-    return [{ value: '', label: '根目录' }, ...opts];
+      .sort((a, b) => a.label.localeCompare(b.label, 'en'));
+    return [{ value: '', label: 'Root' }, ...opts];
   }, [folders, folder.id]);
 
   const submit = async (e: React.FormEvent) => {
@@ -637,18 +637,18 @@ function MoveFolderDialog({
       });
       onDone();
     } catch (e2) {
-      setErr(e2 instanceof ApiError ? e2.message : '移动失败');
+      setErr(e2 instanceof ApiError ? e2.message : 'Failed to move');
     } finally {
       setSubmitting(false);
     }
   };
 
   return (
-    <Dialog title="移动文件夹" onClose={onClose} className="w-full max-w-md">
+    <Dialog title="Move folder" onClose={onClose} className="w-full max-w-md">
       <form onSubmit={submit} className="flex flex-col gap-3">
-        <div className="text-[12px] text-dim">文件夹：{folder.name}</div>
+        <div className="text-[12px] text-dim">Folder: {folder.name}</div>
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[11px] text-dim">目标父文件夹</span>
+          <span className="font-mono text-[11px] text-dim">Target parent folder</span>
           <CustomSelect options={options} value={target} onChange={setTarget} />
         </label>
         {err && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{err}</div>}
@@ -659,14 +659,14 @@ function MoveFolderDialog({
             disabled={submitting}
             className="px-3 py-1.5 text-[13px] rounded-sm border border-line text-dim hover:bg-paper-2"
           >
-            取消
+            Cancel
           </button>
           <button
             type="submit"
             disabled={submitting}
             className="px-3 py-1.5 text-[13px] rounded-sm bg-ink text-paper hover:opacity-90 disabled:opacity-50"
           >
-            {submitting ? '移动中…' : '移动'}
+            {submitting ? 'Moving…' : 'Move'}
           </button>
         </div>
       </form>
@@ -699,15 +699,15 @@ function ManageDocRow({
 
   const reingest = async (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (!(await confirm({ title: '重新摄取', message: `确认重新摄取文档「${doc.title}」？`, confirmText: '确认' }))) return;
+    if (!(await confirm({ title: 'Re-ingest', message: `Re-ingest document "${doc.title}"?`, confirmText: 'Confirm' }))) return;
     setReingesting(true);
     setMsg(null);
     try {
       const res: IngestResult = await api.library.ingestDocument(doc.id);
-      setMsg(`已触发：${res.status}，生成 ${res.chunks_created} 个 chunk`);
+      setMsg(`Triggered: ${res.status}, ${res.chunks_created} chunks created`);
       onReingest(doc);
     } catch (err) {
-      setMsg(err instanceof ApiError ? `失败：${err.message}` : '重新摄取失败');
+      setMsg(err instanceof ApiError ? `Failed: ${err.message}` : 'Re-ingest failed');
     } finally {
       setReingesting(false);
     }
@@ -717,20 +717,20 @@ function ManageDocRow({
     e.stopPropagation();
     if (
       !(await confirm({
-        title: '删除文档',
-        message: `确定删除文档「${doc.title}」吗？此操作不可撤销。`,
+        title: 'Delete document',
+        message: `Delete document "${doc.title}"? This can’t be undone.`,
         tone: 'danger',
-        confirmText: '删除',
+        confirmText: 'Delete',
       }))
     )
       return;
     setDeleting(true);
     try {
       await api.library.deleteDocument(doc.id);
-      toast.success('已删除文档');
+      toast.success('Document deleted');
       onDeleted(doc);
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '删除失败');
+      toast.error(err instanceof ApiError ? err.message : 'Failed to delete');
       setDeleting(false);
     }
   };
@@ -759,28 +759,28 @@ function ManageDocRow({
             disabled={reingesting || deleting}
             className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-dim hover:text-ink transition-opacity disabled:opacity-50"
           >
-            改密级
+            Classification
           </button>
           <button
             onClick={(e) => { e.stopPropagation(); onMoved(doc); }}
             disabled={reingesting || deleting}
             className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-dim hover:text-ink transition-opacity disabled:opacity-50"
           >
-            移动
+            Move
           </button>
           <button
             onClick={reingest}
             disabled={reingesting || deleting}
             className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-dim hover:text-ink transition-opacity disabled:opacity-50"
           >
-            {reingesting ? '摄取中…' : '重新摄取'}
+            {reingesting ? 'Ingesting…' : 'Re-ingest'}
           </button>
           <button
             onClick={remove}
             disabled={reingesting || deleting}
             className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-red-600 hover:text-red-700 transition-opacity disabled:opacity-50"
           >
-            {deleting ? '删除中…' : '删除'}
+            {deleting ? 'Deleting…' : 'Delete'}
           </button>
         </div>
       </td>
@@ -821,7 +821,7 @@ function FolderTree({
         }`}
       >
         <span className="text-[13px] leading-none">📁</span>
-        <span className="flex-1 truncate">根目录</span>
+        <span className="flex-1 truncate">Root</span>
       </button>
       {flat.map(({ node, depth }) => (
         <div
@@ -843,7 +843,7 @@ function FolderTree({
           <div className="flex items-center gap-0.5 pr-1 opacity-0 group-hover:opacity-100 transition-opacity">
             <button
               type="button"
-              title="重命名"
+              title="Rename"
               onClick={() => onRename(node)}
               className="text-[11px] font-mono text-dim hover:text-ink px-1"
             >
@@ -851,7 +851,7 @@ function FolderTree({
             </button>
             <button
               type="button"
-              title="移动"
+              title="Move"
               onClick={() => onMove(node)}
               className="text-[11px] font-mono text-dim hover:text-ink px-1"
             >
@@ -859,7 +859,7 @@ function FolderTree({
             </button>
             <button
               type="button"
-              title="删除"
+              title="Delete"
               onClick={() => onDelete(node)}
               className="text-[11px] font-mono text-red-600 hover:text-red-700 px-1"
             >
@@ -869,7 +869,7 @@ function FolderTree({
         </div>
       ))}
       {flat.length === 0 && (
-        <div className="px-2 py-1.5 font-mono text-[11px] text-dim italic">暂无文件夹</div>
+        <div className="px-2 py-1.5 font-mono text-[11px] text-dim italic">No folders</div>
       )}
     </div>
   );
@@ -887,7 +887,7 @@ export function KnowledgeAdminPage() {
 
   const canSwitchTenant = isPlatformAdmin(userProfile?.permissions);
   const ownTenantId = userProfile?.tenant_id ?? null;
-  const ownTenantName = tenants.find((t) => t.id === ownTenantId)?.name ?? ownTenantId ?? '当前租户';
+  const ownTenantName = tenants.find((t) => t.id === ownTenantId)?.name ?? ownTenantId ?? 'Current tenant';
 
   // Platform admins may pick any tenant; tenant admins are locked to their own.
   // The shared adminStore may hold a stale cross-tenant id from a prior
@@ -970,7 +970,7 @@ export function KnowledgeAdminPage() {
       })
       .catch((err) => {
         if (cancelled) return;
-        setManageError(err instanceof ApiError ? err.message : '加载失败');
+        setManageError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => {
         if (!cancelled) setManageLoading(false);
@@ -1004,7 +1004,7 @@ export function KnowledgeAdminPage() {
         if (err instanceof ApiError && (err.status === 404 || err.status === 501 || err.status === 502)) {
           setIsTodoEndpoint(true);
         } else {
-          setAuditError(err instanceof ApiError ? err.message : '加载失败');
+          setAuditError(err instanceof ApiError ? err.message : 'Failed to load');
         }
       })
       .finally(() => { if (!cancelled) setAuditLoading(false); });
@@ -1022,7 +1022,7 @@ export function KnowledgeAdminPage() {
       .filter((d) =>
         currentFolderId ? d.folder_id === currentFolderId : !d.folder_id,
       )
-      .sort((a, b) => a.title.localeCompare(b.title, 'zh'));
+      .sort((a, b) => a.title.localeCompare(b.title, 'en'));
   }, [docs, currentFolderId]);
   const currentFolderDefaultSensitivity: DlpSensitivity = useMemo(() => {
     const f = folders.find((x) => x.id === currentFolderId);
@@ -1033,21 +1033,21 @@ export function KnowledgeAdminPage() {
   const handleRenameFolder = useCallback(
     async (f: KnowledgeFolder) => {
       const next = await prompt({
-        title: '重命名文件夹',
-        label: '名称',
+        title: 'Rename folder',
+        label: 'Name',
         defaultValue: f.name,
         required: true,
-        confirmText: '保存',
+        confirmText: 'Save',
       });
       if (next === null) return;
       const name = next.trim();
       if (!name || name === f.name) return;
       try {
         await api.library.updateFolder(f.id, { name });
-        toast.success('已重命名');
+        toast.success('Renamed');
         setReloadKey((k) => k + 1);
       } catch (err) {
-        toast.error(err instanceof ApiError ? err.message : '重命名失败');
+        toast.error(err instanceof ApiError ? err.message : 'Failed to rename');
       }
     },
     [prompt, toast],
@@ -1057,25 +1057,25 @@ export function KnowledgeAdminPage() {
     async (f: KnowledgeFolder) => {
       if (
         !(await confirm({
-          title: '删除文件夹',
-          message: `确定删除文件夹「${f.name}」吗？仅空文件夹可删除。`,
+          title: 'Delete folder',
+          message: `Delete folder "${f.name}"? Only empty folders can be deleted.`,
           tone: 'danger',
-          confirmText: '删除',
+          confirmText: 'Delete',
         }))
       )
         return;
       try {
         await api.library.deleteFolder(f.id);
-        toast.success('已删除文件夹');
+        toast.success('Folder deleted');
         if (currentFolderId === f.id) setCurrentFolderId(null);
         setReloadKey((k) => k + 1);
       } catch (err) {
         const msg =
           err instanceof ApiError
             ? err.status === 409
-              ? `文件夹非空：${err.message}`
+              ? `Folder is not empty: ${err.message}`
               : err.message
-            : '删除失败';
+            : 'Failed to delete';
         toast.error(msg);
       }
     },
@@ -1086,26 +1086,26 @@ export function KnowledgeAdminPage() {
   const tenantSelectorOptions = useMemo(() => {
     if (!canSwitchTenant) return [];
     return [
-      { value: '', label: '我的租户（管理）' },
+      { value: '', label: 'My tenant (manage)' },
       ...tenants
         .filter((t) => t.id !== ownTenantId)
-        .map((t) => ({ value: t.id, label: `${t.name}（审计）` })),
+        .map((t) => ({ value: t.id, label: `${t.name} (audit)` })),
     ];
   }, [canSwitchTenant, tenants, ownTenantId]);
 
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">知识库</h1>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Knowledge base</h1>
         <p className="text-[12px] text-dim mt-0.5">
-          租户知识库文件夹与文档管理（由 knowledge-ingest 提供）
+          Manage tenant knowledge base folders and documents (via knowledge-ingest)
         </p>
       </div>
 
       {/* Tenant selector + mode badge */}
       <div className="flex items-center gap-3 flex-wrap">
         <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">
-          {canSwitchTenant ? '选择租户' : '当前租户'}
+          {canSwitchTenant ? 'Tenant' : 'Current tenant'}
         </label>
         {canSwitchTenant ? (
           <CustomSelect
@@ -1131,7 +1131,7 @@ export function KnowledgeAdminPage() {
               : 'border-line bg-paper-2 text-dim'
           }`}
         >
-          {isManageMode ? '管理模式：可增删改' : '审计模式：只读（跨租户）'}
+          {isManageMode ? 'Manage mode: read/write' : 'Audit mode: read-only (cross-tenant)'}
         </span>
       </div>
 
@@ -1145,7 +1145,7 @@ export function KnowledgeAdminPage() {
           )}
 
           {manageLoading && folders.length === 0 && docs.length === 0 && (
-            <div className="font-mono text-[12px] text-dim">加载中…</div>
+            <div className="font-mono text-[12px] text-dim">Loading…</div>
           )}
 
           <div className="flex gap-4 min-w-0">
@@ -1153,14 +1153,14 @@ export function KnowledgeAdminPage() {
             <div className="w-[260px] shrink-0 border border-line rounded-md p-2 bg-surface flex flex-col gap-2 max-h-[70vh] overflow-y-auto">
               <div className="flex items-center justify-between px-1">
                 <span className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  文件夹
+                  Folders
                 </span>
                 <button
                   type="button"
                   onClick={() => setCreateFolderOpen(true)}
                   className="px-2 py-0.5 text-[11px] font-mono border border-line bg-paper rounded-sm hover:bg-paper-2"
                 >
-                  + 新建
+                  + New
                 </button>
               </div>
               <FolderTree
@@ -1183,7 +1183,7 @@ export function KnowledgeAdminPage() {
                     className={`hover:text-ink ${currentFolderId === null ? 'text-ink' : ''}`}
                     onClick={() => setCurrentFolderId(null)}
                   >
-                    根目录
+                    Root
                   </button>
                   {breadcrumb.map((f) => (
                     <span key={f.id} className="flex items-center gap-1">
@@ -1203,7 +1203,7 @@ export function KnowledgeAdminPage() {
                   onClick={() => setUploadOpen(true)}
                   className="ml-auto px-3 py-1.5 text-[12px] font-mono bg-accent text-surface rounded-sm hover:opacity-90"
                 >
-                  上传文档
+                  Upload document
                 </button>
               </div>
 
@@ -1212,11 +1212,11 @@ export function KnowledgeAdminPage() {
                 <table className="w-full text-left border-collapse">
                   <thead className="bg-paper-2 border-b border-line">
                     <tr>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">文件名</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">密级</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Chunk 数</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">上传时间</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">File name</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Classification</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Chunks</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Uploaded at</th>
                       <th className="px-3 py-2 w-56"></th>
                     </tr>
                   </thead>
@@ -1235,7 +1235,7 @@ export function KnowledgeAdminPage() {
                     {currentDocs.length === 0 && !manageLoading && (
                       <tr>
                         <td colSpan={6} className="px-3 py-6 text-center font-mono text-[12px] text-dim italic">
-                          该文件夹暂无文档
+                          No documents in this folder
                         </td>
                       </tr>
                     )}
@@ -1267,23 +1267,23 @@ export function KnowledgeAdminPage() {
           )}
           {isTodoEndpoint && (
             <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-              该能力暂未启用：knowledge-ingest 代理端点尚未就绪，接线后将自动展示文档列表。
+              Not available yet: the knowledge-ingest proxy endpoint isn’t ready. Documents will appear here once it’s connected.
             </div>
           )}
-          {auditLoading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+          {auditLoading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
           {!auditLoading && !isTodoEndpoint && auditDocs.length === 0 && !auditError && (
-            <div className="font-mono text-[12px] text-dim italic">该租户暂无文档</div>
+            <div className="font-mono text-[12px] text-dim italic">No documents for this tenant</div>
           )}
           {auditDocs.length > 0 && (
             <div className="border border-line rounded-md overflow-hidden">
               <table className="w-full text-left border-collapse">
                 <thead className="bg-paper-2 border-b border-line">
                   <tr>
-                    <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">文件名</th>
-                    <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">密级</th>
-                    <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
-                    <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Chunk 数</th>
-                    <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">上传时间</th>
+                    <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">File name</th>
+                    <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Classification</th>
+                    <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
+                    <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Chunks</th>
+                    <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Uploaded at</th>
                     <th className="px-3 py-2 w-40"></th>
                   </tr>
                 </thead>

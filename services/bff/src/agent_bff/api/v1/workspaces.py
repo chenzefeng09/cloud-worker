@@ -267,3 +267,45 @@ async def get_workspace_file_content(
         media_type=content_type,
         headers={"Content-Disposition": content_disp} if content_disp else {},
     )
+
+
+# --------------------------------------------------------------------------- #
+# File versions
+# --------------------------------------------------------------------------- #
+
+
+@router.get("/workspaces/{workspace_id}/files/{file_id}/versions")
+async def list_file_versions(
+    workspace_id: str,
+    file_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> JSONResponse:
+    """List historical versions of a workspace file."""
+    tenant_id, user_id, access_token = _auth
+    orch_url = await _orchestrator_url(request)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{orch_url}/workspaces/{workspace_id}/files/{file_id}/versions",
+            headers=foundation_headers(tenant_id, user_id, access_token),
+        )
+    return _proxy_json(resp)
+
+
+@router.post("/workspaces/{workspace_id}/files/{file_id}/versions/{version_id}/restore")
+async def restore_file_version(
+    workspace_id: str,
+    file_id: str,
+    version_id: str,
+    request: Request,
+    _auth: tuple = Depends(require_auth()),
+) -> JSONResponse:
+    """Restore a workspace file to a historical version."""
+    tenant_id, user_id, access_token = _auth
+    orch_url = await _orchestrator_url(request)
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"{orch_url}/workspaces/{workspace_id}/files/{file_id}/versions/{version_id}/restore",
+            headers=foundation_headers(tenant_id, user_id, access_token),
+        )
+    return _proxy_json(resp)

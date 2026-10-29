@@ -305,8 +305,9 @@ async def test_server(
             return McpTestResult(
                 ok=False,
                 error=(
-                    "更改 endpoint 后不能复用已保存的凭据，"
-                    "请重新填写认证信息与请求头（无需凭据时显式提交为空）后再测试"
+                    "Saved credentials cannot be reused after changing the endpoint. "
+                    "Re-enter the authentication details and request headers "
+                    "(submit them explicitly empty if none are needed), then test again."
                 ),
             )
 

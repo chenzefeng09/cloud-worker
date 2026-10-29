@@ -18,10 +18,10 @@ import type {
 // count up via `onCount` so the stat tile / tab badge stay in sync.
 
 const DOC_STATUS_ZH: Record<DocumentStatus, string> = {
-  PENDING: '待处理',
-  INGESTING: '摄入中',
-  READY: '就绪',
-  FAILED: '失败',
+  PENDING: 'Pending',
+  INGESTING: 'Ingesting',
+  READY: 'Ready',
+  FAILED: 'Failed',
 };
 
 /** Ancestor chain root -> currentFolderId (cycle-safe). */
@@ -73,7 +73,7 @@ export function KnowledgeSourceTab({
       })
       .catch((err) => {
         if (cancelled) return;
-        setError(err instanceof ApiError ? err.message : '加载知识源失败');
+        setError(err instanceof ApiError ? err.message : 'Failed to load knowledge sources');
         onCount?.(0);
       })
       .finally(() => {
@@ -99,7 +99,7 @@ export function KnowledgeSourceTab({
       .filter((f) =>
         currentFolderId ? f.parent_id === currentFolderId : f.parent_id === null,
       )
-      .sort((a, b) => a.name.localeCompare(b.name, 'zh'));
+      .sort((a, b) => a.name.localeCompare(b.name, 'en'));
   }, [folders, currentFolderId]);
 
   const currentDocs = useMemo(() => {
@@ -107,11 +107,11 @@ export function KnowledgeSourceTab({
       .filter((d) =>
         currentFolderId ? d.folder_id === currentFolderId : !d.folder_id,
       )
-      .sort((a, b) => a.title.localeCompare(b.title, 'zh'));
+      .sort((a, b) => a.title.localeCompare(b.title, 'en'));
   }, [docs, currentFolderId]);
 
   if (loading) {
-    return <div className="font-mono text-[11px] text-dim">加载中…</div>;
+    return <div className="font-mono text-[11px] text-dim">Loading…</div>;
   }
   if (error) {
     return (
@@ -134,7 +134,7 @@ export function KnowledgeSourceTab({
           }`}
           onClick={() => setCurrentFolderId(null)}
         >
-          根目录
+          Root
         </button>
         {breadcrumb.map((f) => (
           <span key={f.id} className="flex items-center gap-1">
@@ -202,12 +202,12 @@ export function KnowledgeSourceTab({
       {/* Empty states */}
       {subfolders.length === 0 && currentDocs.length === 0 && !isEmpty && (
         <div className="font-mono italic text-dim text-[12px]">
-          该文件夹暂无文档
+          This folder has no documents yet
         </div>
       )}
       {isEmpty && (
         <div className="font-mono italic text-dim text-[12px]">
-          暂无知识源。管理员可在「管理后台 → 知识库」中上传文档。
+          No knowledge sources yet. Admins can upload documents under Admin console → Knowledge base.
         </div>
       )}
       {previewDoc && (

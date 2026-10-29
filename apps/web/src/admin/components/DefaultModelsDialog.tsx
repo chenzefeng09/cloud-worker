@@ -25,36 +25,36 @@ interface PurposeSection {
 const PURPOSE_SECTIONS: PurposeSection[] = [
   {
     purpose: 'llm',
-    label: '系统推理模型',
-    desc: '用于对话、推理和任务执行的核心语言模型',
+    label: 'System reasoning model',
+    desc: 'Core language model for chat, reasoning and task execution',
     glyph: '⊛',
     modelTypes: ['llm'],
   },
   {
     purpose: 'embedding',
-    label: 'Embedding 模型',
-    desc: '用于文本向量化，支持检索和 RAG 场景',
+    label: 'Embedding model',
+    desc: 'Text embeddings for retrieval and RAG',
     glyph: '⊞',
     modelTypes: ['text_embedding'],
   },
   {
     purpose: 'rerank',
-    label: 'Rerank 模型',
-    desc: '用于搜索结果重排序，提升检索相关性',
+    label: 'Rerank model',
+    desc: 'Reranks search results to improve retrieval relevance',
     glyph: '⊟',
     modelTypes: ['rerank'],
   },
   {
     purpose: 'stt',
-    label: '语音转文本模型',
-    desc: '用于语音识别和语音转文字处理',
+    label: 'Speech-to-text model',
+    desc: 'Speech recognition and transcription',
     glyph: '⊠',
     modelTypes: [],
   },
   {
     purpose: 'tts',
-    label: '文本转语音模型',
-    desc: '用于文本到语音合成输出',
+    label: 'Text-to-speech model',
+    desc: 'Speech synthesis from text',
     glyph: '⊡',
     modelTypes: [],
   },
@@ -91,7 +91,7 @@ export function DefaultModelsDialog({ onClose }: { onClose: () => void }) {
       }
       setSelections(sel);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '加载失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to load');
     } finally {
       setLoading(false);
     }
@@ -128,7 +128,7 @@ export function DefaultModelsDialog({ onClose }: { onClose: () => void }) {
 
     const providerId = findProviderForModel(enabledProviders, modelId, section.modelTypes);
     if (!providerId) {
-      toast.error('无法确定该模型所属的 Provider');
+      toast.error('Couldn\'t determine which provider this model belongs to');
       return;
     }
 
@@ -149,9 +149,9 @@ export function DefaultModelsDialog({ onClose }: { onClose: () => void }) {
         }
         return [...prev, result];
       });
-      toast.success(`${section.label} 已保存`);
+      toast.success(`${section.label} saved`);
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '保存失败');
+      toast.error(err instanceof ApiError ? err.message : 'Save failed');
     } finally {
       setSavingPurpose((prev) => ({ ...prev, [section.purpose]: false }));
     }
@@ -162,9 +162,9 @@ export function DefaultModelsDialog({ onClose }: { onClose: () => void }) {
   }
 
   return (
-    <Dialog title="默认模型设置" onClose={onClose} className="w-full max-w-xl">
+    <Dialog title="Default models" onClose={onClose} className="w-full max-w-xl">
       <p className="text-[11px] text-dim leading-snug">
-        配置租户下所有用户的默认模型。当用户未自行设置偏好时，将使用此处配置的默认模型。
+        Set the default models for every user in the tenant. These are used whenever a user hasn't chosen their own.
       </p>
 
       {error && (
@@ -173,7 +173,7 @@ export function DefaultModelsDialog({ onClose }: { onClose: () => void }) {
         </div>
       )}
 
-      {loading && <div className="text-[12px] text-dim py-6 text-center">加载中…</div>}
+      {loading && <div className="text-[12px] text-dim py-6 text-center">Loading…</div>}
 
       {!loading && (
         <div className="flex flex-col gap-2 max-h-[60vh] overflow-auto -mr-1 pr-1">
@@ -231,7 +231,7 @@ export function DefaultModelsDialog({ onClose }: { onClose: () => void }) {
                     }))}
                     value={currentModelId}
                     onChange={(v) => handleSelectChange(section.purpose, v)}
-                    placeholder={hasOptions ? '-- 请选择 --' : '无可用模型'}
+                    placeholder={hasOptions ? '-- Select --' : 'No models available'}
                     disabled={!hasOptions}
                   />
                   <button
@@ -240,7 +240,7 @@ export function DefaultModelsDialog({ onClose }: { onClose: () => void }) {
                     onClick={() => handleSave(section)}
                     className="shrink-0 px-3 py-1 text-[11px] font-mono bg-ink text-paper rounded-sm hover:opacity-90 disabled:opacity-40 transition-opacity"
                   >
-                    {saving ? '…' : '保存'}
+                    {saving ? '…' : 'Save'}
                   </button>
                 </div>
               </div>
@@ -249,9 +249,9 @@ export function DefaultModelsDialog({ onClose }: { onClose: () => void }) {
 
           {enabledProviders.length === 0 && (
             <div className="border border-line border-dashed rounded px-4 py-6 text-center">
-              <div className="text-[12px] text-dim">暂无已启用的 Provider</div>
+              <div className="text-[12px] text-dim">No enabled providers</div>
               <p className="text-[10px] text-dim mt-1">
-                请先添加并启用至少一个 Provider，然后再配置默认模型。
+                Add and enable at least one provider before configuring default models.
               </p>
             </div>
           )}
@@ -264,7 +264,7 @@ export function DefaultModelsDialog({ onClose }: { onClose: () => void }) {
           onClick={onClose}
           className="px-3 py-1 text-[12px] rounded-sm border border-line text-dim hover:bg-paper-2 focus:outline-none focus:border-accent"
         >
-          关闭
+          Close
         </button>
       </div>
     </Dialog>

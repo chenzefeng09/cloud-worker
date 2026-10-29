@@ -13,19 +13,19 @@ import type {
 } from '../../api/types';
 
 const TIER_LABELS: Record<string, string> = {
-  FREE: '免费版',
-  PRO: '专业版',
-  BUSINESS: '商业版',
-  ENTERPRISE: '企业版',
-  CUSTOM: '定制',
+  FREE: 'Free',
+  PRO: 'Pro',
+  BUSINESS: 'Business',
+  ENTERPRISE: 'Enterprise',
+  CUSTOM: 'Custom',
 };
 
 const STATUS_LABELS: Record<string, string> = {
-  TRIAL: '试用',
-  ACTIVE: '生效中',
-  PAST_DUE: '逾期',
-  CANCELED: '已取消',
-  SUSPENDED: '已暂停',
+  TRIAL: 'Trial',
+  ACTIVE: 'Active',
+  PAST_DUE: 'Past due',
+  CANCELED: 'Canceled',
+  SUSPENDED: 'Suspended',
 };
 
 const STATUS_STYLES: Record<string, string> = {
@@ -83,10 +83,10 @@ function BindPlanForm({
     setError(null);
     try {
       await api.admin.billing.createSubscription({ plan_id: selectedPlan }, tenantId);
-      toast.success('已为租户绑定套餐');
+      toast.success('Plan assigned to tenant');
       onBound();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '绑定失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to assign plan');
     } finally {
       setBusy(false);
     }
@@ -98,10 +98,10 @@ function BindPlanForm({
     <form onSubmit={handleBind} className="flex items-end gap-2 flex-wrap mt-2">
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm w-full">{error}</div>}
       <label className="flex flex-col gap-1">
-        <span className="font-mono text-[10px] text-dim uppercase tracking-[0.08em]">选择套餐</span>
+        <span className="font-mono text-[10px] text-dim uppercase tracking-[0.08em]">Plan</span>
         <CustomSelect
           options={[
-            { value: '', label: '— 请选择 —' },
+            { value: '', label: '— Select —' },
             ...activePlans.map((p) => ({
               value: p.id,
               label: `${p.name} (${TIER_LABELS[planTier(p)] ?? planTier(p)})`,
@@ -117,7 +117,7 @@ function BindPlanForm({
         disabled={busy || !selectedPlan}
         className="px-3 py-1.5 text-[11px] font-mono bg-ink text-surface rounded-sm hover:opacity-90 disabled:opacity-50"
       >
-        {busy ? '绑定中…' : '绑定套餐'}
+        {busy ? 'Assigning…' : 'Assign plan'}
       </button>
     </form>
   );
@@ -150,12 +150,12 @@ function SubscriptionActions({
     setError(null);
     try {
       await api.admin.billing.changePlan({ new_plan_id: targetPlan }, tenantId);
-      toast.success('已提交套餐变更');
+      toast.success('Plan change submitted');
       setChanging(false);
       setTargetPlan('');
       onChanged();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '变更失败');
+      setError(err instanceof ApiError ? err.message : 'Plan change failed');
     } finally {
       setBusy(false);
     }
@@ -164,10 +164,10 @@ function SubscriptionActions({
   const handleCancel = async () => {
     if (
       !(await confirm({
-        title: '取消订阅',
-        message: '确定取消该租户的当前订阅吗？此操作可能影响其服务可用性。',
+        title: 'Cancel subscription',
+        message: 'Cancel this tenant’s current subscription? This may affect service availability.',
         tone: 'danger',
-        confirmText: '取消订阅',
+        confirmText: 'Cancel subscription',
       }))
     )
       return;
@@ -175,10 +175,10 @@ function SubscriptionActions({
     setError(null);
     try {
       await api.admin.billing.cancelSubscription({}, tenantId);
-      toast.success('已提交取消订阅');
+      toast.success('Cancellation submitted');
       onChanged();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '取消失败');
+      setError(err instanceof ApiError ? err.message : 'Cancellation failed');
     } finally {
       setBusy(false);
     }
@@ -192,7 +192,7 @@ function SubscriptionActions({
       {changing ? (
         <form onSubmit={handleChangePlan} className="flex items-center gap-2 flex-wrap">
           <CustomSelect
-            options={[{ value: '', label: '— 选择目标套餐 —' }, ...candidates.map((p) => ({ value: p.id, label: p.name }))]}
+            options={[{ value: '', label: '— Select target plan —' }, ...candidates.map((p) => ({ value: p.id, label: p.name }))]}
             value={targetPlan}
             onChange={(v) => setTargetPlan(v)}
             className="min-w-[180px]"
@@ -202,14 +202,14 @@ function SubscriptionActions({
             disabled={busy || !targetPlan}
             className="px-2.5 py-1.5 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50"
           >
-            {busy ? '提交中…' : '确认变更'}
+            {busy ? 'Submitting…' : 'Confirm change'}
           </button>
           <button
             type="button"
             onClick={() => { setChanging(false); setTargetPlan(''); setError(null); }}
             className="px-2.5 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink"
           >
-            取消
+            Cancel
           </button>
         </form>
       ) : (
@@ -219,14 +219,14 @@ function SubscriptionActions({
             disabled={busy}
             className="px-2.5 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2 disabled:opacity-50"
           >
-            变更套餐
+            Change plan
           </button>
           <button
             onClick={handleCancel}
             disabled={busy}
             className="px-2.5 py-1.5 text-[11px] font-mono border border-red-200 text-red-600 rounded-sm hover:bg-red-50 disabled:opacity-50"
           >
-            取消订阅
+            Cancel subscription
           </button>
         </div>
       )}
@@ -250,7 +250,7 @@ export function QuotaPage() {
   // platform-admin session, so a tenant_admin never trusts selectedTenantId.
   const canSwitchTenant = isPlatformAdmin(userProfile?.permissions);
   const ownTenantId = userProfile?.tenant_id ?? null;
-  const ownTenantName = tenants.find((t) => t.id === ownTenantId)?.name ?? ownTenantId ?? '当前租户';
+  const ownTenantName = tenants.find((t) => t.id === ownTenantId)?.name ?? ownTenantId ?? 'Current tenant';
 
   // The tenant we view: platform-admins follow the selector; tenant-admins are
   // pinned to their own tenant. The composite quota endpoint requires a
@@ -328,7 +328,7 @@ export function QuotaPage() {
       .catch((err) => {
         if (cancelled) return;
         if (isTodo(err)) setQuotaTodo(true);
-        else setError(err instanceof ApiError ? err.message : '加载失败');
+        else setError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => { if (!cancelled) setQuotaLoading(false); });
 
@@ -365,8 +365,8 @@ export function QuotaPage() {
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">订阅与配额</h1>
-        <p className="text-[12px] text-dim mt-0.5">租户订阅管理与用量明细</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Subscriptions & quotas</h1>
+        <p className="text-[12px] text-dim mt-0.5">Tenant subscriptions and usage details</p>
       </div>
 
       {error && (
@@ -380,11 +380,11 @@ export function QuotaPage() {
           own tenant (shown read-only) and see only their own quota. */}
       <div className="flex items-center gap-3">
         <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">
-          {canSwitchTenant ? '选择租户' : '当前租户'}
+          {canSwitchTenant ? 'Tenant' : 'Current tenant'}
         </label>
         {canSwitchTenant ? (
           <CustomSelect
-            options={[{ value: '', label: '— 请选择 —' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+            options={[{ value: '', label: '— Select —' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
             value={selectedTenantId ?? ''}
             onChange={(v) => {
               setSelectedTenantId(v || null);
@@ -403,24 +403,24 @@ export function QuotaPage() {
       </div>
 
       {canSwitchTenant && !effectiveTenantId && (
-        <div className="font-mono text-[12px] text-dim italic">选择一个租户以查看其订阅与用量</div>
+        <div className="font-mono text-[12px] text-dim italic">Select a tenant to view its subscription and usage</div>
       )}
 
       {effectiveTenantId && (
         <>
           {/* ─── 当前套餐 + 用量 ──────────────────────────────── */}
           <section className="flex flex-col gap-2">
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">当前套餐与用量</div>
-            {quotaLoading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Current plan & usage</div>
+            {quotaLoading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
             {quotaTodo && (
               <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-                该能力服务未启用（配额代理端点不可达）。
+                This service isn't enabled (the quota proxy endpoint is unreachable).
               </div>
             )}
             {!quotaLoading && !quotaTodo && quota && !quota.plan && (
               <div className="border border-line rounded-md p-4 flex flex-col gap-2">
                 <div className="text-[13px] text-dim">
-                  {canSwitchTenant ? '该租户暂无有效订阅' : '当前租户暂无有效订阅，如需开通请联系平台管理员'}
+                  {canSwitchTenant ? 'This tenant has no active subscription' : 'Your tenant has no active subscription. Contact a platform administrator to set one up.'}
                 </div>
                 {/* Binding a plan is a mutation → platform super_admin only. */}
                 {canSwitchTenant && (
@@ -435,7 +435,7 @@ export function QuotaPage() {
             {!quotaLoading && !quotaTodo && quota && quota.plan && (
               <div className="flex flex-col gap-4">
                 <div className="border border-line rounded-md p-4 bg-surface">
-                  <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim mb-2">当前套餐</div>
+                  <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim mb-2">Current plan</div>
                   <div className="text-[18px] font-display text-ink">{quota.plan.name}</div>
                   <div className="font-mono text-[11px] text-dim mt-1">
                     {TIER_LABELS[quota.plan.tier] ?? quota.plan.tier}
@@ -443,15 +443,15 @@ export function QuotaPage() {
                 </div>
                 <div className="border border-line rounded-md overflow-hidden">
                   <div className="bg-paper-2 px-3 py-2 border-b border-line font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                    用量 / 限额
+                    Usage / limits
                   </div>
                   <table className="w-full text-left border-collapse">
                     <thead className="border-b border-line-2">
                       <tr>
-                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">指标</th>
-                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">已用</th>
-                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">上限</th>
-                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">占比</th>
+                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">Metric</th>
+                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">Used</th>
+                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">Limit</th>
+                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">Share</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -486,15 +486,15 @@ export function QuotaPage() {
 
           {/* ─── 订阅详情 ─────────────────────────────────────── */}
           <section className="flex flex-col gap-2">
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">订阅详情</div>
-            {subLoading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Subscription details</div>
+            {subLoading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
             {subTodo && (
               <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-                该能力服务未启用（订阅代理端点不可达）。
+                This service isn't enabled (the subscription proxy endpoint is unreachable).
               </div>
             )}
             {!subLoading && !subTodo && (noSubscription || !subscription) && (
-              <div className="border border-line rounded-md p-4 text-[13px] text-dim">该租户暂无订阅记录</div>
+              <div className="border border-line rounded-md p-4 text-[13px] text-dim">No subscription records for this tenant</div>
             )}
             {!subLoading && !subTodo && subscription && !noSubscription && (
               <div className="border border-line rounded-md p-4 bg-surface flex flex-col gap-3">
@@ -509,27 +509,27 @@ export function QuotaPage() {
                   )}
                 </div>
                 <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1.5 text-[11.5px]">
-                  <span className="font-mono text-dim">订阅 ID</span>
+                  <span className="font-mono text-dim">Subscription ID</span>
                   <span className="font-mono text-ink-2 truncate">{subscription.id}</span>
-                  <span className="font-mono text-dim">当前周期</span>
+                  <span className="font-mono text-dim">Current period</span>
                   <span className="font-mono text-ink-2">
                     {formatDate(subscription.current_period_start)} ~ {formatDate(subscription.current_period_end)}
                   </span>
                   {subscription.trial_ends_at && (
                     <>
-                      <span className="font-mono text-dim">试用结束</span>
+                      <span className="font-mono text-dim">Trial ends</span>
                       <span className="font-mono text-ink-2">{formatDate(subscription.trial_ends_at)}</span>
                     </>
                   )}
                   {subscription.canceled_at && (
                     <>
-                      <span className="font-mono text-dim">取消时间</span>
+                      <span className="font-mono text-dim">Canceled at</span>
                       <span className="font-mono text-ink-2">{formatDate(subscription.canceled_at)}</span>
                     </>
                   )}
                   {subscription.provider && (
                     <>
-                      <span className="font-mono text-dim">计费渠道</span>
+                      <span className="font-mono text-dim">Billing channel</span>
                       <span className="font-mono text-ink-2">{subscription.provider}</span>
                     </>
                   )}
@@ -550,29 +550,29 @@ export function QuotaPage() {
 
           {/* ─── 用量明细 ─────────────────────────────────────── */}
           <section className="flex flex-col gap-2">
-            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">用量明细</div>
-            {usageLoading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+            <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Usage details</div>
+            {usageLoading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
             {usageTodo && (
               <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-                该能力服务未启用（用量查询代理端点不可达）。
+                This service isn't enabled (the usage query proxy endpoint is unreachable).
               </div>
             )}
             {!usageLoading && !usageTodo && usage && (
               <div className="border border-line rounded-md overflow-hidden">
                 <div className="bg-paper-2 px-3 py-2 border-b border-line flex items-center justify-between">
                   <span className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                    {usage.dimension ?? '用量序列'}
+                    {usage.dimension ?? 'Usage series'}
                   </span>
                   {usage.total !== undefined && (
-                    <span className="font-mono text-[11px] text-ink-2">合计 {usage.total.toLocaleString()}</span>
+                    <span className="font-mono text-[11px] text-ink-2">Total {usage.total.toLocaleString()}</span>
                   )}
                 </div>
                 {usage.series && usage.series.length > 0 ? (
                   <table className="w-full text-left border-collapse">
                     <thead className="border-b border-line-2">
                       <tr>
-                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">时间</th>
-                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim text-right">用量</th>
+                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim">Time</th>
+                        <th className="px-3 py-2 font-mono text-[10.5px] text-dim text-right">Usage</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -587,7 +587,7 @@ export function QuotaPage() {
                     </tbody>
                   </table>
                 ) : (
-                  <div className="px-3 py-4 font-mono text-[12px] text-dim italic">该周期暂无用量数据</div>
+                  <div className="px-3 py-4 font-mono text-[12px] text-dim italic">No usage data for this period</div>
                 )}
               </div>
             )}

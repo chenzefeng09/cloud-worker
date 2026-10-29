@@ -32,7 +32,7 @@ export default function ExcelPreview({ blob }: { blob: Blob }) {
         setSheets(parsed);
       })
       .catch((e) => {
-        if (!cancelled) setError(e instanceof Error ? e.message : '解析失败');
+        if (!cancelled) setError(e instanceof Error ? e.message : 'Parse failed');
       });
 
     return () => {
@@ -41,10 +41,10 @@ export default function ExcelPreview({ blob }: { blob: Blob }) {
   }, [blob]);
 
   if (error) {
-    return <div className="font-mono text-[11px] text-accent">表格解析失败：{error}</div>;
+    return <div className="font-mono text-[11px] text-accent">Failed to parse spreadsheet: {error}</div>;
   }
   if (!sheets) {
-    return <div className="font-mono text-[11px] text-dim">解析表格…</div>;
+    return <div className="font-mono text-[11px] text-dim">Parsing spreadsheet…</div>;
   }
 
   const sheet = sheets[active];
@@ -52,7 +52,7 @@ export default function ExcelPreview({ blob }: { blob: Blob }) {
   return (
     <div className="border border-line rounded-md overflow-hidden bg-surface">
       <div className="cw-label px-4 py-2 border-b border-line-2 flex items-center gap-2 flex-wrap">
-        表格预览
+        Spreadsheet preview
         {sheets.length > 1 &&
           sheets.map((s, i) => (
             <button
@@ -68,7 +68,7 @@ export default function ExcelPreview({ blob }: { blob: Blob }) {
       </div>
       <div className="cw-scroll overflow-auto max-h-[560px]">
         {sheet.rows.length === 0 ? (
-          <div className="px-4 py-3 font-mono text-[11px] text-dim italic">（空工作表）</div>
+          <div className="px-4 py-3 font-mono text-[11px] text-dim italic">(Empty sheet)</div>
         ) : (
           <table className="border-collapse font-mono text-[11.5px] text-ink-2">
             <tbody>

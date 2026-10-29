@@ -209,14 +209,14 @@ class ApiError extends Error {
 // localised) wins over a raw `detail` string; never stringify a whole problem
 // document into the message the user sees.
 function extractMessage(problem: unknown, depth = 0): string {
-  if (problem == null || depth > 4) return '请求失败';
+  if (problem == null || depth > 4) return 'Request failed';
   if (typeof problem === 'string') return problem;
-  if (typeof problem !== 'object') return '请求失败';
+  if (typeof problem !== 'object') return 'Request failed';
   const obj = problem as Record<string, unknown>;
   if (typeof obj.user_message === 'string' && obj.user_message) return obj.user_message;
   if ('detail' in obj) return extractMessage(obj.detail, depth + 1);
   if (typeof obj.title === 'string' && obj.title) return obj.title;
-  return '请求失败';
+  return 'Request failed';
 }
 
 function extractCode(problem: unknown, depth = 0): string | undefined {

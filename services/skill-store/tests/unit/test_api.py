@@ -235,7 +235,7 @@ def test_upload_rejects_missing_skill_md(
     skill = _create_skill(app_client, tenant_headers)
     tarball = _make_tarball({"README.md": b"no skill md here"})
     resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
-    _assert_invalid(resp, contains="缺少 SKILL.md")
+    _assert_invalid(resp, contains="Missing SKILL.md")
 
 
 def test_upload_rejects_multiple_skill_md(
@@ -249,7 +249,7 @@ def test_upload_rejects_multiple_skill_md(
         }
     )
     resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
-    _assert_invalid(resp, contains="多个 SKILL.md")
+    _assert_invalid(resp, contains="multiple SKILL.md")
 
 
 def test_upload_rejects_missing_name(
@@ -279,7 +279,7 @@ def test_upload_rejects_malformed_yaml(
     fm = "---\nname: [unclosed\ndescription: x\n---\nbody\n"
     tarball = _make_tarball({"SKILL.md": fm.encode("utf-8")})
     resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
-    _assert_invalid(resp, contains="frontmatter 格式错误")
+    _assert_invalid(resp, contains="frontmatter is malformed")
 
 
 def test_upload_rejects_description_over_limit(
@@ -292,7 +292,7 @@ def test_upload_rejects_description_over_limit(
     fm = f"---\nname: too-long-desc\ndescription: {long_desc}\n---\nbody\n"
     tarball = _make_tarball({"SKILL.md": fm.encode("utf-8")})
     resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
-    _assert_invalid(resp, contains="description 过长")
+    _assert_invalid(resp, contains="description is too long")
 
 
 def test_upload_accepts_description_at_2000_character_limit(
@@ -332,7 +332,7 @@ def test_upload_rejects_symlink(
         add_symlink=("evil", "/etc/passwd"),
     )
     resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
-    _assert_invalid(resp, contains="符号链接")
+    _assert_invalid(resp, contains="symbolic or hard links")
 
 
 def test_upload_rejects_too_many_members(
@@ -344,7 +344,7 @@ def test_upload_rejects_too_many_members(
         members[f"f{i}.txt"] = b"x"
     tarball = _make_tarball(members)
     resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
-    _assert_invalid(resp, contains="成员数过多")
+    _assert_invalid(resp, contains="too many entries")
 
 
 def test_upload_rejects_total_size_bomb(
@@ -358,7 +358,7 @@ def test_upload_rejects_total_size_bomb(
         members[f"big{i}.bin"] = chunk
     tarball = _make_tarball(members)
     resp = _upload(app_client, tenant_headers, skill["id"], tarball=tarball)
-    _assert_invalid(resp, contains="总大小")
+    _assert_invalid(resp, contains="total uncompressed size")
 
 
 def test_download_redirects_to_presigned(

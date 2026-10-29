@@ -12,6 +12,7 @@ Covers:
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -369,6 +370,25 @@ def _patch_edit_backend(fake: FakeEditBackend, monkeypatch: pytest.MonkeyPatch) 
         async def post(self, url: str, **kw: Any) -> httpx.Response:
             return fake.route("POST", url, **kw)
 
+        def stream(self, method: str, url: str, **kw: Any) -> Any:
+            # The edit endpoint streams /chat/completions (SSE); re-encode the
+            # fake's non-streaming completion body as SSE deltas.
+            resp = fake.route(method, url, **kw)
+
+            class _Stream:
+                async def __aenter__(self_inner) -> httpx.Response:
+                    if resp.status_code != 200:
+                        return resp
+                    content = resp.json()["choices"][0]["message"]["content"]
+                    chunk = {"choices": [{"delta": {"content": content}}]}
+                    sse = f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n"
+                    return httpx.Response(200, content=sse.encode())
+
+                async def __aexit__(self_inner, *a: Any) -> None:
+                    pass
+
+            return _Stream()
+
     monkeypatch.setattr(httpx, "AsyncClient", _AC)
 
 
@@ -398,7 +418,7 @@ def test_edit_stale_base_version_returns_409_without_llm(
     )
     assert resp.status_code == 409
     detail = resp.json()["detail"]
-    assert "刷新" in detail["user_message"]
+    assert "refresh" in detail["user_message"]
 
     assert fake.completion_call_count == 0
     assert not any("/chat/completions" in c[1] for c in fake.calls)

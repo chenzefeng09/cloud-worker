@@ -1,11 +1,13 @@
 # Worker Wire Contract — task.json / Redis 流 / 平台 SSE 事件
 
-> **这是谁的契约**:沙箱 worker(今天是 AgentScope `agentscope_ext.runtime_worker`,将来可能是
-> Claude Agent SDK worker——scheduler 已有 `claude_sdk_image` + `enable_claude_sdk_worker`
-> 灰度旗标)与平台(agent-scheduler / session-orchestrator / 前端)之间的全部线上格式。
-> **换 worker 框架时,只要新 worker 遵守本文件,orchestrator 与前端零改动。**
-> 框架内部事件名(AgentScope 的 `TextBlockDeltaEvent`、Claude SDK 的 `content_block_delta`…)
-> 一律不得外漏:worker 在自己内部把它们翻译成本契约的 Redis 条目。
+> **这是谁的契约**:沙箱 worker 与平台(agent-scheduler / session-orchestrator / 前端)之间的
+> 全部线上格式。唯一的 worker 实现是 Claude Agent SDK worker(`worker-claude-sdk/`,入口
+> `node /app/dist/main.js`,镜像 `ghcr.io/agent-platform/claude-sdk-sandbox:0.1`),见
+> [ADR 0003](../docs/adr/0003-claude-agent-sdk-sole-agent-runtime.md)。早期的 AgentScope worker
+> (`agentscope-ext/`)已移除。
+> **只要 worker 遵守本文件,orchestrator 与前端零改动。**
+> SDK 内部事件名(如 Claude SDK 的 `content_block_delta`)一律不得外漏:worker 在自己内部
+> (`src/event_translator.ts`)把它们翻译成本契约的 Redis 条目。
 >
 > 前端侧的对应单点:`apps/web/src/hooks/useChat.ts` 的 `SSE_HANDLERS` 映射表。
 > 维护纪律:改任何一层,三处同步——本文件、orchestrator 归一层、`SSE_HANDLERS`。
@@ -22,13 +24,14 @@ cube: `cube_runtime.spawn_run` 的 `task_json`,经 `AGENT_TASK_JSON` env)。
   "task": "string",              // 用户指令(>32KiB 截断带哨兵后缀)
   "mcp_servers": [],             // 【历史遗留,恒空,不是选择器】见 §1a
   "mcp_server_ids": [...],       // 【三态,按"键是否存在"判定】见 §1a
-  "skills": ["name", ...],       // skills_loader 据此解析 manifest
+  "skills": ["name", ...],       // worker 据此在 /home/skills/<name> 下解析 SKILL.md
   "files": [{"key","filename","mime"}, ...],   // worker 下载到 /workspace/inputs/
   "memory": "string",            // 预取记忆片段,worker 前置进 system prompt
   "history": [{"role","type",...}, ...],  // 多轮历史(有损 dict);resume 时忽略
   "model_override": "string|null",
   "reasoning_effort": "string|null",
-  "sys_prompt": "string",        // App harness 系统提示(聊天 run 为空串)
+  "sys_prompt": "string",        // App harness 系统提示;orchestrator 预取的租户知识库
+                                 // top-k 命中也追加在这里(聊天 run 无命中时可为空串)
   "sampling_params": {},         // App harness 采样覆盖
   "hitl": true,                  // false=一刀切 BYPASS(定时/后台 run)
   "resume": null                 // 或 {"kind":"confirm"|"answer", "tool_call_id":str,
@@ -62,22 +65,18 @@ mcp-registry 的 server `id`(形如 `mcp_<26HEX>`)。它是**三态**的,三态�
 
 **与 `mcp_servers` 的关系:没有关系。`mcp_servers` 不是选择器,永远不要读它来做启用判断。**
 它是早期设计的残留,scheduler 在两个 runtime 里都把它**硬编码写成 `[]`**
-(`docker_runtime.py:929/966`,注释 "mcp_tenant_injector fetches live"),因为 server
+(`docker_runtime.py`,注释 "the worker fetches live"),因为 server
 清单是 worker 在沙箱内实时向 mcp-registry 拉的,不经 task.json 下发。
 **若有人把 `mcp_servers` 当成选择器读,由于它恒为 `[]`,每个 run 的 MCP 都会被全部禁用。**
-两侧 worker 均有回归测试钉住这一点(`test_legacy_mcp_servers_key_is_not_the_selector` /
-`"is unaffected by the legacy mcp_servers key"`),改动时不要绕过。
+worker 有回归测试钉住这一点(`"is unaffected by the legacy mcp_servers key"`),改动时不要绕过。
 
-**消费端**(两个 worker 实现都在**注册前**过滤,且**先按选择过滤、再做 transport 过滤**——
+**消费端**(worker 在**注册前**过滤,且**先按选择过滤、再做 transport 过滤**——
 选择是"用户选没选中"的身份判断,transport 是"本运行时支不支持"的能力判断,两者不得混淆;
 先过滤保证未选中的 server **完全不被连接/探测**,也保证 transport 的丢弃告警只对用户真正
 选中的 server 报出):
 
-* Claude SDK worker:`worker-claude-sdk/src/task.ts`(解析,保留 `undefined`)→
+* `worker-claude-sdk/src/task.ts`(解析,保留 `undefined`)→
   `src/worker.ts` `loadMcpServers(env, selectedIds)`。显式 `[]` 直接短路,连 registry 都不请求。
-* AgentScope worker:`agentscope_ext/mcp_tenant_injector/__init__.py` 的
-  `_selected_server_ids(task)`;task.json 由 `hooks.build_toolkit(task, ...)` 的首参直接送达
-  (`runtime_worker/__main__.py:1231`),**不走 env**。
 
 ## 1b. 输入:`/workspace/.secrets.json`(scheduler 写,worker 读后即删)
 
@@ -93,10 +92,11 @@ mcp-registry 的 server `id`(形如 `mcp_<26HEX>`)。它是**三态**的,三态�
 { "KEY": "value", ... }
 ```
 
-**可能出现的键(至多这 7 个)**:`FOUNDATION_API_TOKEN`、`TOOL_BROKER_LEASE`、
-`LLM_VIRTUAL_KEY`、`LLM_API_KEY`、`S3_ACCESS_KEY_ID`、`S3_SECRET_ACCESS_KEY`、
-`REDIS_URL`。`TOOL_BROKER_LEASE` / `LLM_VIRTUAL_KEY` 仅在非空时出现;`LLM_API_KEY`
-恒在(gateway enforcer 启用时为 `""`)。键缺失即语义上"未配置",worker 不得猜测。
+**可能出现的键(至多这 6 个)**:`FOUNDATION_API_TOKEN`、`TOOL_BROKER_LEASE`、
+`LLM_VIRTUAL_KEY`、`S3_ACCESS_KEY_ID`、`S3_SECRET_ACCESS_KEY`、`REDIS_URL`。
+`TOOL_BROKER_LEASE` 仅在非空时出现。`LLM_VIRTUAL_KEY` 是租户级 LLM 网关虚拟密钥:
+scheduler 解析不到虚拟密钥时**直接让 spawn 失败**,不存在直连模型厂商的回退
+(已无 `LLM_API_KEY`)。键缺失即语义上"未配置",worker 不得猜测。
 
 **worker 契约**:启动后、**任何工具子进程运行前**,worker 必须把本文件读进自身
 进程 env,然后 `unlink` 删除该文件(避免凭据残留在工作区被产物收集器或后续步骤
@@ -142,10 +142,8 @@ scheduler 把 `status` 以顶层 `result_status` 透传;orchestrator reconcile �
   "reply_id": "string",                  // 续跑时 reply_id 延续,不再发 ReplyStart
   "tool_calls": [{"id","name","args"}],
   "question": "string|null",
-  "agent_state": {...},                  // 框架自定义的完整可恢复状态。
-                                         // AgentScope: AgentState.model_dump(mode="json")
-                                         //   (mode=json 必须,否则枚举写成 repr 还原崩)
-                                         // Claude SDK: 等价的会话恢复载荷,格式自定,
+  "agent_state": {...},                  // worker 自定义的完整可恢复状态
+                                         // (Claude SDK 会话恢复载荷),格式由 worker 定,
                                          //   平台只负责原样回传,不解析
   "paused_at": "iso8601"
 }
@@ -179,6 +177,10 @@ session-scoped、multiplex 该会话所有 run、5 分钟服务端 deadline(客�
 ## 6. 鉴权与身份(机器路径)
 
 - worker→平台:per-run JWT(`foundation_token`);LLM 走 gateway `X-LLM-Virtual-Key`。
+  worker 内置适配器(`src/adapter.ts`)在 `localhost` 上监听,SDK 经 `ANTHROPIC_BASE_URL`
+  指向它;适配器把 Anthropic Messages 转为网关的 OpenAI 兼容 `chat/completions`,并注入
+  `Authorization` / `X-Tenant-Id` / `X-User-Id` / `X-LLM-Virtual-Key`(broker 模式另带 `X-Tool-Broker-Lease`)。
+- per-run token 的 scope 不含 `audit.write`:沙箱内不直接写 foundation audit。
 - 服务账号(如 cron-runner)调 BFF:`X-Service-Token`(hmac 比对 `BFF_SERVICE_TOKEN`)+
   `X-Tenant-Id` + `X-User-Id`。**user id 必须形如 `usr_[0-9A-Z]{26}`**——下游 RBAC
   守卫第一道是格式正则,不匹配直接 403、不询问 authz。

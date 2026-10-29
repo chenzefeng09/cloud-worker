@@ -34,13 +34,13 @@ export function RewindConfirmModal({
 
   return (
     <Dialog
-      title="回退到这一步"
+      title="Rewind to here"
       onClose={onCancel}
       dismissable={!busy}
       className="w-full max-w-[420px]"
     >
       <p className="text-[13px] leading-[1.6] text-ink-2">
-        这之后的对话（包括该消息本身）会被删除，该消息内容会回填到输入框以便重新编辑。
+        The conversation from this message onward (including the message itself) will be deleted, and the message text will be put back in the input box so you can edit it.
       </p>
       {preview && (
         <div className="px-3 py-2 border border-line bg-paper-2 rounded-md text-[12px] text-ink-2 whitespace-pre-wrap break-words">
@@ -55,14 +55,14 @@ export function RewindConfirmModal({
 
       <div className="flex items-center justify-end gap-2 pt-1">
         <button className="cw-btn cw-btn-sm" onClick={onCancel} disabled={busy}>
-          取消
+          Cancel
         </button>
         <button
           className="cw-btn cw-btn-accent cw-btn-sm"
           onClick={onConfirm}
           disabled={busy}
         >
-          {busy ? '回退中…' : '确认回退'}
+          {busy ? 'Rewinding…' : 'Rewind'}
         </button>
       </div>
     </Dialog>

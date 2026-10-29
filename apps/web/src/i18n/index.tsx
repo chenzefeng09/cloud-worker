@@ -4,9 +4,11 @@
  * Shape:
  *   <I18nProvider>         — wraps the app, reads/persists lang to localStorage
  *   useTranslation()       — { t, lang, setLang }
- *   t(key, vars?)          — lookup chain: currentLang → zh → key
- *                            Missing en keys fall back silently to zh.
- *                            Missing zh keys fall back to the raw key + dev console.warn.
+ *   t(key, vars?)          — lookup chain: currentLang → en → key
+ *                            English is the default and the fallback locale;
+ *                            zh is optional. Missing zh keys fall back silently
+ *                            to en; missing en keys fall back to the raw key +
+ *                            dev console.warn.
  *   {{var}} interpolation  — replaced with vars[var] values
  */
 
@@ -19,12 +21,16 @@ import {
   type ReactNode,
 } from 'react';
 
-import zhMessages from './locales/zh.json';
 import enMessages from './locales/en.json';
+import zhMessages from './locales/zh.json';
 
-export type Lang = 'zh' | 'en';
+export type Lang = 'en' | 'zh';
 
-const STORAGE_KEY = 'app.lang';
+/** Default + fallback display language. */
+export const DEFAULT_LANG: Lang = 'en';
+
+export const LANG_STORAGE_KEY = 'app.lang';
+const STORAGE_KEY = LANG_STORAGE_KEY;
 
 // Flatten nested JSON into dot-delimited keys: { "a": { "b": "v" } } → { "a.b": "v" }
 type FlatMessages = Record<string, string>;
@@ -43,8 +49,8 @@ function flatten(obj: Record<string, unknown>, prefix = ''): FlatMessages {
 }
 
 const MESSAGES: Record<Lang, FlatMessages> = {
-  zh: flatten(zhMessages as Record<string, unknown>),
   en: flatten(enMessages as Record<string, unknown>),
+  zh: flatten(zhMessages as Record<string, unknown>),
 };
 
 function interpolate(template: string, vars?: Record<string, string | number>): string {
@@ -54,14 +60,14 @@ function interpolate(template: string, vars?: Record<string, string | number>): 
   );
 }
 
-function readStoredLang(): Lang {
+export function readStoredLang(): Lang {
   try {
     const v = localStorage.getItem(STORAGE_KEY);
     if (v === 'zh' || v === 'en') return v;
   } catch {
     // localStorage unavailable (SSR / private mode)
   }
-  return 'zh';
+  return DEFAULT_LANG;
 }
 
 // ─── Context ──────────────────────────────────────────────────────────────────
@@ -93,13 +99,13 @@ export function I18nProvider({ children }: { children: ReactNode }) {
       const inCurrent = MESSAGES[lang][key];
       if (inCurrent !== undefined) return interpolate(inCurrent, vars);
 
-      // Fallback 1: zh string (covers missing en keys)
-      const inZh = MESSAGES['zh'][key];
-      if (inZh !== undefined) return interpolate(inZh, vars);
+      // Fallback 1: English string (covers keys missing from optional locales)
+      const inEn = MESSAGES[DEFAULT_LANG][key];
+      if (inEn !== undefined) return interpolate(inEn, vars);
 
       // Fallback 2: raw key — dev warning
       if (import.meta.env.DEV) {
-        console.warn(`[i18n] missing key "${key}" in both "${lang}" and "zh"`);
+        console.warn(`[i18n] missing key "${key}" in both "${lang}" and "${DEFAULT_LANG}"`);
       }
       return key;
     },

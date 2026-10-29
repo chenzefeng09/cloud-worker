@@ -13,8 +13,8 @@ Security posture matches agent-scheduler:
   ``agent-platform.pool-state=idle`` so they can be audited and cleaned up
   by anything that knows the label convention.
 * The sandbox container is started with an idle command (``sleep infinity``
-  for Docker — the real agentscope_ext.runtime_worker runs only after
-  acquire + task injection in the KEDA/B-M3 path).  For the current Docker
+  for Docker — the real Claude SDK worker (``node /app/dist/main.js``) runs
+  only after acquire + task injection in the KEDA/B-M3 path).  For the current Docker
   dev path the idle container just parks a warm image; the acquire caller
   stops it and agent-scheduler spawns a fresh one with the task.  This gives
   the warm-pool the intended latency benefit: image layers are already pulled
@@ -174,7 +174,7 @@ class PoolDockerRuntime:
         except docker.errors.ImageNotFound as exc:
             raise RuntimeError(
                 f"Sandbox image not found: {self._settings.sandbox_image}. "
-                "Pull it or build from sandbox-images/base.Dockerfile."
+                "Pull it or build it with `make build-claude-sdk-image`."
             ) from exc
         except docker.errors.APIError as exc:
             raise RuntimeError(f"Docker API error while spawning pool container: {exc}") from exc

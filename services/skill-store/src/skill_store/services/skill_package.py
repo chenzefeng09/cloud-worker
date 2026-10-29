@@ -19,7 +19,7 @@ manifest could lie about the contents.  Here we:
    its frontmatter, so the manifest we persist is server-derived, not
    uploader-supplied.
 
-Every ``raise`` carries a Chinese ``user_message`` so the failure can be shown
+Every ``raise`` carries an English ``user_message`` so the failure can be shown
 verbatim to the uploader by the API/BFF layer.
 """
 
@@ -86,7 +86,7 @@ def validate_and_parse(tarball: bytes) -> ParsedSkill:
     Raises :class:`SkillPackageInvalidError` (HTTP 400 at the API layer) on any
     structural or content problem.  Never lets a ``tarfile`` or ``yaml``
     exception escape as a 500 — those are caught and re-raised as
-    ``SkillPackageInvalidError`` with an explanatory Chinese ``user_message``.
+    ``SkillPackageInvalidError`` with an explanatory English ``user_message``.
     """
     # 1) Must be a legal gzip-compressed tar.  We open from an in-memory buffer
     #    so we never touch the filesystem.  Any failure here means the bytes are
@@ -95,7 +95,7 @@ def validate_and_parse(tarball: bytes) -> ParsedSkill:
         tar = tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz")  # noqa: SIM115 — closed via `with tar` below
     except (tarfile.TarError, OSError, EOFError) as exc:
         raise SkillPackageInvalidError(
-            "无效的压缩包，必须是 gzip 压缩的 tar",
+            "Invalid archive: it must be a gzip-compressed tar",
         ) from exc
 
     with tar:
@@ -108,12 +108,12 @@ def validate_and_parse(tarball: bytes) -> ParsedSkill:
             members = tar.getmembers()
         except (tarfile.TarError, OSError, EOFError) as exc:
             raise SkillPackageInvalidError(
-                "无效的压缩包，必须是 gzip 压缩的 tar",
+                "Invalid archive: it must be a gzip-compressed tar",
             ) from exc
 
         if len(members) > MAX_MEMBERS:
             raise SkillPackageInvalidError(
-                f"压缩包成员数过多，最多允许 {MAX_MEMBERS} 个",
+                f"The archive has too many entries (at most {MAX_MEMBERS} allowed)",
             )
 
         total_size = 0
@@ -126,33 +126,33 @@ def validate_and_parse(tarball: bytes) -> ParsedSkill:
             # an instruction pack.
             if member.issym() or member.islnk():
                 raise SkillPackageInvalidError(
-                    f"压缩包不允许包含符号链接或硬链接：{name}",
+                    f"The archive must not contain symbolic or hard links: {name}",
                 )
             if member.isdev():
                 raise SkillPackageInvalidError(
-                    f"压缩包不允许包含设备文件：{name}",
+                    f"The archive must not contain device files: {name}",
                 )
 
             # Path-traversal / zip-slip defence: no absolute paths, no ".."
             # segment anywhere in the path.  We check normalised POSIX segments.
             if name.startswith("/"):
                 raise SkillPackageInvalidError(
-                    f"压缩包不允许包含绝对路径：{name}",
+                    f"The archive must not contain absolute paths: {name}",
                 )
             if ".." in name.replace("\\", "/").split("/"):
                 raise SkillPackageInvalidError(
-                    f"压缩包路径不允许包含 '..'：{name}",
+                    f"Archive paths must not contain '..': {name}",
                 )
 
             # Per-member and cumulative decompressed-size caps.
             if member.size > MAX_MEMBER_SIZE:
                 raise SkillPackageInvalidError(
-                    f"压缩包单个文件过大，最大允许 {MAX_MEMBER_SIZE} 字节：{name}",
+                    f"A file in the archive is too large (max {MAX_MEMBER_SIZE} bytes): {name}",
                 )
             total_size += member.size
             if total_size > MAX_TOTAL_SIZE:
                 raise SkillPackageInvalidError(
-                    f"压缩包解压后总大小超过上限 {MAX_TOTAL_SIZE} 字节",
+                    f"The archive's total uncompressed size exceeds the {MAX_TOTAL_SIZE}-byte limit",
                 )
 
             # 3) Track every regular file literally named SKILL.md, accepting a
@@ -165,9 +165,9 @@ def validate_and_parse(tarball: bytes) -> ParsedSkill:
 
         # 3b) Exactly one SKILL.md must exist.
         if not skill_md_paths:
-            raise SkillPackageInvalidError("缺少 SKILL.md")
+            raise SkillPackageInvalidError("Missing SKILL.md")
         if len(skill_md_paths) > 1:
-            raise SkillPackageInvalidError("包内存在多个 SKILL.md")
+            raise SkillPackageInvalidError("The package contains multiple SKILL.md files")
         skill_md_path = skill_md_paths[0]
 
         # 4) Read + parse the SKILL.md frontmatter.  The member is re-fetched by
@@ -176,7 +176,7 @@ def validate_and_parse(tarball: bytes) -> ParsedSkill:
         skill_md_member = tar.getmember(skill_md_path)
         extracted = tar.extractfile(skill_md_member)
         if extracted is None:  # pragma: no cover — isfile() guaranteed above
-            raise SkillPackageInvalidError("无法读取 SKILL.md 内容")
+            raise SkillPackageInvalidError("Unable to read SKILL.md")
         raw = extracted.read()
 
     # Decode as UTF-8 — SKILL.md must be text.
@@ -184,7 +184,7 @@ def validate_and_parse(tarball: bytes) -> ParsedSkill:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise SkillPackageInvalidError(
-            "SKILL.md 不是合法的 UTF-8 文本",
+            "SKILL.md is not valid UTF-8 text",
         ) from exc
 
     name, description = _parse_frontmatter(text)
@@ -214,7 +214,7 @@ def _parse_frontmatter(text: str) -> tuple[str, str]:
     stripped = text.lstrip("﻿")
     if not stripped.startswith("---"):
         raise SkillPackageInvalidError(
-            "SKILL.md 缺少 YAML frontmatter（必须以 --- 开头）",
+            "SKILL.md is missing YAML frontmatter (it must start with ---)",
         )
 
     # Find the closing fence: the first line that is exactly --- after the open.
@@ -227,7 +227,7 @@ def _parse_frontmatter(text: str) -> tuple[str, str]:
             break
     if closing_idx is None:
         raise SkillPackageInvalidError(
-            "SKILL.md frontmatter 未正确闭合（缺少结束的 ---）",
+            "SKILL.md frontmatter is not closed (missing the closing ---)",
         )
 
     frontmatter_text = "\n".join(lines[1:closing_idx])
@@ -236,29 +236,29 @@ def _parse_frontmatter(text: str) -> tuple[str, str]:
         data = yaml.safe_load(frontmatter_text)
     except yaml.YAMLError as exc:
         raise SkillPackageInvalidError(
-            f"SKILL.md frontmatter 格式错误：{exc}",
+            f"SKILL.md frontmatter is malformed: {exc}",
         ) from exc
 
     if not isinstance(data, dict):
         raise SkillPackageInvalidError(
-            "SKILL.md frontmatter 必须是键值对映射",
+            "SKILL.md frontmatter must be a key-value mapping",
         )
 
     name = data.get("name")
     description = data.get("description")
     if not isinstance(name, str) or not name.strip():
         raise SkillPackageInvalidError(
-            "SKILL.md frontmatter 缺少 name",
+            "SKILL.md frontmatter is missing name",
         )
     if not isinstance(description, str) or not description.strip():
         raise SkillPackageInvalidError(
-            "SKILL.md frontmatter 缺少 description",
+            "SKILL.md frontmatter is missing description",
         )
     description_clean = description.strip()
     if len(description_clean) > MAX_DESCRIPTION_LEN:
         raise SkillPackageInvalidError(
-            "SKILL.md frontmatter description 过长，"
-            f"最多 {MAX_DESCRIPTION_LEN} 字符（当前 {len(description_clean)}）",
+            "SKILL.md frontmatter description is too long: "
+            f"at most {MAX_DESCRIPTION_LEN} characters (currently {len(description_clean)})",
         )
 
     return name.strip(), description_clean
@@ -340,7 +340,7 @@ def read_member(tarball: bytes, skill_md_path: str, path: str) -> ExtractedFile:
         tar = tarfile.open(fileobj=io.BytesIO(tarball), mode="r:gz")  # noqa: SIM115 — closed via `with tar`
     except (tarfile.TarError, OSError, EOFError) as exc:
         raise SkillPackageInvalidError(
-            "无效的压缩包，必须是 gzip 压缩的 tar",
+            "Invalid archive: it must be a gzip-compressed tar",
         ) from exc
 
     with tar:

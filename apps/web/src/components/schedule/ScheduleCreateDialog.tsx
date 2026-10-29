@@ -54,11 +54,14 @@ export const CRON_PRESETS: CronPreset[] = [
 ];
 
 export const TIMEZONE_OPTIONS = [
-  { value: 'Asia/Shanghai',   label: 'Asia/Shanghai (CST)' },
-  { value: 'UTC',             label: 'UTC' },
-  { value: 'America/New_York',label: 'America/New_York (ET)' },
-  { value: 'Europe/London',   label: 'Europe/London (GMT/BST)' },
-  { value: 'Asia/Tokyo',      label: 'Asia/Tokyo (JST)' },
+  { value: 'UTC',                 label: 'UTC' },
+  { value: 'America/Los_Angeles', label: 'America/Los_Angeles (PT)' },
+  { value: 'America/New_York',    label: 'America/New_York (ET)' },
+  { value: 'Europe/London',       label: 'Europe/London (GMT/BST)' },
+  { value: 'Europe/Berlin',       label: 'Europe/Berlin (CET/CEST)' },
+  { value: 'Asia/Singapore',      label: 'Asia/Singapore (SGT)' },
+  { value: 'Asia/Shanghai',       label: 'Asia/Shanghai (CST)' },
+  { value: 'Asia/Tokyo',          label: 'Asia/Tokyo (JST)' },
 ];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -239,7 +242,7 @@ export function ScheduleCreateDialog({ app, onClose, onCreated }: Props) {
   const [name, setName] = useState('');
   const [presetKey, setPresetKey] = useState<PresetKey>('daily');
   const [customExpr, setCustomExpr] = useState('');
-  const [timezone, setTimezone] = useState('Asia/Shanghai');
+  const [timezone, setTimezone] = useState('UTC');
   // The App never changes here, so the defaults can be seeded once on mount.
   const [formValue, setFormValue] = useState<SchemaFormValue>(() => buildDefaultFormValue(schema));
   // Webhook per-field rows. Default mode is 'event' (identity mapping) so the
@@ -338,7 +341,7 @@ export function ScheduleCreateDialog({ app, onClose, onCreated }: Props) {
       await api.schedules.create(body);
       onCreated();
     } catch (e) {
-      setErrors({ submit: e instanceof ApiError ? e.message : '创建失败，请稍后重试' });
+      setErrors({ submit: e instanceof ApiError ? e.message : t('schedules.error.createFailed') });
     } finally {
       setSubmitting(false);
     }

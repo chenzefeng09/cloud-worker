@@ -74,7 +74,7 @@ export function CustomSelect({
   options,
   value,
   onChange,
-  placeholder = '请选择…',
+  placeholder = 'Select…',
   disabled = false,
   className = '',
 }: CustomSelectProps) {
@@ -136,9 +136,9 @@ export function SearchableSelect({
   options,
   value,
   onChange,
-  placeholder = '请选择…',
-  searchPlaceholder = '搜索…',
-  emptyText = '无匹配项',
+  placeholder = 'Select…',
+  searchPlaceholder = 'Search…',
+  emptyText = 'No matches',
   disabled = false,
   className = '',
 }: SearchableSelectProps) {
@@ -183,7 +183,7 @@ export function SearchableSelect({
               onClick={(e) => { e.stopPropagation(); onChange(''); }}
               onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); onChange(''); } }}
               className="w-3.5 h-3.5 rounded-full border border-line flex items-center justify-center text-[10px] leading-none text-dim hover:text-ink cursor-pointer"
-              aria-label="清空"
+              aria-label="Clear"
             >
               ×
             </span>
@@ -247,8 +247,8 @@ export function ComboBox({
   options,
   value,
   onChange,
-  placeholder = '请选择或输入…',
-  searchPlaceholder = '搜索或输入…',
+  placeholder = 'Select or type…',
+  searchPlaceholder = 'Search or type…',
   disabled = false,
   className = '',
 }: ComboBoxProps) {
@@ -291,7 +291,7 @@ export function ComboBox({
               onClick={(e) => { e.stopPropagation(); onChange(''); }}
               onKeyDown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); onChange(''); } }}
               className="w-3.5 h-3.5 rounded-full border border-line flex items-center justify-center text-[10px] leading-none text-dim hover:text-ink cursor-pointer"
-              aria-label="清空"
+              aria-label="Clear"
             >
               ×
             </span>
@@ -333,7 +333,7 @@ export function ComboBox({
               }}
               className={`${itemCls(false)} font-mono`}
             >
-              + 使用 “{value}”
+              + Use “{value}”
             </button>
           )}
         </div>
@@ -354,7 +354,7 @@ export function MultiChipSelect({
   options,
   value,
   onChange,
-  placeholder = '请选择…',
+  placeholder = 'Select…',
   className = '',
 }: MultiSelectProps) {
   const ref = useRef<HTMLDivElement>(null);
@@ -426,7 +426,7 @@ export function GroupedSelect({
   groups,
   value,
   onChange,
-  placeholder = '请选择…',
+  placeholder = 'Select…',
   disabled = false,
   className = '',
 }: GroupedSelectProps) {

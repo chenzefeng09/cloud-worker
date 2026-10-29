@@ -97,8 +97,8 @@ export function isSkillOn(skill: InstalledSkill, selected?: string[]): boolean {
 /** Short "工具：a、b、c" summary from the last connectivity test. */
 function toolSummary(server: McpServer): string {
   const tools = server.discovered_tools ?? [];
-  if (tools.length === 0) return '尚未探测到工具';
-  return `工具：${tools.map((t) => t.name).join('、')}`;
+  if (tools.length === 0) return 'No tools discovered yet';
+  return `Tools: ${tools.map((t) => t.name).join(', ')}`;
 }
 
 export function ComposerAddMenu({
@@ -147,11 +147,13 @@ export function ComposerAddMenu({
 
   // Name the trigger after the sections that are actually wired, e.g.
   // 「添加文件、技能或工具」 with all three, 「添加文件」 with uploads alone.
-  const parts = [onPickFiles ? '文件' : null, hasSkills ? '技能' : null, hasMcp ? '工具' : null]
+  const parts = [onPickFiles ? 'files' : null, hasSkills ? 'skills' : null, hasMcp ? 'tools' : null]
     .filter((p): p is string => p !== null);
   const label =
-    '添加' +
-    (parts.length > 1 ? `${parts.slice(0, -1).join('、')}或${parts[parts.length - 1]}` : parts[0]);
+    'Add ' +
+    (parts.length > 1
+      ? `${parts.slice(0, -1).join(', ')}${parts.length > 2 ? ',' : ''} or ${parts[parts.length - 1]}`
+      : parts[0]);
 
   const skillCount = skills ? skills.skills.filter((s) => isSkillOn(s, skills.selected)).length : 0;
   const mcpOnCount = mcp ? mcp.servers.filter((s) => isMcpServerOn(s, mcp.selected)).length : 0;
@@ -203,7 +205,7 @@ export function ComposerAddMenu({
               className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md font-mono text-[12px] text-ink-2 hover:bg-paper disabled:opacity-40 text-left"
             >
               <span aria-hidden>📎</span>
-              <span className="flex-1">上传文件 / 图片</span>
+              <span className="flex-1">Upload files / images</span>
             </button>
           )}
 
@@ -219,7 +221,7 @@ export function ComposerAddMenu({
               className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md font-mono text-[12px] text-ink-2 hover:bg-paper text-left"
             >
               <span aria-hidden>🧩</span>
-              <span className="flex-1">技能</span>
+              <span className="flex-1">Skills</span>
               <span className="font-mono text-[11px] text-dim">
                 {skillCount}/{skills.skills.length}
               </span>
@@ -241,7 +243,7 @@ export function ComposerAddMenu({
               className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md font-mono text-[12px] text-ink-2 hover:bg-paper text-left"
             >
               <span aria-hidden>🔌</span>
-              <span className="flex-1">MCP 工具</span>
+              <span className="flex-1">MCP tools</span>
               <span className="font-mono text-[11px] text-dim">
                 {mcpOnCount}/{mcp.servers.length}
               </span>
@@ -257,12 +259,12 @@ export function ComposerAddMenu({
               type="button"
               role="menuitemcheckbox"
               aria-checked={platformDefaults.enabled}
-              title="平台为每个组织内置的默认技能。关闭后本次会话不再自动注入它们。"
+              title="Default skills the platform provides for every organization. Turn off to stop injecting them into this session."
               onClick={() => platformDefaults.onToggle()}
               className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md font-mono text-[12px] text-ink-2 hover:bg-paper text-left"
             >
               <span aria-hidden>🌐</span>
-              <span className="flex-1">平台默认技能</span>
+              <span className="flex-1">Platform default skills</span>
               <span
                 aria-hidden
                 className={`shrink-0 w-3.5 h-3.5 inline-flex items-center justify-center rounded-[3px] border text-[9px] leading-none ${
@@ -281,7 +283,7 @@ export function ComposerAddMenu({
             <div
               id="composer-add-menu-skills"
               role="group"
-              aria-label="技能"
+              aria-label="Skills"
               className={`absolute ${flyoutPlacement} w-72 max-h-[60vh] overflow-y-auto z-30 bg-surface border border-line rounded-lg shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-2 animate-pop-in ${flipLeft ? 'origin-right' : 'origin-left'}`}
             >
               <div className="flex flex-wrap gap-1">
@@ -299,7 +301,7 @@ export function ComposerAddMenu({
                   );
                 })}
                 {skills.skills.length === 0 && (
-                  <span className="font-mono text-[11px] italic text-dim">暂无 skill</span>
+                  <span className="font-mono text-[11px] italic text-dim">No skills yet</span>
                 )}
               </div>
             </div>
@@ -310,7 +312,7 @@ export function ComposerAddMenu({
             <div
               id="composer-add-menu-mcp"
               role="group"
-              aria-label="MCP 工具"
+              aria-label="MCP tools"
               className={`absolute ${flyoutPlacement} w-72 max-h-[60vh] overflow-y-auto z-30 bg-surface border border-line rounded-lg shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-1.5 animate-pop-in ${flipLeft ? 'origin-right' : 'origin-left'}`}
             >
               <div className="flex flex-col gap-0.5">
@@ -348,7 +350,7 @@ export function ComposerAddMenu({
                 })}
                 {mcp.servers.length === 0 && (
                   <span className="px-2 font-mono text-[11px] italic text-dim">
-                    暂无 MCP 工具
+                    No MCP tools yet
                   </span>
                 )}
               </div>

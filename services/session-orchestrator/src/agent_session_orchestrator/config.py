@@ -53,24 +53,10 @@ class Settings(BaseSettings):
     skill_store_url: str = "http://skill-store:8011/api/skills/v1"
     skill_store_service_scopes: str = "skill.read_internal"
 
-    # MCP registry — inline (no-sandbox) conversations discover the tenant's
-    # enabled HTTP MCP servers here, then execute their tools from the trusted
-    # orchestrator process.  Empty disables inline MCP without affecting chat.
-    mcp_registry_url: str = ""
-    mcp_registry_service_scopes: str = "mcp.read_internal"
-    inline_mcp_timeout: float = 20.0
-
     # Foundation authz + billing — RBAC enforcement and quota checks.
     authz_url: str = "http://authz:8002/api/authz/v1"
     foundation_billing_url: str = "http://billing:8007/api/billing/v1"
     feature_flag_url: str = "http://feature-flag:8012/api/feature-flag/v1"
-
-    # Rich document conversion — optional internal doc_to_markdown service.
-    # When configured, inline attachments prefer its structure-preserving
-    # Markdown output for Word/PDF files and fail open to the local lightweight
-    # extractor whenever the service is absent or unhealthy.
-    doc_to_md_url: str = ""
-    doc_to_md_timeout: float = 120.0
 
     # Foundation DLP — data-flow controls on the attachment path:
     #   • download check:download (fail-open on DLP error — see dlp_guard.py)
@@ -87,25 +73,10 @@ class Settings(BaseSettings):
     session_retention_sweep_interval_seconds: int = 86400
 
     # Redis — used to read agent run hot-state (plan/step/cursor) written by the
-    # runtime_worker inside the sandbox.  Key schema: agent:run:{run_id}:state.
+    # Claude SDK worker inside the sandbox.  Key schema: agent:run:{run_id}:state.
     # Failure-open: if unset or unreachable, the /state endpoint returns DB status
     # with empty plan/cursor fields rather than 500.
     redis_url: str | None = None
-
-    # LLM gateway — the OpenAI-protocol proxy the orchestrator talks to directly
-    # for chat-mode "inline" runs (POST {url}/chat/completions with
-    # X-LLM-Virtual-Key).  Default aligns with the BFF value
-    # (``services/bff/src/agent_bff/config.py``); the gateway resolves tenant +
-    # actor from the X-Tenant-Id / X-User-Id / X-Actor headers, so no bearer is
-    # required for the mesh call.  Env: SESSION_ORCHESTRATOR_LLM_GATEWAY_URL.
-    llm_gateway_url: str = "http://llm-gateway:8011/api/llm-gateway/v1"
-
-    # Timeout (seconds) for a single inline /chat/completions stream. Reasoning
-    # models can be slow; give a generous window before we abort the stream.
-    inline_completion_timeout: float = 300.0
-    # Timeout (seconds) for the lightweight gateway metadata calls made during an
-    # inline run (mint/fetch virtual key, resolve default model, revoke key).
-    inline_meta_timeout: float = 5.0
 
     # Maximum size (bytes) of a single file uploaded to a workspace file library.
     workspace_file_max_bytes: int = 20 * 1024 * 1024  # 20 MiB

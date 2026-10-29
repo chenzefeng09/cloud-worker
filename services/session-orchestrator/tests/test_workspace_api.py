@@ -8,8 +8,7 @@ Covers, in mock-DB style (same conventions as ``test_attachments.py``):
   (best-effort blob delete), content download (RFC 6266 non-ASCII filename);
 * ``load_workspace_context`` — None without workspace_id / for a deleted
   workspace, full context otherwise;
-* the pure helpers ``_merge_skills`` (runs.py) and
-  ``build_workspace_files_block`` (attachment_text_extractor).
+* the pure helper ``_merge_skills`` (runs.py).
 """
 
 from __future__ import annotations
@@ -41,7 +40,7 @@ def _fake_workspace(
         id=ws_id,
         tenant_id=TEST_TENANT,
         user_id=user_id,
-        name="工作区",
+        name="Workspace",
         description=None,
         instructions=instructions,
         skills=skills if skills is not None else ["writer"],
@@ -101,7 +100,7 @@ def test_list_workspaces_returns_rows_with_file_count(
     items = resp.json()["items"]
     assert len(items) == 1
     assert items[0]["id"] == "wsp_001"
-    assert items[0]["name"] == "工作区"
+    assert items[0]["name"] == "Workspace"
     assert items[0]["skills"] == ["writer"]
     assert items[0]["file_count"] == 2
     assert items[0]["meta"]["glyph"] == "◇"
@@ -139,7 +138,7 @@ def test_list_workspaces_lazy_creates_default(
     added = lazy_db.add.call_args[0][0]
     assert isinstance(added, Workspace)
     assert added.is_default is True
-    assert added.name == "工作区"
+    assert added.name == "Workspace"
     assert added.meta == {"glyph": "◇", "accent": "#d23a1f"}
 
 
@@ -552,51 +551,6 @@ def test_prioritize_workspace_files_hoists_referenced_order_preserving() -> None
     out = _prioritize_workspace_files(files, [])
     assert [f["id"] for f in out] == ["wsf_1", "wsf_2", "wsf_3", "wsf_4"]
     assert out is not files
-
-
-def test_build_workspace_files_block_tags_and_header() -> None:
-    from agent_session_orchestrator.services.attachment_text_extractor import (
-        build_workspace_files_block,
-    )
-
-    block = build_workspace_files_block([("wsf_1", "规范.md", "所有接口必须带鉴权。")])
-    assert block is not None
-    assert "工作区" in block
-    # The wsf id is surfaced as an id attribute for the file-link convention.
-    assert '<workspace_file id="wsf_1" filename="规范.md">' in block
-    assert "所有接口必须带鉴权。" in block
-    assert build_workspace_files_block([]) is None
-
-
-def test_build_workspace_files_block_caps_files_and_lists_omitted() -> None:
-    from agent_session_orchestrator.services.attachment_text_extractor import (
-        build_workspace_files_block,
-    )
-
-    files = [(f"wsf_{i}", f"f{i}.txt", f"内容{i}") for i in range(12)]
-    block = build_workspace_files_block(files, max_files=10)
-    assert block is not None
-    assert '<workspace_file id="wsf_9" filename="f9.txt">' in block
-    assert '<workspace_file id="wsf_10" filename="f10.txt">' not in block
-    # Omitted files are listed by name.
-    assert "f10.txt" in block and "f11.txt" in block
-    assert "未注入" in block
-
-
-def test_build_workspace_files_block_enforces_budget() -> None:
-    from agent_session_orchestrator.services.attachment_text_extractor import (
-        build_workspace_files_block,
-    )
-
-    block = build_workspace_files_block(
-        [("wsf_a", "a.txt", "x" * 100), ("wsf_b", "b.txt", "y" * 100)],
-        session_budget=100,
-    )
-    assert block is not None
-    assert '<workspace_file id="wsf_a" filename="a.txt">' in block
-    # b.txt blew the budget: not injected, listed as omitted.
-    assert '<workspace_file filename="b.txt">' not in block
-    assert "b.txt" in block
 
 
 # ─────────────────────────────────────────────────────────────────────────────

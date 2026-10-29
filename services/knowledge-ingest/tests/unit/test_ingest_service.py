@@ -175,7 +175,7 @@ async def test_create_document_persists_origin_session_id(
         title="[memory] hi",
         filename="memory.txt",
         mime="text/plain",
-        data="用户任务：hi\n\n助理回答：hello".encode(),
+        data="User task: hi\n\nAssistant answer: hello".encode(),
         origin_session_id="ses_abc123",
     )
     refreshed, _ = await svc.get_document(doc.id)
@@ -342,7 +342,7 @@ async def test_create_document_stamps_origin_user_id_for_memory(
         title="[memory] hi",
         filename="memory.txt",
         mime="text/plain",
-        data="用户任务：hi\n\n助理回答：hello".encode(),
+        data="User task: hi\n\nAssistant answer: hello".encode(),
         origin_session_id="ses_abc123",
     )
     refreshed, _ = await svc.get_document(doc.id)

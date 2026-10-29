@@ -65,7 +65,7 @@ export function AccountMenu() {
             }}
             className="w-full text-left px-2 py-1.5 rounded-md text-[12.5px] text-ink-2 hover:bg-paper hover:text-ink"
           >
-            我的账户
+            My account
           </button>
         </div>
       )}

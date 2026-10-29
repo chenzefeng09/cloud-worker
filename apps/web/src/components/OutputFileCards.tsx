@@ -11,19 +11,19 @@ function formatBytes(bytes: number): string {
 
 /** Human-readable file kind label, e.g. "Markdown", "JSON", "Image". */
 const KIND_LABEL: Record<string, string> = {
-  md: '文档',
-  txt: '文本',
+  md: 'Document',
+  txt: 'Text',
   json: 'JSON',
   yaml: 'YAML',
-  csv: '表格',
+  csv: 'Spreadsheet',
   pdf: 'PDF',
-  xlsx: '表格',
-  docx: '文档',
-  pptx: '幻灯片',
-  png: '图片',
-  jpg: '图片',
-  env: '配置',
-  ics: '日历',
+  xlsx: 'Spreadsheet',
+  docx: 'Document',
+  pptx: 'Slides',
+  png: 'Image',
+  jpg: 'Image',
+  env: 'Config',
+  ics: 'Calendar',
 };
 
 function fileKindLabel(mime?: string): string {
@@ -136,7 +136,7 @@ function OutputFileCard({ file, sessionId, onPreviewFile }: OutputFileCardProps)
       <a
         href={contentUrl}
         download={file.filename}
-        title={`下载 ${file.filename}`}
+        title={`Download ${file.filename}`}
         onClick={(e) => e.stopPropagation()}
         style={{
           display: 'flex',
@@ -195,7 +195,7 @@ export function OutputFileCards({ files, sessionId, onPreviewFile }: OutputFileC
           marginBottom: 2,
         }}
       >
-        输出文件
+        Output files
       </div>
       {files.map((f) => (
         <OutputFileCard

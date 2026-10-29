@@ -8,14 +8,14 @@ import { Dialog } from './Dialog';
 // inconsistent across browsers, and blocks the main thread).
 //
 //   const confirm = useConfirm();
-//   if (!(await confirm({ message: '确定删除？', tone: 'danger' }))) return;
+//   if (!(await confirm({ message: 'Delete this item?', tone: 'danger' }))) return;
 //
 //   const prompt = usePrompt();
-//   const name = await prompt({ title: '新建部门', label: '名称' });
+//   const name = await prompt({ title: 'New department', label: 'Name' });
 //   if (name === null) return;          // cancelled
 //
 //   const toast = useToast();
-//   toast.success('已保存');
+//   toast.success('Saved');
 
 // ─── Types ─────────────────────────────────────────────────────────────────────
 
@@ -75,7 +75,7 @@ function ConfirmDialog({
   const danger = opts.tone === 'danger';
   return (
     <Dialog
-      title={opts.title ?? '确认操作'}
+      title={opts.title ?? 'Confirm action'}
       onClose={() => onResult(false)}
       initialFocusRef={confirmRef}
     >
@@ -86,7 +86,7 @@ function ConfirmDialog({
           onClick={() => onResult(false)}
           className="px-3 py-1.5 text-[13px] rounded-sm border border-line text-dim hover:bg-paper-2 focus:outline-none focus:border-accent"
         >
-          {opts.cancelText ?? '取消'}
+          {opts.cancelText ?? 'Cancel'}
         </button>
         <button
           ref={confirmRef}
@@ -96,7 +96,7 @@ function ConfirmDialog({
             danger ? 'bg-accent hover:opacity-90' : 'bg-ink hover:opacity-90'
           }`}
         >
-          {opts.confirmText ?? '确定'}
+          {opts.confirmText ?? 'OK'}
         </button>
       </div>
     </Dialog>
@@ -120,7 +120,7 @@ function PromptDialog({
     e.preventDefault();
     const trimmed = value.trim();
     if (opts.required && !trimmed) {
-      setError('此项为必填');
+      setError('This field is required');
       return;
     }
     if (opts.validate) {
@@ -136,7 +136,7 @@ function PromptDialog({
   const InputTag = opts.multiline ? 'textarea' : 'input';
 
   return (
-    <Dialog title={opts.title ?? '输入'} onClose={() => onResult(null)} initialFocusRef={inputRef}>
+    <Dialog title={opts.title ?? 'Input'} onClose={() => onResult(null)} initialFocusRef={inputRef}>
       <form onSubmit={submit} className="flex flex-col gap-3">
         {opts.description && (
           <div className="text-[12px] text-dim whitespace-pre-line leading-relaxed">
@@ -164,13 +164,13 @@ function PromptDialog({
             onClick={() => onResult(null)}
             className="px-3 py-1.5 text-[13px] rounded-sm border border-line text-dim hover:bg-paper-2 focus:outline-none focus:border-accent"
           >
-            {opts.cancelText ?? '取消'}
+            {opts.cancelText ?? 'Cancel'}
           </button>
           <button
             type="submit"
             className="px-3 py-1.5 text-[13px] rounded-sm bg-ink text-paper hover:opacity-90 focus:outline-none"
           >
-            {opts.confirmText ?? '确定'}
+            {opts.confirmText ?? 'OK'}
           </button>
         </div>
       </form>

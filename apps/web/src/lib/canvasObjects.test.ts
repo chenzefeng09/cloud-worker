@@ -145,6 +145,37 @@ describe('extractCanvasDeliverable', () => {
     expect(result.content.startsWith('亲爱的老师们、同学们：')).toBe(true);
   });
 
+  it('strips English assistant preludes and trailing notes', () => {
+    const result = extractCanvasDeliverable(
+      [
+        'Sure, here is a draft of the welcome speech.',
+        '',
+        '# A fresh start',
+        '',
+        'Good morning, everyone!',
+        '',
+        'Thank you all!',
+        '',
+        'Note: this runs about three minutes when read aloud.',
+      ].join('\n'),
+      { kind: 'article', fallbackTitle: 'Untitled article' },
+    );
+
+    expect(result.title).toBe('A fresh start');
+    expect(result.content).toBe('Good morning, everyone!\n\nThank you all!');
+  });
+
+  it('reads an English "Title:" label and drops the generic draft title', () => {
+    const result = prepareCanvasOpenSeed({
+      kind: 'article',
+      title: 'Untitled article',
+      content: 'Title: Market notes before the open\n\nThe market has felt sluggish lately.',
+    });
+
+    expect(result.title).toBe('Market notes before the open');
+    expect(result.content).toBe('The market has felt sluggish lately.');
+  });
+
   it('normalizes manual canvas seeds instead of preserving the generic draft title', () => {
     const result = prepareCanvasOpenSeed({
       kind: 'article',

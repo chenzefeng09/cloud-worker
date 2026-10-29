@@ -54,67 +54,67 @@ interface AdminNavGroup {
 
 const ADMIN_NAV_GROUPS: AdminNavGroup[] = [
   {
-    title: '租户与组织',
+    title: 'Tenants & organization',
     items: [
-      { to: '/admin/tenants', label: '租户管理', glyph: '◫' },
-      { to: '/admin/org', label: '组织架构', glyph: '⊞', requires: 'org.read' },
+      { to: '/admin/tenants', label: 'Tenants', glyph: '◫' },
+      { to: '/admin/org', label: 'Org structure', glyph: '⊞', requires: 'org.read' },
     ],
   },
   {
-    title: '用户与权限',
+    title: 'Users & permissions',
     items: [
-      { to: '/admin/users', label: '用户管理', glyph: '◎' },
-      { to: '/admin/rbac', label: '角色与权限', glyph: '⊙', requires: 'authz.role.manage' },
-      { to: '/admin/pam', label: '特权访问', glyph: '⊘' },
-      { to: '/admin/sso', label: '身份源管理', glyph: '⊜' },
+      { to: '/admin/users', label: 'Users', glyph: '◎' },
+      { to: '/admin/rbac', label: 'Roles & permissions', glyph: '⊙', requires: 'authz.role.manage' },
+      { to: '/admin/pam', label: 'Privileged access', glyph: '⊘' },
+      { to: '/admin/sso', label: 'Identity providers', glyph: '⊜' },
     ],
   },
   {
-    title: '计费与配额',
+    title: 'Billing & quotas',
     items: [
-      { to: '/admin/plans', label: '套餐目录', glyph: '◈' },
-      { to: '/admin/quota', label: '订阅与配额', glyph: '◷', requires: 'quota.read' },
+      { to: '/admin/plans', label: 'Plan catalog', glyph: '◈' },
+      { to: '/admin/quota', label: 'Subscriptions & quotas', glyph: '◷', requires: 'quota.read' },
     ],
   },
   {
-    title: '模型与 AI',
+    title: 'Models & AI',
     items: [
-      { to: '/admin/models', label: '模型管理', glyph: '⊕', requires: 'model.read' },
+      { to: '/admin/models', label: 'Models', glyph: '⊕', requires: 'model.read' },
     ],
   },
   {
-    title: '平台治理',
+    title: 'Platform governance',
     items: [
-      { to: '/admin/apps', label: '应用审核', glyph: '▣' },
-      { to: '/admin/skills', label: '技能管理', glyph: '✦', requires: 'skill.create' },
-      { to: '/admin/mcp', label: 'MCP 服务器', glyph: '⊟', requires: 'mcp_server.create' },
-      { to: '/admin/knowledge', label: '知识库', glyph: '❖', requires: 'document.create' },
-      { to: '/admin/ops', label: '运行与沙箱', glyph: '◳', requires: 'sandbox.read' },
-      { to: '/admin/pool-monitor', label: '温池监控', glyph: '▦' },
-      { to: '/admin/large-attachment', label: '大附件能力', glyph: '⊠', requires: 'session.attachment.large.create' },
-      { to: '/admin/api-platform', label: 'API 平台', glyph: '⌘' },
+      { to: '/admin/apps', label: 'App review', glyph: '▣' },
+      { to: '/admin/skills', label: 'Skills', glyph: '✦', requires: 'skill.create' },
+      { to: '/admin/mcp', label: 'MCP servers', glyph: '⊟', requires: 'mcp_server.create' },
+      { to: '/admin/knowledge', label: 'Knowledge base', glyph: '❖', requires: 'document.create' },
+      { to: '/admin/ops', label: 'Runs & sandboxes', glyph: '◳', requires: 'sandbox.read' },
+      { to: '/admin/pool-monitor', label: 'Warm pool monitor', glyph: '▦' },
+      { to: '/admin/large-attachment', label: 'Large attachments', glyph: '⊠', requires: 'session.attachment.large.create' },
+      { to: '/admin/api-platform', label: 'API platform', glyph: '⌘' },
     ],
   },
   {
-    title: '运营与合规',
+    title: 'Operations & compliance',
     items: [
       { to: '/admin/flags', label: 'Feature Flags', glyph: '⚑' },
-      { to: '/admin/audit', label: '审计日志', glyph: '≡' },
-      { to: '/admin/replay', label: '会话回放', glyph: '▷' },
-      { to: '/admin/notification', label: '通知中心', glyph: '✉' },
-      { to: '/admin/dlp', label: '数据防泄漏', glyph: '⛨' },
-      { to: '/admin/compliance', label: '合规中心', glyph: '⚖' },
-      { to: '/admin/security-ops', label: '安全运营', glyph: '⊛' },
-      { to: '/admin/lifecycle', label: '数据生命周期', glyph: '♺' },
-      { to: '/admin/data-protection', label: '数据保护', glyph: '⛉' },
+      { to: '/admin/audit', label: 'Audit log', glyph: '≡' },
+      { to: '/admin/replay', label: 'Session replay', glyph: '▷' },
+      { to: '/admin/notification', label: 'Notifications', glyph: '✉' },
+      { to: '/admin/dlp', label: 'Data loss prevention', glyph: '⛨' },
+      { to: '/admin/compliance', label: 'Compliance', glyph: '⚖' },
+      { to: '/admin/security-ops', label: 'Security operations', glyph: '⊛' },
+      { to: '/admin/lifecycle', label: 'Data lifecycle', glyph: '♺' },
+      { to: '/admin/data-protection', label: 'Data protection', glyph: '⛉' },
     ],
   },
   {
-    title: '存储管理',
+    title: 'Storage',
     items: [
-      { to: '/admin/storage-quotas', label: '租户配额', glyph: '▤' },
-      { to: '/admin/storage-orphans', label: '孤儿对账', glyph: '◌' },
-      { to: '/admin/platform-settings', label: '平台设置', glyph: '⚙' },
+      { to: '/admin/storage-quotas', label: 'Tenant quotas', glyph: '▤' },
+      { to: '/admin/storage-orphans', label: 'Orphan reconciliation', glyph: '◌' },
+      { to: '/admin/platform-settings', label: 'Platform settings', glyph: '⚙' },
     ],
   },
 ];
@@ -188,7 +188,7 @@ export function AdminLayout() {
         {/* Header */}
         <div className="flex items-center gap-2 px-1">
           <span className="font-mono text-[10px] font-semibold tracking-[0.12em] uppercase text-dim">
-            管理后台
+            Admin console
           </span>
         </div>
 
@@ -243,7 +243,7 @@ export function AdminLayout() {
             className="flex items-center gap-2 text-[12px] text-dim hover:text-ink no-underline"
           >
             <span className="font-mono text-[10px]">←</span>
-            <span>返回工作区</span>
+            <span>Back to workspace</span>
           </NavLink>
           <div className="mt-2 font-mono text-[10px] text-dim truncate">
             {userProfile?.email}

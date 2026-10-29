@@ -2,10 +2,9 @@
 # =============================================================================
 # claude-sdk-sandbox — Claude Agent SDK runtime worker image (TypeScript/Node)
 #
-# Parallel sibling to base.Dockerfile (the AgentScope/Python worker).  This
-# image ships the `worker-claude-sdk/` TypeScript worker compiled to JS,
-# running under Node.js 22.  It honours the same sandbox runtime contract as
-# the AgentScope worker:
+# The platform's agent sandbox image.  It ships the `worker-claude-sdk/`
+# TypeScript worker (Claude Agent SDK) compiled to JS, running under Node.js 22.
+# It honours the sandbox runtime contract (contracts/worker-wire-contract.md):
 #   * reads the task from /workspace/task.json OR the AGENT_TASK_JSON env var
 #   * writes /workspace/result.json + /workspace/events.jsonl
 #   * /workspace is the scheduler bind-mount target
@@ -29,8 +28,8 @@
 #
 # Notes
 # -----
-# * Non-root `agent` user, uid 1000 / gid 1000 — MUST match the AgentScope
-#   image's `agent` user, because the scheduler bind-mounts /workspace files
+# * Non-root `agent` user, uid 1000 / gid 1000 — MUST stay uid 1000, because
+#   the scheduler bind-mounts /workspace files
 #   owned by uid 1000.  A mismatched uid makes result.json/events.jsonl writes
 #   fail with EACCES.
 # * --omit=dev keeps the @anthropic-ai/claude-agent-sdk + aws-sdk + ioredis
@@ -43,17 +42,16 @@ FROM node:22-slim
 
 # ── Non-root agent user (uid/gid 1000) ───────────────────────────────────────
 # node:22-slim already creates a `node` user at uid 1000.  We want the username
-# `agent` at uid/gid 1000 to mirror the AgentScope image, so create a dedicated
+# `agent` at uid/gid 1000 (the uid the scheduler expects), so create a dedicated
 # group+user, falling back gracefully if 1000 is already taken by `node`.
 RUN groupadd --gid 1000 agent 2>/dev/null || groupmod -n agent node \
  && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash agent 2>/dev/null \
     || usermod -l agent -d /home/agent -m node
 
 # ── Python toolchain for the agent (Office / data-viz via Bash) ───────────────
-# The AgentScope worker image (base.Dockerfile, FROM python:3.12-slim) shipped a
-# Python runtime + Office/plotting libs; the Claude SDK worker is Node-only, so
-# the agent lost the ability to run `python3` for Office docs, charts, graphs.
-# We install them back here.  This is purely an agent-callable runtime — the
+# The worker itself is Node-only, but the agent needs `python3` (via Bash) for
+# Office docs, charts and graphs, so a Python runtime + those libs are
+# installed here.  This is purely an agent-callable runtime — the
 # worker itself remains the Node ENTRYPOINT below, unchanged.
 #
 # bookworm's apt python3 is 3.11.  We install all Python libs from PyPI (not the

@@ -23,7 +23,6 @@ beforeEach(() => {
     selectedMcpServerIds: {},
     selectedModel: {},
     selectedEffort: {},
-    executionMode: {},
     platformDefaultsEnabled: {},
   });
 });
@@ -36,7 +35,6 @@ describe('buildChatRequestBody — mcp_server_ids', () => {
     expect(body).toEqual({
       message: '你好',
       attachment_ids: [],
-      execution_mode: 'sandbox',
     });
   });
 
@@ -113,11 +111,10 @@ describe('buildChatRequestBody — include_platform_defaults (per-session opt-ou
 });
 
 describe('buildChatRequestBody — remaining fields', () => {
-  it('forwards model, effort, execution mode and workspace files', () => {
+  it('forwards model, effort and workspace files (never execution_mode)', () => {
     useChatStore.setState({
       selectedModel: { [sessionId]: 'deepseek-v4' },
       selectedEffort: { [sessionId]: 'high' },
-      executionMode: { [sessionId]: 'inline' },
     });
 
     const body = buildChatRequestBody(sessionId, {
@@ -131,7 +128,6 @@ describe('buildChatRequestBody — remaining fields', () => {
       attachment_ids: ['att_1'],
       model: 'deepseek-v4',
       reasoning_effort: 'high',
-      execution_mode: 'inline',
       workspace_file_ids: ['wsf_1'],
     });
   });

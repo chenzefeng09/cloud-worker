@@ -1,6 +1,11 @@
 # ADR 0001 — Sandbox runtime: CubeSandbox default, Kata Containers as fallback
 
 - **Status**: Accepted
+- **Note (2026-10)**: the runtime decision stands. References below to
+  AgentScope, `agentscope_ext.runtime_worker` and the `base` / `office` /
+  `matlab` images are historical — the sandbox entrypoint is now the Claude
+  Agent SDK worker (`node /app/dist/main.js`, `claude-sdk*.Dockerfile`
+  images); see [ADR 0003](0003-claude-agent-sdk-sole-agent-runtime.md).
 - **Date**: 2026-06
 - **Phase**: B-M2
 - **Plan reference**: top-plan [§ 决策 — 沙盒（B 阶段）] + [§ 风险 #4]

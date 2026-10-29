@@ -3,7 +3,7 @@
 Focuses on:
 - health.readyz endpoint
 - DockerRuntime.get_run_status with result.json on disk
-- DockerRuntime._upload_artifacts empty workspace / missing s3 client
+- artifact_store.upload_run_output_files empty workspace / missing s3 client
 - DockerRuntime._make_s3_client failure-open path
 - authz_guard B904 paths (unreachable in normal tests)
 """
@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
+from agent_scheduler.services import artifact_store
 from agent_scheduler.services.docker_runtime import DockerRuntime
 
 # ---------------------------------------------------------------------------
@@ -134,40 +135,45 @@ def test_get_run_status_result_json_failed_status_promotes(
 
 
 # ---------------------------------------------------------------------------
-# DockerRuntime._upload_artifacts — edge cases
+# artifact_store.upload_run_output_files — edge cases
+# (DockerRuntime._upload_artifacts was folded into this shared helper.)
 # ---------------------------------------------------------------------------
 
 
-def test_upload_artifacts_returns_empty_when_workspace_missing(
-    runtime: DockerRuntime,
-) -> None:
-    """Non-existent workspace dir → empty list, no S3 call."""
-    result = runtime._upload_artifacts(  # type: ignore[attr-defined]
+def test_upload_output_files_returns_empty_when_workspace_missing() -> None:
+    """Non-existent workspace dir → empty lists, no S3 call."""
+    s3 = MagicMock()
+    result = artifact_store.upload_run_output_files(
         workspace=Path("/nonexistent/path"),
         tenant_id="tnt_test",
         session_id="ses_test",
         run_id="run_test",
+        workspace_id="",
+        bucket="agent-platform",
+        s3_client=s3,
     )
-    assert result == []
+    assert result == {"workspace_files": [], "artifacts": []}
+    s3.put_object.assert_not_called()
 
 
-def test_upload_artifacts_returns_empty_when_s3_unavailable(
-    runtime: DockerRuntime,
-) -> None:
-    """When _make_s3_client returns None, artifacts list is empty."""
+def test_upload_output_files_returns_empty_when_s3_unavailable() -> None:
+    """No S3 client (``make_s3_client`` returned None) → empty lists."""
     with tempfile.TemporaryDirectory() as tmpdir:
         workspace = Path(tmpdir)
-        (workspace / "output.txt").write_text("hello", encoding="utf-8")
+        (workspace / "outputs").mkdir()
+        (workspace / "outputs" / "output.txt").write_text("hello", encoding="utf-8")
 
-        with patch.object(runtime, "_make_s3_client", return_value=None):
-            result = runtime._upload_artifacts(  # type: ignore[attr-defined]
-                workspace=workspace,
-                tenant_id="tnt_test",
-                session_id="ses_test",
-                run_id="run_test",
-            )
+        result = artifact_store.upload_run_output_files(
+            workspace=workspace,
+            tenant_id="tnt_test",
+            session_id="ses_test",
+            run_id="run_test",
+            workspace_id="",
+            bucket="agent-platform",
+            s3_client=None,
+        )
 
-    assert result == []
+    assert result == {"workspace_files": [], "artifacts": []}
 
 
 # ---------------------------------------------------------------------------

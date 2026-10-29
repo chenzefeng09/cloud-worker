@@ -106,6 +106,28 @@ def test_materialize_strips_trailing_meta_label() -> None:
     assert not any(t.startswith("说明：") for t in texts)
 
 
+def test_materialize_strips_english_ack_and_trailing_notes() -> None:
+    md = (
+        "Sure, here's the article you asked for.\n\n# Title\n\n"
+        "Body paragraph.\n\nNotes: adjust the tone as needed."
+    )
+    texts = [b["text"] for b in materialize_blocks(md)]
+    assert texts == ["# Title", "Body paragraph."]
+
+
+def test_materialize_strips_english_handoff_line() -> None:
+    md = "Here is the revised draft:\n\nFirst paragraph.\n\nSecond paragraph."
+    texts = [b["text"] for b in materialize_blocks(md)]
+    assert texts == ["First paragraph.", "Second paragraph."]
+
+
+def test_materialize_keeps_english_body_sentence() -> None:
+    # No trailing colon → a genuine opening sentence, not a hand-off.
+    md = "Here is a simple idea that changes everything.\n\nMore body."
+    texts = [b["text"] for b in materialize_blocks(md)]
+    assert texts[0] == "Here is a simple idea that changes everything."
+
+
 def test_materialize_pure_meta_falls_back_to_whole() -> None:
     # A single meta-only line: stripping would empty it, so it must fall back
     # to splitting the original whole text (never lose content).

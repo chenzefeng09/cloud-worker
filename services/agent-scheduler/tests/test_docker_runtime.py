@@ -170,7 +170,7 @@ def test_list_containers_filters_by_label(
         "agent-platform.session-id": "s1",
     }
     c1.status = "running"
-    c1.image.tags = ["agentscope-sandbox:latest"]
+    c1.image.tags = ["claude-sdk-sandbox:0.1"]
     c1.attrs = {"Created": "2026-01-01"}
     mock_docker_client.containers.list.return_value = [c1]
     items = runtime.list_containers(tenant_id="tnt_a")
@@ -217,8 +217,8 @@ def test_spawn_run_env_contains_mcp_and_skill_urls(
     runtime: DockerRuntime,
     mock_docker_client: MagicMock,
 ) -> None:
-    """``spawn_run`` must pass MCP_REGISTRY_URL, SKILL_STORE_URL, RUNTIME_EXTENSIONS
-    in the container environment so in-sandbox extensions can reach the services."""
+    """``spawn_run`` must pass MCP_REGISTRY_URL and SKILL_STORE_URL in the
+    container environment so the worker can reach the tenant MCP / skill services."""
     mock_docker_client.containers.run.return_value = MagicMock(id="container-abc")
 
     runtime.spawn_run(
@@ -236,9 +236,8 @@ def test_spawn_run_env_contains_mcp_and_skill_urls(
     env = kwargs["environment"]
     assert "MCP_REGISTRY_URL" in env, "MCP_REGISTRY_URL missing from container env"
     assert "SKILL_STORE_URL" in env, "SKILL_STORE_URL missing from container env"
-    assert "RUNTIME_EXTENSIONS" in env, "RUNTIME_EXTENSIONS missing from container env"
-    assert "mcp_tenant_injector" in env["RUNTIME_EXTENSIONS"]
-    assert "skills_loader" in env["RUNTIME_EXTENSIONS"]
+    # AgentScope-era extension selector is gone with that worker.
+    assert "RUNTIME_EXTENSIONS" not in env
 
 
 def test_spawn_run_env_contains_foundation_service_scopes(
@@ -276,8 +275,7 @@ def test_spawn_run_env_injects_knowledge_ingest_url_and_clearance(
 ) -> None:
     """``spawn_run`` must inject KNOWLEDGE_INGEST_URL (broker façade in broker
     mode) + FOUNDATION_USER_CLEARANCE (from the new user_clearance kwarg) into
-    the container env, and RUNTIME_EXTENSIONS must list knowledge_tool so the
-    in-sandbox extension activates."""
+    the container env."""
     mock_docker_client.containers.run.return_value = MagicMock(id="cid-kb")
 
     runtime.spawn_run(
@@ -299,9 +297,6 @@ def test_spawn_run_env_injects_knowledge_ingest_url_and_clearance(
     assert "tool-broker" in env["KNOWLEDGE_INGEST_URL"]
     # Clearance is plain env (not secret) - NOT in the secrets file.
     assert env["FOUNDATION_USER_CLEARANCE"] == "L3"
-    assert "knowledge_tool" in env["RUNTIME_EXTENSIONS"], (
-        "knowledge_tool missing from RUNTIME_EXTENSIONS default"
-    )
     # The clearance must NOT leak into the secrets file (it isn't secret).
     secrets_path = (
         Path(runtime._settings.workspace_base)  # noqa: SLF001
@@ -811,7 +806,7 @@ def test_spawn_run_virtual_key_delivered_via_secrets_file_when_provided(
     assert secrets["LLM_VIRTUAL_KEY"] == "vk-tenant-test-123"
 
 
-def test_spawn_run_rejects_missing_virtual_key_when_enforcer_enabled(
+def test_spawn_run_rejects_missing_virtual_key(
     runtime: DockerRuntime,
     mock_docker_client: MagicMock,
 ) -> None:
@@ -831,11 +826,12 @@ def test_spawn_run_rejects_missing_virtual_key_when_enforcer_enabled(
     mock_docker_client.containers.run.assert_not_called()
 
 
-def test_spawn_run_blanks_direct_key_when_enforcer_enabled(
+def test_spawn_run_never_exposes_direct_provider_config(
     runtime: DockerRuntime,
     mock_docker_client: MagicMock,
 ) -> None:
-    """Default enforcer mode must not expose provider secrets to sandbox code."""
+    """Gateway mode is unconditional: no provider key / provider selector /
+    base URL / extension list reaches the sandbox — env or secrets file."""
     from agent_scheduler.config import Settings
 
     runtime._settings = Settings(
@@ -847,12 +843,9 @@ def test_spawn_run_blanks_direct_key_when_enforcer_enabled(
         foundation_identity_url="http://identity-test/api/identity/v1",
         scheduler_service_token="fake-service-token",
         otel_enabled=False,
-        llm_api_key="sk-direct-key",
         llm_model="deepseek-chat",
-        llm_provider="openai",
-        llm_base_url="https://api.deepseek.com/v1",
     )
-    mock_docker_client.containers.run.return_value = MagicMock(id="container-direct")
+    mock_docker_client.containers.run.return_value = MagicMock(id="container-gw")
 
     run_id = "run_01J5RUN0000000000000GW004"
     session_id = "ses_01J5SES0000000000000GW004"
@@ -860,84 +853,62 @@ def test_spawn_run_blanks_direct_key_when_enforcer_enabled(
     runtime.spawn_run(
         run_id=run_id,
         session_id=session_id,
-        task="direct connect check",
+        task="gateway only check",
         tenant_id=tenant_id,
         user_id="usr_01J5USR0000000000000000001",
-        foundation_token="tok_direct",
-        llm_virtual_key="vk-also-injected",
+        foundation_token="tok_gw",
+        llm_virtual_key="vk-gw",
     )
 
     _, kwargs = mock_docker_client.containers.run.call_args
     env = kwargs["environment"]
-    # Secret keys live in the file, not env.
-    assert "LLM_API_KEY" not in env
+    for key in ("LLM_API_KEY", "LLM_PROVIDER", "LLM_BASE_URL", "RUNTIME_EXTENSIONS"):
+        assert key not in env, f"{key} must not be in container env"
     assert "LLM_VIRTUAL_KEY" not in env
-    # Non-secret LLM routing/metadata stays in env.
-    assert env.get("LLM_BASE_URL") == "https://api.deepseek.com/v1", "LLM_BASE_URL must be preserved"
+    # Non-secret routing/metadata stays in env.
     assert env.get("LLM_MODEL") == "deepseek-chat", "LLM_MODEL must be preserved"
-    assert env.get("LLM_PROVIDER") == "openai", "LLM_PROVIDER must be preserved"
-    assert "LLM_GATEWAY_URL" in env
+    assert env.get("LLM_GATEWAY_URL"), "LLM_GATEWAY_URL must be set"
     secrets = _read_secrets_file(
         runtime._settings.workspace_base,  # noqa: SLF001
         tenant_id=tenant_id,
         session_id=session_id,
         run_id=run_id,
     )
-    assert secrets["LLM_API_KEY"] == "", "LLM_API_KEY must be blank in gateway mode"
-    assert secrets["LLM_VIRTUAL_KEY"] == "vk-also-injected"
+    assert "LLM_API_KEY" not in secrets
+    assert secrets["LLM_VIRTUAL_KEY"] == "vk-gw"
 
 
-def test_spawn_run_direct_connect_vars_preserved_when_enforcer_disabled(
+def test_spawn_run_uses_agent_image_with_entrypoint(
     runtime: DockerRuntime,
     mock_docker_client: MagicMock,
 ) -> None:
-    """Local-only direct-connect mode remains available when explicitly configured."""
-    from agent_scheduler.config import Settings
+    """Every run uses ``agent_image`` and ``command=None`` (image ENTRYPOINT,
+    i.e. the Claude SDK worker's node entry) — no per-run image routing."""
+    mock_docker_client.containers.run.return_value = MagicMock(id="container-img")
 
-    runtime._settings = Settings(
-        env="test",
-        log_level="WARNING",
-        agent_image="hello-world:latest",
-        workspace_base="/tmp/agent-platform-test",
-        docker_network="none",
-        foundation_identity_url="http://identity-test/api/identity/v1",
-        scheduler_service_token="fake-service-token",
-        otel_enabled=False,
-        llm_api_key="sk-direct-key",
-        llm_model="deepseek-chat",
-        llm_provider="openai",
-        llm_base_url="https://api.deepseek.com/v1",
-        runtime_extensions="mcp_tenant_injector,skills_loader,web_fetch",
-    )
-    mock_docker_client.containers.run.return_value = MagicMock(id="container-direct")
-
-    run_id = "run_01J5RUN0000000000000GW005"
-    session_id = "ses_01J5SES0000000000000GW005"
-    tenant_id = "tnt_01J5TNT0000000000000000001"
     runtime.spawn_run(
-        run_id=run_id,
-        session_id=session_id,
-        task="direct connect check",
-        tenant_id=tenant_id,
+        run_id="run_01J5RUN0000000000000IMG01",
+        session_id="ses_01J5SES0000000000000IMG01",
+        task="image check",
+        tenant_id="tnt_01J5TNT0000000000000000001",
         user_id="usr_01J5USR0000000000000000001",
-        foundation_token="tok_direct",
+        foundation_token="tok_img",
+        llm_virtual_key="vk-test",
     )
 
     _, kwargs = mock_docker_client.containers.run.call_args
-    env = kwargs["environment"]
-    # The real provider key is a secret → file channel, not env.
-    assert "LLM_API_KEY" not in env
-    secrets = _read_secrets_file(
-        runtime._settings.workspace_base,  # noqa: SLF001
-        tenant_id=tenant_id,
-        session_id=session_id,
-        run_id=run_id,
-    )
-    assert secrets["LLM_API_KEY"] == "sk-direct-key"
-    # Non-secret routing/metadata stays in env.
-    assert env.get("LLM_BASE_URL") == "https://api.deepseek.com/v1"
-    assert env.get("LLM_MODEL") == "deepseek-chat"
-    assert env.get("LLM_PROVIDER") == "openai"
+    assert kwargs["image"] == runtime._settings.agent_image  # noqa: SLF001
+    assert kwargs["command"] is None
+
+
+def test_agent_image_defaults_to_claude_sdk_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_scheduler.config import Settings
+
+    monkeypatch.delenv("SCHEDULER_AGENT_IMAGE", raising=False)
+    settings = Settings(_env_file=None)  # type: ignore[call-arg]
+    assert settings.agent_image == "ghcr.io/agent-platform/claude-sdk-sandbox:0.1"
 
 
 # ---------------------------------------------------------------------------
@@ -951,7 +922,7 @@ def test_spawn_run_env_contains_redis_url_and_run_id(
 ) -> None:
     """``spawn_run`` must pass RUN_ID in the container environment and deliver
     REDIS_URL (a secret) via /workspace/.secrets.json so the in-sandbox
-    runtime_worker can write hot-state checkpoints to Redis."""
+    worker can write hot-state checkpoints to Redis."""
     from agent_scheduler.config import Settings
 
     # Give the runtime a settings with a REDIS_URL configured.  REDIS_URL is
@@ -1036,11 +1007,7 @@ def test_spawn_run_secrets_moved_to_file_not_env(
         foundation_identity_url="http://identity-test/api/identity/v1",
         scheduler_service_token="fake-service-token",
         otel_enabled=False,
-        llm_api_key="sk-direct-key",
         llm_model="deepseek-chat",
-        llm_provider="openai",
-        llm_base_url="https://api.deepseek.com/v1",
-        runtime_extensions="mcp_tenant_injector,skills_loader,web_fetch",
         redis_url="redis://:redis_change_me@foundation-redis:6379/0",
         s3_endpoint_url="http://foundation-minio:9000",
         s3_bucket="agent-platform",
@@ -1082,7 +1049,8 @@ def test_spawn_run_secrets_moved_to_file_not_env(
     )
     assert secrets["FOUNDATION_API_TOKEN"] == "tok-foundation-secret"
     assert secrets["LLM_VIRTUAL_KEY"] == "vk-tenant-secret"
-    assert secrets["LLM_API_KEY"] == "sk-direct-key"  # enforcer off here
+    # The real upstream provider key never reaches the sandbox.
+    assert "LLM_API_KEY" not in secrets
     assert secrets["S3_ACCESS_KEY_ID"] == "minio-root"
     assert secrets["S3_SECRET_ACCESS_KEY"] == "minio-root-secret"
     assert secrets["REDIS_URL"] == "redis://:redis_change_me@foundation-redis:6379/0"
@@ -1257,16 +1225,16 @@ def test_spawn_run_broker_tolerates_fake_client_without_networks(
 def _foundation_settings(**over: object):
     from agent_scheduler.config import Settings
 
-    base: dict[str, object] = dict(
-        log_level="WARNING",
-        agent_image="hello-world:latest",
-        workspace_base="/tmp/agent-platform-test",
-        docker_network="foundation-net",
-        sandbox_egress_mode="foundation",
-        foundation_identity_url="http://identity-test/api/identity/v1",
-        scheduler_service_token="fake-service-token",
-        otel_enabled=False,
-    )
+    base: dict[str, object] = {
+        "log_level": "WARNING",
+        "agent_image": "hello-world:latest",
+        "workspace_base": "/tmp/agent-platform-test",
+        "docker_network": "foundation-net",
+        "sandbox_egress_mode": "foundation",
+        "foundation_identity_url": "http://identity-test/api/identity/v1",
+        "scheduler_service_token": "fake-service-token",
+        "otel_enabled": False,
+    }
     base.update(over)
     return Settings(**base)  # type: ignore[arg-type]
 
@@ -1337,26 +1305,25 @@ def test_spawn_run_foundation_egress_allowed_in_dev_without_optin(
     mock_docker_client.containers.run.assert_called_once()
 
 
-def test_spawn_run_secrets_file_keeps_empty_llm_api_key_under_enforcer(
+def test_spawn_run_secrets_file_has_no_provider_key(
     runtime: DockerRuntime,
     mock_docker_client: MagicMock,
 ) -> None:
-    """Under the gateway enforcer LLM_API_KEY is "" but still present in the
-    dict, so it must be written to the secrets file (not silently dropped) —
-    while falsy LLM_VIRTUAL_KEY/TOOL_BROKER_LEASE are absent."""
-    mock_docker_client.containers.run.return_value = MagicMock(id="container-enforcer")
+    """With default settings the secrets file carries the tenant virtual key
+    and foundation token, and never a direct provider ``LLM_API_KEY``."""
+    mock_docker_client.containers.run.return_value = MagicMock(id="container-gw-file")
 
     tenant_id = "tnt_01J5TNT0000000000000000001"
-    session_id = "ses_01J5SES000000000000ENFRC"
-    run_id = "run_01J5RUN000000000000ENFRC"
+    session_id = "ses_01J5SES000000000000GWFIL"
+    run_id = "run_01J5RUN000000000000GWFIL"
     runtime.spawn_run(
         run_id=run_id,
         session_id=session_id,
-        task="enforcer empty-key check",
+        task="gateway secrets file check",
         tenant_id=tenant_id,
         user_id="usr_01J5USR0000000000000000001",
-        foundation_token="tok-enforcer",
-        llm_virtual_key="vk-enforcer",
+        foundation_token="tok-gw",
+        llm_virtual_key="vk-gw",
     )
 
     _, kwargs = mock_docker_client.containers.run.call_args
@@ -1368,7 +1335,12 @@ def test_spawn_run_secrets_file_keeps_empty_llm_api_key_under_enforcer(
         session_id=session_id,
         run_id=run_id,
     )
-    # Default settings → enforcer active → blanked key, but key present.
-    assert "LLM_API_KEY" in secrets
-    assert secrets["LLM_API_KEY"] == ""
-    assert secrets["LLM_VIRTUAL_KEY"] == "vk-enforcer"
+    assert "LLM_API_KEY" not in secrets
+    assert secrets["LLM_VIRTUAL_KEY"] == "vk-gw"
+    assert secrets["FOUNDATION_API_TOKEN"] == "tok-gw"
+    assert _secrets_file_mode(
+        runtime._settings.workspace_base,  # noqa: SLF001
+        tenant_id=tenant_id,
+        session_id=session_id,
+        run_id=run_id,
+    ) == 0o600

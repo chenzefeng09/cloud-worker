@@ -42,13 +42,13 @@ function CreateTenantForm({ onCreated }: { onCreated: (t: Tenant) => void }) {
       const body: CreateTenantRequest = { name: name.trim(), tier, admin_email: adminEmail.trim() };
       const created = await api.admin.tenants.create(body);
       onCreated(created);
-      toast.success(`租户「${created.name ?? name.trim()}」已创建`);
+      toast.success(`Tenant "${created.name ?? name.trim()}" created`);
       setName('');
       setAdminEmail('');
       setTier('FREE');
       setOpen(false);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '创建失败');
+      setError(err instanceof ApiError ? err.message : 'Create failed');
     } finally {
       setLoading(false);
     }
@@ -60,16 +60,16 @@ function CreateTenantForm({ onCreated }: { onCreated: (t: Tenant) => void }) {
         onClick={() => setOpen(true)}
         className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 transition-opacity"
       >
-        + 新建租户
+        + New tenant
       </button>
       {open && (
-        <Dialog title="新建租户" onClose={close} dismissable={!loading} className="w-full max-w-md">
+        <Dialog title="New tenant" onClose={close} dismissable={!loading} className="w-full max-w-md">
           <form onSubmit={handleSubmit} className="flex flex-col gap-3">
             {error && (
               <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>
             )}
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">租户名称</label>
+              <label className="text-[11px] text-dim font-mono">Tenant name</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
                 value={name}
@@ -79,7 +79,7 @@ function CreateTenantForm({ onCreated }: { onCreated: (t: Tenant) => void }) {
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">套餐</label>
+              <label className="text-[11px] text-dim font-mono">Plan</label>
               <CustomSelect
                 options={TIERS.map((t) => ({ value: t, label: t }))}
                 value={tier}
@@ -87,7 +87,7 @@ function CreateTenantForm({ onCreated }: { onCreated: (t: Tenant) => void }) {
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">管理员邮箱</label>
+              <label className="text-[11px] text-dim font-mono">Admin email</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
                 type="email"
@@ -104,14 +104,14 @@ function CreateTenantForm({ onCreated }: { onCreated: (t: Tenant) => void }) {
                 disabled={loading}
                 className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
               >
-                取消
+                Cancel
               </button>
               <button
                 type="submit"
                 disabled={loading}
                 className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
               >
-                {loading ? '创建中…' : '创建'}
+                {loading ? 'Creating…' : 'Create'}
               </button>
             </div>
           </form>
@@ -142,7 +142,7 @@ function EditTenantRow({ tenant, onPatched }: { tenant: Tenant; onPatched: (t: T
       onPatched(updated);
       setEditing(false);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '更新失败');
+      setError(err instanceof ApiError ? err.message : 'Update failed');
     } finally {
       setLoading(false);
     }
@@ -163,7 +163,7 @@ function EditTenantRow({ tenant, onPatched }: { tenant: Tenant; onPatched: (t: T
             onClick={() => setEditing(true)}
             className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-dim hover:text-ink transition-opacity"
           >
-            编辑
+            Edit
           </button>
         </td>
       </tr>
@@ -198,13 +198,13 @@ function EditTenantRow({ tenant, onPatched }: { tenant: Tenant; onPatched: (t: T
           disabled={loading}
           className="text-[11px] font-mono text-ok hover:opacity-80 disabled:opacity-50"
         >
-          {loading ? '…' : '保存'}
+          {loading ? '…' : 'Save'}
         </button>
         <button
           onClick={() => { setEditing(false); setTier(tenant.tier); setStatus(tenant.status); }}
           className="text-[11px] font-mono text-dim hover:text-ink"
         >
-          取消
+          Cancel
         </button>
       </td>
     </tr>
@@ -224,7 +224,7 @@ export function TenantsPage() {
     api.admin.tenants
       .list()
       .then((data) => { if (!cancelled) setTenants(data.items); })
-      .catch((err) => { if (!cancelled) setTenantsError(err instanceof ApiError ? err.message : '加载失败'); })
+      .catch((err) => { if (!cancelled) setTenantsError(err instanceof ApiError ? err.message : 'Failed to load'); })
       .finally(() => { if (!cancelled) setTenantsLoading(false); });
     return () => { cancelled = true; };
   }, [setTenants, setTenantsLoading, setTenantsError]);
@@ -234,8 +234,8 @@ export function TenantsPage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">租户管理</h1>
-          <p className="text-[12px] text-dim mt-0.5">管理平台上的所有租户</p>
+          <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Tenants</h1>
+          <p className="text-[12px] text-dim mt-0.5">Manage all tenants on the platform</p>
         </div>
         <CreateTenantForm onCreated={upsertTenant} />
       </div>
@@ -247,19 +247,19 @@ export function TenantsPage() {
       )}
 
       {tenantsLoading ? (
-        <div className="font-mono text-[12px] text-dim">加载中…</div>
+        <div className="font-mono text-[12px] text-dim">Loading…</div>
       ) : tenants.length === 0 ? (
-        <div className="font-mono text-[12px] text-dim italic">暂无租户</div>
+        <div className="font-mono text-[12px] text-dim italic">No tenants</div>
       ) : (
         <div className="border border-line rounded-md overflow-hidden">
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
               <tr>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">ID</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">名称</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">套餐</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">创建时间</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Name</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Plan</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Created</th>
                 <th className="px-3 py-2 w-16"></th>
               </tr>
             </thead>

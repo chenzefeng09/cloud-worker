@@ -9,11 +9,11 @@ import { Dropdown } from '../shell/Dropdown';
 // ─── Constants ──────────────────────────────────────────────────────────────
 
 const TYPE_OPTIONS: { id: InputFieldType; label: string }[] = [
-  { id: 'text', label: '单行文本' },
-  { id: 'textarea', label: '多行文本' },
-  { id: 'select', label: '单选' },
-  { id: 'multiselect', label: '多选' },
-  { id: 'file', label: '文件上传' },
+  { id: 'text', label: 'Single-line text' },
+  { id: 'textarea', label: 'Multi-line text' },
+  { id: 'select', label: 'Single select' },
+  { id: 'multiselect', label: 'Multi-select' },
+  { id: 'file', label: 'File upload' },
 ];
 
 /**
@@ -31,7 +31,7 @@ const DEFAULT_MAX_SIZE = 10 * 1024 * 1024; // 10 MiB
 const FILE_CATEGORIES: { id: string; label: string; mimes: string[] }[] = [
   {
     id: 'doc',
-    label: '文档',
+    label: 'Documents',
     mimes: [
       'application/pdf',
       'application/msword',
@@ -47,22 +47,22 @@ const FILE_CATEGORIES: { id: string; label: string; mimes: string[] }[] = [
   },
   {
     id: 'image',
-    label: '图片',
+    label: 'Images',
     mimes: ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/svg+xml'],
   },
   {
     id: 'audio',
-    label: '音频',
+    label: 'Audio',
     mimes: ['audio/mpeg', 'audio/wav', 'audio/ogg', 'audio/webm'],
   },
   {
     id: 'video',
-    label: '视频',
+    label: 'Video',
     mimes: ['video/mp4', 'video/webm', 'video/ogg'],
   },
   {
     id: 'archive',
-    label: '压缩包',
+    label: 'Archives',
     mimes: [
       'application/zip',
       'application/gzip',
@@ -73,7 +73,7 @@ const FILE_CATEGORIES: { id: string; label: string; mimes: string[] }[] = [
   },
   {
     id: 'code',
-    label: '代码',
+    label: 'Code',
     mimes: [
       'text/html',
       'text/css',
@@ -133,38 +133,38 @@ export function validateSchema(fields: InputField[]): {
   const seen = new Map<string, number>();
   fields.forEach((f, i) => {
     if (!f.key.trim()) {
-      errors[i] = { path: 'key', msg: '字段标识不能为空' };
+      errors[i] = { path: 'key', msg: 'Field key is required' };
     } else if (!KEY_RE.test(f.key)) {
-      errors[i] = { path: 'key', msg: '标识须以字母开头，仅含字母、数字、下划线、中划线（≤40 字符）' };
+      errors[i] = { path: 'key', msg: 'Key must start with a letter and contain only letters, digits, underscores, or hyphens (≤40 characters)' };
     } else if (seen.has(f.key)) {
-      errors[i] = { path: 'key', msg: `标识 "${f.key}" 重复` };
+      errors[i] = { path: 'key', msg: `Duplicate key "${f.key}"` };
     } else {
       seen.set(f.key, i);
     }
     if (errors[i]) return;
     if (!f.label.trim()) {
-      errors[i] = { path: 'label', msg: '显示名称不能为空' };
+      errors[i] = { path: 'label', msg: 'Display name is required' };
       return;
     }
     if (f.type === 'select' || f.type === 'multiselect') {
       const opts = f.options ?? [];
       if (opts.length === 0) {
-        errors[i] = { path: 'options', msg: '单选/多选至少需要一个选项' };
+        errors[i] = { path: 'options', msg: 'Select fields need at least one option' };
         return;
       }
       if (opts.some((o) => !o.value.trim())) {
-        errors[i] = { path: 'options', msg: '选项的值不能为空' };
+        errors[i] = { path: 'options', msg: 'Option values can’t be empty' };
         return;
       }
       const allowed = new Set(opts.map((o) => o.value));
       if (f.type === 'select' && typeof f.default === 'string' && f.default && !allowed.has(f.default)) {
-        errors[i] = { path: 'default', msg: '默认值需匹配某个选项 value' };
+        errors[i] = { path: 'default', msg: 'Default value must match an option value' };
         return;
       }
       if (f.type === 'multiselect' && Array.isArray(f.default)) {
         const bad = f.default.filter((v) => !allowed.has(String(v)));
         if (bad.length > 0) {
-          errors[i] = { path: 'default', msg: '默认选项需匹配已定义的选项 value' };
+          errors[i] = { path: 'default', msg: 'Default options must match defined option values' };
           return;
         }
       }
@@ -172,7 +172,7 @@ export function validateSchema(fields: InputField[]): {
     if (f.type === 'file') {
       const accept = f.file?.accept ?? [];
       if (accept.length === 0) {
-        errors[i] = { path: 'file', msg: '请至少选择一种文件类型' };
+        errors[i] = { path: 'file', msg: 'Select at least one file type' };
         return;
       }
     }
@@ -196,9 +196,9 @@ function OptionsEditor({
 
   return (
     <div className="flex flex-col gap-1.5">
-      <span className="cw-label">选项</span>
+      <span className="cw-label">Options</span>
       {options.length === 0 && (
-        <span className="text-[11px] text-dim italic font-mono">暂无选项</span>
+        <span className="text-[11px] text-dim italic font-mono">No options yet</span>
       )}
       {options.map((o, i) => (
         <div key={i} className="flex items-center gap-1.5">
@@ -212,13 +212,13 @@ function OptionsEditor({
             className="border border-line rounded-sm px-2 py-1 text-[12px] bg-paper focus:outline-none focus:border-accent flex-1"
             value={o.label}
             onChange={(e) => update(i, { label: e.target.value })}
-            placeholder="显示文本"
+            placeholder="Display text"
           />
           <button
             type="button"
             onClick={() => remove(i)}
             className="font-mono text-dim hover:text-accent text-[13px] leading-none px-1"
-            aria-label="移除选项"
+            aria-label="Remove option"
           >
             ×
           </button>
@@ -229,7 +229,7 @@ function OptionsEditor({
         onClick={add}
         className="cw-btn cw-btn-ghost cw-btn-sm self-start"
       >
-        <span className="font-mono">＋</span> 添加选项
+        <span className="font-mono">＋</span> Add option
       </button>
     </div>
   );
@@ -253,7 +253,7 @@ function FileConstraintEditor({
   return (
     <div className="flex flex-col gap-2">
       <div className="flex flex-col gap-1">
-        <span className="cw-label">允许的文件类型</span>
+        <span className="cw-label">Allowed file types</span>
         <div className="flex flex-wrap gap-x-4 gap-y-1.5 px-1">
           {FILE_CATEGORIES.map((cat) => {
             const checked = isCategorySelected(file.accept, cat);
@@ -275,7 +275,7 @@ function FileConstraintEditor({
       </div>
       <div className="flex items-end gap-3">
         <div className="flex flex-col gap-1">
-          <span className="cw-label">最大大小 (MB)</span>
+          <span className="cw-label">Max size (MB)</span>
           <input
             type="number"
             min={0}
@@ -298,7 +298,7 @@ function FileConstraintEditor({
             checked={file.multiple}
             onChange={(e) => setFile({ multiple: e.target.checked })}
           />
-          允许多文件
+          Allow multiple files
         </label>
       </div>
     </div>
@@ -363,7 +363,7 @@ function FieldRow({
 
     // Live validation feedback
     if (cleaned && !KEY_RE.test(cleaned)) {
-      setKeyError('须以字母开头，仅含字母、数字、下划线、中划线');
+      setKeyError('Must start with a letter and contain only letters, digits, underscores, or hyphens');
     } else {
       setKeyError(null);
     }
@@ -392,7 +392,7 @@ function FieldRow({
           onClick={() => onMove(-1)}
           disabled={index === 0}
           className="font-mono text-[12px] text-dim hover:text-ink disabled:opacity-30"
-          title="上移"
+          title="Move up"
         >
           ↑
         </button>
@@ -401,7 +401,7 @@ function FieldRow({
           onClick={() => onMove(1)}
           disabled={index === total - 1}
           className="font-mono text-[12px] text-dim hover:text-ink disabled:opacity-30"
-          title="下移"
+          title="Move down"
         >
           ↓
         </button>
@@ -409,16 +409,16 @@ function FieldRow({
           type="button"
           onClick={onRemove}
           className="font-mono text-[11px] text-dim hover:text-accent ml-1"
-          title="删除字段"
+          title="Delete field"
         >
-          删除
+          Delete
         </button>
       </div>
 
       {/* key + type + label */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div className="flex flex-col gap-1">
-          <span className="cw-label">字段标识 (key)</span>
+          <span className="cw-label">Field key</span>
           <input
             className={`border rounded-sm px-2 py-1.5 text-[12px] font-mono bg-paper focus:outline-none ${
               keyError || error?.path === 'key' ? 'border-accent focus:border-accent' : 'border-line focus:border-accent'
@@ -436,25 +436,25 @@ function FieldRow({
           )}
         </div>
         <div className="flex flex-col gap-1">
-          <span className="cw-label">类型</span>
+          <span className="cw-label">Type</span>
           <Dropdown
             value={field.type}
             options={TYPE_OPTIONS}
             onChange={(id) => changeType(id as InputFieldType)}
             align="left"
-            title="字段类型"
+            title="Field type"
             fullWidth
           />
         </div>
         <div className="flex flex-col gap-1">
-          <span className="cw-label">显示名称</span>
+          <span className="cw-label">Display name</span>
           <input
             className={`border rounded-sm px-2 py-1.5 text-[12px] bg-paper focus:outline-none ${
               error?.path === 'label' ? 'border-accent focus:border-accent' : 'border-line focus:border-accent'
             }`}
             value={field.label}
             onChange={(e) => handleLabelChange(e.target.value)}
-            placeholder="合同正文"
+            placeholder="Contract text"
           />
           {error?.path === 'label' && (
             <span className="text-[10.5px] text-accent">{error.msg}</span>
@@ -464,12 +464,12 @@ function FieldRow({
 
       {/* help */}
       <div className="flex flex-col gap-1">
-        <span className="cw-label">帮助说明（可选）</span>
+        <span className="cw-label">Help text (optional)</span>
         <input
           className="border border-line rounded-sm px-2 py-1.5 text-[12px] bg-paper focus:outline-none focus:border-accent w-full"
           value={field.help ?? ''}
           onChange={(e) => onChange({ help: e.target.value })}
-          placeholder="提示用户如何填写"
+          placeholder="Tell users how to fill this in"
         />
       </div>
 
@@ -478,14 +478,14 @@ function FieldRow({
         field.type === 'textarea' ||
         field.type === 'select') && (
         <div className="flex flex-col gap-1">
-          <span className="cw-label">默认值（可选）</span>
+          <span className="cw-label">Default value (optional)</span>
           <input
             className={`border rounded-sm px-2 py-1.5 text-[12px] bg-paper focus:outline-none ${
               error?.path === 'default' ? 'border-accent focus:border-accent' : 'border-line focus:border-accent'
             }`}
             value={typeof field.default === 'string' ? field.default : ''}
             onChange={(e) => onChange({ default: e.target.value })}
-            placeholder={field.type === 'select' ? '需匹配某个选项的 value' : ''}
+            placeholder={field.type === 'select' ? 'Must match an option value' : ''}
           />
           {error?.path === 'default' && (
             <span className="text-[10.5px] text-accent">{error.msg}</span>
@@ -504,7 +504,7 @@ function FieldRow({
           )}
           {field.type === 'multiselect' && (field.options ?? []).length > 0 && (
             <div className="flex flex-col gap-1">
-              <span className="cw-label">默认选项（可选）</span>
+              <span className="cw-label">Default options (optional)</span>
               <div className="flex flex-wrap gap-1.5">
                 {(field.options ?? []).map((o) => {
                   const cur = Array.isArray(field.default) ? field.default.map(String) : [];
@@ -551,7 +551,7 @@ function FieldRow({
           checked={field.required}
           onChange={(e) => onChange({ required: e.target.checked })}
         />
-        必填
+        Required
       </label>
     </div>
   );
@@ -588,7 +588,7 @@ export function InputSchemaBuilder({ fields, onChange, errors = {} }: Props) {
     <div className="flex flex-col gap-3">
       {fields.length === 0 && (
         <div className="text-[12px] text-dim italic font-mono border border-dashed border-line rounded-md px-3 py-4 text-center">
-          尚未定义任何输入字段。用户运行该应用时将看不到表单。
+          No input fields defined yet. Users won’t see a form when they run this app.
         </div>
       )}
       {fields.map((f, i) => (
@@ -608,7 +608,7 @@ export function InputSchemaBuilder({ fields, onChange, errors = {} }: Props) {
         onClick={add}
         className="cw-btn cw-btn-ghost cw-btn-sm self-start"
       >
-        <span className="font-mono">＋</span> 添加输入字段
+        <span className="font-mono">＋</span> Add input field
       </button>
     </div>
   );

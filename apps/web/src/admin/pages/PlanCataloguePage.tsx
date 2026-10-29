@@ -5,11 +5,11 @@ import { Dialog } from '../components/Dialog';
 import { CustomSelect } from '../components/CustomSelect';
 
 const TIER_LABELS: Record<string, string> = {
-  FREE: '免费版',
-  PRO: '专业版',
-  BUSINESS: '商业版',
-  ENTERPRISE: '企业版',
-  CUSTOM: '定制',
+  FREE: 'Free',
+  PRO: 'Pro',
+  BUSINESS: 'Business',
+  ENTERPRISE: 'Enterprise',
+  CUSTOM: 'Custom',
 };
 
 const TIERS = ['FREE', 'PRO', 'BUSINESS', 'ENTERPRISE', 'CUSTOM'] as const;
@@ -72,7 +72,7 @@ function planTier(p: UpstreamPlan): string {
 
 function formatPrice(p: UpstreamPlan): string {
   if (p.price_monthly_usd !== undefined && p.price_monthly_usd !== null) {
-    return `$${p.price_monthly_usd.toLocaleString()} / 月`;
+    return `$${p.price_monthly_usd.toLocaleString('en-US')} / mo`;
   }
   if (p.price_amount !== undefined && p.price_amount !== null) {
     const amount = p.price_amount / 100;
@@ -121,33 +121,33 @@ function CreatePlanForm({ onCreated, onCancel }: { onCreated: () => void; onCanc
         quotas: quotaMap,
         price_monthly_usd: parseFloat(price) || 0,
       });
-      toast.success('套餐创建成功');
+      toast.success('Plan created');
       onCreated();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '创建失败');
+      setError(err instanceof ApiError ? err.message : 'Create failed');
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <Dialog title="新建套餐" onClose={onCancel} dismissable={!busy} className="w-full max-w-2xl">
+    <Dialog title="New plan" onClose={onCancel} dismissable={!busy} className="w-full max-w-2xl">
       <form onSubmit={handleSubmit} className="flex flex-col gap-3">
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[10px] text-dim uppercase tracking-[0.08em]">套餐名称</span>
+          <span className="font-mono text-[10px] text-dim uppercase tracking-[0.08em]">Plan name</span>
           <input
             type="text"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="如 Enterprise Plan"
+            placeholder="e.g. Enterprise Plan"
             required
             className="border border-line rounded-sm px-2 py-1.5 text-[12px] font-mono bg-paper focus:outline-none focus:border-ink-2"
           />
         </label>
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[10px] text-dim uppercase tracking-[0.08em]">等级</span>
+          <span className="font-mono text-[10px] text-dim uppercase tracking-[0.08em]">Tier</span>
           <CustomSelect
             options={TIERS.map((t) => ({ value: t, label: `${TIER_LABELS[t]} (${t})` }))}
             value={tier}
@@ -155,7 +155,7 @@ function CreatePlanForm({ onCreated, onCancel }: { onCreated: () => void; onCanc
           />
         </label>
         <label className="flex flex-col gap-1">
-          <span className="font-mono text-[10px] text-dim uppercase tracking-[0.08em]">月价 (USD)</span>
+          <span className="font-mono text-[10px] text-dim uppercase tracking-[0.08em]">Monthly price (USD)</span>
           <input
             type="number"
             value={price}
@@ -168,7 +168,7 @@ function CreatePlanForm({ onCreated, onCancel }: { onCreated: () => void; onCanc
         </label>
       </div>
       <div>
-        <div className="font-mono text-[10px] text-dim uppercase tracking-[0.08em] mb-1.5">配额维度</div>
+        <div className="font-mono text-[10px] text-dim uppercase tracking-[0.08em] mb-1.5">Quota dimensions</div>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
           {DEFAULT_QUOTA_DIMS.map((dim) => (
             <label key={dim} className="flex flex-col gap-0.5">
@@ -192,14 +192,14 @@ function CreatePlanForm({ onCreated, onCancel }: { onCreated: () => void; onCanc
           disabled={busy}
           className="px-3 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
         >
-          取消
+          Cancel
         </button>
         <button
           type="submit"
           disabled={busy || !name.trim()}
           className="px-3 py-1.5 text-[11px] font-mono bg-ink text-surface rounded-sm hover:opacity-90 disabled:opacity-50"
         >
-          {busy ? '创建中…' : '创建套餐'}
+          {busy ? 'Creating…' : 'Create plan'}
         </button>
       </div>
       </form>
@@ -238,20 +238,20 @@ export function PlanCataloguePage() {
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">套餐目录</h1>
-        <p className="text-[12px] text-dim mt-0.5">管理平台可用的计费套餐</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Plan catalogue</h1>
+        <p className="text-[12px] text-dim mt-0.5">Manage the billing plans available on the platform</p>
       </div>
 
       <div className="flex items-center justify-between">
         <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-          共 {plans.length} 个套餐
+          {plans.length} {plans.length === 1 ? 'plan' : 'plans'}
         </div>
         {!todo && (
           <button
             onClick={() => setShowCreate(true)}
             className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2"
           >
-            + 新建套餐
+            + New plan
           </button>
         )}
       </div>
@@ -260,14 +260,14 @@ export function PlanCataloguePage() {
         <CreatePlanForm onCreated={refresh} onCancel={() => setShowCreate(false)} />
       )}
 
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
       {todo && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          该能力服务未启用（套餐目录代理端点不可达）。
+          This service isn't enabled (the plan catalogue proxy endpoint is unreachable).
         </div>
       )}
       {!loading && !todo && plans.length === 0 && (
-        <div className="font-mono text-[12px] text-dim italic">暂无可用套餐</div>
+        <div className="font-mono text-[12px] text-dim italic">No plans available</div>
       )}
       {!loading && !todo && plans.length > 0 && (
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
@@ -284,7 +284,7 @@ export function PlanCataloguePage() {
                     )}
                     {plan.active === false && (
                       <span className="inline-flex items-center font-mono text-[10px] text-dim bg-paper-2 border border-line rounded-sm px-1.5 py-0.5">
-                        已下架
+                        Retired
                       </span>
                     )}
                   </div>
@@ -296,7 +296,7 @@ export function PlanCataloguePage() {
               {plan.description && <p className="text-[11.5px] text-dim">{plan.description}</p>}
               {Object.keys(planQuotas(plan)).length > 0 && (
                 <div className="border-t border-line-2 pt-2 mt-1 flex flex-col gap-1">
-                  <div className="font-mono text-[10px] uppercase tracking-[0.08em] text-dim">配额维度</div>
+                  <div className="font-mono text-[10px] uppercase tracking-[0.08em] text-dim">Quota dimensions</div>
                   {Object.entries(planQuotas(plan)).map(([dim, amount]) => (
                     <div key={dim} className="flex items-center justify-between text-[11px]">
                       <span className="font-mono text-ink-2">{dim}</span>

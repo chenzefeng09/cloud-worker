@@ -30,9 +30,8 @@ constructively with other contributors. Report unacceptable behavior to
 | --- | --- |
 | `services/` | The Python backend services, each its own Poetry project (`bff`, `session-orchestrator`, `agent-scheduler`, `sandbox-pool`, `app-registry`, `skill-store`, `mcp-registry`, `tool-broker`, `knowledge-ingest`, `cron-runner`, `web-fetch-gateway`). |
 | `apps/web/` | The React 19 + Vite frontend (the operator/user console). |
-| `agentscope-ext/` | Standalone Python packages installed into the sandbox image (`runtime_worker`, `llm_gateway_enforcer`, `mcp_tenant_injector`, `skills_loader`, `event_audit_sink`, `web_fetch`). |
-| `worker-claude-sdk/` | An alternate TypeScript/Node sandbox worker honoring the same `task.json` → `result.json` contract. |
-| `sandbox-images/` | OCI Dockerfiles for the base/office/matlab sandbox image tiers. |
+| `worker-claude-sdk/` | The TypeScript/Node sandbox worker built on the Claude Agent SDK — the only agent runtime. Honors the `task.json` → `result.json` contract in [`contracts/worker-wire-contract.md`](./contracts/worker-wire-contract.md). |
+| `sandbox-images/` | OCI Dockerfiles for the `claude-sdk*` sandbox images (Docker dev image, Cube-native image, MATLAB layers, worker refresh). |
 | `libs/feature-flag-client/` | Shared feature-flag client used by several services. |
 | `contracts/openapi/` | OpenAPI contracts (linted in CI). |
 | `deploy/` | Docker Compose, Helm chart, KEDA operator, CubeSandbox egress policy, backup/load-test scripts. |
@@ -208,6 +207,9 @@ change to one service only runs that service's pipeline.
   checks out the Foundation repo and installs `foundation_sdk`, so CI mirrors the local
   `make bootstrap` flow.
 
+- **`ci-worker-claude-sdk.yml`** runs `npm ci`, `npm run typecheck`, `npm test` and
+  `npm run build` for `worker-claude-sdk/`.
+
 - **`ci-frontend.yml`** runs `npm run lint`, `npm run typecheck`, `npm test` (Vitest),
   and `npm run build` for `apps/web` on Node 22.
 
@@ -221,8 +223,9 @@ relevant workflow watches; otherwise its checks will not run.
 
 Significant or hard-to-reverse decisions are recorded as **Architecture Decision Records**
 in [`docs/adr/`](./docs/adr/). Existing records include the choice of sandbox runtime
-(`0001-sandbox-runtime-cube-default-kata-fallback.md`) and the agent kernel
-(`0002-agent-kernel-agentscope-over-openhands.md`).
+(`0001-sandbox-runtime-cube-default-kata-fallback.md`), the original agent kernel
+(`0002-agent-kernel-agentscope-over-openhands.md`, superseded) and the current agent
+runtime (`0003-claude-agent-sdk-sole-agent-runtime.md`).
 
 To propose an architectural change:
 

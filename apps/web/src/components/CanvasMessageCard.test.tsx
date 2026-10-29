@@ -91,7 +91,7 @@ describe('CanvasMessageCard', () => {
       />,
     );
 
-    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    const editor = screen.getByRole('textbox', { name: 'Inline canvas body' });
     await waitFor(() => expect(editor.querySelector('h1')).toHaveTextContent('一级标题'));
     expect(editor).toHaveTextContent('这是一段正文。');
   });
@@ -115,7 +115,7 @@ describe('CanvasMessageCard', () => {
     }
 
     render(<ControlledCard />);
-    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    const editor = screen.getByRole('textbox', { name: 'Inline canvas body' });
 
     fireEvent.paste(editor, {
       clipboardData: {
@@ -144,15 +144,15 @@ describe('CanvasMessageCard', () => {
       />,
     );
 
-    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    const editor = screen.getByRole('textbox', { name: 'Inline canvas body' });
     await waitFor(() => expect(editor).toHaveTextContent('这一句需要修改'));
 
     selectText(editor, '这一句需要修改');
     fireEvent.mouseUp(editor);
 
-    await user.click(await screen.findByText('要求更改'));
-    await user.type(screen.getByPlaceholderText('修改一下'), '改得更口语');
-    await user.click(screen.getByTitle('发送修改要求'));
+    await user.click(await screen.findByText('Request changes'));
+    await user.type(screen.getByPlaceholderText('Edit this'), '改得更口语');
+    await user.click(screen.getByTitle('Send edit request'));
 
     await waitFor(() => expect(onRequestEdit).toHaveBeenCalledTimes(1));
     // The revision no longer produces a chat prompt — the callback receives the
@@ -177,19 +177,19 @@ describe('CanvasMessageCard', () => {
       />,
     );
 
-    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    const editor = screen.getByRole('textbox', { name: 'Inline canvas body' });
     await waitFor(() => expect(editor).toHaveTextContent('这一句需要修改'));
 
     selectText(editor, '这一句需要修改');
     fireEvent.mouseUp(editor);
-    await user.click(await screen.findByText('要求更改'));
+    await user.click(await screen.findByText('Request changes'));
 
-    const popupInput = screen.getByPlaceholderText('修改一下');
+    const popupInput = screen.getByPlaceholderText('Edit this');
     await user.type(popupInput, '改得更有力');
 
     expect(popupInput).toHaveValue('改得更有力');
     // The footer instruction input (separate from the popup) stays empty.
-    expect(screen.getByPlaceholderText('输入修改要求…')).toHaveValue('');
+    expect(screen.getByPlaceholderText('Describe the changes you want…')).toHaveValue('');
   });
 
   it('dismisses the floating toolbar with Escape or an outside click', async () => {
@@ -205,27 +205,27 @@ describe('CanvasMessageCard', () => {
       />,
     );
 
-    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    const editor = screen.getByRole('textbox', { name: 'Inline canvas body' });
     await waitFor(() => expect(editor).toHaveTextContent('这一句需要修改'));
 
     selectText(editor, '这一句需要修改');
     fireEvent.mouseUp(editor);
-    await user.click(await screen.findByText('要求更改'));
-    const input = screen.getByPlaceholderText('修改一下');
+    await user.click(await screen.findByText('Request changes'));
+    const input = screen.getByPlaceholderText('Edit this');
 
     fireEvent.keyDown(input, { key: 'Escape' });
     await waitFor(() =>
-      expect(screen.queryByPlaceholderText('修改一下')).not.toBeInTheDocument(),
+      expect(screen.queryByPlaceholderText('Edit this')).not.toBeInTheDocument(),
     );
 
     selectText(editor, '这一句需要修改');
     fireEvent.mouseUp(editor);
-    await user.click(await screen.findByText('要求更改'));
-    expect(screen.getByPlaceholderText('修改一下')).toBeInTheDocument();
+    await user.click(await screen.findByText('Request changes'));
+    expect(screen.getByPlaceholderText('Edit this')).toBeInTheDocument();
 
     fireEvent.pointerDown(document.body);
     await waitFor(() =>
-      expect(screen.queryByPlaceholderText('修改一下')).not.toBeInTheDocument(),
+      expect(screen.queryByPlaceholderText('Edit this')).not.toBeInTheDocument(),
     );
   });
 
@@ -243,12 +243,12 @@ describe('CanvasMessageCard', () => {
       />,
     );
 
-    // Visual "修订中…" feedback appears (status role + input placeholder).
-    expect(screen.getByRole('status')).toHaveTextContent('修订中…');
-    expect(screen.getByPlaceholderText('修订中…')).toBeDisabled();
+    // Visual "Revising…" feedback appears (status role + input placeholder).
+    expect(screen.getByRole('status')).toHaveTextContent('Revising…');
+    expect(screen.getByPlaceholderText('Revising…')).toBeDisabled();
 
     // The whole-document request button is disabled — no double submit.
-    expect(screen.getByRole('button', { name: '修改' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Revise' })).toBeDisabled();
     expect(onRequestEdit).not.toHaveBeenCalled();
   });
 
@@ -269,7 +269,7 @@ describe('CanvasMessageCard', () => {
     );
 
     expect(screen.getByRole('alert')).toHaveTextContent('模型暂时不可用，请稍后重试。');
-    await user.click(screen.getByRole('button', { name: '关闭错误提示' }));
+    await user.click(screen.getByRole('button', { name: 'Dismiss error' }));
     expect(onDismissEditError).toHaveBeenCalledTimes(1);
   });
 
@@ -308,14 +308,14 @@ describe('CanvasMessageCard', () => {
       />,
     );
 
-    expect(screen.getByLabelText('选区修改建议')).toHaveTextContent('改得更口语');
+    expect(screen.getByLabelText('Suggested edit (selection)')).toHaveTextContent('改得更口语');
     expect(screen.getByText('第一段文字。')).toBeInTheDocument();
     expect(screen.getByText(/保持其他内容不变/)).toBeInTheDocument();
     expect(screen.getByText('这一句需要修改')).toHaveClass('canvas-inline-suggestion-old');
     expect(screen.getByText('这句话可以说得更自然一点')).toBeInTheDocument();
 
-    await user.click(screen.getByRole('button', { name: '接受' }));
-    await user.click(screen.getByRole('button', { name: '撤销' }));
+    await user.click(screen.getByRole('button', { name: 'Accept' }));
+    await user.click(screen.getByRole('button', { name: 'Discard' }));
 
     expect(onAcceptSuggestion).toHaveBeenCalledTimes(1);
     expect(onRejectSuggestion).toHaveBeenCalledTimes(1);
@@ -359,9 +359,9 @@ describe('CanvasMessageCard', () => {
     );
 
     // Whole-document card form, not the inline selection diff.
-    expect(screen.getByLabelText('整篇修改建议')).toHaveTextContent('把结尾改得更有力');
-    // The inline selection diff card ("选区修改建议") must NOT render.
-    expect(screen.queryByLabelText('选区修改建议')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Suggested edit (whole document)')).toHaveTextContent('把结尾改得更有力');
+    // The inline selection diff card ("Suggested edit (selection)") must NOT render.
+    expect(screen.queryByLabelText('Suggested edit (selection)')).not.toBeInTheDocument();
     // The whole-document replacement is previewed as-is (no duplicated body).
     expect(screen.getByText('结尾改写成了一句更有力的收束。')).toBeInTheDocument();
 
@@ -371,7 +371,7 @@ describe('CanvasMessageCard', () => {
     // No duplication of the surrounding body.
     expect(applied.content.match(/第一段文字。/g)).toHaveLength(1);
 
-    await user.click(screen.getByRole('button', { name: '接受' }));
+    await user.click(screen.getByRole('button', { name: 'Accept' }));
     expect(onAcceptSuggestion).toHaveBeenCalledTimes(1);
   });
 
@@ -418,13 +418,13 @@ describe('CanvasMessageCard', () => {
 
     render(<ControlledCard />);
 
-    await user.click(screen.getByRole('button', { name: '接受' }));
-    await waitFor(() => expect(screen.getByRole('textbox', { name: '页内画布正文' })).toHaveTextContent('这句话可以说得更自然一点'));
+    await user.click(screen.getByRole('button', { name: 'Accept' }));
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Inline canvas body' })).toHaveTextContent('这句话可以说得更自然一点'));
     expect(screen.queryByText('这一句需要修改')).not.toBeInTheDocument();
 
-    await user.click(screen.getByTitle('撤销'));
+    await user.click(screen.getByTitle('Undo'));
 
-    await waitFor(() => expect(screen.getByRole('textbox', { name: '页内画布正文' })).toHaveTextContent('这一句需要修改'));
+    await waitFor(() => expect(screen.getByRole('textbox', { name: 'Inline canvas body' })).toHaveTextContent('这一句需要修改'));
     expect(screen.queryByText('这句话可以说得更自然一点')).not.toBeInTheDocument();
   });
 
@@ -446,7 +446,7 @@ describe('CanvasMessageCard', () => {
     render(<CanvasMessageCard sessionId="ses_test" canvasId="cvs_1" />);
 
     expect(screen.getByDisplayValue('测试')).toBeInTheDocument();
-    const editor = screen.getByRole('textbox', { name: '页内画布正文' });
+    const editor = screen.getByRole('textbox', { name: 'Inline canvas body' });
     await waitFor(() => expect(editor.querySelector('h1')).toHaveTextContent('标题'));
     expect(editor).toHaveTextContent('正文内容');
   });

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Literal
+from typing import Any
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
@@ -23,22 +23,15 @@ class _ChatBodyEnvelope(BaseModel):
     """Validates the strictly-typed optional fields of a chat request body.
 
     The chat endpoint reads the rest of its body as a loose dict (message,
-    attachment_ids, skills, model, reasoning_effort), but a couple of fields must
+    attachment_ids, skills, model, reasoning_effort), but some fields must
     be strictly validated so an illegal value is a 422 rather than a silent
     fallthrough:
 
-    * ``execution_mode``     — must be one of ``inline`` / ``sandbox`` (defaults
-                               to ``sandbox`` when omitted so existing clients
-                               keep the current agent-mode behaviour with zero
-                               change).  ``inline`` = chat mode (orchestrator
-                               answers in-process via the LLM gateway, no sandbox);
-                               ``sandbox`` = agent mode (existing sandboxed run).
     * ``workspace_file_ids`` — optional list of workspace-file ids (``wsf_…``) the
                                user @-referenced in this message.  A non-list value
                                or a non-string element is a 422; omitted → ``None``.
     """
 
-    execution_mode: Literal["inline", "sandbox"] = "sandbox"
     workspace_file_ids: list[str] | None = None
 
 
@@ -50,7 +43,6 @@ def _validate_chat_body(body: dict) -> _ChatBodyEnvelope:
     """
     try:
         return _ChatBodyEnvelope(
-            execution_mode=body.get("execution_mode", "sandbox"),
             workspace_file_ids=body.get("workspace_file_ids"),
         )
     except ValidationError as exc:
@@ -127,9 +119,6 @@ async def chat(
                                only those servers.
     * ``model``              — optional model name
     * ``reasoning_effort``   — optional reasoning effort string
-    * ``execution_mode``     — optional ``"inline"`` | ``"sandbox"`` (default
-                               ``"sandbox"``); ``inline`` = chat mode (no sandbox),
-                               ``sandbox`` = agent mode.  An illegal value → 422.
 
     Returns JSON ``{"run_id": "...", "message_id": "...", "run": {...}}``.
     On upstream failure returns a JSON error with the upstream status code.
@@ -146,11 +135,9 @@ async def chat(
     mcp_server_ids: list[str] = body.get("mcp_server_ids") or []
     model: str | None = body.get("model") or None
     reasoning_effort: str | None = body.get("reasoning_effort") or None
-    # Strictly validated: execution_mode (inline/sandbox; defaults to sandbox for
-    # existing clients so agent mode stays the zero-change default) and
-    # workspace_file_ids (optional list of strings; illegal types → pydantic 422).
+    # Strictly validated: workspace_file_ids (optional list of strings; illegal
+    # types → pydantic 422).  Every run executes in a Claude SDK worker sandbox.
     envelope = _validate_chat_body(body)
-    execution_mode = envelope.execution_mode
     workspace_file_ids = envelope.workspace_file_ids
 
     async with httpx.AsyncClient(timeout=30) as client:
@@ -200,7 +187,6 @@ async def chat(
             "files": files,
             "model": model,
             "reasoning_effort": reasoning_effort,
-            "execution_mode": execution_mode,
         }
         # Forward @-referenced workspace file ids verbatim (only when the client
         # sent the field) so the orchestrator can prioritise those files.

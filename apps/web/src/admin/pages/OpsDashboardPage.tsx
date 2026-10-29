@@ -17,12 +17,12 @@ import type {
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const STATUS_OPTIONS = [
-  { value: '', label: '全部状态' },
-  { value: 'PENDING', label: '待处理' },
-  { value: 'RUNNING', label: '运行中' },
-  { value: 'COMPLETED', label: '已完成' },
-  { value: 'FAILED', label: '失败' },
-  { value: 'CANCELLED', label: '已取消' },
+  { value: '', label: 'All statuses' },
+  { value: 'PENDING', label: 'Pending' },
+  { value: 'RUNNING', label: 'Running' },
+  { value: 'COMPLETED', label: 'Completed' },
+  { value: 'FAILED', label: 'Failed' },
+  { value: 'CANCELLED', label: 'Cancelled' },
 ];
 
 const STATUS_COLORS: Record<string, string> = {
@@ -34,11 +34,11 @@ const STATUS_COLORS: Record<string, string> = {
 };
 
 const STATUS_LABELS: Record<string, string> = {
-  PENDING: '待处理',
-  RUNNING: '运行中',
-  COMPLETED: '已完成',
-  FAILED: '失败',
-  CANCELLED: '已取消',
+  PENDING: 'Pending',
+  RUNNING: 'Running',
+  COMPLETED: 'Completed',
+  FAILED: 'Failed',
+  CANCELLED: 'Cancelled',
 };
 
 const TENANT_PALETTE = [
@@ -69,7 +69,7 @@ function PieChart({ data, size = 200 }: { data: PieSlice[]; size?: number }) {
   if (total === 0) {
     return (
       <div className="flex items-center justify-center h-[160px]">
-        <span className="font-mono text-[12px] text-dim italic">暂无数据</span>
+        <span className="font-mono text-[12px] text-dim italic">No data</span>
       </div>
     );
   }
@@ -201,7 +201,7 @@ function Pagination({
   return (
     <div className="flex items-center justify-between px-3 py-2 border-t border-line">
       <span className="font-mono text-[11px] text-dim">
-        显示 {from}–{to} / 共 {total} 条
+        Showing {from}–{to} of {total}
       </span>
       <div className="flex gap-2">
         <button
@@ -209,14 +209,14 @@ function Pagination({
           onClick={() => onChange(page - 1)}
           className="font-mono text-[11px] text-dim hover:text-ink disabled:opacity-30 disabled:cursor-not-allowed"
         >
-          ← 上一页
+          ← Previous
         </button>
         <button
           disabled={page >= pages - 1}
           onClick={() => onChange(page + 1)}
           className="font-mono text-[11px] text-dim hover:text-ink disabled:opacity-30 disabled:cursor-not-allowed"
         >
-          下一页 →
+          Next →
         </button>
       </div>
     </div>
@@ -240,14 +240,14 @@ function UsageChartBlock({
 
   return (
     <section className="border border-line rounded-md bg-surface p-4 flex flex-col gap-3">
-      <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-dim">Token 用量趋势（近 14 天）</div>
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+      <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-dim">Token usage (last 14 days)</div>
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
       {isTodoEndpoint && (
-        <div className="text-[12px] text-dim italic">该能力暂未启用：用量统计端点尚未就绪。</div>
+        <div className="text-[12px] text-dim italic">Not available yet: the usage stats endpoint isn’t ready.</div>
       )}
       {days && days.length === 0 && !isTodoEndpoint && (
-        <div className="font-mono text-[12px] text-dim italic">暂无用量数据</div>
+        <div className="font-mono text-[12px] text-dim italic">No usage data</div>
       )}
       {days && days.length > 0 && (
         <div className="flex items-end gap-1.5 h-40 pt-2">
@@ -335,7 +335,7 @@ export function OpsDashboardPage() {
   }, []);
 
   const tenantOptions = useMemo(() => [
-    { value: '', label: '全部租户' },
+    { value: '', label: 'All tenants' },
     ...tenants.map((t) => ({ value: t.id, label: t.name || t.id })),
   ], [tenants]);
 
@@ -362,7 +362,7 @@ export function OpsDashboardPage() {
       .catch((err) => {
         if (cancelled) return;
         if (isTodoError(err)) setUsageTodo(true);
-        else setUsageError(err instanceof ApiError ? err.message : '加载失败');
+        else setUsageError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => { if (!cancelled) setUsageLoading(false); });
     return () => { cancelled = true; };
@@ -389,7 +389,7 @@ export function OpsDashboardPage() {
       .catch((err) => {
         if (cancelled) return;
         if (isTodoError(err)) setSandboxTodo(true);
-        else setSandboxError(err instanceof ApiError ? err.message : '加载失败');
+        else setSandboxError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => { if (!cancelled) setSandboxLoading(false); });
     return () => { cancelled = true; };
@@ -425,12 +425,12 @@ export function OpsDashboardPage() {
   const stopSandbox = useCallback(async (s: SandboxInfo) => {
     const id = sandboxKey(s);
     if (!id) return;
-    if (!(await confirm({ title: '停止沙箱', message: `确认停止沙箱「${s.name ?? id}」？`, tone: 'danger', confirmText: '停止' }))) return;
+    if (!(await confirm({ title: 'Stop sandbox', message: `Stop sandbox “${s.name ?? id}”?`, tone: 'danger', confirmText: 'Stop' }))) return;
     try {
       await api.admin.ops.stopSandbox(id);
       handleSandboxStopped(id);
     } catch (err) {
-      setStopError(err instanceof ApiError ? err.message : '停止失败');
+      setStopError(err instanceof ApiError ? err.message : 'Failed to stop');
     }
   }, [confirm, handleSandboxStopped]);
 
@@ -454,7 +454,7 @@ export function OpsDashboardPage() {
       .catch((err) => {
         if (cancelled) return;
         if (isTodoError(err)) setRunsTodo(true);
-        else setRunsError(err instanceof ApiError ? err.message : '加载失败');
+        else setRunsError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => { if (!cancelled) setRunsLoading(false); });
     return () => { cancelled = true; };
@@ -511,8 +511,8 @@ export function OpsDashboardPage() {
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">运行与沙箱</h1>
-        <p className="text-[12px] text-dim mt-0.5">Token 用量、沙箱池与运行监控</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Runs & sandboxes</h1>
+        <p className="text-[12px] text-dim mt-0.5">Token usage, sandbox pool and run monitoring</p>
       </div>
 
       {/* Filter bar — the tenant filter is platform-admin only; tenant admins
@@ -523,7 +523,7 @@ export function OpsDashboardPage() {
             options={tenantOptions}
             value={tenantId}
             onChange={setTenantId}
-            placeholder="全部租户"
+            placeholder="All tenants"
             className="w-48"
           />
         )}
@@ -531,7 +531,7 @@ export function OpsDashboardPage() {
           options={STATUS_OPTIONS}
           value={statusFilter}
           onChange={setStatusFilter}
-          placeholder="全部状态"
+          placeholder="All statuses"
           className="w-36"
         />
       </div>
@@ -545,34 +545,34 @@ export function OpsDashboardPage() {
 
       {/* Pie charts row */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <PieSection title="运行状态分布" data={runStatusPie} />
-        <PieSection title="沙箱状态分布" data={sandboxStatusPie} />
-        <PieSection title="沙箱按租户分布" data={sandboxTenantPie} />
+        <PieSection title="Runs by status" data={runStatusPie} />
+        <PieSection title="Sandboxes by status" data={sandboxStatusPie} />
+        <PieSection title="Sandboxes by tenant" data={sandboxTenantPie} />
       </div>
 
       {/* Combined sandbox pool + runs section */}
       <section className="border border-line rounded-md bg-surface p-4 flex flex-col gap-3">
-        <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-dim">沙箱池</div>
+        <div className="font-mono text-[11px] uppercase tracking-[0.1em] text-dim">Sandbox pool</div>
 
         {sandboxDisplayError && (
           <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{sandboxDisplayError}</div>
         )}
         {sandboxTodo && (
-          <div className="text-[12px] text-dim italic">该能力暂未启用：沙箱池端点尚未就绪。</div>
+          <div className="text-[12px] text-dim italic">Not available yet: the sandbox pool endpoint isn’t ready.</div>
         )}
 
         {/* Pool cards — always visible */}
         {pool && (
           <div className="flex flex-wrap gap-3">
             <div className="border border-line-2 rounded-md px-3 py-2 min-w-[100px]">
-              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">总数</div>
+              <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">Total</div>
               <div className="text-[18px] font-display text-ink">{pool.total}</div>
             </div>
             {Object.entries(pool.by_template ?? {}).map(([tpl, info]) => (
               <div key={tpl} className="border border-line-2 rounded-md px-3 py-2 min-w-[100px]">
                 <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim truncate max-w-[140px]">{tpl}</div>
                 <div className="text-[13px] font-mono text-ink-2">
-                  空闲 {info.idle} / 共 {info.total}
+                  {info.idle} idle / {info.total} total
                 </div>
               </div>
             ))}
@@ -589,7 +589,7 @@ export function OpsDashboardPage() {
             }`}
             onClick={() => setPoolTab('sandbox')}
           >
-            沙箱列表
+            Sandboxes
           </button>
           <button
             className={`pb-2 text-[13px] font-mono transition-colors border-b-2 ${
@@ -599,7 +599,7 @@ export function OpsDashboardPage() {
             }`}
             onClick={() => setPoolTab('runs')}
           >
-            运行列表
+            Runs
           </button>
         </div>
 
@@ -610,22 +610,22 @@ export function OpsDashboardPage() {
               type="text"
               value={sandboxSearch}
               onChange={(e) => setSandboxSearch(e.target.value)}
-              placeholder="搜索容器 ID 或镜像…"
+              placeholder="Search container ID or image…"
               className="w-64 border border-line rounded-sm px-2 py-1.5 text-[13px] font-mono bg-paper text-ink placeholder:text-dim focus:outline-none focus:border-accent transition-colors"
             />
-            {sandboxLoading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+            {sandboxLoading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
             {!sandboxTodo && !sandboxLoading && filteredSandboxes.length === 0 && (
-              <div className="font-mono text-[12px] text-dim italic">暂无运行中的沙箱</div>
+              <div className="font-mono text-[12px] text-dim italic">No running sandboxes</div>
             )}
             {pagedSandboxes.length > 0 && (
               <div className="border border-line rounded-md overflow-hidden">
                 <table className="w-full text-left border-collapse">
                   <thead className="bg-paper-2 border-b border-line">
                     <tr>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">容器 ID</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">镜像</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">租户</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Container ID</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Image</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Tenant</th>
                       <th className="px-3 py-2 w-20"></th>
                     </tr>
                   </thead>
@@ -647,7 +647,7 @@ export function OpsDashboardPage() {
                               onClick={() => stopSandbox(s)}
                               className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-accent hover:opacity-80 transition-opacity"
                             >
-                              停止
+                              Stop
                             </button>
                           </td>
                         </tr>
@@ -673,27 +673,27 @@ export function OpsDashboardPage() {
               type="text"
               value={runsSearch}
               onChange={(e) => setRunsSearch(e.target.value)}
-              placeholder="搜索运行 ID 或任务描述…"
+              placeholder="Search run ID or task description…"
               className="w-64 border border-line rounded-sm px-2 py-1.5 text-[13px] font-mono bg-paper text-ink placeholder:text-dim focus:outline-none focus:border-accent transition-colors"
             />
-            {runsLoading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+            {runsLoading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
             {runsError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{runsError}</div>}
             {runsTodo && (
-              <div className="text-[12px] text-dim italic">该能力暂未启用：运行列表端点不可达，接线后将自动展示。</div>
+              <div className="text-[12px] text-dim italic">Not available yet: the runs endpoint is unreachable. Runs will appear here once it’s connected.</div>
             )}
             {!runsTodo && !runsLoading && filteredRuns.length === 0 && !runsError && (
-              <div className="font-mono text-[12px] text-dim italic">暂无运行记录</div>
+              <div className="font-mono text-[12px] text-dim italic">No runs yet</div>
             )}
             {pagedRuns.length > 0 && (
               <div className="border border-line rounded-md overflow-hidden">
                 <table className="w-full text-left border-collapse">
                   <thead className="bg-paper-2 border-b border-line">
                     <tr>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">运行 ID</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">任务</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Run ID</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Task</th>
                       <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Token</th>
-                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">创建时间</th>
+                      <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Created</th>
                     </tr>
                   </thead>
                   <tbody>

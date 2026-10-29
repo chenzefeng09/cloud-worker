@@ -7,8 +7,8 @@ import { useWorkspace } from '../lib/workspaceContext';
 import { SENSITIVITY_LABELS, DEFAULT_SENSITIVITY } from '../lib/sensitivity';
 import { useSessions } from '../hooks/useSessions';
 import { api } from '../api/client';
-import type { Attachment, ExecutionMode, Session } from '../api/types';
-import { formatRelativeTimeZh } from '../lib/format';
+import type { Attachment, Session } from '../api/types';
+import { formatRelativeTime } from '../lib/format';
 import { StatusDot, sessionToDesignStatus } from '../components/shell/StatusDot';
 import { Chip } from '../components/shell/Chip';
 import { Composer } from '../components/composer/Composer';
@@ -17,18 +17,19 @@ import { useApps } from '../hooks/useApps';
 import { useInstalledSkills } from '../hooks/useInstalledSkills';
 import { useMcpServers } from '../hooks/useMcpServers';
 import { CreateAppModal } from '../components/app/CreateAppModal';
+import { GridBackdrop } from '../components/GridBackdrop';
 import { SYSTEM_FALLBACK_MODEL, DEFAULT_EFFORT } from '../lib/modelOptions';
 import { useDefaultModel } from '../hooks/useDefaultModel';
 import { useFeatureFlag } from '../hooks/useFeatureFlags';
 
 const PLACEHOLDERS = [
-  '帮我安排明天的团队站会…',
-  '把这份 PDF 概括成 5 个要点？',
-  '草拟一条回复供应商邮件的中文回信…',
-  '迁移到 passkey 的最佳路径是什么？',
+  'Plan tomorrow’s team stand-up…',
+  'Summarize this PDF in 5 bullet points?',
+  'Draft a reply to the supplier’s email…',
+  'What’s the best path to migrate to passkeys?',
 ];
 
-const SUGGESTIONS = ['帮我规划明天', '概括这份 PDF', '回复供应商邮件', 'Q3 发布命名头脑风暴'];
+const SUGGESTIONS = ['Plan my day tomorrow', 'Summarize this PDF', 'Reply to a supplier email', 'Brainstorm Q3 launch names'];
 
 /** Default glyph for an App card when the App has no icon set. */
 const DEFAULT_APP_GLYPH = '▤';
@@ -56,10 +57,6 @@ export function HomePage() {
   const { modelId: defaultModelId, isLoading: defaultModelLoading } = useDefaultModel('llm');
   const [model, setModelRaw] = useState<string>(SYSTEM_FALLBACK_MODEL);
   const [effort, setEffort] = useState<string>(DEFAULT_EFFORT);
-  // Keep new sessions aligned with ChatWindow/useChat's authoritative default:
-  // agent mode loads the tenant's enabled MCP servers, while inline mode is the
-  // deliberately lightweight direct-conversation path.
-  const [executionMode, setExecutionMode] = useState<ExecutionMode>('sandbox');
   // Track whether the user has manually picked a model in the composer.
   // If so, don't overwrite it when the hook resolves later.
   const userModelChosen = useRef(false);
@@ -76,7 +73,6 @@ export function HomePage() {
   }, [defaultModelLoading, defaultModelId]);
   const setSessionModel = useChatStore((s) => s.setSessionModel);
   const setSessionEffort = useChatStore((s) => s.setSessionEffort);
-  const setSessionExecutionMode = useChatStore((s) => s.setSessionExecutionMode);
   // Skill / MCP toggles for a task that has no session yet — they live in the
   // store's draft slot and are handed to the real session id in startChat.
   const skills = useInstalledSkills();
@@ -107,11 +103,8 @@ export function HomePage() {
     if (sessionRef.current) return sessionRef.current;
     // Started inside a workspace → tag the session with it so the backend
     // injects the workspace's instructions / base files / skills.
-    const session = await createSession('新任务', activeWorkspace?.id);
-    if (session) {
-      sessionRef.current = session;
-      setSessionExecutionMode(session.id, executionMode);
-    }
+    const session = await createSession('New task', activeWorkspace?.id);
+    if (session) sessionRef.current = session;
     return session ?? null;
   };
 
@@ -120,7 +113,7 @@ export function HomePage() {
   // Attachments are FK-bound to a session, hence ensureSession() first.
   const uploadAttachment = async (file: File): Promise<Attachment> => {
     const session = await ensureSession();
-    if (!session) throw new Error('创建任务失败，请稍后重试。');
+    if (!session) throw new Error('Couldn’t create the task. Please try again later.');
     return api.attachments.upload(session.id, file);
   };
 
@@ -130,13 +123,12 @@ export function HomePage() {
     try {
       // Reuse the session created during an earlier file upload, if any.
       const session = await ensureSession();
-      if (!session) throw new Error('创建任务失败，请稍后重试。');
+      if (!session) throw new Error('Couldn’t create the task. Please try again later.');
 
       // Persist the composer's model + effort choice onto the new session so
       // useChat picks them up at send time (same store the chat page reads).
       setSessionModel(session.id, model);
       setSessionEffort(session.id, effort);
-      setSessionExecutionMode(session.id, executionMode);
       // Hand the "+" menu's pre-session skill / MCP choices to the session
       // that was just created, and clear the draft so the next new task
       // starts from the defaults instead of inheriting this one.
@@ -154,7 +146,7 @@ export function HomePage() {
       return true;
     } catch (err) {
       const detail = err instanceof Error ? err.message : '';
-      setSubmitError(detail || '创建任务失败，请稍后重试。');
+      setSubmitError(detail || 'Couldn’t create the task. Please try again later.');
       console.warn('create session failed', err);
       return false;
     } finally {
@@ -180,25 +172,16 @@ export function HomePage() {
   return (
     <div className="flex flex-col h-full min-w-0 bg-paper">
       <PageHead
-        crumbs={[{ label: '首页' }]}
+        crumbs={[{ label: 'Home' }]}
         actions={
           <>
-            <button className="cw-btn cw-btn-ghost cw-btn-sm">⌘K 启动</button>
+            <button className="cw-btn cw-btn-ghost cw-btn-sm">⌘K Launch</button>
           </>
         }
       />
 
       <div className="relative flex-1 min-h-0 flex flex-col">
-        {/* faint grid background */}
-        <div
-          aria-hidden
-          className="absolute inset-0 pointer-events-none opacity-60"
-          style={{
-            backgroundImage:
-              'linear-gradient(#e6e3d6 1px, transparent 1px), linear-gradient(90deg, #e6e3d6 1px, transparent 1px)',
-            backgroundSize: '32px 32px',
-          }}
-        />
+        <GridBackdrop />
 
         <div className="cw-scroll flex-1 px-[5vw] pt-8 pb-8 flex flex-col items-center gap-7 relative">
           {/* greeting */}
@@ -207,9 +190,9 @@ export function HomePage() {
               {dateLabel}
             </div>
             <h1 className="m-0 font-display font-normal tracking-[-0.02em] leading-[1.15] text-[clamp(24px,3.4vw,40px)]">
-              你好。
+              Hello.
               <br />
-              <span className="text-dim">需要我做点什么？</span>
+              <span className="text-dim">What can I do for you?</span>
             </h1>
           </div>
 
@@ -251,14 +234,12 @@ export function HomePage() {
                 value: activeWorkspace?.id ?? '',
                 options: workspaces.map((w) => ({
                   id: w.id,
-                  label: `${w.name}（${SENSITIVITY_LABELS[w.sensitivity_level ?? DEFAULT_SENSITIVITY]}）`,
+                  label: `${w.name} (${SENSITIVITY_LABELS[w.sensitivity_level ?? DEFAULT_SENSITIVITY]})`,
                 })),
                 onChange: setActiveWorkspaceId,
                 disabled: workspacesLoading || workspaces.length === 0,
-                emptyLabel: workspacesLoading ? '加载工作区…' : '无工作区',
+                emptyLabel: workspacesLoading ? 'Loading workspaces…' : 'No workspaces',
               }}
-              executionMode={executionMode}
-              onExecutionModeChange={setExecutionMode}
               model={model}
               onModelChange={setModel}
               effort={effort}
@@ -274,7 +255,7 @@ export function HomePage() {
 
           {/* suggestions */}
           <div className="flex gap-2 flex-wrap justify-center max-w-[720px]">
-            <span className="cw-label self-center">试试：</span>
+            <span className="cw-label self-center">Try:</span>
             {SUGGESTIONS.map((s) => (
               <Chip key={s} dashed onClick={() => setDraft(s)}>{s}</Chip>
             ))}
@@ -284,15 +265,15 @@ export function HomePage() {
           <div className="w-[min(960px,95%)] flex items-center gap-3.5 mt-1">
             <div className="flex-1 h-px bg-line" />
             <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim">
-              或选择一个应用
+              Or pick an app
             </span>
             <button
               type="button"
               onClick={() => setShowCreateModal(true)}
               className="cw-btn cw-btn-ghost cw-btn-sm"
-              title="从零创建一个应用"
+              title="Create an app from scratch"
             >
-              <span className="font-mono">+</span> 创建应用
+              <span className="font-mono">+</span> Create app
             </button>
             <div className="flex-1 h-px bg-line" />
           </div>
@@ -308,16 +289,16 @@ export function HomePage() {
                 <div className="w-7 h-7 border border-line rounded-sm flex items-center justify-center font-mono text-[13px] text-ink bg-paper">
                   +
                 </div>
-                <div className="text-[14px] font-semibold tracking-[-0.01em]">空白任务</div>
+                <div className="text-[14px] font-semibold tracking-[-0.01em]">Blank task</div>
                 <div className="flex-1" />
                 <span className="font-mono text-[10.5px] text-dim">→</span>
               </div>
               <div className="text-[12px] text-dim leading-[1.45]">
-                从零开始 — 用日常语言描述目标。
+                Start from scratch — describe your goal in plain language.
               </div>
               <div className="flex-1" />
               <div className="flex gap-1 flex-wrap">
-                <Chip>自由会话</Chip>
+                <Chip>Free-form</Chip>
               </div>
             </div>
 
@@ -337,18 +318,18 @@ export function HomePage() {
                   <span className="font-mono text-[10.5px] text-dim">→</span>
                 </div>
                 <div className="text-[12px] text-dim leading-[1.45]">
-                  {app.description || '运行此应用'}
+                  {app.description || 'Run this app'}
                 </div>
                 <div className="flex-1" />
                 <div className="flex gap-1 flex-wrap">
-                  <Chip>应用</Chip>
+                  <Chip>App</Chip>
                 </div>
               </div>
             ))}
 
             {!appsLoading && apps.length === 0 && (
               <div className="border border-line border-dashed bg-surface rounded-md p-3.5 flex flex-col gap-2 items-start justify-center min-h-[120px]">
-                <div className="font-mono italic text-dim text-[12px]">暂无已发布应用</div>
+                <div className="font-mono italic text-dim text-[12px]">No published apps yet</div>
               </div>
             )}
           </div>
@@ -359,7 +340,7 @@ export function HomePage() {
               onClick={() => navigate('/apps?tab=published')}
               className="font-mono text-[11px] text-dim hover:text-ink transition-colors"
             >
-              进入应用中心 →
+              Open App Center →
             </button>
           </div>
 
@@ -367,7 +348,7 @@ export function HomePage() {
           <div className="w-[min(960px,95%)] flex items-center gap-3.5 mt-1">
             <div className="flex-1 h-px bg-line" />
             <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim">
-              我的应用
+              My apps
             </span>
             <div className="flex-1 h-px bg-line" />
           </div>
@@ -379,11 +360,11 @@ export function HomePage() {
                 ? app.versions[app.versions.length - 1]
                 : null;
               const statusLabel =
-                latestVersion?.status === 'draft' ? '草稿'
-                : latestVersion?.status === 'pending_review' ? '待审核'
-                : latestVersion?.status === 'published' ? '已发布'
-                : latestVersion?.status === 'rejected' ? '已拒绝'
-                : '草稿';
+                latestVersion?.status === 'draft' ? 'Draft'
+                : latestVersion?.status === 'pending_review' ? 'In review'
+                : latestVersion?.status === 'published' ? 'Published'
+                : latestVersion?.status === 'rejected' ? 'Rejected'
+                : 'Draft';
               return (
                 <div
                   key={app.id}
@@ -399,7 +380,7 @@ export function HomePage() {
                     <span className="font-mono text-[10.5px] text-dim">→</span>
                   </div>
                   <div className="text-[12px] text-dim leading-[1.45]">
-                    {app.description || '点击编辑此应用'}
+                    {app.description || 'Click to edit this app'}
                   </div>
                   <div className="flex-1" />
                   <div className="flex gap-1 flex-wrap">
@@ -411,13 +392,13 @@ export function HomePage() {
 
             {!myAppsLoading && myApps.length === 0 && (
               <div className="border border-line border-dashed bg-surface rounded-md p-3.5 flex flex-col gap-2 items-start justify-center min-h-[120px]">
-                <div className="font-mono italic text-dim text-[12px]">你还没有创建应用</div>
+                <div className="font-mono italic text-dim text-[12px]">You haven’t created any apps yet</div>
                 <button
                   type="button"
                   onClick={() => setShowCreateModal(true)}
                   className="cw-btn cw-btn-ghost cw-btn-sm"
                 >
-                  <span className="font-mono">+</span> 创建应用
+                  <span className="font-mono">+</span> Create app
                 </button>
               </div>
             )}
@@ -429,7 +410,7 @@ export function HomePage() {
               onClick={() => navigate('/apps')}
               className="font-mono text-[11px] text-dim hover:text-ink transition-colors"
             >
-              查看全部 →
+              View all →
             </button>
           </div>
         </div>
@@ -438,7 +419,7 @@ export function HomePage() {
         <div className="border-t border-line bg-paper px-6 py-3 shrink-0 relative">
           <div className="flex items-baseline justify-between mb-2.5">
             <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim">
-              最近 · 进行中
+              Recent · In progress
             </span>
           </div>
           <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-2.5">
@@ -452,16 +433,16 @@ export function HomePage() {
                   <StatusDot status={sessionToDesignStatus(s.status)} />
                   <div className="flex-1" />
                   <span className="font-mono text-[10.5px] text-dim">
-                    {formatRelativeTimeZh(s.updated_at)}
+                    {formatRelativeTime(s.updated_at)}
                   </span>
                 </div>
                 <div className="text-[13px] font-medium tracking-[-0.01em] leading-[1.3] truncate">
-                  {s.title || '未命名任务'}
+                  {s.title || 'Untitled task'}
                 </div>
               </div>
             ))}
             {sessions.length === 0 && (
-              <div className="font-mono italic text-dim text-[11px] px-2">暂无任务</div>
+              <div className="font-mono italic text-dim text-[11px] px-2">No tasks yet</div>
             )}
           </div>
         </div>

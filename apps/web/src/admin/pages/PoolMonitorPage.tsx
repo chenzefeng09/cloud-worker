@@ -15,8 +15,8 @@ const TIER_SIZE_GB: Record<string, number> = {
 };
 
 const TIER_LABELS: Record<string, string> = {
-  small: '小档 (small)',
-  large: '大档 (large)',
+  small: 'Small (small)',
+  large: 'Large (large)',
 };
 
 const REFRESH_INTERVAL_MS = 10_000;
@@ -50,7 +50,7 @@ export function PoolMonitorPage() {
       })
       .catch((err) => {
         if (isTodo(err)) setTodo(true);
-        else setError(err instanceof ApiError ? err.message : '加载失败');
+        else setError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => setLoading(false));
   }, []);
@@ -93,8 +93,8 @@ export function PoolMonitorPage() {
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">温池监控</h1>
-          <p className="text-[12px] text-dim mt-0.5">分档温沙箱池占用情况（只读，平台级，不区分租户）。</p>
+          <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Warm pool monitor</h1>
+          <p className="text-[12px] text-dim mt-0.5">Warm sandbox pool occupancy by tier (read-only, platform-wide, not per tenant).</p>
         </div>
         <div className="flex items-center gap-3 shrink-0">
           <label className="flex items-center gap-1.5 text-[11px] font-mono text-dim cursor-pointer select-none">
@@ -104,14 +104,14 @@ export function PoolMonitorPage() {
               onChange={(e) => setAutoRefresh(e.target.checked)}
               className="accent-ink"
             />
-            自动刷新 (10s)
+            Auto-refresh (10s)
           </label>
           <button
             onClick={load}
             disabled={loading}
             className="px-3 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2 disabled:opacity-50"
           >
-            {loading ? '刷新中…' : '刷新'}
+            {loading ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>
       </div>
@@ -124,7 +124,7 @@ export function PoolMonitorPage() {
 
       {todo && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          该能力服务未启用（沙箱池代理端点不可达）。
+          This service isn't enabled (the sandbox pool proxy endpoint is unreachable).
         </div>
       )}
 
@@ -132,18 +132,18 @@ export function PoolMonitorPage() {
       <div className="border border-line rounded-md px-4 py-3 bg-paper-2 text-[12px] text-ink-2 flex gap-2">
         <span className="font-mono text-dim shrink-0">ⓘ</span>
         <span>
-          常驻预留内存仅在 <span className="font-mono">Cube</span> 运行时有意义——温池会按档位预热并常驻容器；
-          在 <span className="font-mono">Docker</span> 运行时为按需创建，下表常驻内存仅作容量参考。
+          Resident reserved memory is only meaningful on the <span className="font-mono">Cube</span> runtime — the warm pool pre-warms and keeps containers resident per tier;
+          on the <span className="font-mono">Docker</span> runtime sandboxes are created on demand, so the resident memory below is a capacity reference only.
         </span>
       </div>
 
       {!todo && (
         <section className="flex flex-col gap-2">
           <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim flex items-center justify-between">
-            <span>分档占用</span>
+            <span>Occupancy by tier</span>
             {lastRefreshed && (
               <span className="normal-case tracking-normal text-dim">
-                最后刷新 {formatTimeAuto(lastRefreshed)}
+                Last refreshed {formatTimeAuto(lastRefreshed)}
               </span>
             )}
           </div>
@@ -151,11 +151,11 @@ export function PoolMonitorPage() {
             <table className="w-full text-left border-collapse">
               <thead className="border-b border-line-2 bg-paper-2">
                 <tr>
-                  <th className="px-3 py-2 font-mono text-[10.5px] text-dim">档位</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] text-dim text-right">空闲</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] text-dim text-right">总数</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] text-dim text-right">单沙箱内存</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] text-dim text-right">常驻预留内存</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] text-dim">Tier</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] text-dim text-right">Idle</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] text-dim text-right">Total</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] text-dim text-right">Memory per sandbox</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] text-dim text-right">Resident reserved memory</th>
                 </tr>
               </thead>
               <tbody>
@@ -172,7 +172,7 @@ export function PoolMonitorPage() {
                 ) : (
                   <tr>
                     <td colSpan={5} className="px-3 py-4 font-mono text-[12px] text-dim italic">
-                      {loading ? '加载中…' : '暂无分档数据'}
+                      {loading ? 'Loading…' : 'No tier data'}
                     </td>
                   </tr>
                 )}
@@ -180,7 +180,7 @@ export function PoolMonitorPage() {
               {rows.length > 0 && (
                 <tfoot className="border-t border-line bg-paper-2">
                   <tr>
-                    <td className="px-3 py-2 font-mono text-[11px] text-dim uppercase tracking-[0.08em]">合计</td>
+                    <td className="px-3 py-2 font-mono text-[11px] text-dim uppercase tracking-[0.08em]">Total</td>
                     <td className="px-3 py-2 font-mono text-[12px] text-ink-2 text-right">{totalIdle}</td>
                     <td className="px-3 py-2 font-mono text-[12px] text-ink text-right">{totalTotal}</td>
                     <td className="px-3 py-2 font-mono text-[12px] text-dim text-right">—</td>

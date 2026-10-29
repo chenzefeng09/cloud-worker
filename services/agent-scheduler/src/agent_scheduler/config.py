@@ -14,7 +14,7 @@ Notes on the foundation surface
   requiring a separately-minted ``foundation_token`` argument.
 
 * :data:`SANDBOX_TOKEN_SCOPES` — the scopes embedded in tokens we mint for
-  the AgentScope worker running inside each sandbox.  Deliberately a
+  the Claude SDK worker running inside each sandbox.  Deliberately a
   **module constant, not config**: changing the scope set is a
   security-relevant decision that should go through code review, not
   env-var twiddling at deploy time.
@@ -46,32 +46,27 @@ def _lease_secret_is_weak(secret: str) -> bool:
         or len(value) < 32
     )
 
-# Smallest scope set that lets the in-sandbox AgentScope worker do useful
+# Smallest scope set that lets the in-sandbox Claude SDK worker do useful
 # work.  Expanding this list is a code change, on purpose.
 #
 # Security fix B7 (least privilege) — ``notification.send`` was removed: it was
 # a dead capability in the sandbox token.  Nothing in the sandbox/worker path
-# consumes it (no ``notification``/``notify`` caller in agentscope_ext), there
+# consumes it (no ``notification``/``notify`` caller in the worker), there
 # is no tool-broker route that proxies to a notification service, and it is not
 # in ``egress_policy.BROKER_LEASE_SCOPES``.  Carrying it only widened the
 # token's blast radius if leaked, for zero functional benefit.
 #
-# ``audit.write`` is deliberately KEPT: the ``event_audit_sink`` worker
-# extension (default-enabled via ``runtime_extensions``) POSTs each agent event
-# directly to ``{FOUNDATION_API_URL}/audit/v1/events`` carrying this minted
-# token.  That direct call is air-gapped (and silently fails open) in ``broker``
-# egress mode, but in ``foundation`` egress mode the sandbox shares the
-# foundation network and the audit service genuinely enforces ``audit.write``.
-# Dropping it would break audit forwarding in foundation mode, so it stays.
+# ``audit.write`` was removed with the AgentScope worker: its
+# ``event_audit_sink`` extension was the only in-sandbox audit caller; the
+# Claude SDK worker makes no direct audit-service calls.
 SANDBOX_TOKEN_SCOPES: tuple[str, ...] = (
-    "audit.write",
     "llm-gateway.invoke",
 )
 
 # Comma-separated X-Service-Scopes value the scheduler injects into the sandbox
-# env as FOUNDATION_SERVICE_SCOPES.  The mcp_tenant_injector and skills_loader
-# extensions read this and forward it as the ``X-Service-Scopes`` header when
-# calling the internal endpoints on mcp-registry and skill-store.
+# env as FOUNDATION_SERVICE_SCOPES.  The worker reads this and forwards it as
+# the ``X-Service-Scopes`` header when calling the internal endpoints on
+# mcp-registry and skill-store.
 #
 # In production the API gateway translates the verified Bearer JWT into this
 # header before the request reaches the service; in dev (no gateway between
@@ -164,50 +159,17 @@ class Settings(BaseSettings):
     # Dev one-click default is ``e2b_000000``; override via SCHEDULER_CUBE_API_KEY.
     cube_api_key: str = "e2b_000000"
 
-    # Sandbox image — built from ``sandbox-images/base.Dockerfile``,
-    # ships AgentScope 2.x + agentscope_ext.runtime_worker.  The
-    # runtime invokes ``python -m agentscope_ext.runtime_worker`` as
-    # the container/VM entrypoint.
-    agent_image: str = "ghcr.io/agent-platform/agentscope-sandbox:0.1"
-    # Phase 5: alternate worker image for the new Claude SDK backend.  The
-    # runtime selects between ``agent_image`` (AgentScope, default) and this
-    # image per-run based on the ``enable_claude_sdk_worker`` feature flag,
-    # enabling grey-release / instant rollback without a redeploy.  The Claude
-    # SDK image runs via its own ENTRYPOINT (node), not the AgentScope CMD.
-    claude_sdk_image: str = "ghcr.io/agent-platform/claude-sdk-sandbox:0.1"
+    # Sandbox image — the Claude Agent SDK worker (``worker-claude-sdk``),
+    # built from ``sandbox-images/claude-sdk.Dockerfile``.  It runs via its own
+    # ENTRYPOINT (node); the cube runtime launches ``node /app/dist/main.js``.
+    agent_image: str = "ghcr.io/agent-platform/claude-sdk-sandbox:0.1"
     # Cube v0.6 fixes memory on the template rather than accepting a per-spawn
     # resource override. A deployment may therefore point these two aliases at
-    # the same OCI image with different template memory settings. They only
-    # apply to the Claude SDK worker; empty values preserve the single-template
-    # behaviour for existing deployments and the AgentScope worker path.
+    # the same OCI image with different template memory settings. Empty values
+    # fall back to the single ``agent_image`` template.
     cube_claude_sdk_template_small: str = ""
     cube_claude_sdk_template_large: str = ""
-    # Global fallback for the Claude SDK worker selection.  The runtimes first
-    # evaluate the per-run ``enable_claude_sdk_worker`` feature flag (for
-    # gradual / per-tenant grey rollout); when that flag returns False (or the
-    # flag service is unreachable, since ``evaluate_flag`` is failure-open) they
-    # fall back to this default.  Deliberately False in committed code — flipping
-    # it globally is a deploy-time decision made via
-    # ``SCHEDULER_USE_CLAUDE_SDK_WORKER_DEFAULT``, not a code change.  The flag
-    # still wins when it returns True; this only applies on the False/unreachable
-    # branch.
-    use_claude_sdk_worker_default: bool = False
-    # Timeout (ms) for the synchronous feature-flag evaluate call on the spawn
-    # path.  Kept tight: the call is failure-open, so a slow flag service must
-    # not stall run scheduling.
-    feature_flag_timeout_ms: int = 200
-    llm_api_key: str = ""
     llm_model: str = "claude-sonnet-4-20250514"
-    # Optional LLM provider override for the in-sandbox worker.
-    # ``llm_provider`` selects the AgentScope model adapter
-    # (e.g. ``anthropic`` default, ``openai`` for OpenAI-compatible endpoints
-    # like DeepSeek / Together / a local vLLM).  ``llm_base_url`` overrides the
-    # provider base URL (only honoured by providers that accept it, such as
-    # ``openai``).  Both are forwarded to the sandbox as ``LLM_PROVIDER`` /
-    # ``LLM_BASE_URL`` env vars; the worker treats the empty string as "use
-    # provider default" so a stock deploy that doesn't set them keeps working.
-    llm_provider: str = ""
-    llm_base_url: str = ""
     workspace_base: str = "/var/agent-platform/workspaces"
     docker_network: str = "saas-foundation-dev_foundation"
     # Sandbox egress policy:
@@ -270,26 +232,14 @@ class Settings(BaseSettings):
 
     # B-M3: base URLs for the MCP registry and skill-store services.
     # These are forwarded to the sandbox as MCP_REGISTRY_URL / SKILL_STORE_URL
-    # where the in-sandbox extensions (mcp_tenant_injector, skills_loader)
-    # append /internal/mcp-servers and /internal/skills respectively.
+    # where the in-sandbox worker appends /internal/mcp-servers and
+    # /internal/skills respectively.
     # Values must include the service's API version prefix.
     mcp_registry_url: str = "http://mcp-registry:8010/api/mcp/v1"
     skill_store_url: str = "http://skill-store:8011/api/skills/v1"
-    # Comma-separated list of agentscope_ext extensions to activate inside
-    # the sandbox.  Order matters: load MCP / Skills / web tools before the
-    # audit + LLM gateway hooks so every tool call and model call is captured.
-    # The enterprise default is fail-closed: no direct provider keys in the
-    # sandbox, and every model call must route through foundation llm-gateway.
-    # ``knowledge_tool`` is fail-open: it self-gates on KNOWLEDGE_INGEST_URL
-    # being set, so deployments without ki simply don't register the tool.
-    runtime_extensions: str = (
-        "mcp_tenant_injector,skills_loader,web_fetch,knowledge_tool,"
-        "event_audit_sink,llm_gateway_enforcer"
-    )
-
     # Web-fetch gateway — the sidecar that lets sandboxed agents fetch public
     # URLs.  Forwarded into the sandbox as WEB_FETCH_GATEWAY_URL so the
-    # web_fetch extension can POST to /api/web-fetch/v1/fetch.  Uses the
+    # worker's web-fetch tool can POST to /api/web-fetch/v1/fetch.  Uses the
     # service name ``web-fetch-gateway`` which is routable on the ``foundation``
     # docker network shared by all platform services and sandbox containers.
     web_fetch_gateway_url: str = "http://web-fetch-gateway:8013"
@@ -305,13 +255,13 @@ class Settings(BaseSettings):
     # Forwarded into every sandbox as LLM_GATEWAY_URL.  The scheduler also
     # queries GET /tenant-keys?tenant_id= on this base URL to retrieve the
     # tenant's virtual key (LLM_VIRTUAL_KEY) at spawn time.
-    # The enforcer is enabled by default.  A missing tenant virtual key is a
-    # spawn-time error; direct-connect is reserved for explicit local dev only.
+    # Gateway mode is unconditional: a missing tenant virtual key is a
+    # spawn-time error and there is no direct-connect fallback.
     llm_gateway_url: str = "http://llm-gateway:8011/api/llm-gateway/v1"
 
     # Knowledge-ingest (KB v1) - base URL *with* API version prefix.
     # Forwarded into the sandbox as KNOWLEDGE_INGEST_URL so the in-sandbox
-    # ``knowledge_tool`` extension can GET {base}/search?scope=knowledge on
+    # worker's knowledge tool can GET {base}/search?scope=knowledge on
     # behalf of the agent.  In foundation egress mode this is the direct ki
     # URL (ki is on the foundation net); in broker mode ``egress_policy``
     # rewrites it to the tool-broker ``/knowledge/v1`` façade.  ki needs no
@@ -323,7 +273,7 @@ class Settings(BaseSettings):
     otel_enabled: bool = True
     otel_exporter_endpoint: str = "http://localhost:4317"
 
-    # S3/MinIO — forwarded into the sandbox so the runtime_worker can download
+    # S3/MinIO — forwarded into the sandbox so the worker can download
     # user-uploaded attachments from the agent-platform bucket.
     s3_endpoint_url: str = "http://foundation-minio:9000"
     s3_bucket: str = "agent-platform"
@@ -332,7 +282,7 @@ class Settings(BaseSettings):
     s3_secret_access_key: str = ""
 
     # Hot-state layer — Redis URL forwarded into each sandbox container so the
-    # runtime_worker can write step/plan/cursor checkpoints for breakpoint
+    # worker can write step/plan/cursor checkpoints for breakpoint
     # resume.  foundation-redis is on the saas-foundation-dev_foundation network;
     # sandbox containers share that network so they reach it directly (plan a).
     # Format: redis://[:password@]host:port/db  (empty = hot-state disabled)
@@ -341,7 +291,6 @@ class Settings(BaseSettings):
     # Foundation authz + billing — RBAC enforcement and quota checks.
     authz_url: str = "http://authz:8002/api/authz/v1"
     foundation_billing_url: str = "http://billing:8007/api/billing/v1"
-    feature_flag_url: str = "http://feature-flag:8012/api/feature-flag/v1"
 
     # Session-orchestrator base URL *with* API version prefix.  The scheduler
     # has no DB of its own; run history lives in the orchestrator's Postgres.

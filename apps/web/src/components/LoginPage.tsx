@@ -19,7 +19,7 @@ export function LoginPage() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.has('sso_error')) {
-      setError('企业登录失败，请重试或联系管理员。');
+      setError('Enterprise sign-in failed. Please try again or contact your administrator.');
       params.delete('sso_error');
       const qs = params.toString();
       window.history.replaceState(
@@ -71,9 +71,9 @@ export function LoginPage() {
       // for ops to diagnose via request_id but the raw `.message` is fine
       // for end users (foundation surfaces localised text in `detail`).
       if (err instanceof ApiError && err.status === 401) {
-        setError('邮箱或密码不正确，请重试。');
+        setError('Incorrect email or password. Please try again.');
       } else {
-        setError('登录失败，请稍后重试。');
+        setError('Sign-in failed. Please try again later.');
          
         console.warn('login failed', err);
       }
@@ -85,10 +85,10 @@ export function LoginPage() {
   return (
     <div className="min-h-screen flex items-center justify-center bg-surface-50">
       <div className="w-full max-w-sm p-8 bg-white rounded-xl shadow-sm border border-surface-200">
-        <h1 className="text-2xl font-semibold text-center mb-8">Agent 平台</h1>
+        <h1 className="text-2xl font-semibold text-center mb-8">Agent Platform</h1>
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
-            <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-1">邮箱</label>
+            <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-1">Email</label>
             <input
               id="email"
               type="email"
@@ -100,7 +100,7 @@ export function LoginPage() {
             />
           </div>
           <div>
-            <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-1">密码</label>
+            <label htmlFor="password" className="block text-sm font-medium text-gray-700 mb-1">Password</label>
             <input
               id="password"
               type="password"
@@ -116,7 +116,7 @@ export function LoginPage() {
             disabled={loading}
             className="w-full py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50 font-medium"
           >
-            {loading ? '登录中…' : '登录'}
+            {loading ? 'Signing in…' : 'Sign in'}
           </button>
         </form>
 
@@ -124,7 +124,7 @@ export function LoginPage() {
           <div className="mt-6">
             <div className="flex items-center gap-3 mb-4">
               <span className="flex-1 h-px bg-surface-200" />
-              <span className="text-xs text-gray-400">或使用企业账号登录</span>
+              <span className="text-xs text-gray-400">or sign in with your enterprise account</span>
               <span className="flex-1 h-px bg-surface-200" />
             </div>
             <div className="space-y-2">

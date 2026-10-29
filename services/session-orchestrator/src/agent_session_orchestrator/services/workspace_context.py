@@ -1,10 +1,8 @@
 """Workspace context loader — resolves a session's workspace into run-injectable
 context (instructions + base files + skills).
 
-Called from ``create_run`` for BOTH execution modes: the sandbox branch folds
-the context into the scheduler payload (files[] / skills union / sys_prompt
-append) and the inline branch passes it to ``start_inline_run`` as plain
-values.  A session with ``workspace_id IS NULL`` — or whose workspace has been
+Called from ``create_run``, which folds the context into the scheduler payload
+(files[] / skills union / sys_prompt append).  A session with ``workspace_id IS NULL`` — or whose workspace has been
 soft-deleted since — yields ``None`` and the run proceeds exactly as before
 the feature existed.
 
@@ -122,8 +120,7 @@ async def resolve_workspace_sensitivity(
 async def workspace_context_injection_enabled(tenant_id: str) -> bool:
     """Whether the ``workspace_context_injection`` flag is on for ``tenant_id``.
 
-    Mirrors ``inline_run_executor._inline_attachments_enabled_for_tenant``:
-    reads the foundation feature-flag source of truth via the shared client and
+    Reads the foundation feature-flag source of truth via the shared client and
     fail-OPENs to enabled.  Workspace context is opportunistic — a model that
     ignores the injected blocks costs nothing — so a flag-service outage should
     not silently strip workspace context from runs.  A tenant that has

@@ -1,13 +1,12 @@
 /**
- * event_translator.ts — Claude SDK message stream → agentscope event vocabulary.
+ * event_translator.ts — Claude SDK message stream → platform event vocabulary.
  *
  * The scheduler / orchestrator SSE bridge / frontend consume events.jsonl using
- * the SAME event_type vocabulary the AgentScope runtime_worker emits (see
- * agentscope-ext/tests/test_runtime_worker.py). A Claude SDK run must therefore
- * re-shape the SDK's `SDKMessage` stream into that exact vocabulary so the two
- * runtimes are interchangeable upstream.
+ * a fixed event_type vocabulary (see contracts/worker-wire-contract.md). The
+ * names were inherited from the retired AgentScope worker and are kept for
+ * wire compatibility, so the SDK's `SDKMessage` stream is re-shaped into them.
  *
- * One SDKMessage produces 0..N agentscope EventPayloads. The translator is
+ * One SDKMessage produces 0..N EventPayloads. The translator is
  * stateful (a class, not a pure function) for two reasons:
  *
  *   1. SDK content blocks carry no stable id for text / thinking blocks, so we

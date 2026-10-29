@@ -62,16 +62,16 @@ function InviteUserDialog({
       onInvited();
       onClose();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '邀请失败');
+      setError(err instanceof ApiError ? err.message : 'Invite failed');
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <Dialog title="邀请用户" onClose={onClose} dismissable={!loading} className="w-full max-w-[440px]">
+    <Dialog title="Invite user" onClose={onClose} dismissable={!loading} className="w-full max-w-[440px]">
       <p className="text-[11px] text-dim -mt-1">
-        {tenantId ? '邀请将加入当前筛选的租户' : '邀请将加入你所属的租户'}
+        {tenantId ? 'The user will join the currently filtered tenant' : 'The user will join your tenant'}
       </p>
 
       <form onSubmit={handleSubmit} className="flex flex-col gap-3">
@@ -79,7 +79,7 @@ function InviteUserDialog({
           <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>
         )}
         <div className="flex flex-col gap-1">
-          <label className="text-[11px] text-dim font-mono">邮箱</label>
+          <label className="text-[11px] text-dim font-mono">Email</label>
           <input
             className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
             type="email"
@@ -90,16 +90,16 @@ function InviteUserDialog({
           />
         </div>
         <div className="flex flex-col gap-1">
-          <label className="text-[11px] text-dim font-mono">显示名 (可选)</label>
+          <label className="text-[11px] text-dim font-mono">Display name (optional)</label>
           <input
             className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
             value={displayName}
             onChange={(e) => setDisplayName(e.target.value)}
-            placeholder="张三"
+            placeholder="Jane Doe"
           />
         </div>
         <div className="flex flex-col gap-1">
-          <label className="text-[11px] text-dim font-mono">角色 (逗号分隔, 可选)</label>
+          <label className="text-[11px] text-dim font-mono">Roles (comma-separated, optional)</label>
           <input
             className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
             value={roles}
@@ -109,7 +109,7 @@ function InviteUserDialog({
         </div>
         <label className="flex items-center gap-2 cursor-pointer mt-1">
           <input type="checkbox" checked={sendEmail} onChange={(e) => setSendEmail(e.target.checked)} />
-          <span className="text-[12px] text-ink-2">发送邀请邮件</span>
+          <span className="text-[12px] text-ink-2">Send invitation email</span>
         </label>
 
         <div className="flex items-center justify-end gap-2 pt-1">
@@ -119,14 +119,14 @@ function InviteUserDialog({
             disabled={loading}
             className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
           >
-            取消
+            Cancel
           </button>
           <button
             type="submit"
             disabled={loading || !email.trim()}
             className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
           >
-            {loading ? '邀请中…' : '发送邀请'}
+            {loading ? 'Inviting…' : 'Send invite'}
           </button>
         </div>
       </form>
@@ -159,7 +159,7 @@ function UserActions({
       await fn();
       onChanged();
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : '操作失败');
+      onError(err instanceof ApiError ? err.message : 'Action failed');
     } finally {
       setBusy(null);
     }
@@ -172,15 +172,15 @@ function UserActions({
   const handleReset = async () => {
     if (
       !(await confirm({
-        title: '重置密码',
-        message: `确定要重置用户「${user.email}」的密码吗？`,
-        confirmText: '重置',
+        title: 'Reset password',
+        message: `Reset the password for "${user.email}"?`,
+        confirmText: 'Reset',
       }))
     )
       return;
     run('reset', async () => {
       await api.admin.users.resetPassword(user.id, tenantId ?? undefined);
-      toast.success('已发起密码重置');
+      toast.success('Password reset initiated');
     });
   };
 
@@ -193,7 +193,7 @@ function UserActions({
           disabled={!!busy}
           className="text-[11px] font-mono text-green-700 border border-green-200 rounded-sm px-2 py-0.5 hover:bg-green-50 disabled:opacity-50"
         >
-          {busy === 'unfreeze' ? '…' : '解冻'}
+          {busy === 'unfreeze' ? '…' : 'Unfreeze'}
         </button>
       )}
       {frozen !== true && (
@@ -202,7 +202,7 @@ function UserActions({
           disabled={!!busy}
           className="text-[11px] font-mono text-amber-700 border border-amber-200 rounded-sm px-2 py-0.5 hover:bg-amber-50 disabled:opacity-50"
         >
-          {busy === 'freeze' ? '…' : '冻结'}
+          {busy === 'freeze' ? '…' : 'Freeze'}
         </button>
       )}
       <button
@@ -210,7 +210,7 @@ function UserActions({
         disabled={!!busy}
         className="text-[11px] font-mono text-dim border border-line rounded-sm px-2 py-0.5 hover:text-ink hover:bg-paper-2 disabled:opacity-50"
       >
-        {busy === 'reset' ? '…' : '重置密码'}
+        {busy === 'reset' ? '…' : 'Reset password'}
       </button>
     </div>
   );
@@ -256,7 +256,7 @@ export function UsersPage() {
     api.admin.users
       .list(selectedTenantId ?? undefined)
       .then((data) => { if (!cancelled) setUsers(data.items); })
-      .catch((err) => { if (!cancelled) setUsersError(err instanceof ApiError ? err.message : '加载失败'); })
+      .catch((err) => { if (!cancelled) setUsersError(err instanceof ApiError ? err.message : 'Failed to load'); })
       .finally(() => { if (!cancelled) setUsersLoading(false); });
     return () => { cancelled = true; };
   }, [selectedTenantId, reloadKey, setUsers, setUsersLoading, setUsersError]);
@@ -268,22 +268,22 @@ export function UsersPage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">用户管理</h1>
-          <p className="text-[12px] text-dim mt-0.5">跨租户用户查询与生命周期操作</p>
+          <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Users</h1>
+          <p className="text-[12px] text-dim mt-0.5">Cross-tenant user lookup and lifecycle actions</p>
         </div>
         <button
           onClick={() => setShowInvite(true)}
           className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 transition-opacity"
         >
-          + 邀请用户
+          + Invite user
         </button>
       </div>
 
       {/* Tenant filter */}
       <div className="flex items-center gap-3">
-        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">筛选租户</label>
+        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">Filter by tenant</label>
         <CustomSelect
-          options={[{ value: '', label: '全部租户' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+          options={[{ value: '', label: 'All tenants' }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
           value={selectedTenantId ?? ''}
           onChange={(v) => setSelectedTenantId(v || null)}
           disabled={tenantsLoading}
@@ -298,19 +298,19 @@ export function UsersPage() {
       )}
 
       {usersLoading ? (
-        <div className="font-mono text-[12px] text-dim">加载中…</div>
+        <div className="font-mono text-[12px] text-dim">Loading…</div>
       ) : users.length === 0 ? (
-        <div className="font-mono text-[12px] text-dim italic">暂无用户</div>
+        <div className="font-mono text-[12px] text-dim italic">No users</div>
       ) : (
         <div className="border border-line rounded-md overflow-hidden">
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
               <tr>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">邮箱</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">显示名</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">角色</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">租户 ID</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">操作</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Email</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Display name</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Roles</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Tenant ID</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Actions</th>
               </tr>
             </thead>
             <tbody>

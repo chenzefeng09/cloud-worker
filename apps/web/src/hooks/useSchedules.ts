@@ -24,7 +24,7 @@ export function useSchedules(): UseSchedulesResult {
         setSchedules(Array.isArray(res) ? res : []);
       })
       .catch((e) => {
-        setError((e as Error).message ?? '加载定时任务失败');
+        setError((e as Error).message ?? 'Failed to load triggers');
       })
       .finally(() => {
         setLoading(false);

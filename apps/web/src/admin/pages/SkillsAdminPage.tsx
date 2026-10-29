@@ -23,20 +23,20 @@ function SkillDetailPanel({
   const handleDelete = async () => {
     if (
       !(await confirm({
-        title: '删除技能',
-        message: `确定删除技能「${skill.name}」吗？此操作不可撤销。`,
+        title: 'Delete skill',
+        message: `Delete skill "${skill.name}"? This cannot be undone.`,
         tone: 'danger',
-        confirmText: '删除',
+        confirmText: 'Delete',
       }))
     )
       return;
     setDeleting(true);
     try {
       await api.admin.skills.delete(skill.id);
-      toast.success('已删除技能');
+      toast.success('Skill deleted');
       onDeleted();
     } catch (err) {
-      const msg = err instanceof ApiError ? err.message : '删除失败';
+      const msg = err instanceof ApiError ? err.message : 'Delete failed';
       toast.error(msg);
     } finally {
       setDeleting(false);
@@ -60,7 +60,7 @@ function SkillDetailPanel({
     api.admin.skills
       .get(skill.id)
       .then((data) => { if (!cancelled) setDetail(data); })
-      .catch((err) => { if (!cancelled) setError(err instanceof ApiError ? err.message : '加载失败'); })
+      .catch((err) => { if (!cancelled) setError(err instanceof ApiError ? err.message : 'Failed to load'); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [skill.id]);
@@ -76,7 +76,7 @@ function SkillDetailPanel({
         if (err instanceof ApiError && (err.status === 404 || err.status === 501)) {
           setVersionsTodo(true);
         } else {
-          setVersionsError(err instanceof ApiError ? err.message : '加载失败');
+          setVersionsError(err instanceof ApiError ? err.message : 'Failed to load');
         }
       })
       .finally(() => setVersionsLoading(false));
@@ -85,8 +85,8 @@ function SkillDetailPanel({
   const d = detail ?? skill;
 
   return (
-    <Dialog title="技能详情" onClose={onClose} className="w-full max-w-2xl">
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+    <Dialog title="Skill details" onClose={onClose} className="w-full max-w-2xl">
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
       {error && (
         <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>
       )}
@@ -94,15 +94,15 @@ function SkillDetailPanel({
       <div className="grid grid-cols-[120px_1fr] gap-y-2 gap-x-3 text-[12px]">
         <span className="font-mono text-dim">ID</span>
         <span className="font-mono text-ink-2 break-all">{d.id}</span>
-        <span className="font-mono text-dim">名称</span>
+        <span className="font-mono text-dim">Name</span>
         <span className="text-ink">{d.name}</span>
-        <span className="font-mono text-dim">描述</span>
+        <span className="font-mono text-dim">Description</span>
         <span className="text-ink-2">{d.description || '—'}</span>
-        <span className="font-mono text-dim">所有者</span>
+        <span className="font-mono text-dim">Owner</span>
         <span className="text-ink-2">{d.owner || '—'}</span>
-        <span className="font-mono text-dim">可见性</span>
+        <span className="font-mono text-dim">Visibility</span>
         <span className="font-mono text-ink-2">{d.visibility || '—'}</span>
-        <span className="font-mono text-dim">创建时间</span>
+        <span className="font-mono text-dim">Created</span>
         <span className="font-mono text-ink-2">
           {d.created_at ? formatDateTimeAuto(new Date(d.created_at)) : '—'}
         </span>
@@ -116,37 +116,37 @@ function SkillDetailPanel({
             disabled={versionsLoading}
             className="px-2.5 py-1 border border-line text-[11px] font-mono rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
           >
-            {versionsLoading ? '加载版本中…' : '查看版本'}
+            {versionsLoading ? 'Loading versions…' : 'View versions'}
           </button>
           <button
             onClick={handleDelete}
             disabled={deleting}
             className="px-2.5 py-1 border border-red-200 text-[11px] font-mono rounded-sm text-red-600 hover:bg-red-50 disabled:opacity-50"
           >
-            {deleting ? '删除中…' : '删除'}
+            {deleting ? 'Deleting…' : 'Delete'}
           </button>
         </div>
 
         {versionsTodo && (
           <div className="border border-line rounded-md p-3 text-[12px] text-dim italic">
-            未能加载该技能的版本列表。
+            Couldn't load this skill's versions.
           </div>
         )}
         {versionsError && (
           <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{versionsError}</div>
         )}
         {versions && versions.length === 0 && !versionsTodo && (
-          <div className="font-mono text-[12px] text-dim italic">暂无版本</div>
+          <div className="font-mono text-[12px] text-dim italic">No versions</div>
         )}
         {versions && versions.length > 0 && (
           <div className="border border-line rounded-md overflow-hidden max-h-[40vh] overflow-y-auto">
             <table className="w-full text-left border-collapse">
               <thead className="bg-paper-2 border-b border-line">
                 <tr>
-                  <th className="px-3 py-1.5 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">版本</th>
+                  <th className="px-3 py-1.5 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Version</th>
                   <th className="px-3 py-1.5 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">SHA256</th>
-                  <th className="px-3 py-1.5 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">上传者</th>
-                  <th className="px-3 py-1.5 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">上传时间</th>
+                  <th className="px-3 py-1.5 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Uploaded by</th>
+                  <th className="px-3 py-1.5 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Uploaded</th>
                 </tr>
               </thead>
               <tbody>
@@ -194,7 +194,7 @@ export function SkillsAdminPage() {
         if (err instanceof ApiError && (err.status === 404 || err.status === 501 || err.status === 502)) {
           setIsTodoEndpoint(true);
         } else {
-          setError(err instanceof ApiError ? err.message : '加载失败');
+          setError(err instanceof ApiError ? err.message : 'Failed to load');
         }
       })
       .finally(() => { if (!cancelled) setLoading(false); });
@@ -204,8 +204,8 @@ export function SkillsAdminPage() {
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">技能管理</h1>
-        <p className="text-[12px] text-dim mt-0.5">平台技能库治理（→ skill-store）</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Skills</h1>
+        <p className="text-[12px] text-dim mt-0.5">Platform skill library governance (→ skill-store)</p>
       </div>
 
       {error && (
@@ -216,24 +216,24 @@ export function SkillsAdminPage() {
 
       {isTodoEndpoint && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          该能力暂未启用：skill-store 代理端点尚未就绪，接线后将自动展示技能列表。
+          Not available yet: the skill-store proxy endpoint isn't ready. Skills will appear here once it's connected.
         </div>
       )}
 
       {loading ? (
-        <div className="font-mono text-[12px] text-dim">加载中…</div>
+        <div className="font-mono text-[12px] text-dim">Loading…</div>
       ) : !isTodoEndpoint && skills.length === 0 ? (
-        <div className="font-mono text-[12px] text-dim italic">暂无技能</div>
+        <div className="font-mono text-[12px] text-dim italic">No skills</div>
       ) : (
         !isTodoEndpoint && (
           <div className="border border-line rounded-md overflow-hidden">
             <table className="w-full text-left border-collapse">
               <thead className="bg-paper-2 border-b border-line">
                 <tr>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">名称</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">可见性</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">描述</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">创建时间</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Name</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Visibility</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Description</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Created</th>
                 </tr>
               </thead>
               <tbody>

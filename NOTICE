@@ -7,8 +7,8 @@ LICENSE file in this repository).
 Agent Platform builds on a number of third-party open-source projects,
 each distributed under its own license. Notable components include:
 
-  - AgentScope (Apache-2.0) — the agent kernel, integrated (not forked)
-    via the packages under agentscope-ext/.
+  - Claude Agent SDK (@anthropic-ai/claude-agent-sdk) — the agent runtime
+    used by worker-claude-sdk/, distributed under terms set by Anthropic.
   - SaaS Foundation — the enterprise base providing identity, authorization,
     billing, audit, LLM gateway and related capabilities, consumed through
     the foundation SDK. See https://github.com/chenzefeng09/saas-foundation

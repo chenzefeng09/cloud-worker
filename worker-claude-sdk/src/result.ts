@@ -5,8 +5,8 @@
  * replay what happened. Both writers are failure-open: a filesystem error logs
  * a warning and is swallowed so an artifact write never crashes a finished run.
  *
- * Field names are pinned to the existing runtime_worker contract (see
- * agentscope-ext/tests/test_runtime_worker.py): status / summary / error /
+ * Field names are pinned to the worker wire contract (see
+ * contracts/worker-wire-contract.md): status / summary / error /
  * usage{input_tokens,output_tokens,total_tokens} / plan_steps[{n,t,d,live}].
  */
 

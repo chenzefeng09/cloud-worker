@@ -21,9 +21,9 @@ const KIND_LABELS: Record<SsoKind, string> = {
   SAML: 'SAML 2.0',
   AD: 'Azure AD / Entra',
   LDAP: 'LDAP / AD',
-  DINGTALK_ENTERPRISE: '钉钉',
-  FEISHU_ENTERPRISE: '飞书',
-  WECOM: '企业微信',
+  DINGTALK_ENTERPRISE: 'DingTalk',
+  FEISHU_ENTERPRISE: 'Feishu',
+  WECOM: 'WeCom',
 };
 
 const KIND_OPTIONS = (Object.keys(KIND_LABELS) as SsoKind[]).map((k) => ({
@@ -32,10 +32,10 @@ const KIND_OPTIONS = (Object.keys(KIND_LABELS) as SsoKind[]).map((k) => ({
 }));
 
 const MATCH_TYPE_LABELS: Record<SsoMatchType, string> = {
-  EMAIL_DOMAIN: '邮箱域',
-  EQUALS: '等于',
-  CONTAINS: '包含',
-  REGEX: '正则',
+  EMAIL_DOMAIN: 'Email domain',
+  EQUALS: 'Equals',
+  CONTAINS: 'Contains',
+  REGEX: 'Regex',
 };
 
 const MATCH_TYPE_OPTIONS = (Object.keys(MATCH_TYPE_LABELS) as SsoMatchType[]).map((k) => ({
@@ -56,7 +56,7 @@ const CONFIG_FIELDS: Record<SsoKind, FieldSpec[]> = {
   SAML: [
     { key: 'sso_url', label: 'SSO URL', placeholder: 'https://idp.example.com/sso' },
     { key: 'entity_id', label: 'Entity ID', placeholder: 'https://idp.example.com/metadata' },
-    { key: 'certificate', label: '证书', placeholder: '-----BEGIN CERTIFICATE-----', type: 'textarea' },
+    { key: 'certificate', label: 'Certificate', placeholder: '-----BEGIN CERTIFICATE-----', type: 'textarea' },
   ],
   OIDC: [
     { key: 'discovery_url', label: 'Discovery URL', placeholder: 'https://accounts.google.com/.well-known/openid-configuration' },
@@ -64,16 +64,16 @@ const CONFIG_FIELDS: Record<SsoKind, FieldSpec[]> = {
     { key: 'client_secret', label: 'Client Secret', type: 'password' },
   ],
   AD: [
-    { key: 'azure_tenant_id', label: 'Azure AD Tenant ID', placeholder: 'Azure AD 租户 ID' },
+    { key: 'azure_tenant_id', label: 'Azure AD Tenant ID', placeholder: 'Azure AD tenant ID' },
     { key: 'client_id', label: 'Client ID' },
     { key: 'client_secret', label: 'Client Secret', type: 'password' },
   ],
   LDAP: [
-    { key: 'server_url', label: '服务器地址', placeholder: 'ldap://ad.corp.com:389' },
+    { key: 'server_url', label: 'Server URL', placeholder: 'ldap://ad.corp.com:389' },
     { key: 'base_dn', label: 'Base DN', placeholder: 'dc=corp,dc=com' },
     { key: 'bind_dn', label: 'Bind DN', placeholder: 'cn=admin,dc=corp,dc=com' },
-    { key: 'bind_password', label: 'Bind 密码', type: 'password' },
-    { key: 'user_search_filter', label: '用户搜索过滤', placeholder: '(objectClass=person)' },
+    { key: 'bind_password', label: 'Bind password', type: 'password' },
+    { key: 'user_search_filter', label: 'User search filter', placeholder: '(objectClass=person)' },
   ],
   DINGTALK_ENTERPRISE: [
     { key: 'corp_id', label: 'Corp ID' },
@@ -104,7 +104,7 @@ function ConfigFields({
   return (
     <div className="border-t border-line-2 pt-2 flex flex-col gap-2">
       <div className="text-[10.5px] font-mono text-dim uppercase tracking-[0.1em]">
-        {KIND_LABELS[kind]} 配置
+        {KIND_LABELS[kind]} settings
       </div>
       {fields.map((f) =>
         f.type === 'textarea' ? (
@@ -166,20 +166,20 @@ function CreateSsoDialog({
         { kind, name: name.trim(), config },
         tenantId ?? undefined,
       );
-      toast.success('身份源已创建');
+      toast.success('Identity provider created');
       onCreated();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '创建失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to create');
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <Dialog title="添加身份源" onClose={onClose} dismissable={!busy}>
+    <Dialog title="Add identity provider" onClose={onClose} dismissable={!busy}>
       <form onSubmit={handleSubmit} className="flex flex-col gap-3">
         <div className="flex flex-col gap-1">
-          <label className="text-[11px] text-dim font-mono">类型</label>
+          <label className="text-[11px] text-dim font-mono">Type</label>
           <CustomSelect
             options={KIND_OPTIONS}
             value={kind}
@@ -188,12 +188,12 @@ function CreateSsoDialog({
           />
         </div>
         <div className="flex flex-col gap-1">
-          <label className="text-[11px] text-dim font-mono">名称</label>
+          <label className="text-[11px] text-dim font-mono">Name</label>
           <input
             className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="如：公司域账号"
+            placeholder="e.g. Corporate domain account"
           />
         </div>
 
@@ -208,14 +208,14 @@ function CreateSsoDialog({
             onClick={onClose}
             className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink"
           >
-            取消
+            Cancel
           </button>
           <button
             type="submit"
             disabled={busy || !name.trim()}
             className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50"
           >
-            {busy ? '创建中…' : '创建'}
+            {busy ? 'Creating…' : 'Create'}
           </button>
         </div>
       </form>
@@ -245,7 +245,7 @@ function TenantSsoTab() {
       .then(setProviders)
       .catch((err) => {
         if (isTodo(err)) setTodo(true);
-        else setError(err instanceof ApiError ? err.message : '加载失败');
+        else setError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => setLoading(false));
   }, [selectedTenantId]);
@@ -255,44 +255,44 @@ function TenantSsoTab() {
   const handleToggle = async (p: SsoProvider) => {
     if (p.enabled) {
       const yes = await confirm({
-        title: '禁用身份源',
-        message: `禁用「${p.name}」后，使用该身份源登录的用户将无法登录。确定继续？`,
+        title: 'Disable identity provider',
+        message: `Disable "${p.name}"? Users who sign in through it will no longer be able to sign in.`,
         tone: 'danger',
-        confirmText: '禁用',
+        confirmText: 'Disable',
       });
       if (!yes) return;
       try {
         await api.admin.sso.disable(p.id, selectedTenantId ?? undefined);
-        toast.success('已禁用');
+        toast.success('Disabled');
         load();
       } catch (err) {
-        toast.error(err instanceof ApiError ? err.message : '操作失败');
+        toast.error(err instanceof ApiError ? err.message : 'Operation failed');
       }
     } else {
       try {
         await api.admin.sso.enable(p.id, selectedTenantId ?? undefined);
-        toast.success('已启用');
+        toast.success('Enabled');
         load();
       } catch (err) {
-        toast.error(err instanceof ApiError ? err.message : '操作失败');
+        toast.error(err instanceof ApiError ? err.message : 'Operation failed');
       }
     }
   };
 
   const handleDelete = async (p: SsoProvider) => {
     const yes = await confirm({
-      title: '删除身份源',
-      message: `删除后「${p.name}」的配置将永久移除，关联用户需重新绑定。确定继续？`,
+      title: 'Delete identity provider',
+      message: `Delete "${p.name}"? Its configuration will be permanently removed and linked users will need to re-link.`,
       tone: 'danger',
-      confirmText: '删除',
+      confirmText: 'Delete',
     });
     if (!yes) return;
     try {
       await api.admin.sso.delete(p.id, selectedTenantId ?? undefined);
-      toast.success('已删除');
+      toast.success('Deleted');
       load();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '删除失败');
+      toast.error(err instanceof ApiError ? err.message : 'Failed to delete');
     }
   };
 
@@ -300,10 +300,10 @@ function TenantSsoTab() {
     <div className="flex flex-col gap-5">
       {/* Tenant selector */}
       <div className="flex items-center gap-3">
-        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">选择租户</label>
+        <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">Tenant</label>
         <CustomSelect
           options={[
-            { value: '', label: '（默认 / 当前租户）' },
+            { value: '', label: '(Default / current tenant)' },
             ...tenants.map((t) => ({ value: t.id, label: t.name })),
           ]}
           value={selectedTenantId ?? ''}
@@ -315,12 +315,12 @@ function TenantSsoTab() {
 
       {/* Header + action */}
       <div className="flex items-center justify-between">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">身份源列表</div>
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Identity providers</div>
         <button
           onClick={() => setCreating(true)}
           className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2"
         >
-          + 添加身份源
+          + Add identity provider
         </button>
       </div>
 
@@ -333,14 +333,14 @@ function TenantSsoTab() {
       )}
 
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
       {todo && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          该能力暂未启用：身份源管理端点不可达。
+          Not available yet: the identity provider endpoint is unreachable.
         </div>
       )}
       {!loading && !todo && providers.length === 0 && (
-        <div className="font-mono text-[12px] text-dim italic">暂无身份源配置</div>
+        <div className="font-mono text-[12px] text-dim italic">No identity providers configured</div>
       )}
 
       {!loading && !todo && providers.length > 0 && (
@@ -348,10 +348,10 @@ function TenantSsoTab() {
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
               <tr>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">名称</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">类型</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">创建时间</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Name</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Type</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Created at</th>
                 <th className="px-3 py-2 w-28"></th>
               </tr>
             </thead>
@@ -362,9 +362,9 @@ function TenantSsoTab() {
                   <td className="px-3 py-2 font-mono text-[11px] text-dim">{KIND_LABELS[p.kind] ?? p.kind}</td>
                   <td className="px-3 py-2 text-[12px]">
                     {p.enabled ? (
-                      <span className="text-green-700">已启用</span>
+                      <span className="text-green-700">Enabled</span>
                     ) : (
-                      <span className="text-dim">已禁用</span>
+                      <span className="text-dim">Disabled</span>
                     )}
                   </td>
                   <td className="px-3 py-2 font-mono text-[11px] text-dim">
@@ -375,13 +375,13 @@ function TenantSsoTab() {
                       onClick={() => handleToggle(p)}
                       className="text-[11px] font-mono text-ink-2 hover:text-ink"
                     >
-                      {p.enabled ? '禁用' : '启用'}
+                      {p.enabled ? 'Disable' : 'Enable'}
                     </button>
                     <button
                       onClick={() => handleDelete(p)}
                       className="text-[11px] font-mono text-accent hover:opacity-80"
                     >
-                      删除
+                      Delete
                     </button>
                   </td>
                 </tr>
@@ -422,7 +422,7 @@ function CreatePlatformSsoDialog({
     e.preventDefault();
     if (!name.trim()) return;
     if (scope === 'TENANT' && !tenantId) {
-      setError('租户级身份源必须选择目标租户');
+      setError('A tenant-scoped identity provider requires a target tenant');
       return;
     }
     setBusy(true);
@@ -436,20 +436,20 @@ function CreatePlatformSsoDialog({
         tenant_id: scope === 'TENANT' ? tenantId : null,
         default_tenant_id: scope === 'PLATFORM' ? (defaultTenantId || null) : null,
       });
-      toast.success('身份源已创建');
+      toast.success('Identity provider created');
       onCreated();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '创建失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to create');
     } finally {
       setBusy(false);
     }
   };
 
   return (
-    <Dialog title="添加平台身份源" onClose={onClose} dismissable={!busy}>
+    <Dialog title="Add platform identity provider" onClose={onClose} dismissable={!busy}>
       <form onSubmit={handleSubmit} className="flex flex-col gap-3">
         <div className="flex flex-col gap-1">
-          <label className="text-[11px] text-dim font-mono">类型</label>
+          <label className="text-[11px] text-dim font-mono">Type</label>
           <CustomSelect
             options={KIND_OPTIONS}
             value={kind}
@@ -458,20 +458,20 @@ function CreatePlatformSsoDialog({
           />
         </div>
         <div className="flex flex-col gap-1">
-          <label className="text-[11px] text-dim font-mono">名称</label>
+          <label className="text-[11px] text-dim font-mono">Name</label>
           <input
             className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent"
             value={name}
             onChange={(e) => setName(e.target.value)}
-            placeholder="如：公司域账号"
+            placeholder="e.g. Corporate domain account"
           />
         </div>
         <div className="flex flex-col gap-1">
-          <label className="text-[11px] text-dim font-mono">范围</label>
+          <label className="text-[11px] text-dim font-mono">Scope</label>
           <CustomSelect
             options={[
-              { value: 'PLATFORM', label: '平台级' },
-              { value: 'TENANT', label: '租户级' },
+              { value: 'PLATFORM', label: 'Platform' },
+              { value: 'TENANT', label: 'Tenant' },
             ]}
             value={scope}
             onChange={(v) => setScope(v as SsoScope)}
@@ -480,9 +480,9 @@ function CreatePlatformSsoDialog({
         </div>
         {scope === 'TENANT' ? (
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">目标租户</label>
+            <label className="text-[11px] text-dim font-mono">Target tenant</label>
             <CustomSelect
-              options={[{ value: '', label: '（选择租户）' }, ...tenantOptions]}
+              options={[{ value: '', label: '(Select tenant)' }, ...tenantOptions]}
               value={tenantId}
               onChange={setTenantId}
               className="w-full"
@@ -490,14 +490,14 @@ function CreatePlatformSsoDialog({
           </div>
         ) : (
           <div className="flex flex-col gap-1">
-            <label className="text-[11px] text-dim font-mono">默认租户</label>
+            <label className="text-[11px] text-dim font-mono">Default tenant</label>
             <CustomSelect
-              options={[{ value: '', label: '（无）' }, ...tenantOptions]}
+              options={[{ value: '', label: '(None)' }, ...tenantOptions]}
               value={defaultTenantId}
               onChange={setDefaultTenantId}
               className="w-full"
             />
-            <span className="text-[10.5px] text-dim">无匹配规则时回落的租户</span>
+            <span className="text-[10.5px] text-dim">Fallback tenant when no rule matches</span>
           </div>
         )}
 
@@ -512,14 +512,14 @@ function CreatePlatformSsoDialog({
             onClick={onClose}
             className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink"
           >
-            取消
+            Cancel
           </button>
           <button
             type="submit"
             disabled={busy || !name.trim()}
             className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50"
           >
-            {busy ? '创建中…' : '创建'}
+            {busy ? 'Creating…' : 'Create'}
           </button>
         </div>
       </form>
@@ -565,7 +565,7 @@ function RoutingRulesPanel({
       .then((rs) => setRules([...rs].sort((a, b) => a.priority - b.priority)))
       .catch((err) => {
         if (isTodo(err)) setTodo(true);
-        else setError(err instanceof ApiError ? err.message : '加载失败');
+        else setError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => setLoading(false));
   }, [provider.id]);
@@ -585,7 +585,7 @@ function RoutingRulesPanel({
   const handleAdd = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!matchValue.trim() || !targetTenantId) {
-      setError('匹配值与目标租户必填');
+      setError('Match value and target tenant are required');
       return;
     }
     setBusy(true);
@@ -601,7 +601,7 @@ function RoutingRulesPanel({
         enabled: true,
       };
       await api.admin.sso.platform.rules.create(provider.id, body);
-      toast.success('规则已添加');
+      toast.success('Rule added');
       setPriority('100');
       setMatchType('EMAIL_DOMAIN');
       setMatchAttribute('email');
@@ -611,7 +611,7 @@ function RoutingRulesPanel({
       setCreating(false);
       load();
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '添加失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to add');
     } finally {
       setBusy(false);
     }
@@ -634,24 +634,24 @@ function RoutingRulesPanel({
       await api.admin.sso.platform.rules.update(provider.id, r.id, { enabled: !r.enabled });
       load();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '操作失败');
+      toast.error(err instanceof ApiError ? err.message : 'Operation failed');
     }
   };
 
   const handleDeleteRule = async (r: SsoRoutingRule) => {
     const yes = await confirm({
-      title: '删除路由规则',
-      message: '删除后该匹配规则将不再生效。确定继续？',
+      title: 'Delete routing rule',
+      message: 'Delete this rule? It will stop taking effect.',
       tone: 'danger',
-      confirmText: '删除',
+      confirmText: 'Delete',
     });
     if (!yes) return;
     try {
       await api.admin.sso.platform.rules.delete(provider.id, r.id);
-      toast.success('已删除');
+      toast.success('Deleted');
       load();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '删除失败');
+      toast.error(err instanceof ApiError ? err.message : 'Failed to delete');
     }
   };
 
@@ -659,28 +659,28 @@ function RoutingRulesPanel({
     <div className="flex flex-col gap-3 bg-paper-2 border border-line-2 rounded-md p-4">
       <div className="flex items-center justify-between">
         <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-          「{provider.name}」路由规则
+          "{provider.name}" routing rules
         </div>
         {!todo && (
           <button
             onClick={() => setCreating(true)}
             className="px-2 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2"
           >
-            + 添加规则
+            + Add rule
           </button>
         )}
       </div>
 
       {error && !creating && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
       {todo && (
         <div className="border border-line rounded-md p-3 text-[12px] text-dim italic">
-          该能力暂未启用：路由规则端点不可达。
+          Not available yet: the routing rules endpoint is unreachable.
         </div>
       )}
 
       {!loading && !todo && rules.length === 0 && (
-        <div className="font-mono text-[12px] text-dim italic">暂无路由规则</div>
+        <div className="font-mono text-[12px] text-dim italic">No routing rules</div>
       )}
 
       {!loading && !todo && rules.length > 0 && (
@@ -688,13 +688,13 @@ function RoutingRulesPanel({
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
               <tr>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">优先级</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">匹配属性</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">匹配方式</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">匹配值</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">目标租户</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">默认角色</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Priority</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Match attribute</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Match type</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Match value</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Target tenant</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Default role</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
                 <th className="px-3 py-2 w-16"></th>
               </tr>
             </thead>
@@ -712,7 +712,7 @@ function RoutingRulesPanel({
                       onClick={() => handleToggleEnabled(r)}
                       className={r.enabled ? 'text-green-700 hover:opacity-80' : 'text-dim hover:text-ink'}
                     >
-                      {r.enabled ? '已启用' : '已禁用'}
+                      {r.enabled ? 'Enabled' : 'Disabled'}
                     </button>
                   </td>
                   <td className="px-3 py-2">
@@ -720,7 +720,7 @@ function RoutingRulesPanel({
                       onClick={() => handleDeleteRule(r)}
                       className="opacity-0 group-hover:opacity-100 text-[11px] font-mono text-accent hover:opacity-80 transition-opacity"
                     >
-                      删除
+                      Delete
                     </button>
                   </td>
                 </tr>
@@ -733,7 +733,7 @@ function RoutingRulesPanel({
       {/* Add rule dialog */}
       {creating && (
         <Dialog
-          title="添加路由规则"
+          title="Add routing rule"
           onClose={closeCreate}
           dismissable={!busy}
           className="w-full max-w-[560px]"
@@ -742,7 +742,7 @@ function RoutingRulesPanel({
           {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
           <div className="grid grid-cols-2 gap-2">
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">优先级</label>
+              <label className="text-[11px] text-dim font-mono">Priority</label>
               <input
                 type="number"
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
@@ -751,7 +751,7 @@ function RoutingRulesPanel({
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">匹配方式</label>
+              <label className="text-[11px] text-dim font-mono">Match type</label>
               <CustomSelect
                 options={MATCH_TYPE_OPTIONS}
                 value={matchType}
@@ -760,7 +760,7 @@ function RoutingRulesPanel({
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">匹配属性</label>
+              <label className="text-[11px] text-dim font-mono">Match attribute</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono disabled:opacity-50"
                 value={matchAttribute}
@@ -770,7 +770,7 @@ function RoutingRulesPanel({
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">匹配值</label>
+              <label className="text-[11px] text-dim font-mono">Match value</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
                 value={matchValue}
@@ -779,16 +779,16 @@ function RoutingRulesPanel({
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">目标租户</label>
+              <label className="text-[11px] text-dim font-mono">Target tenant</label>
               <CustomSelect
-                options={[{ value: '', label: '（选择租户）' }, ...tenantOptions]}
+                options={[{ value: '', label: '(Select tenant)' }, ...tenantOptions]}
                 value={targetTenantId}
                 onChange={setTargetTenantId}
                 className="w-full"
               />
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">默认角色（可选）</label>
+              <label className="text-[11px] text-dim font-mono">Default role (optional)</label>
               <input
                 className="border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent font-mono"
                 value={defaultRole}
@@ -804,14 +804,14 @@ function RoutingRulesPanel({
               disabled={busy}
               className="px-3 py-1.5 text-[12px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
             >
-              取消
+              Cancel
             </button>
             <button
               type="submit"
               disabled={busy}
               className="px-4 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 disabled:opacity-50"
             >
-              {busy ? '添加中…' : '添加规则'}
+              {busy ? 'Adding…' : 'Add rule'}
             </button>
           </div>
         </form>
@@ -848,7 +848,7 @@ function PlatformSsoTab() {
       .then(setProviders)
       .catch((err) => {
         if (isTodo(err)) setTodo(true);
-        else setError(err instanceof ApiError ? err.message : '加载失败');
+        else setError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => setLoading(false));
   }, []);
@@ -858,60 +858,60 @@ function PlatformSsoTab() {
   const handleToggle = async (p: SsoProvider) => {
     if (p.enabled) {
       const yes = await confirm({
-        title: '禁用身份源',
-        message: `禁用「${p.name}」后，使用该身份源登录的用户将无法登录。确定继续？`,
+        title: 'Disable identity provider',
+        message: `Disable "${p.name}"? Users who sign in through it will no longer be able to sign in.`,
         tone: 'danger',
-        confirmText: '禁用',
+        confirmText: 'Disable',
       });
       if (!yes) return;
       try {
         await api.admin.sso.platform.disable(p.id);
-        toast.success('已禁用');
+        toast.success('Disabled');
         load();
       } catch (err) {
-        toast.error(err instanceof ApiError ? err.message : '操作失败');
+        toast.error(err instanceof ApiError ? err.message : 'Operation failed');
       }
     } else {
       try {
         await api.admin.sso.platform.enable(p.id);
-        toast.success('已启用');
+        toast.success('Enabled');
         load();
       } catch (err) {
-        toast.error(err instanceof ApiError ? err.message : '操作失败');
+        toast.error(err instanceof ApiError ? err.message : 'Operation failed');
       }
     }
   };
 
   const handleDelete = async (p: SsoProvider) => {
     const yes = await confirm({
-      title: '删除身份源',
-      message: `删除后「${p.name}」的配置将永久移除，关联路由规则一并删除。确定继续？`,
+      title: 'Delete identity provider',
+      message: `Delete "${p.name}"? Its configuration and routing rules will be permanently removed.`,
       tone: 'danger',
-      confirmText: '删除',
+      confirmText: 'Delete',
     });
     if (!yes) return;
     try {
       await api.admin.sso.platform.delete(p.id);
-      toast.success('已删除');
+      toast.success('Deleted');
       if (expandedId === p.id) setExpandedId(null);
       load();
     } catch (err) {
-      toast.error(err instanceof ApiError ? err.message : '删除失败');
+      toast.error(err instanceof ApiError ? err.message : 'Failed to delete');
     }
   };
 
   const scopeLabel = (p: SsoProvider) =>
-    p.scope === 'TENANT' ? `租户级：${tenantNameOf(p.tenant_id)}` : '平台级';
+    p.scope === 'TENANT' ? `Tenant: ${tenantNameOf(p.tenant_id)}` : 'Platform';
 
   return (
     <div className="flex flex-col gap-5">
       <div className="flex items-center justify-between">
-        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">平台身份源列表</div>
+        <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Platform identity providers</div>
         <button
           onClick={() => setCreating(true)}
           className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2"
         >
-          + 添加身份源
+          + Add identity provider
         </button>
       </div>
 
@@ -924,14 +924,14 @@ function PlatformSsoTab() {
       )}
 
       {error && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>}
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
       {todo && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          该能力暂未启用：平台身份源端点不可达。
+          Not available yet: the platform identity provider endpoint is unreachable.
         </div>
       )}
       {!loading && !todo && providers.length === 0 && (
-        <div className="font-mono text-[12px] text-dim italic">暂无平台身份源配置</div>
+        <div className="font-mono text-[12px] text-dim italic">No platform identity providers configured</div>
       )}
 
       {!loading && !todo && providers.length > 0 && (
@@ -939,11 +939,11 @@ function PlatformSsoTab() {
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
               <tr>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">名称</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">类型</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">范围</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">默认租户</th>
-                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Name</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Type</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Scope</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Default tenant</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
                 <th className="px-3 py-2 w-56"></th>
               </tr>
             </thead>
@@ -957,9 +957,9 @@ function PlatformSsoTab() {
                     <td className="px-3 py-2 text-[12px] text-ink-2">{tenantNameOf(p.default_tenant_id)}</td>
                     <td className="px-3 py-2 text-[12px]">
                       {p.enabled ? (
-                        <span className="text-green-700">已启用</span>
+                        <span className="text-green-700">Enabled</span>
                       ) : (
-                        <span className="text-dim">已禁用</span>
+                        <span className="text-dim">Disabled</span>
                       )}
                     </td>
                     <td className="px-3 py-2 flex gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
@@ -967,19 +967,19 @@ function PlatformSsoTab() {
                         onClick={() => handleToggle(p)}
                         className="text-[11px] font-mono text-ink-2 hover:text-ink"
                       >
-                        {p.enabled ? '禁用' : '启用'}
+                        {p.enabled ? 'Disable' : 'Enable'}
                       </button>
                       <button
                         onClick={() => setExpandedId((id) => (id === p.id ? null : p.id))}
                         className="text-[11px] font-mono text-ink-2 hover:text-ink"
                       >
-                        路由规则
+                        Routing rules
                       </button>
                       <button
                         onClick={() => handleDelete(p)}
                         className="text-[11px] font-mono text-accent hover:opacity-80"
                       >
-                        删除
+                        Delete
                       </button>
                     </td>
                   </tr>
@@ -1024,15 +1024,15 @@ export function SsoPage() {
   }, [tenants.length, setTenants, setTenantsLoading]);
 
   const tabs: { id: Tab; label: string }[] = [
-    { id: 'platform', label: '平台身份源' },
-    { id: 'tenant', label: '租户身份源' },
+    { id: 'platform', label: 'Platform providers' },
+    { id: 'tenant', label: 'Tenant providers' },
   ];
 
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
-        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">身份源管理</h1>
-        <p className="text-[12px] text-dim mt-0.5">平台级 / 租户级 SSO 身份源与租户路由（→ identity）</p>
+        <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">Identity providers</h1>
+        <p className="text-[12px] text-dim mt-0.5">Platform and tenant SSO identity providers and tenant routing (→ identity)</p>
       </div>
 
       {/* Tabs */}

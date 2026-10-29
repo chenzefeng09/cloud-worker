@@ -480,7 +480,7 @@ class IngestService:
         """Map every tenant folder id → its full slash-joined path.
 
         Root-level folders map to their own name; nested folders to
-        ``parent/child`` (e.g. ``产品/合同模板``).  Cycle-safe.
+        ``parent/child`` (e.g. ``Products/Contract templates``).  Cycle-safe.
         """
         folders = await self.list_folders()
         by_id = {f.id: f for f in folders}

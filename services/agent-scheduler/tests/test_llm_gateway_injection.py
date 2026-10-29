@@ -2,10 +2,9 @@
 
 Covers:
 * ``_fetch_tenant_virtual_key`` — key found, key absent, gateway unreachable.
-* ``create_run`` end-to-end — with the default enforcer enabled, sandbox
-  spawn is fail-closed unless the gateway returns a tenant virtual key.
-* Direct provider keys are blanked from the sandbox in gateway mode.
-* RUNTIME_EXTENSIONS default contains llm_gateway_enforcer.
+* ``create_run`` end-to-end — sandbox spawn is fail-closed unless the
+  gateway returns a tenant virtual key (gateway mode is unconditional).
+* No direct provider key ever reaches the sandbox.
 """
 
 from __future__ import annotations
@@ -13,7 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -24,6 +23,7 @@ from agent_scheduler.api.v1.runs import (
     _mint_run_virtual_key,
     _revoke_run_virtual_keys,
 )
+from agent_scheduler.config import Settings
 
 # Mirrors conftest._TENANT — the tenant header the gateway injects.
 _TENANT = "tnt_01J5TEST00000000000000TNT1"
@@ -37,8 +37,6 @@ def _read_run_secrets(
         Path(workspace_base) / tenant_id / session_id / run_id / ".secrets.json"
     )
     return json.loads(path.read_text(encoding="utf-8"))
-from agent_scheduler.config import Settings
-
 
 # ---------------------------------------------------------------------------
 # _fetch_tenant_virtual_key unit tests
@@ -51,7 +49,7 @@ class _MockHTTPX:
         self._status_code = status_code
         self._body = body
 
-    async def __aenter__(self) -> "_MockHTTPX":
+    async def __aenter__(self) -> _MockHTTPX:
         return self
 
     async def __aexit__(self, *args: Any) -> None:
@@ -344,16 +342,16 @@ def _make_gateway_client(status_code: int, body: Any):
     return _FakeClient
 
 
-def test_create_run_rejects_missing_virtual_key_when_enforcer_enabled(
+def test_create_run_rejects_missing_virtual_key(
     settings: Settings,
     runtime,
     mock_docker_client: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
     auth_headers: dict,
 ) -> None:
-    """Default enforcer mode refuses to start when the tenant has no gateway key."""
-    from agent_scheduler.main import create_app
+    """create_run refuses to start when the tenant has no gateway key."""
     from agent_scheduler.api.dependencies import get_runtime
+    from agent_scheduler.main import create_app
 
     monkeypatch.setattr(
         httpx,
@@ -390,8 +388,8 @@ def test_create_run_injects_virtual_key_when_gateway_has_one(
     auth_headers: dict,
 ) -> None:
     """LLM_VIRTUAL_KEY must be injected when the gateway returns a key."""
-    from agent_scheduler.main import create_app
     from agent_scheduler.api.dependencies import get_runtime
+    from agent_scheduler.main import create_app
 
     monkeypatch.setattr(
         httpx,
@@ -417,8 +415,8 @@ def test_create_run_injects_virtual_key_when_gateway_has_one(
 
     assert resp.status_code == 201, resp.text
     env = mock_docker_client.containers.run.call_args.kwargs["environment"]
-    # The virtual key + (blanked) provider key are secrets → delivered via
-    # /workspace/.secrets.json, never the container env.
+    # The virtual key is a secret → delivered via /workspace/.secrets.json,
+    # never the container env.  No direct provider key exists at all.
     assert "LLM_VIRTUAL_KEY" not in env
     assert "LLM_API_KEY" not in env
     secrets = _read_run_secrets(
@@ -428,10 +426,10 @@ def test_create_run_injects_virtual_key_when_gateway_has_one(
         run_id="run_01J5RUN0000000000000GW011",
     )
     assert secrets["LLM_VIRTUAL_KEY"] == "vk-tenant-injected"
-    assert secrets["LLM_API_KEY"] == ""
+    assert "LLM_API_KEY" not in secrets
     # Non-secret gateway routing stays in env.
     assert "LLM_GATEWAY_URL" in env
-    assert "llm_gateway_enforcer" in env.get("RUNTIME_EXTENSIONS", "")
+    assert "RUNTIME_EXTENSIONS" not in env
 
 
 def _make_minting_gateway_client(
@@ -483,8 +481,8 @@ def test_create_run_prefers_minted_ephemeral_key(
 ) -> None:
     """When the gateway mints an ephemeral key, the sandbox gets THAT key,
     never the long-lived tenant key."""
-    from agent_scheduler.main import create_app
     from agent_scheduler.api.dependencies import get_runtime
+    from agent_scheduler.main import create_app
 
     monkeypatch.setattr(
         httpx,
@@ -533,8 +531,8 @@ def test_create_run_falls_back_to_tenant_key_when_mint_unavailable(
 ) -> None:
     """Older gateway (mint 404) → fall back to the long-lived tenant key so
     runs don't break."""
-    from agent_scheduler.main import create_app
     from agent_scheduler.api.dependencies import get_runtime
+    from agent_scheduler.main import create_app
 
     monkeypatch.setattr(
         httpx,
@@ -580,8 +578,8 @@ def test_create_run_rejects_when_gateway_down(
     auth_headers: dict,
 ) -> None:
     """Gateway outage must not fall back to direct provider credentials."""
-    from agent_scheduler.main import create_app
     from agent_scheduler.api.dependencies import get_runtime
+    from agent_scheduler.main import create_app
 
     class _PartiallyDown:
         def __init__(self, *args, **kw):

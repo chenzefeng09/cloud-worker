@@ -40,10 +40,6 @@ import httpx
 from agent_scheduler.config import SANDBOX_SERVICE_SCOPES, Settings
 from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
 from agent_scheduler.services import artifact_store, egress_policy
-from agent_scheduler.services.feature_flag import (
-    evaluate_flag,
-    runtime_extensions_for_run,
-)
 from agent_scheduler.services.runtime import RUNTIME_REGISTRY
 from agent_scheduler.services.skill_cache import MountedSkill, SkillCache
 
@@ -63,11 +59,11 @@ _MAX_TASK_LEN = 32 * 1024
 # run IDs, model, egress mode, scopes) stay in ``env``.
 #
 # KEEP IN SYNC with ``docker_runtime._SECRET_ENV_KEYS`` and the worker's
-# ``runtime_worker.__main__._SECRET_FILE_KEYS`` (same 7 keys).  We duplicate
+# ``SECRET_FILE_KEYS`` in ``worker-claude-sdk/src/main.ts``.  We duplicate
 # rather than import from ``docker_runtime`` on purpose: that module imports
 # the ``docker`` SDK at top level, and the Cube (microVM) path must not take a
 # hard dependency on Docker being installed.  The Cube env only ever sets a
-# subset of these (LLM_API_KEY / FOUNDATION_API_TOKEN, and conditionally
+# subset of these (FOUNDATION_API_TOKEN, and conditionally
 # TOOL_BROKER_LEASE / LLM_VIRTUAL_KEY); ``pop`` over the full set is safe since
 # absent keys are simply skipped.
 _SECRET_ENV_KEYS: frozenset[str] = frozenset(
@@ -75,7 +71,6 @@ _SECRET_ENV_KEYS: frozenset[str] = frozenset(
         "FOUNDATION_API_TOKEN",
         "TOOL_BROKER_LEASE",
         "LLM_VIRTUAL_KEY",
-        "LLM_API_KEY",
         "S3_ACCESS_KEY_ID",
         "S3_SECRET_ACCESS_KEY",
         "REDIS_URL",
@@ -359,18 +354,11 @@ class CubeSandboxRuntime:
             task = task[: _MAX_TASK_LEN - 32] + "\n…[truncated by scheduler]"
 
         client = self._require_client()
-        extensions = {
-            e.strip()
-            for e in (self._settings.runtime_extensions or "").split(",")
-            if e.strip()
-        }
-        gateway_mode = "llm_gateway_enforcer" in extensions
-        if gateway_mode and not llm_virtual_key:
+        if not llm_virtual_key:
             raise SandboxSpawnError(
-                "llm_gateway_enforcer is enabled but no tenant LLM virtual key "
-                "was provided; refusing direct-connect fallback",
+                "no tenant LLM virtual key was provided; refusing to spawn a "
+                "worker without gateway credentials",
             )
-        sandbox_llm_api_key = "" if gateway_mode else self._settings.llm_api_key
 
         # CubeVS egress allowlist (broker mode).  Parse the operator-provided
         # CIDR list now so the fail-closed guard runs alongside the other
@@ -469,28 +457,15 @@ class CubeSandboxRuntime:
         )
         public_llm_gateway = _rewrite_to_public(raw_llm_gateway, self._public_host)
         public_tool_broker = _rewrite_to_public(raw_tool_broker, self._public_host)
-        # Canvas v2 (Phase B): append ``canvas_tool`` to RUNTIME_EXTENSIONS when
-        # the per-run ``enable_canvas_tool`` flag is on (failure-open — flag off
-        # leaves the base extensions unchanged).
-        runtime_extensions = runtime_extensions_for_run(
-            base_extensions=self._settings.runtime_extensions,
-            tenant_id=tenant_id,
-            user_id=user_id,
-            flag_url=self._settings.feature_flag_url,
-            timeout_ms=self._settings.feature_flag_timeout_ms,
-        )
         env = {
-            "LLM_API_KEY": sandbox_llm_api_key,
             "LLM_MODEL": self._settings.llm_model,
-            "LLM_PROVIDER": self._settings.llm_provider,
-            "LLM_BASE_URL": self._settings.llm_base_url,
             "LLM_GATEWAY_URL": public_llm_gateway,
             "FOUNDATION_API_URL": self._settings.foundation_api_url,
             "FOUNDATION_API_TOKEN": foundation_token,
             "FOUNDATION_TENANT_ID": tenant_id,
             "FOUNDATION_USER_ID": user_id,
             # Effective clearance (min(user, workspace)); mirrors the docker
-            # runtime so knowledge_tool / the broker façade enforce the same
+            # runtime so the worker's knowledge tool / the broker façade enforce the same
             # visibility gate under cube.
             "FOUNDATION_USER_CLEARANCE": user_clearance,
             "OTEL_EXPORTER_OTLP_ENDPOINT": self._settings.otel_exporter_endpoint,
@@ -500,7 +475,6 @@ class CubeSandboxRuntime:
             "SKILL_STORE_URL": service_env["SKILL_STORE_URL"],
             "WEB_FETCH_GATEWAY_URL": service_env["WEB_FETCH_GATEWAY_URL"],
             "DLP_URL": service_env["DLP_URL"],
-            "RUNTIME_EXTENSIONS": runtime_extensions,
             "FOUNDATION_SERVICE_SCOPES": SANDBOX_SERVICE_SCOPES,
             "RUN_ID": run_id,
             # The Claude Agent SDK CLI tries to phone home (Statsig / BigQuery 1P
@@ -532,10 +506,9 @@ class CubeSandboxRuntime:
         # interface to any same-uid in-VM tool subprocess.  ``pop`` preserves
         # the conditional semantics above: a key lands in the file only if it
         # was present in ``env`` (so an absent TOOL_BROKER_LEASE / LLM_VIRTUAL_KEY
-        # is absent here too), while LLM_API_KEY — always present, possibly ""
-        # under the gateway enforcer — is carried verbatim.  See
+        # is absent here too).  See
         # ``docker_runtime`` (same pattern) and the worker's
-        # ``_load_secret_file_into_env`` / ``_SECRET_FILE_KEYS``.
+        # ``loadSecretFileIntoEnv`` / ``SECRET_FILE_KEYS`` (worker-claude-sdk).
         secret_file_payload = {
             k: env.pop(k) for k in _SECRET_ENV_KEYS if k in env
         }
@@ -610,34 +583,12 @@ class CubeSandboxRuntime:
         )
         metadata["host-mount"] = json.dumps(host_mounts)
 
-        # Phase 5: pick the worker image per-run via feature flag.  Failure-open
-        # (inside ``evaluate_flag``) falls back to the AgentScope template, so
-        # the agentscope path stays byte-for-byte unchanged.  Unlike docker we
-        # do NOT rely on an empty cmd for the Claude SDK image: CubeSandbox's
-        # behaviour with an empty cmd is unspecified, so we pass the equivalent
-        # of the image ENTRYPOINT explicitly.
-        use_claude_sdk = evaluate_flag(
-            "enable_claude_sdk_worker",
-            tenant_id=tenant_id,
-            user_id=user_id,
-            flag_url=self._settings.feature_flag_url,
-            timeout_ms=self._settings.feature_flag_timeout_ms,
-        )
-        # Global config fallback: when the per-run flag is False/unreachable, a
-        # deployment can still route every run to the Claude SDK worker via
-        # ``SCHEDULER_USE_CLAUDE_SDK_WORKER_DEFAULT``.  The flag wins when it
-        # returns True; the default only applies on the False branch.  Committed
-        # default is False, so this is a no-op for existing behaviour.
-        if not use_claude_sdk:
-            use_claude_sdk = self._settings.use_claude_sdk_worker_default
-        selected_image = (
-            self._settings.claude_sdk_image
-            if use_claude_sdk
-            else self._settings.agent_image
-        )
+        # CubeSandbox's behaviour with an empty cmd is unspecified, so the
+        # worker's image ENTRYPOINT is passed explicitly (``selected_cmd``).
+        selected_image = self._settings.agent_image
         selected_template = selected_image
         memory_tier = ""
-        if use_claude_sdk and memory_limit:
+        if memory_limit:
             try:
                 memory_tier = (
                     "large"
@@ -661,11 +612,7 @@ class CubeSandboxRuntime:
                 if tier_template:
                     selected_template = tier_template
                     metadata["agent-platform.memory-tier"] = memory_tier
-        selected_cmd = (
-            ["node", "/app/dist/main.js"]
-            if use_claude_sdk
-            else ["python", "-m", "agentscope_ext.runtime_worker"]
-        )
+        selected_cmd = ["node", "/app/dist/main.js"]
         logger.info(
             "worker image selected",
             extra={
@@ -675,7 +622,6 @@ class CubeSandboxRuntime:
                 "template": selected_template,
                 "memory_limit": memory_limit,
                 "memory_tier": memory_tier,
-                "claude_sdk": use_claude_sdk,
             },
         )
 

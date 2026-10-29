@@ -18,7 +18,7 @@ Auth + RLS mirror the messages endpoints: every route carries a
 session is tenant-bound (RLS) via ``TDbSession``.  Ownership of a canvas is
 enforced in the service by validating the owning session (soft-deleted /
 cross-tenant sessions raise NOT_FOUND).  Errors are RFC 9457 problem+json with
-``AGENT.SESSION.CANVAS.*`` codes and Chinese ``user_message`` (see errors.py).
+``AGENT.SESSION.CANVAS.*`` codes and English ``user_message`` (see errors.py).
 """
 
 from __future__ import annotations

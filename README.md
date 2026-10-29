@@ -74,10 +74,12 @@ management, and platform governance (App review, skills, MCP, knowledge, sandbox
 - **Sandboxed agent runs** — every run gets a fresh, isolated workspace. Two runtimes:
   Docker (dev) and CubeSandbox microVMs with kernel-level isolation (production, see
   [ADR 0001](docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md)).
-- **Two interchangeable agent workers** — a TypeScript worker built on the
-  [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview), and a Python
-  worker built on [AgentScope 2.x](https://github.com/agentscope-ai/agentscope)
-  (see [ADR 0002](docs/adr/0002-agent-kernel-agentscope-over-openhands.md)).
+- **One agent runtime** — every run is executed by a TypeScript worker built on the
+  [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview), inside a
+  sandbox. Model traffic goes through the foundation LLM gateway with a per-tenant
+  virtual key; the worker's adapter translates Anthropic Messages to the gateway's
+  OpenAI-compatible API, so the model vendor stays a gateway choice (see
+  [ADR 0003](docs/adr/0003-claude-agent-sdk-sole-agent-runtime.md)).
 - **Human-in-the-loop** — agents can pause mid-run to ask a question or request
   confirmation; cards survive a page reload and resume the run in place.
 
@@ -92,15 +94,17 @@ management, and platform governance (App review, skills, MCP, knowledge, sandbox
 - **MCP** — per-tenant registry of MCP servers with custom headers, auth (including
   OAuth), timeouts and tool allow/deny filters. A broker fronts them so sandboxes never
   hold tenant credentials.
-- **Knowledge** — document → chunk → embedding → pgvector ingest pipeline, queryable as
-  a tool from inside a run.
+- **Knowledge** — document → chunk → embedding → pgvector ingest pipeline. The
+  orchestrator prefetches the tenant's top-k hits for each run and appends them to the
+  agent's system prompt (an on-demand search tool is not available yet).
 
 **Documents & workspace**
 
 - **Workspaces and files** — session-bound workspaces, `@`-mention file completion, and
   inline preview for PDF / Word / Excel / PowerPoint / archives.
-- **Canvas** — a document surface the model can create and revise mid-conversation,
-  including executable HTML previewed in a sandboxed iframe.
+- **Canvas** — a document surface for drafts and executable HTML previewed in a
+  sandboxed iframe. Users create and edit canvases; the agent cannot yet create them
+  mid-run (see the known gaps in ADR 0003).
 - **Artifacts** — run outputs surfaced as downloadable cards in the transcript.
 
 **Operations**
@@ -197,8 +201,8 @@ spawns one sandbox per run             pre-warmed CubeSandbox microVMs
               ▼
         ┌───────────────────────────────────────────────┐
         │  agent worker inside the sandbox              │
-        │  • worker-claude-sdk   (TS, Claude Agent SDK) │
-        │  • agentscope-ext      (Py, AgentScope 2.x)   │
+        │  worker-claude-sdk  (TS, Claude Agent SDK)    │
+        │  adapter → foundation llm-gateway (vkey)      │
         └───────┬───────────────────────────┬───────────┘
                 │                           │
                 ▼                           ▼
@@ -219,7 +223,7 @@ browser.
 |---|---|---|
 | `web` | 5173 | React 19 SPA — chat, apps, library, workspace, admin console |
 | `bff` | 8005 | Auth proxy, API aggregation, SSE relay, admin fan-out |
-| `session-orchestrator` | 8006 | Sessions, messages, runs, canvas, workspaces, inline tool loop |
+| `session-orchestrator` | 8006 | Sessions, messages, runs, canvas, workspaces, knowledge prefetch |
 | `agent-scheduler` | 8007 | Spawns sandbox containers/microVMs, injects credentials |
 | `sandbox-pool` | 8008 | Pre-warmed CubeSandbox microVM pool |
 | `mcp-registry` | 8010 | Tenant MCP server registry (encrypted secrets, tool filters) |
@@ -239,11 +243,8 @@ cloud-worker/
 ├── apps/web/              React 19 SPA (Vite, Zustand, Tailwind)
 │   └── src/admin/         28-page admin console
 ├── services/              FastAPI services (Python 3.12, Poetry) — see table above
-├── worker-claude-sdk/     TypeScript agent worker — Claude Agent SDK
-├── agentscope-ext/        Python agent worker + AgentScope extensions
-│                          (canvas/knowledge/web-fetch tools, gateway enforcer,
-│                           MCP tenant injector, skills loader, audit sink)
-├── sandbox-images/        Sandbox Dockerfiles — base / office / MATLAB tiers
+├── worker-claude-sdk/     TypeScript agent worker — Claude Agent SDK (the only runtime)
+├── sandbox-images/        Sandbox Dockerfiles — claude-sdk / claude-sdk-cube / MATLAB
 ├── libs/                  Shared client libraries (feature flags, quota guard)
 ├── contracts/             OpenAPI 3.1 specs + worker wire contract
 ├── deploy/
@@ -329,7 +330,8 @@ that matter most:
 | `FOUNDATION_SDK_PATH` | `../../../saas-foundation/sdks/python` | Sibling SDK source, injected as a build context |
 | `BFF_COOKIE_SECRET` | *(empty — you must set it)* | Session cookie signing key, ≥32 chars |
 | `SCHEDULER_RUNTIME` | `docker` | `docker` for dev, `cube` for microVM isolation |
-| `CLAUDE_SDK_IMAGE` / `AGENT_IMAGE` | see `.env.example` | Sandbox image per worker flavor |
+| `AGENT_IMAGE` | `ghcr.io/agent-platform/claude-sdk-sandbox:0.1` | Sandbox image (Claude Agent SDK worker) |
+| `LLM_MODEL` | see `.env.example` | Default model routed through the foundation LLM gateway |
 | `POOL_IDLE_LOW` / `POOL_IDLE_HIGH` / `POOL_MAX_TOTAL` | `2` / `10` / `50` | microVM pool sizing |
 | `CUBE_CONTROLLER_URL`, `CUBE_TLS_MODE`, `CUBE_API_KEY` | — | CubeSandbox controller (required when `SCHEDULER_RUNTIME=cube`) |
 
@@ -375,13 +377,15 @@ changing service code, rebuild with `make agent-up` (which passes `--build`).
 
 ## Sandbox images
 
-`sandbox-images/` builds the images an agent run executes inside, in layered tiers:
+`sandbox-images/` builds the images an agent run executes inside. All of them run the
+Claude Agent SDK worker (`node /app/dist/main.js`, non-root uid 1000):
 
 ```
-base            Python 3.12 · agent worker · non-root uid 1000
-                office document libs · scientific Python · Noto CJK fonts
-  └─ office     + LibreOffice headless (format conversion, e.g. docx → pdf)
-       └─ matlab  + MATLAB (Control System / Aerospace toolbox layers)
+claude-sdk                Docker runtime (dev) · Node 22 + Python office/data libs
+claude-sdk-cube           CubeSandbox-native · scientific Python · CMake/native build tools
+  └─ claude-sdk-cube-matlab   + MATLAB 2019b (bring-your-own license)
+       └─ control / aerospace toolbox layers (build scripts)
+claude-sdk-cube-worker-refresh   swap only the worker into an existing Cube image
 ```
 
 **The default image already does office work — no extra tier, no license needed.**
@@ -394,10 +398,6 @@ boxes. All of it is open-source and installed from PyPI/apt. The build asserts t
 imports and the CJK font resolve, so a broken image fails at build time rather than
 mid-run.
 
-The separate `office` tier adds **LibreOffice headless** on top — reach for it only when
-you need true format *conversion* (docx → pdf, xlsx → csv via `unoconv`) rather than
-document generation.
-
 ```bash
 make build-claude-sdk-image
 ```
@@ -408,11 +408,11 @@ make build-claude-sdk-cube-image
 
 > **MATLAB tiers are bring-your-own.** No MATLAB installer media, license file or
 > binaries are included in this repository, and none may be redistributed. The
-> `matlab*.Dockerfile` targets expect you to point `MATLAB_ISO_DIR` at your own
+> `claude-sdk-cube-matlab*` targets expect you to point `MATLAB_ISO_DIR` at your own
 > legitimately licensed installation media. Nothing else in the platform depends on
 > them — skip these targets entirely and everything above still works.
 
-See [sandbox-images/README.md](sandbox-images/README.md) for the full tier matrix.
+See [sandbox-images/README.md](sandbox-images/README.md) for the full image matrix.
 
 ---
 
@@ -449,7 +449,8 @@ rather than opening a public issue.
 | Topic | Document |
 |---|---|
 | Sandbox runtime decision | [ADR 0001 — CubeSandbox default, Kata fallback](docs/adr/0001-sandbox-runtime-cube-default-kata-fallback.md) |
-| Agent kernel decision | [ADR 0002 — AgentScope over OpenHands](docs/adr/0002-agent-kernel-agentscope-over-openhands.md) |
+| Agent runtime decision | [ADR 0003 — Claude Agent SDK as the sole agent runtime](docs/adr/0003-claude-agent-sdk-sole-agent-runtime.md) |
+| Agent kernel decision (superseded) | [ADR 0002 — AgentScope over OpenHands](docs/adr/0002-agent-kernel-agentscope-over-openhands.md) |
 | Sandbox runtime design | [docs/design/b-m2-sandbox-runtime-v1.md](docs/design/b-m2-sandbox-runtime-v1.md) |
 | Consuming the foundation SDK | [docs/foundation-sdk-consumption.md](docs/foundation-sdk-consumption.md) |
 | Admin console spec | [docs/admin-console-v2-spec.md](docs/admin-console-v2-spec.md) |
@@ -498,8 +499,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ```
 
-Third-party components keep their own licenses. Notably, this project integrates
-[AgentScope](https://github.com/agentscope-ai/agentscope) (Apache 2.0) and the
+Third-party components keep their own licenses. Notably, the agent worker depends on the
 [Claude Agent SDK](https://www.npmjs.com/package/@anthropic-ai/claude-agent-sdk), whose
 terms are set by Anthropic. MATLAB, if you build those image tiers, requires your own
 license from MathWorks.

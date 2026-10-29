@@ -119,7 +119,7 @@ describe('canvasStore', () => {
   it('requestEdit 409 does not set a suggestion, sets an error, and returns null', async () => {
     const canvas = makeCanvas({ current_version: 2 });
     useCanvasStore.getState().setCanvas(canvas);
-    mockEdit.mockRejectedValueOnce({ status: 409, message: '请刷新' });
+    mockEdit.mockRejectedValueOnce({ status: 409, message: 'Please refresh' });
 
     const result = await useCanvasStore.getState().requestEdit('cvs_1', 'ses_1', {
       instruction: '润色',
@@ -148,7 +148,7 @@ describe('canvasStore', () => {
   it('saveManual 409 sets an error and returns null', async () => {
     const canvas = makeCanvas({ current_version: 5 });
     useCanvasStore.getState().setCanvas(canvas);
-    mockSaveVersion.mockRejectedValueOnce({ status: 409, message: '请刷新' });
+    mockSaveVersion.mockRejectedValueOnce({ status: 409, message: 'Please refresh' });
 
     const result = await useCanvasStore
       .getState()

@@ -4,7 +4,7 @@
 class OrchestratorError(Exception):
     """Base error for session-orchestrator.
 
-    ``user_message`` is an optional Chinese, user-facing string.  When present
+    ``user_message`` is an optional English, user-facing string.  When present
     the exception handler surfaces it alongside the RFC 9457 body so the
     frontend can render it directly without stringifying the whole problem
     (see BFF ``canvas.py`` for the same convention).  It defaults to ``detail``
@@ -70,7 +70,7 @@ class WorkspaceNotFoundError(OrchestratorError):
             f"Workspace {workspace_id} not found",
             code="AGENT.WORKSPACE.NOT_FOUND",
             status=404,
-            user_message="工作区不存在或已被删除。",
+            user_message="This workspace does not exist or has been deleted.",
         )
 
 
@@ -80,7 +80,7 @@ class WorkspaceFileNotFoundError(OrchestratorError):
             f"Workspace file {file_id} not found",
             code="AGENT.WORKSPACE.FILE_NOT_FOUND",
             status=404,
-            user_message="工作区文件不存在或已被删除。",
+            user_message="This workspace file does not exist or has been deleted.",
         )
 
 
@@ -90,7 +90,7 @@ class WorkspaceDefaultDeleteError(OrchestratorError):
             f"Workspace {workspace_id} is the default workspace and cannot be deleted",
             code="AGENT.WORKSPACE.DEFAULT_DELETE",
             status=409,
-            user_message="默认工作区不可删除。",
+            user_message="The default workspace cannot be deleted.",
         )
 
 
@@ -103,7 +103,7 @@ class CanvasNotFoundError(OrchestratorError):
             f"Canvas {canvas_id} not found",
             code="AGENT.SESSION.CANVAS.NOT_FOUND",
             status=404,
-            user_message="画布不存在或已被删除。",
+            user_message="This canvas does not exist or has been deleted.",
         )
 
 
@@ -113,7 +113,7 @@ class CanvasVersionNotFoundError(OrchestratorError):
             f"Canvas {canvas_id} has no version {version}",
             code="AGENT.SESSION.CANVAS.VERSION_NOT_FOUND",
             status=404,
-            user_message="指定的画布版本不存在。",
+            user_message="The requested canvas version does not exist.",
         )
 
 
@@ -123,7 +123,7 @@ class CanvasVersionConflictError(OrchestratorError):
             f"base_version {base_version} != current_version {current_version}",
             code="AGENT.SESSION.CANVAS.VERSION_CONFLICT",
             status=409,
-            user_message="画布已被更新，请刷新后重试。",
+            user_message="The canvas has been updated. Please refresh and try again.",
         )
 
 
@@ -133,7 +133,7 @@ class CanvasSuggestionResolvedError(OrchestratorError):
             f"Suggestion {suggestion_id} already {status_value}",
             code="AGENT.SESSION.CANVAS.SUGGESTION_RESOLVED",
             status=409,
-            user_message="该修改建议已被处理，请勿重复操作。",
+            user_message="This suggestion has already been handled.",
         )
 
 

@@ -1,14 +1,14 @@
 /**
- * ProfilePage — display-name rename flow tests (账户 tab → 个人信息).
+ * ProfilePage — display-name rename flow tests (Account tab → Profile).
  *
  * Covers handleSaveProfile + the edit-mode handlers (enterProfileEdit /
  * cancelProfileEdit). The rename headline calls api.auth.updateProfile(
  * { display_name }) → PATCH /auth/me, then setLiveProfile(updated) and store
  * setUserProfile(updated).
  *
- * 1. SUCCESS — 编辑 → change 显示名称 → 保存更改: updateProfile called with the
- *    trimmed value, field returns read-only showing the new name, 已保存 shown.
- * 2. FAILURE — updateProfile rejects: stays in edit mode, 保存失败 shown.
+ * 1. SUCCESS — Edit → change Display name → Save changes: updateProfile called with the
+ *    trimmed value, field returns read-only showing the new name, Saved shown.
+ * 2. FAILURE — updateProfile rejects: stays in edit mode, Save failed shown.
  * 3. NO-OP — empty or unchanged name: exits edit WITHOUT calling updateProfile.
  * 4. PERMISSION-SURVIVES-SAVE (B1 guard) — updateProfile resolves with a profile
  *    carrying `permissions`; setUserProfile is called with an object that still
@@ -31,7 +31,7 @@ vi.mock('../lib/workspaceContext', () => ({
 
 // Mock i18n — the page reads useTranslation() for the 语言 switcher
 vi.mock('../i18n', () => ({
-  useTranslation: () => ({ lang: 'zh', setLang: vi.fn(), t: (k: string) => k }),
+  useTranslation: () => ({ lang: 'en', setLang: vi.fn(), t: (k: string) => k }),
 }));
 
 const mockSetUserProfile = vi.fn();
@@ -135,7 +135,7 @@ const BASE_PROFILE = {
   roles: [],
 };
 
-// The 显示名称 input is the first text input in the 个人信息 section. We grab it
+// The Display name input is the first text input in the Profile section. We grab it
 // by its current display value (the read-only field shows the live name).
 function nameInput(currentValue: string): HTMLInputElement {
   return screen.getByDisplayValue(currentValue) as HTMLInputElement;
@@ -164,47 +164,47 @@ describe('ProfilePage — display-name rename flow', () => {
     // Wait for liveProfile (api.auth.me) to resolve so the field shows the real name.
     await waitFor(() => expect(nameInput('Test User')).toBeInTheDocument());
 
-    await userEvent.click(screen.getByRole('button', { name: '编辑' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
 
     const input = nameInput('Test User');
     await userEvent.clear(input);
     await userEvent.type(input, '  Renamed User  ');
 
-    await userEvent.click(screen.getByRole('button', { name: '保存更改' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save changes' }));
 
     await waitFor(() => {
       expect(mockUpdateProfile).toHaveBeenCalledWith({ display_name: 'Renamed User' });
     });
 
-    // Back to read-only: the 编辑 button is shown again (保存更改 is gone) and the
+    // Back to read-only: the Edit button is shown again (Save changes is gone) and the
     // field now shows the new name.
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: '编辑' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
     });
-    expect(screen.queryByRole('button', { name: '保存更改' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Save changes' })).not.toBeInTheDocument();
     expect(nameInput('Renamed User')).toBeInTheDocument();
-    expect(screen.getByText('已保存')).toBeInTheDocument();
+    expect(screen.getByText('Saved')).toBeInTheDocument();
   });
 
-  it('stays in edit mode and shows 保存失败 when updateProfile rejects', async () => {
+  it('stays in edit mode and shows Save failed when updateProfile rejects', async () => {
     mockUpdateProfile.mockRejectedValue(new Error('boom'));
     render(<ProfilePage />);
 
     await waitFor(() => expect(nameInput('Test User')).toBeInTheDocument());
 
-    await userEvent.click(screen.getByRole('button', { name: '编辑' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
 
     const input = nameInput('Test User');
     await userEvent.clear(input);
     await userEvent.type(input, 'New Name');
 
-    await userEvent.click(screen.getByRole('button', { name: '保存更改' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save changes' }));
 
     await waitFor(() => {
-      expect(screen.getByText('保存失败')).toBeInTheDocument();
+      expect(screen.getByText('Save failed')).toBeInTheDocument();
     });
-    // Still in edit mode: 保存更改 button remains.
-    expect(screen.getByRole('button', { name: '保存更改' })).toBeInTheDocument();
+    // Still in edit mode: Save changes button remains.
+    expect(screen.getByRole('button', { name: 'Save changes' })).toBeInTheDocument();
   });
 
   it('does not call updateProfile when the name is unchanged (no-op exits edit)', async () => {
@@ -212,12 +212,12 @@ describe('ProfilePage — display-name rename flow', () => {
 
     await waitFor(() => expect(nameInput('Test User')).toBeInTheDocument());
 
-    await userEvent.click(screen.getByRole('button', { name: '编辑' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
     // Save without changing anything.
-    await userEvent.click(screen.getByRole('button', { name: '保存更改' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save changes' }));
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: '编辑' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
     });
     expect(mockUpdateProfile).not.toHaveBeenCalled();
   });
@@ -227,13 +227,13 @@ describe('ProfilePage — display-name rename flow', () => {
 
     await waitFor(() => expect(nameInput('Test User')).toBeInTheDocument());
 
-    await userEvent.click(screen.getByRole('button', { name: '编辑' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
     const input = nameInput('Test User');
     await userEvent.clear(input);
-    await userEvent.click(screen.getByRole('button', { name: '保存更改' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save changes' }));
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: '编辑' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
     });
     expect(mockUpdateProfile).not.toHaveBeenCalled();
   });
@@ -249,11 +249,11 @@ describe('ProfilePage — display-name rename flow', () => {
 
     await waitFor(() => expect(nameInput('Test User')).toBeInTheDocument());
 
-    await userEvent.click(screen.getByRole('button', { name: '编辑' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
     const input = nameInput('Test User');
     await userEvent.clear(input);
     await userEvent.type(input, 'Perms User');
-    await userEvent.click(screen.getByRole('button', { name: '保存更改' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save changes' }));
 
     await waitFor(() => {
       expect(mockSetUserProfile).toHaveBeenCalled();
@@ -262,13 +262,13 @@ describe('ProfilePage — display-name rename flow', () => {
     expect(passed.permissions).toEqual(['admin.users.read', 'admin.billing.read']);
   });
 
-  it('saves on Enter key in the 显示名称 input', async () => {
+  it('saves on Enter key in the Display name input', async () => {
     mockUpdateProfile.mockResolvedValue({ ...BASE_PROFILE, display_name: 'Enter Name' });
     render(<ProfilePage />);
 
     await waitFor(() => expect(nameInput('Test User')).toBeInTheDocument());
 
-    await userEvent.click(screen.getByRole('button', { name: '编辑' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
     const input = nameInput('Test User');
     await userEvent.clear(input);
     await userEvent.type(input, 'Enter Name{Enter}');
@@ -278,20 +278,20 @@ describe('ProfilePage — display-name rename flow', () => {
     });
   });
 
-  it('reverts the edited name when 取消 is clicked', async () => {
+  it('reverts the edited name when Cancel is clicked', async () => {
     render(<ProfilePage />);
 
     await waitFor(() => expect(nameInput('Test User')).toBeInTheDocument());
 
-    await userEvent.click(screen.getByRole('button', { name: '编辑' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Edit' }));
     const input = nameInput('Test User');
     await userEvent.clear(input);
     await userEvent.type(input, 'Discarded');
 
-    await userEvent.click(screen.getByRole('button', { name: '取消' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
 
     await waitFor(() => {
-      expect(screen.getByRole('button', { name: '编辑' })).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
     });
     // Field reverted to the live name, edit not saved.
     expect(nameInput('Test User')).toBeInTheDocument();

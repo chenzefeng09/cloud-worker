@@ -533,7 +533,7 @@ export function ArticleCanvasPanel({
           value={draft.kind}
           onChange={(e) => handleKindChange(e.target.value as CanvasObjectKind)}
           className="border border-line bg-surface rounded-sm px-2 py-1 text-[12px] text-ink focus:outline-none focus:border-accent"
-          title="对象类型"
+          title="Object type"
         >
           {CANVAS_OBJECTS.map((item) => (
             <option key={item.kind} value={item.kind}>
@@ -545,23 +545,23 @@ export function ArticleCanvasPanel({
           value={draft.title}
           onChange={(e) => updateDraft({ title: e.target.value })}
           className="flex-1 min-w-0 bg-transparent border-none outline-none text-[13px] font-semibold text-ink"
-          aria-label="画布标题"
+          aria-label="Canvas title"
         />
         <button
           type="button"
           onClick={() => copy(draft.content)}
           className="cw-btn cw-btn-ghost cw-btn-sm"
-          title="复制"
-          aria-label="复制"
+          title="Copy"
+          aria-label="Copy"
         >
-          {copied ? <span className="font-mono text-[10px]">已复制</span> : <CopyIcon />}
+          {copied ? <span className="font-mono text-[10px]">Copied</span> : <CopyIcon />}
         </button>
         <button
           type="button"
           onClick={() => setFullScreen((v) => !v)}
           className="cw-btn cw-btn-ghost cw-btn-sm"
-          title={fullScreen ? '退出全屏' : '全屏'}
-          aria-label={fullScreen ? '退出全屏' : '全屏'}
+          title={fullScreen ? 'Exit full screen' : 'Full screen'}
+          aria-label={fullScreen ? 'Exit full screen' : 'Full screen'}
         >
           {fullScreen ? '□' : '⛶'}
         </button>
@@ -569,17 +569,17 @@ export function ArticleCanvasPanel({
           type="button"
           onClick={onClose}
           className="cw-btn cw-btn-ghost cw-btn-sm font-mono text-[12px] text-dim leading-none px-1.5 py-0.5"
-          aria-label="关闭画布"
+          aria-label="Close canvas"
         >
           ✕
         </button>
       </div>
 
       <div className="flex items-center gap-1 px-3 py-2 border-b border-line-2 shrink-0 overflow-x-auto">
-        <button type="button" className="cw-btn cw-btn-ghost cw-btn-sm" onClick={undo} disabled={history.length === 0} title="撤销">
+        <button type="button" className="cw-btn cw-btn-ghost cw-btn-sm" onClick={undo} disabled={history.length === 0} title="Undo">
           ↶
         </button>
-        <button type="button" className="cw-btn cw-btn-ghost cw-btn-sm" onClick={redo} disabled={future.length === 0} title="恢复">
+        <button type="button" className="cw-btn cw-btn-ghost cw-btn-sm" onClick={redo} disabled={future.length === 0} title="Redo">
           ↷
         </button>
         <span className="h-5 w-px bg-line mx-1 shrink-0" />
@@ -588,7 +588,7 @@ export function ArticleCanvasPanel({
           className="cw-btn cw-btn-ghost cw-btn-sm font-semibold"
           onMouseDown={keepEditorSelection}
           onClick={() => applyRichCommand('bold')}
-          title="加粗"
+          title="Bold"
         >
           B
         </button>
@@ -597,7 +597,7 @@ export function ArticleCanvasPanel({
           className="cw-btn cw-btn-ghost cw-btn-sm italic"
           onMouseDown={keepEditorSelection}
           onClick={() => applyRichCommand('italic')}
-          title="斜体"
+          title="Italic"
         >
           I
         </button>
@@ -606,7 +606,7 @@ export function ArticleCanvasPanel({
           className="cw-btn cw-btn-ghost cw-btn-sm"
           onMouseDown={keepEditorSelection}
           onClick={() => applyBlockCommand('h1')}
-          title="标题 1"
+          title="Heading 1"
         >
           H1
         </button>
@@ -615,7 +615,7 @@ export function ArticleCanvasPanel({
           className="cw-btn cw-btn-ghost cw-btn-sm"
           onMouseDown={keepEditorSelection}
           onClick={() => applyBlockCommand('h2')}
-          title="标题 2"
+          title="Heading 2"
         >
           H2
         </button>
@@ -624,17 +624,17 @@ export function ArticleCanvasPanel({
           className="cw-btn cw-btn-ghost cw-btn-sm"
           onMouseDown={keepEditorSelection}
           onClick={() => applyBlockCommand('blockquote')}
-          title="引用"
+          title="Quote"
         >
           “
         </button>
         <span className="h-5 w-px bg-line mx-1 shrink-0" />
-        <button type="button" className="cw-btn cw-btn-ghost cw-btn-sm" onClick={() => newDraft()} title="新建">
+        <button type="button" className="cw-btn cw-btn-ghost cw-btn-sm" onClick={() => newDraft()} title="New">
           +
         </button>
         <div className="flex-1" />
         <span className="font-mono text-[10.5px] text-dim whitespace-nowrap">
-          {draft.content.length} 字符 · {wordCount} 词
+          {draft.content.length} chars · {wordCount} words
         </span>
       </div>
 
@@ -650,7 +650,7 @@ export function ArticleCanvasPanel({
             caretColor: 'var(--accent)',
           }}
           role="textbox"
-          aria-label="文章画布"
+          aria-label="Article canvas"
           onInput={handleInput}
           onMouseUp={refreshSelection}
           onKeyUp={refreshSelection}
@@ -661,7 +661,7 @@ export function ArticleCanvasPanel({
         {isRevising && (
           <div className="canvas-card-pending mb-2" role="status" aria-live="polite">
             <span className="cw-blip" />
-            <span>修订中…</span>
+            <span>Revising…</span>
           </div>
         )}
         {editError && (
@@ -672,7 +672,7 @@ export function ArticleCanvasPanel({
                 type="button"
                 className="canvas-card-edit-error-dismiss"
                 onClick={onDismissEditError}
-                aria-label="关闭错误提示"
+                aria-label="Dismiss error"
               >
                 ✕
               </button>
@@ -701,10 +701,10 @@ export function ArticleCanvasPanel({
             className="flex-1 resize-none border border-line rounded-md bg-surface px-2.5 py-2 text-[12.5px] leading-[1.45] outline-none focus:border-accent disabled:opacity-60"
             placeholder={
               isRevising
-                ? '修订中…'
+                ? 'Revising…'
                 : selection
-                  ? `已选中 ${selectedChars} 字符，输入修改要求…`
-                  : '输入整篇修改要求…'
+                  ? `${selectedChars} chars selected — describe the changes…`
+                  : 'Describe changes to the whole document…'
             }
           />
           <div className="flex flex-col gap-1.5 shrink-0">
@@ -714,7 +714,7 @@ export function ArticleCanvasPanel({
               disabled={!instruction.trim() || isRevising || aiDisabled}
               onClick={() => requestEdit('document')}
             >
-              整篇
+              Whole doc
             </button>
             <button
               type="button"
@@ -722,7 +722,7 @@ export function ArticleCanvasPanel({
               disabled={!selection || !instruction.trim() || isRevising || aiDisabled}
               onClick={() => requestEdit('selection')}
             >
-              选区
+              Selection
             </button>
           </div>
         </div>

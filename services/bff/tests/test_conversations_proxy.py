@@ -276,26 +276,27 @@ def test_chat_attachment_with_unknown_id(
 
 
 # ---------------------------------------------------------------------------
-# Tests: POST /sessions/{id}/chat — execution_mode (chat vs agent mode)
+# Tests: POST /sessions/{id}/chat — execution_mode is no longer forwarded
 # ---------------------------------------------------------------------------
 
-def test_chat_execution_mode_defaults_to_sandbox(
+def test_chat_does_not_forward_execution_mode(
     client: TestClient,
     authed_cookie: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No execution_mode in the body → forwarded as 'sandbox' (agent mode)."""
+    """Every run is a sandboxed Claude SDK run: the BFF never forwards a mode,
+    even when a legacy client still sends ``execution_mode``."""
     fake = FakeChatFoundation()
     _patch_async_client(fake, monkeypatch)
 
     resp = client.post(
         "/api/bff/v1/sessions/ses_abc/chat",
         cookies=authed_cookie,
-        json={"message": "hello"},
+        json={"message": "hello", "execution_mode": "inline"},
     )
     assert resp.status_code == 200
     assert fake.runs_body is not None
-    assert fake.runs_body.get("execution_mode") == "sandbox"
+    assert "execution_mode" not in fake.runs_body
 
 
 def test_chat_omits_skills_upstream_when_client_omits_them(
@@ -386,65 +387,6 @@ def test_chat_preserves_explicit_mcp_server_selection(
     assert resp.status_code == 200
     assert fake.runs_body is not None
     assert fake.runs_body["mcp_server_ids"] == mcp_server_ids
-
-
-def test_chat_execution_mode_inline_passthrough(
-    client: TestClient,
-    authed_cookie: dict[str, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """execution_mode='inline' (chat mode) is forwarded to the runs body."""
-    fake = FakeChatFoundation()
-    _patch_async_client(fake, monkeypatch)
-
-    resp = client.post(
-        "/api/bff/v1/sessions/ses_abc/chat",
-        cookies=authed_cookie,
-        json={"message": "hello", "execution_mode": "inline"},
-    )
-    assert resp.status_code == 200
-    assert fake.runs_body is not None
-    assert fake.runs_body.get("execution_mode") == "inline"
-    # The run object echoes it back to the caller.
-    assert resp.json()["run"].get("execution_mode") == "inline"
-
-
-def test_chat_execution_mode_sandbox_passthrough(
-    client: TestClient,
-    authed_cookie: dict[str, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """execution_mode='sandbox' (agent mode) is forwarded to the runs body."""
-    fake = FakeChatFoundation()
-    _patch_async_client(fake, monkeypatch)
-
-    resp = client.post(
-        "/api/bff/v1/sessions/ses_abc/chat",
-        cookies=authed_cookie,
-        json={"message": "hello", "execution_mode": "sandbox"},
-    )
-    assert resp.status_code == 200
-    assert fake.runs_body is not None
-    assert fake.runs_body.get("execution_mode") == "sandbox"
-
-
-def test_chat_execution_mode_invalid_returns_422(
-    client: TestClient,
-    authed_cookie: dict[str, str],
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An illegal execution_mode value → 422, and no run is started."""
-    fake = FakeChatFoundation()
-    _patch_async_client(fake, monkeypatch)
-
-    resp = client.post(
-        "/api/bff/v1/sessions/ses_abc/chat",
-        cookies=authed_cookie,
-        json={"message": "hello", "execution_mode": "bogus"},
-    )
-    assert resp.status_code == 422
-    # Validation happens before any orchestrator call → no runs POST attempted.
-    assert not any("runs" in u and m == "POST" for m, u in fake.calls)
 
 
 # ---------------------------------------------------------------------------

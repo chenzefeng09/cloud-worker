@@ -87,10 +87,7 @@ def test_sandbox_token_scopes_keeps_required_caps() -> None:
     """The capabilities the sandbox genuinely uses must remain.
 
     * ``llm-gateway.invoke`` — gates the model-call façade (broker + direct).
-    * ``audit.write`` — the ``event_audit_sink`` worker extension POSTs agent
-      events directly to the foundation audit service in ``foundation`` egress
-      mode, where the scope is genuinely enforced; dropping it would break
-      audit forwarding there.
+    * ``audit.write`` is gone with the AgentScope ``event_audit_sink``.
     """
     assert "llm-gateway.invoke" in SANDBOX_TOKEN_SCOPES
-    assert "audit.write" in SANDBOX_TOKEN_SCOPES
+    assert "audit.write" not in SANDBOX_TOKEN_SCOPES

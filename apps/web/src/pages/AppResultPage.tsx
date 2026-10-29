@@ -45,17 +45,17 @@ function runToDesignStatus(status: RunStatus): DesignStatus {
 function runStatusZh(status: RunStatus): string {
   switch (status) {
     case 'PENDING':
-      return '排队中';
+      return 'Queued';
     case 'RUNNING':
-      return '运行中';
+      return 'Running';
     case 'PAUSED':
-      return '待确认';
+      return 'Awaiting confirmation';
     case 'COMPLETED':
-      return '已完成';
+      return 'Completed';
     case 'FAILED':
-      return '已失败';
+      return 'Failed';
     case 'CANCELLED':
-      return '已取消';
+      return 'Cancelled';
     default:
       return status;
   }
@@ -71,19 +71,19 @@ function runStatusZh(status: RunStatus): string {
  * instead; both are honest.
  */
 function phaseZh(cursor: string | undefined, status: RunStatus): string {
-  if (status === 'PENDING') return '正在排队…';
+  if (status === 'PENDING') return 'Queued…';
   // Empty cursor covers both "worker hasn't written state yet" and inline-mode
   // runs (which never write it) — the generic label is the honest one there.
-  if (!cursor) return '正在执行…';
-  if (cursor === 'start') return '正在启动…';
-  if (cursor.startsWith('TextBlock')) return '正在生成回复…';
-  if (cursor.startsWith('ToolCall')) return '正在调用工具…';
-  if (cursor.startsWith('ToolResult')) return '正在读取工具结果…';
-  if (cursor === 'RequireExternalExecutionEvent') return '等待外部执行…';
-  if (cursor === 'ReplyEndEvent') return '正在收尾…';
+  if (!cursor) return 'Running…';
+  if (cursor === 'start') return 'Starting…';
+  if (cursor.startsWith('TextBlock')) return 'Writing a reply…';
+  if (cursor.startsWith('ToolCall')) return 'Calling a tool…';
+  if (cursor.startsWith('ToolResult')) return 'Reading tool results…';
+  if (cursor === 'RequireExternalExecutionEvent') return 'Waiting for external execution…';
+  if (cursor === 'ReplyEndEvent') return 'Wrapping up…';
   // ThinkEvent / ThinkingBlock* / ModelCall* / ReplyStartEvent — the model is
   // working and hasn't emitted user-visible output yet.
-  return '正在思考…';
+  return 'Thinking…';
 }
 
 /** `mm:ss` (or `h:mm:ss`) since the run started. */
@@ -120,8 +120,8 @@ function SnapshotPanel({ snapshot }: { snapshot: AppRunSnapshot }) {
         <span className="text-[13px] font-semibold text-ink">{snapshot.app_name}</span>
         <Chip>v{snapshot.app_version}</Chip>
         <div className="flex-1" />
-        <Chip>模型 · {modelLabel(snapshot.model)}</Chip>
-        {snapshot.reasoning_effort && <Chip>推理 · {effortLabel(snapshot.reasoning_effort)}</Chip>}
+        <Chip>Model · {modelLabel(snapshot.model)}</Chip>
+        {snapshot.reasoning_effort && <Chip>Reasoning · {effortLabel(snapshot.reasoning_effort)}</Chip>}
       </div>
       <div className="px-3.5 py-3 flex flex-col gap-2.5">
         <div className="flex flex-wrap gap-1.5 pb-1">
@@ -136,7 +136,7 @@ function SnapshotPanel({ snapshot }: { snapshot: AppRunSnapshot }) {
           ))}
         </div>
         {snapshot.inputs.length === 0 && (
-          <div className="font-mono italic text-dim text-[11.5px]">无输入</div>
+          <div className="font-mono italic text-dim text-[11.5px]">No inputs</div>
         )}
         {snapshot.inputs.map((inp) => (
           <div key={inp.key} className="grid grid-cols-[120px_1fr] gap-3 items-start">
@@ -150,7 +150,7 @@ function SnapshotPanel({ snapshot }: { snapshot: AppRunSnapshot }) {
         ))}
         {snapshot.rendered_task_preview && (
           <div className="border-t border-line-2 pt-3 mt-1 flex flex-col gap-1">
-            <div className="cw-label">最终任务</div>
+            <div className="cw-label">Final task</div>
             <pre className="m-0 font-mono text-[11.5px] text-ink-2 leading-[1.55] whitespace-pre-wrap break-words bg-paper border border-line rounded-sm px-2.5 py-2">
               {snapshot.rendered_task_preview}
             </pre>
@@ -158,7 +158,7 @@ function SnapshotPanel({ snapshot }: { snapshot: AppRunSnapshot }) {
         )}
         {(snapshot.system_prompt || snapshot.user_prompt_template) && (
           <details className="border-t border-line-2 pt-3 mt-1">
-            <summary className="cw-label cursor-pointer">固定 Prompt 快照</summary>
+            <summary className="cw-label cursor-pointer">Fixed prompt snapshot</summary>
             <div className="mt-2 flex flex-col gap-2">
               {snapshot.system_prompt && (
                 <pre className="m-0 font-mono text-[11px] text-ink-2 leading-[1.55] whitespace-pre-wrap break-words bg-paper border border-line rounded-sm px-2.5 py-2">
@@ -234,7 +234,7 @@ export function AppResultPage() {
 
   useEffect(() => {
     if (!sessionId || !runId) {
-      setLoadError('缺少运行参数。');
+      setLoadError('Missing run parameters.');
       return;
     }
     let alive = true;
@@ -324,12 +324,12 @@ export function AppResultPage() {
   }, [sessionId, runId]);
 
   const crumbs: Crumb[] = [
-    { label: '首页', to: '/home' },
-    { label: '应用', to: '/apps' },
+    { label: 'Home', to: '/home' },
+    { label: 'Apps', to: '/apps' },
     ...(snapshot?.app_id
       ? [{ label: snapshot.app_name, to: `/apps/${snapshot.app_id}` }]
       : []),
-    { label: '运行结果' },
+    { label: 'Run result' },
   ];
 
   // ─── Split layout (transcript-ish column + optional preview panel) ──────────
@@ -361,7 +361,7 @@ export function AppResultPage() {
             )}
 
             {!run && !loadError && (
-              <div className="font-mono text-[12px] text-dim">加载中…</div>
+              <div className="font-mono text-[12px] text-dim">Loading…</div>
             )}
 
             {/* RUNNING / PENDING — streamlined progress, NO composer */}
@@ -395,16 +395,16 @@ export function AppResultPage() {
                 <div className="border border-line rounded-md bg-surface px-4 py-4 flex flex-col gap-2">
                   <div className="flex items-center gap-2">
                     <span className="cw-dot" style={{ background: '#c68a17' }} />
-                    <span className="text-[13px] font-medium text-ink">运行已暂停，等待你的确认</span>
+                    <span className="text-[13px] font-medium text-ink">Run paused — waiting for your confirmation</span>
                   </div>
                   <div className="text-[12.5px] text-dim leading-[1.55]">
-                    处理下面的请求后，运行会自动继续，无需刷新页面。
+                    Once you handle the request below, the run continues automatically — no need to refresh.
                   </div>
                 </div>
 
                 {pendingError && (
                   <div className="px-3 py-2 border border-accent-line bg-accent-soft rounded-md text-[12.5px] text-accent">
-                    待确认项加载失败：{pendingError}
+                    Failed to load pending items: {pendingError}
                   </div>
                 )}
 
@@ -418,7 +418,7 @@ export function AppResultPage() {
 
                 {pendingLoaded && !pendingError && runPending.length === 0 && (
                   <div className="font-mono italic text-dim text-[12px]">
-                    暂无待处理的确认项（可能已在别处应答）。运行状态会自动刷新。
+                    No pending confirmations (they may have been answered elsewhere). The run status refreshes automatically.
                   </div>
                 )}
               </div>
@@ -432,7 +432,7 @@ export function AppResultPage() {
                 {run.result_summary && (
                   <div className="flex flex-col gap-2">
                     <div className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim">
-                      输出
+                      Output
                     </div>
                     <div className="prose-cw text-[14px] leading-[1.6] text-ink">
                       <MarkdownAssetsProvider value={markdownAssets}>
@@ -451,7 +451,7 @@ export function AppResultPage() {
                 {outputs.length > 0 && (
                   <div className="flex flex-col gap-2">
                     <div className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim">
-                      产出文件
+                      Output files
                     </div>
                     <div className="flex flex-col gap-1.5">
                       {outputs.map((att) => (
@@ -475,7 +475,7 @@ export function AppResultPage() {
                             download={att.filename}
                             className="cw-btn cw-btn-ghost cw-btn-sm shrink-0"
                           >
-                            下载
+                            Download
                           </a>
                         </div>
                       ))}
@@ -484,7 +484,7 @@ export function AppResultPage() {
                 )}
 
                 {!run.result_summary && outputs.length === 0 && (
-                  <div className="font-mono italic text-dim text-[12px]">本次运行无文本或文件产出。</div>
+                  <div className="font-mono italic text-dim text-[12px]">This run produced no text or files.</div>
                 )}
               </div>
             )}
@@ -494,7 +494,7 @@ export function AppResultPage() {
               <div className="flex flex-col gap-6">
                 <div className="px-3.5 py-3 border border-accent-line bg-accent-soft rounded-md">
                   <div className="text-[13px] font-medium text-accent mb-1">
-                    {status === 'FAILED' ? '运行失败' : '运行已取消'}
+                    {status === 'FAILED' ? 'Run failed' : 'Run cancelled'}
                   </div>
                   {run.error_message && (
                     <div className="text-[12.5px] text-ink-2 leading-[1.5] whitespace-pre-wrap break-words">

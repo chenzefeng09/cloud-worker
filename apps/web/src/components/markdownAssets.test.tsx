@@ -71,7 +71,7 @@ describe('markdown image rendering', () => {
   it('renders a labelled placeholder — and NO <img> — when the file is unknown', () => {
     const { container } = renderMd('![x](outputs/missing_chart.png)');
     expect(container.querySelector('img')).toBeNull();
-    expect(screen.getByText(/图片未找到：missing_chart\.png/)).toBeTruthy();
+    expect(screen.getByText(/Image not found: missing_chart\.png/)).toBeTruthy();
   });
 
   it('leaves absolute http(s) sources untouched', () => {
@@ -101,7 +101,7 @@ describe('markdown image rendering', () => {
   it('click opens the page preview panel when a handler is provided', async () => {
     const onOpen = vi.fn();
     renderMd('![图](outputs/sales_trend.png)', { onOpen });
-    screen.getByRole('button', { name: '查看 sales_trend.png' }).click();
+    screen.getByRole('button', { name: 'View sales_trend.png' }).click();
     expect(onOpen).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'att_01JQ7Z', filename: 'sales_trend.png' }),
     );
@@ -114,7 +114,7 @@ describe('markdown image rendering', () => {
       </ReactMarkdown>,
     );
     expect(container.querySelector('img')).toBeNull();
-    expect(screen.getByText(/图片未找到：sales_trend\.png/)).toBeTruthy();
+    expect(screen.getByText(/Image not found: sales_trend\.png/)).toBeTruthy();
   });
 
   it('resolver yields null without a session (no URL can be built)', () => {

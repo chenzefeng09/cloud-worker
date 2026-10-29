@@ -1,5 +1,12 @@
 # B-M2 — Sandbox runtime + AgentScope worker (v1)
 
+> **Historical note (2026-10).** This design was written for the AgentScope
+> worker (`agentscope-ext/`), which has since been removed. The sandbox-runtime
+> contracts (`SandboxRuntime` protocol, run state machine, pool, egress) still
+> hold; the agent side is now the Claude Agent SDK worker — see
+> [ADR 0003](../adr/0003-claude-agent-sdk-sole-agent-runtime.md) and
+> [contracts/worker-wire-contract.md](../../contracts/worker-wire-contract.md).
+
 > **Phase**: B-M2  ·  **Status**: skeleton landed, real wiring is B-M2 work
 >
 > See also:
@@ -163,10 +170,10 @@ in ``deploy/cube/`` (CubeVS ``allow_out`` overlay + host nftables fallback).
 
 | Control | How B-M2 delivers it |
 |---|---|
-| 等保三级 8.1.4.4 / 7.1.4.4 安全审计 | runtime_worker writes events.jsonl; future forwarder ships to foundation.audit |
-| 等保三级 8.1.4.1.b 入侵防范 (隔离) | microVM (CubeSandbox) — kernel isolation per ADR 0001 |
-| 等保三级 8.1.4.2.b 镜像完整性 | sandbox-images built in CI, signed via cosign (B-M3 follow-up) |
-| PIPL/GDPR data minimisation in sandbox | short-lived foundation_token + per-run workspace; nothing persists across runs |
+| ISO/IEC 27001:2022 A.8.15 Logging / SOC 2 CC7.2 (system monitoring) | the worker writes events.jsonl per run; run events are persisted platform-side for transcript and session replay |
+| ISO/IEC 27001:2022 A.8.22 Segregation of networks · A.8.31 Separation of environments / SOC 2 CC6.6 (boundary protection) | microVM (CubeSandbox) — kernel isolation per ADR 0001; default-deny egress via tool-broker |
+| ISO/IEC 27001:2022 A.8.32 Change management · A.8.28 Secure coding (supply chain) / SOC 2 CC8.1 | sandbox images built from pinned bases + lockfiles; cosign signing + syft SBOM are follow-ups |
+| GDPR Art. 5(1)(c) data minimisation · Art. 25 data protection by design | short-lived foundation_token + per-run workspace; nothing persists across runs |
 
 ## 8. Open issues + follow-ups
 

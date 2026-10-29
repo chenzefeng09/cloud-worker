@@ -22,7 +22,7 @@ interface TagInputProps {
 export function TagInput({
   value,
   onChange,
-  placeholder = '输入后回车或逗号添加…',
+  placeholder = 'Type and press Enter or comma to add…',
   max = 20,
   maxLength = 32,
   className,
@@ -69,7 +69,7 @@ export function TagInput({
             type="button"
             onClick={() => remove(tag)}
             className="text-dim hover:text-accent transition-colors leading-none"
-            aria-label={`移除标签 ${tag}`}
+            aria-label={`Remove tag ${tag}`}
           >
             ✕
           </button>

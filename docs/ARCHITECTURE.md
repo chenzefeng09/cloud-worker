@@ -5,7 +5,7 @@ English | [中文](ARCHITECTURE.zh-CN.md)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](../LICENSE)
 [![Language: Python](https://img.shields.io/badge/backend-Python%203.12-3776AB.svg)](https://www.python.org/)
 [![Frontend: React](https://img.shields.io/badge/frontend-React%2019%20%2B%20Vite-61DAFB.svg)](https://react.dev/)
-[![Agent kernel: AgentScope](https://img.shields.io/badge/agent%20kernel-AgentScope%202.x-success.svg)](https://github.com/agentscope-ai/agentscope)
+[![Agent runtime: Claude Agent SDK](https://img.shields.io/badge/agent%20runtime-Claude%20Agent%20SDK-success.svg)](https://docs.claude.com/en/api/agent-sdk/overview)
 
 Agent Platform runs untrusted, model-generated agent code inside per-run microVMs
 and gives each run a default-deny network with a single brokered egress path. It
@@ -65,7 +65,7 @@ flowchart TB
     subgraph sandboxLayer["Sandbox layer (untrusted)"]
         broker["tool-broker :8024\nlease-gated egress façade"]
         webfetch["web-fetch-gateway :8013c\nSSRF-filtered internet egress"]
-        sbx["sandbox microVM / container\nruntime_worker (AgentScope ReActAgent)"]
+        sbx["sandbox microVM / container\nworker-claude-sdk (Claude Agent SDK)"]
     end
 
     subgraph foundation["SaaS Foundation (../saas-foundation)"]
@@ -134,10 +134,9 @@ sequenceDiagram
     participant P as sandbox-pool :8008
     participant FID as foundation identity
     participant FLLM as foundation llm-gateway
-    participant SBX as sandbox (runtime_worker)
+    participant SBX as sandbox (worker-claude-sdk)
     participant TB as tool-broker :8024
     participant R as Redis
-    participant FA as foundation audit
 
     U->>B: GET /auth/me (signed ap_session cookie)
     B->>FID: verify embedded access token (JWKS)
@@ -145,20 +144,20 @@ sequenceDiagram
     U->>B: POST /sessions/{id}/chat
     B->>O: forward (session/message/run CRUD + RLS)
     O->>O: QuotaGuard + DLP scan hooks
+    O->>O: prefetch knowledge top-k into sys_prompt
     O->>S: POST /runs (create_run)
     S->>FID: mint short-lived per-run foundation JWT
     S->>FLLM: GET /tenant-keys (resolve LLM virtual key)
     S->>P: claim a warm sandbox slot
     S->>SBX: spawn (docker-socket-proxy / cube-controller mTLS)
-    Note over S,SBX: deliver identity+LLM+OTEL env, task.json,<br/>and mode-0600 /workspace/.secrets.json (7 secrets)
+    Note over S,SBX: deliver identity+LLM+OTEL env, task.json,<br/>and mode-0600 /workspace/.secrets.json (6 secrets)
     SBX->>SBX: load + unlink .secrets.json into userspace env
-    SBX->>SBX: build ReActAgent + Toolkit<br/>(mcp_tenant_injector, skills_loader, web_fetch)
+    SBX->>SBX: start gateway adapter, assemble prompt,<br/>load tenant MCP servers, skills, web_fetch
     loop agent steps
         SBX->>TB: LLM call (carries signed per-run HMAC lease)
         TB->>FLLM: proxy with virtual key (quota + audit)
         FLLM-->>SBX: token deltas (streaming)
         SBX->>R: stream token deltas + plan/step state (via /state façade)
-        SBX->>FA: event_audit_sink POSTs each event
     end
     SBX->>SBX: write /workspace/result.json (+ events.jsonl)
     SBX-->>S: exit with coded status (0/1/2/137)
@@ -176,29 +175,29 @@ Narrated steps:
 2. **Chat/run request.** The SPA POSTs to the BFF (auth gateway + API aggregation +
    SSE relay), which forwards to the **session-orchestrator** for session/message/run
    CRUD under RLS. The orchestrator owns the DLP `check:download` / scan hooks and
-   enforces quota with a billing `QuotaGuard`.
+   enforces quota with a billing `QuotaGuard`, and prefetches the tenant knowledge
+   base's top-k hits, which it appends to the run's `sys_prompt`.
 3. **create_run.** The orchestrator mints (via the scheduler path) a short-lived
    per-run Foundation JWT and calls the **agent-scheduler**.
 4. **Resolve + spawn.** The scheduler resolves the tenant LLM virtual key
-   (`llm-gateway GET /tenant-keys`) and, via the selected `SandboxRuntime`
+   (`llm-gateway GET /tenant-keys`) — a missing virtual key fails the spawn — and, via the selected `SandboxRuntime`
    implementation (Docker through docker-socket-proxy, or Cube through the
    cube-controller over mTLS on `:8443`), spawns a sandbox from a warm **sandbox-pool**
-   slot. It delivers identity + LLM + OTEL env, `task.json` (`{task, mcp_servers,
-   skills}`), and a mode-`0600` `/workspace/.secrets.json` carrying the 7 control-plane
-   secrets.
-5. **Build the agent.** Inside the sandbox, `runtime_worker` loads and immediately
-   unlinks the secrets file, then builds a fresh `ReActAgent` + `Toolkit`:
-   `mcp_tenant_injector` pulls the tenant MCP servers from `mcp-registry`,
-   `skills_loader` mounts packaged Skills, and `web_fetch` adds the `WebFetch` tool.
+   slot. It delivers identity + LLM + OTEL env, `task.json` (`{task, mcp_server_ids,
+   skills, files, sys_prompt, …}`), and a mode-`0600` `/workspace/.secrets.json`
+   carrying the 6 control-plane secrets.
+5. **Build the agent.** Inside the sandbox, the Claude SDK worker loads and immediately
+   unlinks the secrets file, starts its local gateway adapter, assembles the system
+   prompt, pulls the tenant MCP servers from `mcp-registry`, indexes the mounted Skills
+   under `/home/skills`, and registers the in-process `web_fetch` tool.
 6. **Run (broker egress).** In broker mode the sandbox can reach **only** the
-   tool-broker façade + DNS. LLM calls go `llm_gateway_enforcer -> tool-broker ->
+   tool-broker façade + DNS. LLM calls go `SDK -> adapter.ts -> tool-broker ->
    Foundation llm-gateway` (virtual key + quota + audit); Redis hot-state / token
    streams and S3 artifacts go through the tool-broker `/state` and `/s3` façades; web
    fetches go `web_fetch -> web-fetch-gateway` (SSRF-filtered). Every call carries the
    signed per-run lease.
 7. **Persist + exit.** The worker streams token deltas + plan/step state to Redis,
    writes `/workspace/result.json` (+ `events.jsonl`), and exits with a coded status.
-   `event_audit_sink` also POSTs each event to Foundation audit.
 8. **Reconcile + relay.** The scheduler polls run status; the orchestrator reconciles
    completion (`reconcile_sweeper`), persists artifacts (DLP scan + classification
    tag), applies output/transcript DLP, and relays the SSE stream back through the BFF
@@ -216,7 +215,7 @@ Foundation audit service.
 | Service | Port (container / dev host) | One-liner |
 |---|---|---|
 | [bff](#bff) | 8005 | Auth gateway, cookie session, API aggregation, SSE relay |
-| [session-orchestrator](#session-orchestrator) | 8006 | Session / message / run lifecycle, attachments, run SSE |
+| [session-orchestrator](#session-orchestrator) | 8006 | Session / message / run lifecycle, attachments, knowledge prefetch, run SSE |
 | [agent-scheduler](#agent-scheduler) | 8007 | Spawns + manages sandboxes per run |
 | [sandbox-pool](#sandbox-pool) | 8008 | Pre-warms idle sandbox slots |
 | [skill-store](#skill-store) | 8011 | Versioned skill-package registry |
@@ -260,7 +259,9 @@ in its own `session_orchestrator` Postgres schema, stores attachments in S3/MinI
 reads agent run hot-state (plan/step/cursor) from Redis. It kicks off runs by calling
 the agent-scheduler, runs background loops for session-retention sweeps and run
 reconciliation, and enforces quota via a billing `QuotaGuard` plus DLP checks on the
-attachment path.
+attachment path. Every run is dispatched to a sandbox: `execution_mode` is still
+stored and returned on runs for legacy rows, but an incoming `inline` is coerced to
+`sandbox`.
 
 - **Key endpoints:** `GET/POST /sessions`, `GET/PATCH/DELETE /sessions/{session_id}`;
   `GET/POST /sessions/{session_id}/messages`; `POST /sessions/{session_id}/runs`,
@@ -270,8 +271,8 @@ attachment path.
   `POST/GET /sessions/{session_id}/attachments`,
   `GET /sessions/{session_id}/files/{file_id}/content`;
   `GET /runs/token-usage/daily`; `GET /healthz`.
-- **Depends on:** `foundation_sdk`; agent-scheduler; knowledge-ingest (memory
-  pre-fetch + write-back); Foundation authz / billing / feature-flag / dlp; Postgres;
+- **Depends on:** `foundation_sdk`; agent-scheduler; knowledge-ingest (memory and
+  knowledge-base top-k pre-fetch, memory write-back); Foundation authz / billing / feature-flag / dlp; Postgres;
   Redis (run hot-state); S3/MinIO (attachments).
 
 ### agent-scheduler
@@ -281,9 +282,10 @@ prefix `/api/scheduler/v1`. It builds a pluggable sandbox runtime (`docker` or `
 at startup and, on `POST /runs`, mints a per-run scope-limited tenant token from
 Foundation identity, signs an HMAC tool-broker capability lease, and starts a sandbox
 via the docker-socket-proxy with the configured egress mode (`broker` / `foundation` /
-`none`). It injects runtime extensions (`mcp_tenant_injector`, `skills_loader`,
-`web_fetch`, `event_audit_sink`, `llm_gateway_enforcer`), forwards registry/gateway
-URLs, and enforces billing quota via `QuotaGuard`.
+`none`). Every sandbox runs the Claude SDK image (`AGENT_IMAGE` /
+`SCHEDULER_AGENT_IMAGE`); the scheduler forwards registry/gateway URLs, delivers the
+tenant LLM virtual key (failing the spawn if none resolves), and enforces billing quota
+via `QuotaGuard`.
 
 - **Key endpoints:** `POST /runs`, `GET /runs`, `GET /runs/{run_id}`,
   `POST /runs/{run_id}/cancel`, `GET /runs/{run_id}/events` (SSE);
@@ -317,7 +319,7 @@ prefix `/api/skills/v1`. It manages skill metadata in Postgres and stores versio
 skill tarballs in a pluggable blob backend (S3/MinIO by default, in-memory for tests).
 It supports listing/installing/uninstalling skills, uploading new versions, downloading
 version tarballs, and internal resolve endpoints (`skill.read_internal` scope) that the
-scheduler's `skills_loader` uses to bind-mount content-addressed skills into sandboxes.
+scheduler uses to bind-mount content-addressed skills into sandboxes.
 Billing is enforced via `QuotaGuard`.
 
 - **Key endpoints:** `GET /skills`, `GET /skills/installed`,
@@ -332,8 +334,8 @@ Billing is enforced via `QuotaGuard`.
 **Per-tenant MCP server registry — port 8010.** FastAPI title *MCP Registry*, API
 prefix `/api/mcp/v1`. It provides tenant-scoped CRUD over MCP server records persisted
 in Postgres (`public` schema), and exposes an internal listing endpoint guarded by the
-`mcp.read_internal` service scope that the scheduler's `mcp_tenant_injector` (via the
-tool-broker) calls to inject the tenant's MCP servers into each sandbox.
+`mcp.read_internal` service scope that the in-sandbox worker (via the tool-broker)
+calls to load the tenant's MCP servers for each run.
 
 - **Key endpoints:** `GET/POST /mcp-servers`, `GET /mcp-servers/{server_id}`,
   `PATCH /mcp-servers/{server_id}`, `DELETE /mcp-servers/{server_id}`;
@@ -347,7 +349,8 @@ Ingest*, API prefix `/api/knowledge/v1`. It ingests uploaded documents (stored i
 pluggable blob backend: S3/MinIO or in-memory), generates embeddings via a pluggable
 client (local by default, or the Foundation llm-gateway), and writes vectors into
 Postgres with the `pgvector` extension. It serves document CRUD and a vector `/search`
-endpoint, which session-orchestrator uses for memory pre-fetch/write-back. Billing is
+endpoint, which session-orchestrator uses for memory and knowledge pre-fetch and memory
+write-back. Billing is
 enforced via `QuotaGuard`.
 
 - **Key endpoints:** `GET/POST /documents` (ingest), `GET /documents/{document_id}`,
@@ -434,49 +437,52 @@ credentials the sandbox never sees.
 
 ## The agent runtime
 
-The agent kernel is **[AgentScope 2.x](https://github.com/agentscope-ai/agentscope)**
-(Apache-2.0: `ReActAgent` + `Toolkit` + `MsgHub` + Model/Formatter abstraction). It is
-**not forked** — it was chosen over OpenHands because we already own the platform layer
-and need a framework, not a platform. See
-[ADR 0002](adr/0002-agent-kernel-agentscope-over-openhands.md) for the full rationale
-and the OpenHands → AgentScope mapping table.
+The agent runtime is the **[Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview)**
+worker in [`worker-claude-sdk/`](../worker-claude-sdk/) — a TypeScript/Node 22 program
+that is the **only** agent loop in the platform. Every run, chat or App, is a sandboxed
+Claude SDK run; there is no in-process ("inline") execution path. See
+[ADR 0003](adr/0003-claude-agent-sdk-sole-agent-runtime.md) for the decision (it
+supersedes [ADR 0002](adr/0002-agent-kernel-agentscope-over-openhands.md), which chose
+AgentScope).
 
 The integration shape is **one agent per sandbox, one task per agent**. A long-running
 multi-tenant agent service would defeat the per-run microVM isolation boundary, so each
 run is a one-shot worker that maps cleanly onto a `run` row for audit and billing.
 
-### agentscope-ext modules
-
-The integration ships as standalone Python 3.12 packages that the sandbox image
-`pip install`s alongside the pinned AgentScope version. Tests stub AgentScope via
-`sys.modules` so they run without the real dependency. See
-[`agentscope-ext/README.md`](../agentscope-ext/README.md).
+### worker-claude-sdk modules
 
 | Module | Purpose |
 |---|---|
-| `runtime_worker` | The sandbox entrypoint — boots one `ReActAgent` + `Toolkit`, runs one task, persists result + audit trail, exits with a coded status. |
-| `llm_gateway_enforcer` | Custom `OpenAIChatModel` subclass routing every sandbox LLM call through the Foundation llm-gateway instead of holding raw provider keys. Injects `Authorization: Bearer <per-run foundation JWT>`, `X-LLM-Virtual-Key`, `X-Tenant-Id`, `X-User-Id`, `X-Tool-Broker-Lease`. Preserves native streaming/tool-call/thinking; supports per-run model/reasoning/sampling overrides from `task.json`. |
-| `mcp_tenant_injector` | Resolves the tenant MCP-server list from `mcp-registry` into the `Toolkit`. |
-| `skills_loader` | Materializes packaged Skills (content-addressed cache, bind-mounted per-SHA into `/home/skills`) into the `Toolkit`. |
-| `event_audit_sink` | Registers a second `post_print` hook POSTing each agent event to Foundation audit (disk log + audit POST both run). |
-| `web_fetch` | The in-sandbox `WebFetch` tool, adapting AgentScope's `ToolBase` to the web-fetch-gateway HTTP API. |
+| `main.ts` | Entrypoint (`node /app/dist/main.js`): loads + unlinks `.secrets.json`, validates required env, starts the gateway adapter, runs the query, writes `result.json`, exits with a coded status. |
+| `adapter.ts` | In-process HTTP adapter the SDK talks to via `ANTHROPIC_BASE_URL=http://localhost:<port>`. Translates Anthropic Messages ⇄ the Foundation llm-gateway's OpenAI-compatible `chat/completions` (streaming, tool calls, thinking, structured output) and injects `Authorization: Bearer <per-run foundation JWT>`, `X-Tenant-Id`, `X-User-Id`, `X-LLM-Virtual-Key` and, in broker mode, `X-Tool-Broker-Lease`. |
+| `worker.ts` | The run loop: downloads attachments into `/workspace/inputs`, assembles the system prompt (resume note, memory, history, `sys_prompt` incl. prefetched knowledge hits, skills index), resolves tenant MCP servers from `mcp-registry`, registers the in-process `web_fetch` tool (via web-fetch-gateway) and drives the SDK `query()`. |
+| `event_translator.ts` | Re-shapes the SDK message stream into the platform event vocabulary (`events.jsonl` + Redis token stream). |
+| `hitl.ts` | Human-in-the-loop pause/resume (`pending_confirmation` / `pending_question`). |
+| `dlp.ts` | `PreToolUse` hook calling Foundation DLP `core/scan` (fail-open). |
+| `redis_state.ts` | Hot-state + token stream writes (directly, or through the tool-broker `/state` façade). |
 
-### The runtime_worker contract
+**Knowledge.** The orchestrator prefetches the tenant knowledge base's top-k hits for
+the run and appends them to the worker's `sys_prompt`. There is no on-demand
+knowledge-search tool inside the sandbox yet.
 
-`runtime_worker` is the sandbox entrypoint (`python -m agentscope_ext.runtime_worker`).
-It boots one `ReActAgent` + `Toolkit` per run from `task.json` plus Foundation env
-vars, runs one task, and reports its outcome through files and an exit code. This
-contract is **load-bearing**: two runtimes (docker, cube) and the alternate
-`worker-claude-sdk` (a TypeScript/Node Claude Agent SDK worker on `node:22-slim`)
-depend on it. Changing it is a coordinated change across packages.
+**Known gaps vs. the removed AgentScope worker** (see ADR 0003): no canvas tool (the
+agent cannot create canvases), no on-demand knowledge search tool, and no in-sandbox
+audit sink.
+
+### The worker contract
+
+The sandbox entrypoint reads its task from files/env and reports its outcome through
+files, Redis and an exit code. This contract is **load-bearing**: both sandbox runtimes
+(docker, cube) depend on it. The full wire format lives in
+[`contracts/worker-wire-contract.md`](../contracts/worker-wire-contract.md).
 
 | Direction | Artifact | Notes |
 |---|---|---|
-| **In** | `/workspace/task.json` (docker) or `AGENT_TASK_JSON` env (cube) | `{ task, mcp_servers, skills }` plus per-run model/reasoning/sampling overrides |
-| **In** | Foundation env vars | `FOUNDATION_API_TOKEN`, `FOUNDATION_TENANT_ID`, registry/gateway URLs, OTEL config |
-| **In** | `/workspace/.secrets.json` (mode `0600`) | 7 allowlisted control-plane secrets; loaded into userspace `os.environ` then **unlinked** |
+| **In** | `/workspace/task.json` (docker) or `AGENT_TASK_JSON` env (cube) | `{ task, mcp_server_ids, skills, files, memory, history, sys_prompt, … }` plus per-run model/reasoning/sampling overrides |
+| **In** | Foundation env vars | `FOUNDATION_API_URL`, `FOUNDATION_TENANT_ID`, `FOUNDATION_USER_ID`, registry/gateway URLs, `LLM_MODEL`, OTEL config |
+| **In** | `/workspace/.secrets.json` (mode `0600`) | 6 allowlisted control-plane secrets; loaded into the worker's `process.env` then **unlinked** |
 | **Out** | `/workspace/result.json` | The run result the scheduler reads |
-| **Out** | `/workspace/events.jsonl` | One JSON line per printed `Msg` (disk log survives gateway outages) |
+| **Out** | `/workspace/events.jsonl` | One JSON line per platform event (disk log survives gateway outages) |
 | **Out** | Redis hot-state + token stream | Plan/step/cursor + streaming token deltas (via the `/state` façade in broker mode) |
 | **Out** | Exit code | Coded status (below) |
 
@@ -484,37 +490,22 @@ depend on it. Changing it is a coordinated change across packages.
 
 | Code | Meaning |
 |---|---|
-| `0` | OK — task completed |
-| `1` | Infrastructure error |
-| `2` | Bad task (malformed payload) |
+| `0` | Run completed (OK, FAILED or paused is reported inside `result.json`) |
+| `1` | Infrastructure error (missing required env, worker crash) |
+| `2` | Bad task (missing / malformed payload) |
 | `137` | OOM (killed) |
 
-**Security hardening.** `_load_secret_file_into_env` reads `/workspace/.secrets.json`
-(7 allowlisted keys) into userspace `os.environ`, then **unlinks** the file — keeping
-secrets out of `/proc/1/environ` and out of the writable workspace that the agent's
-`Read`/`Bash` tools can see.
-
-### The four hook override points
-
-`runtime_worker` exposes four module-level functions in
-`agentscope_ext.runtime_worker.hooks`. Each sibling extension owns one (or two) and
-monkey-patches it at import time; the entrypoint resolves the function via attribute
-access on each invocation, so the one-way dependency arrow lets the smoke-test image
-ship without the extensions.
-
-| Hook | Default behaviour | Owner extension |
-|---|---|---|
-| `build_model(task, env) -> ModelBase` | `AnthropicChatModel` / `OpenAIChatModel` per `LLM_PROVIDER`, reading `LLM_API_KEY` directly | `llm_gateway_enforcer` — returns a gateway model POSTing to Foundation llm-gateway with the foundation JWT |
-| `build_formatter(task, env) -> FormatterBase` | Matches the provider above | `llm_gateway_enforcer` (paired with the model) |
-| `build_toolkit(task, tenant_id, env) -> Toolkit` | Empty `Toolkit()` (smoke tests without the foundation stack) | `mcp_tenant_injector` then `skills_loader` (chained: MCP servers first, Skills on top) |
-| `attach_hooks(agent, *, events_path, env) -> None` | Registers a `post_print` hook appending each `Msg` to `events.jsonl` | `event_audit_sink` — registers a **second** `post_print` hook POSTing each event to Foundation audit (both run) |
+**Security hardening.** The worker reads `/workspace/.secrets.json` into its own
+`process.env`, then **unlinks** the file, and scrubs control-plane variables from the
+environment before any tool subprocess runs — keeping secrets out of `/proc/1/environ`
+and out of the writable workspace that the agent's `Read`/`Bash` tools can see.
 
 ## Sandbox runtimes
 
 Three implementations sit behind the `SandboxRuntime` protocol
 (`spawn_run` / `get_run_status` / `get_container_tenant` / `cancel_run` /
 `list_containers`), selected by the `SCHEDULER_RUNTIME` environment variable. All three
-run the **same OCI image** and the **same `runtime_worker` contract**, so switching
+run the **same OCI image** and the **same worker contract**, so switching
 runtimes is a one-line config change — the rationale and risk table are in
 [ADR 0001](adr/0001-sandbox-runtime-cube-default-kata-fallback.md).
 
@@ -540,7 +531,8 @@ and minted tokens scope every call to a single run.
   Docker is dev/CI only. One agent per sandbox, one task per agent — the per-run
   microVM is the tenant isolation + audit + billing boundary
   ([ADR 0001](adr/0001-sandbox-runtime-cube-default-kata-fallback.md) /
-  [ADR 0002](adr/0002-agent-kernel-agentscope-over-openhands.md)).
+  [ADR 0003](adr/0003-claude-agent-sdk-sole-agent-runtime.md)). There is no
+  in-process execution path: tool calls never run inside the orchestrator.
 - **Default-deny egress.** In broker mode, sandboxes join only the internal
   `sandbox_broker` network and can reach **only** the tool-broker façade + DNS. The
   verified-refused set includes Redis, MinIO, Keycloak, mcp-registry, the public
@@ -556,17 +548,16 @@ and minted tokens scope every call to a single run.
   JWT per run (`FOUNDATION_API_TOKEN`) injected into the sandbox; the scheduler
   bootstraps its own service-account token via Keycloak OIDC `client_credentials`.
   Tokens are expected to be revoked at run end / TTL expiry.
-- **Secret-delivery hardening.** The 7 control-plane secrets are written to a mode-`0600`
+- **Secret-delivery hardening.** The 6 control-plane secrets are written to a mode-`0600`
   `/workspace/.secrets.json` (allowlisted keys: `FOUNDATION_API_TOKEN`,
-  `TOOL_BROKER_LEASE`, `LLM_VIRTUAL_KEY`, etc.), loaded into userspace `os.environ` by
-  `runtime_worker` and immediately unlinked — never in the container's `environment=`
+  `TOOL_BROKER_LEASE`, `LLM_VIRTUAL_KEY`, etc.), loaded into the worker's `process.env`
+  and immediately unlinked — never in the container's `environment=`
   block or `/proc/1/environ`, and removed from the writable workspace the agent's
   `Read`/`Bash` tools can see.
-- **LLM-gateway enforcement.** `llm_gateway_enforcer` routes all sandbox LLM traffic
-  through the Foundation llm-gateway with a tenant virtual key (quota + audit + model
-  routing). When enabled, the scheduler stops injecting any direct provider key, and a
-  missing virtual key **fails the spawn** rather than falling back to direct
-  credentials.
+- **LLM-gateway enforcement.** The worker's `adapter.ts` routes all sandbox LLM
+  traffic through the Foundation llm-gateway with a tenant virtual key (quota + audit +
+  model routing). No provider API key exists anywhere in the agent stack, and a missing
+  virtual key **fails the spawn**. Per-run sandbox tokens do not carry `audit.write`.
 - **DLP (real defense, not a test page).** A default global regex rule library
   (ID / phone / bank-card / email / AWS-key / private-key / api-key with L2–L4
   sensitivity) drives enforcement: session-orchestrator enforces `check:download`
@@ -584,8 +575,8 @@ and minted tokens scope every call to a single run.
   docker-socket-proxy (no `/var/run/docker.sock` bind-mount); `exec` / `volumes` /
   `privileged` verbs are denied; container caps are dropped with 2 GB memory / cpu-share
   / 600 s timeout limits; the sandbox S3 bucket is locked down.
-- **Image supply chain.** Non-root agent user (uid 1000), reproducible pinned base
-  digest + pip constraints, with cosign signing + syft SBOM **planned**. The compliance
+- **Image supply chain.** Non-root agent user (uid 1000), pinned base image digests
+  for the Cube images and `npm ci` from the committed lockfile, with cosign signing + syft SBOM **planned**. The compliance
   controls (audit trail, microVM isolation, image integrity, per-run data minimization)
   are mapped in the sandbox-runtime design doc.
 
@@ -639,10 +630,11 @@ login → session → chat-SSE journey with TTFT / total SLOs.
 ## Further reading
 
 - **[ADR 0001 — Sandbox runtime: CubeSandbox default, Kata fallback](adr/0001-sandbox-runtime-cube-default-kata-fallback.md)** — why CubeSandbox is the default and Kata the fallback, the `SandboxRuntime` escape-hatch env var, and the risk table.
-- **[ADR 0002 — Agent kernel: AgentScope, not OpenHands](adr/0002-agent-kernel-agentscope-over-openhands.md)** — why the kernel is AgentScope 2.x (framework) over OpenHands (platform): license, one-agent-per-sandbox, and the mapping table.
-- **[Sandbox runtime design](design/b-m2-sandbox-runtime-v1.md)** — the load-bearing contracts: `SandboxRuntime` protocol, the sandbox ↔ worker wire contract (`task.json` / `result.json` / exit codes), the run state machine, pool watermarks, deployment profiles, and the compliance mapping.
-- **[agentscope-ext README](../agentscope-ext/README.md)** — the extension modules and the four `runtime_worker` hook override points, and why AgentScope is not forked.
-- **[Sandbox images README](../sandbox-images/README.md)** — the base/office/matlab image tiers (what each ships, sizes), the separate claude-sdk Node worker image, and the two-step build / pinning-upgrade procedure.
+- **[ADR 0003 — Claude Agent SDK as the sole agent runtime](adr/0003-claude-agent-sdk-sole-agent-runtime.md)** — why the platform consolidated on one worker, what was removed (AgentScope, inline mode), the known gaps, and rollback.
+- **[ADR 0002 — Agent kernel: AgentScope, not OpenHands](adr/0002-agent-kernel-agentscope-over-openhands.md)** — *superseded by ADR 0003*; kept as the historical record of the original kernel choice.
+- **[Worker wire contract](../contracts/worker-wire-contract.md)** — `task.json`, `.secrets.json`, the Redis token stream, `result.json`, pause state, platform SSE events and the egress / tool-broker contract.
+- **[Sandbox runtime design](design/b-m2-sandbox-runtime-v1.md)** — the `SandboxRuntime` protocol, the run state machine, pool watermarks, deployment profiles, and the compliance mapping (written for the AgentScope worker; the runtime-level contracts still hold).
+- **[Sandbox images README](../sandbox-images/README.md)** — the `claude-sdk*` images (what each ships), the MATLAB layers and the build procedure.
 - **[CubeSandbox egress isolation README](../deploy/cube/README.md)** — per-microVM egress isolation: CubeVS `allow_out` overlay vs host-`nftables` fallback, the RFC-1918 hard-deny caveat, and the isolation verification checklist.
 
 ## License

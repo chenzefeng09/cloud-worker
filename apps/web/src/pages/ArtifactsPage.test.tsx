@@ -29,8 +29,8 @@ vi.mock('../components/FilePreviewPanel', () => ({
     file: { filename: string };
     onClose: () => void;
   }) => (
-    <aside aria-label={`文件预览：${file.filename}`}>
-      <button type="button" onClick={onClose}>返回</button>
+    <aside aria-label={`File preview: ${file.filename}`}>
+      <button type="button" onClick={onClose}>Back</button>
     </aside>
   ),
 }));
@@ -42,8 +42,8 @@ vi.mock('../components/CanvasReadonlyView', () => ({
     canvasId: string;
     onClose: () => void;
   }) => (
-    <aside aria-label={`画布预览：${canvasId}`}>
-      <button type="button" onClick={onClose}>返回</button>
+    <aside aria-label={`Canvas preview: ${canvasId}`}>
+      <button type="button" onClick={onClose}>Back</button>
     </aside>
   ),
 }));
@@ -86,15 +86,15 @@ describe('ArtifactsPage delete confirmation', () => {
     render(<ArtifactsPage />);
 
     await screen.findByText('季度总结');
-    await user.click(screen.getByTitle('删除'));
+    await user.click(screen.getByTitle('Delete'));
 
-    const dialog = screen.getByRole('dialog', { name: '删除产物' });
-    expect(dialog).toHaveTextContent('确定删除「季度总结」？此操作不可撤销。');
+    const dialog = screen.getByRole('dialog', { name: 'Delete artifact' });
+    expect(dialog).toHaveTextContent('Delete “季度总结”? This can’t be undone.');
     expect(nativeConfirm).not.toHaveBeenCalled();
     expect(nativeAlert).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole('button', { name: '取消' }));
-    expect(screen.queryByRole('dialog', { name: '删除产物' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog', { name: 'Delete artifact' })).not.toBeInTheDocument();
   });
 
   it('deletes only after the in-app confirm button is clicked', async () => {
@@ -102,8 +102,8 @@ describe('ArtifactsPage delete confirmation', () => {
     render(<ArtifactsPage />);
 
     await screen.findByText('季度总结');
-    await user.click(screen.getByTitle('删除'));
-    await user.click(screen.getByRole('button', { name: '删除' }));
+    await user.click(screen.getByTitle('Delete'));
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
 
     await waitFor(() => expect(mocks.deleteCanvas).toHaveBeenCalledWith('cvs_1'));
   });
@@ -121,13 +121,13 @@ describe('ArtifactsPage preview layout', () => {
 
     await user.click(await screen.findByText('季度数据'));
 
-    expect(screen.getByLabelText('文件预览：quarter.csv')).toBeInTheDocument();
-    expect(screen.getByRole('separator', { name: '拖动调整预览栏宽度' })).toBeInTheDocument();
+    expect(screen.getByLabelText('File preview: quarter.csv')).toBeInTheDocument();
+    expect(screen.getByRole('separator', { name: 'Drag to resize the preview panel' })).toBeInTheDocument();
     expect(screen.getByText('季度总结')).toBeVisible();
 
-    await user.click(screen.getByRole('button', { name: '返回' }));
-    expect(screen.queryByLabelText('文件预览：quarter.csv')).not.toBeInTheDocument();
-    expect(screen.queryByRole('separator', { name: '拖动调整预览栏宽度' })).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+    expect(screen.queryByLabelText('File preview: quarter.csv')).not.toBeInTheDocument();
+    expect(screen.queryByRole('separator', { name: 'Drag to resize the preview panel' })).not.toBeInTheDocument();
   });
 
   it('switches the right-side preview from a file to a canvas', async () => {
@@ -137,7 +137,7 @@ describe('ArtifactsPage preview layout', () => {
     await user.click(await screen.findByText('季度数据'));
     await user.click(screen.getByText('季度总结'));
 
-    expect(screen.queryByLabelText('文件预览：quarter.csv')).not.toBeInTheDocument();
-    expect(screen.getByLabelText('画布预览：cvs_1')).toBeInTheDocument();
+    expect(screen.queryByLabelText('File preview: quarter.csv')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Canvas preview: cvs_1')).toBeInTheDocument();
   });
 });

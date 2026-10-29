@@ -9,11 +9,11 @@ export const SENSITIVITY_COLORS: Record<DlpSensitivity, string> = {
 };
 
 export const SENSITIVITY_LABELS: Record<DlpSensitivity, string> = {
-  L1: '公开',
-  L2: '内部',
-  L3: '敏感',
-  L4: '机密',
-  L5: '绝密',
+  L1: 'Public',
+  L2: 'Internal',
+  L3: 'Sensitive',
+  L4: 'Confidential',
+  L5: 'Top secret',
 };
 
 export const SENSITIVITY_ORDER: DlpSensitivity[] = ['L1', 'L2', 'L3', 'L4', 'L5'];

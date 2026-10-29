@@ -32,8 +32,8 @@ export function FilePreviewPanel({ sessionId, file, onClose, getSource, closeVar
   const closeButton = (
     <button
       onClick={onClose}
-      aria-label={isCloseX ? '关闭' : '返回'}
-      title={isCloseX ? '关闭' : '返回'}
+      aria-label={isCloseX ? 'Close' : 'Back'}
+      title={isCloseX ? 'Close' : 'Back'}
       className="h-8 inline-flex items-center gap-1.5 px-2.5 rounded-md border border-line bg-paper text-ink-2 hover:text-ink hover:bg-paper-2 hover:border-ink-2 transition-colors shrink-0 font-mono text-[12px]"
     >
       {isCloseX ? (

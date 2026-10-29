@@ -22,7 +22,7 @@ Limitations / follow-ups
   CubeSandbox supports snapshotting a running VM so a new microVM can fork
   from a memory checkpoint (cold-start in < 100 ms, even less than a warm
   Docker container).  This requires:
-    1. Spawning one "template VM" with the agentscope_ext worker in a
+    1. Spawning one "template VM" with the Claude SDK worker in a
        quiescent state.
     2. Calling the CubeSandbox snapshot API (not yet in this codebase — no
        E2B spec for it exists publicly).
@@ -48,7 +48,6 @@ References
 from __future__ import annotations
 
 import logging
-from typing import Literal
 
 import httpx
 
@@ -58,6 +57,9 @@ logger = logging.getLogger(__name__)
 
 # Labels we embed in microVM metadata (analogous to Docker labels).
 _LABEL_PREFIX = "agent-platform"
+
+# Claude Agent SDK worker entry (``worker-claude-sdk`` image ENTRYPOINT).
+WORKER_CMD: list[str] = ["node", "/app/dist/main.js"]
 
 
 class PoolCubeRuntime:
@@ -129,8 +131,8 @@ class PoolCubeRuntime:
         each tier must warm at its own size; when omitted we fall back to the
         legacy single-bucket ``sandbox_memory_limit``.
 
-        The microVM runs the agentscope_ext runtime_worker command but with
-        an empty task (AGENT_TASK_JSON is set to a quiescent payload).
+        The microVM runs the Claude SDK worker entry (``WORKER_CMD``) with an
+        empty task (AGENT_TASK_JSON is set to a quiescent payload).
         The pool will hand the sandbox_id to the scheduler on acquire; the
         scheduler then tells the VM what task to run by other means
         (for CubeSandbox this relies on the snapshot fork path — follow-up).
@@ -138,7 +140,7 @@ class PoolCubeRuntime:
         NOTE: Snapshot-based pre-warming is NOT implemented.
         This is a cold-spawn that gives the pool one pre-booted VM ready
         to receive a task.  The latency benefit comes from the microVM
-        already being booted (OS + Python runtime in memory), not from
+        already being booted (OS + Node runtime in memory), not from
         a memory-checkpoint fork.  Snapshot integration is a follow-up.
         """
         import json
@@ -156,10 +158,14 @@ class PoolCubeRuntime:
                 # injected.  In the snapshot path this state is captured as
                 # the "ready" checkpoint; until snapshots land the VM just
                 # waits for a signal.
-                "AGENT_TASK_JSON": json.dumps({"task": "__idle__", "mcp_servers": [], "skills": []}),
+                "AGENT_TASK_JSON": json.dumps(
+                    {"task": "__idle__", "mcp_servers": [], "skills": []},
+                ),
             },
-            # Worker entry point — matches docker_runtime and cube_runtime.
-            "cmd": ["python", "-m", "agentscope_ext.runtime_worker"],
+            # Worker entry point — matches agent-scheduler's cube_runtime
+            # (CubeSandbox's behaviour with an empty cmd is unspecified, so the
+            # image ENTRYPOINT is passed explicitly).
+            "cmd": list(WORKER_CMD),
             "resources": {
                 "memory_mb": _parse_memory_mb(
                     memory_limit or self._settings.sandbox_memory_limit,

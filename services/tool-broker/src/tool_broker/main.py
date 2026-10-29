@@ -1200,8 +1200,8 @@ async def _mcp_upstream_auth_headers(record: Mapping[str, Any]) -> dict[str, str
     """Build the UPSTREAM auth + custom headers for a tenant MCP server.
 
     The broker is the ONLY injection point for registry-supplied upstream
-    auth/headers on broker-routed sessions: the claude-sdk worker and the
-    agentscope injector point their MCP clients at the broker and carry only
+    auth/headers on broker-routed sessions: the claude-sdk worker points its
+    MCP clients at the broker and carries only
     broker-auth headers (Authorization / X-Tenant-Id / X-Tool-Broker-Lease), so
     the registry's ``auth`` / ``headers`` fields for the real upstream must be
     applied here.  Auth headers win over colliding custom ``headers`` keys.
@@ -1367,8 +1367,8 @@ async def proxy_mcp_tenant(
     # foundation Bearer was just stripped above; the registry's ``auth`` (a
     # bearer/api_key for the third-party MCP server) and ``headers`` are added
     # here so they reach the real upstream and ONLY the real upstream. This is
-    # the single injection point for broker-routed sessions: the worker /
-    # agentscope clients carry only broker-auth headers, never upstream auth.
+    # the single injection point for broker-routed sessions: worker clients
+    # carry only broker-auth headers, never upstream auth.
     # For ``auth.type == "oauth"`` the broker performs the client-credentials
     # flow itself (cached + single-flight by server_id) and injects the bearer.
     forward_headers.update(await _mcp_upstream_auth_headers(record))

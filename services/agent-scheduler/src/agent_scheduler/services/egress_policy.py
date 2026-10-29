@@ -14,7 +14,6 @@ import json
 import time
 from typing import Any
 
-
 BROKER_LEASE_SCOPES: tuple[str, ...] = (
     "llm-gateway.invoke",
     "mcp.read_internal",
@@ -166,13 +165,12 @@ def service_env(settings: Any, *, llm_gateway_url: str | None = None) -> dict[st
         return {
             "SANDBOX_EGRESS_MODE": mode,
             "TOOL_BROKER_URL": _trim(settings.tool_broker_url),
-            # OpenAI-compatible base; llm_gateway_enforcer appends
-            # /chat/completions to this value.
+            # Gateway base the worker's model adapter sends every LLM call to.
             "LLM_GATEWAY_URL": _broker_url(settings, "llm-gateway/v1"),
-            # mcp_tenant_injector appends /internal/mcp-servers.
+            # The worker appends /internal/mcp-servers.
             "MCP_REGISTRY_URL": _broker_url(settings, "mcp/v1"),
-            # Kept for old skills_loader deployments that still resolve in
-            # sandbox; current scheduler-side mounted skills do not need it.
+            # Kept for in-sandbox skill-store lookups; scheduler-side mounted
+            # skills do not need it.
             "SKILL_STORE_URL": _broker_url(settings, "skills/v1"),
             # WebFetchTool appends /fetch when the URL ends with /api/web-fetch/v1.
             "WEB_FETCH_GATEWAY_URL": _broker_url(
@@ -181,8 +179,9 @@ def service_env(settings: Any, *, llm_gateway_url: str | None = None) -> dict[st
             # The worker appends /core/scan; the broker /dlp route allowlists
             # that single path on the foundation-dlp upstream.
             "DLP_URL": _broker_url(settings, "dlp/api/dlp/v1"),
-            # knowledge_tool appends /search; the broker /knowledge/v1 route
-            # allowlists that single path on the knowledge-ingest upstream and
+            # The worker's knowledge tool appends /search; the broker
+            # /knowledge/v1 route allowlists that single path on the
+            # knowledge-ingest upstream and
             # re-injects X-User-Clearance from the signed per-run lease.
             "KNOWLEDGE_INGEST_URL": _broker_url(settings, "knowledge/v1"),
             # Direct object-store endpoint and Redis access must not be

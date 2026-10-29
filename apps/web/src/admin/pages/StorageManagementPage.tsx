@@ -134,7 +134,7 @@ export function StorageManagementPage() {
       .then((res) => setItems(res.items ?? []))
       .catch((err) => {
         if (isTodo(err)) setTodo(true);
-        else setError(err instanceof ApiError ? err.message : '加载失败');
+        else setError(err instanceof ApiError ? err.message : 'Failed to load');
       })
       .finally(() => setLoading(false));
   }, []);
@@ -173,20 +173,20 @@ export function StorageManagementPage() {
     if (!edit.item) return;
     const value = parseFloat(edit.limitValue);
     if (!Number.isFinite(value) || value < 0) {
-      setEdit((s) => ({ ...s, error: '配额数值无效' }));
+      setEdit((s) => ({ ...s, error: 'Invalid quota value' }));
       return;
     }
     const limitBytes = Math.round(value * UNIT_FACTORS[edit.limitUnit]);
     const softWarn = parseInt(edit.softWarnInput, 10);
     if (!Number.isFinite(softWarn) || softWarn < 0 || softWarn > 100) {
-      setEdit((s) => ({ ...s, error: '软警戒阈值需为 0–100 之间的整数' }));
+      setEdit((s) => ({ ...s, error: 'Soft warning threshold must be an integer from 0 to 100' }));
       return;
     }
     const { item } = edit;
     const ok = await confirm({
-      title: '调整租户配额',
-      message: `将 ${item.tenant_id} 的 ${item.bucket_purpose} 配额调整为 ${formatBytes(limitBytes)}（软警戒 ${softWarn}%）？`,
-      confirmText: '确认调整',
+      title: 'Adjust tenant quota',
+      message: `Set the ${item.bucket_purpose} quota for ${item.tenant_id} to ${formatBytes(limitBytes)} (soft warning at ${softWarn}%)?`,
+      confirmText: 'Adjust',
     });
     if (!ok) return;
     setEdit((s) => ({ ...s, busy: true, error: null }));
@@ -196,14 +196,14 @@ export function StorageManagementPage() {
         item.bucket_purpose,
         { limit_bytes: limitBytes, soft_warn_pct: softWarn },
       );
-      toast.success('已更新');
+      toast.success('Updated');
       closeEdit();
       refresh();
     } catch (err) {
       setEdit((s) => ({
         ...s,
         busy: false,
-        error: err instanceof ApiError ? err.message : '更新失败',
+        error: err instanceof ApiError ? err.message : 'Update failed',
       }));
     }
   };
@@ -229,7 +229,7 @@ export function StorageManagementPage() {
       .then((res) => setSeries(res))
       .catch((err) => {
         if (isTodo(err)) setSeries(null);
-        else setSeriesErr(err instanceof ApiError ? err.message : '加载趋势失败');
+        else setSeriesErr(err instanceof ApiError ? err.message : 'Failed to load trend');
       })
       .finally(() => setSeriesLoading(false));
   }, [chartRange, chartPurpose, chartTenantId]);
@@ -260,7 +260,7 @@ export function StorageManagementPage() {
   const tenantOptions = useMemo(() => {
     const ids = Array.from(new Set(items.map((i) => i.tenant_id))).sort();
     return [
-      { value: '', label: '全部租户' },
+      { value: '', label: 'All tenants' },
       ...ids.map((id) => ({ value: id, label: id })),
     ];
   }, [items]);
@@ -269,10 +269,10 @@ export function StorageManagementPage() {
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
         <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">
-          存储管理 / 租户配额
+          Storage / Tenant quotas
         </h1>
         <p className="text-[12px] text-dim mt-0.5">
-          跨租户配额汇总、上限调整与趋势监控（→ lifecycle + prometheus）
+          Cross-tenant quota summary, limit adjustments and trend monitoring (→ lifecycle + prometheus)
         </p>
       </div>
 
@@ -283,7 +283,7 @@ export function StorageManagementPage() {
       )}
       {todo && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          该能力暂未启用：存储配额汇总端点不可达，接线后将自动展示。
+          Not available yet: the storage quota summary endpoint is unreachable. Data will appear here once it’s connected.
         </div>
       )}
 
@@ -291,11 +291,11 @@ export function StorageManagementPage() {
       {!todo && (
         <div className="flex items-center gap-3">
           <label className="text-[11px] font-mono text-dim uppercase tracking-[0.1em]">
-            桶类型过滤
+            Bucket type
           </label>
           <CustomSelect
             options={[
-              { value: '', label: '全部' },
+              { value: '', label: 'All' },
               ...PURPOSES.map((p) => ({ value: p, label: p })),
             ]}
             value={filterPurpose}
@@ -306,17 +306,17 @@ export function StorageManagementPage() {
             onClick={refresh}
             className="ml-auto px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2"
           >
-            刷新
+            Refresh
           </button>
         </div>
       )}
 
-      {loading && <div className="font-mono text-[12px] text-dim">加载中…</div>}
+      {loading && <div className="font-mono text-[12px] text-dim">Loading…</div>}
 
       {/* Quotas table */}
       {!todo && !loading && filteredItems.length === 0 && (
         <div className="font-mono text-[12px] text-dim italic">
-          无配额记录{filterPurpose ? `（桶类型：${filterPurpose}）` : ''}
+          No quota records{filterPurpose ? ` (bucket type: ${filterPurpose})` : ''}
         </div>
       )}
 
@@ -326,25 +326,25 @@ export function StorageManagementPage() {
             <thead className="bg-paper-2 border-b border-line">
               <tr>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  租户
+                  Tenant
                 </th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  桶
+                  Bucket
                 </th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  已用
+                  Used
                 </th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  上限
+                  Limit
                 </th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  占用率
+                  Usage
                 </th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  软警戒
+                  Soft warning
                 </th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-                  更新时间
+                  Updated
                 </th>
                 <th className="px-3 py-2 w-20"></th>
               </tr>
@@ -401,7 +401,7 @@ export function StorageManagementPage() {
                         onClick={() => openEdit(it)}
                         className="text-[11px] font-mono text-ink-2 border border-line rounded-sm px-2 py-0.5 hover:bg-paper-2"
                       >
-                        调整
+                        Adjust
                       </button>
                     </td>
                   </tr>
@@ -415,7 +415,7 @@ export function StorageManagementPage() {
       {/* Trend chart */}
       <section className="flex flex-col gap-2 mt-2">
         <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">
-          趋势 — storage_quota_used_bytes
+          Trend — storage_quota_used_bytes
         </div>
         <div className="flex items-center gap-3 flex-wrap">
           <CustomSelect
@@ -426,7 +426,7 @@ export function StorageManagementPage() {
           />
           <CustomSelect
             options={[
-              { value: '', label: '全部桶' },
+              { value: '', label: 'All buckets' },
               ...PURPOSES.map((p) => ({ value: p, label: p })),
             ]}
             value={chartPurpose}
@@ -435,10 +435,10 @@ export function StorageManagementPage() {
           />
           <CustomSelect
             options={[
-              { value: '1h', label: '近 1 小时' },
-              { value: '6h', label: '近 6 小时' },
-              { value: '24h', label: '近 24 小时' },
-              { value: '7d', label: '近 7 天' },
+              { value: '1h', label: 'Last hour' },
+              { value: '6h', label: 'Last 6 hours' },
+              { value: '24h', label: 'Last 24 hours' },
+              { value: '7d', label: 'Last 7 days' },
             ]}
             value={chartRange}
             onChange={(v) => setChartRange(v as '1h' | '6h' | '24h' | '7d')}
@@ -454,11 +454,11 @@ export function StorageManagementPage() {
 
         <div className="border border-line rounded-md p-3 bg-surface h-[260px]">
           {seriesLoading && (
-            <div className="font-mono text-[12px] text-dim">加载趋势…</div>
+            <div className="font-mono text-[12px] text-dim">Loading trend…</div>
           )}
           {!seriesLoading && chartData.length === 0 && (
             <div className="font-mono text-[12px] text-dim italic h-full flex items-center justify-center">
-              暂无数据
+              No data
             </div>
           )}
           {!seriesLoading && chartData.length > 0 && (
@@ -484,7 +484,7 @@ export function StorageManagementPage() {
                   labelFormatter={(t) =>
                     formatDateTimeAuto(new Date(Number(t) * 1000))
                   }
-                  formatter={(value) => [formatBytes(Number(value) || 0), '已用']}
+                  formatter={(value) => [formatBytes(Number(value) || 0), 'Used']}
                 />
                 <Line
                   type="monotone"
@@ -502,7 +502,7 @@ export function StorageManagementPage() {
       {/* Edit modal */}
       {edit.open && edit.item && (
         <Dialog
-          title="调整配额"
+          title="Adjust quota"
           onClose={closeEdit}
           dismissable={!edit.busy}
           className="w-full max-w-[420px]"
@@ -511,7 +511,7 @@ export function StorageManagementPage() {
             {edit.item.tenant_id} · {edit.item.bucket_purpose}
           </div>
           <div className="text-[11px] text-dim">
-            当前已用：{formatBytes(edit.item.used_bytes)} ／ 上限{' '}
+            Currently used: {formatBytes(edit.item.used_bytes)} / limit{' '}
             {formatBytes(edit.item.limit_bytes)}
           </div>
           <form onSubmit={submitEdit} className="flex flex-col gap-3">
@@ -521,7 +521,7 @@ export function StorageManagementPage() {
               </div>
             )}
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">上限</label>
+              <label className="text-[11px] text-dim font-mono">Limit</label>
               <div className="flex gap-2">
                 <input
                   value={edit.limitValue}
@@ -539,7 +539,7 @@ export function StorageManagementPage() {
               </div>
             </div>
             <div className="flex flex-col gap-1">
-              <label className="text-[11px] text-dim font-mono">软警戒阈值 (%)</label>
+              <label className="text-[11px] text-dim font-mono">Soft warning threshold (%)</label>
               <input
                 value={edit.softWarnInput}
                 onChange={(e) => setEdit((s) => ({ ...s, softWarnInput: e.target.value }))}
@@ -556,14 +556,14 @@ export function StorageManagementPage() {
                 disabled={edit.busy}
                 className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:text-ink disabled:opacity-50"
               >
-                取消
+                Cancel
               </button>
               <button
                 type="submit"
                 disabled={edit.busy}
                 className="px-2.5 py-1 text-[11px] font-mono bg-accent text-surface rounded-sm hover:opacity-90 disabled:opacity-50"
               >
-                {edit.busy ? '提交中…' : '确认'}
+                {edit.busy ? 'Submitting…' : 'Confirm'}
               </button>
             </div>
           </form>

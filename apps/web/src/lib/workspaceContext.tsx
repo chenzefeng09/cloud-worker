@@ -195,7 +195,7 @@ export function WorkspaceProvider({ children }: { children: ReactNode }) {
   const uploadFile = useCallback(
     async (file: File, description?: string, folder?: string, level?: DlpSensitivity) => {
       const id = activeWsIdRef.current;
-      if (!id) throw new Error('没有可用的工作区');
+      if (!id) throw new Error('No workspace available');
       const uploaded = await api.workspaces.uploadFile(id, file, description, folder, level);
       await refreshFiles();
       // file_count on the workspace is derived server-side; refresh the list so

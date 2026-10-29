@@ -23,7 +23,7 @@ Please fill out the sections below. PRs that leave the checklist incomplete may 
 
 <!-- e.g. bff, session-orchestrator, agent-scheduler, sandbox-pool, app-registry, skill-store,
      mcp-registry, tool-broker, knowledge-ingest, cron-runner, web-fetch-gateway,
-     web frontend, agentscope-ext / sandbox, deploy. -->
+     web frontend, worker-claude-sdk / sandbox images, contracts, deploy. -->
 
 ## Linked issues
 
@@ -39,6 +39,7 @@ Closes #
 - [ ] `make test` (pytest across affected services) passes
 - [ ] `make conformance` (or `conformance-docker` / `conformance-static`) passes where relevant
 - [ ] Frontend checks pass where relevant (`make web-install`, lint, Vitest)
+- [ ] Worker checks pass where relevant (`worker-claude-sdk`: `npm run typecheck`, `npm test`, `npm run build`)
 - [ ] Manual verification (describe below)
 
 <!-- Notes on manual testing, edge cases, or anything reviewers should reproduce: -->

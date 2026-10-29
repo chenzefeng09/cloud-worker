@@ -72,6 +72,39 @@ describe('routeCanvasIntent', () => {
     expect(routeCanvasIntent('   ', true)).toBe('chat');
   });
 
+  describe('English messages', () => {
+    const updateCases = [
+      'Rewrite this paragraph',
+      'Shorten the intro',
+      'Polish the whole thing',
+      'Make it more formal',
+      'Change the second paragraph to a friendlier tone',
+      'Replace the ending with a call to action',
+      'Change the title',
+      'Remove the last paragraph',
+    ];
+    for (const msg of updateCases) {
+      it(`"${msg}" routes to update_canvas`, () => {
+        expect(routeCanvasIntent(msg, true)).toBe('update_canvas');
+      });
+    }
+    const chatCases = [
+      'Write a new article on the same topic',
+      'Draft another email, then polish it',
+      'What would you change to improve it?',
+      'Thanks!',
+      'What is this article about?',
+    ];
+    for (const msg of chatCases) {
+      it(`"${msg}" routes to chat`, () => {
+        expect(routeCanvasIntent(msg, true)).toBe('chat');
+      });
+    }
+    it('routes to chat with no active canvas', () => {
+      expect(routeCanvasIntent('Rewrite this paragraph', false)).toBe('chat');
+    });
+  });
+
   it('new-content signal wins even when a modify verb is also present', () => {
     // "再写一篇" (new) + "润色" (modify) — the new-content signal must win.
     expect(routeCanvasIntent('再写一篇然后帮我润色', true)).toBe('chat');

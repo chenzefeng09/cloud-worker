@@ -175,8 +175,8 @@ function PreviewCopyButton({ text }: { text: string }) {
   return (
     <button
       onClick={() => copy(text)}
-      aria-label="复制文件内容"
-      title="复制文件内容"
+      aria-label="Copy file contents"
+      title="Copy file contents"
       style={{
         display: 'flex',
         alignItems: 'center',
@@ -194,7 +194,7 @@ function PreviewCopyButton({ text }: { text: string }) {
         userSelect: 'none',
       }}
     >
-      {copied ? <span>已复制</span> : <CopyIcon />}
+      {copied ? <span>Copied</span> : <CopyIcon />}
     </button>
   );
 }
@@ -239,7 +239,7 @@ function TextContent({
   }, [contentText, lang]);
 
   if (contentLoading) {
-    return <div className="px-4 py-3 font-mono text-[11px] text-dim">加载预览…</div>;
+    return <div className="px-4 py-3 font-mono text-[11px] text-dim">Loading preview…</div>;
   }
   if (contentError) {
     return <div className="px-4 py-3 font-mono text-[11px] text-accent">{contentError}</div>;
@@ -264,7 +264,7 @@ function TextPreview({ contentText, contentLoading, contentError, filename, fill
   return (
     <div className={cardCls(fill)}>
       <div className="flex items-center justify-between px-4 py-2 border-b border-line-2 shrink-0">
-        <span className="cw-label">文件内容</span>
+        <span className="cw-label">File contents</span>
         {contentText !== null && !contentLoading && (
           <PreviewCopyButton text={contentText} />
         )}
@@ -298,7 +298,7 @@ function HtmlPreview({ contentText, contentLoading, contentError, filename, fill
             style={mode === 'render' ? { borderColor: 'var(--accent)' } : undefined}
             onClick={() => setMode('render')}
           >
-            预览
+            Preview
           </button>
           <button
             type="button"
@@ -306,7 +306,7 @@ function HtmlPreview({ contentText, contentLoading, contentError, filename, fill
             style={mode === 'source' ? { borderColor: 'var(--accent)' } : undefined}
             onClick={() => setMode('source')}
           >
-            源码
+            Source
           </button>
         </div>
         {mode === 'source' && contentText !== null && !contentLoading && (
@@ -315,7 +315,7 @@ function HtmlPreview({ contentText, contentLoading, contentError, filename, fill
       </div>
 
       {contentLoading && (
-        <div className="px-4 py-3 font-mono text-[11px] text-dim">加载预览…</div>
+        <div className="px-4 py-3 font-mono text-[11px] text-dim">Loading preview…</div>
       )}
       {contentError && (
         <div className="px-4 py-3 font-mono text-[11px] text-accent">{contentError}</div>
@@ -339,7 +339,7 @@ function HtmlPreview({ contentText, contentLoading, contentError, filename, fill
               />
             </div>
             <div className="font-mono text-[10.5px] text-dim">
-              脚本在隔离沙箱中运行（无法访问站点数据）。引用站点相对资源的内容可能无法加载，如需完整效果请下载查看。
+              Scripts run in an isolated sandbox (no access to site data). Content that references site-relative resources may not load; download the file for the full experience.
             </div>
           </div>
         ) : (
@@ -413,7 +413,7 @@ function MarkdownPreview({
             style={mode === 'render' ? { borderColor: 'var(--accent)' } : undefined}
             onClick={() => setMode('render')}
           >
-            预览
+            Preview
           </button>
           <button
             type="button"
@@ -421,7 +421,7 @@ function MarkdownPreview({
             style={mode === 'source' ? { borderColor: 'var(--accent)' } : undefined}
             onClick={() => setMode('source')}
           >
-            源码
+            Source
           </button>
         </div>
         {contentText !== null && !contentLoading && (
@@ -430,7 +430,7 @@ function MarkdownPreview({
       </div>
 
       {contentLoading && (
-        <div className="px-4 py-3 font-mono text-[11px] text-dim">加载预览…</div>
+        <div className="px-4 py-3 font-mono text-[11px] text-dim">Loading preview…</div>
       )}
       {contentError && (
         <div className="px-4 py-3 font-mono text-[11px] text-accent">{contentError}</div>
@@ -492,7 +492,7 @@ function ImageLightbox({ src, alt, onClose }: { src: string; alt: string; onClos
     >
       <button
         type="button"
-        aria-label="关闭"
+        aria-label="Close"
         onClick={onClose}
         className="fixed top-4 right-4 text-white text-2xl leading-none"
       >
@@ -516,7 +516,7 @@ function ImagePreview({ src, alt, fill = false }: { src: string; alt: string; fi
         <img
           src={src}
           alt={alt}
-          title="点击放大"
+          title="Click to zoom"
           onClick={() => setZoomed(true)}
           className={`max-w-full object-contain cursor-zoom-in ${fill ? 'max-h-full' : INLINE_BODY_CAP}`}
           style={{ display: 'block' }}
@@ -632,7 +632,7 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime, source, fil
       })
       .catch((e) => {
         if (cancelled) return;
-        setContentError(e instanceof ApiError ? e.message : '加载文件内容失败');
+        setContentError(e instanceof ApiError ? e.message : 'Failed to load file contents');
       })
       .finally(() => {
         if (!cancelled) setContentLoading(false);
@@ -701,7 +701,7 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime, source, fil
   // PDF / Excel / Word / PPT — 懒加载预览器
   if (isPdf || isExcel || isWord || isPptx) {
     return (
-      <Suspense fallback={<div className="font-mono text-[11px] text-dim">加载预览组件…</div>}>
+      <Suspense fallback={<div className="font-mono text-[11px] text-dim">Loading preview…</div>}>
         {contentError ? (
           <div className="font-mono text-[11px] text-accent">{contentError}</div>
         ) : isPdf ? (
@@ -710,7 +710,7 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime, source, fil
           isExcel ? <ExcelPreview blob={contentBlob} /> : isPptx ? <PptxPreview blob={contentBlob} /> : <DocxPreview blob={contentBlob} />
         ) : (
           <div className="font-mono text-[11px] text-dim">
-            {isExcel ? '加载表格…' : isPptx ? '加载演示文稿…' : '加载文档…'}
+            {isExcel ? 'Loading spreadsheet…' : isPptx ? 'Loading presentation…' : 'Loading document…'}
           </div>
         )}
       </Suspense>
@@ -720,13 +720,13 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime, source, fil
   // Archive — list the internal file tree without extracting (libarchive.js)
   if (isArchive) {
     return (
-      <Suspense fallback={<div className="font-mono text-[11px] text-dim">加载预览组件…</div>}>
+      <Suspense fallback={<div className="font-mono text-[11px] text-dim">Loading preview…</div>}>
         {contentError ? (
           <div className="font-mono text-[11px] text-accent">{contentError}</div>
         ) : contentBlob ? (
           <ArchivePreview blob={contentBlob} filename={filename} />
         ) : (
-          <div className="font-mono text-[11px] text-dim">读取压缩包…</div>
+          <div className="font-mono text-[11px] text-dim">Reading archive…</div>
         )}
       </Suspense>
     );
@@ -736,13 +736,13 @@ export function FilePreviewBody({ sessionId, fileId, filename, mime, source, fil
   return (
     <div className="border border-line rounded-md bg-surface px-4 py-4 flex flex-col gap-2">
       <div className="font-mono text-[12px] text-ink">{filename}</div>
-      <div className="font-mono text-[11px] text-dim italic">— 该文件类型暂不支持预览，请下载查看 —</div>
+      <div className="font-mono text-[11px] text-dim italic">— Preview isn’t available for this file type. Download it to view. —</div>
       <a
         href={contentUrl}
         download={filename}
         className="cw-btn cw-btn-sm cw-btn-ghost self-start"
       >
-        下载
+        Download
       </a>
     </div>
   );

@@ -31,6 +31,8 @@ export type CanvasIntent = 'update_canvas' | 'chat';
  * separate document".
  */
 const NEW_CONTENT_SIGNAL = /再写(?:一篇|一份|一个|个|篇|份)|另写|另起(?:一篇|一份)?|新写(?:一篇|一份|一个)?|重新写(?:一篇|一份|一个)|写(?:一篇|一份|一个)(?:新的|全新)|新建(?:一个)?(?:画布|文档|文章)/;
+/** English equivalents: "write a new article", "draft another email", "start a fresh doc". */
+const NEW_CONTENT_SIGNAL_EN = /\b(?:write|draft|create|start)\s+(?:a\s+|an\s+)?(?:new|another|separate|fresh)\b/i;
 
 /**
  * Modify-intent predicates. A message matching any of these (and NOT a
@@ -51,6 +53,16 @@ const MODIFY_PREDICATES: RegExp[] = [
   /把.{0,12}(?:改成|换成|改为|换为)/,
   // retitle: 换.*标题 / 改.*标题
   /(?:换|改|重拟|另拟).{0,6}(?:标题|题目)/,
+  // English: bare revision verbs ("rewrite this", "shorten it", "polish the intro")
+  /\b(?:rewrite|rephrase|reword|shorten|condense|tighten|expand|polish|proofread|simplify)\b/i,
+  // "make it shorter / more formal / less wordy"
+  /\bmake\s+(?:it|this|that|the\s+\w+)\s+(?:shorter|longer|clearer|simpler|punchier|more|less)\b/i,
+  // targeted replacement: "change X to Y" / "replace X with Y"
+  /\bchange\s+(?:the|this|that|it)\b.{0,40}\b(?:to|into)\b|\breplace\b.{0,40}\bwith\b/i,
+  // retitle: "change/rename the title", "retitle"
+  /\b(?:change|rename|update)\s+(?:the\s+)?(?:title|heading)\b|\bretitle\b/i,
+  // "remove/delete the second paragraph"
+  /\b(?:remove|delete|cut)\s+(?:the\s+)?(?:\w+\s+)?(?:paragraph|sentence|section|line)\b/i,
 ];
 
 /**
@@ -67,7 +79,7 @@ export function routeCanvasIntent(userMsg: string, hasActiveCanvas: boolean): Ca
   if (!text) return 'chat';
   // An explicit "write something new" signal always wins — never hijack it
   // into an edit of the current canvas.
-  if (NEW_CONTENT_SIGNAL.test(text)) return 'chat';
+  if (NEW_CONTENT_SIGNAL.test(text) || NEW_CONTENT_SIGNAL_EN.test(text)) return 'chat';
   const isModify = MODIFY_PREDICATES.some((re) => re.test(text));
   return isModify ? 'update_canvas' : 'chat';
 }

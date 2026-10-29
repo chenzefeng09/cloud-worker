@@ -24,8 +24,8 @@ export const appInputCls =
   'border border-line rounded-sm px-2 py-1.5 text-[13px] bg-paper focus:outline-none focus:border-accent';
 
 export const VISIBILITY_OPTIONS: { id: AppVisibility; label: string }[] = [
-  { id: 'private', label: '私有（仅自己）' },
-  { id: 'tenant', label: '租户（提交发布后可见）' },
+  { id: 'private', label: 'Private (only me)' },
+  { id: 'tenant', label: 'Tenant (visible once published)' },
 ];
 
 export function EmojiPicker({
@@ -53,7 +53,7 @@ export function EmojiPicker({
         type="button"
         onClick={() => setOpen((o) => !o)}
         className="w-10 h-10 border border-line rounded-md flex items-center justify-center text-[18px] bg-paper hover:border-ink-2 transition-colors cursor-pointer"
-        title="选择图标"
+        title="Choose icon"
       >
         {value || '◐'}
       </button>
@@ -82,7 +82,7 @@ export function EmojiPicker({
               className="w-full border border-line rounded-sm px-2 py-1 text-[12px] bg-paper focus:outline-none focus:border-accent font-mono"
               value={value}
               onChange={(e) => onChange(e.target.value)}
-              placeholder="自定义输入"
+              placeholder="Custom"
               maxLength={4}
             />
           </div>
@@ -108,7 +108,7 @@ export function VisibilitySelect({
         options={VISIBILITY_OPTIONS}
         onChange={(v) => onChange(v as AppVisibility)}
         align="left"
-        title="可见性"
+        title="Visibility"
       />
     </div>
   );

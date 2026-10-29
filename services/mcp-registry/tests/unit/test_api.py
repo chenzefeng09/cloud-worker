@@ -1044,7 +1044,7 @@ def test_test_endpoint_redirect_refuses_to_reuse_stored_auth(
     assert body["ok"] is False
     assert body["tools"] == []
     assert "endpoint" in body["error"]
-    assert "凭据" in body["error"]
+    assert "credentials" in body["error"]
     # No outbound handshake, and no decrypt: the secret never left the DB.
     assert fake.calls == []
     assert decrypt_calls == []
@@ -1100,7 +1100,7 @@ def test_test_endpoint_redirect_refuses_to_reuse_stored_headers(
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["ok"] is False
-    assert "凭据" in body["error"]
+    assert "credentials" in body["error"]
     assert fake.calls == []
 
 

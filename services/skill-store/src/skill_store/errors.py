@@ -15,7 +15,7 @@ class SkillStoreError(Exception):
         self.detail = detail
         self.code = code
         self.status = status
-        # Human-facing (Chinese) message safe to render to the uploader as-is.
+        # Human-facing (English) message safe to render to the uploader as-is.
         # Falls back to ``detail`` when not explicitly provided so every error
         # carries a displayable message.
         self.user_message = user_message or detail
@@ -69,8 +69,8 @@ class SkillSha256MismatchError(SkillStoreError):
 class SkillPackageInvalidError(SkillStoreError):
     """Uploaded tarball failed structural / content validation.
 
-    ``message`` is a Chinese, user-facing explanation of *why* the package was
-    rejected (e.g. "缺少 SKILL.md").  It is surfaced both as ``detail`` and
+    ``message`` is an English, user-facing explanation of *why* the package was
+    rejected (e.g. "Missing SKILL.md").  It is surfaced both as ``detail`` and
     ``user_message`` so the API/BFF/frontend can show it verbatim.
     """
 
@@ -101,7 +101,7 @@ class SkillFilePathInvalidError(SkillStoreError):
             f"Invalid skill file path {path!r}",
             code="SKILL.FILE.PATH_INVALID",
             status=400,
-            user_message=f"非法的文件路径：{path}（不允许绝对路径或包含 '..'）",
+            user_message=f"Invalid file path: {path} (absolute paths and '..' are not allowed)",
         )
 
 
@@ -113,7 +113,7 @@ class SkillFileNotFoundError(SkillStoreError):
             f"Skill file {path!r} not found in package",
             code="SKILL.FILE.NOT_FOUND",
             status=404,
-            user_message=f"技能包内不存在该文件：{path}",
+            user_message=f"File not found in the skill package: {path}",
         )
 
 
@@ -125,7 +125,7 @@ class SkillFileTooLargeError(SkillStoreError):
             f"Skill file {path!r} exceeds the maximum member size",
             code="SKILL.FILE.TOO_LARGE",
             status=413,
-            user_message=f"技能包内该文件过大，超出单文件大小上限：{path}",
+            user_message=f"File in the skill package exceeds the per-file size limit: {path}",
         )
 
 
@@ -137,5 +137,5 @@ class SkillFileNotTextError(SkillStoreError):
             f"Skill file {path!r} is not valid UTF-8 text",
             code="SKILL.FILE.NOT_TEXT",
             status=415,
-            user_message=f"技能包内该文件不是合法的 UTF-8 文本：{path}",
+            user_message=f"File in the skill package is not valid UTF-8 text: {path}",
         )

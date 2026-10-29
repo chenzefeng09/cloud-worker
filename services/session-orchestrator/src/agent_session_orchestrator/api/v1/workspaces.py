@@ -16,7 +16,7 @@ Blob storage layout mirrors attachments::
 
 Lazy default workspace
 ----------------------
-``GET /workspaces`` creates a default workspace ("工作区", ``is_default=True``)
+``GET /workspaces`` creates a default workspace ("Workspace", ``is_default=True``)
 on first touch for a user with no live workspaces.  The create runs in its own
 short transaction so a concurrent-request unique-index conflict
 (``uq_workspace_default_per_user``) never poisons the request transaction — the
@@ -167,7 +167,7 @@ async def create_workspace(
             "workspace sensitivity_level exceeds caller clearance",
             code="AGENT.WORKSPACE.CLEARANCE_DENIED",
             status=403,
-            user_message="工作区密级不能超过你的权限级别。",
+            user_message="The workspace sensitivity level cannot exceed your clearance level.",
         )
     svc = WorkspaceService(db, tenant_id=tenant_id)
     workspace = await svc.create_workspace(
@@ -221,7 +221,7 @@ async def update_workspace(
             "workspace sensitivity_level exceeds caller clearance",
             code="AGENT.WORKSPACE.CLEARANCE_DENIED",
             status=403,
-            user_message="工作区密级不能超过你的权限级别。",
+            user_message="The workspace sensitivity level cannot exceed your clearance level.",
         )
     workspace = await svc.update_workspace(
         workspace_id, user_id=owner, updates=updates
@@ -278,14 +278,14 @@ async def upload_workspace_file(
             f"invalid sensitivity_level {sensitivity_level!r}",
             code="AGENT.WORKSPACE.INVALID_LEVEL",
             status=422,
-            user_message="密级级别无效，必须是 L1 到 L5 之一。",
+            user_message="Invalid sensitivity level; it must be one of L1 to L5.",
         )
     if not level_allows(clearance, sensitivity_level):
         raise OrchestratorError(
             "file sensitivity_level exceeds caller clearance",
             code="AGENT.WORKSPACE.CLEARANCE_DENIED",
             status=403,
-            user_message="文件密级不能超过你的权限级别。",
+            user_message="The file sensitivity level cannot exceed your clearance level.",
         )
 
     blob_store = _get_blob_store(request)
@@ -424,7 +424,7 @@ async def get_workspace_file_content(
             "file sensitivity_level exceeds caller clearance",
             code="AGENT.WORKSPACE.CLEARANCE_DENIED",
             status=403,
-            user_message="文件密级超过你的权限级别，无法下载。",
+            user_message="This file's sensitivity level exceeds your clearance level, so it cannot be downloaded.",
         )
 
     try:

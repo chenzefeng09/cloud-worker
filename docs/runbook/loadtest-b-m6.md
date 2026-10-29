@@ -272,7 +272,7 @@ kubectl get events -n agent-platform --field-selector reason=OOMKilling
 | `create_session HTTP 503` | Session-orchestrator not ready / DB pool exhausted |
 | `chat POST HTTP 504` | Agent scheduler not responding / sandbox cold-start timeout |
 | `SSE stream ended without 'done'` | Agent run crashed; check orchestrator logs |
-| `agent error event:` | Worker-level error; check agentscope-ext logs in sandbox |
+| `agent error event:` | Worker-level error; check the worker-claude-sdk logs in the sandbox |
 | High error rate after 1 h | Connection pool exhaustion; check `DB_POOL_SIZE` |
 
 ---

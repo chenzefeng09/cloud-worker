@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
-import type { Attachment, ExecutionMode } from '../../api/types';
+import type { Attachment } from '../../api/types';
 import { Dropdown, type DropdownOption } from '../shell/Dropdown';
 import { HoverHint } from '../shell/HoverHint';
 import { EFFORT_OPTIONS } from '../../lib/modelOptions';
@@ -33,32 +33,27 @@ import {
 //   onStop/isStreaming   session only — nothing to interrupt on the home page
 //   skills / mcp         session only — both are keyed by session id
 //   text/onTextChange    optional controlled text; the home page needs the
-//                        draft for the session title and the 「试试」chips
+//                        draft for the session title and the "Try:" chips
 //
 // Anything omitted simply doesn't render.
-
-const EXECUTION_MODE_OPTIONS: DropdownOption[] = [
-  { id: 'sandbox', label: '智能体' },
-  { id: 'inline', label: '对话' },
-];
 
 const ACCEPT =
   'image/*,.pdf,.txt,.csv,.md,.json,.py,.js,.ts,.html,.xml,.yaml,.yml,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.wps,.et,.dps';
 
 const COPY = {
   session: {
-    placeholder: '输入消息…（Enter 发送，Shift+Enter 换行，@ 引用文件）',
-    modelHint: '选择本次会话使用的模型',
-    sendLabel: '发送消息',
-    sendHint: '发送消息（Enter）',
-    busyLabel: '正在等待附件上传',
+    placeholder: 'Type a message… (Enter to send, Shift+Enter for a new line, @ to reference a file)',
+    modelHint: 'Choose the model for this session',
+    sendLabel: 'Send message',
+    sendHint: 'Send message (Enter)',
+    busyLabel: 'Waiting for attachments to upload',
   },
   home: {
     placeholder: '',
-    modelHint: '选择新任务使用的模型',
-    sendLabel: '发送',
-    sendHint: '发送并创建任务（Enter）',
-    busyLabel: '正在创建任务',
+    modelHint: 'Choose the model for the new task',
+    sendLabel: 'Send',
+    sendHint: 'Send and create task (Enter)',
+    busyLabel: 'Creating task',
   },
 } as const;
 
@@ -103,9 +98,6 @@ interface Props {
   effort?: string;
   onModelChange?: (id: string) => void;
   onEffortChange?: (id: string) => void;
-  /** Execution mode. Omit either prop to hide the control. */
-  executionMode?: ExecutionMode;
-  onExecutionModeChange?: (mode: ExecutionMode) => void;
   /** Workspace picker — home only (see the note at the top of the file). */
   workspace?: ComposerWorkspacePicker;
   /**
@@ -135,8 +127,6 @@ export function Composer({
   effort,
   onModelChange,
   onEffortChange,
-  executionMode,
-  onExecutionModeChange,
   workspace,
   mentionCandidates,
 }: Props) {
@@ -365,7 +355,7 @@ export function Composer({
           // a friendly message instead of a late server-side failure.
           const gate = await checkFile(file);
           if (!gate.allowed) {
-            setUploadError('该文件较大，需要管理员授予大附件权限后才能上传，请联系管理员。');
+            setUploadError('This file is large. An administrator must grant you large-attachment permission before you can upload it.');
             return [...attachments, ...added];
           }
           const att = await onUpload(file);
@@ -374,7 +364,7 @@ export function Composer({
         }
         return [...attachments, ...added];
       } catch (err) {
-        const name = err instanceof Error ? err.message : '上传失败，请重试';
+        const name = err instanceof Error ? err.message : 'Upload failed. Please try again.';
         setUploadError(name);
         throw err;
       } finally {
@@ -420,7 +410,7 @@ export function Composer({
                 type="button"
                 onClick={() => removeAttachment(att.id)}
                 className="font-mono text-dim hover:text-ink ml-0.5 leading-none"
-                aria-label="移除附件"
+                aria-label="Remove attachment"
               >
                 ×
               </button>
@@ -428,7 +418,7 @@ export function Composer({
           ))}
           {uploading && (
             <div className="flex items-center px-2 py-1 text-[11px] text-dim font-mono">
-              <span className="animate-pulse">上传中…</span>
+              <span className="animate-pulse">Uploading…</span>
             </div>
           )}
         </div>
@@ -443,12 +433,12 @@ export function Composer({
           }`}
         >
           <span className="shrink-0 leading-[1.5]">⚠</span>
-          <span className="flex-1 leading-[1.5]">附件上传失败：{uploadError}</span>
+          <span className="flex-1 leading-[1.5]">Attachment upload failed: {uploadError}</span>
           <button
             type="button"
             onClick={() => setUploadError(null)}
             className="shrink-0 text-red-400 hover:text-red-700 leading-none"
-            aria-label="关闭错误提示"
+            aria-label="Dismiss error"
           >
             ×
           </button>
@@ -481,7 +471,7 @@ export function Composer({
         {mentionOpen && (
           <div
             role="listbox"
-            aria-label="文件补全"
+            aria-label="File suggestions"
             className="absolute bottom-full left-0 mb-2 w-72 max-h-64 overflow-y-auto z-30 bg-surface border border-line rounded-lg shadow-[0_8px_24px_-6px_rgba(15,17,20,0.18)] p-1 animate-pop-in origin-bottom"
           >
             {filteredMentions.map((c, i) => {
@@ -508,7 +498,7 @@ export function Composer({
                   </span>
                   <span className="flex-1 truncate">{c.filename}</span>
                   <span className="shrink-0 font-mono text-[10px] text-dim">
-                    {c.kind === 'workspace' ? '工作区' : '附件'}
+                    {c.kind === 'workspace' ? 'Workspace' : 'Attachment'}
                   </span>
                 </button>
               );
@@ -557,29 +547,16 @@ export function Composer({
           platformDefaults={platformDefaults}
         />
         {workspace && (
-          <HoverHint label="切换任务使用的工作区" align="left">
+          <HoverHint label="Switch the workspace for this task" align="left">
             <Dropdown
               value={workspace.value}
               options={workspace.options}
               onChange={workspace.onChange}
               disabled={workspace.disabled}
               emptyLabel={workspace.emptyLabel}
-              ariaLabel="选择工作区"
+              ariaLabel="Select workspace"
               align="left"
               triggerClassName="max-w-[190px] overflow-hidden text-ellipsis text-[12px] text-ink-2"
-            />
-          </HoverHint>
-        )}
-        {executionMode && onExecutionModeChange && (
-          <HoverHint label="选择智能体或对话模式" align="left">
-            <Dropdown
-              value={executionMode}
-              options={EXECUTION_MODE_OPTIONS}
-              onChange={(mode) => onExecutionModeChange(mode as ExecutionMode)}
-              disabled={(disabled && !isStreaming) || busy}
-              ariaLabel="选择运行模式"
-              align="left"
-              triggerClassName="text-[12px] text-accent"
             />
           </HoverHint>
         )}
@@ -593,29 +570,29 @@ export function Composer({
                 value={model ?? ''}
                 options={modelOptions}
                 onChange={onModelChange}
-                ariaLabel="选择模型"
+                ariaLabel="Select model"
                 triggerClassName="text-[12.5px] text-ink-2"
               />
             </HoverHint>
           )}
           {onEffortChange && (
-            <HoverHint label="调整模型的思考深度">
+            <HoverHint label="Adjust how deeply the model thinks">
               <Dropdown
                 value={effort ?? ''}
                 options={EFFORT_OPTIONS}
                 onChange={onEffortChange}
-                ariaLabel="调整推理强度"
+                ariaLabel="Adjust reasoning effort"
                 triggerClassName="text-[12.5px] text-ink-2"
               />
             </HoverHint>
           )}
           {isStreaming && onStop ? (
-            <HoverHint label="停止当前回复" align="right">
+            <HoverHint label="Stop the current response" align="right">
               <button
                 type="button"
                 onClick={onStop}
                 className="w-10 h-10 inline-flex items-center justify-center rounded-full border border-accent-line bg-accent-soft text-accent hover:bg-accent/10 transition-colors"
-                aria-label="停止当前回复"
+                aria-label="Stop the current response"
               >
                 <span aria-hidden className="inline-block w-3 h-3 bg-current rounded-[2px]" />
               </button>

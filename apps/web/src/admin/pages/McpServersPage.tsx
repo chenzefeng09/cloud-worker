@@ -46,7 +46,7 @@ function McpToolsDialog({
         if (r.ok && r.tools && onTested) onTested(r.tools);
       })
       .catch((err) => {
-        if (!cancelled) setError(err instanceof ApiError ? err.message : '拉取工具列表失败');
+        if (!cancelled) setError(err instanceof ApiError ? err.message : 'Failed to fetch tools');
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -61,9 +61,9 @@ function McpToolsDialog({
   }, [server.id]);
 
   return (
-    <Dialog title={`工具列表：${server.name}`} onClose={onClose} className="w-full max-w-lg">
+    <Dialog title={`Tools: ${server.name}`} onClose={onClose} className="w-full max-w-lg">
       <div className="flex flex-col gap-3">
-        {loading && <div className="font-mono text-[12px] text-dim">正在连接并读取工具…</div>}
+        {loading && <div className="font-mono text-[12px] text-dim">Connecting and reading tools…</div>}
 
         {error && !loading && (
           <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{error}</div>
@@ -74,7 +74,7 @@ function McpToolsDialog({
             {result.tools && result.tools.length > 0 ? (
               <div className="flex flex-col gap-1">
                 <div className="text-[11px] text-dim font-mono uppercase tracking-wide">
-                  工具（{result.tools.length}）
+                  Tools ({result.tools.length})
                 </div>
                 <div className="flex flex-col gap-1 max-h-[320px] overflow-auto">
                   {result.tools.map((t) => (
@@ -94,7 +94,7 @@ function McpToolsDialog({
               </div>
             ) : (
               <div className="text-[12px] text-dim italic">
-                {result.ok ? '该服务器未返回任何工具。' : '未能读取工具列表。'}
+                {result.ok ? 'This server returned no tools.' : 'Couldn’t read the tool list.'}
               </div>
             )}
 
@@ -105,7 +105,7 @@ function McpToolsDialog({
                   : 'bg-accent-soft border-accent-line text-accent'
               }`}
             >
-              {result.ok ? '✓ 连通性正常' : '✗ 连接失败'}
+              {result.ok ? '✓ Connection OK' : '✗ Connection failed'}
             </div>
 
             {result.error && (
@@ -115,7 +115,7 @@ function McpToolsDialog({
             {result.server_info && Object.keys(result.server_info).length > 0 && (
               <div className="flex flex-col gap-1">
                 <div className="text-[11px] text-dim font-mono uppercase tracking-wide">
-                  服务器信息
+                  Server info
                 </div>
                 <pre className="text-[11px] font-mono text-ink-2 bg-paper border border-line rounded-sm px-2 py-1.5 overflow-auto max-h-[160px] whitespace-pre-wrap break-all">
                   {JSON.stringify(result.server_info, null, 2)}
@@ -131,7 +131,7 @@ function McpToolsDialog({
             onClick={onClose}
             className="px-3 py-1.5 border border-line text-[12px] font-mono rounded-sm text-ink-2 hover:text-ink"
           >
-            关闭
+            Close
           </button>
         </div>
       </div>
@@ -141,7 +141,7 @@ function McpToolsDialog({
 
 // ─── Row ──────────────────────────────────────────────────────────────────────
 
-/** Renders a server's discovered tool list inline. null/empty -> "未探测".
+/** Renders a server's discovered tool list inline. null/empty -> "Not probed".
  *  Shows up to N names as tags, folding the rest into a "+K" overflow chip
  *  whose tooltip lists the remaining names. Reads only from
  *  `server.discovered_tools` - never probes at render time. */
@@ -149,7 +149,7 @@ const TOOL_PREVIEW_LIMIT = 5;
 
 function ToolsCell({ tools }: { tools?: McpTestTool[] | null }) {
   if (!tools || tools.length === 0) {
-    return <span className="text-[11px] text-dim italic">未探测</span>;
+    return <span className="text-[11px] text-dim italic">Not probed</span>;
   }
   const visible = tools.slice(0, TOOL_PREVIEW_LIMIT);
   const overflow = tools.length - visible.length;
@@ -166,10 +166,10 @@ function ToolsCell({ tools }: { tools?: McpTestTool[] | null }) {
       ))}
       {overflow > 0 && (
         <span
-          title={`共 ${tools.length} 个工具：${tools
+          title={`${tools.length} tools: ${tools
             .slice(TOOL_PREVIEW_LIMIT)
             .map((t) => t.name)
-            .join('、')}`}
+            .join(', ')}`}
           className="text-[10.5px] font-mono text-dim"
         >
           +{overflow}
@@ -197,10 +197,10 @@ function McpRow({
   const remove = async () => {
     if (
       !(await confirm({
-        title: '删除 MCP 服务器',
-        message: `确认删除 MCP 服务器「${server.name}」？`,
+        title: 'Delete MCP server',
+        message: `Delete MCP server “${server.name}”?`,
         tone: 'danger',
-        confirmText: '删除',
+        confirmText: 'Delete',
       }))
     )
       return;
@@ -210,7 +210,7 @@ function McpRow({
       await api.admin.mcp.delete(server.id);
       onDeleted(server.id);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '删除失败');
+      setError(err instanceof ApiError ? err.message : 'Failed to delete');
       setLoading(false);
     }
   };
@@ -221,8 +221,8 @@ function McpRow({
   const canTest = server.transport === 'http';
   const testDisabledTitle =
     server.transport === 'sse'
-      ? 'sse 仅在 worker 直连模式可用，注册测试器暂不支持'
-      : 'stdio 暂不支持远程读取工具列表';
+      ? 'SSE is only available in worker direct-connect mode; the registry tester doesn’t support it yet'
+      : 'Reading tools remotely isn’t supported for stdio yet';
 
   return (
     <tr className="border-b border-line-2 hover:bg-paper-2 transition-colors group">
@@ -234,7 +234,7 @@ function McpRow({
           : server.command || '-'}
       </td>
       <td className={`px-3 py-2 font-mono text-[11px] ${server.enabled ? 'text-ok' : 'text-dim'}`}>
-        {server.enabled ? '已启用' : '已停用'}
+        {server.enabled ? 'Enabled' : 'Disabled'}
       </td>
       <td className="px-3 py-2">
         <ToolsCell tools={server.discovered_tools} />
@@ -245,24 +245,24 @@ function McpRow({
           <button
             onClick={() => onTest(server)}
             disabled={!canTest || loading}
-            title={canTest ? '查看该服务器提供的工具，并顺带检查连通性' : testDisabledTitle}
+            title={canTest ? 'View the tools this server provides and check connectivity' : testDisabledTitle}
             className="text-[11px] font-mono text-dim hover:text-ink disabled:opacity-40 disabled:cursor-not-allowed"
           >
-            连通性测试
+            Test connection
           </button>
           <button
             onClick={() => onEdit(server)}
             disabled={loading}
             className="text-[11px] font-mono text-dim hover:text-ink disabled:opacity-50"
           >
-            编辑
+            Edit
           </button>
           <button
             onClick={remove}
             disabled={loading}
             className="text-[11px] font-mono text-accent hover:opacity-80 disabled:opacity-50"
           >
-            删除
+            Delete
           </button>
         </div>
       </td>
@@ -324,7 +324,7 @@ export function McpServersPage() {
         if (err instanceof ApiError && (err.status === 404 || err.status === 501 || err.status === 502)) {
           setIsTodoEndpoint(true);
         } else {
-          setError(err instanceof ApiError ? err.message : '加载失败');
+          setError(err instanceof ApiError ? err.message : 'Failed to load');
         }
       })
       .finally(() => {
@@ -368,14 +368,14 @@ export function McpServersPage() {
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">MCP 服务器</h1>
-          <p className="text-[12px] text-dim mt-0.5">注册与治理 MCP 服务器（→ mcp-registry）</p>
+          <h1 className="text-[18px] font-display text-ink tracking-[-0.02em]">MCP servers</h1>
+          <p className="text-[12px] text-dim mt-0.5">Register and govern MCP servers (→ mcp-registry)</p>
         </div>
         <button
           onClick={() => setShowModal(true)}
           className="px-3 py-1.5 bg-accent text-surface text-[12px] font-mono rounded-sm hover:opacity-90 transition-opacity"
         >
-          + 注册服务器
+          + Register server
         </button>
       </div>
 
@@ -387,25 +387,25 @@ export function McpServersPage() {
 
       {isTodoEndpoint && (
         <div className="border border-line rounded-md p-4 text-[12px] text-dim italic">
-          该能力暂未启用：mcp-registry 代理端点尚未就绪，接线后将自动展示服务器列表。
+          Not available yet: the mcp-registry proxy endpoint isn’t ready. Servers will appear here once it’s connected.
         </div>
       )}
 
       {loading ? (
-        <div className="font-mono text-[12px] text-dim">加载中…</div>
+        <div className="font-mono text-[12px] text-dim">Loading…</div>
       ) : !isTodoEndpoint && servers.length === 0 ? (
-        <div className="font-mono text-[12px] text-dim italic">暂无 MCP 服务器</div>
+        <div className="font-mono text-[12px] text-dim italic">No MCP servers</div>
       ) : (
         !isTodoEndpoint && (
           <div className="border border-line rounded-md overflow-hidden">
             <table className="w-full text-left border-collapse">
               <thead className="bg-paper-2 border-b border-line">
                 <tr>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">名称</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">传输</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">端点 / 命令</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">状态</th>
-                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">工具</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Name</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Transport</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Endpoint / command</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
+                  <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Tools</th>
                   <th className="px-3 py-2 w-52"></th>
                 </tr>
               </thead>

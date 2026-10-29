@@ -27,7 +27,7 @@ For a first local run, start with the [getting-started guide](./getting-started.
 
 The active runtime is selected by `SCHEDULER_RUNTIME` (compose) /
 `agentScheduler.config.runtime` (Helm). All runtimes execute the **same** OCI
-sandbox image and the **same** `runtime_worker` task contract
+sandbox image and the **same** worker task contract
 (`task.json` → `result.json`, coded exit status), so switching runtimes does not
 change agent behaviour.
 
@@ -181,42 +181,39 @@ requires a Prometheus that scrapes the pool. Tuning lives in the values file:
 
 ## Building the sandbox images
 
-Agent runs execute inside an OCI image. There are three layered Python/AgentScope
-tiers plus a separate Node.js Claude SDK image. **All build contexts are the repo
-root** (note the trailing `..` / `.`) so the Dockerfiles can `COPY agentscope-ext/`
-without a separate vendor step.
+Agent runs execute inside an OCI image that runs the Claude Agent SDK worker
+(`worker-claude-sdk/`, entrypoint `node /app/dist/main.js`, non-root `agent`
+user uid 1000). It is the only agent runtime — see
+[ADR 0003](adr/0003-claude-agent-sdk-sole-agent-runtime.md). **All build
+contexts are the repo root** so the Dockerfiles can `COPY worker-claude-sdk/`.
 
-| Image | Adds on top of previous | Approx size | Notes |
-|---|---|---|---|
-| `base` | Python 3.12 + pinned AgentScope + ext packages + NumPy/Pandas/Polars + Node 20 + Playwright/Chromium | ~1.6 GiB | Default agent workload; always pre-warmed. Non-root `agent` user (uid 1000). |
-| `office` | LibreOffice headless + `unoconv` | ~2.4 GiB | Read/generate `.docx` / `.xlsx` / `.pptx`. |
-| `matlab` | MATLAB Runtime + `matlabengine` | ~5 GiB | Needs the MATLAB R2024a Runtime installer at **build** time and a license server at **runtime**. |
-| `claude-sdk` | `node:22-slim` + prebuilt `worker-claude-sdk/dist` | — | Separate TypeScript worker lineage; honours the same `task.json` → `result.json` contract. |
+| Image | Dockerfile | Notes |
+|---|---|---|
+| `ghcr.io/agent-platform/claude-sdk-sandbox:0.1` | `claude-sdk.Dockerfile` | Default image for the docker runtime. `node:22-slim` + prebuilt `worker-claude-sdk/dist` + Python office/data libs (`python-docx`, `openpyxl`, `python-pptx`, `pypdf`, `pandas`, `matplotlib`, …) and Noto CJK fonts. Pre-warmed by `sandbox-pool`. |
+| `claude-sdk-cube:0.2-scientific` | `claude-sdk-cube.Dockerfile` | CubeSandbox-native image (Cube `sandbox-code` base, pinned digest) with scientific Python and CMake/native build tools; compiles the worker in a build stage. |
+| `claude-sdk-cube:0.2-matlab-*` | `claude-sdk-cube-matlab.Dockerfile` + `build-matlab-*-layer.sh` | Optional MATLAB 2019b + Control System / Aerospace toolbox layers on top of the Cube image. **Bring your own installer media and license.** |
+| *(refresh)* | `claude-sdk-cube-worker-refresh.Dockerfile` | Replaces only `/app/dist` + `/app/node_modules` in an existing Cube image, leaving heavyweight layers (MATLAB) untouched. |
 
-```bash
-# Python tiers (build context = repo root, hence trailing "..")
-docker build -t agentscope-sandbox-base:0.1   -f sandbox-images/base.Dockerfile   ..
-docker build -t agentscope-sandbox-office:0.1 -f sandbox-images/office.Dockerfile ..
-docker build -t agentscope-sandbox-matlab:0.1 -f sandbox-images/matlab.Dockerfile ..
-```
-
-The Claude SDK worker is a **two-step** build (compile TypeScript, then
-containerise) — the Dockerfile copies a prebuilt `dist/`, it does not run `tsc`:
+The default image is a **two-step** build (compile TypeScript, then
+containerise) — `claude-sdk.Dockerfile` copies a prebuilt `dist/`, it does not
+run `tsc`:
 
 ```bash
 make build-claude-sdk-image     # runs npm ci && npm run build, then docker build
 make push-claude-sdk-image      # pushes to the configured registry
+make build-claude-sdk-cube-image
 ```
 
 **Selecting an image.** The image the scheduler launches is set per-deployment
-via `SCHEDULER_AGENT_IMAGE` (`agentScheduler.config.agentImage` /
+via `AGENT_IMAGE` / `SCHEDULER_AGENT_IMAGE` (`agentScheduler.config.agentImage` /
 `sandboxPool.config.sandboxImage` in Helm) and, for the cube runtime, per-run via
-the `template` field of the pool acquire payload.
+the Cube template (`CUBE_CLAUDE_SDK_TEMPLATE_SMALL` / `_LARGE`) in the pool
+acquire payload.
 
-> Bumping the pinned AgentScope version is a coordinated change (rebuild + retag,
-> run the conformance suite, then bump the scheduler default). Reproducible
-> builds (pinned base digest + pip constraints) and cosign signing + syft SBOM
-> are on the roadmap. See [sandbox-images/README.md](../sandbox-images/README.md).
+> Bumping the Claude Agent SDK version is a coordinated change (update
+> `worker-claude-sdk/package-lock.json`, rebuild + retag, run the worker tests and
+> the conformance suite, then bump the scheduler default). Cosign signing + syft
+> SBOM are on the roadmap. See [sandbox-images/README.md](../sandbox-images/README.md).
 
 ---
 
@@ -235,8 +232,13 @@ come from `existingSecret` references so the chart never bakes literals.
 | `BFF_COOKIE_SECRET` | Signs the `ap_session` browser cookie. `CookieSigner` rejects empty/placeholder/`<32`-char values at startup. | `python3 -c "import secrets; print(secrets.token_urlsafe(48))"` |
 | `TOOL_BROKER_LEASE_SECRET` + `SCHEDULER_TOOL_BROKER_LEASE_SECRET` | Shared HMAC anchor for per-run sandbox capability leases. The scheduler signs; the broker verifies. **Must be identical.** A leaked/misconfigured value lets a sandbox self-sign leases and bypass tenant/scope boundaries. | `python3 -c "import secrets; print(secrets.token_urlsafe(48))"` |
 | `SCHEDULER_SERVICE_TOKEN` | Lets the scheduler mint short-lived per-run sandbox tokens from Foundation Identity. Scope limited to service-account token issuance. **Never expose to sandboxes** — only the per-run minted token belongs in a sandbox. | Issued by Foundation Identity. |
-| `LLM_API_KEY` | Upstream model key reached through the Foundation LLM gateway. | Provider-issued. |
 | `APP_USER_PASSWORD` / `APP_MIGRATOR_PASSWORD` | Postgres roles inherited from Foundation (least-privilege app user vs. migrator). | Operator-set; never reuse the `*_change_me` placeholders in production. |
+
+> **No model provider key.** All agent model traffic goes through the Foundation
+> LLM gateway with a per-tenant virtual key resolved by the scheduler; provider
+> keys are configured on the gateway (saas-foundation), not here. `LLM_API_KEY`,
+> `LLM_PROVIDER`, `LLM_BASE_URL` and `RUNTIME_EXTENSIONS` are no longer read, and a
+> tenant without a virtual key cannot start runs.
 
 > **Generation pattern.** All HMAC/cookie secrets use the same recipe:
 > `python3 -c "import secrets; print(secrets.token_urlsafe(48))"`. Each must be

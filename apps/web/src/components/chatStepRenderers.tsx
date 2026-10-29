@@ -69,7 +69,7 @@ function CodeBlockCopyButton({ preRef }: { preRef: React.RefObject<HTMLPreElemen
   return (
     <button
       onClick={handleCopy}
-      aria-label="复制代码"
+      aria-label="Copy code"
       style={{
         position: 'absolute',
         top: 6,
@@ -91,7 +91,7 @@ function CodeBlockCopyButton({ preRef }: { preRef: React.RefObject<HTMLPreElemen
         whiteSpace: 'nowrap',
       }}
     >
-      {copied ? <span>已复制</span> : <CopyIcon />}
+      {copied ? <span>Copied</span> : <CopyIcon />}
     </button>
   );
 }
@@ -171,7 +171,7 @@ function TableBlock({ children }: { children?: React.ReactNode }) {
     <div className="group relative my-3">
       <button
         onClick={handleDownload}
-        aria-label="导出 CSV"
+        aria-label="Export CSV"
         className="opacity-0 group-hover:opacity-100 transition-opacity duration-150"
         style={{
           position: 'absolute',
@@ -260,7 +260,7 @@ function MarkdownImage({ src, alt, title }: { src?: string; alt?: string; title?
     return (
       <span className="inline-flex items-center gap-1.5 px-2 py-1 border border-line rounded-sm bg-paper font-mono text-[11.5px] text-dim align-middle">
         <span aria-hidden>📎</span>
-        图片未找到：{assetBasename(raw) || raw}
+        Image not found: {assetBasename(raw) || raw}
       </span>
     );
   }
@@ -271,8 +271,8 @@ function MarkdownImage({ src, alt, title }: { src?: string; alt?: string; title?
     <button
       type="button"
       onClick={() => (open ? open(hit) : window.open(hit.url, '_blank', 'noopener'))}
-      title={title ?? `查看 ${hit.filename}`}
-      aria-label={`查看 ${hit.filename}`}
+      title={title ?? `View ${hit.filename}`}
+      aria-label={`View ${hit.filename}`}
       className="block max-w-full p-0 bg-transparent border-0 cursor-zoom-in"
     >
       <img src={hit.url} alt={label} className={IMG_CLS} />
