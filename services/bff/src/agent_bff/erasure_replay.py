@@ -9,9 +9,10 @@ command uses the BFF's own configuration):
 It reads every erasure the ledger (``domain/erasure_ledger.py``) recorded at
 or after ``--since`` — the restore point less a few minutes, for erasures
 still running at that point (restore runbook §3.7) — and erases each recorded
-user again with the admin erasure fan-out (``privacy.run_erasure``: schedules,
-platform, memories, BFF rows; every step idempotent), acting as ``--actor``
-with ``X-Actor: ADMIN`` inside the user's own tenant.  A user recorded more
+user again with the admin erasure fan-out (``privacy.run_erasure``: a preflight
+that changes nothing, then schedules, platform, memories, LLM preferences,
+Apps and BFF rows; every step idempotent), acting as ``--actor`` with
+``X-Actor: ADMIN`` inside the user's own tenant.  A user recorded more
 than once is erased once, in full: data created after the request goes too,
 so ``--since`` should reach back no further than that.  Every replayed user
 gets an ``admin.privacy.user.erasure_replayed`` audit event (counts only).
@@ -20,10 +21,8 @@ Prints a JSON report with one result per user and exits with
 
     0  every recorded user was erased again (``--dry-run``: nothing erased)
     1  at least one erasure is incomplete — fix the failing service and rerun
+       (``"phase": "preflight"``: that user's preflight failed, nothing erased)
     2  bad arguments, or the ledger is not configured or can't be read
-
-``llm_preferences`` is reported as skipped (``not_supported``): the LLM
-gateway only answers for the calling user, so an administrator can't clear it.
 """
 
 from __future__ import annotations
@@ -41,6 +40,7 @@ from agent_bff.api.v1.privacy import (
     USER_ID_PATTERN,
     DataSubject,
     ErasureIncompleteError,
+    ErasureRefusedError,
     emit_privacy_audit,
     erasure_counts,
     run_erasure,
@@ -72,6 +72,8 @@ async def _replay_one(
             "error": exc.error,
             "counts": erasure_counts(exc.results),
         }
+        if isinstance(exc, ErasureRefusedError):
+            result["phase"] = "preflight"
         outcome = "PARTIAL" if exc.succeeded else "FAILURE"
     else:
         result = {
@@ -89,6 +91,8 @@ async def _replay_one(
     }
     if "failed" in result:
         payload["failed"] = result["failed"]
+    if "phase" in result:
+        payload["phase"] = result["phase"]
     if result["skipped"]:
         payload["skipped"] = result["skipped"]
     await emit_privacy_audit(

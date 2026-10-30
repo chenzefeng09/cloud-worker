@@ -42,6 +42,9 @@ PREFIX = "/api/bff/v1"
 CANVAS_ID = "cvs_01J5TESTCANVAS00000000001"
 SESSION_ID = "ses_abc"
 
+# What the gateway answers a key mint for a tenant with no enabled LLM provider.
+_NO_PROVIDER = {"code": "FOUNDATION.LLM_GATEWAY.PROVIDER.NOT_FOUND", "status": 404}
+
 _DEFAULT_BLOCKS = [
     {"id": "blk_00000001", "type": "heading", "text": "# 标题"},
     {"id": "blk_00000002", "type": "paragraph", "text": "第一段原文内容。"},
@@ -78,12 +81,14 @@ def _good_output(
 # ---------------------------------------------------------------------------
 
 class FakeBackends:
-    """Stub for gateway (/tenant-keys, /tenant-defaults, /chat/completions) +
-    orchestrator (GET /canvases/{id}, POST /canvases/{id}/suggestions)."""
+    """Stub for gateway (/tenant-keys/ephemeral, /tenant-keys, /tenant-defaults,
+    /chat/completions) + orchestrator (GET /canvases/{id}, POST /canvases/{id}/suggestions)."""
 
     def __init__(
         self,
         *,
+        mint_status: int = 201,
+        mint_body: Any = None,
         virtual_keys: Any = None,
         default_model_id: str | None = "deepseek-chat",
         blocks: list[dict] | None = None,
@@ -95,6 +100,8 @@ class FakeBackends:
         suggestion_status: int = 201,
         suggestion_body: dict | None = None,
     ) -> None:
+        self.mint_status = mint_status
+        self.mint_body = mint_body if mint_body is not None else {"virtual_key": "vk_eph"}
         self.virtual_keys = (
             virtual_keys
             if virtual_keys is not None
@@ -126,6 +133,8 @@ class FakeBackends:
         self.calls.append((method, url, kwargs.get("json")))
 
         # ── gateway meta ──
+        if url.endswith("/tenant-keys/ephemeral") and method == "POST":
+            return httpx.Response(self.mint_status, json=self.mint_body)
         if "/tenant-keys" in url and method == "GET":
             return httpx.Response(200, json=self.virtual_keys)
         if "/tenant-defaults/resolve" in url and method == "GET":
@@ -337,7 +346,7 @@ def test_canvas_v2_happy_blocks(
     assert fake.last_suggestion_body["change_summary"] == "改写第二段并补充一段"
 
     # gateway called with virtual key + json_object response_format + model.
-    assert fake.last_completion_headers.get("X-LLM-Virtual-Key") == "vk_test"
+    assert fake.last_completion_headers.get("X-LLM-Virtual-Key") == "vk_eph"
     assert fake.last_completion_payload["model"] == "deepseek-chat"
     assert fake.last_completion_payload["response_format"] == {"type": "json_object"}
     prompt = fake.last_completion_payload["messages"][0]["content"]
@@ -591,18 +600,32 @@ def test_canvas_v2_suggestion_409_passthrough(
 
 
 # ---------------------------------------------------------------------------
-# no virtual key → 400
+# no model key: no provider → 422; nothing obtainable → 502
 # ---------------------------------------------------------------------------
 
-def test_canvas_v2_no_virtual_key_400(
+def test_canvas_v2_tenant_without_llm_provider_422(
     client: TestClient, authed_cookie: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fake = FakeBackends(virtual_keys=[])
+    fake = FakeBackends(mint_status=404, mint_body=_NO_PROVIDER)
     _patch(fake, monkeypatch)
 
     resp = client.post(_url(), cookies=authed_cookie, json=_body())
-    assert resp.status_code == 400
-    assert "model key" in resp.json()["detail"]["user_message"]
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["detail"]["code"] == "AGENT.BFF.CANVAS.LLM_NOT_CONFIGURED"
+    assert "Admin → Models" in detail["user_message"]
+    assert fake.last_completion_payload is None
+
+
+def test_canvas_v2_no_virtual_key_at_all_502(
+    client: TestClient, authed_cookie: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeBackends(mint_status=503, mint_body={"detail": "down"}, virtual_keys=[])
+    _patch(fake, monkeypatch)
+
+    resp = client.post(_url(), cookies=authed_cookie, json=_body())
+    assert resp.status_code == 502
+    assert resp.json()["detail"]["detail"]["code"] == "AGENT.BFF.CANVAS.GATEWAY_UNAVAILABLE"
 
 
 def test_canvas_v2_resolves_default_model_when_omitted(

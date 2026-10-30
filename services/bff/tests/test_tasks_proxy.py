@@ -3,6 +3,8 @@
 A small in-memory fake of the orchestrator stands in for the upstream: it
 keeps sessions, messages and runs so create → retry flows can be asserted
 end to end (what was persisted, rewound and forwarded to ``POST /runs``).
+Like the orchestrator, it writes a turn's user message only together with
+its run: a refused run leaves no message.
 """
 
 from __future__ import annotations
@@ -83,11 +85,6 @@ class FakeOrchestrator:
                 if body.get("title"):
                     self.sessions[sid]["title"] = body["title"]
                 return httpx.Response(200, json=self.sessions[sid])
-            if rest == ["messages"] and method == "POST":
-                body = kw["json"]
-                self.add_message(sid, "USER", body["content"],
-                                 [{"id": a} for a in body.get("attachment_ids") or []])
-                return httpx.Response(201, json=self.messages[sid][-1])
             if rest == ["messages"] and method == "GET":
                 return httpx.Response(200, json={"items": self.messages[sid], "next_cursor": None})
             if rest == ["messages"] and method == "DELETE":
@@ -108,7 +105,13 @@ class FakeOrchestrator:
                 run = {"id": f"run_{len(self.runs[sid]) + 1}", "status": "RUNNING",
                        "task_description": body["task"]}
                 self.runs[sid].append(run)
-                return httpx.Response(201, json=run)
+                created = dict(run)
+                if body.get("message") is not None:
+                    turn = body["message"]
+                    self.add_message(sid, "USER", turn["content"],
+                                     [{"id": a} for a in turn.get("attachment_ids") or []])
+                    created["message"] = self.messages[sid][-1]
+                return httpx.Response(201, json=created)
         return httpx.Response(500, json={"detail": f"unrouted {method} {path}"})
 
 
@@ -195,9 +198,12 @@ def test_create_task_creates_session_spec_message_and_run(
     spec = session["metadata"]["task"]
     assert spec["instructions"] == "Compile a competitor report"
     assert spec["options"] == {"skills": [], "model": "claude-sonnet-5-5", "hitl": False}
+    assert spec["attachment_ids"] == []
     assert orch.messages[sid][0]["content"] == "Compile a competitor report"
     run_body = orch.run_bodies[0]
     assert run_body["task"] == "Compile a competitor report"
+    # The instructions are written as the first user turn with the run.
+    assert run_body["message"] == {"content": "Compile a competitor report", "attachment_ids": []}
     assert run_body["skills"] == []
     assert "mcp_server_ids" not in run_body  # omitted → tenant defaults
     assert run_body["hitl"] is False
@@ -269,8 +275,36 @@ def test_create_task_run_failure_reports_task_id(
     orch.run_status_code = 503
     resp = client.post(f"{_BASE}/tasks", cookies=authed_cookie, json={"instructions": "x"})
     assert resp.status_code == 503
-    assert resp.json()["task_id"] in orch.sessions
-    assert resp.json()["reason"] == "task_not_started"
+    body = resp.json()
+    assert body["task_id"] in orch.sessions
+    assert body["reason"] == "task_not_started"
+    assert "could not be started" in body["detail"]
+    # The task is defined, but no unanswered instructions sit in its transcript.
+    assert orch.messages[body["task_id"]] == []
+
+
+def test_task_that_never_started_retries_with_its_attachments(
+    client: TestClient, authed_cookie: dict[str, str], orch: FakeOrchestrator,
+) -> None:
+    orch.seed_session("ses_draft")
+    orch.run_status_code = 503
+    resp = client.post(f"{_BASE}/tasks", cookies=authed_cookie, json={
+        "instructions": "Summarise the attached PDF",
+        "session_id": "ses_draft",
+        "attachment_ids": ["att_1"],
+    })
+    assert resp.status_code == 503
+    assert orch.sessions["ses_draft"]["metadata"]["task"]["attachment_ids"] == ["att_1"]
+
+    orch.run_status_code = 201
+    resp = client.post(f"{_BASE}/tasks/ses_draft/retry", cookies=authed_cookie)
+    assert resp.status_code == 201, resp.text
+    run_body = orch.run_bodies[-1]
+    assert run_body["message"] == {
+        "content": "Summarise the attached PDF", "attachment_ids": ["att_1"],
+    }
+    assert run_body["files"] == [{"key": "k/att_1", "filename": "a.pdf", "mime": "x"}]
+    assert [m["content"] for m in orch.messages["ses_draft"]] == ["Summarise the attached PDF"]
 
 
 # ── retry ────────────────────────────────────────────────────────────────────
@@ -297,7 +331,8 @@ def test_retry_rewinds_failed_attempt_and_replays_options(
     assert run_body["skills"] == ["pdf"]
     assert run_body["hitl"] is False
     assert run_body["files"][0]["key"] == "k/att_1"
-    assert not any(m == "POST" and p.endswith("/messages") for m, p, _ in orch.calls)
+    # The kept user turn is re-run, not written again.
+    assert "message" not in run_body
 
 
 def test_retry_overrides_take_precedence(
@@ -327,7 +362,7 @@ def test_retry_refuses_active_task(
 def test_retry_of_never_started_task_uses_stored_instructions(
     client: TestClient, authed_cookie: dict[str, str], orch: FakeOrchestrator,
 ) -> None:
-    """The first run failed to launch and the message never saved: persist it now."""
+    """The first run failed to launch, so no message was saved: write it with this run."""
     orch.seed_session("ses_n", task={"instructions": "Start me", "options": {}})
     resp = client.post(f"{_BASE}/tasks/ses_n/retry", cookies=authed_cookie)
     assert resp.status_code == 201, resp.text

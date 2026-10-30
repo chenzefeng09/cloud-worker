@@ -2,10 +2,26 @@
 
 Request-id propagation and tenant/user header extraction live in the shared
 ``foundation_sdk.fastapi`` helpers; this module only owns the BFF-specific
-piece: validating the signed session cookie and pushing its payload into the
-shared identity contextvars (plus a BFF-only contextvar for the OIDC
+piece: validating the signed session cookie and pushing its identity into the
+shared identity contextvars (plus BFF-only contextvars for the OIDC
 access_token that gets forwarded to foundation services as
-``Authorization: Bearer``).
+``Authorization: Bearer``, the caller's clearance, and how the session
+resolved).
+
+Session cookie
+--------------
+The cookie is signed by :class:`foundation_sdk.CookieSigner` and carries
+``{sid, tenant_id, user_id}``: ``sid`` names a server-side session whose
+tokens :class:`agent_bff.api.web_session.WebSessionManager` resolves —
+refreshing the access token first when it is about to expire.  Cookies minted
+before server-side sessions (``access_token`` in the payload, no ``sid``) are
+still honoured until they lapse; they cannot be refreshed.
+
+A request that presents a session cookie is a browser request: when the cookie
+does not authenticate (bad signature, expired, session ended or unavailable),
+identity is cleared rather than left to the ``X-Tenant-Id`` / ``X-User-Id``
+request headers, and :func:`get_session_state` tells ``require_auth`` whether
+to answer 401 (sign in again) or 503 (retry).
 
 Machine path (service-account)
 -------------------------------
@@ -33,6 +49,7 @@ from __future__ import annotations
 import hmac
 import logging
 from contextvars import ContextVar
+from typing import Any
 
 from fastapi import Request, Response
 from foundation_sdk import (
@@ -49,6 +66,9 @@ from foundation_sdk.fastapi import (
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.types import ASGIApp
 
+from agent_bff.api.web_session import SessionState, WebSessionManager
+from agent_bff.domain.web_sessions import hash_session_id
+
 logger = logging.getLogger(__name__)
 
 # Re-export the shared getters so callers needn't know whether the data
@@ -58,12 +78,18 @@ __all__ = [
     "get_access_token",
     "get_clearance",
     "get_request_id",
+    "get_session_state",
     "get_tenant_id",
     "get_user_id",
+    "get_web_session_id",
 ]
 
 _access_token_var: ContextVar[str] = ContextVar("agent_bff.access_token", default="")
 _clearance_var: ContextVar[str] = ContextVar("agent_bff.clearance", default="")
+_session_state_var: ContextVar[SessionState] = ContextVar(
+    "agent_bff.session_state", default=SessionState.NONE
+)
+_web_session_var: ContextVar[str] = ContextVar("agent_bff.web_session", default="")
 
 
 def get_access_token() -> str:
@@ -81,6 +107,20 @@ def get_clearance() -> str:
     return _clearance_var.get()
 
 
+def get_session_state() -> SessionState:
+    """How this request's session cookie resolved (``NONE`` without one)."""
+    return _session_state_var.get()
+
+
+def get_web_session_id() -> str:
+    """Row id (``web_sessions.id``) of the session this request signed in with.
+
+    ``""`` when the request did not authenticate with a server-side session
+    (no cookie, a pre-server-side-session cookie, or a service call).
+    """
+    return _web_session_var.get()
+
+
 class SessionMiddleware(BaseHTTPMiddleware):
     """Validate the signed session cookie and populate identity contextvars.
 
@@ -96,10 +136,12 @@ class SessionMiddleware(BaseHTTPMiddleware):
         cookie_name: str,
         signer: CookieSigner,
         service_token: str = "",
+        web_sessions: WebSessionManager | None = None,
     ) -> None:
         super().__init__(app)
         self._cookie_name = cookie_name
         self._signer = signer
+        self._web_sessions = web_sessions
         # Store as bytes for constant-time compare; empty string = disabled.
         self._service_token_bytes: bytes = service_token.encode() if service_token else b""
 
@@ -127,21 +169,60 @@ class SessionMiddleware(BaseHTTPMiddleware):
         # ── Cookie path (human users) ────────────────────────────────────────
         raw = request.cookies.get(self._cookie_name)
         if raw:
-            try:
-                payload = self._signer.unsign(raw)
-            except SignatureExpiredError:
-                logger.info("session cookie expired", extra={"cookie": self._cookie_name})
-            except SignatureInvalid:
-                logger.warning(
-                    "session cookie signature invalid",
-                    extra={"cookie": self._cookie_name},
-                )
-            else:
-                push_identity(
-                    tenant_id=str(payload.get("tenant_id", "")),
-                    user_id=str(payload.get("user_id", "")),
-                )
-                _access_token_var.set(str(payload.get("access_token", "")))
-                _clearance_var.set(str(payload.get("clearance", "")))
+            await self._authenticate_cookie(raw)
 
         return await call_next(request)
+
+    async def _authenticate_cookie(self, raw: str) -> None:
+        try:
+            payload: dict[str, Any] = self._signer.unsign(raw)
+        except SignatureExpiredError:
+            logger.info("session cookie expired", extra={"cookie": self._cookie_name})
+            _reject(SessionState.ENDED)
+            return
+        except SignatureInvalid:
+            logger.warning(
+                "session cookie signature invalid",
+                extra={"cookie": self._cookie_name},
+            )
+            _reject(SessionState.NONE)
+            return
+
+        tenant_id = str(payload.get("tenant_id", ""))
+        user_id = str(payload.get("user_id", ""))
+        sid = payload.get("sid")
+        if isinstance(sid, str) and sid:
+            if self._web_sessions is None or not (tenant_id and user_id):
+                _reject(SessionState.NONE)
+                return
+            resolution = await self._web_sessions.resolve(
+                session_id=sid, tenant_id=tenant_id, user_id=user_id
+            )
+            if resolution.state is not SessionState.AUTHENTICATED:
+                _reject(resolution.state)
+                return
+            access_token, clearance = resolution.access_token, resolution.clearance
+            web_session_id = hash_session_id(sid)
+        elif "access_token" in payload:
+            # Pre server-side-session cookie: honoured until it lapses.
+            access_token = str(payload.get("access_token", ""))
+            clearance = str(payload.get("clearance", ""))
+            web_session_id = ""
+        else:
+            _reject(SessionState.NONE)
+            return
+
+        push_identity(tenant_id=tenant_id, user_id=user_id)
+        _access_token_var.set(access_token)
+        _clearance_var.set(clearance)
+        _web_session_var.set(web_session_id)
+        _session_state_var.set(SessionState.AUTHENTICATED)
+
+
+def _reject(state: SessionState) -> None:
+    """The request's session cookie did not authenticate it."""
+    push_identity(tenant_id="", user_id="")
+    _access_token_var.set("")
+    _clearance_var.set("")
+    _web_session_var.set("")
+    _session_state_var.set(state)

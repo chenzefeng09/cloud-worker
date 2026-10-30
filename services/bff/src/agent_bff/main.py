@@ -11,6 +11,7 @@ from foundation_sdk import CookieSigner, CookieSignerSettings
 from foundation_sdk.fastapi import install_request_context, register_problem_details
 
 from agent_bff.api.middleware import SessionMiddleware
+from agent_bff.api.web_session import WebSessionManager
 from agent_bff.config import Settings
 from agent_bff.domain.db import close_db, init_db
 from agent_bff.observability import init_observability
@@ -47,6 +48,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.cookie_signer = signer
+    # Server-side web sessions: the cookie names one, this resolves / refreshes
+    # / revokes it.  Built eagerly so a malformed BFF_SESSION_TOKEN_KEYS fails
+    # startup, like an unsafe cookie secret does.
+    web_sessions = WebSessionManager.from_settings(settings)
+    app.state.web_sessions = web_sessions
 
     # CORS — order matters: must precede SessionMiddleware so OPTIONS preflight
     # never reaches cookie parsing.
@@ -64,6 +70,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         cookie_name=settings.cookie_name,
         signer=signer,
         service_token=settings.service_token,
+        web_sessions=web_sessions,
     )
     # Shared request-id + tenant header propagation; the cookie middleware
     # above overrides the tenant/user contextvars with the cookie-derived

@@ -15,6 +15,15 @@ Upstream paths (foundation-dlp; the core router is mounted under ``/core``):
     GET  /core/events               (query: check_type?, decision?, limit, before?)
     GET  /core/classifications      (query: sensitivity?, resource_type?, limit, before?)
     GET  /core/stats                (query: since?)
+
+foundation-dlp lets only a SERVICE or ADMIN actor write classification labels,
+so ``classification:tag`` goes out with ``X-Actor: ADMIN`` (every route here is
+super_admin only).  ``scan`` deliberately goes out as an ordinary caller:
+foundation-dlp then reports the matches and records the event but writes no
+label.  The admin scans text they paste in, which says nothing about the
+resource's real content, and a blank resource id becomes the ``adhoc-scan``
+placeholder, which must never turn into a label.  Labels are set on purpose,
+with ``classification:tag``.
 """
 
 from __future__ import annotations
@@ -31,10 +40,13 @@ _SERVICE = "dlp"
 _TIMEOUT = 15
 
 
-def _headers(request: Request, auth: tuple) -> dict[str, str]:
+def _headers(request: Request, auth: tuple, *, actor: str | None = None) -> dict[str, str]:
     tenant_id, user_id, access_token = auth
     target_tenant = request.query_params.get("tenant_id") or tenant_id
-    return foundation_headers(target_tenant, user_id, access_token)
+    headers = foundation_headers(target_tenant, user_id, access_token)
+    if actor is not None:
+        headers["X-Actor"] = actor
+    return headers
 
 
 def _forward_params(request: Request) -> dict[str, str]:
@@ -85,7 +97,7 @@ async def tag_classification(
             resp = await client.post(
                 f"{settings.foundation_dlp_url}/core/classification:tag",
                 json=body,
-                headers=_headers(request, _auth),
+                headers=_headers(request, _auth, actor="ADMIN"),
             )
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         raise _connect_502(exc) from exc

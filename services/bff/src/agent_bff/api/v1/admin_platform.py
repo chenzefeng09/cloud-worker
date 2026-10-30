@@ -787,7 +787,9 @@ async def admin_cancel_run(
     body = await request.json() if await request.body() else {}
     url = f"{request.app.state.settings.agent_scheduler_url}/runs/{run_id}/cancel"
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        # The scheduler gives the worker up to 10 s to save its final counts
+        # before it removes the sandbox: wait as long as the orchestrator does.
+        async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(url, json=body, headers=headers)
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         raise HTTPException(

@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 # Tight timeout for the authz /check call backing the tenant-admin guard —
 # fail-closed (403) on timeout, same posture as require_super_admin_bff.
 _AUTHZ_TIMEOUT = 2.0
+# The orchestrator waits up to 30 s for the scheduler to stop the sandbox (the
+# worker gets 10 s to save its final token counts), so a cancel must outwait
+# it: a shorter timeout reported a failed cancel that went on to succeed.
+_CANCEL_TIMEOUT = 45.0
 
 # Audit event types emitted when an admin views session replay data.
 _AUDIT_EVENT_SESSION_LIST = "admin.session.list.viewed"
@@ -465,7 +469,7 @@ async def cancel_session(
     """
     tenant_id, user_id, access_token = _auth
     orch_url = await _orchestrator_url(request)
-    async with httpx.AsyncClient(timeout=15) as client:
+    async with httpx.AsyncClient(timeout=_CANCEL_TIMEOUT) as client:
         resp = await client.post(
             f"{orch_url}/sessions/{session_id}/cancel",
             headers=foundation_headers(tenant_id, user_id, access_token),

@@ -26,7 +26,9 @@ from agent_bff.domain.erasure_ledger import ErasureLedger, LedgerError
 from tests.privacy_fakes import (
     ADMIN,
     LEDGER_BUCKET,
+    NO_ROWS,
     PREFIX,
+    SEEDED,
     TENANT,
     USER_A,
     USER_B,
@@ -46,8 +48,6 @@ from tests.privacy_fakes import (
 
 SINCE = datetime(2026, 10, 30, 8, 0, tzinfo=UTC)
 CEST = timezone(timedelta(hours=2))
-NO_ROWS = {"notification_preferences": 0, "api_keys": 0, "privacy_notice_acknowledgements": 0}
-SEEDED = {"notification_preferences": 1, "api_keys": 1, "privacy_notice_acknowledgements": 2}
 
 SELF_ERASE = ("/me/privacy/erase", {"confirm": "DELETE MY DATA"}, USER_A, "self_service")
 ADMIN_ERASE = (f"/admin/privacy/users/{USER_A}/erase", {"confirm": USER_A}, ADMIN, "admin_dsar")
@@ -176,13 +176,14 @@ def test_erasure_is_recorded_before_any_step_runs(
     path: str, body: dict, caller: str, via: str,
 ) -> None:
     seed_rows(client, db_factory, USER_A)
-    data_calls_at_record: list[list[tuple[str, str, str]]] = []
-    s3.on_put = lambda: data_calls_at_record.append(fake.data_calls())
+    writes_at_record: list[list[tuple[str, str, str]]] = []
+    s3.on_put = lambda: writes_at_record.append(fake.writes())
 
     resp = client.post(PREFIX + path, json=body, cookies=make_cookie(settings, caller))
 
     assert resp.status_code == 200, resp.text
-    assert data_calls_at_record == [[]]
+    # After the preflight (reads and dry runs only), before anything is erased.
+    assert writes_at_record == [[]]
     [entry] = s3.entries()
     assert (entry["tenant_id"], entry["user_id"]) == (TENANT, USER_A)
     assert (entry["via"], entry["actor_user_id"]) == (via, caller)
@@ -190,6 +191,23 @@ def test_erasure_is_recorded_before_any_step_runs(
     [event] = fake.audit_events
     assert event["outcome"] == "SUCCESS"
     assert event["payload"]["ledger"] == "recorded"
+
+
+@pytest.mark.parametrize("path,body,caller,via", [SELF_ERASE, ADMIN_ERASE])
+def test_a_refused_preflight_records_nothing_in_the_ledger(
+    client: TestClient, settings: Settings, db_factory, fake: FakePlatform, s3: FakeS3,
+    path: str, body: dict, caller: str, via: str,
+) -> None:
+    """Nothing was erased, so there is nothing for a restore to replay."""
+    seed_rows(client, db_factory, USER_A)
+    fake.down.add("apps")
+
+    resp = client.post(PREFIX + path, json=body, cookies=make_cookie(settings, caller))
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"]["code"] == "PRIVACY_ERASURE_UNAVAILABLE"
+    assert s3.entries() == []
+    assert fake.writes() == []
 
 
 @pytest.mark.parametrize("path,body,caller,via", [SELF_ERASE, ADMIN_ERASE])
@@ -206,7 +224,7 @@ def test_erasure_is_refused_when_the_ledger_cannot_record_it(
     detail = resp.json()["detail"]
     assert detail["code"] == "PRIVACY_LEDGER_UNAVAILABLE"
     assert "Nothing was erased" in detail["user_message"]
-    assert fake.data_calls() == []
+    assert fake.writes() == []
     assert count_rows(client, db_factory, USER_A) == SEEDED
     assert USER_A in fake.memories
     assert USER_A in fake.schedules

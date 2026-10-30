@@ -355,6 +355,29 @@ def test_dlp_hits_dlp_url(gov_client, gov_cookie, gov_allowed) -> None:
     assert any(u == f"{DLP_URL}/core/scan" for (_, u, _, _) in gov_allowed.requests)
 
 
+@pytest.mark.parametrize(
+    "method,path,body,_ok",
+    [e for e in ENDPOINTS if e[1].startswith("/admin/dlp/")],
+)
+def test_only_classify_is_sent_with_admin_authority(
+    gov_client, gov_cookie, gov_allowed, method, path, body, _ok,
+) -> None:
+    """foundation-dlp lets only SERVICE/ADMIN actors write labels.
+
+    Classify needs that authority.  Scan must not have it: it checks text the
+    admin pastes in, and with it a hit would label the resource (or the
+    ``adhoc-scan`` placeholder).  An ``X-Actor`` sent by the browser is never
+    passed on.
+    """
+    _call(gov_client, method, path, body, cookies=gov_cookie, headers={"X-Actor": "SERVICE"})
+
+    upstream = path.split("?")[0].removeprefix("/admin/dlp/")
+    sent = [h for (_, u, h, _) in gov_allowed.requests if u == f"{DLP_URL}/core/{upstream}"]
+    assert sent, path
+    expected = "ADMIN" if upstream == "classification:tag" else None
+    assert sent[-1].get("X-Actor") == expected
+
+
 def test_compliance_hits_compliance_url(gov_client, gov_cookie, gov_allowed) -> None:
     gov_client.get(PREFIX + "/admin/compliance/ropa", cookies=gov_cookie)
     assert any(u == f"{COMPL_URL}/ropa" for (_, u, _, _) in gov_allowed.requests)

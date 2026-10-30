@@ -62,8 +62,11 @@ from tests.privacy_fakes import (
 USER_C = "usr_01J5TEST0000000000000USER3"
 SINCE = datetime(2026, 10, 30, 8, 0, tzinfo=UTC)
 REPLAY = ("--since", "2026-10-30T08:00:00Z", "--actor", ADMIN)
-ADMIN_STEPS = ["schedules", "platform", "memories", "bff"]
-SEEDED_BFF = {"notification_preferences": 1, "api_keys": 0, "privacy_notice_acknowledgements": 1}
+ADMIN_STEPS = ["schedules", "platform", "memories", "llm_preferences", "apps", "bff"]
+SEEDED_BFF = {
+    "notification_preferences": 1, "api_keys": 0, "privacy_notice_acknowledgements": 1,
+    "web_sessions": 0,
+}
 
 
 # ── BFF database (a file, so every event loop sees the same data) ─────────────
@@ -185,30 +188,44 @@ def test_replay_erases_every_user_recorded_since_the_restore_point(
     for result in (first, second):
         assert result["status"] == "erased"
         assert result["succeeded"] == ADMIN_STEPS
-        assert result["skipped"] == {"llm_preferences": "not_supported"}
+        assert result["skipped"] == {}
         assert result["counts"]["bff"] == SEEDED_BFF
     assert first["counts"]["schedules_deleted"] == 2
     assert first["counts"]["memories_deleted"] == 2
     assert first["counts"]["platform_deleted"] == {"sessions": 2, "messages": 7, "workspaces": 1}
+    assert first["counts"]["llm_preferences_deleted"] == 1
+    assert first["counts"]["apps"]["apps_deleted"] == 1
 
-    # The admin fan-out, inside each user's own tenant, as the actor (no bearer).
-    orch_a, orch_b = fake.calls_to("orchestrator")
-    assert (orch_a.headers["X-Tenant-Id"], orch_a.json) == (
-        TENANT, {"dry_run": False, "user_id": USER_A},
-    )
-    assert (orch_b.headers["X-Tenant-Id"], orch_b.json) == (
-        OTHER_TENANT, {"dry_run": False, "user_id": USER_B},
-    )
-    assert [c.path for c in fake.calls_to("knowledge")] == [
-        f"/internal/privacy/users/{USER_A}/memories",
-        f"/internal/privacy/users/{USER_B}/memories",
+    # The admin fan-out, inside each user's own tenant, as the actor (no bearer):
+    # a dry run first (the preflight), then the erasure.
+    assert [(c.headers["X-Tenant-Id"], c.json) for c in fake.calls_to("orchestrator")] == [
+        (TENANT, {"dry_run": True, "user_id": USER_A}),
+        (TENANT, {"dry_run": False, "user_id": USER_A}),
+        (OTHER_TENANT, {"dry_run": True, "user_id": USER_B}),
+        (OTHER_TENANT, {"dry_run": False, "user_id": USER_B}),
     ]
-    for call in (*fake.calls_to("orchestrator"), *fake.calls_to("knowledge")):
+    assert [(c.method, c.path) for c in fake.calls_to("knowledge")] == [
+        ("GET", f"/internal/privacy/users/{USER_A}/memories"),
+        ("DELETE", f"/internal/privacy/users/{USER_A}/memories"),
+        ("GET", f"/internal/privacy/users/{USER_B}/memories"),
+        ("DELETE", f"/internal/privacy/users/{USER_B}/memories"),
+    ]
+    assert [(c.method, c.path) for c in fake.calls_to("llm")] == [
+        ("GET", f"/users/{USER_A}/preferences"),
+        ("DELETE", f"/users/{USER_A}/preferences"),
+        ("GET", f"/users/{USER_B}/preferences"),
+        ("DELETE", f"/users/{USER_B}/preferences"),
+    ]
+    for call in (
+        *fake.calls_to("orchestrator"), *fake.calls_to("knowledge"),
+        *fake.calls_to("llm"), *fake.calls_to("apps"),
+    ):
         assert call.headers["X-Actor"] == "ADMIN"
         assert call.headers["X-User-Id"] == ADMIN
         assert "Authorization" not in call.headers
-    assert [c.headers["X-Tenant-Id"] for c in fake.calls_to("cron")] == [TENANT, OTHER_TENANT]
-    assert fake.calls_to("llm") == []
+    assert [c.headers["X-Tenant-Id"] for c in fake.calls_to("cron")] == [
+        TENANT, TENANT, OTHER_TENANT, OTHER_TENANT,
+    ]
 
     # Erased again; the user whose erasure the backup already holds is untouched.
     assert bff_rows(dsn, USER_A, TENANT) == 0
@@ -239,7 +256,7 @@ def test_each_replayed_user_is_audited_as_the_actor_with_counts_only(
         assert event["payload"]["via"] == "restore_replay"
         assert event["payload"]["since"] == "2026-10-30T08:00:00+00:00"
         assert event["payload"]["succeeded"] == ADMIN_STEPS
-        assert event["payload"]["skipped"] == {"llm_preferences": "not_supported"}
+        assert "skipped" not in event["payload"]
         assert MEMORY_TEXT not in json.dumps(event)
 
 
@@ -248,7 +265,7 @@ def test_an_incomplete_user_exits_1_and_a_rerun_finishes(
 ) -> None:
     add_ledger_entry(s3, at=SINCE + timedelta(minutes=1), tenant_id=TENANT, user_id=USER_A)
     seed(dsn, USER_A, TENANT)
-    fake.down.add("knowledge")
+    fake.write_down.add("knowledge")
 
     code, report = run_cli(capsys, *REPLAY)
 
@@ -256,9 +273,10 @@ def test_an_incomplete_user_exits_1_and_a_rerun_finishes(
     assert (report["erased"], report["incomplete"]) == (0, 1)
     [result] = report["results"]
     assert result["status"] == "incomplete"
+    assert "phase" not in result
     assert result["succeeded"] == ["schedules", "platform"]
     assert result["failed"] == "memories"
-    assert result["not_attempted"] == ["llm_preferences", "bff"]
+    assert result["not_attempted"] == ["llm_preferences", "apps", "bff"]
     assert "knowledge-ingest unreachable" in result["error"]
     assert bff_rows(dsn, USER_A, TENANT) == 2  # the BFF step never ran
     [event] = fake.audit_events
@@ -266,7 +284,7 @@ def test_an_incomplete_user_exits_1_and_a_rerun_finishes(
     assert event["payload"]["failed"] == "memories"
 
     # Every step is idempotent: once knowledge-ingest is back, a rerun finishes.
-    fake.down.clear()
+    fake.write_down.clear()
     code, report = run_cli(capsys, *REPLAY)
 
     assert code == 0
@@ -275,6 +293,29 @@ def test_an_incomplete_user_exits_1_and_a_rerun_finishes(
     assert result["counts"]["schedules_deleted"] == 0  # already gone
     assert result["counts"]["memories_deleted"] == 2
     assert bff_rows(dsn, USER_A, TENANT) == 0
+
+
+def test_a_user_whose_preflight_fails_is_reported_and_nothing_is_erased(
+    capsys: pytest.CaptureFixture[str], dsn: str, s3: FakeS3, fake: FakePlatform,
+) -> None:
+    add_ledger_entry(s3, at=SINCE + timedelta(minutes=1), tenant_id=TENANT, user_id=USER_A)
+    seed(dsn, USER_A, TENANT)
+    fake.down.add("apps")
+
+    code, report = run_cli(capsys, *REPLAY)
+
+    assert code == 1
+    assert (report["erased"], report["incomplete"]) == (0, 1)
+    [result] = report["results"]
+    assert result["status"] == "incomplete"
+    assert result["phase"] == "preflight"
+    assert result["failed"] == "apps"
+    assert result["succeeded"] == []
+    assert fake.writes() == []
+    assert bff_rows(dsn, USER_A, TENANT) == 2
+    [event] = fake.audit_events
+    assert event["outcome"] == "FAILURE"
+    assert (event["payload"]["phase"], event["payload"]["failed"]) == ("preflight", "apps")
 
 
 def test_dry_run_lists_the_users_and_erases_nothing(

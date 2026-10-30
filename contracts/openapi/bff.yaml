@@ -20,6 +20,13 @@ paths:
     post:
       operationId: auth_login
       summary: Login (proxy to foundation identity)
+      description: |
+        Signs in through foundation identity and starts a server-side web
+        session.  The identity tokens never reach the browser: the BFF keeps
+        them (encrypted) in its session store and refreshes the access token
+        shortly before it expires.  The `ap_session` cookie (HttpOnly,
+        SameSite=Strict, signed) carries only an opaque session id; signing in
+        again ends the session the browser held before.
       tags: [Auth]
       requestBody:
         required: true
@@ -37,18 +44,42 @@ paths:
                   minLength: 1
       responses:
         '200':
-          description: Login successful
+          description: Login successful; sets the `ap_session` cookie.
+          headers:
+            Set-Cookie:
+              schema: { type: string }
+              description: "`ap_session=<signed opaque session id>; HttpOnly; SameSite=Strict; Path=/`"
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/LoginResponse'
         '401':
-          $ref: '#/components/responses/Unauthorized'
+          description: |
+            Sign-in refused.  Refused credentials (and a locked account) answer a
+            generic `AGENT.BFF.AUTH_FAILED` problem.  When the password was right
+            but the account still has required actions pending (expired password,
+            administrator-requested reset), identity's
+            `FOUNDATION.IDENTITY.AUTH.ACCOUNT_SETUP_REQUIRED` problem is passed
+            through as `{"detail": {"detail": <identity problem>, "user_message": ...}}`
+            so the client can tell the user how to finish the setup.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/Error'
+                  - $ref: '#/components/schemas/UpstreamProblem'
+        '502':
+          $ref: '#/components/responses/UpstreamError'
+        '503':
+          $ref: '#/components/responses/SessionUnavailable'
 
   /api/bff/v1/auth/logout:
     post:
       operationId: auth_logout
-      summary: Logout (clears session cookie)
+      summary: Logout (ends the web session)
+      description: |
+        Deletes the server-side web session, revokes its identity session
+        (best-effort) and clears the cookie.  Works without a valid session.
       tags: [Auth]
       security:
         - bearerAuth: []
@@ -70,6 +101,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/UserProfile'
+        '401':
+          description: |
+            No usable session: no cookie (`Login required`), or the session has
+            ended — expired, signed out, or its token refresh was refused
+            (`Session expired`).  The client should return to the sign-in page.
+            Every authenticated endpoint answers the same way.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          $ref: '#/components/responses/SessionUnavailable'
 
   # ---------------------------------------------------------------------------
   # Sessions
@@ -226,20 +269,24 @@ paths:
                     illegal type (non-array, or a non-string element) → 422.
       responses:
         '200':
-          description: SSE event stream
+          description: >-
+            The run started, and the user message was saved with it. The run's
+            output arrives on `GET /api/bff/v1/sessions/{session_id}/stream`.
           content:
-            text/event-stream:
+            application/json:
               schema:
-                type: string
-                description: |
-                  SSE events:
-                  - event: message_created — user message persisted
-                  - event: agent_message — streaming assistant response
-                  - event: tool_call — agent invoked a tool
-                  - event: tool_result — tool result returned
-                  - event: run_complete — run finished
-                  - event: error — error occurred
-                  - event: done — stream ended
+                type: object
+                properties:
+                  run_id: { type: string }
+                  message_id: { type: string, nullable: true }
+                  run: { type: object }
+        '402': { $ref: '#/components/responses/TurnRefused' }
+        '403': { $ref: '#/components/responses/TurnRefused' }
+        '404': { $ref: '#/components/responses/TurnRefused' }
+        '409': { $ref: '#/components/responses/TurnRefused' }
+        '422': { $ref: '#/components/responses/TurnRefused' }
+        '502': { $ref: '#/components/responses/TurnRefused' }
+        '503': { $ref: '#/components/responses/TurnRefused' }
 
   # ---------------------------------------------------------------------------
   # Workspaces (transparent proxy to session-orchestrator)
@@ -757,6 +804,7 @@ paths:
       tags: [Health]
       responses:
         '200':
+          description: The service is alive
           content:
             application/json:
               schema:
@@ -769,6 +817,7 @@ paths:
       tags: [Health]
       responses:
         '200':
+          description: The service is ready to take requests
           content:
             application/json:
               schema:
@@ -950,9 +999,8 @@ components:
 
     LoginResponse:
       type: object
+      description: The identity tokens stay in the BFF; only the session cookie is set.
       properties:
-        access_token: { type: string }
-        refresh_token: { type: string }
         user_id: { type: string }
         tenant_id: { type: string }
         email: { type: string }
@@ -987,7 +1035,54 @@ components:
         instance: { type: string, description: "Request path" }
         code: { type: string, description: "FOUNDATION.<SERVICE>.<CATEGORY>.<NAME>" }
 
+    UpstreamProblem:
+      type: object
+      description: An upstream (foundation) problem passed through by the BFF.
+      properties:
+        detail:
+          type: object
+          properties:
+            detail:
+              allOf:
+                - $ref: '#/components/schemas/Error'
+                - type: object
+                  properties:
+                    user_message: { type: string }
+            user_message: { type: string }
+
   responses:
+    TurnRefused:
+      description: |
+        The run did not start, so nothing of the turn was saved and the send can
+        be repeated. The status is the orchestrator's. `detail` is written for
+        the user: by status (409 another run is live, 404 the conversation is
+        gone, 403 no permission, 5xx try again shortly), except for refusals
+        retrying cannot fix, which say what will instead:
+        `AGENT.RUN.LLM_NOT_CONFIGURED` (422, no model set up for the
+        organization) and `AGENT.RUN.QUOTA_EXCEEDED` (402).
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              detail: { type: string }
+              status: { type: integer }
+              code: { type: string, description: "The orchestrator's code, when it gave one" }
+    UpstreamError:
+      description: An upstream service (e.g. foundation identity) is unreachable or failed (`AGENT.BFF.UPSTREAM_ERROR`).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    SessionUnavailable:
+      description: |
+        The session exists but cannot be used right now — the session store or
+        identity is unavailable while the access token needs refreshing
+        (`AGENT.BFF.SESSION_UNAVAILABLE`).  Retry later; the session is kept.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
     Unauthorized:
       description: Authentication required
       content:

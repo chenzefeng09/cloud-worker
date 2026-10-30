@@ -22,25 +22,43 @@ Where a user's data lives
 * knowledge-ingest — the "[memory] …" session-memory documents (``/memories``).
 * cron-runner — the schedules and webhook triggers the user created (internal
   ``/internal/privacy/users/{id}/cron-jobs``, service token).
-* llm-gateway — the user's model preferences (``/user-preferences``).
+* llm-gateway — the user's model preferences (``/user-preferences`` for the
+  caller, ``/users/{id}/preferences`` for a tenant admin).
+* app-registry — the Apps the user authored and the review-trail entries
+  naming them (``/privacy/apps``).  Erasure deletes the Apps only they could
+  see and keeps the ones shared with the tenant without naming them.
 * this BFF — ``notification_preferences``, ``api_keys`` (metadata only; the key
-  hash never leaves the database) and ``privacy_notice_acknowledgements``.
-* foundation identity — the sign-in account.  Closing it is an administrator
-  action, so erasure leaves it in place and says so in its response.
+  hash never leaves the database), ``privacy_notice_acknowledgements`` and the
+  browser sign-ins in ``web_sessions`` (exported as when each started, was last
+  refreshed and ends; the stored tokens never leave the database).  Erasure
+  ends every sign-in of the subject except the one the request itself came
+  from: the account stays open, and the user is still looking at the result.
+* foundation identity — the sign-in account (exported as ``profile``).  Closing
+  it is an administrator action, so erasure leaves it in place and says so in
+  its response.
 
-Erasure runs in a fixed order and stops at the first failing step: the user's
-schedules first (so none starts another run on their behalf), the orchestrator
-(which also cancels live runs, so no new memory is written afterwards),
-knowledge-ingest memories, the LLM preferences, then the BFF rows.  A step this
-deployment cannot perform is reported as skipped with the reason, never as
-done.  Every step is idempotent, so after a partial failure (502 naming the
-steps that finished) the request is simply repeated.
+Every part of an export is required: an export that silently missed one would
+misstate what is held, so any upstream failure fails the export (502).
 
-Before the first step, the request is written to the erasure ledger
-(``domain/erasure_ledger.py``), which a backup restore does not rewind, so
-``agent_bff.erasure_replay`` can erase the restored rows again.  A configured
-ledger that can't be written refuses the erasure (503, nothing erased): an
-erasure a restore would silently undo is not performed.
+Erasure first runs a preflight that touches nothing: each step's service is
+asked, with the same identity the erasure will use, for what it would delete
+(dry runs on the orchestrator and app-registry, listings elsewhere).  A service
+that is unreachable or refuses refuses the whole erasure — 503, nothing erased
+— so a deterministic failure (a missing permission, a misconfigured URL) can no
+longer leave an erasure half done.  Then the steps run in a fixed order and
+stop at the first failing one: the user's schedules first (so none starts
+another run on their behalf), the orchestrator (which also cancels live runs,
+so no new memory is written afterwards), knowledge-ingest memories, the LLM
+preferences, the Apps, then the BFF rows.  A step this deployment cannot
+perform is reported as skipped with the reason, never as done.  Every step is
+idempotent, so after a partial failure (502 naming the steps that finished)
+the request is simply repeated.
+
+Between the preflight and the first step, the request is written to the
+erasure ledger (``domain/erasure_ledger.py``), which a backup restore does not
+rewind, so ``agent_bff.erasure_replay`` can erase the restored rows again.  A
+configured ledger that can't be written refuses the erasure (503, nothing
+erased): an erasure a restore would silently undo is not performed.
 
 The export and erasure fan-outs are plain functions so the tenant-admin DSAR
 routes (``admin_privacy.py``) and the post-restore replay run the same code
@@ -68,11 +86,13 @@ from sqlalchemy import delete, select
 
 from agent_bff.api._http import foundation_headers
 from agent_bff.api.dependencies import require_auth
+from agent_bff.api.middleware import get_web_session_id
 from agent_bff.api.v1.admin import _raise_for_upstream
 from agent_bff.config import Settings
 from agent_bff.domain import db as db_module
 from agent_bff.domain.erasure_ledger import ErasureLedger, LedgerError
 from agent_bff.domain.models import ApiKey, NotificationPreference, PrivacyNoticeAcknowledgement
+from agent_bff.domain.web_sessions import WebSession
 
 router = APIRouter(tags=["Privacy"])
 logger = logging.getLogger(__name__)
@@ -87,15 +107,18 @@ _ORCHESTRATOR = "session-orchestrator"
 _KNOWLEDGE = "knowledge-ingest"
 _CRON = "cron-runner"
 _LLM = "llm-gateway"
+_APPS = "app-registry"
+_IDENTITY = "identity"
 
 _TIMEOUT = 15
 # The orchestrator walks every session the user owns for an export / erasure.
 _FANOUT_TIMEOUT = 120
-# Best-effort lookups (profile, notice retention) must not hold up a response.
+# Best-effort lookups (the notice's retention and memory setting) must not hold
+# up a response.
 _SOFT_TIMEOUT = 5
 _AUDIT_TIMEOUT = 5
 
-_ERASE_STEPS = ("schedules", "platform", "memories", "llm_preferences", "bff")
+_ERASE_STEPS = ("schedules", "platform", "memories", "llm_preferences", "apps", "bff")
 # A gateway purpose becomes a URL path segment, so it must be a plain token.
 _LLM_PURPOSE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -132,16 +155,28 @@ class DataSubject:
     actor_user_id: str
     access_token: str
     admin: bool = False
+    # ``web_sessions.id`` of the sign-in the request came from: erasure never
+    # ends it (``""`` = none, e.g. the post-restore replay).
+    keep_web_session: str = ""
 
     @classmethod
-    def from_auth(cls, auth: tuple[str, str, str]) -> DataSubject:
+    def from_auth(
+        cls, auth: tuple[str, str, str], *, keep_web_session: str = "",
+    ) -> DataSubject:
         tenant_id, user_id, access_token = auth
-        return cls(tenant_id, user_id, user_id, access_token)
+        return cls(
+            tenant_id, user_id, user_id, access_token, keep_web_session=keep_web_session,
+        )
 
     @classmethod
-    def for_admin(cls, auth: tuple[str, str, str], subject_user_id: str) -> DataSubject:
+    def for_admin(
+        cls, auth: tuple[str, str, str], subject_user_id: str, *, keep_web_session: str = "",
+    ) -> DataSubject:
         tenant_id, actor_user_id, access_token = auth
-        return cls(tenant_id, subject_user_id, actor_user_id, access_token, admin=True)
+        return cls(
+            tenant_id, subject_user_id, actor_user_id, access_token,
+            admin=True, keep_web_session=keep_web_session,
+        )
 
     def plain_headers(self) -> dict[str, str]:
         return foundation_headers(self.tenant_id, self.actor_user_id, self.access_token)
@@ -345,6 +380,16 @@ async def _bff_rows(subject: DataSubject) -> dict[str, list[dict[str, Any]]]:
                 .order_by(PrivacyNoticeAcknowledgement.acknowledged_at)
             )
         ).scalars().all()
+        sign_ins = (
+            await session.execute(
+                select(WebSession)
+                .where(
+                    WebSession.tenant_id == subject.tenant_id,
+                    WebSession.user_id == subject.user_id,
+                )
+                .order_by(WebSession.created_at)
+            )
+        ).scalars().all()
     return {
         "notification_preferences": [
             {
@@ -371,6 +416,15 @@ async def _bff_rows(subject: DataSubject) -> dict[str, list[dict[str, Any]]]:
             {"notice_version": a.notice_version, "acknowledged_at": _iso(a.acknowledged_at)}
             for a in acks
         ],
+        # Times only: the session id and the stored tokens are credentials.
+        "sign_in_sessions": [
+            {
+                "created_at": _iso(s.created_at),
+                "refreshed_at": _iso(s.refreshed_at),
+                "expires_at": _iso(s.expires_at),
+            }
+            for s in sign_ins
+        ],
     }
 
 
@@ -386,6 +440,15 @@ async def _erase_bff_rows(subject: DataSubject) -> dict[str, int]:
                 )
             )
             counts[model.__tablename__] = int(getattr(result, "rowcount", 0) or 0)
+        # Deleting a sign-in is what signs that browser out (its tokens live
+        # only in this row).  The one the request came from stays.
+        sign_ins = delete(WebSession).where(
+            WebSession.tenant_id == subject.tenant_id, WebSession.user_id == subject.user_id,
+        )
+        if subject.keep_web_session:
+            sign_ins = sign_ins.where(WebSession.id != subject.keep_web_session)
+        result = await session.execute(sign_ins)
+        counts[WebSession.__tablename__] = int(getattr(result, "rowcount", 0) or 0)
     return counts
 
 
@@ -423,19 +486,35 @@ async def _export_schedules(
     return items
 
 
-async def _erase_llm_preferences(settings: Settings, subject: DataSubject) -> int:
-    """Delete every LLM model preference the gateway keeps for the caller.
+def _llm_preferences_url(settings: Settings, subject: DataSubject) -> str:
+    """The gateway answers ``/user-preferences`` for the caller only; a tenant
+    admin reads and deletes a member's through ``/users/{id}/preferences``."""
+    base = settings.foundation_llm_gateway_url.rstrip("/")
+    if subject.admin:
+        return f"{base}/users/{subject.user_id}/preferences"
+    return f"{base}/user-preferences"
 
-    The gateway lists them (``GET /user-preferences`` → ``{"items": [...]}``)
-    and deletes one purpose at a time.  A purpose that is already gone (404)
-    counts as deleted, so a repeat is harmless.
-    """
-    base = f"{settings.foundation_llm_gateway_url}/user-preferences"
-    headers = subject.plain_headers()
-    listing = await _call("GET", base, service=_LLM, headers=headers)
-    items = listing.get("items") if isinstance(listing, dict) else None
+
+def _llm_headers(subject: DataSubject) -> dict[str, str]:
+    # ``X-Actor: ADMIN`` is what the gateway's member routes require; the
+    # self-service routes act on the caller, so no actor header there.
+    return subject.headers() if subject.admin else subject.plain_headers()
+
+
+async def _export_llm_preferences(
+    settings: Settings, subject: DataSubject,
+) -> list[dict[str, Any]]:
+    body = await _call(
+        "GET", _llm_preferences_url(settings, subject), service=_LLM,
+        headers=_llm_headers(subject),
+    )
+    items = body.get("items") if isinstance(body, dict) else None
     if not isinstance(items, list):
         raise UpstreamError(_LLM, "returned an unexpected preference listing")
+    return items
+
+
+def _llm_purposes(items: list[dict[str, Any]]) -> list[str]:
     purposes: list[str] = []
     for item in items:
         purpose = item.get("purpose") if isinstance(item, dict) else None
@@ -443,6 +522,26 @@ async def _erase_llm_preferences(settings: Settings, subject: DataSubject) -> in
             raise UpstreamError(_LLM, "returned a preference without a usable purpose")
         if purpose not in purposes:
             purposes.append(purpose)
+    return purposes
+
+
+async def _erase_llm_preferences(settings: Settings, subject: DataSubject) -> int:
+    """Delete every LLM model preference the gateway keeps for the subject.
+
+    A tenant admin deletes a member's in one call (``DELETE
+    /users/{id}/preferences`` → ``{"deleted": n}``).  The caller's own are
+    listed and deleted one purpose at a time; a purpose that is already gone
+    (404) counts as deleted, so a repeat is harmless.
+    """
+    if subject.admin:
+        body = await _call(
+            "DELETE", _llm_preferences_url(settings, subject), service=_LLM,
+            headers=_llm_headers(subject),
+        )
+        return _deleted_count(body, _LLM)
+    base = _llm_preferences_url(settings, subject)
+    headers = _llm_headers(subject)
+    purposes = _llm_purposes(await _export_llm_preferences(settings, subject))
     for purpose in purposes:
         try:
             resp = await _send("DELETE", f"{base}/{purpose}", headers=headers, timeout=_TIMEOUT)
@@ -451,6 +550,49 @@ async def _erase_llm_preferences(settings: Settings, subject: DataSubject) -> in
         if resp.status_code >= 400 and resp.status_code != 404:
             raise UpstreamError(_LLM, f"returned HTTP {resp.status_code}")
     return len(purposes)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Apps (app-registry)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _apps_url(settings: Settings, path: str) -> str:
+    return f"{settings.app_registry_url.rstrip('/')}/privacy/apps{path}"
+
+
+async def _export_apps(settings: Settings, subject: DataSubject) -> dict[str, Any]:
+    body = await _call(
+        "GET",
+        _apps_url(settings, ""),
+        service=_APPS,
+        headers=subject.headers(),
+        params={"user_id": subject.user_id} if subject.admin else None,
+    )
+    if (
+        not isinstance(body, dict)
+        or not isinstance(body.get("apps"), list)
+        or not isinstance(body.get("review_trail"), list)
+    ):
+        raise UpstreamError(_APPS, "returned an unexpected App listing")
+    return {"authored": body["apps"], "review_trail": body["review_trail"]}
+
+
+async def _erase_apps(
+    settings: Settings, subject: DataSubject, *, dry_run: bool,
+) -> dict[str, int]:
+    erase_body: dict[str, Any] = {"dry_run": dry_run}
+    if subject.admin:
+        erase_body["user_id"] = subject.user_id
+    body = await _call(
+        "POST", _apps_url(settings, "/erase"), service=_APPS, headers=subject.headers(),
+        json_body=erase_body,
+    )
+    deleted = body.get("deleted") if isinstance(body, dict) else None
+    if not isinstance(deleted, dict) or not all(
+        isinstance(v, int) for v in deleted.values()
+    ):
+        raise UpstreamError(_APPS, "returned an unexpected erasure result")
+    return {str(k): int(v) for k, v in deleted.items()}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -466,13 +608,9 @@ def _memories_url(settings: Settings, subject: DataSubject) -> str:
 async def build_export(settings: Settings, subject: DataSubject) -> dict[str, Any]:
     """Everything the platform holds about ``subject``, as one JSON document.
 
-    The orchestrator, knowledge-ingest and cron-runner parts are required —
-    an export that silently missed them would misstate what is held — so their
-    failure raises ``UpstreamError``; ``schedules`` is ``null`` only where
-    cron-runner is not deployed.  The identity profile (and, self-service only,
-    the LLM model preferences the gateway keeps) are best-effort and ``null``
-    when unavailable.  The admin path has no gateway lookup: the gateway only
-    answers for the calling user.
+    Every part is required — an export that silently missed one would misstate
+    what is held — so any failure raises ``UpstreamError``; ``schedules`` is
+    ``null`` only where cron-runner is not deployed.
     """
     headers = subject.headers()
     platform = await _call(
@@ -494,19 +632,13 @@ async def build_export(settings: Settings, subject: DataSubject) -> dict[str, An
         profile_url = f"{settings.foundation_identity_url}/users/{subject.user_id}"
     else:
         profile_url = f"{settings.foundation_identity_url}/sessions/me"
-    profile = await _call_soft(
-        "GET", profile_url, service="identity", headers=subject.plain_headers(),
-    )
+    profile = await _call("GET", profile_url, service=_IDENTITY, headers=subject.plain_headers())
+    if not isinstance(profile, dict):
+        raise UpstreamError(_IDENTITY, "returned an unexpected profile")
 
+    llm_preferences = await _export_llm_preferences(settings, subject)
+    apps = await _export_apps(settings, subject)
     rows = await _bff_rows(subject)
-    preferences: dict[str, Any] = {"notifications": rows["notification_preferences"]}
-    if not subject.admin:
-        preferences["llm"] = await _call_soft(
-            "GET",
-            f"{settings.foundation_llm_gateway_url}/user-preferences",
-            service="llm-gateway",
-            headers=subject.plain_headers(),
-        )
 
     return {
         "generated_at": datetime.now(UTC).isoformat(),
@@ -514,9 +646,14 @@ async def build_export(settings: Settings, subject: DataSubject) -> dict[str, An
         "platform": platform,
         "memories": memories["items"],
         "schedules": schedules,
-        "preferences": preferences,
+        "apps": apps,
+        "preferences": {
+            "notifications": rows["notification_preferences"],
+            "llm": llm_preferences,
+        },
         "api_keys": rows["api_keys"],
         "privacy_acknowledgements": rows["privacy_acknowledgements"],
+        "sign_in_sessions": rows["sign_in_sessions"],
     }
 
 
@@ -596,19 +733,104 @@ class ErasureIncompleteError(Exception):
         }
 
 
+class ErasureRefusedError(ErasureIncompleteError):
+    """The preflight failed: no step ran, so nothing was erased.
+
+    An ``ErasureIncompleteError`` with no step done, so a caller that only
+    knows the general case (the post-restore replay) still reports it as an
+    incomplete erasure.
+    """
+
+    def __init__(self, *, failed: str, error: str) -> None:
+        super().__init__(run=ErasureRun(), failed=failed, error=error)
+
+    @property
+    def not_attempted(self) -> list[str]:
+        return list(_ERASE_STEPS)
+
+    def detail(self) -> dict[str, Any]:
+        return {
+            "user_message": (
+                "Nothing was erased: a platform service is unavailable or refused the "
+                "request. Please try again later."
+            ),
+            "code": "PRIVACY_ERASURE_UNAVAILABLE",
+            "failed": self.failed,
+            "error": self.error,
+        }
+
+
 def _deleted_count(body: Any, service: str = _KNOWLEDGE) -> int:
     if isinstance(body, dict) and isinstance(body.get("deleted"), int):
         return int(body["deleted"])
     raise UpstreamError(service, "returned an unexpected erasure result")
 
 
-async def run_erasure(settings: Settings, subject: DataSubject) -> ErasureRun:
+async def preflight_erasure(settings: Settings, subject: DataSubject) -> dict[str, Any]:
+    """Ask every step's service what it would erase, changing nothing.
+
+    Each call uses the identity the erasure itself will use, so a missing
+    permission, a misconfigured URL or an unreachable service shows up here,
+    before anything is deleted.  Returns the per-step previews; raises
+    ``ErasureRefusedError`` naming the first step that failed.
+    """
+    headers = subject.headers()
+    preview: dict[str, Any] = {}
+    step = _ERASE_STEPS[0]
+    try:
+        schedules = await _export_schedules(settings, subject)
+        preview[step] = None if schedules is None else {"count": len(schedules)}
+
+        step = "platform"
+        dry_run_body: dict[str, Any] = {"dry_run": True}
+        if subject.admin:
+            dry_run_body["user_id"] = subject.user_id
+        preview[step] = await _call(
+            "POST",
+            f"{settings.session_orchestrator_url}/privacy/erase",
+            service=_ORCHESTRATOR,
+            headers=headers,
+            timeout=_FANOUT_TIMEOUT,
+            json_body=dry_run_body,
+        )
+
+        step = "memories"
+        memories = await _call(
+            "GET", _memories_url(settings, subject), service=_KNOWLEDGE, headers=headers,
+        )
+        if not isinstance(memories, dict) or not isinstance(memories.get("items"), list):
+            raise UpstreamError(_KNOWLEDGE, "returned an unexpected memory listing")
+        preview[step] = {"count": len(memories["items"])}
+
+        step = "llm_preferences"
+        llm_preferences = await _export_llm_preferences(settings, subject)
+        if not subject.admin:
+            # The caller's own are deleted one purpose at a time: each must
+            # make a usable URL segment before anything is deleted.
+            _llm_purposes(llm_preferences)
+        preview[step] = {"count": len(llm_preferences)}
+
+        step = "apps"
+        preview[step] = await _erase_apps(settings, subject, dry_run=True)
+
+        step = "bff"
+        rows = await _bff_rows(subject)
+        preview[step] = {table: len(items) for table, items in rows.items()}
+    except UpstreamError as exc:
+        raise ErasureRefusedError(failed=step, error=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 — a local DB failure refuses it too
+        logger.exception("privacy erasure preflight step %s failed", step)
+        raise ErasureRefusedError(failed=step, error="internal error") from exc
+    return preview
+
+
+async def execute_erasure(settings: Settings, subject: DataSubject) -> ErasureRun:
     """Erase ``subject``'s data, one step at a time (see ``_ERASE_STEPS``).
 
     Schedules go first, so none can start another run on the user's behalf
     after the platform data is gone.  Stops at the first failing step and
     raises ``ErasureIncompleteError``; every step is idempotent, so the whole
-    request can simply be repeated.
+    request can simply be repeated.  Run ``preflight_erasure`` first.
     """
     headers = subject.headers()
     run = ErasureRun()
@@ -651,13 +873,12 @@ async def run_erasure(settings: Settings, subject: DataSubject) -> ErasureRun:
         run.succeeded.append(step)
 
         step = "llm_preferences"
-        if subject.admin:
-            # The gateway answers only for the calling user, so an admin cannot
-            # clear another member's model preferences from here.
-            run.skip(step, "not_supported")
-        else:
-            run.results[step] = {"deleted": await _erase_llm_preferences(settings, subject)}
-            run.succeeded.append(step)
+        run.results[step] = {"deleted": await _erase_llm_preferences(settings, subject)}
+        run.succeeded.append(step)
+
+        step = "apps"
+        run.results[step] = await _erase_apps(settings, subject, dry_run=False)
+        run.succeeded.append(step)
 
         step = "bff"
         run.results["bff"] = await _erase_bff_rows(subject)
@@ -668,6 +889,15 @@ async def run_erasure(settings: Settings, subject: DataSubject) -> ErasureRun:
         logger.exception("privacy erasure step %s failed", step)
         raise ErasureIncompleteError(run=run, failed=step, error="internal error") from exc
     return run
+
+
+async def run_erasure(settings: Settings, subject: DataSubject) -> ErasureRun:
+    """``preflight_erasure`` then ``execute_erasure`` (the post-restore replay).
+
+    Raises ``ErasureRefusedError`` (nothing erased) or ``ErasureIncompleteError``.
+    """
+    await preflight_erasure(settings, subject)
+    return await execute_erasure(settings, subject)
 
 
 def erasure_counts(results: dict[str, Any]) -> dict[str, Any]:
@@ -683,6 +913,9 @@ def erasure_counts(results: dict[str, Any]) -> dict[str, Any]:
         outcome = results.get(step)
         if isinstance(outcome, dict) and isinstance(outcome.get("deleted"), int):
             counts[f"{step}_deleted"] = outcome["deleted"]
+    apps = results.get("apps")
+    if isinstance(apps, dict) and all(isinstance(v, int) for v in apps.values()):
+        counts["apps"] = apps
     if "bff" in results:
         counts["bff"] = results["bff"]
     return counts
@@ -740,14 +973,29 @@ async def erase_with_audit(
     event_type: str,
     account_note: str,
 ) -> dict[str, Any]:
-    """Ledger entry, ``run_erasure``, then an audit event either way.
+    """Preflight, ledger entry, the erasure, then an audit event either way.
 
-    Ledger unavailable → HTTP 503 (nothing erased); incomplete → HTTP 502.
+    Preflight refused or ledger unavailable → HTTP 503 (nothing erased);
+    incomplete → HTTP 502.
     """
     via = "admin_dsar" if subject.admin else "self_service"
+    try:
+        await preflight_erasure(settings, subject)
+    except ErasureRefusedError as exc:
+        logger.warning("privacy erasure refused by preflight: %s", exc)
+        await emit_privacy_audit(
+            settings,
+            subject,
+            event_type=event_type,
+            outcome="FAILURE",
+            payload={"via": via, "phase": "preflight", "failed": exc.failed},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=exc.detail(),
+        ) from exc
     ledger = await _record_in_ledger(settings, subject, via=via, event_type=event_type)
     try:
-        run = await run_erasure(settings, subject)
+        run = await execute_erasure(settings, subject)
     except ErasureIncompleteError as exc:
         payload: dict[str, Any] = {
             "via": via,
@@ -923,7 +1171,7 @@ async def erase_my_data(
         )
     return await erase_with_audit(
         request.app.state.settings,
-        DataSubject.from_auth(_auth),
+        DataSubject.from_auth(_auth, keep_web_session=get_web_session_id()),
         event_type="privacy.user.erased",
         account_note=SELF_ACCOUNT_NOTE,
     )

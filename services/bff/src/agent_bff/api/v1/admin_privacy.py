@@ -6,9 +6,9 @@ Prefix: /api/bff/v1 — gated by ``require_tenant_admin_bff`` (fail-closed authz
     POST /admin/privacy/users/{user_id}/export
          → JSON download of everything the platform holds about the user
     POST /admin/privacy/users/{user_id}/erase   body {"confirm": "<user_id>"}
-         → {"schedules", "platform", "memories_deleted", "llm_preferences", "bff",
-            "account"} — ``llm_preferences`` is ``{"skipped": "not_supported"}``:
-            the gateway only answers for the calling user
+         → {"schedules", "platform", "memories_deleted", "llm_preferences", "apps",
+            "bff", "account"}; 503 (nothing erased) when a service fails the
+            preflight, 502 naming the finished steps when one fails after it
 
 Both run the same fan-out as the self-service routes (``privacy.py``) with
 ``X-Actor: ADMIN`` and the subject named explicitly, so they stay inside the
@@ -25,6 +25,7 @@ from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from agent_bff.api.middleware import get_web_session_id
 from agent_bff.api.v1.privacy import (
     USER_ID_PATTERN,
     DataSubject,
@@ -60,11 +61,17 @@ def _count(value: Any) -> int | None:
 def _export_counts(export: dict[str, Any]) -> dict[str, Any]:
     platform = export.get("platform")
     platform = platform if isinstance(platform, dict) else {}
+    preferences = export.get("preferences")
+    preferences = preferences if isinstance(preferences, dict) else {}
+    apps = export.get("apps")
+    apps = apps if isinstance(apps, dict) else {}
     return {
         "sessions": _count(platform.get("sessions")),
         "workspaces": _count(platform.get("workspaces")),
         "memories": _count(export.get("memories")),
         "schedules": _count(export.get("schedules")),
+        "llm_preferences": _count(preferences.get("llm")),
+        "apps": _count(apps.get("authored")),
         "api_keys": _count(export.get("api_keys")),
     }
 
@@ -121,7 +128,7 @@ async def admin_erase_user_data(
         )
     return await erase_with_audit(
         request.app.state.settings,
-        DataSubject.for_admin(_auth, user_id),
+        DataSubject.for_admin(_auth, user_id, keep_web_session=get_web_session_id()),
         event_type=_EVENT_ERASED,
         account_note=ADMIN_ACCOUNT_NOTE,
     )

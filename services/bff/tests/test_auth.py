@@ -2,9 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Iterator
+from pathlib import Path
+
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+
+from agent_bff.domain.db import set_session_factory
+from tests.web_session_support import all_rows, sqlite_session_factory
+
+
+@pytest.fixture
+def session_store(client: TestClient, tmp_path: Path) -> Iterator[object]:
+    """SQLite web-session store, installed after ``client``'s lifespan ran
+    ``init_db`` — so login never reaches the default Postgres DSN."""
+    factory = sqlite_session_factory(tmp_path / "bff.db")
+    yield factory
+    set_session_factory(None)
 
 
 def test_healthz(client: TestClient) -> None:
@@ -15,7 +31,7 @@ def test_healthz(client: TestClient) -> None:
 
 
 def test_login_happy_path_sets_signed_cookie(
-    client: TestClient, fake_foundation,
+    client: TestClient, fake_foundation, session_store,
 ) -> None:
     resp = client.post(
         "/api/bff/v1/auth/login",
@@ -25,8 +41,13 @@ def test_login_happy_path_sets_signed_cookie(
     body = resp.json()
     assert body["tenant_id"] == "tnt_01J5TEST00000000000000TNT1"
     assert body["user_id"] == "usr_01J5TEST0000000000000USER1"
-    # Signed cookie set
+    # Signed cookie set — it names a server-side session, it does not carry
+    # the tokens.
     assert "ap_session" in resp.cookies
+    payload = client.app.state.cookie_signer.unsign(resp.cookies["ap_session"])
+    assert set(payload) == {"sid", "tenant_id", "user_id"}
+    [row] = asyncio.run(all_rows(session_store))
+    assert row.user_id == "usr_01J5TEST0000000000000USER1"
 
 
 def test_login_invalid_credentials_returns_401(
@@ -126,6 +147,26 @@ def test_patch_me_updates_display_name(
     patch_calls = [c for c in calls if c[0] == "PATCH" and "/sessions/me" in c[1]]
     assert patch_calls, calls
     assert patch_calls[0][2] == {"display_name": "新名字"}
+
+
+def test_patch_me_drops_the_cached_display_name(
+    client: TestClient, authed_cookie: dict[str, str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a rename, pages naming the caller (an App's author) look the name up again."""
+    from agent_bff.api import _people
+
+    key = ("tnt_01J5TEST00000000000000TNT1", "usr_01J5TEST0000000000000USER1")
+    _people._remember(key, "Old name")
+    _install_patch_me_foundation(
+        monkeypatch, status=200, body={"user_id": key[1], "display_name": "New name"},
+    )
+
+    resp = client.patch(
+        "/api/bff/v1/auth/me", json={"display_name": "New name"}, cookies=authed_cookie,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert _people._cached(key) == (False, None)
 
 
 def test_patch_me_extra_field_dropped_before_upstream(

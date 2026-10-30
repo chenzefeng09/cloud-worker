@@ -4,8 +4,9 @@ Covers:
 1. Login + tenant-admin guard (fail-closed) before any data is touched.
 2. Admin export — the subject's data only, ``X-Actor: ADMIN`` with the
    subject named explicitly, download headers, audit event (counts only).
-3. Admin erase — typed user-id confirmation, subject-only and tenant-bound
-   deletion, partial failure, audit events.
+3. Admin erase — typed user-id confirmation, a preflight that touches nothing,
+   subject-only and tenant-bound deletion (model preferences and Apps
+   included), refusal and partial failure, audit events.
 """
 
 from __future__ import annotations
@@ -24,8 +25,10 @@ from agent_bff.config import Settings
 from tests.privacy_fakes import (
     ADMIN,
     MEMORY_TEXT,
+    NO_ROWS,
     OTHER_TENANT,
     PREFIX,
+    SEEDED,
     TENANT,
     USER_A,
     USER_B,
@@ -43,8 +46,6 @@ from tests.privacy_fakes import (
 MEMBER = USER_A
 EXPORT = f"/admin/privacy/users/{MEMBER}/export"
 ERASE = f"/admin/privacy/users/{MEMBER}/erase"
-NO_ROWS = {"notification_preferences": 0, "api_keys": 0, "privacy_notice_acknowledgements": 0}
-SEEDED = {"notification_preferences": 1, "api_keys": 1, "privacy_notice_acknowledgements": 2}
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -167,7 +168,10 @@ def test_admin_export_returns_only_the_subjects_data(
     assert body["profile"] == {"id": MEMBER, "email": "member@example.com"}
     assert [m["id"] for m in body["memories"]] == ["doc_A1", "doc_A2"]
     assert [j["id"] for j in body["schedules"]] == ["cron_A1", "cron_A2"]
-    assert set(body["preferences"]) == {"notifications"}  # the gateway is caller-only
+    assert body["preferences"]["llm"] == [
+        {"purpose": "llm", "model_id": "model-a", "provider_id": "prov-1"},
+    ]
+    assert [a["id"] for a in body["apps"]["authored"]] == ["app_A1"]
     assert [k["key_prefix"] for k in body["api_keys"]] == [f"ap_{MEMBER[-6:]}"]
     assert [a["notice_version"] for a in body["privacy_acknowledgements"]] == [
         "2026-09.aaaaaaaaaaaa", "2026-10.bbbbbbbbbbbb",
@@ -188,7 +192,14 @@ def test_admin_export_calls_upstreams_as_admin_for_the_subject(
     assert (knowledge.method, knowledge.path) == (
         "GET", f"/internal/privacy/users/{MEMBER}/memories",
     )
-    for call in (orch, knowledge):
+    # The gateway's member routes and app-registry name the subject too.
+    [llm] = fake.calls_to("llm")
+    assert (llm.method, llm.path) == ("GET", f"/users/{MEMBER}/preferences")
+    [apps] = fake.calls_to("apps")
+    assert (apps.method, apps.path, apps.params) == (
+        "GET", "/privacy/apps", {"user_id": MEMBER},
+    )
+    for call in (orch, knowledge, llm, apps):
         assert call.headers["X-Actor"] == "ADMIN"
         assert call.headers["X-User-Id"] == ADMIN
         assert call.headers["X-Tenant-Id"] == TENANT
@@ -197,7 +208,6 @@ def test_admin_export_calls_upstreams_as_admin_for_the_subject(
     assert "X-Actor" not in identity.headers
     [cron] = fake.calls_to("cron")
     assert cron.path == f"/internal/privacy/users/{MEMBER}/cron-jobs"
-    assert fake.calls_to("llm") == []
     assert fake.unexpected == []
 
 
@@ -218,7 +228,8 @@ def test_admin_export_is_audited_with_counts_only(
     assert event["payload"] == {
         "via": "admin_dsar",
         "counts": {
-            "sessions": 1, "workspaces": 1, "memories": 2, "schedules": 2, "api_keys": 1,
+            "sessions": 1, "workspaces": 1, "memories": 2, "schedules": 2,
+            "llm_preferences": 1, "apps": 1, "api_keys": 1,
         },
     }
     assert MEMORY_TEXT not in json.dumps(event)
@@ -274,20 +285,40 @@ def test_admin_erase_deletes_only_the_subjects_data(
     assert body["platform"]["subject_user_id"] == MEMBER
     assert body["memories_deleted"] == 2
     assert body["schedules"] == {"deleted": 2}
-    # The gateway only answers for the calling user: reported, not faked.
-    assert body["llm_preferences"] == {"skipped": "not_supported"}
+    assert body["llm_preferences"] == {"deleted": 1}
+    assert body["apps"] == {
+        "apps_deleted": 1, "apps_deattributed": 0, "versions_deattributed": 0,
+    }
     assert body["bff"] == SEEDED
     assert body["account"] == ADMIN_ACCOUNT_NOTE
 
+    cron_path = f"/internal/privacy/users/{MEMBER}/cron-jobs"
+    memories_path = f"/internal/privacy/users/{MEMBER}/memories"
     assert fake.data_calls() == [
-        ("cron", "DELETE", f"/internal/privacy/users/{MEMBER}/cron-jobs"),
+        # Preflight: nothing changes.
+        ("cron", "GET", cron_path),
         ("orchestrator", "POST", "/privacy/erase"),
-        ("knowledge", "DELETE", f"/internal/privacy/users/{MEMBER}/memories"),
+        ("knowledge", "GET", memories_path),
+        ("llm", "GET", f"/users/{MEMBER}/preferences"),
+        ("apps", "POST", "/privacy/apps/erase"),
+        # The erasure.
+        ("cron", "DELETE", cron_path),
+        ("orchestrator", "POST", "/privacy/erase"),
+        ("knowledge", "DELETE", memories_path),
+        ("llm", "DELETE", f"/users/{MEMBER}/preferences"),
+        ("apps", "POST", "/privacy/apps/erase"),
     ]
-    orch, knowledge = fake.calls_to("orchestrator")[0], fake.calls_to("knowledge")[0]
-    assert orch.json == {"dry_run": False, "user_id": MEMBER}
-    assert knowledge.params == {}
-    for call in (orch, knowledge):
+    assert [c.json for c in fake.calls_to("orchestrator")] == [
+        {"dry_run": True, "user_id": MEMBER}, {"dry_run": False, "user_id": MEMBER},
+    ]
+    assert [c.json for c in fake.calls_to("apps")] == [
+        {"dry_run": True, "user_id": MEMBER}, {"dry_run": False, "user_id": MEMBER},
+    ]
+    assert fake.calls_to("knowledge")[-1].params == {}
+    for call in (
+        *fake.calls_to("orchestrator"), *fake.calls_to("knowledge"),
+        *fake.calls_to("llm"), *fake.calls_to("apps"),
+    ):
         assert call.headers["X-Actor"] == "ADMIN"
         assert call.headers["X-User-Id"] == ADMIN
 
@@ -299,7 +330,10 @@ def test_admin_erase_deletes_only_the_subjects_data(
     assert USER_B in fake.memories
     assert MEMBER not in fake.schedules
     assert USER_B in fake.schedules
-    assert len(fake.llm_preferences[MEMBER]) == 1  # untouched — see llm_preferences above
+    assert MEMBER not in fake.llm_preferences
+    assert USER_B in fake.llm_preferences
+    assert MEMBER not in fake.apps
+    assert USER_B in fake.apps
 
 
 def test_admin_erase_is_audited(
@@ -317,15 +351,18 @@ def test_admin_erase_is_audited(
     assert event["payload"]["via"] == "admin_dsar"
     assert event["payload"]["memories_deleted"] == 2
     assert event["payload"]["schedules_deleted"] == 2
-    assert event["payload"]["succeeded"] == ["schedules", "platform", "memories", "bff"]
-    assert event["payload"]["skipped"] == {"llm_preferences": "not_supported"}
+    assert event["payload"]["succeeded"] == [
+        "schedules", "platform", "memories", "llm_preferences", "apps", "bff",
+    ]
+    assert event["payload"]["llm_preferences_deleted"] == 1
+    assert "skipped" not in event["payload"]
 
 
 def test_admin_erase_partial_failure(
     client: TestClient, db_factory, fake: FakePlatform, admin_cookie: dict[str, str],
 ) -> None:
     seed_rows(client, db_factory, MEMBER)
-    fake.status["knowledge"] = 500
+    fake.write_down.add("knowledge")
 
     resp = client.post(PREFIX + ERASE, json={"confirm": MEMBER}, cookies=admin_cookie)
 
@@ -333,9 +370,33 @@ def test_admin_erase_partial_failure(
     detail = resp.json()["detail"]
     assert detail["succeeded"] == ["schedules", "platform"]
     assert detail["failed"] == "memories"
-    assert detail["not_attempted"] == ["llm_preferences", "bff"]
-    assert "knowledge-ingest returned HTTP 500" in detail["error"]
+    assert detail["not_attempted"] == ["llm_preferences", "apps", "bff"]
+    assert "knowledge-ingest unreachable" in detail["error"]
     assert count_rows(client, db_factory, MEMBER) == SEEDED
     [event] = fake.audit_events
     assert event["outcome"] == "PARTIAL"
     assert event["event_type"] == "admin.privacy.user.erased"
+
+
+@pytest.mark.parametrize("service,step", [
+    ("knowledge", "memories"), ("llm", "llm_preferences"), ("apps", "apps"),
+])
+def test_admin_erase_is_refused_when_a_service_fails_the_preflight(
+    client: TestClient, db_factory, fake: FakePlatform, admin_cookie: dict[str, str],
+    service: str, step: str,
+) -> None:
+    seed_rows(client, db_factory, MEMBER)
+    fake.status[service] = 500
+
+    resp = client.post(PREFIX + ERASE, json={"confirm": MEMBER}, cookies=admin_cookie)
+
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+    assert detail["code"] == "PRIVACY_ERASURE_UNAVAILABLE"
+    assert detail["failed"] == step
+    assert fake.writes() == []
+    assert count_rows(client, db_factory, MEMBER) == SEEDED
+    [event] = fake.audit_events
+    assert event["event_type"] == "admin.privacy.user.erased"
+    assert event["outcome"] == "FAILURE"
+    assert event["payload"] == {"via": "admin_dsar", "phase": "preflight", "failed": step}

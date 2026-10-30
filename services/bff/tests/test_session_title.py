@@ -10,6 +10,13 @@ import httpx
 import pytest
 
 from agent_bff import session_title
+from agent_bff.api.v1 import canvas
+
+
+@pytest.fixture(autouse=True)
+def _clear_vkey_cache() -> None:
+    # The model key is cached per tenant (shared with the canvas endpoints).
+    canvas._vkey_cache.clear()
 
 
 def test_fallback_session_title_is_normalized_and_bounded() -> None:
@@ -43,7 +50,10 @@ class _FakeClient:
         completion_status: int = 200,
         completion_content: str = "航天反作用飞轮 FOC 控制验证",
         renamed_during_generation: bool = False,
+        mint_response: httpx.Response | None = None,
     ) -> None:
+        self.mint_response = mint_response or httpx.Response(201, json={"virtual_key": "vk-eph"})
+        self.completions = 0
         self.completion_status = completion_status
         self.completion_content = completion_content
         self.renamed_during_generation = renamed_during_generation
@@ -70,7 +80,10 @@ class _FakeClient:
         raise AssertionError(f"unexpected GET {url}")
 
     async def post(self, url: str, **_kwargs: Any) -> httpx.Response:
+        if url.endswith("/tenant-keys/ephemeral"):
+            return self.mint_response
         assert url.endswith("/chat/completions")
+        self.completions += 1
         return httpx.Response(
             self.completion_status,
             json={
@@ -84,6 +97,10 @@ class _FakeClient:
         assert "/sessions/" in url
         self.patches.append(kwargs["json"])
         return httpx.Response(200, json={"id": "ses_1", **kwargs["json"]})
+
+
+# What the gateway answers a key mint for a tenant with no enabled LLM provider.
+_NO_PROVIDER = {"code": "FOUNDATION.LLM_GATEWAY.PROVIDER.NOT_FOUND", "status": 404}
 
 
 def _settings() -> SimpleNamespace:
@@ -168,3 +185,32 @@ def test_generate_does_not_overwrite_manual_rename(
     )
 
     assert fake.patches == []
+
+
+def test_generate_keeps_the_fallback_title_when_no_model_is_set_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _FakeClient(
+        mint_response=httpx.Response(404, json=_NO_PROVIDER),
+    )
+    monkeypatch.setattr(
+        session_title.httpx,
+        "AsyncClient",
+        lambda **_kwargs: fake,
+    )
+    message = "设计航天器姿态控制闭环验证"
+
+    asyncio.run(
+        session_title.generate_and_update_session_title(
+            settings=_settings(),
+            session_id="ses_1",
+            message=message,
+            tenant_id="tnt_1",
+            user_id="usr_1",
+            access_token="token",
+            model_hint="deepseek-fast",
+        )
+    )
+
+    assert fake.completions == 0
+    assert fake.patches == [{"title": message}]

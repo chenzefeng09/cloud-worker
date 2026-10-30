@@ -35,8 +35,10 @@ _DEFAULT_PRIVACY_PURPOSES: tuple[PrivacyNoticePurpose, ...] = (
     ),
     PrivacyNoticePurpose(
         purpose=(
-            "Session memory: keep short summaries of past conversations to "
-            "personalise later answers (you can switch this off)"
+            "Memory: when the agent finishes a reply or a task, keep a "
+            "word-for-word excerpt of it (the start of your request and of the "
+            "agent's answer) to give later conversations and tasks context "
+            "(you can switch this off)"
         ),
         legal_basis=(
             "Legitimate interests (GDPR Art. 6(1)(f)); you can object at any "
@@ -187,6 +189,21 @@ class Settings(BaseSettings):
     cookie_max_age: int = 86_400  # 24h
     cookie_secure: bool = False  # True in production (requires HTTPS)
 
+    # ── Server-side web sessions (domain/web_sessions.py) ───────────────────
+    # The cookie only names a session; its Keycloak access + refresh tokens
+    # are kept encrypted in the ``web_sessions`` table and refreshed by the BFF.
+    # Comma-separated Fernet keys: the first encrypts, all decrypt (prepend a
+    # new key to rotate).  Empty → a key derived from ``cookie_secret``; set
+    # explicit keys in production.  Generate one with
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    session_token_keys: str = ""
+    # Refresh the access token once it has less than this many seconds left
+    # (Keycloak issues 300 s tokens).
+    session_refresh_skew_seconds: int = Field(default=60, ge=5)
+    # Read timeout for identity's refresh call; requests waiting on a refresh
+    # wait at most about this long.
+    session_refresh_timeout_seconds: float = Field(default=15.0, gt=0)
+
     cors_origins: str = "http://localhost:5173,http://web:5173"
 
     otel_enabled: bool = True
@@ -205,6 +222,12 @@ class Settings(BaseSettings):
     db_pool_size: int = 5
     db_max_overflow: int = 10
     db_pool_recycle: int = 1800
+    # Log every SQL statement (BFF_SQL_ECHO=true), for a targeted SQL-debugging
+    # session only.  Off by default even in dev: every request reads its web
+    # session, so the echo floods the log pipe the SSE relay also writes to (the
+    # orchestrator stalled on exactly that).  Bound parameters are never logged
+    # either way: they include encrypted session tokens and API key hashes.
+    sql_echo: bool = False
 
     # ── Service-account token ────────────────────────────────────────────────
     # Shared secret used by internal services (cron-runner) to authenticate

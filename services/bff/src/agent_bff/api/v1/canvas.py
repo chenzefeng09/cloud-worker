@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import re
 import time
+import uuid
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -37,10 +38,20 @@ _COMPLETION_TIMEOUT = 300.0
 # tenant-keys / tenant-defaults 这类轻量元数据查询用短超时。
 _META_TIMEOUT = 5.0
 
-# 进程内虚拟密钥缓存：{tenant_id: (virtual_key, expires_ts)}，TTL 300s。
-# 避免每次修订都查一遍 gateway ``/tenant-keys``。
-_VKEY_TTL_SECONDS = 300.0
+# 虚拟密钥：向 gateway 铸造的短期密钥（POST /tenant-keys/ephemeral），存活
+# _VKEY_TTL_SECONDS。进程内按租户复用 —— {tenant_id: (virtual_key, reuse_until)}
+# —— 但只复用到剩余有效期还撑得完一次最长的 completion 为止。
+_VKEY_TTL_SECONDS = 900
+_VKEY_REUSE_SECONDS = _VKEY_TTL_SECONDS - _COMPLETION_TIMEOUT - 60
 _vkey_cache: dict[str, tuple[str, float]] = {}
+
+# gateway 答复“租户没有可用 provider”时的 problem code（与 scheduler 的判定一致）。
+# 旧版 gateway 没有铸造端点时也回 404，但不带这个 code。
+_GATEWAY_NO_PROVIDER = "FOUNDATION.LLM_GATEWAY.PROVIDER.NOT_FOUND"
+
+
+class LlmNotConfiguredError(Exception):
+    """租户没有启用的 LLM provider：任何密钥都路由不到模型，重试也没用。"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -93,6 +104,27 @@ def _problem(status: int, user_message: str, *, code: str, detail: str) -> HTTPE
             "detail": {"code": code, "detail": detail},
             "user_message": user_message,
         },
+    )
+
+
+def _llm_not_configured_problem() -> HTTPException:
+    """租户还没配置模型：管理员能处理，与聊天的 AGENT.RUN.LLM_NOT_CONFIGURED 同义。"""
+    return _problem(
+        422,
+        "No AI model is set up for your organization yet. "
+        "An administrator can add one under Admin → Models.",
+        code="AGENT.BFF.CANVAS.LLM_NOT_CONFIGURED",
+        detail="tenant has no enabled LLM provider",
+    )
+
+
+def _no_virtual_key_problem() -> HTTPException:
+    """铸造与长期密钥都拿不到：gateway 侧故障，稍后重试。"""
+    return _problem(
+        502,
+        "The model service is temporarily unavailable. Please try again later.",
+        code="AGENT.BFF.CANVAS.GATEWAY_UNAVAILABLE",
+        detail="no virtual key could be obtained from llm-gateway",
     )
 
 
@@ -338,8 +370,59 @@ def normalize_selection_replacement(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 虚拟密钥获取（照抄 scheduler _fetch_tenant_virtual_key 范式 + 进程内缓存）
+# 虚拟密钥获取（同 scheduler：先铸造短期密钥，旧 gateway 退回长期密钥；进程内缓存）
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _problem_code(resp: httpx.Response) -> str | None:
+    """RFC 9457 problem body 里的 ``code``，没有则 None。"""
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    code = body.get("code") if isinstance(body, dict) else None
+    return code if isinstance(code, str) else None
+
+
+async def _mint_virtual_key(
+    *,
+    client: httpx.AsyncClient,
+    gateway_url: str,
+    tenant_id: str,
+    access_token: str,
+) -> str | None:
+    """向 gateway 铸造一把短期虚拟密钥（POST /tenant-keys/ephemeral）。
+
+    租户没有可用 provider 时抛 ``LlmNotConfiguredError``；gateway 不支持铸造（旧版
+    404/405）、出错或不可达时返回 None，由调用方退回长期密钥。
+    """
+    url = f"{gateway_url.rstrip('/')}/tenant-keys/ephemeral"
+    headers = foundation_headers(tenant_id, "", access_token)
+    try:
+        resp = await client.post(
+            url,
+            # gateway 把 run_id 记在密钥上（审计 / 撤销）；这里没有 run，给个唯一标签。
+            json={"run_id": f"bff-{uuid.uuid4().hex}", "ttl_seconds": _VKEY_TTL_SECONDS},
+            headers=headers,
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("llm-gateway unreachable while minting a virtual key: %s", exc)
+        return None
+
+    if resp.status_code == 404 and _problem_code(resp) == _GATEWAY_NO_PROVIDER:
+        raise LlmNotConfiguredError
+    if resp.status_code not in (200, 201):
+        logger.warning(
+            "llm-gateway returned HTTP %s for POST /tenant-keys/ephemeral", resp.status_code
+        )
+        return None
+    try:
+        data = resp.json()
+    except ValueError:
+        logger.warning("failed to parse /tenant-keys/ephemeral response")
+        return None
+    val = data.get("virtual_key") if isinstance(data, dict) else None
+    return str(val) if val else None
+
 
 async def _fetch_tenant_virtual_key(
     *,
@@ -348,11 +431,11 @@ async def _fetch_tenant_virtual_key(
     tenant_id: str,
     access_token: str,
 ) -> str | None:
-    """查询 gateway 的租户虚拟密钥（GET /tenant-keys）。
+    """查询 gateway 的租户长期虚拟密钥（GET /tenant-keys），仅作铸造不可用时的退路。
 
     返回第一个 enabled key 的 ``virtual_key``（容忍 ``key`` / ``value`` 别名），
-    拿不到或 gateway 出错则返回 None（由调用方转 problem+json）。
-    照抄 scheduler ``_fetch_tenant_virtual_key`` 的解析范式。
+    拿不到或 gateway 出错则返回 None。照抄 scheduler ``_fetch_tenant_virtual_key``
+    的解析范式。
     """
     url = f"{gateway_url.rstrip('/')}/tenant-keys"
     headers = foundation_headers(tenant_id, "", access_token)
@@ -397,20 +480,32 @@ async def _resolve_virtual_key(
     tenant_id: str,
     access_token: str,
 ) -> str | None:
-    """带进程内缓存（TTL 300s）地拿虚拟密钥。缓存未命中再查 gateway。"""
+    """拿一把能用的虚拟密钥：进程内缓存 → 铸造短期密钥 → 长期密钥（旧 gateway）。
+
+    先铸造，因为在 Admin → Models 里配置的租户只有 provider、没有长期密钥。
+    租户没有可用 provider 时抛 ``LlmNotConfiguredError``（不缓存，管理员一配好就生效）；
+    都拿不到时返回 None（gateway 侧故障）。
+    """
     now = time.monotonic()
     cached = _vkey_cache.get(tenant_id)
     if cached is not None and cached[1] > now:
         return cached[0]
 
-    key = await _fetch_tenant_virtual_key(
+    key = await _mint_virtual_key(
         client=client,
         gateway_url=gateway_url,
         tenant_id=tenant_id,
         access_token=access_token,
     )
+    if not key:
+        key = await _fetch_tenant_virtual_key(
+            client=client,
+            gateway_url=gateway_url,
+            tenant_id=tenant_id,
+            access_token=access_token,
+        )
     if key:
-        _vkey_cache[tenant_id] = (key, now + _VKEY_TTL_SECONDS)
+        _vkey_cache[tenant_id] = (key, now + _VKEY_REUSE_SECONDS)
     return key
 
 
@@ -499,19 +594,17 @@ async def canvas_edit(
 
     async with httpx.AsyncClient(timeout=_META_TIMEOUT) as meta_client:
         # 1. 虚拟密钥（gateway /chat/completions 强制要求 X-LLM-Virtual-Key）。
-        virtual_key = await _resolve_virtual_key(
-            client=meta_client,
-            gateway_url=gateway_url,
-            tenant_id=tenant_id,
-            access_token=access_token,
-        )
-        if not virtual_key:
-            raise _problem(
-                400,
-                "No model key is configured for this tenant. Please ask an administrator to set one up in Model Management.",
-                code="AGENT.BFF.CANVAS.NO_VIRTUAL_KEY",
-                detail="tenant has no enabled virtual key",
+        try:
+            virtual_key = await _resolve_virtual_key(
+                client=meta_client,
+                gateway_url=gateway_url,
+                tenant_id=tenant_id,
+                access_token=access_token,
             )
+        except LlmNotConfiguredError:
+            raise _llm_not_configured_problem() from None
+        if not virtual_key:
+            raise _no_virtual_key_problem()
 
         # 2. 模型：请求传了就用；没传则查租户默认模型；仍无则 4xx。
         model = req.model or None

@@ -2,9 +2,11 @@
 
 ``FakePlatform`` stands in for every upstream the privacy routes talk to —
 authz, session-orchestrator, knowledge-ingest, cron-runner, identity,
-llm-gateway, data-protection and audit — with just enough state to check that an export
-reads, and an erasure deletes, the right person's data.  Every call is
-recorded; ``down`` / ``status`` inject failures per service.
+llm-gateway, app-registry, data-protection and audit — with just enough state
+to check that an export reads, and an erasure deletes, the right person's data.
+Every call is recorded; ``down`` / ``status`` inject failures per service, and
+``write_down`` breaks only a service's writes (an erasure that fails after its
+preflight passed).
 
 ``FakeS3`` stands in for the erasure-ledger bucket (Object Lock: a stored key
 can't be rewritten); ``install_ledger`` points the ledger at it.
@@ -21,7 +23,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -40,6 +42,7 @@ from agent_bff.domain.models import (
     NotificationPreference,
     PrivacyNoticeAcknowledgement,
 )
+from agent_bff.domain.web_sessions import WebSession, hash_session_id
 from agent_bff.main import create_app
 
 PREFIX = "/api/bff/v1"
@@ -57,6 +60,7 @@ KNOWLEDGE_URL = "http://knowledge-test/api/knowledge/v1"
 IDENTITY_URL = "http://identity-test/api/identity/v1"
 LLM_URL = "http://llm-test/api/llm-gateway/v1"
 CRON_URL = "http://cron-test:8013/api/cron/v1"
+APPS_URL = "http://apps-test:8013/api/apps/v1"
 SERVICE_TOKEN = "test-service-token"
 DP_URL = "http://dp-test/api/data-protection/v1"
 AUDIT_URL = "http://audit-test/api/audit/v1"
@@ -68,6 +72,7 @@ SERVICE_URLS: dict[str, str] = {
     "cron": CRON_URL,
     "identity": IDENTITY_URL,
     "llm": LLM_URL,
+    "apps": APPS_URL,
     "data_protection": DP_URL,
     "audit": AUDIT_URL,
 }
@@ -98,6 +103,7 @@ def make_settings(**overrides: Any) -> Settings:
         "knowledge_ingest_url": KNOWLEDGE_URL,
         "foundation_llm_gateway_url": LLM_URL,
         "cron_runner_url": CRON_URL,
+        "app_registry_url": APPS_URL,
         "service_token": SERVICE_TOKEN,
         "foundation_data_protection_url": DP_URL,
         "foundation_audit_url": AUDIT_URL,
@@ -147,6 +153,16 @@ def _schedule(job_id: str, name: str, owner: str) -> dict[str, Any]:
     }
 
 
+def _app(app_id: str, name: str, owner: str) -> dict[str, Any]:
+    return {
+        "id": app_id,
+        "name": name,
+        "author_id": owner,
+        "visibility": "private",
+        "versions": [{"id": f"{app_id}_v1", "system_prompt": "You summarise."}],
+    }
+
+
 def _memory(memory_id: str, title: str, session_id: str) -> dict[str, Any]:
     return {
         "id": memory_id,
@@ -165,6 +181,7 @@ class FakePlatform:
         default_factory=lambda: {"session_retention_days": 90, "trash_grace_days": 30},
     )
     down: set[str] = field(default_factory=set)
+    write_down: set[str] = field(default_factory=set)
     status: dict[str, int] = field(default_factory=dict)
     memories: dict[str, list[dict[str, Any]]] = field(
         default_factory=lambda: {
@@ -190,6 +207,12 @@ class FakePlatform:
             USER_B: [{"purpose": "embedding", "model_id": "embed-b", "provider_id": "prov-1"}],
         },
     )
+    apps: dict[str, list[dict[str, Any]]] = field(
+        default_factory=lambda: {
+            USER_A: [_app("app_A1", "Report summariser", USER_A)],
+            USER_B: [_app("app_B1", "Standup helper", USER_B)],
+        },
+    )
     calls: list[Call] = field(default_factory=list)
     audit_events: list[dict[str, Any]] = field(default_factory=list)
     consents: list[dict[str, Any]] = field(default_factory=list)
@@ -199,6 +222,23 @@ class FakePlatform:
 
     def calls_to(self, service: str) -> list[Call]:
         return [c for c in self.calls if c.service == service]
+
+    @staticmethod
+    def is_write(call: Call) -> bool:
+        """A call that changes data: not a read, not a dry run."""
+        if call.method in {"DELETE", "PUT", "PATCH"}:
+            return True
+        if call.method == "POST" and call.path.endswith("/erase"):
+            return not (call.json or {}).get("dry_run", False)
+        return False
+
+    def writes(self) -> list[tuple[str, str, str]]:
+        """(service, method, path) of every data-changing call except audit."""
+        return [
+            (c.service, c.method, c.path)
+            for c in self.calls
+            if c.service not in {"authz", "audit"} and self.is_write(c)
+        ]
 
     def data_calls(self) -> list[tuple[str, str, str]]:
         """(service, method, path) of every call except authz + audit."""
@@ -224,7 +264,7 @@ class FakePlatform:
             json=kw.get("json"),
         )
         self.calls.append(call)
-        if service in self.down:
+        if service in self.down or (service in self.write_down and self.is_write(call)):
             raise httpx.ConnectError(f"{service} is down")
         if service in self.status:
             code = self.status[service]
@@ -332,6 +372,18 @@ class FakePlatform:
 
     def _llm(self, call: Call) -> httpx.Response | None:
         caller = call.headers.get("X-User-Id", "")
+        member = re.fullmatch(r"/users/([^/]+)/preferences", call.path)
+        if member:
+            if call.headers.get("X-Actor") not in {"ADMIN", "SERVICE"}:
+                return httpx.Response(403, json={"code": "PERMISSION_DENIED"})
+            if call.method == "GET":
+                return httpx.Response(
+                    200, json={"items": list(self.llm_preferences.get(member[1], []))},
+                )
+            if call.method == "DELETE":
+                deleted = len(self.llm_preferences.pop(member[1], []))
+                return httpx.Response(200, json={"deleted": deleted})
+            return None
         if (call.method, call.path) == ("GET", "/user-preferences"):
             return httpx.Response(200, json={"items": list(self.llm_preferences.get(caller, []))})
         one = re.fullmatch(r"/user-preferences/([^/]+)", call.path)
@@ -343,6 +395,34 @@ class FakePlatform:
                     return httpx.Response(204)
             return httpx.Response(404, json={"detail": "preference not found"})
         return None
+
+    def _apps(self, call: Call) -> httpx.Response | None:
+        caller = call.headers.get("X-User-Id", "")
+        admin = call.headers.get("X-Actor") == "ADMIN"
+        if (call.method, call.path) == ("GET", "/privacy/apps"):
+            named = call.params.get("user_id")
+        elif (call.method, call.path) == ("POST", "/privacy/apps/erase"):
+            named = (call.json or {}).get("user_id")
+        else:
+            return None
+        if named and named != caller and not admin:
+            return httpx.Response(403, json={"code": "APP.PRIVACY.FORBIDDEN"})
+        subject = named or caller
+        if call.method == "GET":
+            return httpx.Response(200, json={
+                "subject_user_id": subject,
+                "apps": list(self.apps.get(subject, [])),
+                "review_trail": [],
+            })
+        dry_run = bool((call.json or {}).get("dry_run", False))
+        owned = self.apps.get(subject, []) if dry_run else self.apps.pop(subject, [])
+        return httpx.Response(200, json={
+            "subject_user_id": subject,
+            "dry_run": dry_run,
+            "deleted": {
+                "apps_deleted": len(owned), "apps_deattributed": 0, "versions_deattributed": 0,
+            },
+        })
 
     def _data_protection(self, call: Call) -> httpx.Response | None:
         if (call.method, call.path) == ("POST", "/consent"):
@@ -554,7 +634,8 @@ def seed_rows(
     ack_versions: tuple[str, ...] = ("2026-09.aaaaaaaaaaaa", "2026-10.bbbbbbbbbbbb"),
     event_key: str = "task_completed",
 ) -> str:
-    """One notification preference, one API key and ``ack_versions`` for a user.
+    """One notification preference, one API key, ``ack_versions`` and the two
+    sign-ins ``web_session_ids`` names, for a user.
 
     Returns the API key's stored hash, so tests can check it never leaks.
     """
@@ -573,9 +654,29 @@ def seed_rows(
             session.add(PrivacyNoticeAcknowledgement(
                 tenant_id=tenant_id, user_id=user_id, notice_version=version,
             ))
+        now = datetime.now(UTC)
+        for row_id in web_session_ids(user_id, tenant_id=tenant_id):
+            session.add(WebSession(
+                id=row_id, tenant_id=tenant_id, user_id=user_id,
+                access_token_enc=WEB_SESSION_TOKEN_ENC,
+                access_expires_at=now + timedelta(minutes=5),
+                refresh_token_enc=WEB_SESSION_TOKEN_ENC, clearance="L3",
+                created_at=now, expires_at=now + timedelta(hours=8),
+            ))
 
     run_db(client, factory, _seed)
     return key_hash
+
+
+# What ``seed_rows`` stores as the encrypted tokens: an export must never carry it.
+WEB_SESSION_TOKEN_ENC = "gAAAAA-encrypted-token-for-tests"
+
+
+def web_session_ids(user_id: str, *, tenant_id: str = TENANT) -> tuple[str, str]:
+    """``web_sessions.id`` of the two sign-ins ``seed_rows`` creates for a user."""
+    return tuple(  # type: ignore[return-value]
+        hash_session_id(f"{tenant_id}:{user_id}:browser-{n}") for n in (1, 2)
+    )
 
 
 def count_rows(
@@ -587,7 +688,7 @@ def count_rows(
 ) -> dict[str, int]:
     async def _count(session: AsyncSession) -> dict[str, int]:
         counts: dict[str, int] = {}
-        for model in (NotificationPreference, ApiKey, PrivacyNoticeAcknowledgement):
+        for model in (NotificationPreference, ApiKey, PrivacyNoticeAcknowledgement, WebSession):
             counts[model.__tablename__] = (
                 await session.execute(
                     select(func.count())
@@ -598,3 +699,13 @@ def count_rows(
         return counts
 
     return run_db(client, factory, _count)
+
+
+# ``count_rows`` for a user ``seed_rows`` seeded with its defaults, and once all
+# of it is gone.  Kept beside the seeding so a new per-user table updates every
+# privacy test at once.
+SEEDED = {
+    "notification_preferences": 1, "api_keys": 1, "privacy_notice_acknowledgements": 2,
+    "web_sessions": 2,
+}
+NO_ROWS = dict.fromkeys(SEEDED, 0)

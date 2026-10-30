@@ -24,9 +24,9 @@ Upstream paths (foundation-authz REST mirror):
     PATCH  /roles/{role_id}       → Role          (merge-patch semantics)
     DELETE /roles/{role_id}       → 204
     GET    /permissions           → bare array of Permission (filter.service)
-    GET    /bindings              → list (CursorPage)
+    GET    /bindings              → list (CursorPage; ACTIVE only unless filter.status)
     POST   /bindings              → create (201, RoleBinding)
-    DELETE /bindings/{binding_id} → 204
+    DELETE /bindings/{binding_id} → 204           (soft revoke)
 """
 
 from __future__ import annotations
@@ -237,7 +237,8 @@ def _pick(body: dict, allowed: tuple[str, ...]) -> dict:
 # principal_kind / principal_id / grant_reason / scope_id (+ scope_kind).
 # Upstream's request model is ``extra="forbid"``, so passing the front-end body
 # through verbatim yields a 422 on every create.  These two pure helpers
-# translate request (front-end → upstream) and response (upstream → front-end).
+# translate request (front-end → upstream) and response (upstream → front-end);
+# ``_binding_list_params`` does the same for the list endpoint's filters.
 
 # request direction: front-end key → upstream key
 _BINDING_IN_MAP = {
@@ -262,8 +263,19 @@ _BINDING_OUT_PASSTHROUGH = (
     "granted_at",
     "expires_at",
     "scope_kind",
+    # lifecycle: status is ACTIVE / EXPIRED / REVOKED (revocation wins).
+    "status",
     "revoked_at",
+    "revoked_by",
+    "revoked_reason",
 )
+# list-filter direction: front-end query key → upstream query key.  Upstream
+# silently ignores filters it doesn't know, so an untranslated
+# ``filter.subject_id`` would list every binding instead of the subject's.
+_BINDING_FILTER_MAP = {
+    "filter.subject_type": "filter.principal_kind",
+    "filter.subject_id": "filter.principal_id",
+}
 
 
 def _binding_in(body: dict) -> dict:
@@ -307,8 +319,9 @@ def _binding_out(item: dict) -> dict:
 
     Tolerant of missing upstream keys (never raises).  Guarantees the keys the
     front-end ``RoleBinding`` type consumes — subject_type / subject_id /
-    reason / scope_resource_id — are mapped when present; harmless upstream
-    extras (scope_kind / revoked_at) are preserved.
+    reason / scope_resource_id — are mapped when present; scope_kind and the
+    lifecycle fields (status / revoked_at / revoked_by / revoked_reason) are
+    preserved.
     """
     if not isinstance(item, dict):
         return item
@@ -320,6 +333,27 @@ def _binding_out(item: dict) -> dict:
         if key in item:
             out[key] = item[key]
     return out
+
+
+def _binding_list_params(request: Request) -> dict[str, str]:
+    """Translate the front-end list-bindings query to the upstream one.
+
+    ``filter.subject_type`` / ``filter.subject_id`` become upstream's
+    ``filter.principal_kind`` / ``filter.principal_id``; ``filter.role_id``,
+    ``cursor`` and ``limit`` keep their names.  ``filter.status`` is upstream's
+    comma-separated lifecycle filter (absent → ACTIVE only); a repeated
+    ``filter.status`` is folded into that form instead of keeping only its last
+    value.  Values are not validated here — upstream 422s on anything outside
+    ACTIVE / EXPIRED / REVOKED and ``_raise_for_upstream`` surfaces it.
+    """
+    params = _params(request)
+    for fe_key, up_key in _BINDING_FILTER_MAP.items():
+        if fe_key in params:
+            params[up_key] = params.pop(fe_key)
+    statuses = request.query_params.getlist("filter.status")
+    if statuses:
+        params["filter.status"] = ",".join(statuses)
+    return params
 
 
 def _connect_502(exc: httpx.HTTPError) -> HTTPException:
@@ -472,7 +506,7 @@ async def list_bindings(
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.get(
                 f"{settings.authz_url}/bindings",
-                params=_params(request), headers=_headers(request, _auth),
+                params=_binding_list_params(request), headers=_headers(request, _auth),
             )
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         raise _connect_502(exc) from exc

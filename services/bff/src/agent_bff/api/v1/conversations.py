@@ -93,24 +93,70 @@ async def _resolve_attachment_files(
         return []
 
 
-class TurnError(Exception):
-    """An upstream step of :func:`start_turn` failed.
+# What the user is told when the orchestrator refuses to start a turn, by its
+# status.  The orchestrator's own wording is for operators (it names internal
+# ids and upstream services), so it goes to the log instead.  Nothing of the
+# turn was saved, so the send can always be retried.
+_TURN_REFUSALS: dict[int, str] = {
+    403: "You don't have permission to send messages in this conversation.",
+    404: "This conversation no longer exists.",
+    409: (
+        "A run is already in progress in this conversation. "
+        "Wait for it to finish or stop it, then send your message again."
+    ),
+    422: "Your message could not be sent because the request was not valid.",
+}
+_TURN_UNAVAILABLE = (
+    "The agent could not be started, so your message was not sent. "
+    "Please try again in a moment."
+)
+# Refusals whose orchestrator ``user_message`` is written for the user and says
+# what to do: no model set up for the tenant, its run quota used up.  Retrying
+# does not help with either, so the status-based wording would mislead.
+_USER_ACTIONABLE_REFUSALS = frozenset({
+    "AGENT.RUN.LLM_NOT_CONFIGURED",
+    "AGENT.RUN.QUOTA_EXCEEDED",
+})
 
-    ``message`` is the persisted user message when the failure happened after
-    it was saved (the caller may still want to act on it, e.g. auto-naming).
+
+class TurnError(Exception):
+    """The orchestrator refused to start a turn; nothing of it was saved.
+
+    The turn's user message is written together with its run, so a refused
+    turn leaves no trace.  ``detail`` is meant for the user as is;
+    ``status_code`` is the orchestrator's (409: another run is live).
     """
 
-    def __init__(self, status_code: int, detail: str, *, message: dict | None = None) -> None:
+    def __init__(self, status_code: int, detail: str, *, code: str | None = None) -> None:
         super().__init__(detail)
         self.status_code = status_code if status_code < 600 else 502
         self.detail = detail
-        self.message = message
+        self.code = code
+
+    @classmethod
+    def from_response(cls, resp: httpx.Response) -> TurnError:
+        problem: Any = None
+        with contextlib.suppress(ValueError):
+            problem = resp.json()
+        if not isinstance(problem, dict):
+            problem = {}
+        code = problem.get("code")
+        logger.warning(
+            "run start refused: HTTP %s %s %s",
+            resp.status_code, code or "-", problem.get("detail"),
+        )
+        user_message = problem.get("user_message")
+        if code in _USER_ACTIONABLE_REFUSALS and isinstance(user_message, str) and user_message:
+            detail = user_message
+        else:
+            detail = _TURN_REFUSALS.get(resp.status_code, _TURN_UNAVAILABLE)
+        return cls(resp.status_code, detail, code=code if isinstance(code, str) else None)
 
     def response(self) -> JSONResponse:
-        return JSONResponse(
-            status_code=self.status_code,
-            content={"detail": self.detail, "status": self.status_code},
-        )
+        content: dict[str, Any] = {"detail": self.detail, "status": self.status_code}
+        if self.code:
+            content["code"] = self.code
+        return JSONResponse(status_code=self.status_code, content=content)
 
 
 async def start_turn(
@@ -126,7 +172,7 @@ async def start_turn(
     run_options: dict[str, Any],
     persist_message: bool = True,
 ) -> tuple[dict | None, dict]:
-    """Persist the user turn (optional) and start a sandbox run for it.
+    """Start a sandbox run for a user turn.
 
     Shared by the chat endpoint and the task board (create / retry).
     ``run_options`` holds the presence-carried run knobs (``skills``,
@@ -134,23 +180,16 @@ async def start_turn(
     ``hitl``): a key is forwarded only when the caller expressed a choice, so
     "omitted → defaults" and "explicit [] → none" stay distinguishable.
 
-    ``persist_message=False`` re-runs an already-persisted user message (task
-    retry); the orchestrator's history assembly drops that row as this turn's
-    input, exactly as it does for a freshly persisted one.
+    The user message rides in the run request and the orchestrator writes it
+    in the run's transaction: if the run is refused (another one is live) or
+    cannot start, no unanswered message is left in the transcript.
+    ``persist_message=False`` re-runs a user message already in the transcript
+    (task retry); the orchestrator's history assembly drops that row as this
+    turn's input.
 
-    Returns ``(message, run)``; raises :class:`TurnError` on upstream failure.
+    Returns ``(message, run)`` (``message`` is ``None`` when none was written);
+    raises :class:`TurnError` when the orchestrator refuses the run.
     """
-    message: dict | None = None
-    if persist_message:
-        resp = await client.post(
-            f"{orch_url}/sessions/{session_id}/messages",
-            json={"role": "USER", "content": message_text, "attachment_ids": attachment_ids},
-            headers=headers,
-        )
-        if resp.status_code >= 400:
-            raise TurnError(resp.status_code, "Failed to save message")
-        message = resp.json()
-
     files = await _resolve_attachment_files(
         client=client,
         orch_url=orch_url,
@@ -165,14 +204,18 @@ async def start_turn(
         "reasoning_effort": reasoning_effort,
         **run_options,
     }
+    if persist_message:
+        run_body["message"] = {"content": message_text, "attachment_ids": attachment_ids}
     resp = await client.post(
         f"{orch_url}/sessions/{session_id}/runs",
         json=run_body,
         headers=headers,
     )
     if resp.status_code >= 400:
-        raise TurnError(resp.status_code, "Failed to start run", message=message)
-    return message, resp.json()
+        raise TurnError.from_response(resp)
+    run = resp.json()
+    message = run.pop("message", None)
+    return message, run
 
 
 def schedule_auto_title(
@@ -215,7 +258,7 @@ async def chat(
     _auth: tuple = Depends(require_auth()),
     clearance: str = TClearance,
 ) -> JSONResponse:
-    """Persist user message, trigger run, return run_id + message_id.
+    """Start a run for the user's message (saved with it); return run_id + message_id.
 
     Body fields:
     * ``message``            — required, user text
@@ -236,7 +279,9 @@ async def chat(
     * ``reasoning_effort``   — optional reasoning effort string
 
     Returns JSON ``{"run_id": "...", "message_id": "...", "run": {...}}``.
-    On upstream failure returns a JSON error with the upstream status code.
+    When the run does not start, nothing was saved: the response carries the
+    orchestrator's status (409 while another run is live) and a ``detail``
+    written for the user.
     """
     tenant_id, user_id, access_token = _auth
     orch_url = request.app.state.settings.session_orchestrator_url
@@ -289,12 +334,6 @@ async def chat(
                 run_options=run_options,
             )
         except TurnError as exc:
-            # The message may have been saved before the run failed to start;
-            # it still names the session.
-            schedule_auto_title(
-                background_tasks, request, message=exc.message, message_text=message_text,
-                session_id=session_id, auth=_auth, clearance=clearance, model_hint=model,
-            )
             return exc.response()
 
     schedule_auto_title(

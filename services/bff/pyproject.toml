@@ -17,6 +17,9 @@ opentelemetry-sdk = "^1.28.0"
 opentelemetry-instrumentation-fastapi = "^0.49b0"
 opentelemetry-exporter-otlp = "^1.28.0"
 python-jose = { extras = ["cryptography"], version = "^3.3.0" }
+# web_sessions encrypts identity tokens with Fernet (domain/web_sessions.py).
+# python-jose's extra pulls it in as well, but a direct import is a direct dep.
+cryptography = ">=42"
 # CookieSigner + identity SDK
 itsdangerous = "^2.2.0"
 # BFF-local DB — notification preferences + api_keys (domain/db.py, alembic/)

@@ -182,7 +182,11 @@ async def create_task(
             _raise_for(resp, "Failed to create the task")
             session_id = resp.json()["id"]
 
-        patch: dict[str, Any] = {"task": {"instructions": instructions, "options": options}}
+        patch: dict[str, Any] = {"task": {
+            "instructions": instructions,
+            "options": options,
+            "attachment_ids": body.attachment_ids,
+        }}
         if title:
             patch["title"] = title
         resp = await client.patch(f"{orch_url}/sessions/{session_id}", json=patch,
@@ -269,7 +273,18 @@ async def retry_task(
         turn = await _locate_turn(
             client, orch_url=orch_url, headers=headers, session_id=task_id, task_text=task_text,
         )
-        attachment_ids, rewind_from = turn if turn is not None else ([], None)
+        if turn is not None:
+            attachment_ids, rewind_from = turn
+        else:
+            # The turn is not in the transcript: the first run never started
+            # (its message is written with the run), or it was rewound by hand.
+            # The instructions keep the files they were created with.
+            rewind_from = None
+            attachment_ids = (
+                _stored_attachment_ids(spec)
+                if task_text.strip() == str(spec.get("instructions") or "").strip()
+                else []
+            )
         if rewind_from is not None:
             resp = await client.delete(
                 f"{orch_url}/sessions/{task_id}/messages",
@@ -292,8 +307,8 @@ async def retry_task(
                 reasoning_effort=merged.get("reasoning_effort"),
                 run_options=options,
                 # Re-run the user turn already in the transcript; only when it
-                # is gone (rewound by hand, or a first run whose message never
-                # saved) is it persisted again.
+                # is gone (rewound by hand, or a first run that never started)
+                # is it written again, with the run.
                 persist_message=turn is None,
             )
         except TurnError as exc:
@@ -329,6 +344,11 @@ async def _list_messages(
         if not cursor:
             break
     return sorted(items, key=lambda m: int(m.get("sequence") or 0))
+
+
+def _stored_attachment_ids(spec: dict[str, Any]) -> list[str]:
+    raw = spec.get("attachment_ids")
+    return [a for a in raw if isinstance(a, str)] if isinstance(raw, list) else []
 
 
 async def _locate_turn(

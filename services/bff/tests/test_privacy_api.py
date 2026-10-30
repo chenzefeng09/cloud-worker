@@ -2,12 +2,14 @@
 
 Covers:
 1. Every route requires the session cookie and reaches no upstream without it.
-2. Export — every source included, API-key hashes never exported, the
-   download headers, required vs best-effort sources.
-3. Erasure — typed confirmation, step order (schedules → orchestrator →
-   memories → LLM preferences → BFF rows), other users untouched, 502 naming
-   finished steps on partial failure, safe re-run, skipped steps reported as
-   skipped, audit events that pass foundation-audit validation.
+2. Export — every source included (every one required), API-key hashes never
+   exported, the download headers.
+3. Erasure — typed confirmation, a preflight that touches nothing and refuses
+   the erasure (503) when any service fails it, step order (schedules →
+   orchestrator → memories → LLM preferences → Apps → BFF rows), other users
+   untouched, 502 naming finished steps on a failure after the preflight, safe
+   re-run, skipped steps reported as skipped, audit events that pass
+   foundation-audit validation.
 4. Privacy settings + memories proxies.
 5. Privacy notice — shape, content-hash version, env-driven settings,
    retention / memory fail-soft.
@@ -26,17 +28,22 @@ import httpx
 import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_bff.api.v1 import privacy as privacy_module
 from agent_bff.config import PrivacyNoticePurpose, Settings
+from agent_bff.domain.web_sessions import WebSession
 from tests.privacy_fakes import (
     MEMORY_TEXT,
+    NO_ROWS,
     PREFIX,
+    SEEDED,
     SERVICE_TOKEN,
     TENANT,
     USER_A,
     USER_B,
+    WEB_SESSION_TOKEN_ENC,
     FakePlatform,
     app_client,
     assert_valid_audit_event,
@@ -44,13 +51,13 @@ from tests.privacy_fakes import (
     install_fake,
     make_cookie,
     make_settings,
+    run_db,
     seed_rows,
     sqlite_factory,
+    web_session_ids,
 )
 
 CONFIRM = {"confirm": "DELETE MY DATA"}
-NO_ROWS = {"notification_preferences": 0, "api_keys": 0, "privacy_notice_acknowledgements": 0}
-SEEDED = {"notification_preferences": 1, "api_keys": 1, "privacy_notice_acknowledgements": 2}
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -142,8 +149,8 @@ def test_export_contains_every_source(
 
     body = resp.json()
     assert set(body) == {
-        "generated_at", "profile", "platform", "memories", "schedules", "preferences",
-        "api_keys", "privacy_acknowledgements",
+        "generated_at", "profile", "platform", "memories", "schedules", "apps",
+        "preferences", "api_keys", "privacy_acknowledgements", "sign_in_sessions",
     }
     assert datetime.fromisoformat(body["generated_at"]).tzinfo is not None
     assert body["profile"]["email"] == "ada@example.com"
@@ -152,9 +159,12 @@ def test_export_contains_every_source(
     assert [m["id"] for m in body["memories"]] == ["doc_A1", "doc_A2"]
     assert [j["id"] for j in body["schedules"]] == ["cron_A1", "cron_A2"]
     assert body["schedules"][0]["input_values"] == {"text": {"topic": "quarterly numbers"}}
-    assert body["preferences"]["llm"] == {
-        "items": [{"purpose": "llm", "model_id": "model-a", "provider_id": "prov-1"}],
-    }
+    assert body["preferences"]["llm"] == [
+        {"purpose": "llm", "model_id": "model-a", "provider_id": "prov-1"},
+    ]
+    assert [a["id"] for a in body["apps"]["authored"]] == ["app_A1"]
+    assert body["apps"]["authored"][0]["versions"][0]["system_prompt"] == "You summarise."
+    assert body["apps"]["review_trail"] == []
     [pref] = body["preferences"]["notifications"]
     assert pref["event_key"] == "task_completed"
     assert pref["email_enabled"] is False
@@ -170,6 +180,17 @@ def test_export_contains_every_source(
     versions = [a["notice_version"] for a in body["privacy_acknowledgements"]]
     assert versions == ["2026-09.aaaaaaaaaaaa", "2026-10.bbbbbbbbbbbb"]
 
+    # Sign-ins: when, never the session ids or the stored tokens.
+    assert len(body["sign_in_sessions"]) == 2
+    for sign_in in body["sign_in_sessions"]:
+        assert set(sign_in) == {"created_at", "refreshed_at", "expires_at"}
+        assert datetime.fromisoformat(sign_in["expires_at"]) > datetime.fromisoformat(
+            sign_in["created_at"]
+        )
+    for row_id in web_session_ids(USER_A):
+        assert row_id not in resp.text
+    assert WEB_SESSION_TOKEN_ENC not in resp.text
+
     # Nothing of user B's.
     assert USER_B not in resp.text
     assert f"ap_{USER_B[-6:]}" not in resp.text
@@ -184,7 +205,11 @@ def test_export_calls_upstreams_as_the_caller(
     assert (orch.method, orch.path, orch.params) == ("GET", "/privacy/export", {})
     [knowledge] = fake.calls_to("knowledge")
     assert (knowledge.method, knowledge.path) == ("GET", "/memories")
-    for call in (orch, knowledge):
+    [llm] = fake.calls_to("llm")
+    assert (llm.method, llm.path) == ("GET", "/user-preferences")
+    [apps] = fake.calls_to("apps")
+    assert (apps.method, apps.path, apps.params) == ("GET", "/privacy/apps", {})
+    for call in (orch, knowledge, llm, apps):
         assert call.headers["X-User-Id"] == USER_A
         assert call.headers["X-Tenant-Id"] == TENANT
         assert call.headers["Authorization"] == "Bearer fake-jwt"
@@ -207,6 +232,14 @@ def test_export_calls_upstreams_as_the_caller(
         ("knowledge", 503, "knowledge-ingest"),
         ("cron", "down", "cron-runner"),
         ("cron", 500, "cron-runner"),
+        # The profile and the model preferences are part of what is held too:
+        # an export without them would misstate it (an expired token, say).
+        ("identity", 401, "identity"),
+        ("identity", "down", "identity"),
+        ("llm", "down", "llm-gateway"),
+        ("llm", 500, "llm-gateway"),
+        ("apps", "down", "app-registry"),
+        ("apps", 403, "app-registry"),
     ],
 )
 def test_export_fails_when_a_required_source_is_unavailable(
@@ -243,20 +276,6 @@ def test_export_rejects_an_unusable_memory_listing(
     resp = client.get(PREFIX + "/me/privacy/export", cookies=cookie_a)
     assert resp.status_code == 502
     assert resp.json()["detail"]["service"] == "knowledge-ingest"
-
-
-def test_export_degrades_optional_sources_to_null(
-    client: TestClient, db_factory, fake: FakePlatform, cookie_a: dict[str, str],
-) -> None:
-    fake.down.update({"identity", "llm"})
-
-    resp = client.get(PREFIX + "/me/privacy/export", cookies=cookie_a)
-
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["profile"] is None
-    assert body["preferences"]["llm"] is None
-    assert len(body["memories"]) == 2
 
 
 @pytest.mark.parametrize("override", [{"service_token": ""}, {"cron_runner_url": ""}])
@@ -328,24 +347,39 @@ def test_erase_runs_every_step_in_order(
         },
         "memories_deleted": 2,
         "llm_preferences": {"deleted": 1},
+        "apps": {"apps_deleted": 1, "apps_deattributed": 0, "versions_deattributed": 0},
         "bff": SEEDED,
         "account": "Your sign-in account itself is closed by your administrator.",
     }
+    cron_path = f"/internal/privacy/users/{USER_A}/cron-jobs"
     assert fake.data_calls() == [
-        ("cron", "DELETE", f"/internal/privacy/users/{USER_A}/cron-jobs"),
+        # Preflight: every service is asked first, and nothing changes.
+        ("cron", "GET", cron_path),
+        ("orchestrator", "POST", "/privacy/erase"),
+        ("knowledge", "GET", "/memories"),
+        ("llm", "GET", "/user-preferences"),
+        ("apps", "POST", "/privacy/apps/erase"),
+        # The erasure itself, in order.
+        ("cron", "DELETE", cron_path),
         ("orchestrator", "POST", "/privacy/erase"),
         ("knowledge", "DELETE", "/memories"),
         ("llm", "GET", "/user-preferences"),
         ("llm", "DELETE", "/user-preferences/llm"),
+        ("apps", "POST", "/privacy/apps/erase"),
     ]
-    orch, knowledge = fake.calls_to("orchestrator")[0], fake.calls_to("knowledge")[0]
-    assert orch.json == {"dry_run": False}
+    assert [c.json for c in fake.calls_to("orchestrator")] == [
+        {"dry_run": True}, {"dry_run": False},
+    ]
+    assert [c.json for c in fake.calls_to("apps")] == [{"dry_run": True}, {"dry_run": False}]
+    knowledge = fake.calls_to("knowledge")[-1]
     assert knowledge.params == {"all": "true"}
-    for call in (orch, knowledge, *fake.calls_to("llm")):
+    for call in (
+        *fake.calls_to("orchestrator"), knowledge, *fake.calls_to("llm"), *fake.calls_to("apps"),
+    ):
         assert call.headers["X-User-Id"] == USER_A
         assert "X-Actor" not in call.headers
-    [cron] = fake.calls_to("cron")
-    assert cron.headers == {"X-Service-Token": SERVICE_TOKEN, "X-Tenant-Id": TENANT}
+    for cron in fake.calls_to("cron"):
+        assert cron.headers == {"X-Service-Token": SERVICE_TOKEN, "X-Tenant-Id": TENANT}
 
     assert count_rows(client, db_factory, USER_A) == NO_ROWS
     assert count_rows(client, db_factory, USER_B) == SEEDED
@@ -355,6 +389,34 @@ def test_erase_runs_every_step_in_order(
     assert [j["id"] for j in fake.schedules[USER_B]] == ["cron_B1"]
     assert fake.llm_preferences[USER_A] == []
     assert len(fake.llm_preferences[USER_B]) == 1
+    assert USER_A not in fake.apps
+    assert [a["id"] for a in fake.apps[USER_B]] == ["app_B1"]
+
+
+def test_erase_keeps_the_sign_in_the_request_came_from(
+    client: TestClient,
+    db_factory,
+    fake: FakePlatform,
+    cookie_a: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The account stays open, so the browser showing the result stays signed
+    in; the user's other sign-ins end."""
+    seed_rows(client, db_factory, USER_A)
+    current, other = web_session_ids(USER_A)
+    monkeypatch.setattr(privacy_module, "get_web_session_id", lambda: current)
+
+    resp = client.post(PREFIX + "/me/privacy/erase", json=CONFIRM, cookies=cookie_a)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["bff"]["web_sessions"] == 1
+    assert count_rows(client, db_factory, USER_A) == {**NO_ROWS, "web_sessions": 1}
+
+    async def _ids(session: AsyncSession) -> list[str]:
+        return list((await session.execute(select(WebSession.id))).scalars())
+
+    assert run_db(client, db_factory, _ids) == [current]
+    assert other != current
 
 
 def test_erase_emits_an_audit_event_with_counts_only(
@@ -377,12 +439,13 @@ def test_erase_emits_an_audit_event_with_counts_only(
         "via": "self_service",
         # No ledger bucket configured: erased, but a backup restore can't replay it.
         "ledger": "not_configured",
-        "succeeded": ["schedules", "platform", "memories", "llm_preferences", "bff"],
+        "succeeded": ["schedules", "platform", "memories", "llm_preferences", "apps", "bff"],
         "schedules_deleted": 2,
         "platform_deleted": {"sessions": 2, "messages": 7, "workspaces": 1},
         "runs_cancelled": 1,
         "memories_deleted": 2,
         "llm_preferences_deleted": 1,
+        "apps": {"apps_deleted": 1, "apps_deattributed": 0, "versions_deattributed": 0},
         "bff": SEEDED,
     }
     assert MEMORY_TEXT not in json.dumps(event)
@@ -392,7 +455,8 @@ def test_erase_partial_failure_names_finished_steps_and_can_be_retried(
     client: TestClient, db_factory, fake: FakePlatform, cookie_a: dict[str, str],
 ) -> None:
     seed_rows(client, db_factory, USER_A)
-    fake.down.add("knowledge")
+    # knowledge-ingest passes the preflight, then fails the deletion itself.
+    fake.write_down.add("knowledge")
 
     resp = client.post(PREFIX + "/me/privacy/erase", json=CONFIRM, cookies=cookie_a)
 
@@ -403,7 +467,7 @@ def test_erase_partial_failure_names_finished_steps_and_can_be_retried(
     assert detail["succeeded"] == ["schedules", "platform"]
     assert detail["skipped"] == {}
     assert detail["failed"] == "memories"
-    assert detail["not_attempted"] == ["llm_preferences", "bff"]
+    assert detail["not_attempted"] == ["llm_preferences", "apps", "bff"]
     assert "knowledge-ingest unreachable" in detail["error"]
     assert detail["results"]["platform"]["runs_cancelled"] == 1
     assert count_rows(client, db_factory, USER_A) == SEEDED  # BFF step never ran
@@ -412,14 +476,16 @@ def test_erase_partial_failure_names_finished_steps_and_can_be_retried(
     assert event["payload"]["failed"] == "memories"
 
     # Every step is idempotent: once knowledge-ingest is back, re-running finishes.
-    fake.down.clear()
+    fake.write_down.clear()
     retry = client.post(PREFIX + "/me/privacy/erase", json=CONFIRM, cookies=cookie_a)
 
     assert retry.status_code == 200, retry.text
     assert retry.json()["memories_deleted"] == 2
     assert retry.json()["schedules"] == {"deleted": 0}  # already gone: idempotent
     assert count_rows(client, db_factory, USER_A) == NO_ROWS
-    assert len(fake.calls_to("orchestrator")) == 2
+    assert [c.json for c in fake.calls_to("orchestrator")] == [
+        {"dry_run": True}, {"dry_run": False}, {"dry_run": True}, {"dry_run": False},
+    ]
     assert fake.audit_events[-1]["outcome"] == "SUCCESS"
 
 
@@ -427,7 +493,7 @@ def test_erase_stops_when_the_platform_step_fails(
     client: TestClient, db_factory, fake: FakePlatform, cookie_a: dict[str, str],
 ) -> None:
     seed_rows(client, db_factory, USER_A)
-    fake.status["orchestrator"] = 500
+    fake.write_down.add("orchestrator")
 
     resp = client.post(PREFIX + "/me/privacy/erase", json=CONFIRM, cookies=cookie_a)
 
@@ -435,9 +501,9 @@ def test_erase_stops_when_the_platform_step_fails(
     detail = resp.json()["detail"]
     assert detail["succeeded"] == ["schedules"]
     assert detail["failed"] == "platform"
-    assert detail["not_attempted"] == ["memories", "llm_preferences", "bff"]
+    assert detail["not_attempted"] == ["memories", "llm_preferences", "apps", "bff"]
     assert detail["results"] == {"schedules": {"deleted": 2}}
-    assert fake.calls_to("knowledge") == []
+    assert [c.method for c in fake.calls_to("knowledge")] == ["GET"]  # the preflight only
     assert count_rows(client, db_factory, USER_A) == SEEDED
     assert fake.audit_events[-1]["outcome"] == "PARTIAL"
 
@@ -446,7 +512,7 @@ def test_erase_stops_when_the_schedules_step_fails(
     client: TestClient, db_factory, fake: FakePlatform, cookie_a: dict[str, str],
 ) -> None:
     seed_rows(client, db_factory, USER_A)
-    fake.down.add("cron")
+    fake.write_down.add("cron")
 
     resp = client.post(PREFIX + "/me/privacy/erase", json=CONFIRM, cookies=cookie_a)
 
@@ -454,9 +520,9 @@ def test_erase_stops_when_the_schedules_step_fails(
     detail = resp.json()["detail"]
     assert detail["succeeded"] == []
     assert detail["failed"] == "schedules"
-    assert detail["not_attempted"] == ["platform", "memories", "llm_preferences", "bff"]
+    assert detail["not_attempted"] == ["platform", "memories", "llm_preferences", "apps", "bff"]
     assert "cron-runner unreachable" in detail["error"]
-    assert fake.calls_to("orchestrator") == []
+    assert [c.json for c in fake.calls_to("orchestrator")] == [{"dry_run": True}]
     assert count_rows(client, db_factory, USER_A) == SEEDED
     assert fake.audit_events[-1]["outcome"] == "FAILURE"
 
@@ -474,7 +540,9 @@ def test_erase_reports_schedules_as_skipped_without_cron_runner(
     assert resp.json()["schedules"] == {"skipped": "not_configured"}
     assert fake.calls_to("cron") == []
     [event] = fake.audit_events
-    assert event["payload"]["succeeded"] == ["platform", "memories", "llm_preferences", "bff"]
+    assert event["payload"]["succeeded"] == [
+        "platform", "memories", "llm_preferences", "apps", "bff",
+    ]
     assert event["payload"]["skipped"] == {"schedules": "not_configured"}
     assert "schedules_deleted" not in event["payload"]
 
@@ -491,10 +559,12 @@ def test_erase_rejects_an_unusable_llm_preference_listing(
 
     resp = client.post(PREFIX + "/me/privacy/erase", json=CONFIRM, cookies=cookie_a)
 
-    assert resp.status_code == 502
+    # The preflight catches it, so nothing is erased.
+    assert resp.status_code == 503
     detail = resp.json()["detail"]
+    assert detail["code"] == "PRIVACY_ERASURE_UNAVAILABLE"
     assert detail["failed"] == "llm_preferences"
-    assert detail["not_attempted"] == ["bff"]
+    assert fake.writes() == []
     assert all(c.method == "GET" for c in fake.calls_to("llm"))
 
 
@@ -549,7 +619,9 @@ def test_erase_reports_a_failed_bff_step(
 
     assert resp.status_code == 502
     detail = resp.json()["detail"]
-    assert detail["succeeded"] == ["schedules", "platform", "memories", "llm_preferences"]
+    assert detail["succeeded"] == [
+        "schedules", "platform", "memories", "llm_preferences", "apps",
+    ]
     assert detail["failed"] == "bff"
     assert detail["not_attempted"] == []
     assert detail["error"] == "internal error"  # no internals leak to the client
@@ -560,12 +632,79 @@ def test_erase_rejects_an_unusable_memory_result(
     client: TestClient, db_factory, fake: FakePlatform, cookie_a: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(fake, "_knowledge", lambda call: httpx.Response(200, json={"ok": True}))
+    original = fake._knowledge
+
+    def _broken(call):
+        if call.method == "DELETE":
+            return httpx.Response(200, json={"ok": True})
+        return original(call)
+
+    monkeypatch.setattr(fake, "_knowledge", _broken)
 
     resp = client.post(PREFIX + "/me/privacy/erase", json=CONFIRM, cookies=cookie_a)
 
     assert resp.status_code == 502
     assert resp.json()["detail"]["failed"] == "memories"
+
+
+@pytest.mark.parametrize(
+    "service,failure,step",
+    [
+        ("cron", "down", "schedules"),
+        ("cron", 500, "schedules"),
+        ("orchestrator", 500, "platform"),
+        # e.g. a role without the permission: refused before anything is erased.
+        ("orchestrator", 403, "platform"),
+        ("knowledge", "down", "memories"),
+        ("llm", "down", "llm_preferences"),
+        ("apps", "down", "apps"),
+        ("apps", 403, "apps"),
+    ],
+)
+def test_erase_is_refused_when_a_service_fails_the_preflight(
+    client: TestClient, db_factory, fake: FakePlatform, cookie_a: dict[str, str],
+    service: str, failure: str | int, step: str,
+) -> None:
+    seed_rows(client, db_factory, USER_A)
+    if failure == "down":
+        fake.down.add(service)
+    else:
+        fake.status[service] = int(failure)
+
+    resp = client.post(PREFIX + "/me/privacy/erase", json=CONFIRM, cookies=cookie_a)
+
+    assert resp.status_code == 503, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "PRIVACY_ERASURE_UNAVAILABLE"
+    assert detail["user_message"].startswith("Nothing was erased")
+    assert detail["failed"] == step
+    # Nothing changed anywhere.
+    assert fake.writes() == []
+    assert count_rows(client, db_factory, USER_A) == SEEDED
+    assert len(fake.memories[USER_A]) == 2
+    assert len(fake.schedules[USER_A]) == 2
+    [event] = fake.audit_events
+    assert_valid_audit_event(event)
+    assert event["outcome"] == "FAILURE"
+    assert event["payload"] == {"via": "self_service", "phase": "preflight", "failed": step}
+
+
+def test_erase_is_refused_when_the_bff_rows_cannot_be_read(
+    client: TestClient, db_factory, fake: FakePlatform, cookie_a: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def _boom(_subject):
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(privacy_module, "_bff_rows", _boom)
+
+    resp = client.post(PREFIX + "/me/privacy/erase", json=CONFIRM, cookies=cookie_a)
+
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+    assert detail["failed"] == "bff"
+    assert detail["error"] == "internal error"  # no internals leak to the client
+    assert fake.writes() == []
 
 
 def test_erase_succeeds_when_audit_is_down(

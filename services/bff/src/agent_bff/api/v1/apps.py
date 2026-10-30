@@ -1,8 +1,11 @@
 """App proxy endpoints + the "run an App" resolver.
 
-CRUD / version / submit / publish / review endpoints are pure pass-throughs to
+CRUD / version / submit / publish / review endpoints are pass-throughs to
 the ``app-registry`` service (mirrors ``library.py`` style: forward the caller's
-foundation headers, relay status/body via ``_raise_for_upstream``).
+foundation headers, relay status/body via ``_raise_for_upstream``).  The one
+addition is a display name beside every user id (``author_id`` →
+``author_name``, ``created_by`` / ``submitted_by`` / ``reviewed_by`` →
+``…_name``), resolved by ``_relay``; a name that cannot be resolved is null.
 
 The interesting endpoint is ``POST /apps/{id}/run`` — it resolves the published
 harness for an App, validates + renders the caller's inputs against the version's
@@ -33,6 +36,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from agent_bff.api._http import foundation_headers
+from agent_bff.api._people import display_names
 from agent_bff.api.dependencies import require_auth
 from agent_bff.api.v1.conversations import _resolve_attachment_files
 
@@ -54,6 +58,53 @@ def _raise_for_upstream(resp: httpx.Response) -> None:
         except Exception:
             detail = resp.text
         raise HTTPException(status_code=resp.status_code, detail=detail)
+
+
+# Who-did-what fields on App, version and review-queue rows, and the display
+# name the BFF adds beside each (see ``agent_bff.api._people``).
+_PERSON_FIELDS = {
+    "author_id": "author_name",
+    "created_by": "created_by_name",
+    "submitted_by": "submitted_by_name",
+    "reviewed_by": "reviewed_by_name",
+}
+
+
+def _people_rows(payload: Any) -> list[dict[str, Any]]:
+    """The App / version / review-queue dicts in an app-registry response."""
+    if isinstance(payload, dict) and isinstance(payload.get("items"), list):
+        roots = payload["items"]
+    else:
+        roots = [payload]
+    rows: list[dict[str, Any]] = []
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        rows.append(root)
+        versions = root.get("versions")
+        if isinstance(versions, list):
+            rows.extend(v for v in versions if isinstance(v, dict))
+        if isinstance(root.get("version"), dict):  # a review-queue row
+            rows.append(root["version"])
+    return rows
+
+
+async def _relay(request: Request, auth: tuple, resp: httpx.Response) -> JSONResponse:
+    """Relay an app-registry response, naming the people its user ids refer to."""
+    _raise_for_upstream(resp)
+    payload = resp.json()
+    rows = _people_rows(payload)
+    names = await display_names(
+        request.app.state.settings.foundation_identity_url,
+        auth,
+        (row.get(field) for row in rows for field in _PERSON_FIELDS),
+    )
+    for row in rows:
+        for field, name_field in _PERSON_FIELDS.items():
+            if field in row:
+                value = row[field]
+                row[name_field] = names.get(value) if isinstance(value, str) else None
+    return JSONResponse(content=payload, status_code=resp.status_code)
 
 
 def _registry_url(request: Request) -> str:
@@ -122,8 +173,7 @@ async def list_apps(
             params=params,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    _raise_for_upstream(resp)
-    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    return await _relay(request, _auth, resp)
 
 
 @router.post("/apps", status_code=201)
@@ -141,8 +191,7 @@ async def create_app(
             json=body,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    _raise_for_upstream(resp)
-    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    return await _relay(request, _auth, resp)
 
 
 @router.get("/apps/review/pending")
@@ -158,8 +207,7 @@ async def review_pending(
             f"{url}/apps/review/pending",
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    _raise_for_upstream(resp)
-    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    return await _relay(request, _auth, resp)
 
 
 @router.post("/apps/review/{vid}/approve")
@@ -181,8 +229,7 @@ async def review_approve(
             json=body or {},
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    _raise_for_upstream(resp)
-    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    return await _relay(request, _auth, resp)
 
 
 @router.post("/apps/review/{vid}/reject")
@@ -204,8 +251,7 @@ async def review_reject(
             json=body or {},
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    _raise_for_upstream(resp)
-    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    return await _relay(request, _auth, resp)
 
 
 @router.get("/apps/{app_id}")
@@ -222,8 +268,7 @@ async def get_app(
             f"{url}/apps/{app_id}",
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    _raise_for_upstream(resp)
-    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    return await _relay(request, _auth, resp)
 
 
 @router.put("/apps/{app_id}")
@@ -242,8 +287,7 @@ async def update_app(
             json=body,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    _raise_for_upstream(resp)
-    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    return await _relay(request, _auth, resp)
 
 
 @router.delete("/apps/{app_id}", status_code=204)
@@ -280,8 +324,7 @@ async def create_version(
             json=body,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    _raise_for_upstream(resp)
-    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    return await _relay(request, _auth, resp)
 
 
 @router.put("/apps/{app_id}/versions/{vid}")
@@ -301,8 +344,7 @@ async def update_version(
             json=body,
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    _raise_for_upstream(resp)
-    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    return await _relay(request, _auth, resp)
 
 
 @router.post("/apps/{app_id}/versions/{vid}/submit")
@@ -325,8 +367,7 @@ async def submit_version(
             json=body or {},
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    _raise_for_upstream(resp)
-    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    return await _relay(request, _auth, resp)
 
 
 @router.post("/apps/{app_id}/versions/{vid}/publish")
@@ -349,8 +390,7 @@ async def publish_version(
             json=body or {},
             headers=foundation_headers(tenant_id, user_id, access_token),
         )
-    _raise_for_upstream(resp)
-    return JSONResponse(content=resp.json(), status_code=resp.status_code)
+    return await _relay(request, _auth, resp)
 
 
 # --------------------------------------------------------------------------- #

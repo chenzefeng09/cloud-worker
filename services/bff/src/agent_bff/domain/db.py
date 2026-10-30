@@ -22,8 +22,11 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 async def init_db(settings: Settings) -> None:
     global _engine, _session_factory
     is_sqlite = settings.db_dsn.startswith("sqlite")
+    # hide_parameters keeps bound values (encrypted session tokens, API key
+    # hashes, personal data) out of the SQL echo and out of DBAPI error
+    # messages, which end up in logs and error reports.
     if is_sqlite:
-        _engine = create_async_engine(settings.db_dsn, echo=False)
+        _engine = create_async_engine(settings.db_dsn, echo=False, hide_parameters=True)
     else:
         url = make_url(settings.db_dsn).update_query_dict(
             {"prepared_statement_cache_size": "0"}, append=False
@@ -33,7 +36,8 @@ async def init_db(settings: Settings) -> None:
             pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow,
             pool_recycle=settings.db_pool_recycle,
-            echo=settings.env == "dev",
+            echo=settings.sql_echo,
+            hide_parameters=True,
         )
         _engine = _engine.execution_options(
             schema_translate_map={None: settings.db_schema}
