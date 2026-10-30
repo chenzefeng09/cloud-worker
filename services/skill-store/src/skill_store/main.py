@@ -12,6 +12,7 @@ from skill_store.blob.base import BlobStore
 from skill_store.blob.s3 import S3BlobStore
 from skill_store.config import Settings
 from skill_store.domain.db import close_db, init_db
+from skill_store.logging_setup import configure_logging
 
 
 @asynccontextmanager
@@ -44,6 +45,9 @@ def create_app(
 ) -> FastAPI:
     if settings is None:
         settings = Settings()
+    # First thing, so all later output (uvicorn's included) is JSON at the
+    # configured level, with or without OTel.
+    configure_logging(service="skill-store", level=settings.log_level)
 
     app = FastAPI(title="Skill Store", version="0.1.0a1", lifespan=lifespan)
     app.state.settings = settings

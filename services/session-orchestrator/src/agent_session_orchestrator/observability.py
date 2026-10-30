@@ -1,22 +1,18 @@
 """OpenTelemetry initialization — one-liner for each service."""
 
-import logging
 import os
 
 
 def init_observability(*, service_name: str, otlp_endpoint: str | None = None) -> None:
-    """Bootstrap OTel SDK for traces, metrics, and structured logging."""
+    """Bootstrap the OTel SDK for traces and metrics.
+
+    Logging is set up by create_app (logging_setup), whether OTel is on or not.
+    """
     if os.environ.get("SESSION_ORCHESTRATOR_OTEL_ENABLED", "true").lower() == "false":
         return
 
     _ = otlp_endpoint or os.environ.get(
         "SESSION_ORCHESTRATOR_OTEL_EXPORTER_ENDPOINT", "http://localhost:4317"
-    )
-
-    # Structured logging setup
-    logging.basicConfig(
-        level=logging.INFO,
-        format='{"timestamp":"%(asctime)s","level":"%(levelname)s","service":"%(name)s","message":"%(message)s"}',
     )
 
     # OTel SDK auto-instrumentation is handled at the FastAPI level via

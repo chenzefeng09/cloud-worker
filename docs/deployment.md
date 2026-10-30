@@ -282,6 +282,49 @@ every tool call would be denied. See [`dlp-real-defense-plan.md`](dlp-real-defen
 | `foundation` | Legacy/compat mode: sandboxes reach the Foundation service network directly. |
 | `none` | Local-filesystem tools only. |
 
+### Logging
+
+Every service in `services/` (except the dev-only `echo-mcp` example) sets up
+logging once at startup, in `create_app`, with OpenTelemetry on or off. It
+writes one JSON object per line to stderr:
+`timestamp` (UTC, ISO 8601), `level`, `service`, `logger`, `message`, then
+`exception` (the formatted traceback) or `stack` when present, and any fields
+the code passed as `extra=`. Each line is built with `json.dumps`, so quotes,
+newlines and tracebacks cannot break it. uvicorn's startup and access lines,
+Python warnings and SQL echo come out the same way.
+
+| Variable | Service |
+|---|---|
+| `BFF_LOG_LEVEL` | bff |
+| `SESSION_ORCHESTRATOR_LOG_LEVEL` | session-orchestrator |
+| `SCHEDULER_LOG_LEVEL` | agent-scheduler |
+| `SANDBOX_POOL_LOG_LEVEL` | sandbox-pool |
+| `TOOL_BROKER_LOG_LEVEL` | tool-broker |
+| `MCP_REGISTRY_LOG_LEVEL` | mcp-registry |
+| `SKILL_STORE_LOG_LEVEL` | skill-store |
+| `APP_REGISTRY_LOG_LEVEL` | app-registry |
+| `KNOWLEDGE_INGEST_LOG_LEVEL` | knowledge-ingest |
+| `CRON_RUNNER_LOG_LEVEL` | cron-runner |
+| `WEB_FETCH_LOG_LEVEL` | web-fetch-gateway |
+
+- Values are `DEBUG`, `INFO` (the default), `WARNING`, `ERROR` and `CRITICAL`,
+  in any case. Any other value stops the service at startup.
+- The level applies to the service's own code. Libraries (uvicorn, httpx,
+  botocore, SQLAlchemy, ...) never log below INFO, because their DEBUG output
+  carries request and response headers, request bodies and bound SQL
+  parameters. A level above INFO quiets them too.
+- uvicorn's access log and httpx's request log show URLs without their query
+  string (`?[redacted]`), which can carry an OAuth `code` or a presigned S3
+  signature.
+- SQL echo is a separate, opt-in setting of each service with a database
+  (`<PREFIX>SQL_ECHO`, default false). Bound parameters are hidden either way,
+  in the echo and in database error messages.
+- Compose defaults every service to INFO; set a variable in
+  `deploy/docker-compose/.env` to change one. Use DEBUG only for targeted
+  debugging: on the session-orchestrator's SSE path it can back up
+  `docker logs` enough to stall the stream. The Helm chart sets none of these,
+  so services run at INFO there.
+
 ---
 
 ## Backup, restore, and disaster recovery

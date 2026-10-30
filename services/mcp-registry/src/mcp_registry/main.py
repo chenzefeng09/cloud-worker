@@ -10,6 +10,7 @@ from foundation_sdk.fastapi import install_request_context, register_problem_det
 
 from mcp_registry.config import Settings
 from mcp_registry.domain.db import close_db, init_db
+from mcp_registry.logging_setup import configure_logging
 
 
 @asynccontextmanager
@@ -23,6 +24,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(settings: Settings | None = None) -> FastAPI:
     if settings is None:
         settings = Settings()
+    # First thing, so all later output (uvicorn's included) is JSON at the
+    # configured level, with or without OTel.
+    configure_logging(service="mcp-registry", level=settings.log_level)
 
     app = FastAPI(
         title="MCP Registry",

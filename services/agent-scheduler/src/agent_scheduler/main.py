@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from foundation_sdk.fastapi import install_request_context, register_problem_details
 
 from agent_scheduler.config import Settings
+from agent_scheduler.logging_setup import configure_logging
 from agent_scheduler.observability import init_observability
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(settings: Settings | None = None) -> FastAPI:
     if settings is None:
         settings = Settings()
+    # First thing, so all later output (uvicorn's included) is JSON at the
+    # configured level, with or without OTel.
+    configure_logging(service="agent-scheduler", level=settings.log_level)
 
     app = FastAPI(
         title="Agent Scheduler",
