@@ -113,6 +113,13 @@ class Settings(BaseSettings):
     foundation_audit_url: str = "http://audit:8013/api/audit/v1"
     # LLM Gateway — capability probe endpoint (POST /probe).
     foundation_llm_gateway_url: str = "http://llm-gateway:8011/api/llm-gateway/v1"
+    # Proves the BFF is a SERVICE caller to the gateway, which mints the
+    # short-lived keys canvas edits and session titles use for no one else:
+    # sent as X-Internal-Service-Token with X-Actor: SERVICE, it must equal the
+    # gateway's LLM_GATEWAY_INTERNAL_SERVICE_TOKEN.  Empty → the gateway
+    # refuses the mint (403) and the BFF falls back to the tenant's long-lived
+    # key, which a tenant set up only under Admin → Models does not have.
+    foundation_llm_gateway_service_token: str = ""
     # Optional cheap model dedicated to automatic session titles.  When empty,
     # the model selected for the first chat turn wins, then the tenant default.
     session_title_model: str = ""

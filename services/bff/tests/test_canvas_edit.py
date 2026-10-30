@@ -7,7 +7,8 @@ Covers:
 4. request model wins; no model → resolve tenant default
 5. no model + no tenant default → 400 with user_message
 6. virtual key: minted per tenant; no provider → 422, older gateway → long-lived
-   key, none at all → 502
+   key, none at all → 502; minted as a proven SERVICE (service token), refused
+   mint (403) → long-lived key
 7. gateway non-200 → 502 with user_message
 8. gateway timeout → 502 with user_message
 9. empty replacement → 502 with user_message
@@ -18,6 +19,7 @@ Covers:
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 
@@ -288,6 +290,107 @@ def test_canvas_edit_no_virtual_key_at_all_502(
     assert detail["detail"]["code"] == "AGENT.BFF.CANVAS.GATEWAY_UNAVAILABLE"
     assert "temporarily unavailable" in detail["user_message"]
     assert fake.last_completion_payload is None
+
+
+# ---------------------------------------------------------------------------
+# The gateway mints keys for a proven SERVICE caller only
+# ---------------------------------------------------------------------------
+
+_GW_SERVICE_TOKEN = "bff-gw-service-token-0123456789"
+
+
+def _mint_headers(fake: FakeGateway) -> dict[str, str]:
+    (headers,) = [
+        h for m, u, h in fake.calls if m == "POST" and u.endswith("/tenant-keys/ephemeral")
+    ]
+    assert headers is not None
+    return headers
+
+
+def test_canvas_edit_mints_as_a_proven_service(
+    client: TestClient,
+    settings: Any,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings.foundation_llm_gateway_service_token = _GW_SERVICE_TOKEN
+    fake = FakeGateway()
+    _patch(fake, monkeypatch)
+
+    resp = client.post(
+        f"{PREFIX}/sessions/ses_abc/canvas/edit", cookies=authed_cookie, json=_body()
+    )
+    assert resp.status_code == 200
+    headers = _mint_headers(fake)
+    assert headers["X-Tenant-Id"] == "tnt_01J5TEST00000000000000TNT1"
+    assert headers["X-Actor"] == "SERVICE"
+    assert headers["X-Internal-Service-Token"] == _GW_SERVICE_TOKEN
+    # Only the key endpoints get it: the model call goes out as the user.
+    assert fake.last_completion_headers is not None
+    assert "X-Internal-Service-Token" not in fake.last_completion_headers
+    assert "X-Actor" not in fake.last_completion_headers
+
+
+def test_canvas_edit_makes_no_service_claim_without_a_token(
+    client: TestClient, authed_cookie: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bare X-Actor: SERVICE would only be logged and downgraded by the gateway."""
+    fake = FakeGateway()
+    _patch(fake, monkeypatch)
+
+    resp = client.post(
+        f"{PREFIX}/sessions/ses_abc/canvas/edit", cookies=authed_cookie, json=_body()
+    )
+    assert resp.status_code == 200
+    headers = _mint_headers(fake)
+    assert "X-Actor" not in headers
+    assert "X-Internal-Service-Token" not in headers
+
+
+def test_canvas_edit_falls_back_to_tenant_key_when_gateway_refuses_mint(
+    client: TestClient,
+    settings: Any,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """403: the gateway did not take the BFF for a SERVICE caller (token unset
+    or not its own) — a deploy setting, so the log names it, never the token."""
+    settings.foundation_llm_gateway_service_token = "not-the-gateways-token"
+    fake = FakeGateway(
+        mint_status=403,
+        mint_body={"status": 403, "code": "FOUNDATION.LLM_GATEWAY.AUTH.PERMISSION_DENIED"},
+    )
+    _patch(fake, monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="agent_bff.api.v1.canvas"):
+        resp = client.post(
+            f"{PREFIX}/sessions/ses_abc/canvas/edit", cookies=authed_cookie, json=_body()
+        )
+    assert resp.status_code == 200
+    assert fake.last_completion_headers is not None
+    assert fake.last_completion_headers.get("X-LLM-Virtual-Key") == "vk_test"
+    assert "BFF_FOUNDATION_LLM_GATEWAY_SERVICE_TOKEN" in caplog.text
+    assert "not-the-gateways-token" not in caplog.text
+
+
+def test_canvas_edit_no_provider_is_still_422_for_a_proven_service(
+    client: TestClient,
+    settings: Any,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Behind the SERVICE gate the gateway's 404 still means "no model set up"."""
+    settings.foundation_llm_gateway_service_token = _GW_SERVICE_TOKEN
+    fake = FakeGateway(mint_status=404, mint_body=_NO_PROVIDER)
+    _patch(fake, monkeypatch)
+
+    resp = client.post(
+        f"{PREFIX}/sessions/ses_abc/canvas/edit", cookies=authed_cookie, json=_body()
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["detail"]["code"] == "AGENT.BFF.CANVAS.LLM_NOT_CONFIGURED"
+    assert not any(m == "GET" and "/tenant-keys" in u for m, u, _ in fake.calls)
 
 
 def test_canvas_edit_no_model_no_default_400(

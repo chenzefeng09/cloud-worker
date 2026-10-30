@@ -383,20 +383,36 @@ def _problem_code(resp: httpx.Response) -> str | None:
     return code if isinstance(code, str) else None
 
 
+def _key_headers(tenant_id: str, access_token: str, service_token: str) -> dict[str, str]:
+    """密钥端点（/tenant-keys*）的请求头。
+
+    gateway 只给经证明的 SERVICE 调用方铸造短期密钥：``X-Actor: SERVICE`` 要配上
+    预共享的 ``X-Internal-Service-Token`` 才算数，裸声明只会被记日志、降级成 USER，
+    所以只在配置了 ``service_token`` 时才带这一对。
+    """
+    headers = foundation_headers(tenant_id, "", access_token)
+    if service_token:
+        headers["X-Actor"] = "SERVICE"
+        headers["X-Internal-Service-Token"] = service_token
+    return headers
+
+
 async def _mint_virtual_key(
     *,
     client: httpx.AsyncClient,
     gateway_url: str,
     tenant_id: str,
     access_token: str,
+    service_token: str,
 ) -> str | None:
     """向 gateway 铸造一把短期虚拟密钥（POST /tenant-keys/ephemeral）。
 
-    租户没有可用 provider 时抛 ``LlmNotConfiguredError``；gateway 不支持铸造（旧版
-    404/405）、出错或不可达时返回 None，由调用方退回长期密钥。
+    租户没有可用 provider 时抛 ``LlmNotConfiguredError``；gateway 不认 BFF 是
+    SERVICE（403）、不支持铸造（旧版 404/405）、出错或不可达时返回 None，由调用方
+    退回长期密钥。
     """
     url = f"{gateway_url.rstrip('/')}/tenant-keys/ephemeral"
-    headers = foundation_headers(tenant_id, "", access_token)
+    headers = _key_headers(tenant_id, access_token, service_token)
     try:
         resp = await client.post(
             url,
@@ -410,6 +426,14 @@ async def _mint_virtual_key(
 
     if resp.status_code == 404 and _problem_code(resp) == _GATEWAY_NO_PROVIDER:
         raise LlmNotConfiguredError
+    if resp.status_code == 403:
+        # 令牌没配或与 gateway 的不一致：是部署配置问题而不是故障，日志里点明是哪个设置。
+        logger.warning(
+            "llm-gateway refused to mint a virtual key (HTTP 403): "
+            "BFF_FOUNDATION_LLM_GATEWAY_SERVICE_TOKEN must equal the gateway's "
+            "LLM_GATEWAY_INTERNAL_SERVICE_TOKEN (falling back to the tenant key)"
+        )
+        return None
     if resp.status_code not in (200, 201):
         logger.warning(
             "llm-gateway returned HTTP %s for POST /tenant-keys/ephemeral", resp.status_code
@@ -430,6 +454,7 @@ async def _fetch_tenant_virtual_key(
     gateway_url: str,
     tenant_id: str,
     access_token: str,
+    service_token: str,
 ) -> str | None:
     """查询 gateway 的租户长期虚拟密钥（GET /tenant-keys），仅作铸造不可用时的退路。
 
@@ -438,7 +463,7 @@ async def _fetch_tenant_virtual_key(
     的解析范式。
     """
     url = f"{gateway_url.rstrip('/')}/tenant-keys"
-    headers = foundation_headers(tenant_id, "", access_token)
+    headers = _key_headers(tenant_id, access_token, service_token)
     try:
         resp = await client.get(url, params={"tenant_id": tenant_id}, headers=headers)
     except httpx.HTTPError as exc:
@@ -479,12 +504,14 @@ async def _resolve_virtual_key(
     gateway_url: str,
     tenant_id: str,
     access_token: str,
+    service_token: str,
 ) -> str | None:
     """拿一把能用的虚拟密钥：进程内缓存 → 铸造短期密钥 → 长期密钥（旧 gateway）。
 
     先铸造，因为在 Admin → Models 里配置的租户只有 provider、没有长期密钥。
-    租户没有可用 provider 时抛 ``LlmNotConfiguredError``（不缓存，管理员一配好就生效）；
-    都拿不到时返回 None（gateway 侧故障）。
+    ``service_token`` 即 ``foundation_llm_gateway_service_token``：没有它 gateway
+    不给铸造。租户没有可用 provider 时抛 ``LlmNotConfiguredError``（不缓存，管理员
+    一配好就生效）；都拿不到时返回 None（gateway 侧故障）。
     """
     now = time.monotonic()
     cached = _vkey_cache.get(tenant_id)
@@ -496,6 +523,7 @@ async def _resolve_virtual_key(
         gateway_url=gateway_url,
         tenant_id=tenant_id,
         access_token=access_token,
+        service_token=service_token,
     )
     if not key:
         key = await _fetch_tenant_virtual_key(
@@ -503,6 +531,7 @@ async def _resolve_virtual_key(
             gateway_url=gateway_url,
             tenant_id=tenant_id,
             access_token=access_token,
+            service_token=service_token,
         )
     if key:
         _vkey_cache[tenant_id] = (key, now + _VKEY_REUSE_SECONDS)
@@ -600,6 +629,7 @@ async def canvas_edit(
                 gateway_url=gateway_url,
                 tenant_id=tenant_id,
                 access_token=access_token,
+                service_token=settings.foundation_llm_gateway_service_token,
             )
         except LlmNotConfiguredError:
             raise _llm_not_configured_problem() from None

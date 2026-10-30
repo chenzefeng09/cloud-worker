@@ -692,6 +692,7 @@ async def canvas_v2_edit(
                 gateway_url=gateway_url,
                 tenant_id=tenant_id,
                 access_token=access_token,
+                service_token=settings.foundation_llm_gateway_service_token,
             )
         except LlmNotConfiguredError:
             raise _llm_not_configured_problem() from None

@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -327,6 +328,123 @@ async def test_revoke_run_keys_swallows_errors(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# The gateway mints and revokes run keys for a proven SERVICE caller only
+# ---------------------------------------------------------------------------
+
+_GW_SERVICE_TOKEN = "sched-gw-service-token-0123456789"
+
+
+def _service_settings() -> Settings:
+    settings = _gw_settings()
+    settings.llm_gateway_service_token = _GW_SERVICE_TOKEN
+    return settings
+
+
+class _RecordingGateway:
+    """Answers every POST with (status_code, body) and records the calls."""
+
+    def __init__(self, status_code: int, body: Any) -> None:
+        self._status_code = status_code
+        self._body = body
+        self.calls: list[dict[str, Any]] = []
+
+    async def __aenter__(self) -> _RecordingGateway:
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        return None
+
+    async def post(self, url: str, **kw: Any) -> httpx.Response:
+        self.calls.append({"url": url, **kw})
+        return httpx.Response(self._status_code, json=self._body)
+
+
+@pytest.mark.asyncio
+async def test_mint_run_key_proves_the_scheduler_is_a_service(monkeypatch):
+    gw = _RecordingGateway(201, {"virtual_key": "sk-foundation-eph-SVC"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: gw)
+
+    result = await _mint_run_virtual_key(
+        settings=_service_settings(), tenant_id="tnt_test", run_id="run_SVC", bearer="tok",
+    )
+
+    assert result == "sk-foundation-eph-SVC"
+    (call,) = gw.calls
+    assert call["headers"] == {
+        "Authorization": "Bearer tok",
+        "X-Tenant-Id": "tnt_test",
+        "X-Actor": "SERVICE",
+        "X-Internal-Service-Token": _GW_SERVICE_TOKEN,
+    }
+
+
+@pytest.mark.asyncio
+async def test_mint_run_key_makes_no_service_claim_without_a_token(monkeypatch):
+    """A bare X-Actor: SERVICE would only be logged and downgraded by the gateway."""
+    gw = _RecordingGateway(201, {"virtual_key": "sk-foundation-eph-X"})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: gw)
+
+    await _mint_run_virtual_key(
+        settings=_gw_settings(), tenant_id="tnt_test", run_id="run_NOSVC", bearer="tok",
+    )
+
+    (call,) = gw.calls
+    assert "X-Actor" not in call["headers"]
+    assert "X-Internal-Service-Token" not in call["headers"]
+
+
+@pytest.mark.asyncio
+async def test_mint_run_key_falls_back_when_the_gateway_refuses_the_caller(
+    monkeypatch, caplog,
+):
+    """403 (token unset here or not the gateway's) → None, so create_run falls
+    back to the tenant key; the log names the setting, never the token."""
+    gw = _RecordingGateway(403, {
+        "status": 403, "code": "FOUNDATION.LLM_GATEWAY.AUTH.PERMISSION_DENIED",
+    })
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: gw)
+
+    with caplog.at_level(logging.WARNING, logger="agent_scheduler.api.v1.runs"):
+        result = await _mint_run_virtual_key(
+            settings=_service_settings(), tenant_id="tnt_test", run_id="run_403", bearer="tok",
+        )
+
+    assert result is None
+    assert "SCHEDULER_LLM_GATEWAY_SERVICE_TOKEN" in caplog.text
+    assert _GW_SERVICE_TOKEN not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_revoke_run_keys_proves_the_scheduler_is_a_service(monkeypatch):
+    gw = _RecordingGateway(200, {"run_id": "run_REV", "disabled": 1})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: gw)
+
+    await _revoke_run_virtual_keys(
+        settings=_service_settings(), tenant_id="tnt_test", run_id="run_REV", bearer="tok",
+    )
+
+    (call,) = gw.calls
+    assert call["url"].endswith("/tenant-keys/revoke-run")
+    assert call["json"] == {"run_id": "run_REV"}
+    assert call["headers"]["X-Tenant-Id"] == "tnt_test"
+    assert call["headers"]["X-Actor"] == "SERVICE"
+    assert call["headers"]["X-Internal-Service-Token"] == _GW_SERVICE_TOKEN
+
+
+@pytest.mark.asyncio
+async def test_revoke_run_keys_logs_a_refusal_without_raising(monkeypatch, caplog):
+    gw = _RecordingGateway(403, {"status": 403})
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: gw)
+
+    with caplog.at_level(logging.WARNING, logger="agent_scheduler.api.v1.runs"):
+        await _revoke_run_virtual_keys(
+            settings=_service_settings(), tenant_id="tnt_test", run_id="run_R403", bearer="tok",
+        )
+
+    assert "HTTP 403 for POST /tenant-keys/revoke-run" in caplog.text
+
+
+# ---------------------------------------------------------------------------
 # create_run end-to-end: gateway URL always present, virtual key conditional
 # ---------------------------------------------------------------------------
 
@@ -457,12 +575,14 @@ def test_create_run_injects_virtual_key_when_gateway_has_one(
 
 def _make_minting_gateway_client(
     *, mint_status: int, mint_body: Any, tenant_keys: Any,
+    sent: list[tuple[str, dict[str, Any]]] | None = None,
 ):
     """Gateway stub that distinguishes ephemeral mint from the tenant-key list.
 
     ``POST /tenant-keys/ephemeral`` → (mint_status, mint_body).
     ``GET  /tenant-keys``           → (200, tenant_keys)  [fallback path].
-    Identity/authz/quota POSTs are stubbed as usual.
+    Identity/authz/quota POSTs are stubbed as usual.  Every gateway call is
+    appended to ``sent`` as ``(url, kwargs)`` when it is given.
     """
 
     class _FakeClient:
@@ -476,10 +596,14 @@ def _make_minting_gateway_client(
             return None
 
         async def get(self, url: str, **kw):
+            if sent is not None:
+                sent.append((url, kw))
             return httpx.Response(200, json=tenant_keys)
 
         async def post(self, url: str, **kw):
             if url.endswith("/tenant-keys/ephemeral"):
+                if sent is not None:
+                    sent.append((url, kw))
                 return httpx.Response(mint_status, json=mint_body)
             if "service-account-token" in url:
                 return httpx.Response(201, json={"access_token": "minted-jwt"})
@@ -591,6 +715,114 @@ def test_create_run_falls_back_to_tenant_key_when_mint_unavailable(
         run_id="run_01J5RUN0000000000000FBK01",
     )
     assert secrets["LLM_VIRTUAL_KEY"] == "vk-tenant-FALLBACK"
+
+
+def test_create_run_falls_back_to_tenant_key_when_gateway_refuses_mint(
+    settings: Settings,
+    runtime,
+    mock_docker_client: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_headers: dict,
+) -> None:
+    """A gateway that does not take the scheduler for a SERVICE caller (403:
+    service token unset or mismatched) must not break runs."""
+    from agent_scheduler.api.dependencies import get_runtime
+    from agent_scheduler.main import create_app
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        _make_minting_gateway_client(
+            mint_status=403,
+            mint_body={
+                "status": 403,
+                "code": "FOUNDATION.LLM_GATEWAY.AUTH.PERMISSION_DENIED",
+            },
+            tenant_keys=[{"key": "vk-tenant-REFUSED", "enabled": True}],
+        ),
+    )
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-refused")
+
+    app = create_app(settings)
+    app.state.settings = settings
+    app.dependency_overrides[get_runtime] = lambda: runtime
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post(
+            "/api/scheduler/v1/runs",
+            headers=auth_headers,
+            json={
+                "session_id": "ses_01J5SES0000000000000REF01",
+                "run_id": "run_01J5RUN0000000000000REF01",
+                "task": "mint refused",
+            },
+        )
+
+    assert resp.status_code == 201, resp.text
+    secrets = _read_run_secrets(
+        settings.workspace_base,
+        tenant_id=_TENANT,
+        session_id="ses_01J5SES0000000000000REF01",
+        run_id="run_01J5RUN0000000000000REF01",
+    )
+    assert secrets["LLM_VIRTUAL_KEY"] == "vk-tenant-REFUSED"
+
+
+def test_gateway_service_token_never_reaches_the_sandbox(
+    settings: Settings,
+    runtime,
+    mock_docker_client: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_headers: dict,
+) -> None:
+    """The token proves the scheduler to the gateway; a sandbox holding it
+    could mint keys for any tenant, so it stays out of env, args and files."""
+    from agent_scheduler.api.dependencies import get_runtime
+    from agent_scheduler.main import create_app
+
+    # The runtime shares this Settings object, so it sees the token too.
+    settings.llm_gateway_service_token = _GW_SERVICE_TOKEN
+    sent: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        _make_minting_gateway_client(
+            mint_status=201,
+            mint_body={"virtual_key": "sk-foundation-eph-TOK", "ephemeral": True},
+            tenant_keys=[],
+            sent=sent,
+        ),
+    )
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-tok")
+
+    app = create_app(settings)
+    app.state.settings = settings
+    app.dependency_overrides[get_runtime] = lambda: runtime
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post(
+            "/api/scheduler/v1/runs",
+            headers=auth_headers,
+            json={
+                "session_id": "ses_01J5SES0000000000000TOK01",
+                "run_id": "run_01J5RUN0000000000000TOK01",
+                "task": "service token stays home",
+            },
+        )
+
+    assert resp.status_code == 201, resp.text
+    ((url, kw),) = sent
+    assert url.endswith("/tenant-keys/ephemeral")
+    assert kw["headers"]["X-Internal-Service-Token"] == _GW_SERVICE_TOKEN
+    assert _GW_SERVICE_TOKEN not in repr(mock_docker_client.containers.run.call_args)
+    run_dir = (
+        Path(settings.workspace_base) / _TENANT
+        / "ses_01J5SES0000000000000TOK01" / "run_01J5RUN0000000000000TOK01"
+    )
+    files = [p for p in run_dir.rglob("*") if p.is_file()]
+    assert files  # the secrets file at least
+    for path in files:
+        assert _GW_SERVICE_TOKEN not in path.read_text(encoding="utf-8", errors="replace")
 
 
 def test_create_run_refuses_tenant_without_llm_provider(
