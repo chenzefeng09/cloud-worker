@@ -74,6 +74,9 @@ async def init_db(settings: Settings) -> None:
         # which turned the engine echo firehose on for every dev deploy and
         # could back up the log pipe enough to stall the SSE event loop.
         echo=settings.sql_echo,
+        # Bound values (message text, tenant data) stay out of the SQL echo and
+        # out of DBAPI error messages, which end up in logs.
+        hide_parameters=True,
         connect_args={"statement_cache_size": 0},
     )
     _session_factory = async_sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
@@ -159,6 +162,7 @@ async def privileged_scalars(settings: Settings, sql: str, params: dict | None =
             max_overflow=2,
             pool_recycle=settings.db_pool_recycle,
             pool_pre_ping=True,
+            hide_parameters=True,
             connect_args={"statement_cache_size": 0},
         )
         _privileged_dsn = dsn
