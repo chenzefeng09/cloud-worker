@@ -15,6 +15,7 @@ afterEach(() => {
     sessions: [],
     activeSessionId: null,
     messages: {},
+    streamingSessions: {},
     isStreaming: false,
     isLoggedIn: false,
     userProfile: null,

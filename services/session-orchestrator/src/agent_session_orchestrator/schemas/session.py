@@ -22,9 +22,26 @@ class SessionCreate(BaseModel):
     workspace_id: str | None = None
 
 
+class TaskSpec(BaseModel):
+    """What a task-board task was asked to do, kept for retry and display.
+
+    Stored under ``metadata.task`` of a ``kind="task"`` session.  ``options``
+    holds the run knobs the task was started with (skills, MCP servers, model,
+    reasoning effort, hitl) so a retry can replay them faithfully.
+    ``attachment_ids`` are the files the instructions came with: a task whose
+    first run never started has no user message to take them from.
+    """
+
+    instructions: str = Field(..., min_length=1, max_length=20000)
+    options: dict[str, Any] = Field(default_factory=dict)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=50)
+
+
 class SessionUpdate(BaseModel):
     title: str | None = Field(None, max_length=200)
     status: SessionStatus | None = None
+    # Only accepted on ``kind="task"`` sessions; replaces ``metadata.task``.
+    task: TaskSpec | None = None
 
 
 class SessionOut(BaseModel):

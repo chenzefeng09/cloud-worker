@@ -33,8 +33,9 @@ import type {
 
 const TRANSPORTS: McpTransport[] = ['http', 'sse', 'stdio'];
 
-/** Backend-returned masked sentinel for stored secret fields. Sending this
- *  value back in a PATCH tells the backend "keep the stored secret unchanged". */
+/** Backend-returned masked sentinel for stored auth secrets and for every
+ *  stored env / header value. Sending it back in a PATCH (or a /test override)
+ *  tells the backend "keep the stored value unchanged". */
 const MASKED = '••••••'; // "••••••"
 
 // Shared input / label class tokens so the extended form stays visually
@@ -48,11 +49,19 @@ const labelCls = 'text-[11px] text-dim font-mono';
 interface KvPair {
   key: string;
   value: string;
+  /** The value is still the backend's masked stand-in for a stored value. It is
+   *  sent back as-is (= keep the stored value), so it can't be edited in place:
+   *  the admin keeps it or replaces it. */
+  masked?: boolean;
+  /** Key a masked row was loaded with, so a replacement can be undone. */
+  savedKey?: string;
 }
 
 function toKv(rec: Record<string, string> | undefined | null): KvPair[] {
   if (!rec) return [];
-  return Object.entries(rec).map(([key, value]) => ({ key, value }));
+  return Object.entries(rec).map(([key, value]) =>
+    value === MASKED ? { key, value, masked: true, savedKey: key } : { key, value },
+  );
 }
 
 /** Drop pairs whose key is empty/whitespace; later duplicates win. */
@@ -80,6 +89,17 @@ function KeyValueEditor({
   const update = (i: number, patch: Partial<KvPair>) => {
     onChange(pairs.map((p, idx) => (idx === i ? { ...p, ...patch } : p)));
   };
+  // Undo a replacement: back to the stored value under its original key.
+  const keepSaved = (i: number) => {
+    onChange(
+      pairs.map((p, idx) =>
+        idx === i && p.savedKey !== undefined
+          ? { ...p, key: p.savedKey, value: MASKED, masked: true }
+          : p,
+      ),
+    );
+  };
+  const rowBtnCls = 'shrink-0 text-[11px] font-mono text-dim hover:text-ink px-1';
   return (
     <div className="flex flex-col gap-1.5">
       {pairs.map((p, i) => (
@@ -89,14 +109,49 @@ function KeyValueEditor({
             value={p.key}
             onChange={(e) => update(i, { key: e.target.value })}
             placeholder={keyPlaceholder}
+            // The stored value belongs to this key: renaming means replacing it.
+            readOnly={p.masked}
+            title={p.masked ? 'Replace the value to rename this key' : undefined}
           />
           <span className="text-dim text-[12px] font-mono">=</span>
-          <input
-            className={`${inputCls} flex-1 font-mono`}
-            value={p.value}
-            onChange={(e) => update(i, { value: e.target.value })}
-            placeholder={valuePlaceholder}
-          />
+          {p.masked ? (
+            <>
+              <input
+                className={`${inputCls} flex-1 font-mono text-dim`}
+                value={p.value}
+                readOnly
+                aria-label={`${p.key} value (saved, hidden)`}
+                title="Saved value is hidden"
+              />
+              <button
+                type="button"
+                onClick={() => update(i, { value: '', masked: false })}
+                className={rowBtnCls}
+                aria-label={`Replace ${p.key} value`}
+              >
+                Replace
+              </button>
+            </>
+          ) : (
+            <>
+              <input
+                className={`${inputCls} flex-1 font-mono`}
+                value={p.value}
+                onChange={(e) => update(i, { value: e.target.value })}
+                placeholder={p.savedKey !== undefined ? 'new value' : valuePlaceholder}
+              />
+              {p.savedKey !== undefined && (
+                <button
+                  type="button"
+                  onClick={() => keepSaved(i)}
+                  className={rowBtnCls}
+                  aria-label={`Keep saved ${p.savedKey} value`}
+                >
+                  Keep saved
+                </button>
+              )}
+            </>
+          )}
           <button
             type="button"
             onClick={() => onChange(pairs.filter((_, idx) => idx !== i))}
@@ -516,18 +571,23 @@ export function McpServerFormDialog({
     return false;
   };
 
-  // Built-in admin probe: in edit mode with masked (unchanged) secrets, probe
-  // via the saved-server /test endpoint which decrypts the stored secret
-  // server-side. In create mode (or when the admin has retyped the secret) the
-  // id-less /probe with the plaintext auth from the form is used instead.
+  // Built-in admin probe: in edit mode with any masked (unchanged) value - the
+  // auth secret or a header - probe via the saved-server /test endpoint, which
+  // substitutes the stored value for each masked one server-side (and refuses
+  // if the endpoint was changed, so stored secrets never follow a new URL). In
+  // create mode (or once everything masked has been retyped) the id-less
+  // /probe with the plaintext from the form is used instead.
   // Only used when no explicit `probe` prop is supplied.
   const builtInProbeTools = (): Promise<McpTestResult> => {
-    if (isEdit && server && authHasMasked()) {
-      // Secret fields still masked - use the stored-secret path with optional
-      // overrides for non-secret fields the admin may have edited.
+    const keepStoredAuth = authHasMasked();
+    if (isEdit && server && (keepStoredAuth || headersPairs.some((p) => p.masked))) {
+      // Overrides for whatever the admin may have edited; masked header values
+      // travel as the sentinel, and a still-masked auth is omitted so the
+      // stored one is used.
       return api.admin.mcp.test(server.id, {
         endpoint: endpoint.trim() || undefined,
         headers: fromKv(headersPairs),
+        auth: keepStoredAuth ? undefined : buildAuth(),
         timeout_seconds: parseTimeout() ?? undefined,
       });
     }

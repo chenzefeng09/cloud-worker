@@ -6,6 +6,12 @@ it presents the secret it received from the external caller to this endpoint,
 which does a constant-time comparison against the stored SHA-256 digest and, on
 success, returns the minimal trigger context the receiver needs to launch a run.
 
+The BFF's privacy fan-out (GDPR export / erasure) lists and deletes one user's
+triggers here, tenant-scoped by ``X-Tenant-Id``:
+
+    GET    /internal/privacy/users/{user_id}/cron-jobs → {"items": [...]}
+    DELETE /internal/privacy/users/{user_id}/cron-jobs → {"deleted": n}
+
 Auth
 ----
 cron-runner has no JWT trust chain; internal callers are authenticated by the
@@ -23,10 +29,12 @@ import hashlib
 import hmac
 import logging
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Path, Request, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
+from cron_runner.api.dependencies import TTenantId
+from cron_runner.api.v1.cron_jobs import CronJobOut, _get_scheduler, _remove_job
 from cron_runner.domain.db import get_session
 from cron_runner.domain.models import CronJob
 
@@ -50,6 +58,16 @@ class VerifyWebhookOut(BaseModel):
     # fixed and from-event fields. Empty ``{}`` for all-from-event triggers.
     input_values: dict
     trigger_type: str
+    # The trigger's owner, for recording whose behalf the run is on.
+    created_by_user_id: str | None = None
+
+
+class UserCronJobsOut(BaseModel):
+    items: list[CronJobOut]
+
+
+class DeletedOut(BaseModel):
+    deleted: int
 
 
 def _require_service_token(request: Request) -> None:
@@ -119,4 +137,71 @@ async def verify_webhook_secret(
         field_mapping=job.field_mapping,
         input_values=job.input_values or {},
         trigger_type=job.trigger_type,
+        created_by_user_id=job.created_by_user_id,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Privacy fan-out — one user's triggers (GDPR Art. 15/20 export, Art. 17 erasure)
+# --------------------------------------------------------------------------- #
+
+_UserIdPath = Path(min_length=1, max_length=40)
+
+
+@router.get(
+    "/internal/privacy/users/{user_id}/cron-jobs",
+    response_model=UserCronJobsOut,
+)
+async def list_user_cron_jobs(
+    request: Request,
+    user_id: str = _UserIdPath,
+    tenant_id: str = TTenantId,
+) -> UserCronJobsOut:
+    """Every trigger ``user_id`` created in the tenant (secret hashes never leave)."""
+    _require_service_token(request)
+    jobs: list[CronJob] = []
+    async for session in get_session(tenant_id=tenant_id, user_id="svc-cron", actor="SYSTEM"):
+        result = await session.execute(
+            select(CronJob)
+            .where(CronJob.tenant_id == tenant_id, CronJob.created_by_user_id == user_id)
+            .order_by(CronJob.created_at, CronJob.id)
+        )
+        jobs = list(result.scalars().all())
+    return UserCronJobsOut(items=[CronJobOut.model_validate(job) for job in jobs])
+
+
+@router.delete(
+    "/internal/privacy/users/{user_id}/cron-jobs",
+    response_model=DeletedOut,
+)
+async def delete_user_cron_jobs(
+    request: Request,
+    user_id: str = _UserIdPath,
+    tenant_id: str = TTenantId,
+) -> DeletedOut:
+    """Delete every trigger ``user_id`` created in the tenant and unschedule it.
+
+    Idempotent: a repeat finds nothing and reports ``deleted: 0``.
+    """
+    _require_service_token(request)
+    scheduler = _get_scheduler(request)
+    job_ids: list[str] = []
+    async for session in get_session(tenant_id=tenant_id, user_id="svc-cron", actor="SYSTEM"):
+        result = await session.execute(
+            select(CronJob.id).where(
+                CronJob.tenant_id == tenant_id, CronJob.created_by_user_id == user_id,
+            )
+        )
+        job_ids = list(result.scalars().all())
+        if job_ids:
+            # Unschedule first (as DELETE /cron-jobs/{id} does): a fire that
+            # races the delete then finds no row and skips.
+            if scheduler is not None:
+                for job_id in job_ids:
+                    _remove_job(scheduler, job_id)
+            await session.execute(delete(CronJob).where(CronJob.id.in_(job_ids)))
+    if job_ids:
+        logger.info(
+            "privacy: deleted %d trigger(s)", len(job_ids), extra={"tenant_id": tenant_id},
+        )
+    return DeletedOut(deleted=len(job_ids))

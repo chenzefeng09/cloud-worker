@@ -230,15 +230,18 @@ come from `existingSecret` references so the chart never bakes literals.
 | Secret | Purpose | Generate / source |
 |---|---|---|
 | `BFF_COOKIE_SECRET` | Signs the `ap_session` browser cookie. `CookieSigner` rejects empty/placeholder/`<32`-char values at startup. | `python3 -c "import secrets; print(secrets.token_urlsafe(48))"` |
+| `BFF_SESSION_TOKEN_KEYS` | Comma-separated Fernet keys that encrypt the identity access/refresh tokens the BFF keeps per browser session (`web_sessions`). The first key encrypts, every key decrypts: rotate by putting a new key first, and drop the old one once the sessions it encrypted have ended (identity's absolute session timeout, 8 h by default). A session whose tokens no key can decrypt simply ends and the user signs in again. Empty = a key derived from `BFF_COOKIE_SECRET`, acceptable for dev only. | `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 | `TOOL_BROKER_LEASE_SECRET` + `SCHEDULER_TOOL_BROKER_LEASE_SECRET` | Shared HMAC anchor for per-run sandbox capability leases. The scheduler signs; the broker verifies. **Must be identical.** A leaked/misconfigured value lets a sandbox self-sign leases and bypass tenant/scope boundaries. | `python3 -c "import secrets; print(secrets.token_urlsafe(48))"` |
 | `SCHEDULER_SERVICE_TOKEN` | Lets the scheduler mint short-lived per-run sandbox tokens from Foundation Identity. Scope limited to service-account token issuance. **Never expose to sandboxes** — only the per-run minted token belongs in a sandbox. | Issued by Foundation Identity. |
 | `APP_USER_PASSWORD` / `APP_MIGRATOR_PASSWORD` | Postgres roles inherited from Foundation (least-privilege app user vs. migrator). | Operator-set; never reuse the `*_change_me` placeholders in production. |
 
 > **No model provider key.** All agent model traffic goes through the Foundation
-> LLM gateway with a per-tenant virtual key resolved by the scheduler; provider
-> keys are configured on the gateway (saas-foundation), not here. `LLM_API_KEY`,
-> `LLM_PROVIDER`, `LLM_BASE_URL` and `RUNTIME_EXTENSIONS` are no longer read, and a
-> tenant without a virtual key cannot start runs.
+> LLM gateway: provider keys are configured on the gateway (saas-foundation; in the
+> web app under Admin → Models), not here, and the scheduler gives each run a
+> short-lived virtual key bound to the tenant's provider. `LLM_API_KEY`,
+> `LLM_PROVIDER`, `LLM_BASE_URL` and `RUNTIME_EXTENSIONS` are no longer read. A
+> tenant with no enabled provider cannot start runs: they are refused with
+> `AGENT.RUN.LLM_NOT_CONFIGURED`, and the user is told an administrator has to add one.
 
 > **Generation pattern.** All HMAC/cookie secrets use the same recipe:
 > `python3 -c "import secrets; print(secrets.token_urlsafe(48))"`. Each must be
@@ -251,11 +254,23 @@ In Helm, inject secrets via `existingSecret` rather than chart values:
 
 | Chart field | Backing Secret |
 |---|---|
-| `bff.existingSecret` | `BFF_COOKIE_SECRET` |
+| `bff.existingSecret` | `BFF_COOKIE_SECRET`, `BFF_SESSION_TOKEN_KEYS` |
 | `toolBroker.existingSecret` | `TOOL_BROKER_LEASE_SECRET` (the scheduler **reuses the same Secret** — do not create a second one) |
 | `agentScheduler.existingSecret` | scheduler service token, Keycloak client secret |
 | `global.foundation.database.existingSecret` | Postgres app/migrator credentials |
 | `global.foundation.redis.existingSecret` / `global.foundation.s3.existingSecret` | Redis / MinIO credentials (consumed by the tool-broker façades) |
+
+### DLP failure policy
+
+`DLP_FAILURE_MODE` (compose) / `global.foundation.dlpFailureMode` (helm) decides
+what happens when a Foundation DLP check cannot be completed (DLP unreachable,
+timed out, non-2xx or unparseable answer). `closed` (the default) refuses: the
+sandbox denies the tool call, and the session-orchestrator answers an upload or
+download with 503 `AGENT.DLP.UNAVAILABLE`. `open` lets it through and logs an
+error every time. Both services log the effective policy at startup. Deploy the
+Foundation DLP release that lets any tenant caller scan before (or together
+with) new sandbox images: an older DLP refuses those scans, and with `closed`
+every tool call would be denied. See [`dlp-real-defense-plan.md`](dlp-real-defense-plan.md).
 
 ### Egress mode
 

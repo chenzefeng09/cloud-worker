@@ -20,10 +20,21 @@ export interface FileSpec {
   mime: string;
 }
 
-/** One prior conversation turn. `tool` is present on tool turns only. */
+/**
+ * `HistoryItem.type` of the item the orchestrator puts first when it had to
+ * leave the oldest turns out of the task to keep it under its size limit.
+ */
+export const HISTORY_OMITTED = "history_omitted";
+
+/**
+ * One prior conversation turn. `tool` is present on tool turns only; a
+ * `history_omitted` item (role "system") stands for `omitted` earlier turns.
+ */
 export interface HistoryItem {
-  role: "user" | "assistant" | "tool";
+  role: "user" | "assistant" | "tool" | "system";
+  type?: string;
   content?: string;
+  omitted?: number;
   tool?: {
     id: string;
     name: string;
@@ -298,8 +309,12 @@ export interface Env {
   SANDBOX_EGRESS_MODE: string;
   // Data-loss-prevention scan endpoint (PreToolUse hook). Wired by the backend
   // to a direct DLP base (foundation mode) or a broker façade base (broker mode);
-  // empty when DLP is not configured (the hook then fails open).
+  // empty when DLP is disabled for the deployment (tool calls are not scanned).
   DLP_URL: string;
+  // "closed" (default; also used for an empty/unknown value) blocks a tool call
+  // whose DLP scan cannot complete; "open" lets it run unscanned and logs it as
+  // an error. See dlp.ts.
+  DLP_FAILURE_MODE: string;
   // Observability.
   OTEL_EXPORTER_OTLP_ENDPOINT: string;
 }
@@ -333,6 +348,7 @@ export function readEnv(): Env {
     TOOL_BROKER_LEASE: get("TOOL_BROKER_LEASE"),
     SANDBOX_EGRESS_MODE: get("SANDBOX_EGRESS_MODE"),
     DLP_URL: get("DLP_URL"),
+    DLP_FAILURE_MODE: get("DLP_FAILURE_MODE"),
     OTEL_EXPORTER_OTLP_ENDPOINT: get("OTEL_EXPORTER_OTLP_ENDPOINT"),
   };
 }

@@ -31,6 +31,10 @@ export const SYSTEM_FALLBACK_MODEL = 'deepseek-v4-flash';
  */
 export const DEFAULT_MODEL = SYSTEM_FALLBACK_MODEL;
 
+/** Shown where a model is picked when the tenant has no enabled provider. */
+export const NO_MODEL_CONFIGURED =
+  'No AI model is set up for your organization yet. An administrator can add one under Admin → Models.';
+
 export type EffortId = '' | 'low' | 'medium' | 'high';
 
 export interface EffortOption {

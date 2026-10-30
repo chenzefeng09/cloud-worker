@@ -28,7 +28,7 @@ def is_valid_sensitivity(value: str | None) -> bool:
 def sensitivity_rank(value: str | None) -> int:
     """Rank of a level (0-based). Unknown / None → 0 (== L1, fail-closed)."""
     try:
-        return SENSITIVITY_LEVELS.index(value)  # type: ignore[arg-type]
+        return SENSITIVITY_LEVELS.index(value)
     except (ValueError, TypeError):
         return 0
 

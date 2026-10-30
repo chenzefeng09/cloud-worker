@@ -83,10 +83,12 @@ def create_app(
     from knowledge_ingest.api.v1.documents import router as docs_router
     from knowledge_ingest.api.v1.folders import router as folders_router
     from knowledge_ingest.api.v1.health import router as health_router
+    from knowledge_ingest.api.v1.memories import router as memories_router
 
     app.include_router(health_router, prefix=settings.api_prefix)
     app.include_router(folders_router, prefix=settings.api_prefix)
     app.include_router(docs_router, prefix=settings.api_prefix)
+    app.include_router(memories_router, prefix=settings.api_prefix)
     return app
 
 

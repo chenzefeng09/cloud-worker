@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from foundation_sdk.fastapi import install_request_context, register_problem_details
 
+from agent_session_orchestrator.api.dlp_guard import log_dlp_policy
 from agent_session_orchestrator.config import Settings
 from agent_session_orchestrator.domain.db import close_db, init_db
 from agent_session_orchestrator.observability import init_observability
@@ -40,15 +41,19 @@ def _make_blob_store(settings: Settings):  # type: ignore[no-untyped-def]
         return None
 
 
-async def _retention_sweep_loop(settings: Settings) -> None:
-    """Periodically soft-delete sessions past the retention window.
+async def _retention_sweep_loop(settings: Settings, blob_store: object | None = None) -> None:
+    """Periodically soft-delete inactive sessions, then hard-purge the trash.
 
     Sleeps a short startup delay first (avoid boot-time stampede), then loops
     forever on ``session_retention_sweep_interval_seconds`` (default 24h).
-    Any error is logged and the loop keeps running so a single bad sweep does
-    not silently kill retention enforcement.
+    Each tick runs the inactivity sweep (``session_retention_days``) and then
+    physically purges data soft-deleted more than ``trash_grace_days`` ago
+    (rows + S3 blobs, see ``privacy_service.purge_trash``).  Any error is
+    logged and the loop keeps running so a single bad sweep does not silently
+    kill retention enforcement.
     """
     # Imported lazily to keep app import light and avoid import cycles.
+    from agent_session_orchestrator.services.privacy_service import purge_trash
     from agent_session_orchestrator.services.session_service import (
         purge_expired_sessions,
     )
@@ -59,6 +64,12 @@ async def _retention_sweep_loop(settings: Settings) -> None:
             await purge_expired_sessions(settings, settings.session_retention_days)
         except Exception:  # pragma: no cover — keep the loop alive
             logger.exception("retention sweep tick failed")
+        try:
+            await purge_trash(
+                settings, grace_days=settings.trash_grace_days, blob_store=blob_store,
+            )
+        except Exception:  # pragma: no cover — keep the loop alive
+            logger.exception("trash purge tick failed")
         await asyncio.sleep(settings.session_retention_sweep_interval_seconds)
 
 
@@ -66,22 +77,32 @@ async def _retention_sweep_loop(settings: Settings) -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = app.state.settings
     init_observability(service_name="session-orchestrator")
+    # The effective DLP policy goes in the log at startup, not at the first
+    # upload or download (a bad DLP_FAILURE_MODE value shows up here too).
+    log_dlp_policy(settings.foundation_dlp_url)
     await init_db(settings)
 
-    from agent_session_orchestrator.services.reconcile_sweeper import run_sweeper
+    from agent_session_orchestrator.services.reconcile_sweeper import (
+        run_completion_watcher,
+        run_sweeper,
+    )
 
     sweep_task = asyncio.create_task(
-        _retention_sweep_loop(settings), name="session-retention-sweep"
+        _retention_sweep_loop(settings, app.state.blob_store), name="session-retention-sweep"
     )
     reconcile_task = asyncio.create_task(
         run_sweeper(app), name="run-reconcile-sweep"
+    )
+    completion_task = asyncio.create_task(
+        run_completion_watcher(app), name="run-completion-watcher"
     )
 
     from agent_session_orchestrator.services.version_cleanup import (
         run_version_cleanup_loop,
     )
     version_cleanup_task = asyncio.create_task(
-        run_version_cleanup_loop(settings), name="workspace-version-cleanup"
+        run_version_cleanup_loop(settings, blob_store=app.state.blob_store),
+        name="workspace-version-cleanup",
     )
 
     try:
@@ -89,6 +110,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         sweep_task.cancel()
         reconcile_task.cancel()
+        completion_task.cancel()
         version_cleanup_task.cancel()
         # Cancelled tasks raise CancelledError on await — expected; suppress
         # so shutdown completes cleanly.
@@ -96,6 +118,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await sweep_task
         with contextlib.suppress(asyncio.CancelledError):
             await reconcile_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await completion_task
         with contextlib.suppress(asyncio.CancelledError):
             await version_cleanup_task
         await close_db()
@@ -112,6 +136,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     app.state.settings = settings
     app.state.blob_store = _make_blob_store(settings)
+
+    # Paths without ``app.state`` (reconcile writeback, rewind, session delete)
+    # find the settings + blob store through the privacy-service registry.
+    from agent_session_orchestrator.services import privacy_service
+    privacy_service.configure(settings=settings, blob_store=app.state.blob_store)
 
     from agent_session_orchestrator.services.quota_guard import QuotaGuard
     app.state.quota_guard = QuotaGuard(billing_url=settings.foundation_billing_url)
@@ -135,6 +164,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from agent_session_orchestrator.api.v1.runs import router as runs_router
     app.include_router(runs_router, prefix=settings.api_prefix)
+
+    from agent_session_orchestrator.api.v1.tasks import router as tasks_router
+    app.include_router(tasks_router, prefix=settings.api_prefix)
+
+    from agent_session_orchestrator.api.v1.privacy import router as privacy_router
+    app.include_router(privacy_router, prefix=settings.api_prefix)
 
     from agent_session_orchestrator.api.v1.attachments import router as attachments_router
     app.include_router(attachments_router, prefix=settings.api_prefix)

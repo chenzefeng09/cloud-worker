@@ -132,7 +132,7 @@ sequenceDiagram
     participant R as Redis
 
     U->>B: GET /auth/me（签名 ap_session cookie）
-    B->>FID: 校验内嵌 access token（JWKS）
+    B->>FID: 校验会话存储的 access token（JWKS）
     FID-->>B: 身份通过
     U->>B: POST /sessions/{id}/chat
     B->>O: 转发（会话/消息/运行 CRUD + RLS）
@@ -140,7 +140,7 @@ sequenceDiagram
     O->>O: 预取知识库 top-k 写入 sys_prompt
     O->>S: POST /runs (create_run)
     S->>FID: 铸造短时按运行的 foundation JWT
-    S->>FLLM: GET /tenant-keys（解析 LLM 虚拟密钥）
+    S->>FLLM: POST /tenant-keys/ephemeral（按运行的 LLM 虚拟密钥）
     S->>P: 领取一个预热沙盒槽位
     S->>SBX: 生成（docker-socket-proxy / cube-controller mTLS）
     Note over S,SBX: 投递身份+LLM+OTEL 环境变量、task.json，<br/>以及 mode-0600 /workspace/.secrets.json（6 个密钥）
@@ -162,15 +162,22 @@ sequenceDiagram
 
 逐步说明：
 
-1. **会话。** 浏览器持有 BFF 签名的 `ap_session` cookie。`AuthGate` 调用 BFF `/auth/me`，后者将内嵌
-   的 access token 转发给 Foundation identity 做 JWKS 校验。
+1. **会话。** 浏览器持有 BFF 签名的 `ap_session` cookie，cookie 只标识一个服务端会话
+   （`{sid, tenant_id, user_id}`）。该会话的 identity access/refresh token 存在 BFF 的
+   `web_sessions` 表里，用 `BFF_SESSION_TOKEN_KEYS` 加密；BFF 在 access token 快到期前自行刷新，
+   浏览器始终拿不到 token。`AuthGate` 调用 BFF `/auth/me`，后者把存储的 access token 转发给
+   Foundation identity 做 JWKS 校验；其它接口返回 401 时，也先这样确认，再让用户退出登录。
 2. **聊天/运行请求。** SPA 向 BFF（鉴权网关 + API 聚合 + SSE 中继）发起 POST，BFF 转发给
    **session-orchestrator** 在 RLS 下完成会话/消息/运行 CRUD。orchestrator 负责 DLP
    `check:download` / 扫描钩子，用计费 `QuotaGuard` 强制配额，并预取租户知识库的 top-k 命中追加到
    该运行的 `sys_prompt`。
 3. **create_run。** orchestrator（经 scheduler 路径）铸造一个短时按运行的 Foundation JWT 并调用
    **agent-scheduler**。
-4. **解析 + 生成。** scheduler 解析租户 LLM 虚拟密钥（`llm-gateway GET /tenant-keys`；解析不到即令生成失败），并经所选的
+4. **解析 + 生成。** scheduler 签发一个随运行过期的按运行 LLM 虚拟密钥（`llm-gateway POST /tenant-keys/ephemeral`；
+   签发失败时才回退到 `GET /tenant-keys` 的租户长期密钥）。租户没有已启用的 LLM provider 时运行被拒绝
+   （`AGENT.RUN.LLM_NOT_CONFIGURED`：告知用户需由管理员添加），完全拿不到密钥则令生成失败。BFF 自己的
+   模型调用（画布修订、会话标题）用同类短期密钥，按租户铸造并复用几分钟；没有 provider 时画布修订返回
+   `AGENT.BFF.CANVAS.LLM_NOT_CONFIGURED`，会话标题退回取首条消息开头。随后经所选的
    `SandboxRuntime` 实现（Docker 经 docker-socket-proxy，或 Cube 经 cube-controller 在 `:8443` 上的
    mTLS）从一个预热 **sandbox-pool** 槽位生成沙盒。它投递身份 + LLM + OTEL 环境变量、`task.json`
    （`{task, mcp_server_ids, skills, files, sys_prompt, …}`），以及一个 mode-`0600` 的
@@ -213,8 +220,9 @@ Agent Platform 由 11 个服务组成。除非另有说明，均为 Python 3.12�
 **Backend-for-frontend —— 端口 8005。** FastAPI 标题 *Agent Platform — BFF*，API 前缀
 `/api/bff/v1`。它终结浏览器会话（经 `foundation_sdk.CookieSigner` + `SessionMiddleware` 的签名
 `ap_session` cookie），针对 identity-service 暴露 login/logout/me，并向每个平台与 Foundation 服务
-扇出、聚合并中继响应（含 SSE 聊天流）。它有一个小型 BFF 本地库（`agent_bff` schema）存放通知偏好
-与 API 密钥，并接受共享的 `X-Service-Token` 供 `cron-runner` 等机器调用方使用。
+扇出、聚合并中继响应（含 SSE 聊天流）。它有一个小型 BFF 本地库（`agent_bff` schema）存放通知偏好、
+API 密钥和服务端 web 会话（加密的 identity token，见上文第 1 步），并接受共享的 `X-Service-Token`
+供 `cron-runner` 等机器调用方使用。
 
 - **关键端点：** `POST /auth/login`、`GET /auth/me`、`POST /auth/logout`；
   `GET/POST /sessions`、`POST /sessions/{session_id}/chat`、
@@ -255,7 +263,7 @@ Agent Platform 由 11 个服务组成。除非另有说明，均为 Python 3.12�
 启动时构建可插拔沙盒运行时（`docker` 或 `cube`），并在 `POST /runs` 时从 Foundation identity 铸造一个
 按运行的、限定作用域的租户令牌，签发一个 HMAC tool-broker 能力租约，并以配置的出口模式（`broker` /
 `foundation` / `none`）经 docker-socket-proxy 启动沙盒。每个沙盒都运行 Claude SDK 镜像
-（`AGENT_IMAGE` / `SCHEDULER_AGENT_IMAGE`）；scheduler 转发注册/网关 URL，投递租户 LLM 虚拟密钥
+（`AGENT_IMAGE` / `SCHEDULER_AGENT_IMAGE`）；scheduler 转发注册/网关 URL，投递按运行的 LLM 虚拟密钥
 （解析不到即令生成失败），并以 `QuotaGuard` 强制计费配额。
 
 - **关键端点：** `POST /runs`、`GET /runs`、`GET /runs/{run_id}`、`POST /runs/{run_id}/cancel`、
@@ -329,7 +337,9 @@ AppVersion，并管理 App 生命周期：创建/更新 app、创建版本、提
 - **关键端点：** `GET/POST /apps`、`GET/PUT/DELETE /apps/{app_id}`、
   `POST /apps/{app_id}/versions`、`PUT /apps/{app_id}/versions/{vid}`、
   `POST .../versions/{vid}/submit`、`/approve`、`/reject`、`/publish`（审核流程）；
-  `GET .../internal` 解析（受服务作用域守护）；`GET /healthz`。
+  `GET .../internal` 解析（受服务作用域守护）；`GET /privacy/apps` 与
+  `POST /privacy/apps/erase`（GDPR 导出/擦除某个用户的 App 与审核记录；默认是调用者本人，
+  `X-Actor: ADMIN` 调用方可指定他人）；`GET /healthz`。
 - **依赖：** `foundation_sdk`；Foundation authz；Postgres（`app_registry` schema）。
 
 ### cron-runner
@@ -400,7 +410,7 @@ Claude SDK 运行；不存在进程内（"inline"）执行路径。决策见
 | `worker.ts` | 运行循环：把附件下载到 `/workspace/inputs`，组装系统提示（续跑说明、记忆、历史、含预取知识命中的 `sys_prompt`、技能索引），从 `mcp-registry` 解析租户 MCP 服务器，注册进程内 `web_fetch` 工具（经 web-fetch-gateway），并驱动 SDK `query()`。 |
 | `event_translator.ts` | 把 SDK 消息流转换为平台事件词汇（`events.jsonl` + Redis 令牌流）。 |
 | `hitl.ts` | 人在回路的暂停/续跑（`pending_confirmation` / `pending_question`）。 |
-| `dlp.ts` | 调用 Foundation DLP `core/scan` 的 `PreToolUse` 钩子（fail-open）。 |
+| `dlp.ts` | 调用 Foundation DLP `core/scan` 的 `PreToolUse` 钩子：只拦 `QUARANTINE`（L4 及以上）；默认 fail-closed（`DLP_FAILURE_MODE`）。 |
 | `redis_state.ts` | 热状态 + 令牌流写入（直连，或经 tool-broker `/state` 门面）。 |
 
 **知识库。** orchestrator 为每次运行预取租户知识库的 top-k 命中，并追加到 worker 的 `sys_prompt`。
@@ -479,7 +489,7 @@ Claude SDK 运行；不存在进程内（"inline"）执行路径。决策见
   `FOUNDATION_API_TOKEN`、`TOOL_BROKER_LEASE`、`LLM_VIRTUAL_KEY` 等），由 worker 载入 `process.env`
   后立即 unlink —— 既不在容器的 `environment=` 块或 `/proc/1/environ` 中，也从 agent 的
   `Read`/`Bash` 工具可见的可写工作区中移除。
-- **LLM 网关强制。** worker 的 `adapter.ts` 用租户虚拟密钥（配额 + 审计 + 模型路由）将所有沙盒 LLM
+- **LLM 网关强制。** worker 的 `adapter.ts` 用按运行的虚拟密钥（配额 + 审计 + 模型路由）将所有沙盒 LLM
   流量经 Foundation llm-gateway 路由。Agent 栈中不存在任何 provider API 密钥，缺失虚拟密钥会
   **令生成失败**。按运行的沙盒令牌不含 `audit.write`。
 - **DLP（真实防线，而非测试页）。** 一个默认全局正则规则库（身份证 / 电话 / 银行卡 / 邮箱 / AWS 密钥 /

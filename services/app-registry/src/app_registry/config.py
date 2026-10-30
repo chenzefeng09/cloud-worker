@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     db_pool_size: int = 5
     db_max_overflow: int = 10
     db_pool_recycle: int = 1800
+    # Log every SQL statement (APP_REGISTRY_SQL_ECHO=true), for a targeted SQL-debugging
+    # session only; off by default, dev included. Bound parameters are never
+    # logged either way: they carry tenant data.
+    sql_echo: bool = False
 
     # Foundation authz — RBAC enforcement (fail-closed guard).
     authz_url: str = "http://authz:8002/api/authz/v1"

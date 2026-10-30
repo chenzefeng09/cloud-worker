@@ -58,10 +58,12 @@ class Settings(BaseSettings):
     foundation_billing_url: str = "http://billing:8007/api/billing/v1"
     feature_flag_url: str = "http://feature-flag:8012/api/feature-flag/v1"
 
-    # Foundation DLP — data-flow controls on the attachment path:
-    #   • download check:download (fail-open on DLP error — see dlp_guard.py)
-    #   • upload   scan + classification:tag (fail-open)
-    # Env var: SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL
+    # Foundation DLP — data-flow controls on attachments and workspace files:
+    #   • download: check:download (DLP resolves the user's clearance itself)
+    #   • upload:   scan before the blob is written; DLP tags the resource
+    # A check that cannot be completed follows SESSION_ORCHESTRATOR_DLP_FAILURE_MODE
+    # (closed by default = 503, nothing stored or served; see dlp_guard.py).
+    # Empty = DLP disabled.  Env var: SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL
     foundation_dlp_url: str = "http://foundation-dlp:80/api/dlp/v1"
 
     # Session-retention sweep — background job that soft-deletes sessions older
@@ -71,6 +73,19 @@ class Settings(BaseSettings):
     #   SESSION_ORCHESTRATOR_SESSION_RETENTION_SWEEP_INTERVAL_SECONDS
     session_retention_days: int = 30
     session_retention_sweep_interval_seconds: int = 86400
+    # Trash grace period — soft-deleted sessions (and soft-deleted workspaces /
+    # canvases) whose ``deleted_at`` is older than this many days are physically
+    # purged, together with their child rows and S3 blobs, by the same sweep
+    # loop.  ``0`` purges on the next sweep; a negative value disables the hard
+    # purge.  Env var: SESSION_ORCHESTRATOR_TRASH_GRACE_DAYS
+    trash_grace_days: int = 30
+    # Service accounts that start runs on a user's behalf — cron-runner's
+    # scheduled runs (``CRON_RUNNER_SERVICE_USER_ID``).  Their sessions carry
+    # ``metadata.on_behalf_of_user_id``, and that user's privacy export and
+    # erasure include them.  The tag counts only on sessions these accounts
+    # own: any user can set session metadata on their own sessions.
+    # Env var (JSON list): SESSION_ORCHESTRATOR_ON_BEHALF_PRINCIPAL_USER_IDS
+    on_behalf_principal_user_ids: list[str] = ["usr_01SVCCRON00000000000000000"]
 
     # Redis — used to read agent run hot-state (plan/step/cursor) written by the
     # Claude SDK worker inside the sandbox.  Key schema: agent:run:{run_id}:state.

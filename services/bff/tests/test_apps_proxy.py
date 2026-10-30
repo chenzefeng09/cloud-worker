@@ -262,6 +262,85 @@ def test_run_app_omits_mcp_server_ids_when_app_forces_none(
 
 
 # ---------------------------------------------------------------------------
+# on_behalf_of — whose schedule a service-account run belongs to
+# ---------------------------------------------------------------------------
+
+_SERVICE_TOKEN = "svc-token-for-test"
+_CRON_USER = "usr_01SVCCRON00000000000000000"
+_OWNER = "usr_01J5TEST0000000000000USER1"
+_TENANT = "tnt_01J5TEST00000000000000TNT1"
+
+
+@pytest.fixture
+def service_client_and_stub(
+    settings_for_apps: Settings,
+    client_and_stub: tuple[TestClient, FakeRunAppFoundation],
+) -> tuple[TestClient, FakeRunAppFoundation]:
+    """Same stub as ``client_and_stub``, on an app that has a service token."""
+    _client, fake = client_and_stub
+    settings = settings_for_apps.model_copy(update={"service_token": _SERVICE_TOKEN})
+    with TestClient(create_app(settings), raise_server_exceptions=False) as c:
+        yield c, fake
+
+
+def _session_metadata(fake: FakeRunAppFoundation) -> dict:
+    [body] = [
+        b for m, url, b in fake.calls if m == "POST" and url.endswith("/sessions")
+    ]
+    return body["agent_config"]
+
+
+def test_run_app_records_on_behalf_of_for_a_service_caller(
+    service_client_and_stub: tuple,
+) -> None:
+    client, fake = service_client_and_stub
+    resp = client.post(
+        "/api/bff/v1/apps/app_test/run",
+        json={"inputs": {"task": "hello"}, "source": "schedule", "on_behalf_of": _OWNER},
+        headers={
+            "X-Service-Token": _SERVICE_TOKEN,
+            "X-Tenant-Id": _TENANT,
+            "X-User-Id": _CRON_USER,
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert _session_metadata(fake) == {
+        "kind": "app_run",
+        "app_id": "app_test",
+        "app_version_id": "ver_test",
+        "on_behalf_of_user_id": _OWNER,
+    }
+
+
+@pytest.mark.parametrize(
+    "headers,on_behalf_of",
+    [
+        ({}, _OWNER),  # a signed-in user
+        ({"X-Service-Token": "wrong"}, _OWNER),  # cookie + a bad token
+        ({"X-Service-Token": _SERVICE_TOKEN}, "not-a-user-id"),
+        ({"X-Service-Token": _SERVICE_TOKEN}, ["usr_01J5TEST0000000000000USER1"]),
+    ],
+)
+def test_run_app_ignores_on_behalf_of_it_cannot_trust(
+    service_client_and_stub: tuple,
+    authed: dict[str, str],
+    headers: dict[str, str],
+    on_behalf_of: object,
+) -> None:
+    client, fake = service_client_and_stub
+    if headers.get("X-Service-Token") == _SERVICE_TOKEN:
+        headers = {**headers, "X-Tenant-Id": _TENANT, "X-User-Id": _CRON_USER}
+    resp = client.post(
+        "/api/bff/v1/apps/app_test/run",
+        json={"inputs": {"task": "hello"}, "on_behalf_of": on_behalf_of},
+        headers=headers,
+        cookies=authed,
+    )
+    assert resp.status_code == 201, resp.text
+    assert "on_behalf_of_user_id" not in _session_metadata(fake)
+
+
+# ---------------------------------------------------------------------------
 # GET /apps/{id}/runs - App execution history proxy
 # ---------------------------------------------------------------------------
 

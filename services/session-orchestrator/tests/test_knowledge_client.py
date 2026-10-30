@@ -1,12 +1,12 @@
 """Unit coverage for the knowledge-ingest client (session-consumption side).
 
-Exercises the ``GET /search?scope=knowledge`` contract from
-docs/knowledge-library-v1.md: the effective-clearance header, scope param, the
+Exercises the ``POST /search`` (``scope=knowledge``) contract from
+docs/knowledge-library-v1.md: the effective-clearance header, scope field, the
 ``[Document | folder/path]`` provenance formatting, and fail-open behaviour on every
 error path (a retrieval outage must never block the conversation).
 
 Style mirrors the other service unit tests: a fake ``httpx.AsyncClient`` that
-records url/params/headers and returns canned JSON.
+records url/params-or-body/headers and returns canned JSON.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ class _FakeResp:
 
 
 class _FakeKiClient:
-    """Records every GET (url, params, headers) and returns configured bodies."""
+    """Records every call (url, params or JSON body, headers) and returns configured bodies."""
 
     def __init__(
         self,
@@ -56,13 +56,21 @@ class _FakeKiClient:
         self.calls.append((url, params or {}, headers or {}))
         if self.raise_get:
             raise httpx.ConnectError("ki down")
-        if url.endswith("/search"):
-            return _FakeResp(self.status, {"hits": self.search_hits or []})
         if url.endswith("/documents"):
             return _FakeResp(
                 self.status, self.docs_payload if self.docs_payload is not None else []
             )
         raise AssertionError(f"unexpected GET {url}")
+
+    async def post(  # type: ignore[no-untyped-def]
+        self, url: str, json: dict | None = None, headers: dict | None = None, **kw: Any,
+    ):
+        self.calls.append((url, json or {}, headers or {}))
+        if self.raise_get:
+            raise httpx.ConnectError("ki down")
+        if url.endswith("/search"):
+            return _FakeResp(self.status, {"hits": self.search_hits or []})
+        raise AssertionError(f"unexpected POST {url}")
 
 
 def _await(coro):  # type: ignore[no-untyped-def]

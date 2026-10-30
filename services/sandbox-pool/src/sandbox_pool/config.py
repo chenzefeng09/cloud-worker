@@ -18,6 +18,7 @@ override via env.
 
 from __future__ import annotations
 
+import socket
 from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -108,6 +109,13 @@ class Settings(BaseSettings):
     # (project ``agent-platform-dev`` + network key ``sandbox_broker``) and must
     # match the scheduler's ``sandbox_broker_network`` default.
     docker_network: str = "agent-platform-dev_sandbox_broker"
+    # Identity this pool process stamps on every sandbox it starts
+    # (``agent-platform.pool-owner``).  Startup reaps only leftovers carrying
+    # this same id, so one replica never stops another replica's sandboxes.
+    # Empty → the hostname, which under Kubernetes is the pod name (stable
+    # across container restarts in the pod).  Compose pins it, because a
+    # recreated container gets a new hostname.
+    owner_id: str = ""
     # Resource limits for idle sandbox containers (mirrors scheduler defaults).
     sandbox_memory_limit: str = "2g"
     sandbox_cpu_shares: int = 1024
@@ -140,3 +148,9 @@ class Settings(BaseSettings):
     def tier_memory_size(self, tier: str) -> str:
         """Docker-style memory string the pool warms this tier at."""
         return self.memory_tier_sizes.get(tier, self.sandbox_memory_limit)
+
+    # ---------------------------------------------------------------- owner
+    @property
+    def pool_owner(self) -> str:
+        """The ``owner_id`` setting, or the hostname when it is empty."""
+        return self.owner_id.strip() or socket.gethostname()

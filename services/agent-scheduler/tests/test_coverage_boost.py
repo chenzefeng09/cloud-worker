@@ -176,6 +176,46 @@ def test_upload_output_files_returns_empty_when_s3_unavailable() -> None:
     assert result == {"workspace_files": [], "artifacts": []}
 
 
+def _seed_scratch_and_output(workspace: Path) -> None:
+    (workspace / "outputs").mkdir()
+    (workspace / "outputs" / "report.md").write_text("# report", encoding="utf-8")
+    (workspace / "scratch").mkdir()
+    (workspace / "scratch" / "notes.txt").write_text("working notes", encoding="utf-8")
+
+
+def test_upload_without_a_workspace_ships_only_outputs() -> None:
+    """Nothing references a workspace-less run's other files, so they would sit
+    in the bucket for good: only ``outputs/`` is uploaded."""
+    s3 = MagicMock()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        _seed_scratch_and_output(workspace)
+        result = artifact_store.upload_run_output_files(
+            workspace=workspace, tenant_id="tnt_test", session_id="ses_test",
+            run_id="run_test", workspace_id="", bucket="agent-platform", s3_client=s3,
+        )
+    keys = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+    assert keys == ["tenant/tnt_test/sessions/ses_test/runs/run_test/artifacts/outputs/report.md"]
+    assert [a["filename"] for a in result["artifacts"]] == ["report.md"]
+    assert result["workspace_files"] == []
+
+
+def test_upload_with_a_workspace_ships_every_file_for_writeback() -> None:
+    s3 = MagicMock()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        workspace = Path(tmpdir)
+        _seed_scratch_and_output(workspace)
+        result = artifact_store.upload_run_output_files(
+            workspace=workspace, tenant_id="tnt_test", session_id="ses_test",
+            run_id="run_test", workspace_id="wsp_test", bucket="agent-platform", s3_client=s3,
+        )
+    assert sorted(f["filename"] for f in result["workspace_files"]) == [
+        "outputs/report.md", "scratch/notes.txt",
+    ]
+    assert [a["filename"] for a in result["artifacts"]] == ["report.md"]
+    assert s3.put_object.call_count == 2
+
+
 # ---------------------------------------------------------------------------
 # DockerRuntime._make_s3_client — failure-open
 # ---------------------------------------------------------------------------

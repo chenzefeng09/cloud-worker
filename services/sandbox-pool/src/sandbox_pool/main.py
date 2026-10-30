@@ -17,6 +17,10 @@ from sandbox_pool.pool import Pool
 
 logger = logging.getLogger(__name__)
 
+# How long shutdown waits for the warm spares to stop: inside Kubernetes'
+# default 30 s termination grace period.
+_DRAIN_TIMEOUT_SECONDS = 20.0
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -32,17 +36,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     async def _ticker() -> None:
         while True:
             try:
+                # Drop dead warm sandboxes first so this tick's warmup
+                # replaces them.
+                dead = await pool.reconcile_tick()
                 spawned = await pool.warmup_tick()
                 reaped = await pool.reap_excess_tick()
-                if spawned or reaped:
+                if dead or spawned or reaped:
                     logger.info(
                         "pool tick",
-                        extra={"spawned": spawned, "reaped": reaped},
+                        extra={"dead": dead, "spawned": spawned, "reaped": reaped},
                     )
             except Exception:  # pragma: no cover — keep the loop alive
                 logger.exception("warmup tick failed")
             await asyncio.sleep(5 if settings.env == "dev" else 30)
 
+    orphans = await pool.reap_orphans()
+    if orphans:
+        logger.info("pool: stopped warm sandboxes left by an earlier run", extra={"count": orphans})
     ticker_task = asyncio.create_task(_ticker(), name="sandbox-pool-warmup")
     try:
         yield
@@ -52,6 +62,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # signal we wanted; suppress so shutdown completes cleanly.
         with contextlib.suppress(asyncio.CancelledError):
             await ticker_task
+        # Leave no warm spares behind: the next pool process may run under a
+        # new owner id (a rolling update's new pod) and would not reap them.
+        try:
+            drained = await asyncio.wait_for(pool.drain_idle(), timeout=_DRAIN_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.warning("pool: shutdown stopped waiting for warm sandboxes to stop")
+        else:
+            if drained:
+                logger.info("pool: stopped warm sandboxes on shutdown", extra={"count": drained})
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

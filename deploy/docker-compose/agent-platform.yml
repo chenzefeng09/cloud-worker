@@ -102,19 +102,26 @@ services:
     networks: [foundation]
 
   # ===========================================================================
-  # minio-init — creates the "agent-platform" S3 bucket on foundation-minio
+  # minio-init — creates the "agent-platform" S3 bucket on foundation-minio,
+  # plus the Object-Locked GDPR erasure ledger bucket the BFF writes to
   #
   # foundation-minio lives in the saas-foundation compose project; docker-
   # compose forbids depends_on across projects, so we cannot gate on its
   # healthcheck here.  Instead we loop until `mc alias set` succeeds (retries
   # every 2 s, up to 30 attempts / ~60 s) so start-order doesn't matter.
-  # The four storage-using services (knowledge-ingest, skill-store,
-  # session-orchestrator, agent-scheduler) declare
+  # The storage-using services (knowledge-ingest, skill-store,
+  # session-orchestrator, agent-scheduler, bff) declare
   #   depends_on: { minio-init: { condition: service_completed_successfully } }
   # which IS valid within the same compose project.
   # ===========================================================================
   minio-init:
-    image: minio/mc:latest
+    # minio/mc can no longer be pulled from Docker Hub ("repository does not
+    # exist").  The MinIO server image foundation-minio runs ships
+    # /usr/bin/mc, so reuse it: same MINIO_VERSION pin as the foundation .env,
+    # and the image is already local wherever foundation-minio runs.  Its mc
+    # supports `mb --with-lock`.  MINIO_MC_IMAGE points this at any other mc
+    # image.
+    image: ${MINIO_MC_IMAGE:-minio/minio:${MINIO_VERSION:-RELEASE.2025-09-07T16-13-09Z}}
     container_name: agent-minio-init
     restart: "no"
     entrypoint: ["/bin/sh", "-c"]
@@ -136,6 +143,9 @@ services:
         done
         mc mb --ignore-existing local/agent-platform
         echo "=== minio-init: agent-platform bucket ready ==="
+        # Object Lock can only be switched on when a bucket is created.
+        mc mb --ignore-existing --with-lock local/agent-platform-privacy-ledger
+        echo "=== minio-init: agent-platform-privacy-ledger bucket ready (Object Lock) ==="
     networks: [foundation]
 
   mcp-registry-migrate:
@@ -143,12 +153,15 @@ services:
       context: ../../services/mcp-registry
       dockerfile: Dockerfile
       additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
       args:
         PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
     image: agent-platform-dev-mcp-registry
     container_name: agent-mcp-registry-migrate
     restart: "no"
+    healthcheck:
+      disable: true
     working_dir: /app
     environment:
       MCP_REGISTRY_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
@@ -160,6 +173,7 @@ services:
       context: ../../services/skill-store
       dockerfile: Dockerfile
       additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
         feature_flag_client: ../../libs/feature-flag-client
       args:
@@ -167,6 +181,8 @@ services:
     image: agent-platform-dev-skill-store
     container_name: agent-skill-store-migrate
     restart: "no"
+    healthcheck:
+      disable: true
     working_dir: /app
     environment:
       SKILL_STORE_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
@@ -179,9 +195,13 @@ services:
     build:
       context: ../../services/app-registry
       dockerfile: Dockerfile
+      additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
     image: agent-platform-dev-app-registry
     container_name: agent-app-registry-migrate
     restart: "no"
+    healthcheck:
+      disable: true
     working_dir: /app
     environment:
       APP_REGISTRY_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
@@ -193,12 +213,15 @@ services:
       context: ../../services/knowledge-ingest
       dockerfile: Dockerfile
       additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
       args:
         PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
     image: agent-platform-dev-knowledge-ingest
     container_name: agent-knowledge-ingest-migrate
     restart: "no"
+    healthcheck:
+      disable: true
     working_dir: /app
     environment:
       KNOWLEDGE_INGEST_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
@@ -207,6 +230,29 @@ services:
     depends_on:
       pgvector-init:
         condition: service_completed_successfully
+
+  # ===========================================================================
+  # session-orchestrator-base — build-only (scale: 0, never started)
+  #
+  # Image chain, built in order by one `docker compose build` / `up --build`:
+  #   Dockerfile (this service)  -> agent-platform-dev-session-orchestrator:base
+  #   Dockerfile.overlay         -> agent-platform-dev-session-orchestrator
+  #   most other Python services -> FROM agent-platform-dev-session-orchestrator:latest
+  # Each such FROM is mapped to the service that produces it with an
+  # additional_contexts entry `<image>: service:<service>` (BuildKit matches a
+  # named context to the FROM reference; `:latest` is implied), so no image
+  # has to be built or tagged by hand first.  A plain `docker build` of those
+  # Dockerfiles still resolves the same tags from the local image store.
+  # ===========================================================================
+  session-orchestrator-base:
+    build:
+      context: ../../services/session-orchestrator
+      dockerfile: Dockerfile
+      additional_contexts:
+        feature_flag_client: ../../libs/feature-flag-client
+        foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
+    image: agent-platform-dev-session-orchestrator:base
+    scale: 0
 
   # session-orchestrator 的 app 服务用 Dockerfile.overlay。这里用同一个
   # build(context + dockerfile 完全一致),compose 会复用同一镜像层缓存,
@@ -218,11 +264,16 @@ services:
       context: ../../services/session-orchestrator
       dockerfile: Dockerfile.overlay
       additional_contexts:
+        agent-platform-dev-session-orchestrator:base: service:session-orchestrator-base
         feature_flag_client: ../../libs/feature-flag-client
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
     image: agent-platform-dev-session-orchestrator
     container_name: agent-session-orchestrator-migrate
     restart: "no"
+    # One-shot jobs must not inherit the app image's HEALTHCHECK: Docker marks
+    # every container that has one `unhealthy` once it exits, even on success.
+    healthcheck:
+      disable: true
     working_dir: /app
     environment:
       SESSION_ORCHESTRATOR_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
@@ -235,12 +286,14 @@ services:
   session-orchestrator:
     build:
       context: ../../services/session-orchestrator
-      # Dockerfile.overlay reuses the pre-built base image (which has all
-      # Poetry deps + boto3 + python-multipart installed via wheels) and only
-      # swaps in the current src/. This avoids the PyPI MITM issue on rebuild
-      # while keeping the image up to date with code changes.
+      # Dockerfile.overlay reuses the base image (all Poetry deps + boto3 +
+      # python-multipart, built by session-orchestrator-base) and only swaps
+      # in the current src/.  Source-only rebuilds stay off PyPI; the base
+      # re-runs its installs only when the SDK, the feature-flag client or the
+      # lockfile change.
       dockerfile: Dockerfile.overlay
       additional_contexts:
+        agent-platform-dev-session-orchestrator:base: service:session-orchestrator-base
         feature_flag_client: ../../libs/feature-flag-client
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
     container_name: agent-session-orchestrator
@@ -281,10 +334,13 @@ services:
       SESSION_ORCHESTRATOR_AUTHZ_URL: http://authz:8002/api/authz/v1
       SESSION_ORCHESTRATOR_FOUNDATION_BILLING_URL: http://billing:8007/api/billing/v1
       SESSION_ORCHESTRATOR_FEATURE_FLAG_URL: http://feature-flag:8012/api/feature-flag/v1
-      # Foundation DLP — attachment download check + upload scan/tag (fail-open).
+      # Foundation DLP — attachment download check + upload scan/tag.
       # Shared FOUNDATION_DLP_URL override aligns with scheduler/tool-broker; dev
       # DLP is the `dlp` service on the foundation network at :8007.
       SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL: ${FOUNDATION_DLP_URL:-http://dlp:8007/api/dlp/v1}
+      # A check that cannot be completed: closed = 503, nothing stored or
+      # served; open = let through and log an error (see .env.example).
+      SESSION_ORCHESTRATOR_DLP_FAILURE_MODE: ${DLP_FAILURE_MODE:-closed}
       # Redis — reads agent run hot-state (plan/step/cursor) written by the sandbox.
       # Same Redis instance the scheduler forwards into sandboxes (SCHEDULER_REDIS_URL).
       SESSION_ORCHESTRATOR_REDIS_URL: ${SCHEDULER_REDIS_URL:-redis://:redis_change_me@foundation-redis:6379/0}
@@ -318,6 +374,7 @@ services:
       context: ../../services/sandbox-pool
       dockerfile: Dockerfile
       additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
     container_name: agent-sandbox-pool
     restart: unless-stopped
@@ -334,13 +391,17 @@ services:
       # Docker socket proxy — same sidecar the agent-scheduler uses.
       # The pool uses it to start/stop idle sandbox containers.
       DOCKER_HOST: tcp://docker-socket-proxy:2375
-      SANDBOX_POOL_SANDBOX_IMAGE: ${AGENT_IMAGE:-ghcr.io/agent-platform/claude-sdk-sandbox:0.1}
+      SANDBOX_POOL_SANDBOX_IMAGE: ${AGENT_IMAGE:-${CLAUDE_SDK_IMAGE:-ghcr.io/agent-platform/claude-sdk-sandbox:0.1}}
       # Prewarmed sandboxes join the internal sandbox_broker network (broker
       # egress mode), NOT the flat foundation network. Mirrors the scheduler's
       # SCHEDULER_SANDBOX_BROKER_NETWORK so warm + cold sandboxes land on the
       # same net. The pool service itself also joins sandbox_broker below so it
       # can attach the containers it manages to that network.
       SANDBOX_POOL_DOCKER_NETWORK: ${SANDBOX_BROKER_NETWORK:-agent-platform-dev_sandbox_broker}
+      # Stamped on every warm sandbox; startup reaps only leftovers with this
+      # id. Pinned because a recreated container gets a new hostname, which
+      # would otherwise leave a crashed predecessor's warm sandboxes running.
+      SANDBOX_POOL_OWNER_ID: agent-sandbox-pool
     ports:
       - "${PORT_SANDBOX_POOL:-8008}:8008"
     networks: [foundation, agent_internal, sandbox_broker]
@@ -389,6 +450,7 @@ services:
       context: ../../services/agent-scheduler
       dockerfile: Dockerfile
       additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
         feature_flag_client: ../../libs/feature-flag-client
       args:
@@ -429,7 +491,10 @@ services:
       # /var/run/docker.sock bind-mount on this container.
       DOCKER_HOST: tcp://docker-socket-proxy:2375
       # Claude Agent SDK worker image (sandbox-images/claude-sdk.Dockerfile).
-      SCHEDULER_AGENT_IMAGE: ${AGENT_IMAGE:-ghcr.io/agent-platform/claude-sdk-sandbox:0.1}
+      # Unset AGENT_IMAGE follows CLAUDE_SDK_IMAGE, the tag the Makefile's
+      # build-claude-sdk-image target builds (make exports it); `make up` /
+      # `make agent-up` refuse to start when a pinned AGENT_IMAGE is missing.
+      SCHEDULER_AGENT_IMAGE: ${AGENT_IMAGE:-${CLAUDE_SDK_IMAGE:-ghcr.io/agent-platform/claude-sdk-sandbox:0.1}}
       # Cube v0.6 fixes RAM on templates. These aliases may reference the same
       # OCI image while exposing small/large per-run memory tiers.
       SCHEDULER_CUBE_CLAUDE_SDK_TEMPLATE_SMALL: ${CUBE_CLAUDE_SDK_TEMPLATE_SMALL:-claude-sdk-matlab-aerospace-r2-2g}
@@ -479,6 +544,9 @@ services:
       # egress mode the scheduler rewrites this to the tool-broker /dlp façade;
       # the value here is the direct foundation DLP base used otherwise.
       SCHEDULER_DLP_URL: ${FOUNDATION_DLP_URL:-http://dlp:8007/api/dlp/v1}
+      # Forwarded into the sandbox as DLP_FAILURE_MODE: closed = a scan that
+      # cannot be completed denies the tool call; open = allows it, logged.
+      SCHEDULER_DLP_FAILURE_MODE: ${DLP_FAILURE_MODE:-closed}
       # Knowledge-ingest (KB v1) - forwarded into the sandbox as
       # KNOWLEDGE_INGEST_URL so the in-sandbox knowledge_tool can GET /search.
       # Direct URL in foundation mode; tool-broker /knowledge/v1 façade in
@@ -544,10 +612,13 @@ services:
       context: ../../services/bff
       dockerfile: Dockerfile
       additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
     image: agent-platform-dev-bff
     container_name: agent-bff-migrate
     restart: "no"
+    healthcheck:
+      disable: true
     working_dir: /app
     environment:
       BFF_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
@@ -563,6 +634,7 @@ services:
       context: ../../services/bff
       dockerfile: Dockerfile
       additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
     container_name: agent-bff
     restart: unless-stopped
@@ -599,6 +671,9 @@ services:
       # MUST be supplied via env in any deployment beyond local dev.
       # CookieSigner refuses to start if the value looks like a placeholder.
       BFF_COOKIE_SECRET: ${BFF_COOKIE_SECRET:?BFF_COOKIE_SECRET must be set (>=32 chars, no placeholder text)}
+      # Fernet keys for the identity tokens kept in web_sessions (first one
+      # encrypts, all decrypt).  Empty = derived from BFF_COOKIE_SECRET.
+      BFF_SESSION_TOKEN_KEYS: ${BFF_SESSION_TOKEN_KEYS:-}
       BFF_COOKIE_NAME: ap_session
       BFF_COOKIE_MAX_AGE: "86400"
       BFF_COOKIE_SECURE: "false"
@@ -615,6 +690,17 @@ services:
       # Inbound-webhook receiver re-enters this same process's /apps/{id}/run
       # over HTTP (machine path); localhost reaches this uvicorn in-container.
       BFF_SELF_URL: http://localhost:8005
+      # GDPR erasure ledger (domain/erasure_ledger.py): every erasure request is
+      # written here before it runs, so that after a backup restore
+      # `python -m agent_bff.erasure_replay` can erase the restored rows again
+      # (docs/runbook/backup-restore-b-m6.md §3.7).  Entries are COMPLIANCE-
+      # locked for BFF_PRIVACY_LEDGER_RETENTION_DAYS (default 365): not even
+      # the MinIO root user can delete one before then.
+      BFF_PRIVACY_LEDGER_S3_BUCKET: agent-platform-privacy-ledger
+      BFF_PRIVACY_LEDGER_S3_ENDPOINT_URL: http://foundation-minio:9000
+      BFF_PRIVACY_LEDGER_S3_REGION: us-east-1
+      BFF_PRIVACY_LEDGER_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-foundation}
+      BFF_PRIVACY_LEDGER_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_change_me_min_12_chars}
     ports:
       - "${PORT_BFF:-8005}:8005"
     networks: [foundation]
@@ -625,6 +711,8 @@ services:
       retries: 10
     depends_on:
       bff-migrate:
+        condition: service_completed_successfully
+      minio-init:
         condition: service_completed_successfully
       session-orchestrator:
         condition: service_healthy
@@ -662,6 +750,7 @@ services:
       context: ../../services/mcp-registry
       dockerfile: Dockerfile
       additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
       args:
         PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
@@ -678,6 +767,9 @@ services:
       MCP_REGISTRY_DB_POOL_RECYCLE: "1800"
       MCP_REGISTRY_AUTHZ_URL: http://authz:8002/api/authz/v1
       MCP_REGISTRY_CRYPTO_URL: http://crypto:8004/api/crypto/v1
+      # Local stack only: keep saving MCP secrets (in plaintext) when crypto is
+      # down.  Production leaves this unset, so such a write fails with 503.
+      MCP_REGISTRY_ALLOW_PLAINTEXT_SECRETS: ${MCP_REGISTRY_ALLOW_PLAINTEXT_SECRETS:-true}
     ports:
       - "${PORT_MCP_REGISTRY:-8010}:8010"
     networks: [foundation]
@@ -721,6 +813,7 @@ services:
       context: ../../services/skill-store
       dockerfile: Dockerfile
       additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
         feature_flag_client: ../../libs/feature-flag-client
       args:
@@ -775,6 +868,8 @@ services:
     environment:
       SKILL_STORE_BASE_URL: http://skill-store:8011/api/skills/v1
     entrypoint: ["python", "scripts/seed_default_skills.py"]
+    healthcheck:
+      disable: true
     depends_on:
       skill-store:
         condition: service_healthy
@@ -787,6 +882,8 @@ services:
     build:
       context: ../../services/app-registry
       dockerfile: Dockerfile
+      additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
     container_name: agent-app-registry
     restart: unless-stopped
     environment:
@@ -821,6 +918,7 @@ services:
       context: ../../services/knowledge-ingest
       dockerfile: Dockerfile
       additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
         foundation_sdk: ${FOUNDATION_SDK_PATH:-../../../saas-foundation/sdks/python}
       args:
         PIP_NO_PROXY: ${PIP_NO_PROXY:-pypi.org files.pythonhosted.org pypi.python.org}
@@ -872,6 +970,8 @@ services:
   web-fetch-gateway:
     build:
       context: ../../services/web-fetch-gateway
+      additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
     container_name: agent-web-fetch-gateway
     restart: unless-stopped
     environment:
@@ -914,6 +1014,8 @@ services:
   tool-broker:
     build:
       context: ../../services/tool-broker
+      additional_contexts:
+        agent-platform-dev-session-orchestrator: service:session-orchestrator
     container_name: agent-tool-broker
     restart: unless-stopped
     environment:
@@ -972,6 +1074,8 @@ services:
     image: agent-platform-dev-cron-runner
     container_name: agent-cron-runner-migrate
     restart: "no"
+    healthcheck:
+      disable: true
     working_dir: /app
     environment:
       CRON_RUNNER_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation

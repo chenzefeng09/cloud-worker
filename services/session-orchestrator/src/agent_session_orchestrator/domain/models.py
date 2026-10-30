@@ -375,3 +375,27 @@ class PlatformConfig(Base):
         DateTime(timezone=True), nullable=False, default=utcnow, server_default=func.now()
     )
     updated_by: Mapped[str | None] = mapped_column(String(60), nullable=True)
+
+
+class UserPrivacySettings(Base):
+    """Per-user privacy preferences (GDPR data-owner controls).
+
+    One row per ``(tenant_id, user_id)``; a missing row means "defaults", i.e.
+    ``memory_enabled = true``.  ``memory_enabled = false`` is the user's opt-out
+    from long-term memory: runs in sessions owned by the user neither prefetch
+    memory snippets nor write a run summary back to knowledge-ingest.  RLS is
+    enabled on this table (same pattern as ``platform_config``).
+    """
+
+    __tablename__ = "user_privacy_settings"
+    __table_args__ = {"schema": "session_orchestrator"}
+
+    tenant_id: Mapped[str] = mapped_column(String(30), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(30), primary_key=True)
+    memory_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true",
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=utcnow, onupdate=utcnow, server_default=func.now(),
+    )

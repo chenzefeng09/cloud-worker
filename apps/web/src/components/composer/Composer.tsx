@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEven
 import type { Attachment } from '../../api/types';
 import { Dropdown, type DropdownOption } from '../shell/Dropdown';
 import { HoverHint } from '../shell/HoverHint';
-import { EFFORT_OPTIONS } from '../../lib/modelOptions';
+import { EFFORT_OPTIONS, NO_MODEL_CONFIGURED } from '../../lib/modelOptions';
 import { useCanUploadAttachment } from '../../hooks/useCanUploadAttachment';
 import { useModelOptions } from '../../hooks/useModelOptions';
 import {
@@ -145,7 +145,7 @@ export function Composer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { checkFile } = useCanUploadAttachment();
-  const { options: modelOptions } = useModelOptions();
+  const { options: modelOptions, noProvider } = useModelOptions();
 
   // Auto-correct a fictional/stale model id (e.g. the SYSTEM_FALLBACK_MODEL
   // 'deepseek-v4-flash') once the real catalogue resolves, so we never send a
@@ -565,11 +565,12 @@ export function Composer({
 
         <div className="flex items-center gap-3 shrink-0">
           {onModelChange && (
-            <HoverHint label={copy.modelHint}>
+            <HoverHint label={noProvider ? NO_MODEL_CONFIGURED : copy.modelHint}>
               <Dropdown
                 value={model ?? ''}
                 options={modelOptions}
                 onChange={onModelChange}
+                emptyLabel={noProvider ? 'No model available' : undefined}
                 ariaLabel="Select model"
                 triggerClassName="text-[12.5px] text-ink-2"
               />

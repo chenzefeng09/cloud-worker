@@ -16,6 +16,92 @@ export interface Session {
   updated_at: string;
 }
 
+// ─── Tasks (task board → BFF /tasks) ─────────────────────────────────────────
+//
+// A task is a session seen through its latest run: the board status is derived
+// server-side from that run, so it always matches what the sandbox reported.
+// `kind` says how it was started: `task` (the New task form), `chat` (the
+// composer) or `app_run` (an App execution).
+
+export type TaskStatus =
+  | 'queued'
+  | 'running'
+  | 'needs_input'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'idle';
+
+export type TaskKind = 'task' | 'chat' | 'app_run';
+
+export interface TaskRunSummary {
+  id: string;
+  status: string;
+  source: string;
+  app_id: string | null;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  result_summary: string | null;
+  error_message: string | null;
+  total_tokens: number | null;
+}
+
+/** Run knobs a task was started with (replayed on retry). */
+export interface TaskOptions {
+  skills?: string[];
+  mcp_server_ids?: string[];
+  model?: string | null;
+  reasoning_effort?: string | null;
+  hitl?: boolean;
+}
+
+export interface Task {
+  id: string;
+  title: string | null;
+  kind: TaskKind;
+  status: TaskStatus;
+  workspace_id: string | null;
+  instructions: string | null;
+  options: TaskOptions | null;
+  latest_run: TaskRunSummary | null;
+  run_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TaskListResponse {
+  items: Task[];
+  next_cursor: string | null;
+  counts: Record<TaskStatus, number>;
+}
+
+export interface TaskListParams {
+  status?: TaskStatus[];
+  kind?: TaskKind[];
+  workspace_id?: string;
+  q?: string;
+  cursor?: string;
+  limit?: number;
+}
+
+export interface CreateTaskRequest extends TaskOptions {
+  instructions: string;
+  title?: string;
+  workspace_id?: string;
+  /** Draft `kind: 'task'` session the form uploaded attachments to. */
+  session_id?: string;
+  attachment_ids?: string[];
+}
+
+export interface TaskStartResponse {
+  task: Task;
+  run_id: string | null;
+  /** Retry only: first sequence of the cleared previous attempt (null when
+   *  nothing followed the task's prompt). */
+  rewound_from?: number | null;
+}
+
 // ─── Workspace (→ session-orchestrator, proxied via BFF /workspaces) ──────────
 //
 // A workspace is a reusable, cross-session container of an instruction preamble,
@@ -175,17 +261,19 @@ export interface CursorPage<T> {
   next_cursor: string | null;
 }
 
+/** POST /auth/login — the identity tokens stay in the BFF (server-side web
+ *  session); the browser only gets the HttpOnly session cookie. */
 export interface LoginResponse {
-  access_token: string;
-  refresh_token: string;
   user_id: string;
   tenant_id: string;
   email: string;
   display_name: string;
 }
 
+/** GET / PATCH /auth/me — foundation identity's profile, plus the caller's
+ *  effective permissions. The caller's id is `user_id` (there is no `id`). */
 export interface UserProfile {
-  id: string;
+  user_id: string;
   email: string;
   display_name: string;
   tenant_id: string;
@@ -250,9 +338,11 @@ export interface McpServer {
   transport: McpTransport;
   endpoint: string | null;
   command: string | null;
+  /** Env vars (stdio transport). Keys are real; every non-empty value comes
+   *  back masked as "••••••", never the stored value. */
   env: Record<string, string>;
   enabled: boolean;
-  /** HTTP custom headers (http transport only). */
+  /** HTTP custom headers (http transport only). Values are masked like `env`. */
   headers?: Record<string, string>;
   /** Auth scheme for HTTP transport. */
   auth?: McpAuth;
@@ -405,6 +495,10 @@ export interface AppVersion {
   review_note?: string | null;
   created_by?: string | null;
   created_at: string;
+  /** Display names the BFF resolves beside each user id; null when it can't. */
+  submitted_by_name?: string | null;
+  reviewed_by_name?: string | null;
+  created_by_name?: string | null;
 }
 
 /** Request body for creating a draft version (or the App's initial draft). */
@@ -429,6 +523,8 @@ export interface App {
   description?: string | null;
   icon?: string | null;
   author_id: string;
+  /** The author's display name (resolved by the BFF); null when it can't be. */
+  author_name?: string | null;
   visibility: AppVisibility;
   current_version_id?: string | null;
   /** Free-form tags shown on the app card and used for OR-filtering in the app center. */
@@ -464,6 +560,7 @@ export interface AppReviewItem {
   app_id: string;
   app_name: string;
   author_id: string;
+  author_name?: string | null;
 }
 
 /** One resolved input value recorded in an App run snapshot. */
@@ -1106,6 +1203,12 @@ export interface PermissionDefinition {
   requires_policy?: boolean;
 }
 
+/**
+ * Binding lifecycle: REVOKED once revoked (wins over expiry), EXPIRED once
+ * `expires_at` has passed, otherwise ACTIVE — the only state that grants access.
+ */
+export type RoleBindingStatus = 'ACTIVE' | 'EXPIRED' | 'REVOKED';
+
 /** A grant of a role to a subject (user / team / org-unit), optionally scoped. */
 export interface RoleBinding {
   id: string;
@@ -1117,9 +1220,15 @@ export interface RoleBinding {
   scope_resource_id?: string | null;
   granted_by?: string;
   granted_at?: string;
-  /** JIT elevation: auto-revoked at this time when set. */
+  /** JIT elevation: stops granting (status EXPIRED) after this time when set. */
   expires_at?: string | null;
   reason?: string | null;
+  /** The list returns ACTIVE bindings unless EXPIRED / REVOKED are asked for. */
+  status?: RoleBindingStatus;
+  /** Revocation is final (soft delete); re-granting creates a new binding. */
+  revoked_at?: string | null;
+  revoked_by?: string | null;
+  revoked_reason?: string | null;
 }
 
 export interface CreateBindingRequest {
@@ -1786,6 +1895,41 @@ export interface AssessDpiaRequest {
 export interface CompleteDpiaRequest {
   conclusion: string;
   residual_risks: string;
+}
+
+// Personal-data breach register (BFF-owned, GDPR Art. 33/34).
+export type BreachStatus = 'open' | 'contained' | 'closed';
+/** low: unlikely to result in a risk (no notification due); medium: notify the
+ *  supervisory authority; high: also tell the individuals (Art. 34). */
+export type BreachRiskLevel = 'low' | 'medium' | 'high';
+
+export interface BreachRecordInput {
+  title: string;
+  description: string;
+  occurred_at: string | null;
+  aware_at: string;
+  status: BreachStatus;
+  risk_level: BreachRiskLevel;
+  data_categories: string[];
+  approx_subjects: number | null;
+  approx_records: number | null;
+  likely_consequences: string;
+  measures_taken: string;
+  authority_notified_at: string | null;
+  authority_reference: string | null;
+  subjects_notified_at: string | null;
+  delay_reason: string | null;
+  security_incident_id: string | null;
+}
+
+export interface BreachRecord extends BreachRecordInput {
+  id: string;
+  tenant_id: string;
+  /** aware_at + 72 hours — the Art. 33(1) deadline for notifying the authority. */
+  notify_authority_by: string;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
 }
 
 // ─── Security operations (→ foundation-security-ops) ────────────────────────────

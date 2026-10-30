@@ -1,8 +1,9 @@
 """Knowledge-ingest client for the session-consumption side.
 
 ``create_run`` prefetches the top-k tenant-knowledge hits for the task
-(``fetch_knowledge_prefetch``, ``GET /search?scope=knowledge``) and folds them,
-with ``[Document | folder/path]`` provenance, into the worker's system prompt.
+(``fetch_knowledge_prefetch``, ``POST /search`` with ``scope=knowledge``) and
+folds them, with ``[Document | folder/path]`` provenance, into the worker's
+system prompt.
 
 Every call carries the run's **effective clearance** (``min(user, workspace)``)
 in the ``X-User-Clearance`` header so knowledge-ingest enforces the visibility
@@ -11,7 +12,9 @@ conversation.  The prefetch returns ``""`` on any error.
 
 Contract (per docs/knowledge-library-v1.md — we do NOT read the ki source):
 
-* ``GET /search`` params ``q``, ``k``, ``scope=knowledge``; hit shape
+* ``POST /search`` JSON body ``{"q", "k", "scope": "knowledge"}`` — the prompt
+  rides in the body, never the URL, so it stays out of access logs and traces
+  (the legacy ``GET /search?q=…`` form is not used); hit shape
   ``{document_id, document_name, folder_path, chunk_id, text, score, scope}``
   (``folder_path`` = ``Products/Contract templates``; empty string at the root).
 * ``GET /documents`` returns the documents visible at the header clearance, each
@@ -81,7 +84,7 @@ async def _search(
     query: str,
     k: int,
 ) -> list[dict[str, Any]] | None:
-    """``GET /search?scope=knowledge`` → hit list, or ``None`` on any failure.
+    """``POST /search`` (``scope=knowledge``) → hit list, or ``None`` on any failure.
 
     ``None`` is the fail-open signal (network/HTTP/parse error); callers map it
     to an empty prefetch block or a "service unavailable" tool note.  An empty
@@ -89,16 +92,16 @@ async def _search(
     """
     if not base_url or not query.strip():
         return []
-    params: dict[str, Any] = {
+    payload: dict[str, Any] = {
         "q": query[:500],
         "k": int(k) if k else 5,
         "scope": "knowledge",
     }
     try:
         async with httpx.AsyncClient(timeout=_KNOWLEDGE_TIMEOUT) as client:
-            resp = await client.get(
+            resp = await client.post(
                 f"{base_url}/search",
-                params=params,
+                json=payload,
                 headers=_headers(tenant_id, user_id, clearance),
             )
         if resp.status_code != 200:

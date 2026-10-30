@@ -454,6 +454,8 @@ def test_spawn_run_broker_egress_uses_broker_network_and_urls(
     assert env["WEB_FETCH_GATEWAY_URL"] == (
         "http://tool-broker:8024/api/tool-broker/v1/web-fetch/api/web-fetch/v1"
     )
+    # A DLP scan that cannot be completed denies the tool call by default.
+    assert env["DLP_FAILURE_MODE"] == "closed"
     # Secrets are no longer passed via env — they ride /workspace/.secrets.json.
     assert "REDIS_URL" not in env
     assert "S3_ACCESS_KEY_ID" not in env

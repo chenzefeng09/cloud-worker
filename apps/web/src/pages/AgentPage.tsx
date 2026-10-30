@@ -7,6 +7,7 @@ import { useChatStore } from '../stores/chatStore';
 import { useSessions } from '../hooks/useSessions';
 import { sessionStatusLabel } from '../lib/format';
 import { FilePreviewPanel } from '../components/FilePreviewPanel';
+import { TaskBar } from '../components/tasks/TaskBar';
 import type { FileContentSource } from '../components/filePreview';
 import { FilePreviewProvider } from '../lib/filePreviewContext';
 import { useWorkspace } from '../lib/workspaceContext';
@@ -37,6 +38,8 @@ export function AgentPage() {
   const { sessions } = useSessions();
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const setActiveSession = useChatStore((s) => s.setActiveSession);
+  // This session's own live-run flag (another session's run never blocks it).
+  const sessionBusy = useChatStore((s) => (id ? Boolean(s.streamingSessions[id]) : false));
   const { sendMessage } = useChat();
 
   const [previewFile, setPreviewFile] = useState<{ id: string; filename: string; mime?: string } | null>(null);
@@ -83,6 +86,31 @@ export function AgentPage() {
   }, [id]);
 
   const session = sessions.find((s) => s.id === id);
+  // The sidebar list holds only the pages loaded so far, so a session opened
+  // any other way — a task started from the board, an older link — is fetched
+  // on its own.  Kept in the list, its title follows renames and auto-titles.
+  const upsertSession = useChatStore((s) => s.upsertSession);
+  const sessionLoaded = session !== undefined;
+  useEffect(() => {
+    if (!id || sessionLoaded) return;
+    let stale = false;
+    api.sessions
+      .get(id)
+      .then((fetched) => {
+        if (!stale) upsertSession(fetched);
+      })
+      .catch(() => {
+        /* gone or not ours: the transcript area reports it */
+      });
+    return () => {
+      stale = true;
+    };
+  }, [id, sessionLoaded, upsertSession]);
+  // A task's lifecycle is shown by its TaskBar; a chat's status only when it
+  // is not simply open (ACTIVE says nothing about whether a run is going).
+  const isTaskSession = session?.metadata?.kind === 'task';
+  const statusLabel =
+    session && !isTaskSession && session.status !== 'ACTIVE' ? sessionStatusLabel(session.status) : null;
   // Workspace bound to THIS session (not the global active workspace) — sources
   // the "@" mention workspace files and the wsf_ preview content path.
   const workspaceId = session?.workspace_id ?? undefined;
@@ -105,10 +133,15 @@ export function AgentPage() {
 
   // If HomePage routed us here with an `initialMessage` in state, dispatch it
   // once the chat store has bound to this session. Guard with a ref so React
-  // Strict Mode's double-effect doesn't double-send.
+  // Strict Mode's double-effect doesn't double-send.  The router state is
+  // cleared only once the prompt really went out (or failed visibly): a send
+  // refused because the session is busy is retried when it frees up, and one
+  // the server refused otherwise goes back into the composer, instead of
+  // silently dropping the user's first prompt.
   const sentInitialRef = useRef<string | null>(null);
+  const [initialDraft, setInitialDraft] = useState<string | null>(null);
   useEffect(() => {
-    if (!id || activeSessionId !== id) return;
+    if (!id || activeSessionId !== id || sessionBusy) return;
     const state = location.state as
       | { initialMessage?: string; attachmentIds?: string[] }
       | null;
@@ -118,10 +151,16 @@ export function AgentPage() {
     if (!initial && attachmentIds.length === 0) return;
     if (sentInitialRef.current === id) return;
     sentInitialRef.current = id;
-    sendMessage(initial ?? '', attachmentIds);
-    // Clear router state so a refresh won't re-send.
-    navigate(location.pathname, { replace: true, state: null });
-  }, [id, activeSessionId, location.pathname, location.state, navigate, sendMessage]);
+    void sendMessage(initial ?? '', attachmentIds).then((result) => {
+      if (result === 'busy') {
+        sentInitialRef.current = null; // try again once this session is free
+        return;
+      }
+      if (result === 'rejected' && initial) setInitialDraft(initial);
+      // Clear router state so a refresh won't re-send.
+      navigate(location.pathname, { replace: true, state: null });
+    });
+  }, [id, activeSessionId, sessionBusy, location.pathname, location.state, navigate, sendMessage]);
 
   const handleSendMessage = useCallback(
     (
@@ -160,9 +199,9 @@ export function AgentPage() {
             {workspaceId && (
               <WorkspaceBadge workspaceId={workspaceId} onPreviewFile={openPreviewFile} />
             )}
-            {session && (
+            {statusLabel && (
               <span className="font-mono text-[11px] text-ink-2">
-                · {sessionStatusLabel(session.status)}
+                · {statusLabel}
               </span>
             )}
           </span>
@@ -180,6 +219,9 @@ export function AgentPage() {
           </>
         }
       />
+      {/* Background-task lifecycle (status, attempts, Retry / Cancel); renders
+          nothing for ordinary chats. */}
+      <TaskBar sessionId={id} />
 
       <div
         className="min-h-0 flex-1"
@@ -233,6 +275,8 @@ export function AgentPage() {
                 friendly={friendly}
                 onPreviewFile={openPreviewFile}
                 onSendMessage={handleSendMessage}
+                externalPrefill={initialDraft}
+                onExternalPrefillConsumed={() => setInitialDraft(null)}
               />
             </FilePreviewProvider>
             {hasSidePanel && (

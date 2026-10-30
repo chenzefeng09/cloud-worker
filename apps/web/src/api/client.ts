@@ -27,6 +27,8 @@ import type {
   AppVersion,
   AppVersionCreate,
   AssessDpiaRequest,
+  BreachRecord,
+  BreachRecordInput,
   CompleteDpiaRequest,
   ComplianceReport,
   CreatePlatformApiKeyRequest,
@@ -183,7 +185,14 @@ import type {
   WorkspaceFileVersion,
   DlpSensitivity,
   PlatformConfigEntry,
+  CreateTaskRequest,
+  Task,
+  TaskListParams,
+  TaskListResponse,
+  TaskOptions,
+  TaskStartResponse,
 } from './types';
+import { notifySessionExpired } from './authEvents';
 
 const BFF_BASE = '/api/bff/v1';
 
@@ -237,6 +246,27 @@ function extractReason(problem: unknown, depth = 0): string | undefined {
   return undefined;
 }
 
+// Sign-in calls answer 401 for refused credentials, which says nothing about
+// an existing session — they must not trigger the session-expired flow.
+const SIGN_IN_PATHS = new Set(['/auth/login', '/auth/login/sso']);
+
+/**
+ * Build the ApiError for a failed BFF response.  A 401 (outside the sign-in
+ * calls) also reports that the browser session may have ended — the BFF
+ * refreshes tokens itself, so it only answers 401 once it no longer can —
+ * and AuthGate takes the user back to the sign-in page.
+ */
+async function responseError(res: Response, path?: string): Promise<ApiError> {
+  const problem = await res.json().catch(() => ({ detail: res.statusText }));
+  if (res.status === 401 && !(path && SIGN_IN_PATHS.has(path))) notifySessionExpired();
+  return new ApiError(
+    res.status,
+    extractCode(problem) || 'UNKNOWN',
+    extractMessage(problem),
+    extractReason(problem),
+  );
+}
+
 async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${BFF_BASE}${path}`, {
     method,
@@ -244,17 +274,27 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     body: body ? JSON.stringify(body) : undefined,
     credentials: 'include',
   });
-  if (!res.ok) {
-    const problem = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new ApiError(
-      res.status,
-      extractCode(problem) || 'UNKNOWN',
-      extractMessage(problem),
-      extractReason(problem),
-    );
-  }
+  if (!res.ok) throw await responseError(res, path);
   if (res.status === 204) return undefined as T;
   return res.json();
+}
+
+/**
+ * A read the BFF audits (an admin viewing other members' sessions) must leave
+ * one record per look, so the same read asked for twice at once — React
+ * StrictMode re-running a mount effect, two panels loading together — shares
+ * one request.  Each caller still gets its own copy of the result, so one
+ * sorting or editing it can't change what another sees.
+ */
+const auditedReadsInFlight = new Map<string, Promise<unknown>>();
+
+function auditedRead<T>(path: string): Promise<T> {
+  let pending = auditedReadsInFlight.get(path);
+  if (!pending) {
+    pending = request<T>('GET', path).finally(() => auditedReadsInFlight.delete(path));
+    auditedReadsInFlight.set(path, pending);
+  }
+  return pending.then((result) => structuredClone(result) as T);
 }
 
 /**
@@ -424,8 +464,7 @@ export const api = {
         // No Content-Type header — browser sets multipart boundary automatically
       });
       if (!res.ok) {
-        const problem = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+        throw await responseError(res);
       }
       return res.json();
     },
@@ -447,8 +486,7 @@ export const api = {
         credentials: 'include',
       });
       if (!res.ok) {
-        const problem = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+        throw await responseError(res);
       }
       const mime = res.headers.get('content-type') || 'application/octet-stream';
       const blob = await res.blob();
@@ -514,9 +552,32 @@ export const api = {
       ),
   },
 
+  tasks: {
+    list: (params: TaskListParams = {}) =>
+      request<TaskListResponse>('GET', `/tasks${qs({
+        status: params.status?.join(','),
+        kind: params.kind?.join(','),
+        workspace_id: params.workspace_id,
+        q: params.q,
+        cursor: params.cursor,
+        limit: params.limit,
+      })}`),
+    get: (id: string) =>
+      request<Task>('GET', `/tasks/${id}`),
+    /** Create a task and start its first run in the background. */
+    create: (body: CreateTaskRequest) =>
+      request<TaskStartResponse>('POST', '/tasks', body),
+    /**
+     * Re-run the latest attempt with a fresh sandbox.  The previous attempt's
+     * output is rewound server-side; omitted overrides replay the stored options.
+     */
+    retry: (id: string, overrides?: TaskOptions) =>
+      request<TaskStartResponse>('POST', `/tasks/${id}/retry`, overrides ?? {}),
+  },
+
   messages: {
-    list: (sessionId: string, cursor?: string) =>
-      request<CursorPage<Message>>('GET', `/sessions/${sessionId}/messages${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ''}`),
+    list: (sessionId: string, cursor?: string, limit?: number) =>
+      request<CursorPage<Message>>('GET', `/sessions/${sessionId}/messages${qs({ cursor, limit })}`),
     deleteFrom: (sessionId: string, fromSequence: number) =>
       request<{ deleted_count: number }>('DELETE', `/sessions/${sessionId}/messages?from_sequence=${fromSequence}`),
   },
@@ -532,8 +593,7 @@ export const api = {
         // No Content-Type header — browser sets multipart boundary automatically
       });
       if (!res.ok) {
-        const problem = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+        throw await responseError(res);
       }
       return res.json();
     },
@@ -555,8 +615,7 @@ export const api = {
         credentials: 'include',
       });
       if (!res.ok) {
-        const problem = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+        throw await responseError(res);
       }
       const mime = res.headers.get('content-type') || 'application/octet-stream';
       const blob = await res.blob();
@@ -651,8 +710,7 @@ export const api = {
         // No Content-Type header — browser sets multipart boundary automatically
       });
       if (!res.ok) {
-        const problem = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+        throw await responseError(res);
       }
       return res.json();
     },
@@ -665,8 +723,7 @@ export const api = {
         // No Content-Type header — browser sets multipart boundary automatically
       });
       if (!res.ok) {
-        const problem = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+        throw await responseError(res);
       }
       return res.json();
     },
@@ -683,8 +740,7 @@ export const api = {
         credentials: 'include',
       });
       if (!res.ok) {
-        const problem = await res.json().catch(() => ({ detail: res.statusText }));
-        throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+        throw await responseError(res);
       }
       const mime = res.headers.get('content-type') || 'application/octet-stream';
       const blob = await res.blob();
@@ -786,9 +842,16 @@ export const api = {
     // authz check in the BFF.
     sessions: {
       list: (cursor?: string) =>
-        request<CursorPage<Session>>(
-          'GET',
+        auditedRead<CursorPage<Session>>(
           `/admin/sessions?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`,
+        ),
+      // Any member's runs / transcript page; every successful read is audited
+      // server-side (admin.session.runs.viewed / admin.session.messages.viewed).
+      runs: (sessionId: string) =>
+        auditedRead<{ items: Run[] }>(`/admin/sessions/${sessionId}/runs`),
+      messages: (sessionId: string, cursor?: string, limit?: number) =>
+        auditedRead<CursorPage<Message>>(
+          `/admin/sessions/${sessionId}/messages${qs({ cursor, limit })}`,
         ),
     },
     tenants: {
@@ -838,8 +901,7 @@ export const api = {
           },
         );
         if (!res.ok) {
-          const problem = await res.json().catch(() => ({ detail: res.statusText }));
-          throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+          throw await responseError(res);
         }
         return res.blob();
       },
@@ -889,8 +951,20 @@ export const api = {
           ).then((r) => (Array.isArray(r) ? r : r.items)),
       },
       bindings: {
-        list: (tenantId?: string) =>
-          request<{ items: RoleBinding[] }>('GET', `/admin/authz/bindings${qs({ tenant_id: tenantId })}`).then((r) => r.items),
+        // Not unwrapped: returns the CursorPage so callers can follow next_cursor.
+        // Without `status` the BFF/authz list ACTIVE bindings only.
+        list: (
+          tenantId?: string,
+          opts?: { status?: NonNullable<RoleBinding['status']>[]; cursor?: string },
+        ) =>
+          request<CursorPage<RoleBinding>>(
+            'GET',
+            `/admin/authz/bindings${qs({
+              tenant_id: tenantId,
+              'filter.status': opts?.status?.join(','),
+              cursor: opts?.cursor,
+            })}`,
+          ),
         create: (body: CreateBindingRequest, tenantId?: string) =>
           request<RoleBinding>('POST', `/admin/authz/bindings${qs({ tenant_id: tenantId })}`, body),
         delete: (bindingId: string, tenantId?: string) =>
@@ -1000,8 +1074,7 @@ export const api = {
             { credentials: 'include' },
           );
           if (!res.ok) {
-            const problem = await res.json().catch(() => ({ detail: res.statusText }));
-            throw new ApiError(res.status, extractCode(problem) || 'UNKNOWN', extractMessage(problem));
+            throw await responseError(res);
           }
           const mime = res.headers.get('content-type') || 'application/octet-stream';
           const blob = await res.blob();
@@ -1243,6 +1316,22 @@ export const api = {
           request<DpiaRecord>('POST', `/admin/compliance/dpia${qs({ tenant_id: tenantId })}`, body),
         complete: (id: string, body: CompleteDpiaRequest, tenantId?: string) =>
           request<DpiaRecord>('POST', `/admin/compliance/dpia/${id}/complete${qs({ tenant_id: tenantId })}`, body),
+      },
+      // Personal-data breach register (stored in the BFF, not foundation-compliance).
+      breaches: {
+        list: (tenantId?: string) =>
+          request<{ items: BreachRecord[] }>(
+            'GET',
+            `/admin/compliance/breaches${qs({ tenant_id: tenantId })}`,
+          ).then((r) => r.items ?? []),
+        create: (body: BreachRecordInput, tenantId?: string) =>
+          request<BreachRecord>('POST', `/admin/compliance/breaches${qs({ tenant_id: tenantId })}`, body),
+        update: (id: string, body: Partial<BreachRecordInput>, tenantId?: string) =>
+          request<BreachRecord>(
+            'PATCH',
+            `/admin/compliance/breaches/${id}${qs({ tenant_id: tenantId })}`,
+            body,
+          ),
       },
     },
     // Security operations (→ foundation-security-ops): vulnerabilities / incidents /
@@ -1539,3 +1628,10 @@ export const api = {
 };
 
 export { ApiError };
+
+/**
+ * The shared JSON request helper (credentials, problem-details → ApiError).
+ * Exported for feature modules that keep their endpoints in their own file
+ * (e.g. `api/privacy.ts`) instead of growing the `api` object above.
+ */
+export { request as apiRequest, qs as apiQuery, BFF_BASE };

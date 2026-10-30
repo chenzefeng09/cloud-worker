@@ -23,6 +23,7 @@ data:
   FOUNDATION_AUDIT_URL:     {{ .Values.global.foundation.auditUrl | quote }}
   FOUNDATION_LLM_GATEWAY_URL: {{ .Values.global.foundation.llmGatewayUrl | quote }}
   FOUNDATION_DLP_URL:       {{ .Values.global.foundation.dlpUrl | quote }}
+  FOUNDATION_DLP_FAILURE_MODE: {{ .Values.global.foundation.dlpFailureMode | default "closed" | quote }}
 
   # Keycloak
   KEYCLOAK_URL:   {{ .Values.global.foundation.keycloak.url | quote }}
@@ -79,6 +80,19 @@ data:
   {{- if .Values.bff.config.corsOrigins }}
   BFF_CORS_ORIGINS: {{ .Values.bff.config.corsOrigins | quote }}
   {{- end }}
+  {{- with .Values.bff.config.privacyLedger }}
+  {{- if .bucket }}
+  # GDPR erasure ledger — runbook backup-restore-b-m6.md §3.7
+  BFF_PRIVACY_LEDGER_S3_BUCKET: {{ .bucket | quote }}
+  {{- if .endpointUrl }}
+  BFF_PRIVACY_LEDGER_S3_ENDPOINT_URL: {{ .endpointUrl | quote }}
+  {{- end }}
+  {{- if .region }}
+  BFF_PRIVACY_LEDGER_S3_REGION: {{ .region | quote }}
+  {{- end }}
+  BFF_PRIVACY_LEDGER_RETENTION_DAYS: {{ .retentionDays | default 365 | quote }}
+  {{- end }}
+  {{- end }}
 
   # Web Fetch Gateway config
   WEB_FETCH_ALLOWED_DOMAINS:      {{ .Values.webFetchGateway.config.allowedDomains | quote }}
@@ -97,6 +111,7 @@ data:
   # session-orchestrator is rendered by the generic services.yaml loop with only
   # `envFrom: ap-config`, so the prefixed key must live here for it to take effect.
   SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL: {{ .Values.global.foundation.dlpUrl | quote }}
+  SESSION_ORCHESTRATOR_DLP_FAILURE_MODE: {{ .Values.global.foundation.dlpFailureMode | default "closed" | quote }}
   SESSION_ORCHESTRATOR_SKILL_STORE_URL: {{ printf "http://ap-skill-store:%d/api/skills/v1" (int .Values.skillStore.port) | quote }}
   SESSION_ORCHESTRATOR_SKILL_STORE_SERVICE_SCOPES: {{ .Values.sessionOrchestrator.config.skillStoreServiceScopes | quote }}
 

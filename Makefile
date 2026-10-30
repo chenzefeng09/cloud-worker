@@ -2,16 +2,20 @@
 # agent-platform 顶层 Makefile
 # =============================================================================
 
-SHELL := /usr/bin/env bash
+# A plain path: GNU make >= 3.82 runs .ONESHELL recipes by exec'ing SHELL
+# as-is, so "/usr/bin/env bash" fails there with "No such file or directory".
+SHELL := $(shell command -v bash 2>/dev/null || echo /bin/bash)
 .SHELLFLAGS := -eu -o pipefail -c
 .ONESHELL:
 .DEFAULT_GOAL := help
 
 # Path to the sibling saas-foundation checkout. Override with e.g.
 #   FOUNDATION_DIR=/srv/saas-foundation make up
-FOUNDATION_DIR ?= $(abspath $(CURDIR)/../saas-foundation)
-COMPOSE_FOUNDATION := docker compose -f $(FOUNDATION_DIR)/deploy/docker-compose/dev.yml --env-file $(FOUNDATION_DIR)/deploy/docker-compose/.env
-COMPOSE_AGENT := docker compose -f deploy/docker-compose/agent-platform.yml --env-file $(FOUNDATION_DIR)/deploy/docker-compose/.env --env-file deploy/docker-compose/.env
+# Paths may contain spaces (make functions such as $(abspath) would split them),
+# so every use below is quoted.
+FOUNDATION_DIR ?= $(CURDIR)/../saas-foundation
+COMPOSE_FOUNDATION := docker compose -f "$(FOUNDATION_DIR)/deploy/docker-compose/dev.yml" --env-file "$(FOUNDATION_DIR)/deploy/docker-compose/.env"
+COMPOSE_AGENT := docker compose -f "deploy/docker-compose/agent-platform.yml" --env-file "$(FOUNDATION_DIR)/deploy/docker-compose/.env" --env-file "deploy/docker-compose/.env"
 
 SERVICES := $(shell find services -mindepth 2 -maxdepth 2 -name pyproject.toml -print | sed -e 's|^services/||' -e 's|/pyproject.toml$$||' | sort)
 SDK_SERVICES := $(filter-out web-fetch-gateway,$(SERVICES))
@@ -24,35 +28,61 @@ RESET := \033[0m
 
 .PHONY: help
 help:
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' "$(strip $(MAKEFILE_LIST))" | sort | \
 	  awk 'BEGIN {FS = ":.*?## "}; {printf "  $(GREEN)%-22s$(RESET) %s\n", $$1, $$2}'
 
 # ---- Foundation ----
 .PHONY: foundation-up
 foundation-up: ## Start foundation dev stack
-	cd $(FOUNDATION_DIR) && $(MAKE) up
+	cd "$(FOUNDATION_DIR)" && "$(MAKE)" up
 
 .PHONY: foundation-down
 foundation-down: ## Stop foundation stack
-	cd $(FOUNDATION_DIR) && $(MAKE) down
+	cd "$(FOUNDATION_DIR)" && "$(MAKE)" down
 
 # ---- Agent Platform ----
 .PHONY: env
 env: ## Copy .env.example to .env if missing
-	@if [ ! -f deploy/docker-compose/.env ]; then \
-	  cp deploy/docker-compose/.env.example deploy/docker-compose/.env; \
+	@if [ ! -f "deploy/docker-compose/.env" ]; then \
+	  cp "deploy/docker-compose/.env.example" "deploy/docker-compose/.env"; \
 	  echo "$(YELLOW)Created deploy/docker-compose/.env — adjust values before use$(RESET)"; \
 	fi
 
 .PHONY: up
-up: env ## Start foundation + agent services
+up: env check-agent-image ## Start foundation + agent services
 	$(COMPOSE_FOUNDATION) up -d
 	$(COMPOSE_AGENT) up -d --build
 	@echo "$(GREEN)Agent services starting on ports 8005-8007, web on 5173$(RESET)"
 
 .PHONY: agent-up
-agent-up: env ## Start agent services only (foundation must be running)
+agent-up: env check-agent-image ## Start agent services only (foundation must be running)
 	$(COMPOSE_AGENT) up -d --build
+
+# The sandbox image the scheduler and sandbox-pool launch.  compose takes
+# AGENT_IMAGE (shell, then deploy/docker-compose/.env) and otherwise falls back
+# to CLAUDE_SDK_IMAGE, which make exports, so by default it is exactly what
+# build-claude-sdk-image builds.  A pinned AGENT_IMAGE that is not a local
+# image stops `up` here instead of failing at the first agent run; the default
+# image only warns, because the documented order builds it after `make up`.
+.PHONY: check-agent-image
+check-agent-image: env ## Fail fast if a pinned AGENT_IMAGE is not a local image
+	@if [ "$(SKIP_AGENT_IMAGE_CHECK)" = 1 ]; then exit 0; fi; \
+	img="$$($(COMPOSE_AGENT) config | sed -n 's/^ *SCHEDULER_AGENT_IMAGE: *//p' | tr -d "\"'")"; \
+	if [ -z "$$img" ]; then \
+	  printf '$(RED)%s$(RESET)\n' "Could not resolve SCHEDULER_AGENT_IMAGE from the agent compose config." >&2; \
+	  exit 1; \
+	elif docker image inspect "$$img" > /dev/null 2>&1; then \
+	  echo "Sandbox image: $$img"; \
+	elif [ "$$img" = "$(CLAUDE_SDK_IMAGE)" ]; then \
+	  printf '$(YELLOW)%s$(RESET)\n' "Sandbox image $$img is not built yet; agent runs fail until 'make build-claude-sdk-image' builds it."; \
+	else \
+	  printf '$(RED)%s$(RESET)\n' \
+	    "AGENT_IMAGE resolves to '$$img', which is not a local image (agent runs would fail at spawn)." \
+	    "Fix: unset AGENT_IMAGE in deploy/docker-compose/.env (or your shell) to use $(CLAUDE_SDK_IMAGE)," \
+	    "     built by 'make build-claude-sdk-image'; or build/pull '$$img'; or pass AGENT_IMAGE=<local tag>." \
+	    "     SKIP_AGENT_IMAGE_CHECK=1 skips this check." >&2; \
+	  exit 1; \
+	fi
 
 .PHONY: down
 down: ## Stop agent services
@@ -85,7 +115,7 @@ install-sdk: ## Install foundation_sdk[fastapi] editable into each service venv
 	fi
 	@for svc in $(SDK_SERVICES); do \
 	  echo "$(BOLD)→ install SDK into $$svc venv$(RESET)"; \
-	  cd services/$$svc && \
+	  cd "services/$$svc" && \
 	    poetry run pip install -e "$(FOUNDATION_DIR)/sdks/python[fastapi]" && \
 	    cd - > /dev/null; \
 	done
@@ -94,29 +124,29 @@ install-sdk: ## Install foundation_sdk[fastapi] editable into each service venv
 bootstrap: ## Full local-dev bootstrap: poetry install + install-sdk for all services
 	@for svc in $(SERVICES); do \
 	  echo "$(BOLD)→ poetry install $$svc$(RESET)"; \
-	  cd services/$$svc && poetry install --no-interaction && cd - > /dev/null; \
+	  cd "services/$$svc" && poetry install --no-interaction && cd - > /dev/null; \
 	done
-	$(MAKE) install-sdk
+	"$(MAKE)" install-sdk
 
 # ---- Code Quality ----
 .PHONY: lint
 lint: ## ruff check + mypy across all services
 	@for svc in $(SERVICES); do \
 	  echo "$(BOLD)→ $$svc$(RESET)"; \
-	  cd services/$$svc && poetry run ruff check . && poetry run mypy src/ && cd - > /dev/null; \
+	  cd "services/$$svc" && poetry run ruff check . && poetry run mypy src/ && cd - > /dev/null; \
 	done
 
 .PHONY: format
 format: ## ruff format across all services
 	@for svc in $(SERVICES); do \
-	  cd services/$$svc && poetry run ruff format . && cd - > /dev/null; \
+	  cd "services/$$svc" && poetry run ruff format . && cd - > /dev/null; \
 	done
 
 .PHONY: test
 test: ## pytest across all services
 	@for svc in $(SERVICES); do \
 	  echo "$(BOLD)→ $$svc$(RESET)"; \
-	  cd services/$$svc && poetry run pytest -v --cov=src && cd - > /dev/null; \
+	  cd "services/$$svc" && poetry run pytest -v --cov=src && cd - > /dev/null; \
 	done
 
 # ---- DB ----
@@ -140,6 +170,8 @@ web-install: ## Install frontend dependencies
 # build copies dist/ + a production-only node_modules into the image.  Build
 # context is the repo root because the Dockerfile COPYs from worker-claude-sdk/.
 CLAUDE_SDK_IMAGE ?= ghcr.io/agent-platform/claude-sdk-sandbox:0.1
+# Exported: compose falls back to it when AGENT_IMAGE is unset (check-agent-image).
+export CLAUDE_SDK_IMAGE
 CLAUDE_SDK_CUBE_IMAGE ?= claude-sdk-cube:0.2-scientific
 CLAUDE_SDK_CUBE_MATLAB_IMAGE ?= claude-sdk-cube:0.2-matlab-r4
 CLAUDE_SDK_CUBE_MATLAB_CONTROL_IMAGE ?= 127.0.0.1:5000/claude-sdk-cube:0.2-matlab-control-r2
@@ -156,54 +188,54 @@ build-claude-sdk-image: ## Build claude-sdk-sandbox image (compiles worker first
 	cd worker-claude-sdk && npm ci && npm run build && cd - > /dev/null
 	docker build \
 	  -f sandbox-images/claude-sdk.Dockerfile \
-	  -t $(CLAUDE_SDK_IMAGE) \
+	  -t "$(CLAUDE_SDK_IMAGE)" \
 	  .
 	@echo "$(GREEN)Built $(CLAUDE_SDK_IMAGE)$(RESET)"
 
 .PHONY: push-claude-sdk-image
 push-claude-sdk-image: ## Push claude-sdk-sandbox image to ghcr.io
-	docker push $(CLAUDE_SDK_IMAGE)
+	docker push "$(CLAUDE_SDK_IMAGE)"
 
 .PHONY: build-claude-sdk-cube-image
 build-claude-sdk-cube-image: ## Build Cube-native Claude image with scientific Python + CMake
 	docker build \
 	  -f sandbox-images/claude-sdk-cube.Dockerfile \
-	  -t $(CLAUDE_SDK_CUBE_IMAGE) \
+	  -t "$(CLAUDE_SDK_CUBE_IMAGE)" \
 	  .
 	@echo "$(GREEN)Built $(CLAUDE_SDK_CUBE_IMAGE)$(RESET)"
 
 .PHONY: build-claude-sdk-cube-matlab-image
 build-claude-sdk-cube-matlab-image: ## Build Cube image with MATLAB 2019b (needs the extracted installer in MATLAB_ISO_DIR)
 	docker buildx build --load \
-	  --build-context matlab-iso=$(MATLAB_ISO_DIR) \
-	  --build-arg BASE_IMAGE=$(CLAUDE_SDK_CUBE_IMAGE) \
+	  --build-context "matlab-iso=$(MATLAB_ISO_DIR)" \
+	  --build-arg "BASE_IMAGE=$(CLAUDE_SDK_CUBE_IMAGE)" \
 	  -f sandbox-images/claude-sdk-cube-matlab.Dockerfile \
-	  -t $(CLAUDE_SDK_CUBE_MATLAB_IMAGE) \
+	  -t "$(CLAUDE_SDK_CUBE_MATLAB_IMAGE)" \
 	  .
 	@echo "$(GREEN)Built $(CLAUDE_SDK_CUBE_MATLAB_IMAGE)$(RESET)"
 
 .PHONY: build-claude-sdk-cube-matlab-control-image
 build-claude-sdk-cube-matlab-control-image: ## Add Control System Toolbox to an existing Cube MATLAB image
-	MATLAB_MEDIA_DIR=$(MATLAB_ISO_DIR) \
-	MATLAB_BASE_IMAGE=$(CLAUDE_SDK_CUBE_MATLAB_BASE_IMAGE) \
-	MATLAB_CONTROL_IMAGE=$(CLAUDE_SDK_CUBE_MATLAB_CONTROL_IMAGE) \
+	MATLAB_MEDIA_DIR="$(MATLAB_ISO_DIR)" \
+	MATLAB_BASE_IMAGE="$(CLAUDE_SDK_CUBE_MATLAB_BASE_IMAGE)" \
+	MATLAB_CONTROL_IMAGE="$(CLAUDE_SDK_CUBE_MATLAB_CONTROL_IMAGE)" \
 	  sandbox-images/build-matlab-control-layer.sh
 	@echo "$(GREEN)Built $(CLAUDE_SDK_CUBE_MATLAB_CONTROL_IMAGE)$(RESET)"
 
 .PHONY: build-claude-sdk-cube-matlab-aerospace-image
 build-claude-sdk-cube-matlab-aerospace-image: ## Add core aerospace products to the Control-enabled MATLAB image
-	MATLAB_MEDIA_DIR=$(MATLAB_ISO_DIR) \
-	MATLAB_BASE_IMAGE=$(CLAUDE_SDK_CUBE_MATLAB_AEROSPACE_BASE_IMAGE) \
-	MATLAB_AEROSPACE_IMAGE=$(CLAUDE_SDK_CUBE_MATLAB_AEROSPACE_IMAGE) \
+	MATLAB_MEDIA_DIR="$(MATLAB_ISO_DIR)" \
+	MATLAB_BASE_IMAGE="$(CLAUDE_SDK_CUBE_MATLAB_AEROSPACE_BASE_IMAGE)" \
+	MATLAB_AEROSPACE_IMAGE="$(CLAUDE_SDK_CUBE_MATLAB_AEROSPACE_IMAGE)" \
 	  sandbox-images/build-matlab-aerospace-layer.sh
 	@echo "$(GREEN)Built $(CLAUDE_SDK_CUBE_MATLAB_AEROSPACE_IMAGE)$(RESET)"
 
 .PHONY: build-claude-sdk-cube-worker-refresh-image
 build-claude-sdk-cube-worker-refresh-image: ## Refresh the worker while preserving the existing Cube/MATLAB layers
 	docker build \
-	  --build-arg BASE_IMAGE=$(CLAUDE_SDK_CUBE_REFRESH_BASE_IMAGE) \
+	  --build-arg "BASE_IMAGE=$(CLAUDE_SDK_CUBE_REFRESH_BASE_IMAGE)" \
 	  -f sandbox-images/claude-sdk-cube-worker-refresh.Dockerfile \
-	  -t $(CLAUDE_SDK_CUBE_REFRESH_IMAGE) \
+	  -t "$(CLAUDE_SDK_CUBE_REFRESH_IMAGE)" \
 	  .
 	@echo "$(GREEN)Built $(CLAUDE_SDK_CUBE_REFRESH_IMAGE)$(RESET)"
 

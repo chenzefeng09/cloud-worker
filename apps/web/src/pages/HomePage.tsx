@@ -6,10 +6,11 @@ import { formatDate } from '../i18n/dates';
 import { useWorkspace } from '../lib/workspaceContext';
 import { SENSITIVITY_LABELS, DEFAULT_SENSITIVITY } from '../lib/sensitivity';
 import { useSessions } from '../hooks/useSessions';
+import { useTasks } from '../hooks/useTasks';
 import { api } from '../api/client';
-import type { Attachment, Session } from '../api/types';
+import type { Attachment, Session, Task } from '../api/types';
 import { formatRelativeTime } from '../lib/format';
-import { StatusDot, sessionToDesignStatus } from '../components/shell/StatusDot';
+import { StatusDot, taskToDesignStatus } from '../components/shell/StatusDot';
 import { Chip } from '../components/shell/Chip';
 import { Composer } from '../components/composer/Composer';
 import { DRAFT_SESSION_ID, useChatStore } from '../stores/chatStore';
@@ -17,6 +18,7 @@ import { useApps } from '../hooks/useApps';
 import { useInstalledSkills } from '../hooks/useInstalledSkills';
 import { useMcpServers } from '../hooks/useMcpServers';
 import { CreateAppModal } from '../components/app/CreateAppModal';
+import { CreateTaskDialog } from '../components/tasks/CreateTaskDialog';
 import { GridBackdrop } from '../components/GridBackdrop';
 import { SYSTEM_FALLBACK_MODEL, DEFAULT_EFFORT } from '../lib/modelOptions';
 import { useDefaultModel } from '../hooks/useDefaultModel';
@@ -33,6 +35,8 @@ const SUGGESTIONS = ['Plan my day tomorrow', 'Summarize this PDF', 'Reply to a s
 
 /** Default glyph for an App card when the App has no icon set. */
 const DEFAULT_APP_GLYPH = '▤';
+// The four most recently touched conversations, tasks and app runs.
+const RECENT_PARAMS = { limit: 4 } as const;
 
 export function HomePage() {
   const { lang } = useTranslation();
@@ -42,12 +46,16 @@ export function HomePage() {
     loading: workspacesLoading,
     setActiveWorkspaceId,
   } = useWorkspace();
-  const { sessions, createSession } = useSessions();
+  const { createSession } = useSessions();
+  // The rail shows each session's real state, derived from its latest run;
+  // the session status alone says only whether it is open.
+  const { items: recent } = useTasks(RECENT_PARAMS);
   const { apps, loading: appsLoading } = useApps('published');
   const { apps: myApps, loading: myAppsLoading } = useApps('mine');
   const navigate = useNavigate();
   const [draft, setDraft] = useState('');
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [showCreateTask, setShowCreateTask] = useState(false);
   const [phIdx, setPhIdx] = useState(0);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -155,12 +163,12 @@ export function HomePage() {
   };
 
 
-  const openSession = (s: Session) => {
-    if (s.metadata?.kind === 'app_run' && s.current_run_id) {
-      navigate(`/apps/runs/${s.id}/${s.current_run_id}`);
+  const openRecent = (task: Task) => {
+    if (task.kind === 'app_run' && task.latest_run) {
+      navigate(`/apps/runs/${task.id}/${task.latest_run.id}`);
       return;
     }
-    navigate(`/tasks/${s.id}`);
+    navigate(`/tasks/${task.id}`);
   };
 
   const dateLabel = formatDate(new Date(), lang, {
@@ -280,9 +288,17 @@ export function HomePage() {
 
           {/* 应用中心 — published apps */}
           <div className="w-[min(960px,95%)] grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
-            {/* 空白任务 */}
+            {/* 空白任务 — a structured background task (instructions, files, tools) */}
             <div
-              onClick={() => setShowCreateModal(true)}
+              role="button"
+              tabIndex={0}
+              onClick={() => setShowCreateTask(true)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  setShowCreateTask(true);
+                }
+              }}
               className="border border-line bg-surface rounded-md p-3.5 cursor-pointer flex flex-col gap-1.5 min-h-[120px] transition-all hover:border-ink-2 hover:-translate-y-px"
             >
               <div className="flex items-center gap-2.5 mb-0.5">
@@ -294,11 +310,12 @@ export function HomePage() {
                 <span className="font-mono text-[10.5px] text-dim">→</span>
               </div>
               <div className="text-[12px] text-dim leading-[1.45]">
-                Start from scratch — describe your goal in plain language.
+                Describe a goal, attach files, and let it run in the background.
               </div>
               <div className="flex-1" />
               <div className="flex gap-1 flex-wrap">
                 <Chip>Free-form</Chip>
+                <Chip>Background</Chip>
               </div>
             </div>
 
@@ -419,18 +436,18 @@ export function HomePage() {
         <div className="border-t border-line bg-paper px-6 py-3 shrink-0 relative">
           <div className="flex items-baseline justify-between mb-2.5">
             <span className="font-mono text-[9.5px] uppercase tracking-[0.14em] text-dim">
-              Recent · In progress
+              Recent
             </span>
           </div>
           <div className="grid grid-cols-[repeat(auto-fit,minmax(220px,1fr))] gap-2.5">
-            {sessions.slice(0, 4).map((s) => (
+            {recent.map((s) => (
               <div
                 key={s.id}
-                onClick={() => openSession(s)}
+                onClick={() => openRecent(s)}
                 className="border border-line rounded-md p-3 bg-surface cursor-pointer flex flex-col gap-2 hover:border-ink-2 hover:-translate-y-px transition-all"
               >
                 <div className="flex items-center gap-2">
-                  <StatusDot status={sessionToDesignStatus(s.status)} />
+                  <StatusDot status={taskToDesignStatus(s.status)} />
                   <div className="flex-1" />
                   <span className="font-mono text-[10.5px] text-dim">
                     {formatRelativeTime(s.updated_at)}
@@ -441,7 +458,7 @@ export function HomePage() {
                 </div>
               </div>
             ))}
-            {sessions.length === 0 && (
+            {recent.length === 0 && (
               <div className="font-mono italic text-dim text-[11px] px-2">No tasks yet</div>
             )}
           </div>
@@ -451,6 +468,15 @@ export function HomePage() {
       <CreateAppModal
         open={showCreateModal}
         onClose={() => setShowCreateModal(false)}
+      />
+      <CreateTaskDialog
+        open={showCreateTask}
+        onClose={() => setShowCreateTask(false)}
+        onCreated={(task) => {
+          // Started → watch it run; saved but not started → the board, where
+          // its card offers Start.
+          navigate(task ? `/tasks/${task.id}` : '/tasks');
+        }}
       />
     </div>
   );

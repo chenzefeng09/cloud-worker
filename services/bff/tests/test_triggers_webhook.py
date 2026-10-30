@@ -206,6 +206,43 @@ def test_multipart_maps_inputs_and_files_and_launches_webhook_run(
     assert run["session_id"] == "ses_draft"
 
 
+_OWNER = "usr_01J5OWNER0000000000000000A"
+
+
+def test_webhook_run_records_the_trigger_owner(client_and_fake: tuple) -> None:
+    """The run is the cron account's, so it names whose behalf it is on —
+    including on the draft session the receiver creates for uploaded files."""
+    client, fake = client_and_fake
+    fake.verify_body = {**fake.verify_body, "created_by_user_id": _OWNER}
+    resp = client.post(
+        "/api/bff/v1/triggers/cron_1/webhook",
+        headers={"Authorization": "Bearer good-secret"},
+        data={"subject": "climate"},
+        files={"attachment": ("report.txt", b"file-bytes", "text/plain")},
+    )
+    assert resp.status_code == 202, resp.text
+    run = fake.run_call()
+    assert run is not None and run["on_behalf_of"] == _OWNER
+    drafts = [b for m, u, b in fake.calls if m == "POST" and u.endswith("/sessions")]
+    assert drafts and drafts[0]["agent_config"]["on_behalf_of_user_id"] == _OWNER
+
+
+@pytest.mark.parametrize("owner", [None, "SYSTEM", "not-a-user"])
+def test_webhook_run_without_a_valid_owner_names_none(
+    client_and_fake: tuple, owner: str | None,
+) -> None:
+    client, fake = client_and_fake
+    fake.verify_body = {**fake.verify_body, "created_by_user_id": owner}
+    resp = client.post(
+        "/api/bff/v1/triggers/cron_1/webhook",
+        headers={"X-Webhook-Secret": "good-secret"},
+        json={"subject": "climate"},
+    )
+    assert resp.status_code == 202, resp.text
+    run = fake.run_call()
+    assert run is not None and "on_behalf_of" not in run
+
+
 def test_multipart_text_value_routed_to_file_field_400(
     client_and_fake: tuple,
 ) -> None:

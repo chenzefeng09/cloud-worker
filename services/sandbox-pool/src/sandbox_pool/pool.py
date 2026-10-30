@@ -8,6 +8,13 @@ instantly when available; callers never pay cold-start latency on a warm hit.
 
 Lifecycle
 ~~~~~~~~~
+* **reap_orphans()** runs once at startup: the pool's state lives in memory,
+  so warm sandboxes an earlier process of this pool owner left running (a
+  crash) are stopped instead of being left to pile up.  Another replica's
+  sandboxes carry its own owner id and are never touched.
+* **reconcile_tick()** runs first each tick: one runtime liveness probe over
+  the IDLE entries; any whose container died is dropped and its container
+  removed, so it stops counting as warm and the next warmup replaces it.
 * **warmup_tick()** runs in the background, spawning real Docker containers
   up to ``idle_low_watermark`` per template.
 * **acquire()** claims an IDLE entry (fast path) or cold-spawns one
@@ -18,6 +25,9 @@ Lifecycle
   the snapshot-based recycle path is a KEDA/CubeSandbox follow-up).
 * **reap_excess_tick()** removes idle containers above
   ``idle_high_watermark``.
+* **drain_idle()** runs on a graceful shutdown and stops this process's warm
+  spares: a rolling update brings the pool back under a new owner id (a new
+  pod name), which would not reap them.
 
 Persistence
 ~~~~~~~~~~~
@@ -37,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -60,6 +71,14 @@ class PoolRuntime(Protocol):
     ) -> str: ...
 
     def stop_container(self, container_id: str) -> None: ...
+
+    # Which of these ids are still alive, in one batched probe.  Must raise
+    # when the runtime can't be queried rather than report everything dead.
+    def alive_ids(self, container_ids: Iterable[str]) -> set[str]: ...
+
+    # Every running sandbox this pool owner (``Settings.pool_owner``) started;
+    # never a peer replica's.
+    def running_pool_ids(self) -> set[str]: ...
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +128,7 @@ class Pool:
 
     ``_spawn_one`` starts a real idle container via ``PoolDockerRuntime``.
     ``_reap_one`` stops + removes the container.
+    ``reconcile_tick()`` drops idle entries whose container has died.
     ``acquire()`` polls for a warm container up to ``acquire_timeout_seconds``
     before falling back to a synchronous cold spawn.
     """
@@ -295,6 +315,114 @@ class Pool:
             # ``sleep infinity`` are not reusable after a task run anyway.
             self._reap_one(sandbox_id)
         self._refresh_gauges()
+
+    # ------------------------------------------------------------------ startup
+    async def reap_orphans(self) -> int:
+        """Stop warm sandboxes that an earlier process of this pool left running.
+
+        Pool state lives in memory, so after a crash the previous process's
+        warm spares are unknown here: nothing would ever hand them out or
+        stop them, and they keep holding memory (``sleep infinity`` never
+        exits).  Only sandboxes stamped with this pool's owner id are
+        considered, so a replica starting next to its peers never stops
+        theirs.  Exited ones are left alone: they hold no CPU or memory and
+        their logs may explain a crash.  If the listing fails nothing is
+        stopped.  Returns how many were stopped.
+
+        A sandbox handed out by ``acquire`` is in-memory state too, so it would
+        be stopped here as well.  Nothing acquires from the pool yet (the
+        scheduler spawns its own containers); wiring that in needs the
+        ACQUIRED entries to outlive a pool restart first.
+        """
+        try:
+            running = await asyncio.to_thread(self._runtime.running_pool_ids)
+        except Exception:
+            logger.warning("pool: could not list leftover warm sandboxes", exc_info=True)
+            return 0
+        async with self._lock:
+            orphans = sorted(running - set(self._state.entries))
+        stopped = 0
+        for sandbox_id in orphans:
+            try:
+                await asyncio.to_thread(self._runtime.stop_container, sandbox_id)
+            except Exception:
+                logger.warning(
+                    "pool: could not stop a leftover warm sandbox",
+                    extra={"sandbox_id": sandbox_id},
+                    exc_info=True,
+                )
+            else:
+                stopped += 1
+        return stopped
+
+    # ----------------------------------------------------------------- shutdown
+    async def drain_idle(self) -> int:
+        """Stop this process's warm spares on a graceful shutdown.
+
+        Nothing else would: the next pool process reaps only leftovers carrying
+        its own owner id, and under Kubernetes a replaced pod comes back under
+        a new name.  Handed-out (ACQUIRED) sandboxes are left alone.  The stops
+        run concurrently; returns how many succeeded.
+        """
+        async with self._lock:
+            idle = [e.sandbox_id for e in self._state.entries.values() if e.state == "IDLE"]
+            for sandbox_id in idle:
+                self._state.entries.pop(sandbox_id, None)
+        results = await asyncio.gather(
+            *(asyncio.to_thread(self._runtime.stop_container, sid) for sid in idle),
+            return_exceptions=True,
+        )
+        stopped = 0
+        for sandbox_id, result in zip(idle, results, strict=True):
+            if isinstance(result, BaseException):
+                logger.warning(
+                    "pool: could not stop a warm sandbox on shutdown",
+                    extra={"sandbox_id": sandbox_id},
+                    exc_info=result,
+                )
+            else:
+                stopped += 1
+        self._refresh_gauges()
+        return stopped
+
+    # ------------------------------------------------------------------ liveness
+    async def reconcile_tick(self) -> int:
+        """Drop IDLE entries whose sandbox is no longer alive.
+
+        A warm container can die under the pool (crash, OOM kill, daemon
+        restart, manual ``docker rm``).  Left alone its entry keeps counting as
+        warm, so warmup never replaces it and ``acquire`` would hand out a dead
+        id.  One ``alive_ids`` probe covers every idle entry, and the lock is
+        held from probe to drop so ``acquire`` can never claim an entry the
+        pool already knows is dead.  ACQUIRED entries are left to ``release``.
+
+        If the probe fails nothing is dropped: an unreachable runtime must not
+        read as "every warm sandbox died".  Returns how many entries were
+        dropped; the next ``warmup_tick`` replenishes them.
+        """
+        dead: list[str] = []
+        async with self._lock:
+            idle_ids = [
+                e.sandbox_id for e in self._state.entries.values() if e.state == "IDLE"
+            ]
+            if idle_ids:
+                try:
+                    alive = await asyncio.to_thread(self._runtime.alive_ids, idle_ids)
+                except Exception:
+                    logger.warning(
+                        "pool: liveness probe failed; keeping idle entries this tick",
+                        exc_info=True,
+                    )
+                    alive = set(idle_ids)
+                dead = [sid for sid in idle_ids if sid not in alive]
+                for sid in dead:
+                    logger.warning(
+                        "pool: idle sandbox died; dropping it from the pool",
+                        extra={"sandbox_id": sid},
+                    )
+                    self._reap_one(sid)
+        self._refresh_gauges()
+        return len(dead)
 
     # ------------------------------------------------------------------ warm-up
     async def warmup_tick(self) -> int:

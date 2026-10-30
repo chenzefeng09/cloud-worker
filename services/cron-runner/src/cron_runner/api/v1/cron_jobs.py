@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from cron_runner.api.dependencies import TDbSession, TTenantId
+from cron_runner.api.dependencies import TDbSession, TTenantId, TUserId
 from cron_runner.domain.models import CronJob
 from cron_runner.errors import (
     CronJobNotFoundError,
@@ -83,6 +83,8 @@ class CronJobOut(BaseModel):
     field_mapping: dict[str, Any] | None
     enabled: bool
     source: str
+    # Who created the trigger (NULL for system-created and pre-0004 rows).
+    created_by_user_id: str | None = None
     # Whether a webhook secret exists. The plaintext is NEVER exposed here.
     has_webhook_secret: bool
     last_run_at: datetime | None
@@ -138,6 +140,13 @@ def _webhook_path(job_id: str) -> str:
     return WEBHOOK_PATH_TEMPLATE.format(id=job_id)
 
 
+def _creator(user_id: str) -> str | None:
+    """The owner to record for a new trigger: the calling user, never "SYSTEM"."""
+    if not user_id or user_id == "SYSTEM" or len(user_id) > 40:
+        return None
+    return user_id
+
+
 def _compute_next_run(expression: str, tz: str) -> datetime | None:
     try:
         trigger = CronTrigger.from_crontab(expression, timezone=tz)
@@ -175,6 +184,7 @@ async def create_cron_job(
     request: Request,
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
+    user_id: str = TUserId,
 ) -> CronJobCreateOut:
     """Create a new trigger.
 
@@ -221,6 +231,7 @@ async def create_cron_job(
         webhook_secret_hash=webhook_secret_hash,
         enabled=body.enabled,
         source=body.source,
+        created_by_user_id=_creator(user_id),
         next_run_at=next_run_at,
     )
     db.add(job)

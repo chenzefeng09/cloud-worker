@@ -20,7 +20,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.domain.models import Workspace, WorkspaceFile, WorkspaceFileVersion
@@ -266,13 +266,26 @@ class WorkspaceService:
 
     async def delete_file(
         self, workspace_id: str, file_id: str, *, user_id: str | None
-    ) -> WorkspaceFile:
-        """Hard-delete the row; return it so the caller can best-effort delete
-        the blob (``blob_key`` stays readable on the detached instance)."""
+    ) -> list[str]:
+        """Hard-delete the file and its version history.
+
+        Returns the blob keys those rows pointed at, for the caller to delete
+        the ones no other row still uses (a restored version shares its bytes
+        with the current file).
+        """
         wsf = await self.get_file(workspace_id, file_id, user_id=user_id)
+        of_file = (
+            WorkspaceFileVersion.tenant_id == self._tenant_id,
+            WorkspaceFileVersion.workspace_file_id == wsf.id,
+        )
+        version_keys = (
+            await self._db.execute(select(WorkspaceFileVersion.blob_key).where(*of_file))
+        ).scalars().all()
+        # Versions reference the file, so they go first.
+        await self._db.execute(delete(WorkspaceFileVersion).where(*of_file))
         await self._db.delete(wsf)
         await self._db.flush()
-        return wsf
+        return [key for key in (wsf.blob_key, *version_keys) if key]
 
     # -------------------------------------------------------------- writeback
 

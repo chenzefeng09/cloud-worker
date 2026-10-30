@@ -69,8 +69,29 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Run' }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '422': { $ref: '#/components/responses/Unprocessable' }
-        '502': { $ref: '#/components/responses/BadGateway' }
+        '402':
+          description: >-
+            The tenant's `agent_sessions` quota is used up (billing answered
+            `allowed: false`). `detail` is an object: `message`, `dimension`,
+            `current`, `limit`, `remaining`.
+        '422':
+          description: >-
+            Request validation failed, or `code: AGENT.SCHEDULER.LLM_NOT_CONFIGURED`:
+            the LLM gateway answered that the tenant has no enabled provider
+            (`FOUNDATION.LLM_GATEWAY.PROVIDER.NOT_FOUND` on the run-key mint), so
+            no run can call a model. Not retryable; no fallback to a long-lived
+            tenant key is tried.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '502':
+          description: >-
+            A foundation service failed. `code: AGENT.SCHEDULER.LLM_GATEWAY_UNAVAILABLE`
+            when no model key could be obtained: the run-key mint failed for
+            another reason and so did the long-lived tenant key lookup.
+          content:
+            application/problem+json:
+              schema: { $ref: '#/components/schemas/Error' }
         '503': { $ref: '#/components/responses/ServiceUnavailable' }
 
   /api/scheduler/v1/runs/{run_id}:
@@ -110,7 +131,7 @@ paths:
           description: Run cancelled
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/Run' }
+              schema: { $ref: '#/components/schemas/RunCancelled' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
 
@@ -184,6 +205,7 @@ paths:
       security: []
       responses:
         '200':
+          description: The service is alive
           content:
             application/json:
               schema: { $ref: '#/components/schemas/HealthStatus' }
@@ -196,6 +218,7 @@ paths:
       security: []
       responses:
         '200':
+          description: The service is ready to take requests
           content:
             application/json:
               schema: { $ref: '#/components/schemas/HealthStatus' }
@@ -257,6 +280,30 @@ components:
         finished_at:       { type: string, format: date-time, nullable: true }
         created_at:        { type: string, format: date-time }
 
+    RunCancelled:
+      type: object
+      required: [id, status, usage]
+      properties:
+        id:     { type: string, description: "The path's run_id" }
+        status: { type: string, enum: [CANCELLED] }
+        usage:
+          description: >
+            What the worker last wrote to result.json, read after the stop so
+            counts saved on SIGTERM are included; null when it wrote none. It is
+            the run's cumulative usage, earlier legs of a resumed run included,
+            and the caller records it: a cancelled run is not polled again.
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/TokenUsage'
+
+    TokenUsage:
+      type: object
+      properties:
+        input_tokens:            { type: integer, minimum: 0 }
+        output_tokens:           { type: integer, minimum: 0 }
+        total_tokens:            { type: integer, minimum: 0 }
+        cache_read_input_tokens: { type: integer, minimum: 0 }
+
     Sandbox:
       type: object
       required: [container_id, run_id, session_id, tenant_id, status]
@@ -297,16 +344,6 @@ components:
           schema: { $ref: '#/components/schemas/Error' }
     NotFound:
       description: Resource not found (or not owned by caller's tenant)
-      content:
-        application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
-    Unprocessable:
-      description: Request validation failed
-      content:
-        application/problem+json:
-          schema: { $ref: '#/components/schemas/Error' }
-    BadGateway:
-      description: Upstream foundation service returned an error
       content:
         application/problem+json:
           schema: { $ref: '#/components/schemas/Error' }

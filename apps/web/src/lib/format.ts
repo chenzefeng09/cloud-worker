@@ -1,3 +1,5 @@
+import type { TaskStatus } from '../api/types';
+
 /**
  * Format an ISO timestamp (or Date) as a short relative time string used
  * throughout the workspace UI: just now / 5 min ago / 3 hr ago / 2 days ago.
@@ -69,6 +71,24 @@ export function formatAbsoluteTime(value: string | Date | null | undefined): str
   );
 }
 
+/**
+ * Who a user id stands for, for display.  `name` is the display name the BFF
+ * resolves beside the id; the caller is marked "(you)".  An id with no name is
+ * an erased user's placeholder (not a `usr_` id) or one identity could not
+ * resolve — neither is worth showing raw.
+ */
+export function personLabel(
+  userId: string | null | undefined,
+  name: string | null | undefined,
+  currentUserId?: string | null,
+): string {
+  if (!userId) return '—';
+  const isMe = Boolean(currentUserId) && userId === currentUserId;
+  if (name) return isMe ? `${name} (you)` : name;
+  if (isMe) return 'You';
+  return userId.startsWith('usr_') ? 'Unknown user' : 'Deleted user';
+}
+
 /** Map session status enum from the API to a display label. */
 export function sessionStatusLabel(status: string | null | undefined): string {
   switch (status) {
@@ -112,4 +132,43 @@ export function taskStatusLabel(status: string | null | undefined): string {
     default:
       return status ?? '—';
   }
+}
+
+/** Task board status (server vocabulary) → display label. */
+export function boardStatusLabel(status: TaskStatus): string {
+  switch (status) {
+    case 'queued':
+      return 'Queued';
+    case 'running':
+      return 'Running';
+    case 'needs_input':
+      return 'Needs input';
+    case 'completed':
+      return 'Completed';
+    case 'failed':
+      return 'Failed';
+    case 'cancelled':
+      return 'Cancelled';
+    case 'idle':
+      return 'Not started';
+  }
+}
+
+/**
+ * Compact elapsed time between two instants ("42s", "3m 05s", "1h 12m").
+ * `end` defaults to now so a running task's clock keeps ticking.
+ */
+export function formatElapsed(
+  start: string | Date | null | undefined,
+  end?: string | Date | null,
+): string {
+  if (!start) return '—';
+  const s = typeof start === 'string' ? new Date(start) : start;
+  const e = end ? (typeof end === 'string' ? new Date(end) : end) : new Date();
+  const secs = Math.max(0, Math.round((e.getTime() - s.getTime()) / 1000));
+  if (Number.isNaN(secs)) return '—';
+  if (secs < 60) return `${secs}s`;
+  const mins = Math.floor(secs / 60);
+  if (mins < 60) return `${mins}m ${String(secs % 60).padStart(2, '0')}s`;
+  return `${Math.floor(mins / 60)}h ${String(mins % 60).padStart(2, '0')}m`;
 }

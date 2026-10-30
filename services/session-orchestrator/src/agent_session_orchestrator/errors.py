@@ -61,6 +61,36 @@ class RunNotFoundError(OrchestratorError):
         )
 
 
+# The scheduler refusals a user can act on.  Neither goes away by retrying,
+# so the generic "try again" a refused run otherwise gets would mislead.
+
+
+class LlmNotConfiguredError(OrchestratorError):
+    def __init__(self) -> None:
+        super().__init__(
+            "No enabled LLM provider is configured for this tenant",
+            code="AGENT.RUN.LLM_NOT_CONFIGURED",
+            status=422,
+            user_message=(
+                "No AI model is set up for your organization yet, so the agent "
+                "can't run. An administrator can add one under Admin → Models."
+            ),
+        )
+
+
+class RunQuotaExceededError(OrchestratorError):
+    def __init__(self) -> None:
+        super().__init__(
+            "The tenant's agent session quota is exhausted",
+            code="AGENT.RUN.QUOTA_EXCEEDED",
+            status=402,
+            user_message=(
+                "Your organization has reached its limit for agent runs. "
+                "An administrator can review it under Admin → Subscriptions & quotas."
+            ),
+        )
+
+
 # ── Workspace errors (AGENT.WORKSPACE.*) ────────────────────────────────────
 
 

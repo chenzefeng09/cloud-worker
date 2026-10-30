@@ -103,6 +103,18 @@ class FakeDB:
         return None
 
     async def execute(self, stmt: Any) -> Any:
+        result = await self._execute_entities(stmt)
+        # ``select(Model.column)`` (e.g. the ownership guards' owner lookup):
+        # project the matched rows onto that column instead of whole entities.
+        descriptions = getattr(stmt, "column_descriptions", None)
+        if descriptions and len(descriptions) == 1:
+            desc = descriptions[0]
+            if desc.get("entity") is not None and desc.get("expr") is not desc["entity"]:
+                name = desc["name"]
+                return FakeResult([getattr(row, name) for row in result.all()])
+        return result
+
+    async def _execute_entities(self, stmt: Any) -> Any:
         # We route by the statement's target entity + a hand-rolled predicate
         # evaluator good enough for the service's queries.  Detect UPDATE by the
         # statement type (an ``is_update`` visit_name), NOT a substring on the

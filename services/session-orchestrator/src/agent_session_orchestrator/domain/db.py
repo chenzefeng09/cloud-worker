@@ -27,12 +27,31 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from agent_session_orchestrator.config import Settings
 
 _engine = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
+# The migrator (BYPASSRLS) engine behind ``privileged_scalars``, created on
+# first use and kept for the process: the completion watcher reads through it
+# every couple of seconds.
+_privileged_engine: AsyncEngine | None = None
+_privileged_dsn: str | None = None
+
+
+def _without_statement_caches(dsn: str) -> str:
+    # pgbouncer in ``transaction`` mode cannot honour per-connection prepared
+    # statements; see ``init_db``.
+    sep = "&" if "?" in dsn else "?"
+    if "prepared_statement_cache_size" not in dsn:
+        dsn = f"{dsn}{sep}prepared_statement_cache_size=0"
+    return dsn
 
 
 async def init_db(settings: Settings) -> None:
@@ -46,12 +65,8 @@ async def init_db(settings: Settings) -> None:
     #   * ``prepared_statement_cache_size=0``  -> SQLAlchemy dialect cache
     # Per SQLAlchemy docs the dialect arg goes in the URL query string,
     # not in ``connect_args`` (asyncpg's ``connect`` would error).
-    dsn = settings.db_dsn
-    sep = "&" if "?" in dsn else "?"
-    if "prepared_statement_cache_size" not in dsn:
-        dsn = f"{dsn}{sep}prepared_statement_cache_size=0"
     _engine = create_async_engine(
-        dsn,
+        _without_statement_caches(settings.db_dsn),
         pool_size=settings.db_pool_size,
         max_overflow=settings.db_max_overflow,
         pool_recycle=settings.db_pool_recycle,
@@ -105,10 +120,14 @@ async def get_session(
 
 
 async def close_db() -> None:
-    global _engine
+    global _engine, _privileged_engine, _privileged_dsn
     if _engine is not None:
         await _engine.dispose()
         _engine = None
+    if _privileged_engine is not None:
+        await _privileged_engine.dispose()
+        _privileged_engine = None
+        _privileged_dsn = None
 
 
 async def privileged_scalars(settings: Settings, sql: str, params: dict | None = None) -> list:
@@ -121,22 +140,28 @@ async def privileged_scalars(settings: Settings, sql: str, params: dict | None =
     exactly this kind of operational, cross-tenant read (see the migration
     docstring).
 
-    This helper opens a short-lived engine on ``db_dsn_migrator``, runs the
-    query, and disposes immediately — it is **not** pooled because the sweep
-    runs at most once a day.  Use it only for cross-tenant *reads*; the
-    actual writes (soft-deletes) go through the normal tenant-bound
-    ``app_user`` path so RLS still guards every mutation.
+    The engine on ``db_dsn_migrator`` is created on first use and reused (a
+    small pool: the background jobs that call this run one query at a time);
+    ``close_db`` disposes it.  Use it only for cross-tenant *reads*; the
+    actual writes (soft-deletes, run finalization) go through the normal
+    tenant-bound ``app_user`` path so RLS still guards every mutation.
 
     Returns the first column of every row (``Result.scalars().all()``).
     """
-    dsn = settings.db_dsn_migrator
-    sep = "&" if "?" in dsn else "?"
-    if "prepared_statement_cache_size" not in dsn:
-        dsn = f"{dsn}{sep}prepared_statement_cache_size=0"
-    engine = create_async_engine(dsn, connect_args={"statement_cache_size": 0})
-    try:
-        async with engine.connect() as conn:
-            result = await conn.execute(text(sql), params or {})
-            return list(result.scalars().all())
-    finally:
-        await engine.dispose()
+    global _privileged_engine, _privileged_dsn
+    dsn = _without_statement_caches(settings.db_dsn_migrator)
+    if _privileged_engine is None or _privileged_dsn != dsn:
+        if _privileged_engine is not None:
+            await _privileged_engine.dispose()
+        _privileged_engine = create_async_engine(
+            dsn,
+            pool_size=1,
+            max_overflow=2,
+            pool_recycle=settings.db_pool_recycle,
+            pool_pre_ping=True,
+            connect_args={"statement_cache_size": 0},
+        )
+        _privileged_dsn = dsn
+    async with _privileged_engine.connect() as conn:
+        result = await conn.execute(text(sql), params or {})
+        return list(result.scalars().all())

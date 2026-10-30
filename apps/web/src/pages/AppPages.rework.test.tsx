@@ -73,7 +73,7 @@ vi.mock('../components/shell/PageHead', () => ({
 }));
 vi.mock('../stores/chatStore', () => ({
   useChatStore: (selector: (s: Record<string, unknown>) => unknown) =>
-    selector({ userProfile: { id: 'usr_alice', roles: [] } }),
+    selector({ userProfile: { user_id: 'usr_alice', roles: [] } }),
 }));
 vi.mock('../api/client', () => ({
   ApiError: class ApiError extends Error {},
@@ -215,6 +215,32 @@ describe('acceptance', () => {
     expect(within(dialog).getByText('v1')).toBeTruthy();
     expect(within(dialog).getByText('Published')).toBeTruthy();
     expect(within(dialog).getByText('Current')).toBeTruthy();
+  });
+
+  it('detail page: names the author and reviewer instead of showing their ids', async () => {
+    const user = userEvent.setup();
+    mocks.get.mockResolvedValue({
+      ...APP,
+      author_name: 'Alice Chen',
+      versions: [
+        {
+          ...APP.versions[0],
+          submitted_by: 'usr_alice',
+          submitted_by_name: 'Alice Chen',
+          reviewed_by: 'usr_bob',
+          reviewed_by_name: 'Bob Li',
+        },
+      ],
+    });
+    mocks.listRuns.mockResolvedValue({ items: [] });
+    renderWithShell(<AppDetailPage />);
+
+    expect(await screen.findByText(/Author Alice Chen \(you\)/)).toBeTruthy();
+    await user.click(screen.getByRole('button', { name: 'Version history' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Version history' });
+    expect(within(dialog).getByText(/Submitted by Alice Chen \(you\)/)).toBeTruthy();
+    expect(within(dialog).getByText(/Reviewed by Bob Li/)).toBeTruthy();
+    expect(document.body.textContent).not.toMatch(/usr_bob|usr_alice/);
   });
 
   it('editor page: step 1 shows the app-info block prefilled, saves meta before version', async () => {

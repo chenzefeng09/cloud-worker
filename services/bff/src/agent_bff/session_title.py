@@ -16,7 +16,11 @@ from typing import Any
 import httpx
 
 from agent_bff.api._http import foundation_headers
-from agent_bff.api.v1.canvas import _resolve_default_model, _resolve_virtual_key
+from agent_bff.api.v1.canvas import (
+    LlmNotConfiguredError,
+    _resolve_default_model,
+    _resolve_virtual_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,12 +130,15 @@ async def generate_and_update_session_title(
                 return
 
             generated_title = fallback
-            virtual_key = await _resolve_virtual_key(
-                client=client,
-                gateway_url=gateway_url,
-                tenant_id=tenant_id,
-                access_token=access_token,
-            )
+            try:
+                virtual_key = await _resolve_virtual_key(
+                    client=client,
+                    gateway_url=gateway_url,
+                    tenant_id=tenant_id,
+                    access_token=access_token,
+                )
+            except LlmNotConfiguredError:
+                virtual_key = None  # no model to ask: the fallback title stands
             configured_model = str(
                 getattr(settings, "session_title_model", "") or ""
             ).strip()

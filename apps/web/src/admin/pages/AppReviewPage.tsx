@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../../api/client';
-import { formatAbsoluteTime } from '../../lib/format';
+import { formatAbsoluteTime, personLabel } from '../../lib/format';
 import type { AppReviewItem, AppVersion, InputField } from '../../api/types';
 
 // ─── Harness detail panel ─────────────────────────────────────────────────────
@@ -223,7 +223,7 @@ function ReviewModal({
           <div>
             <div className="text-[15px] font-display text-ink tracking-[-0.01em]">{item.app_name}</div>
             <div className="text-[11px] text-dim font-mono mt-0.5">
-              Version {item.version.version} · Author {item.author_id} · Submitted {formatAbsoluteTime(item.version.submitted_at)}
+              Version {item.version.version} · Author {personLabel(item.author_id, item.author_name)} · Submitted {formatAbsoluteTime(item.version.submitted_at)}
             </div>
           </div>
           <button
@@ -409,7 +409,9 @@ export function AppReviewPage() {
                   className="border-b border-line-2 hover:bg-paper-2 transition-colors group"
                 >
                   <td className="px-3 py-2 text-[13px] text-ink">{it.app_name}</td>
-                  <td className="px-3 py-2 font-mono text-[11px] text-ink-2">{it.author_id}</td>
+                  <td className="px-3 py-2 font-mono text-[11px] text-ink-2" title={it.author_id}>
+                    {personLabel(it.author_id, it.author_name)}
+                  </td>
                   <td className="px-3 py-2 font-mono text-[11px] text-ink-2">{it.version.version}</td>
                   <td className="px-3 py-2 font-mono text-[11px] text-dim">
                     {formatAbsoluteTime(it.version.submitted_at)}

@@ -139,7 +139,7 @@ sequenceDiagram
     participant R as Redis
 
     U->>B: GET /auth/me (signed ap_session cookie)
-    B->>FID: verify embedded access token (JWKS)
+    B->>FID: verify the session's stored access token (JWKS)
     FID-->>B: identity ok
     U->>B: POST /sessions/{id}/chat
     B->>O: forward (session/message/run CRUD + RLS)
@@ -147,7 +147,7 @@ sequenceDiagram
     O->>O: prefetch knowledge top-k into sys_prompt
     O->>S: POST /runs (create_run)
     S->>FID: mint short-lived per-run foundation JWT
-    S->>FLLM: GET /tenant-keys (resolve LLM virtual key)
+    S->>FLLM: POST /tenant-keys/ephemeral (run-scoped LLM virtual key)
     S->>P: claim a warm sandbox slot
     S->>SBX: spawn (docker-socket-proxy / cube-controller mTLS)
     Note over S,SBX: deliver identity+LLM+OTEL env, task.json,<br/>and mode-0600 /workspace/.secrets.json (6 secrets)
@@ -169,9 +169,13 @@ sequenceDiagram
 
 Narrated steps:
 
-1. **Session.** The browser holds a BFF-signed `ap_session` cookie. `AuthGate` calls
-   the BFF `/auth/me`, which forwards the embedded access token to Foundation identity
-   for JWKS verification.
+1. **Session.** The browser holds a BFF-signed `ap_session` cookie that only names a
+   server-side session (`{sid, tenant_id, user_id}`). The BFF keeps that session's
+   identity access and refresh tokens in its `web_sessions` table, encrypted with
+   `BFF_SESSION_TOKEN_KEYS`, and refreshes the access token shortly before it expires,
+   so the browser never sees a token. `AuthGate` calls the BFF `/auth/me`, which
+   forwards the stored access token to Foundation identity for JWKS verification; a
+   401 anywhere else is confirmed the same way before the user is signed out.
 2. **Chat/run request.** The SPA POSTs to the BFF (auth gateway + API aggregation +
    SSE relay), which forwards to the **session-orchestrator** for session/message/run
    CRUD under RLS. The orchestrator owns the DLP `check:download` / scan hooks and
@@ -179,11 +183,17 @@ Narrated steps:
    base's top-k hits, which it appends to the run's `sys_prompt`.
 3. **create_run.** The orchestrator mints (via the scheduler path) a short-lived
    per-run Foundation JWT and calls the **agent-scheduler**.
-4. **Resolve + spawn.** The scheduler resolves the tenant LLM virtual key
-   (`llm-gateway GET /tenant-keys`) — a missing virtual key fails the spawn — and, via the selected `SandboxRuntime`
-   implementation (Docker through docker-socket-proxy, or Cube through the
-   cube-controller over mTLS on `:8443`), spawns a sandbox from a warm **sandbox-pool**
-   slot. It delivers identity + LLM + OTEL env, `task.json` (`{task, mcp_server_ids,
+4. **Resolve + spawn.** The scheduler mints a run-scoped LLM virtual key that
+   expires with the run (`llm-gateway POST /tenant-keys/ephemeral`; the tenant's
+   long-lived key from `GET /tenant-keys` is only a fallback when minting fails).
+   A tenant with no enabled LLM provider is refused (`AGENT.RUN.LLM_NOT_CONFIGURED`:
+   the user is told an administrator has to add one), and no key at all fails the
+   spawn. The BFF's own model calls (canvas edits, session titles) use the same kind
+   of short-lived key, minted per tenant and reused for a few minutes; without a
+   provider, canvas edits answer `AGENT.BFF.CANVAS.LLM_NOT_CONFIGURED` and titles
+   fall back to the start of the first message. Then, via the selected `SandboxRuntime` implementation (Docker through
+   docker-socket-proxy, or Cube through the cube-controller over mTLS on `:8443`),
+   it spawns a sandbox from a warm **sandbox-pool** slot. It delivers identity + LLM + OTEL env, `task.json` (`{task, mcp_server_ids,
    skills, files, sys_prompt, …}`), and a mode-`0600` `/workspace/.secrets.json`
    carrying the 6 control-plane secrets.
 5. **Build the agent.** Inside the sandbox, the Claude SDK worker loads and immediately
@@ -233,7 +243,8 @@ Foundation audit service.
 `foundation_sdk.CookieSigner` + `SessionMiddleware`), exposes login/logout/me against
 identity-service, and fans out to every platform and Foundation service, aggregating
 and relaying responses (including the SSE chat stream). It has a small BFF-local DB
-(`agent_bff` schema) for notification preferences and API keys, and accepts a shared
+(`agent_bff` schema) for notification preferences, API keys and the server-side web
+sessions (encrypted identity tokens; see step 1 above), and accepts a shared
 `X-Service-Token` for machine callers such as `cron-runner`.
 
 - **Key endpoints:** `POST /auth/login`, `GET /auth/me`, `POST /auth/logout`;
@@ -284,7 +295,7 @@ Foundation identity, signs an HMAC tool-broker capability lease, and starts a sa
 via the docker-socket-proxy with the configured egress mode (`broker` / `foundation` /
 `none`). Every sandbox runs the Claude SDK image (`AGENT_IMAGE` /
 `SCHEDULER_AGENT_IMAGE`); the scheduler forwards registry/gateway URLs, delivers the
-tenant LLM virtual key (failing the spawn if none resolves), and enforces billing quota
+run-scoped LLM virtual key (failing the spawn if none resolves), and enforces billing quota
 via `QuotaGuard`.
 
 - **Key endpoints:** `POST /runs`, `GET /runs`, `GET /runs/{run_id}`,
@@ -374,7 +385,10 @@ BFF run resolver and scheduler can look up published App harnesses.
 - **Key endpoints:** `GET/POST /apps`, `GET/PUT/DELETE /apps/{app_id}`,
   `POST /apps/{app_id}/versions`, `PUT /apps/{app_id}/versions/{vid}`,
   `POST .../versions/{vid}/submit`, `/approve`, `/reject`, `/publish` (review
-  workflow); `GET .../internal` resolve (service-scope gated); `GET /healthz`.
+  workflow); `GET .../internal` resolve (service-scope gated); `GET /privacy/apps`
+  and `POST /privacy/apps/erase` (GDPR export / erasure of one user's Apps and review
+  trail; the caller's own, or a named user for an `X-Actor: ADMIN` caller);
+  `GET /healthz`.
 - **Depends on:** `foundation_sdk`; Foundation authz; Postgres (`app_registry` schema).
 
 ### cron-runner
@@ -458,7 +472,7 @@ run is a one-shot worker that maps cleanly onto a `run` row for audit and billin
 | `worker.ts` | The run loop: downloads attachments into `/workspace/inputs`, assembles the system prompt (resume note, memory, history, `sys_prompt` incl. prefetched knowledge hits, skills index), resolves tenant MCP servers from `mcp-registry`, registers the in-process `web_fetch` tool (via web-fetch-gateway) and drives the SDK `query()`. |
 | `event_translator.ts` | Re-shapes the SDK message stream into the platform event vocabulary (`events.jsonl` + Redis token stream). |
 | `hitl.ts` | Human-in-the-loop pause/resume (`pending_confirmation` / `pending_question`). |
-| `dlp.ts` | `PreToolUse` hook calling Foundation DLP `core/scan` (fail-open). |
+| `dlp.ts` | `PreToolUse` hook calling Foundation DLP `core/scan`: blocks `QUARANTINE` (L4+) hits only; fails closed by default (`DLP_FAILURE_MODE`). |
 | `redis_state.ts` | Hot-state + token stream writes (directly, or through the tool-broker `/state` façade). |
 
 **Knowledge.** The orchestrator prefetches the tenant knowledge base's top-k hits for
@@ -555,7 +569,7 @@ and minted tokens scope every call to a single run.
   block or `/proc/1/environ`, and removed from the writable workspace the agent's
   `Read`/`Bash` tools can see.
 - **LLM-gateway enforcement.** The worker's `adapter.ts` routes all sandbox LLM
-  traffic through the Foundation llm-gateway with a tenant virtual key (quota + audit +
+  traffic through the Foundation llm-gateway with a run-scoped virtual key (quota + audit +
   model routing). No provider API key exists anywhere in the agent stack, and a missing
   virtual key **fails the spawn**. Per-run sandbox tokens do not carry `audit.write`.
 - **DLP (real defense, not a test page).** A default global regex rule library

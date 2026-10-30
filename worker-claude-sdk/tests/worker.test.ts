@@ -39,41 +39,80 @@ class RecordingRedis {
   pausedBlob: any = null;
   markedPaused = false;
   endPushed = false;
+  /** status of every pushTokenEnd call, in order. */
+  endStatuses: string[] = [];
+  errors: string[] = [];
+  toolCalls: Array<{ id: string; name: string; args: string }> = [];
   toolResults: Array<{ id: string; name: string; result: string; state: string }> = [];
   tokens: string[] = [];
   thinkings: string[] = [];
+  thinkingDeltas: string[] = [];
+  /** Every call, in order (method name only), to assert sequencing. */
+  calls: string[] = [];
 
   async writeStep(): Promise<void> {}
   async pushToken(delta: string): Promise<void> {
+    this.calls.push("pushToken");
     this.tokens.push(delta);
   }
-  async pushToolCall(): Promise<void> {}
+  async pushToolCall(id: string, name: string, args: string): Promise<void> {
+    this.calls.push("pushToolCall");
+    this.toolCalls.push({ id, name, args });
+  }
   async pushToolResult(id: string, name: string, result: string, state: string): Promise<void> {
+    this.calls.push("pushToolResult");
     this.toolResults.push({ id, name, result, state });
   }
   async pushThinking(text: string): Promise<void> {
+    this.calls.push("pushThinking");
     this.thinkings.push(text);
+  }
+  async pushThinkingDelta(text: string): Promise<void> {
+    this.calls.push("pushThinkingDelta");
+    this.thinkingDeltas.push(text);
+  }
+  async pushError(message: string): Promise<void> {
+    this.calls.push("pushError");
+    this.errors.push(message);
   }
   async markCompleted(): Promise<void> {}
   async markFailed(): Promise<void> {}
   async close(): Promise<void> {}
 
-  async pushTokenEnd(): Promise<void> {
+  async pushTokenEnd(status = "completed"): Promise<void> {
+    this.calls.push("pushTokenEnd");
     this.endPushed = true;
+    this.endStatuses.push(status);
   }
   async pushPendingConfirmation(id: string, name: string, args: string): Promise<void> {
+    this.calls.push("pushPendingConfirmation");
     this.pendingConfirmations.push({ id, name, args });
   }
   async pushPendingQuestion(id: string, question: string): Promise<void> {
+    this.calls.push("pushPendingQuestion");
     this.pendingQuestions.push({ id, question });
   }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   async writePaused(blob: any): Promise<void> {
+    this.calls.push("writePaused");
     this.pausedBlob = blob;
   }
   async markPaused(): Promise<void> {
+    this.calls.push("markPaused");
     this.markedPaused = true;
   }
+}
+
+/** Wrap an Anthropic raw streaming event into an SDK stream_event message. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const se = (event: any): AnyMsg => ({ type: "stream_event", event });
+
+/** A query() stub that yields a fixed message sequence. */
+function fakeQuerySeq(seq: AnyMsg[]) {
+  return () =>
+    (async function* () {
+      for (const m of seq) yield m;
+    })() as AnyMsg;
 }
 
 function baseEnv(over: Partial<Env> = {}): Env {
@@ -100,6 +139,7 @@ function baseEnv(over: Partial<Env> = {}): Env {
     TOOL_BROKER_LEASE: "",
     SANDBOX_EGRESS_MODE: "",
     DLP_URL: "",
+    DLP_FAILURE_MODE: "",
     OTEL_EXPORTER_OTLP_ENDPOINT: "",
     ...over,
   };
@@ -164,7 +204,7 @@ describe("worker", () => {
 
     // Persist + re-read the terminal result.json to assert its shape.
     writeResult(worker.getWorkspaceDir(), {
-      status: result.status,
+      status: "OK",
       summary: result.summary,
       error: null,
       usage: result.usage,
@@ -249,6 +289,53 @@ describe("worker", () => {
     expect(prompt).toContain("[tool_result:Bash]");
     // uploaded-file hint
     expect(prompt).toContain("report.pdf");
+  });
+
+  it("historyToText renders a complete history as-is, with no omission note", () => {
+    const task = baseTask({
+      history: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "hello" },
+      ],
+    });
+    expect(worker.historyToText(task)).toBe("[user]: hi\n[assistant]: hello");
+  });
+
+  it("historyToText says how many earlier messages the orchestrator left out", () => {
+    const marker = {
+      role: "system",
+      type: "history_omitted",
+      omitted: 5,
+      content: "[5 earlier message(s) omitted: the conversation is too long to send in full]",
+    } as const;
+    expect(
+      worker.historyToText(
+        baseTask({ history: [marker, { role: "user", content: "hi" }, { role: "assistant", content: "hello" }] }),
+      ),
+    ).toBe("[5 earlier message(s) of this conversation are not shown]\n[user]: hi\n[assistant]: hello");
+    // Everything left out: the note alone still tells the model there was more.
+    expect(worker.historyToText(baseTask({ history: [marker] }))).toBe(
+      "[5 earlier message(s) of this conversation are not shown]",
+    );
+  });
+
+  it("historyToText counts the turns its own budget drops, a tool call together with its result", () => {
+    const task = baseTask({
+      history: [
+        { role: "system", type: "history_omitted", omitted: 2 },
+        { role: "user", content: "load the table" },
+        // ~6000 tokens of call, a tiny result: dropped as one turn.
+        { role: "tool", tool: { id: "t1", name: "etl", input: { sql: "y".repeat(15_000) }, result: "ok" } },
+        { role: "assistant", content: "x".repeat(10_000) }, // ~4000 tokens
+        { role: "user", content: "latest" },
+      ],
+    });
+    const text = worker.historyToText(task);
+    expect(text.split("\n")[0]).toBe("[4 earlier message(s) of this conversation are not shown]");
+    expect(text).not.toContain("[tool_call:");
+    expect(text).not.toContain("[tool_result:");
+    expect(text).toContain("[user]: latest");
+    expect(text).not.toContain("load the table");
   });
 
   it("runQuery prepends the resume note to the user prompt (not the system prompt)", async () => {
@@ -1101,9 +1188,112 @@ describe("worker", () => {
     }
   });
 
+  /** A PreToolUse input for the DLP hook tests below. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const dlpHookInput = (over: Record<string, unknown> = {}): any => ({
+    hook_event_name: "PreToolUse",
+    tool_name: "Bash",
+    tool_input: { command: "ls" },
+    tool_use_id: "tu_3",
+    session_id: "s",
+    transcript_path: "/tmp/t",
+    cwd: "/workspace",
+    ...over,
+  });
+
+  /** fetch stub answering every DLP scan with the pre-fix 403. */
+  const dlp403 = () =>
+    vi.fn(
+      async () =>
+        new Response(JSON.stringify({ code: "FOUNDATION.DLP.POLICY.DLP_DENIED" }), {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        }),
+    ) as unknown as typeof fetch;
+
+  it("makeDlpPreToolUse: a scan that cannot complete is DENIED by default (fail-closed)", async () => {
+    const realFetch = global.fetch;
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      global.fetch = dlp403();
+      // DLP_FAILURE_MODE unset → closed.
+      const hook = worker.makeDlpPreToolUse(baseEnv({ DLP_URL: "http://dlp.test" }));
+      const out = await hook(dlpHookInput());
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const hso = (out as any).hookSpecificOutput;
+      expect(hso.permissionDecision).toBe("deny");
+      expect(hso.permissionDecisionReason).toContain("could not be completed");
+      expect(hso.permissionDecisionReason).toContain("HTTP 403");
+      expect(errSpy).toHaveBeenCalled();
+    } finally {
+      global.fetch = realFetch;
+      errSpy.mockRestore();
+    }
+  });
+
+  it("makeDlpPreToolUse: DLP_FAILURE_MODE=open lets an unscanned call through (no decision) and logs it", async () => {
+    const realFetch = global.fetch;
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      global.fetch = dlp403();
+      const hook = worker.makeDlpPreToolUse(
+        baseEnv({ DLP_URL: "http://dlp.test", DLP_FAILURE_MODE: "open" }),
+      );
+      const out = await hook(dlpHookInput());
+      // Allowed, but WITHOUT permissionDecision:"allow" (that would bypass HITL).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((out as any).hookSpecificOutput).toBeUndefined();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((out as any).continue).toBe(true);
+      expect(errSpy).toHaveBeenCalledTimes(1);
+      expect(String(errSpy.mock.calls[0][0])).toContain("UNSCANNED");
+    } finally {
+      global.fetch = realFetch;
+      errSpy.mockRestore();
+    }
+  });
+
+  it("makeDlpPreToolUse: an unexpected throw is treated as an incomplete scan, not a silent allow", async () => {
+    const realFetch = global.fetch;
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const fetchSpy = vi.fn();
+      global.fetch = fetchSpy as unknown as typeof fetch;
+      // tool_input's getter throws while the hook builds the scan request.
+      const input = dlpHookInput();
+      Object.defineProperty(input, "tool_input", {
+        enumerable: true,
+        get() {
+          throw new Error("boom");
+        },
+      });
+
+      const closed = await worker.makeDlpPreToolUse(
+        baseEnv({ DLP_URL: "http://dlp.test" }),
+      )(input);
+      const open = await worker.makeDlpPreToolUse(
+        baseEnv({ DLP_URL: "http://dlp.test", DLP_FAILURE_MODE: "open" }),
+      )(input);
+      const disabled = await worker.makeDlpPreToolUse(baseEnv({ DLP_URL: "" }))(input);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((closed as any).hookSpecificOutput.permissionDecision).toBe("deny");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((open as any).continue).toBe(true);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((disabled as any).continue).toBe(true);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      // One error line each for the closed and open cases; disabled is silent.
+      expect(errSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      global.fetch = realFetch;
+      errSpy.mockRestore();
+    }
+  });
+
   // ── HITL pause path ─────────────────────────────────────────────────────────
 
-  it("pauses on an mcp tool call: writePaused blob, markPaused, pending_confirmation, NO end-token, status=paused", async () => {
+  it("pauses on an mcp tool call: writePaused blob, markPaused, pending_confirmation, end(paused), status=paused", async () => {
     const redis = new RecordingRedis();
 
     // A fake query that drives canUseTool exactly as the SDK would: it presents
@@ -1138,12 +1328,19 @@ describe("worker", () => {
 
     expect(result.status).toBe("paused");
 
-    // pending_confirmation pushed (one), NO end token.
+    // pending_confirmation pushed (one), then exactly one end(status=paused).
     expect(redis.pendingConfirmations).toEqual([
       { id: "tu_mcp", name: "mcp__github__search_code", args: '{"query":"foo"}' },
     ]);
     expect(redis.pendingQuestions).toEqual([]);
-    expect(redis.endPushed).toBe(false);
+    expect(redis.endStatuses).toEqual(["paused"]);
+    expect(redis.errors).toEqual([]);
+    // Paused blob + PAUSED state land before the stream announces the pause.
+    const order = ["writePaused", "markPaused", "pushPendingConfirmation", "pushTokenEnd"].map(
+      (c) => redis.calls.indexOf(c),
+    );
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(order[0]).toBeGreaterThanOrEqual(0);
 
     // paused blob shape.
     expect(redis.markedPaused).toBe(true);
@@ -1155,10 +1352,18 @@ describe("worker", () => {
     ]);
     expect(typeof blob.paused_at).toBe("string");
     // agent_state carries our replay transcript (assistant text captured).
-    const state = blob.agent_state as { original_task: string; transcript: unknown[]; pending: unknown[] };
+    const state = blob.agent_state as {
+      original_task: string;
+      transcript: unknown[];
+      pending: unknown[];
+      usage: Record<string, number>;
+    };
     expect(state.original_task).toBe("find the repo");
     expect(state.pending).toHaveLength(1);
     expect(state.transcript).toContainEqual({ role: "assistant", text: "let me search" });
+    // ...and the usage so far, for the resumed leg to count on from.
+    expect(state.usage).toMatchObject({ input_tokens: 5, output_tokens: 3, total_tokens: 8 });
+    expect(result.usage).toMatchObject({ input_tokens: 5, output_tokens: 3, total_tokens: 8 });
   });
 
   it("does NOT push the synthetic tool_result for the paused tool call (would wipe the pending card)", async () => {
@@ -1237,7 +1442,7 @@ describe("worker", () => {
       { id: "tu_ask", question: "Which environment, prod or staging?" },
     ]);
     expect(redis.pendingConfirmations).toEqual([]);
-    expect(redis.endPushed).toBe(false);
+    expect(redis.endStatuses).toEqual(["paused"]);
     expect(redis.pausedBlob!.kind).toBe("question");
     expect(redis.pausedBlob!.question).toBe("Which environment, prod or staging?");
   });
@@ -1264,6 +1469,57 @@ describe("worker", () => {
     });
     expect(result.status).toBe("paused");
     expect(redis.markedPaused).toBe(true);
+    expect(redis.endStatuses).toEqual(["paused"]);
+  });
+
+  it("an AbortError with NOTHING pending is a failure, not a pause", async () => {
+    const redis = new RecordingRedis();
+    const queryFn = () =>
+      (async function* () {
+        yield {
+          type: "assistant",
+          message: { content: [{ type: "text", text: "working" }], usage: { input_tokens: 1, output_tokens: 1 } },
+        } as AnyMsg;
+        throw new (await import("@anthropic-ai/claude-agent-sdk")).AbortError("aborted");
+      })() as AnyMsg;
+
+    const result = await worker.runQuery(baseTask(), baseEnv(), {
+      systemPrompt: "sys",
+      mcpServers: {},
+      redis: redis as never,
+      deps: { queryFn },
+    });
+    expect(result.status).toBe("FAILED");
+    expect(redis.markedPaused).toBe(false);
+    expect(redis.pausedBlob).toBeNull();
+    expect(redis.errors).toEqual(["The agent run failed unexpectedly. Please try again."]);
+    expect(redis.endStatuses).toEqual(["failed"]);
+  });
+
+  it("an abort from outside (abortController) ends the run as cancelled", async () => {
+    const redis = new RecordingRedis();
+    const abortController = new AbortController();
+    const queryFn = (args: AnyMsg) =>
+      (async function* () {
+        expect(args.options.abortController).toBe(abortController);
+        yield {
+          type: "assistant",
+          message: { content: [{ type: "text", text: "partial" }], usage: { input_tokens: 1, output_tokens: 1 } },
+        } as AnyMsg;
+        abortController.abort();
+        throw new (await import("@anthropic-ai/claude-agent-sdk")).AbortError("aborted");
+      })() as AnyMsg;
+
+    const result = await worker.runQuery(baseTask(), baseEnv(), {
+      systemPrompt: "sys",
+      mcpServers: {},
+      redis: redis as never,
+      abortController,
+      deps: { queryFn },
+    });
+    expect(result.status).toBe("cancelled");
+    expect(redis.errors).toEqual([]);
+    expect(redis.endStatuses).toEqual(["cancelled"]);
   });
 
   it("hitl=false keeps bypass: an mcp tool call does NOT pause", async () => {
@@ -1288,7 +1544,7 @@ describe("worker", () => {
     });
     expect(result.status).toBe("OK");
     expect(redis.markedPaused).toBe(false);
-    expect(redis.endPushed).toBe(true);
+    expect(redis.endStatuses).toEqual(["completed"]);
   });
 
   it("disallows Anthropic server-side tools (WebSearch/WebFetch) in HITL mode, keeps client-side tools", async () => {
@@ -1386,6 +1642,44 @@ describe("worker", () => {
     expect(result.status).toBe("OK");
   });
 
+  it("resume leg reports the whole run's usage, earlier legs included", async () => {
+    const queryFn = () =>
+      (async function* () {
+        yield {
+          type: "assistant",
+          message: {
+            content: [{ type: "text", text: "continuing" }],
+            usage: { input_tokens: 40, output_tokens: 10 },
+          },
+        } as AnyMsg;
+        yield { type: "result", subtype: "success" } as AnyMsg;
+      })() as AnyMsg;
+
+    const result = await worker.runQuery(
+      baseTask({
+        resume: {
+          kind: "confirm",
+          tool_call_id: "tu_old",
+          confirmed: true,
+          agent_state: {
+            original_task: "t",
+            transcript: [],
+            pending: [{ id: "tu_old", name: "mcp__x__y", args: "{}" }],
+            usage: { input_tokens: 500, output_tokens: 200, total_tokens: 700 },
+          },
+        },
+      }),
+      baseEnv(),
+      { systemPrompt: "sys", mcpServers: {}, redis: noopRedis(), deps: { queryFn } },
+    );
+    expect(result.status).toBe("OK");
+    expect(result.usage).toMatchObject({
+      input_tokens: 540,
+      output_tokens: 210,
+      total_tokens: 750,
+    });
+  });
+
   it("does NOT map sampling.max_tokens onto maxThinkingTokens (output-cap bug fix)", async () => {
     let seenOptions: AnyMsg;
     const queryFn = (args: AnyMsg) => {
@@ -1436,10 +1730,9 @@ describe("worker", () => {
     expect(seenOptions.maxThinkingTokens).not.toBe(4096);
   });
 
-  describe("thinking aggregation (one Redis entry per thought block)", () => {
+  describe("reasoning streams live as thinking_delta (before the answer)", () => {
     // Drive the streaming (includePartialMessages) path: a thinking block opens,
-    // streams many thinking_delta partials, then closes — exactly the shape that
-    // used to explode into ~231 standalone "Thought" cards.
+    // streams thinking_delta partials, then closes; the answer follows.
     function streamThinkingThenText(
       thinkingChunks: string[],
       textChunks: string[],
@@ -1492,9 +1785,8 @@ describe("worker", () => {
         })() as AnyMsg;
     }
 
-    it("buffers thinking deltas per block and pushes ONE thinking entry at End", async () => {
+    it("pushes each reasoning chunk as thinking_delta, all before the answer text", async () => {
       const redis = new RecordingRedis();
-      // Many small deltas — the bug pushed one Redis entry each.
       const chunks = Array.from({ length: 50 }, (_, i) => `t${i} `);
       const result = await worker.runQuery(baseTask(), baseEnv(), {
         systemPrompt: "sys",
@@ -1504,29 +1796,170 @@ describe("worker", () => {
       });
 
       expect(result.status).toBe("OK");
-      // Exactly ONE thinking entry, equal to the full concatenation — NOT 50.
-      // (The consolidated `assistant` message's thinking block is the SAME block:
-      // its Start/Delta/End reuse the streamed block_id, so no extra entry.)
-      expect(redis.thinkings).toEqual([chunks.join("")]);
-      // Text is still per-token streamed (unaffected by the thinking change).
+      // Live chunks (the Redis client coalesces adjacent ones on the wire).
+      expect(redis.thinkingDeltas).toEqual(chunks);
+      // No whole-block `thinking` entry for a streamed block — the consolidated
+      // message's copy of the block is deduped.
+      expect(redis.thinkings).toEqual([]);
       expect(redis.tokens).toEqual(["hello", " world"]);
+      // Reasoning reaches the stream before any answer text.
+      expect(redis.calls.lastIndexOf("pushThinkingDelta")).toBeLessThan(
+        redis.calls.indexOf("pushToken"),
+      );
     });
 
-    it("emits one thinking entry per block when there are multiple blocks", async () => {
+    it("streams an unterminated thinking block too (no wind-down buffering)", async () => {
       const redis = new RecordingRedis();
-      const queryFn = () =>
+      const result = await worker.runQuery(baseTask(), baseEnv(), {
+        systemPrompt: "sys",
+        mcpServers: {},
+        redis: redis as never,
+        deps: {
+          queryFn: fakeQuerySeq([
+            se({ type: "message_start" }),
+            se({ type: "content_block_start", index: 0, content_block: { type: "thinking" } }),
+            se({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "half " } }),
+            se({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "a thought" } }),
+            // NO content_block_stop for index 0 — abruptly finish.
+            { type: "result", subtype: "success" },
+          ]),
+        },
+      });
+
+      expect(result.status).toBe("OK");
+      expect(redis.thinkingDeltas).toEqual(["half ", "a thought"]);
+      expect(redis.thinkings).toEqual([]);
+    });
+
+    it("pushes a NON-streamed thinking block as one whole `thinking` entry", async () => {
+      const redis = new RecordingRedis();
+      const result = await worker.runQuery(baseTask(), baseEnv(), {
+        systemPrompt: "sys",
+        mcpServers: {},
+        redis: redis as never,
+        deps: {
+          queryFn: fakeQuerySeq([
+            {
+              type: "assistant",
+              message: {
+                id: "msg_ns",
+                content: [
+                  { type: "thinking", thinking: "whole thought" },
+                  { type: "text", text: "answer" },
+                ],
+                usage: { input_tokens: 3, output_tokens: 2 },
+              },
+            },
+            { type: "result", subtype: "success" },
+          ]),
+        },
+      });
+      expect(result.status).toBe("OK");
+      expect(redis.thinkings).toEqual(["whole thought"]);
+      expect(redis.thinkingDeltas).toEqual([]);
+      expect(redis.tokens).toEqual(["answer"]);
+    });
+  });
+
+  // ── duplicate tool calls (real CLI 0.1.77 message shape) ───────────────────
+  // The CLI yields one consolidated `assistant` per content block, at content
+  // index 0 and BEFORE that block's content_block_stop; the adapter closes
+  // blocks in order. The worker must push ONE tool_call per id with the
+  // complete args (never the streamed JSON twice).
+  describe("tool calls with the real per-block consolidated shape", () => {
+    const MSG = "msg_turn1";
+    const consolidated = (block: AnyMsg, usage = { input_tokens: 100, output_tokens: 20 }) => ({
+      type: "assistant",
+      message: { id: MSG, content: [block], usage },
+    });
+
+    function realShapeSeq(): AnyMsg[] {
+      return [
+        se({ type: "message_start", message: { id: MSG } }),
+        se({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "" } }),
+        se({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "let me think" } }),
+        consolidated({ type: "thinking", thinking: "let me think" }),
+        se({ type: "content_block_stop", index: 0 }),
+        se({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } }),
+        se({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "I'll list files." } }),
+        consolidated({ type: "text", text: "I'll list files." }),
+        se({ type: "content_block_stop", index: 1 }),
+        se({ type: "content_block_start", index: 2, content_block: { type: "tool_use", id: "toolu_1", name: "Bash", input: {} } }),
+        se({ type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: '{"command":' } }),
+        se({ type: "content_block_delta", index: 2, delta: { type: "input_json_delta", partial_json: '"ls -la"}' } }),
+        consolidated({ type: "tool_use", id: "toolu_1", name: "Bash", input: { command: "ls -la" } }),
+        se({ type: "content_block_stop", index: 2 }),
+        se({ type: "message_delta", delta: { stop_reason: "tool_use" }, usage: { output_tokens: 20 } }),
+        se({ type: "message_stop" }),
+        { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "file.txt" }] } },
+        se({ type: "message_start", message: { id: "msg_turn2" } }),
+        se({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+        se({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Found file.txt." } }),
+        {
+          type: "assistant",
+          message: {
+            id: "msg_turn2",
+            content: [{ type: "text", text: "Found file.txt." }],
+            usage: { input_tokens: 130, output_tokens: 5 },
+          },
+        },
+        se({ type: "content_block_stop", index: 0 }),
+        { type: "result", subtype: "success" },
+      ];
+    }
+
+    it("pushes one tool_call with the complete args, once", async () => {
+      const redis = new RecordingRedis();
+      const result = await worker.runQuery(baseTask({ hitl: false }), baseEnv(), {
+        systemPrompt: "sys",
+        mcpServers: {},
+        redis: redis as never,
+        deps: { queryFn: fakeQuerySeq(realShapeSeq()) },
+      });
+
+      expect(result.status).toBe("OK");
+      expect(redis.toolCalls).toEqual([
+        { id: "toolu_1", name: "Bash", args: '{"command":"ls -la"}' },
+      ]);
+      expect(redis.toolResults).toEqual([
+        { id: "toolu_1", name: "Bash", result: "file.txt", state: "success" },
+      ]);
+      expect(redis.tokens).toEqual(["I'll list files.", "Found file.txt."]);
+      expect(redis.thinkingDeltas).toEqual(["let me think"]);
+      expect(redis.endStatuses).toEqual(["completed"]);
+
+      // events.jsonl carries exactly one ToolCallStart/End for the call.
+      const evs = readFileSync(path.join(ws, "events.jsonl"), "utf8")
+        .trim()
+        .split("\n")
+        .map((l) => JSON.parse(l));
+      expect(evs.filter((e) => e.event_type === "ToolCallStartEvent")).toHaveLength(1);
+      expect(evs.filter((e) => e.event_type === "ToolCallEndEvent")).toHaveLength(1);
+      // Usage: turn 1 counted once (not per consolidated), plus turn 2.
+      expect(result.usage.input_tokens).toBe(230);
+      expect(result.usage.output_tokens).toBe(25);
+    });
+
+    it("joins text blocks of different turns with a paragraph break in the summary", async () => {
+      const result = await worker.runQuery(baseTask({ hitl: false }), baseEnv(), {
+        systemPrompt: "sys",
+        mcpServers: {},
+        redis: new RecordingRedis() as never,
+        deps: { queryFn: fakeQuerySeq(realShapeSeq()) },
+      });
+      expect(result.summary).toBe("I'll list files.\n\nFound file.txt.");
+    });
+
+    it("a paused run's snapshot keeps text and tools interleaved", async () => {
+      const redis = new RecordingRedis();
+      const seq = realShapeSeq().slice(0, 17); // turn 1 incl. the Bash result
+      const queryFn = (args: AnyMsg) =>
         (async function* () {
-          yield { type: "stream_event", event: { type: "message_start" } } as AnyMsg;
-          // block A (index 0)
-          yield { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "thinking" } } } as AnyMsg;
-          yield { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "AA" } } } as AnyMsg;
-          yield { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "BB" } } } as AnyMsg;
-          yield { type: "stream_event", event: { type: "content_block_stop", index: 0 } } as AnyMsg;
-          // block B (index 1)
-          yield { type: "stream_event", event: { type: "content_block_start", index: 1, content_block: { type: "thinking" } } } as AnyMsg;
-          yield { type: "stream_event", event: { type: "content_block_delta", index: 1, delta: { type: "thinking_delta", thinking: "CC" } } } as AnyMsg;
-          yield { type: "stream_event", event: { type: "content_block_stop", index: 1 } } as AnyMsg;
-          yield { type: "result", subtype: "success" } as AnyMsg;
+          for (const m of seq) yield m;
+          yield se({ type: "message_start", message: { id: "msg_turn2" } });
+          yield se({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } });
+          yield se({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Posting it." } });
+          await args.options.canUseTool("mcp__slack__post", { text: "file.txt" }, { toolUseID: "toolu_2" });
         })() as AnyMsg;
 
       const result = await worker.runQuery(baseTask(), baseEnv(), {
@@ -1535,36 +1968,137 @@ describe("worker", () => {
         redis: redis as never,
         deps: { queryFn },
       });
-
-      expect(result.status).toBe("OK");
-      // Two blocks → two entries, each its own whole text.
-      expect(redis.thinkings).toEqual(["AABB", "CC"]);
+      expect(result.status).toBe("paused");
+      expect(redis.pausedBlob.agent_state.transcript).toEqual([
+        { role: "assistant", text: "I'll list files." },
+        { role: "tool", id: "toolu_1", name: "Bash", args: '{"command":"ls -la"}', result: "file.txt" },
+        { role: "assistant", text: "Posting it." },
+      ]);
     });
+  });
 
-    it("flushes a thinking block at wind-down when it never received an End", async () => {
+  // ── failures reach the token stream ────────────────────────────────────────
+  describe("failure paths push error + end(failed)", () => {
+    it("a failed result pushes a user-safe error, then end(failed)", async () => {
       const redis = new RecordingRedis();
-      // A thinking block streams deltas but the run ends (result) before its
-      // content_block_stop — the residual buffer must still be flushed once.
-      const queryFn = () =>
-        (async function* () {
-          yield { type: "stream_event", event: { type: "message_start" } } as AnyMsg;
-          yield { type: "stream_event", event: { type: "content_block_start", index: 0, content_block: { type: "thinking" } } } as AnyMsg;
-          yield { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "half " } } } as AnyMsg;
-          yield { type: "stream_event", event: { type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "a thought" } } } as AnyMsg;
-          // NO content_block_stop for index 0 — abruptly finish.
-          yield { type: "result", subtype: "success" } as AnyMsg;
-        })() as AnyMsg;
-
       const result = await worker.runQuery(baseTask(), baseEnv(), {
         systemPrompt: "sys",
         mcpServers: {},
         redis: redis as never,
-        deps: { queryFn },
+        deps: {
+          queryFn: fakeQuerySeq([
+            { type: "result", subtype: "error_max_turns", errors: ["max turns at /home/x"] },
+          ]),
+        },
       });
+      expect(result.status).toBe("FAILED");
+      expect(redis.errors).toEqual(["The agent stopped after reaching its maximum number of steps."]);
+      expect(redis.endStatuses).toEqual(["failed"]);
+      expect(redis.calls.indexOf("pushError")).toBeLessThan(redis.calls.indexOf("pushTokenEnd"));
+    });
 
+    it("a thrown query never leaks the raw error text to the stream", async () => {
+      const redis = new RecordingRedis();
+      const queryFn = () => {
+        throw new Error("connect ECONNREFUSED 10.0.0.7:8011 /srv/secret/path");
+      };
+      const result = await worker.runQuery(baseTask(), baseEnv(), {
+        systemPrompt: "sys",
+        mcpServers: {},
+        redis: redis as never,
+        deps: { queryFn: queryFn as never },
+      });
+      expect(result.status).toBe("FAILED");
+      expect(result.error).toContain("ECONNREFUSED"); // result.json keeps the detail
+      expect(redis.errors).toEqual(["The agent run failed unexpectedly. Please try again."]);
+      expect(redis.endStatuses).toEqual(["failed"]);
+    });
+
+    it("an API error surfaced as an assistant message is never streamed as answer text", async () => {
+      const redis = new RecordingRedis();
+      const result = await worker.runQuery(baseTask(), baseEnv(), {
+        systemPrompt: "sys",
+        mcpServers: {},
+        redis: redis as never,
+        deps: {
+          queryFn: fakeQuerySeq([
+            {
+              type: "assistant",
+              error: "rate_limit",
+              message: {
+                id: "msg_err",
+                content: [{ type: "text", text: 'API Error: gateway 429: {"detail":"tenant t-1 over quota"}' }],
+                usage: { input_tokens: 0, output_tokens: 0 },
+              },
+            },
+            { type: "result", subtype: "success", is_error: true, result: "API Error: gateway 429" },
+          ]),
+        },
+      });
+      expect(result.status).toBe("FAILED");
+      expect(redis.tokens).toEqual([]);
+      expect(redis.errors).toEqual([
+        "The model service is rate-limiting requests. Please try again in a moment.",
+      ]);
+      expect(redis.endStatuses).toEqual(["failed"]);
+    });
+
+    it("a code-less CLI notice the run recovers from (output cap) is dropped; the run completes", async () => {
+      const redis = new RecordingRedis();
+      const result = await worker.runQuery(baseTask(), baseEnv(), {
+        systemPrompt: "sys",
+        mcpServers: {},
+        redis: redis as never,
+        deps: {
+          queryFn: fakeQuerySeq([
+            {
+              type: "assistant",
+              message: { id: "msg_1", content: [{ type: "text", text: "Part one." }], usage: { input_tokens: 9, output_tokens: 9 } },
+            },
+            {
+              type: "assistant",
+              message: {
+                id: "syn_1",
+                model: "<synthetic>",
+                content: [{ type: "text", text: "API Error: Claude's response exceeded the 32000 output token maximum." }],
+                usage: { input_tokens: 0, output_tokens: 0 },
+              },
+            },
+            {
+              type: "assistant",
+              message: { id: "msg_2", content: [{ type: "text", text: "Part two." }], usage: { input_tokens: 9, output_tokens: 9 } },
+            },
+            { type: "result", subtype: "success" },
+          ]),
+        },
+      });
       expect(result.status).toBe("OK");
-      // The unterminated block is flushed exactly once with its accumulated text.
-      expect(redis.thinkings).toEqual(["half a thought"]);
+      expect(redis.tokens).toEqual(["Part one.", "Part two."]);
+      expect(result.summary).toBe("Part one.\n\nPart two.");
+      expect(redis.errors).toEqual([]);
+      expect(redis.endStatuses).toEqual(["completed"]);
+    });
+
+    it("a success result pushes end(completed) and no error", async () => {
+      const redis = new RecordingRedis();
+      const result = await worker.runQuery(baseTask(), baseEnv(), {
+        systemPrompt: "sys",
+        mcpServers: {},
+        redis: redis as never,
+        deps: { queryFn: fakeQuerySuccess("hi") },
+      });
+      expect(result.status).toBe("OK");
+      expect(redis.errors).toEqual([]);
+      expect(redis.endStatuses).toEqual(["completed"]);
+    });
+  });
+
+  describe("userSafeErrorMessage", () => {
+    it("maps SDK error codes and result subtypes to fixed user-safe text", () => {
+      expect(worker.userSafeErrorMessage({ apiError: "authentication_failed" })).toMatch(/administrator/);
+      expect(worker.userSafeErrorMessage({ apiError: "server_error" })).toMatch(/temporarily unavailable/);
+      expect(worker.userSafeErrorMessage({ resultSubtype: "error_max_budget_usd" })).toMatch(/budget/);
+      expect(worker.userSafeErrorMessage({})).toBe("The agent run failed unexpectedly. Please try again.");
     });
   });
 

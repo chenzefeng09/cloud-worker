@@ -131,11 +131,14 @@ def test_cancel_run_uses_sandbox_id(
     # Override second execute call for sequence probe inside create_message
     mock_db.execute.side_effect = [
         make_scalar_result(run),        # get_run
+        MagicMock(rowcount=1),          # claim CANCELLED (conditional UPDATE)
         make_scalar_result(_ses_row()), # create_message -> get_session
         seq_result,                      # create_message -> sequence probe
     ]
 
-    async def _refresh(obj: Message) -> None:
+    async def _refresh(obj: Message, attribute_names=None) -> None:
+        if attribute_names:  # cancel re-reads the run's live sandbox_id
+            return
         obj.id = "msg_cancel"
         obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
 
@@ -203,11 +206,14 @@ def test_cancel_session_run_cancels_active_run(
         make_scalar_result(_ses_row()),  # get_session (session-level cancel)
         make_scalar_result(run),         # select RUNNING run
         make_scalar_result(run),         # get_run inside _do_cancel_run
+        MagicMock(rowcount=1),           # claim CANCELLED (conditional UPDATE)
         make_scalar_result(_ses_row()),  # create_message -> get_session
         seq_result,                       # create_message -> sequence probe
     ]
 
-    async def _refresh(obj: Message) -> None:
+    async def _refresh(obj: Message, attribute_names=None) -> None:
+        if attribute_names:  # cancel re-reads the run's live sandbox_id
+            return
         obj.id = "msg_cancel"
         obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
 
@@ -271,15 +277,22 @@ def test_respond_accepts_redis_pause_before_db_status_paused(
 
         async def get(self, key):
             redis_ops.append(("get", key))
-            return json.dumps(paused_blob)
+            return json.dumps(paused_blob) if key == "agent:run:run_1:paused" else None
 
         async def set(self, key, value, ex=None, nx=False):
             redis_ops.append(("set", key))
             return True
 
-        async def delete(self, key):
-            redis_ops.append(("delete", key))
-            return 1
+        async def delete(self, *keys):
+            redis_ops.extend(("delete", key) for key in keys)
+            return len(keys)
+
+        async def xadd(self, key, fields):
+            redis_ops.append(("xadd", key))
+            return "1-0"
+
+        async def ttl(self, key):
+            return 1800
 
         async def aclose(self):
             redis_ops.append(("close", ""))
@@ -533,7 +546,7 @@ def test_fetch_memory_formats_hits() -> None:
     class _FakeClient:
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
-        async def get(self, url, **kw): return _FakeResp()
+        async def post(self, url, **kw): return _FakeResp()
 
     with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
         result = asyncio.get_event_loop().run_until_complete(
@@ -568,7 +581,7 @@ def test_fetch_memory_sends_real_user_header() -> None:
     class _FakeClient:
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
-        async def get(self, url, **kw):
+        async def post(self, url, **kw):
             captured_headers.update(kw.get("headers") or {})
             return _FakeResp()
 
@@ -601,8 +614,8 @@ def test_fetch_memory_passes_exclude_origin_session_id() -> None:
     class _FakeClient:
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
-        async def get(self, url, **kw):
-            captured.update(kw.get("params") or {})
+        async def post(self, url, **kw):
+            captured.update(kw.get("json") or {})
             return _FakeResp()
 
     with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
@@ -634,8 +647,8 @@ def test_fetch_memory_omits_exclude_when_no_session() -> None:
     class _FakeClient:
         async def __aenter__(self): return self
         async def __aexit__(self, *a): pass
-        async def get(self, url, **kw):
-            captured.update(kw.get("params") or {})
+        async def post(self, url, **kw):
+            captured.update(kw.get("json") or {})
             return _FakeResp()
 
     with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
@@ -647,6 +660,7 @@ def test_fetch_memory_omits_exclude_when_no_session() -> None:
                 query="hi",
             )
         )
+    assert captured.get("scope") == "memory"
     assert "exclude_origin_session_id" not in captured
 
 
@@ -773,6 +787,30 @@ def test_write_memory_stamps_origin_session_id_and_real_user() -> None:
     assert captured.get("origin_session_id") == "ses_writeback"
     assert captured_headers.get("X-User-Id") == "usr_TESTUSER00000000000000001"
     assert captured_headers.get("X-User-Id") != "SYSTEM"
+    # A platform write: an ordinary member lacks document.create.
+    assert captured_headers.get("X-Actor") == "ADMIN"
+
+
+def test_write_memory_needs_a_real_owner() -> None:
+    """Without a real user the memory would have no owner, so nothing is sent."""
+    import httpx
+
+    from agent_session_orchestrator.api.v1.messages import _write_memory
+
+    client = MagicMock()
+    with patch.object(httpx, "AsyncClient", return_value=client):
+        for user_id in ("", "SYSTEM"):
+            asyncio.get_event_loop().run_until_complete(
+                _write_memory(
+                    knowledge_ingest_url="http://ki:8012/api/knowledge/v1",
+                    tenant_id="tnt_test",
+                    user_id=user_id,
+                    task_description="hello",
+                    summary="world",
+                    session_id="ses_x",
+                )
+            )
+    client.__aenter__.assert_not_called()
 
 
 def test_write_memory_failure_open() -> None:
@@ -831,16 +869,25 @@ def test_create_run_injects_memory(
             return {"id": "run_mem", "sandbox_id": "abc123", "status": "RUNNING"}
 
     class _FakeClient(AuthzAwareClient):
-        async def get(self, url, **kw): return _MemResp()
         async def post(self, url, json=None, **kw):
             # Let the authz guard handle its own check.
             if "/check" in url and "authz" in url:
                 return self._authz_allowed_resp()
+            if url.endswith("/search"):
+                return _MemResp()
             if json:
                 scheduler_body.append(json)
             return _SchResp()
 
-    with patch.object(httpx, "AsyncClient", return_value=_FakeClient()):
+    # The memory opt-out lookup needs a real transaction; the user has not
+    # opted out here.
+    with (
+        patch.object(httpx, "AsyncClient", return_value=_FakeClient()),
+        patch(
+            "agent_session_orchestrator.services.privacy_service.memory_enabled_for",
+            AsyncMock(return_value=True),
+        ),
+    ):
         app_client.post(
             "/api/session/v1/sessions/ses_mem/runs",
             headers=auth_headers,
@@ -2055,6 +2102,9 @@ def test_reconcile_persists_tool_message_before_assistant() -> None:
         created_messages.append({"role": role, "content": content, "tool_calls": tool_calls})
 
     svc = MagicMock()
+    svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
+    svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock(side_effect=_fake_create_message)
 
@@ -2162,6 +2212,9 @@ def test_reconcile_no_tool_message_when_no_tool_calls() -> None:
         created_messages.append({"role": role, "content": content, "tool_calls": tool_calls})
 
     svc = MagicMock()
+    svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
+    svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock(side_effect=_fake_create_message)
 
@@ -2262,8 +2315,11 @@ def test_reconcile_tool_message_idempotent() -> None:
 
         async def aclose(self): pass
 
-    # list_messages returns existing rows → already_persisted=True → no create_message calls
+    # Rows for this run already exist → already_persisted=True → no create_message calls
     svc = MagicMock()
+    svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
+    svc.run_has_output = AsyncMock(return_value=True)
     svc.list_messages = AsyncMock(return_value=([existing_tool_msg, existing_asst_msg], None))
     svc.create_message = AsyncMock()
 
@@ -2674,6 +2730,9 @@ def test_reconcile_sets_paused_status_when_worker_pauses(
     )
     ses = Session(id="ses_pause", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
     svc = MagicMock()
+    svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
+    svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock()
 
@@ -2866,6 +2925,9 @@ def test_reconcile_404_with_end_marker_marks_completed_and_replays() -> None:
         created_messages.append({"role": role, "content": content})
 
     svc = MagicMock()
+    svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
+    svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock(side_effect=_fake_create_message)
 
@@ -2926,6 +2988,9 @@ def test_reconcile_404_no_end_marker_past_grace_marks_failed() -> None:
     fake_redis = _fake_redis_with_stream(stream)
 
     svc = MagicMock()
+    svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
+    svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock()
 
@@ -2954,8 +3019,12 @@ def test_reconcile_404_no_end_marker_past_grace_marks_failed() -> None:
     assert run.finished_at is not None
     assert run.result_summary and "404" in run.result_summary
     assert run.error_message and "sandbox no longer exists" in run.error_message
-    # No completion → nothing replayed.
-    svc.create_message.assert_not_called()
+    # The partial output is kept, followed by a note saying why the run stopped.
+    rows = [(c.kwargs["role"], c.kwargs["content"]) for c in svc.create_message.call_args_list]
+    assert rows == [
+        ("assistant", "partial"),
+        ("system", "The run failed: its sandbox stopped responding"),
+    ]
 
 
 def test_reconcile_404_no_end_marker_within_grace_keeps_running() -> None:
@@ -2984,6 +3053,9 @@ def test_reconcile_404_no_end_marker_within_grace_keeps_running() -> None:
     fake_redis = _fake_redis_with_stream(stream)
 
     svc = MagicMock()
+    svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
+    svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock()
 
@@ -3034,6 +3106,9 @@ def test_reconcile_503_keeps_running_unchanged() -> None:
     )
 
     svc = MagicMock()
+    svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
+    svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock()
 
@@ -3085,8 +3160,8 @@ def test_fetch_memory_sends_scope_memory_and_clearance_header() -> None:
         async def __aexit__(self, *a):
             pass
 
-        async def get(self, url, **kw):
-            captured["params"] = kw.get("params") or {}
+        async def post(self, url, **kw):
+            captured["body"] = kw.get("json") or {}
             captured["headers"] = kw.get("headers") or {}
             return _FakeResp()
 
@@ -3100,7 +3175,7 @@ def test_fetch_memory_sends_scope_memory_and_clearance_header() -> None:
                 clearance="L3",
             )
         )
-    assert captured["params"].get("scope") == "memory"
+    assert captured["body"].get("scope") == "memory"
     assert captured["headers"].get("X-User-Clearance") == "L3"
 
 
@@ -3130,8 +3205,8 @@ def test_fetch_knowledge_formats_with_provenance_and_scope() -> None:
         async def __aexit__(self, *a):
             pass
 
-        async def get(self, url, **kw):
-            captured["params"] = kw.get("params") or {}
+        async def post(self, url, **kw):
+            captured["body"] = kw.get("json") or {}
             captured["headers"] = kw.get("headers") or {}
             return _FakeResp()
 
@@ -3145,7 +3220,7 @@ def test_fetch_knowledge_formats_with_provenance_and_scope() -> None:
                 clearance="L2",
             )
         )
-    assert captured["params"].get("scope") == "knowledge"
+    assert captured["body"].get("scope") == "knowledge"
     assert captured["headers"].get("X-User-Clearance") == "L2"
     assert "[报销规定 | 行政]" in result
     assert "差旅报销标准" in result
@@ -3164,7 +3239,7 @@ def test_fetch_knowledge_failure_open() -> None:
         async def __aexit__(self, *a):
             pass
 
-        async def get(self, url, **kw):
+        async def post(self, url, **kw):
             raise httpx.ConnectError("down")
 
     with patch.object(httpx, "AsyncClient", return_value=_FailClient()):

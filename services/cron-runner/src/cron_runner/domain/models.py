@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, String, func
+from sqlalchemy import JSON, Boolean, DateTime, Index, String, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -25,6 +25,10 @@ class Base(DeclarativeBase):
 
 class CronJob(Base):
     __tablename__ = "cron_jobs"
+    __table_args__ = (
+        # A user's triggers, for their data export / erasure.
+        Index("ix_cron_jobs_tenant_created_by", "tenant_id", "created_by_user_id"),
+    )
 
     id: Mapped[str] = mapped_column(
         String(40), primary_key=True, default=lambda: new_id("cron")
@@ -56,6 +60,11 @@ class CronJob(Base):
 
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     source: Mapped[str] = mapped_column(String(16), nullable=False, default="USER")
+    # The user who created the trigger (``X-User-Id`` at create time; NULL for
+    # system-created rows).  Runs fire as the cron service account, so this is
+    # what ties a trigger, and the runs it starts, to a person.  PATCH never
+    # changes it.
+    created_by_user_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     last_run_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type WheelEvent } from 'react';
-import { useChat } from '../hooks/useChat';
+import { useChat, type SendResult } from '../hooks/useChat';
 import { useOutputAttachments } from '../hooks/useOutputAttachments';
 import { useInstalledSkills } from '../hooks/useInstalledSkills';
 import { useMcpServers } from '../hooks/useMcpServers';
@@ -10,7 +10,6 @@ import { OutputFileCards } from './OutputFileCards';
 import { Composer } from './composer/Composer';
 import { PlanBlock } from './PlanBlock';
 import { RewindConfirmModal } from './RewindConfirmModal';
-import { DataNoticeModal } from './DataNoticeModal';
 import { ConfirmCard } from './hitl/ConfirmCard';
 import { QuestionCard } from './hitl/QuestionCard';
 import { CanvasMessageCard } from './CanvasMessageCard';
@@ -293,10 +292,6 @@ function FixtureMessageInner({
 
 // ── ChatWindow ────────────────────────────────────────────────────────────────
 
-// localStorage key recording that the user has acknowledged the first-use data
-// notice. Versioned so the notice can be re-shown if the policy text changes.
-const DATA_NOTICE_ACK_KEY = 'data-notice-ack-v1';
-
 export function ChatWindow({
   sessionId,
   workspaceId,
@@ -324,7 +319,7 @@ export function ChatWindow({
   workspaceId?: string;
   friendly?: boolean;
   onPreviewFile?: (att: { id: string; filename: string; mime?: string }) => void;
-  onSendMessage?: (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[], workspaceFileIds?: string[]) => void | Promise<void>;
+  onSendMessage?: (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[], workspaceFileIds?: string[]) => void | Promise<void | SendResult>;
   inlineCanvasDraft?: CanvasDocumentDraft | null;
   inlineCanvasPending?: boolean;
   inlineCanvasRevising?: boolean;
@@ -472,9 +467,6 @@ export function ChatWindow({
   // from forking a paused run with a new message before resolving it.
   const hasPending = useChatStore((s) => hasPendingInteraction(s, sessionId));
 
-  // First-use data-usage notice: show once per device, then remember the
-  // acknowledgement in localStorage so it never appears again.
-  const [showDataNotice, setShowDataNotice] = useState(false);
   // canvas.v2: read the server canvas so the anchor gate can verify it's loaded
   // before rendering the card at its anchor. Selector returns a stable
   // reference (or undefined) — never a fresh object.
@@ -517,24 +509,6 @@ export function ChatWindow({
       if (!cached[cid]) void fetchCanvas(cid).catch(() => {});
     }
   }, [canvasV2, anchoredCanvasIdsKey, fetchCanvas]);
-
-  useEffect(() => {
-    try {
-      if (!localStorage.getItem(DATA_NOTICE_ACK_KEY)) {
-        setShowDataNotice(true);
-      }
-    } catch {
-      // localStorage unavailable (e.g. privacy mode) — skip the notice.
-    }
-  }, []);
-  const ackDataNotice = () => {
-    try {
-      localStorage.setItem(DATA_NOTICE_ACK_KEY, '1');
-    } catch {
-      // Ignore storage failures; just close the modal.
-    }
-    setShowDataNotice(false);
-  };
 
   // Seed this session's enabled skills from the user's install defaults, once
   // the installed list loads — only if the user hasn't chosen yet this session.
@@ -607,10 +581,13 @@ export function ChatWindow({
     }));
     shouldStickToBottomRef.current = true;
     scrollToBottom('smooth');
-    if (onSendMessage) {
-      return onSendMessage(text, attachmentIds, attMeta, workspaceFileIds);
-    }
-    return sendMessage(text, attachmentIds, attMeta, workspaceFileIds);
+    const send = onSendMessage ?? sendMessage;
+    // A refused send (a live run, or the server said no) saved nothing, so keep
+    // the draft (Composer treats `false` as "not accepted").  A send whose
+    // outcome is unknown stays visible as the optimistic message + its error row.
+    return Promise.resolve(send(text, attachmentIds, attMeta, workspaceFileIds)).then(
+      (result) => (result === 'busy' || result === 'rejected' ? false : undefined),
+    );
   };
 
   const handleTranscriptWheel = useCallback((event: WheelEvent<HTMLDivElement>) => {
@@ -901,7 +878,6 @@ export function ChatWindow({
           }}
           mentionCandidates={mentionCandidates}
         />
-        {showDataNotice && <DataNoticeModal onAck={ackDataNotice} />}
         {pendingRewind && (
           <RewindConfirmModal
             message={pendingRewind}

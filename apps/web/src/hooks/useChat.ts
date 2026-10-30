@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useCanvasStore } from '../stores/canvasStore';
 import { api, ApiError } from '../api/client';
+import { notifySessionExpired } from '../api/authEvents';
 import type { Message, MessageAttachment, PendingInteractionItem } from '../api/types';
 
 // ── SSE event handler registry ────────────────────────────────────────────────
@@ -16,7 +17,7 @@ import type { Message, MessageAttachment, PendingInteractionItem } from '../api/
 //
 // Event → store method mapping:
 //   run_started    → clearStreamingBlocks (C3 replay idempotency) +
-//                    clearRunStreamOffsets + setIsStreaming(true)
+//                    clearRunStreamOffsets + setSessionStreaming(sid, true)
 //   token          → appendStreamingToken (idempotent via offset watermark)
 //   tool           → upsertStreamingTool  (idempotent via offset watermark)
 //   thinking       → appendStreamingThinking (idempotent via offset watermark)
@@ -27,11 +28,14 @@ import type { Message, MessageAttachment, PendingInteractionItem } from '../api/
 //   plan           → setPlanSteps
 //   canvas_created → setMessageCanvasId (anchor a materialized canvas to its
 //                    assistant message) + warm the canvas cache (fetchCanvas)
-//   run_complete   → setIsStreaming(false) + one-shot messages.list reconcile
+//   run_complete   → setSessionStreaming(sid, false) + reconcile of the
+//                    latest turn's persisted rows (messages.list)
+//   pending_resolved → acknowledge + drop a HITL card the user already
+//                    answered (replayed after a reload mid-resume)
 //   ping           → no-op (SSE keepalive heartbeat; see the silent-watchdog
 //                    note on runConnectLoop — presence of pings is what arms it)
 //   done           → onDone()  (5-min server window closed; NOT isStreaming)
-//   error          → addMessage SYSTEM + onDone()
+//   error          → one self-clearing SYSTEM notice per session + onDone()
 //   <unknown>      → console.warn (never silently dropped — a silent `message`
 //                    drop has bitten this codebase before)
 //
@@ -75,9 +79,11 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
       // unacknowledged cards and suppresses approvals already submitted.
       store.clearPendingInteractions(ctx.sessionId, runId);
     }
-    // Mark streaming live.  The optimistic setIsStreaming(true) in sendMessage
-    // covers the gap between POST return and the first run_started arriving.
-    store.setIsStreaming(true);
+    // Mark THIS session's run live (never the globally active one: a run
+    // streaming in a background tab must not lock another session's composer).
+    // The optimistic flag set in sendMessage covers the gap between the POST
+    // returning and the first run_started arriving.
+    store.setSessionStreaming(ctx.sessionId, true);
   },
 
   message_created(_ctx, data) {
@@ -211,49 +217,20 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
   },
 
   message(ctx, data) {
-    // A complete message row from the server.  The orchestrator stores roles
-    // lowercase ("assistant"/"user"/"system"/"tool"); compare case-insensitively.
-    const store = useChatStore.getState();
-    const msg = data as unknown as Message;
-    const roleUpper = (msg.role || '').toUpperCase();
-    if ((roleUpper === 'ASSISTANT' || roleUpper === 'TOOL' || roleUpper === 'THINKING') && msg.run_id) {
-      // `canvas_created` can arrive while the assistant answer is still a
-      // transient streaming block.  Preserve that live association when the
-      // durable assistant row arrives without canvas_id; otherwise the clear
-      // below deletes the only copy of the association and the canvas flashes
-      // briefly before disappearing.
-      const liveCanvasId = roleUpper === 'ASSISTANT' && !msg.canvas_id
-        ? (store.messages[ctx.sessionId] || [])
-            .slice()
-            .reverse()
-            .find(
-              (m) =>
-                m.streamRunId === msg.run_id &&
-                m.blockKind === 'text' &&
-                Boolean(m.canvas_id),
-            )?.canvas_id
-        : undefined;
-      const durableMessage = liveCanvasId ? { ...msg, canvas_id: liveCanvasId } : msg;
-      // Swap the transient streaming block for the durable DB row — but only
-      // the block of the SAME kind this row replaces.  Durable rows arrive
-      // THINKING-first, then ASSISTANT text; a non-kind-aware clear would wipe
-      // the live-streamed text when the THINKING row lands, and if the text's
-      // own durable row is delayed (or the stream closes first) the run would
-      // show a lone THOUGHT block with no answer.  addMessage deduplicates.
-      const kindForRole =
-        roleUpper === 'THINKING' ? 'thinking' : roleUpper === 'TOOL' ? 'tool' : 'text';
-      store.clearStreamingBlocks(ctx.sessionId, msg.run_id, kindForRole);
-      store.addMessage(ctx.sessionId, durableMessage);
-      // A durable row for this run has landed → the run reached terminal and was
-      // hydrated.  Close its streaming channel and drop its offset watermark so
-      // any further (replayed) token/tool/thinking events are discarded instead
-      // of rebuilding a duplicate set of side-by-side streaming blocks.  A future
-      // `run_started` (resume / new leg) reopens the channel.
-      store.closeRunStream(ctx.sessionId, msg.run_id);
-      store.clearRunStreamOffsets(ctx.sessionId, msg.run_id);
-    } else {
-      store.addMessage(ctx.sessionId, msg);
-    }
+    // A complete message row from the server.  An assistant / tool / thinking
+    // row replaces its run's streaming block of the same kind and closes the
+    // run's streaming channel (so a replay can't rebuild a duplicate beside
+    // it); `mergeMessages` does that swap for streamed and fetched rows alike.
+    useChatStore.getState().mergeMessages(ctx.sessionId, [data as unknown as Message]);
+  },
+
+  transcript_reset(ctx, _data) {
+    // Rows this client holds were deleted on the server (a rewind in this tab
+    // or another): reload the transcript so the stale ones go and their
+    // replacements, which reused the same sequences, appear.
+    void syncTranscript(ctx.sessionId).catch((err) => {
+      console.warn('[useChat] transcript reload after reset failed', err);
+    });
   },
 
   agent_message(ctx, data) {
@@ -308,13 +285,27 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     }
   },
 
-  run_paused(_ctx) {
+  run_paused(ctx) {
     // Worker exited to save resources while paused.  The run is NOT complete —
     // it will be respawned when the user responds.  We flip isStreaming(false)
     // so the "Working on it…" pill disappears, but the pending cards (set by
     // pending_confirmation / pending_question) remain visible and the composer
     // stays DISABLED via the hasPendingInteraction selector in ChatWindow.
-    useChatStore.getState().setIsStreaming(false);
+    useChatStore.getState().setSessionStreaming(ctx.sessionId, false);
+  },
+
+  pending_resolved(ctx, data) {
+    // The user already answered this card and the run resumed under a new tool
+    // call id, so no tool_result will ever close the original one.  The
+    // orchestrator records the answer in the run's stream; replaying it after a
+    // reload removes the card the replayed pending_* event just re-added.
+    const store = useChatStore.getState();
+    const runId = data.run_id as string | undefined;
+    const toolCallId = data.tool_call_id as string | undefined;
+    if (runId && toolCallId) {
+      store.markPendingInteractionAcknowledged(ctx.sessionId, runId, toolCallId);
+      store.removePendingInteraction(ctx.sessionId, toolCallId);
+    }
   },
 
   run_complete(_ctx, data) {
@@ -323,7 +314,7 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     // should clear the cards automatically).
     const store = useChatStore.getState();
     const runId = data.run_id as string | undefined;
-    store.setIsStreaming(false);
+    store.setSessionStreaming(_ctx.sessionId, false);
     if (runId) {
       store.clearPendingInteractions(_ctx.sessionId, runId);
     } else {
@@ -334,20 +325,18 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     // recovers a stream that stopped mid-flight, but a stream can also reach
     // run_complete having dropped an individual durable row (e.g. a `message`
     // frame lost to a transient hiccup that did NOT stall the whole tail).  On
-    // every completion we do a fire-and-forget re-pull of the canonical message
-    // list and feed each row back through addMessage — which dedups by id and
-    // inserts in sequence order, so this is fully idempotent and cheap when
-    // nothing is missing.  This is the LAST line of defence for lost durable
-    // rows; it never blocks the handler (must stay synchronous), so we run it
-    // inside a detached async IIFE.
+    // every completion we do a fire-and-forget re-pull of the latest turn's
+    // persisted rows (from its USER message on, following the cursor so a long
+    // turn is never cut at one page) and merge them — addMessage semantics
+    // dedup by id and insert in sequence order, so this is fully idempotent
+    // and cheap when nothing is missing.  This is the LAST line of defence for
+    // lost durable rows; it never blocks the handler (must stay synchronous),
+    // so we run it inside a detached async IIFE.
     const sessionId = _ctx.sessionId;
     void (async () => {
       try {
-        const page = await api.messages.list(sessionId);
-        const s = useChatStore.getState();
-        for (const m of page.items) {
-          s.addMessage(sessionId, m);
-        }
+        const rows = await fetchTranscript(sessionId, latestTurnStart(sessionId));
+        useChatStore.getState().mergeMessages(sessionId, rows);
       } catch (err) {
         console.warn('[useChat] run_complete reconcile failed', err);
       }
@@ -402,11 +391,18 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
   },
 
   error(ctx, data) {
-    useChatStore.getState().addMessage(ctx.sessionId, {
-      id: `err_${Date.now()}`,
+    // A stream-level problem (the relay lost its upstream).  Show ONE notice
+    // per session under a fixed id — reconnect loops used to pile up one row
+    // per attempt — and drop it as soon as the stream delivers events again
+    // (see clearStreamNotice in runConnectLoop).
+    const detail = (data as Record<string, unknown>).detail;
+    const store = useChatStore.getState();
+    store.removeMessage(ctx.sessionId, streamNoticeId(ctx.sessionId));
+    store.addMessage(ctx.sessionId, {
+      id: streamNoticeId(ctx.sessionId),
       session_id: ctx.sessionId,
       role: 'SYSTEM',
-      content: `Error: ${(data as Record<string, unknown>).detail || 'Unknown error'}`,
+      content: `${typeof detail === 'string' && detail ? detail : 'Connection interrupted'} — reconnecting…`,
       tool_calls: null,
       run_id: null,
       sequence: 0,
@@ -415,6 +411,91 @@ const SSE_HANDLERS: Record<string, SSEHandler> = {
     ctx.onDone();
   },
 };
+
+/** Fixed id of a session's (single) stream-connection notice row. */
+function streamNoticeId(sessionId: string): string {
+  return `stream_notice_${sessionId}`;
+}
+
+function clearStreamNotice(sessionId: string): void {
+  useChatStore.getState().removeMessage(sessionId, streamNoticeId(sessionId));
+}
+
+const TRANSCRIPT_PAGE_SIZE = 200;
+const TRANSCRIPT_MAX_PAGES = 50;
+
+/**
+ * Every persisted message of a session with `sequence > afterSequence`
+ * (the whole transcript when omitted), oldest first, following the cursor —
+ * a single page silently hid everything past the first 50 rows, including
+ * the latest prompt of a long conversation.  Exported for tests.
+ */
+export async function fetchTranscript(
+  sessionId: string,
+  afterSequence?: number,
+): Promise<Message[]> {
+  return (await loadTranscriptPages(sessionId, afterSequence)).rows;
+}
+
+/** `fetchTranscript`, plus whether it reached the end (not cut at the page cap). */
+async function loadTranscriptPages(
+  sessionId: string,
+  afterSequence?: number,
+): Promise<{ rows: Message[]; complete: boolean }> {
+  const rows: Message[] = [];
+  let cursor = afterSequence && afterSequence > 0 ? String(afterSequence) : undefined;
+  for (let page = 0; page < TRANSCRIPT_MAX_PAGES; page += 1) {
+    const res = await api.messages.list(sessionId, cursor, TRANSCRIPT_PAGE_SIZE);
+    rows.push(...res.items);
+    if (!res.next_cursor) return { rows, complete: true };
+    cursor = res.next_cursor;
+  }
+  return { rows, complete: false };
+}
+
+/**
+ * Load the WHOLE transcript (cursor-followed) and make the store match it in
+ * one update: `mergeMessages` semantics, plus dropping persisted rows the
+ * server no longer has.  Live streaming blocks and rows that streamed in
+ * during the fetch stay.
+ */
+export async function syncTranscript(sessionId: string): Promise<void> {
+  const known = (useChatStore.getState().messages[sessionId] || []).filter((m) => m.sequence > 0);
+  const { rows, complete } = await loadTranscriptPages(sessionId);
+  // A fetch cut at the page cap says nothing about rows past its last one.
+  const newest = rows.reduce((max, m) => Math.max(max, m.sequence), 0);
+  const knownIds = new Set(
+    known.filter((m) => complete || m.sequence <= newest).map((m) => m.id),
+  );
+  useChatStore.getState().replacePersistedMessages(sessionId, rows, knownIds);
+}
+
+/**
+ * The newest persisted row the store holds for a session (null when none).
+ * Sent as the stream's `after` / `after_id` cursor so a reconnect only gets
+ * newer rows — and is told to reload if that row has since been deleted.
+ */
+function transcriptHead(sessionId: string): Message | null {
+  let head: Message | null = null;
+  for (const m of useChatStore.getState().messages[sessionId] || []) {
+    if (m.sequence > 0 && (!head || m.sequence > head.sequence)) head = m;
+  }
+  return head;
+}
+
+/**
+ * The sequence just before the latest persisted USER turn (0 when none):
+ * reconciling from there re-pulls the whole current turn, so a row lost
+ * mid-run is recovered even when later rows did arrive.
+ */
+function latestTurnStart(sessionId: string): number {
+  const msgs = useChatStore.getState().messages[sessionId] || [];
+  for (let i = msgs.length - 1; i >= 0; i -= 1) {
+    const m = msgs[i];
+    if (m.sequence > 0 && (m.role || '').toUpperCase() === 'USER') return m.sequence - 1;
+  }
+  return 0;
+}
 
 /**
  * Restore canvases whose document row survived but whose message.canvas_id
@@ -735,10 +816,23 @@ export function shouldWatchdogFire(
   return sawPing && now - lastEventAt > WATCHDOG_STALL_MS;
 }
 
+/**
+ * HTTP statuses on which reconnecting the session stream cannot help: the
+ * session was deleted, is not the caller's, or the request is malformed.
+ * 401, 408 and 429 stay retryable, as does every 5xx.  A 401 is also reported
+ * as a possible session expiry: AuthGate confirms it and signs the user out,
+ * which tears this loop down.  Exported for tests.
+ */
+export function isPermanentStreamFailure(status: number): boolean {
+  return status >= 400 && status < 500 && status !== 401 && status !== 408 && status !== 429;
+}
+
 /** The reconnecting fetch loop for one session's SSE stream. */
 async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> {
   const { controller: master } = handle;
   let backoffMs = 1000;
+  // A 401 is reported once per outage, not on every reconnect attempt.
+  let reportedExpiry = false;
 
   while (!handle.cancelled) {
     const connectStart = Date.now();
@@ -770,21 +864,40 @@ async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> 
     }, WATCHDOG_CHECK_MS);
 
     try {
-      const res = await fetch(`/api/bff/v1/sessions/${sid}/stream`, {
+      const head = transcriptHead(sid);
+      const cursor = head
+        ? `?${new URLSearchParams({ after: String(head.sequence), after_id: head.id })}`
+        : '';
+      const res = await fetch(`/api/bff/v1/sessions/${sid}/stream${cursor}`, {
         credentials: 'include',
         signal: attempt.signal,
       });
 
       if (!res.ok || !res.body) {
+        if (isPermanentStreamFailure(res.status)) {
+          // The session is gone or not ours (403/404/410…): retrying can't
+          // succeed, so stop instead of reconnecting every second forever.  A
+          // later subscribe (remount / session switch) starts a fresh loop.
+          console.warn(`[useChat] session stream ${res.status} for ${sid}; not reconnecting`);
+          if (activeStreams.get(sid) === handle) activeStreams.delete(sid);
+          break;
+        }
+        if (res.status === 401 && !reportedExpiry) {
+          reportedExpiry = true;
+          notifySessionExpired();
+        }
         console.warn(`[useChat] session stream ${res.status} for ${sid}; backing off ${backoffMs}ms`);
         await delay(backoffMs, attempt.signal);
         backoffMs = Math.min(backoffMs * 2, 8000);
         continue;
       }
 
-      backoffMs = 1000;
-
+      reportedExpiry = false;
       const reader = res.body.getReader();
+      // Backoff resets only once the connection proves useful (delivers an
+      // event) — resetting on every 200 turned a relay that answers 200 and
+      // dies straight away into a 1 s reconnect storm.
+      let sawEvent = false;
       let doneFired = false;
 
       // Explicitly cancel the reader when the attempt aborts.  Aborting the
@@ -807,6 +920,11 @@ async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> 
           // Every parsed event proves the connection is alive — refresh the
           // watchdog clock before dispatching (ping included; that's the point).
           lastEventAt = Date.now();
+          if (eventType !== 'error' && !sawEvent) {
+            sawEvent = true;
+            backoffMs = 1000;
+            clearStreamNotice(sid);
+          }
           if (eventType === 'ping') sawPing = true;
           if (eventType === 'done') doneFired = true;
           handleSSEEvent(sid, eventType, data, () => {
@@ -971,8 +1089,95 @@ export function buildChatRequestBody(
   };
 }
 
+const inflightHydrations = new Map<string, Promise<void>>();
+
+/**
+ * Load a session's transcript, canvas anchors and paused HITL cards into the
+ * store.  Concurrent callers for the same session share one load (AgentPage
+ * and ChatWindow both mount useChat), and every step is idempotent, so a
+ * later call (revisiting the session) simply refreshes it.
+ */
+export function hydrateSession(sid: string): Promise<void> {
+  const inflight = inflightHydrations.get(sid);
+  if (inflight) return inflight;
+  const load = (async () => {
+    try {
+      await syncTranscript(sid);
+      // A canvas can be committed before its assistant message exists.  The
+      // normal server backfill now retries, but list + recover also repairs
+      // sessions created before that fix.
+      try {
+        await recoverSessionCanvasAnchors(sid);
+      } catch (err) {
+        if (!(err instanceof ApiError) || err.status !== 401) {
+          console.warn('recover canvas anchors failed', err);
+        }
+      }
+    } catch (err) {
+      if (!(err instanceof ApiError) || err.status !== 401) {
+        console.warn('load messages failed', err);
+      }
+    }
+
+    // Rehydrate any HITL pause that happened while the page was closed (or on
+    // an earlier run in this session).  The live SSE pending_confirmation /
+    // pending_question event is missed on refresh/reconnect, so without this
+    // the run sits PAUSED with no card.  applyPendingInteractions mirrors the
+    // SSE handlers and is dedup-safe, so it can run alongside stream replay.
+    // Wrapped in its own try/catch so a failure never breaks message hydration.
+    try {
+      const pending = await api.sessions.pending(sid);
+      applyPendingInteractions(sid, pending.items);
+    } catch (err) {
+      console.warn('load pending interactions failed', err);
+    }
+  })().finally(() => {
+    inflightHydrations.delete(sid);
+  });
+  inflightHydrations.set(sid, load);
+  return load;
+}
+
+/** Outcome of `sendMessage`:
+ *  - `sent`: the run started with the message.
+ *  - `busy`: this session already has a live run — known here (nothing was
+ *    added) or reported by the server (an error row explains).
+ *  - `rejected`: the server refused the send for another reason (an error row
+ *    explains).
+ *  - `failed`: the request did not complete, so whether the message arrived is
+ *    unknown (an error row explains; the optimistic message stays).
+ *  After `busy` and `rejected` nothing was saved, so the caller keeps the
+ *  draft for a retry. */
+export type SendResult = 'sent' | 'busy' | 'rejected' | 'failed';
+
+/** The user-facing reason the server gave for refusing a send. */
+async function refusalMessage(res: Response): Promise<string> {
+  if (res.status === 401) return 'You have been signed out. Sign in again, then resend your message.';
+  try {
+    const body = await res.json();
+    if (typeof body?.user_message === 'string' && body.user_message) return body.user_message;
+    if (typeof body?.detail === 'string' && body.detail) return body.detail;
+  } catch {
+    // not JSON: fall through to the generic message
+  }
+  return `Your message could not be sent (HTTP ${res.status}). Please try again.`;
+}
+
+function addSendError(sessionId: string, content: string): void {
+  useChatStore.getState().addMessage(sessionId, {
+    id: `err_${Date.now()}`,
+    session_id: sessionId,
+    role: 'SYSTEM',
+    content,
+    tool_calls: null,
+    run_id: null,
+    sequence: 0,
+    created_at: new Date().toISOString(),
+  });
+}
+
 export function useChat() {
-  const { activeSessionId, messages, setIsStreaming, isStreaming } = useChatStore();
+  const { activeSessionId, messages, isStreaming } = useChatStore();
   // abortRef is used by cancel() to abort an in-flight POST (rare — the POST is
   // now very short-lived, typically <500 ms, but we keep the ref so cancel()
   // can still call abortRef.current?.abort() for consistency).
@@ -988,50 +1193,13 @@ export function useChat() {
   // ── Hydrate transcript ──────────────────────────────────────────────────────
   //
   // Load existing message history from the server when the active session
-  // changes (page refresh, deep-link, session switch).
+  // changes (page refresh, deep-link, session switch).  Every mounted useChat()
+  // consumer asks, but hydrateSession() shares one in-flight load per session.
   useEffect(() => {
     if (!activeSessionId) return;
     if (loadedRef.current.has(activeSessionId)) return;
     loadedRef.current.add(activeSessionId);
-    const sid = activeSessionId;
-    (async () => {
-      try {
-        const page = await api.messages.list(sid);
-        const store = useChatStore.getState();
-        // addMessage handles dedup; we add in order so sequence is preserved.
-        for (const m of page.items) {
-          store.addMessage(sid, m);
-        }
-        // A canvas can be committed before its assistant message exists.  The
-        // normal server backfill now retries, but list + recover also repairs
-        // sessions created before that fix.
-        try {
-          await recoverSessionCanvasAnchors(sid);
-        } catch (err) {
-          if (!(err instanceof ApiError) || err.status !== 401) {
-            console.warn('recover canvas anchors failed', err);
-          }
-        }
-      } catch (err) {
-        if (!(err instanceof ApiError) || err.status !== 401) {
-
-          console.warn('load messages failed', err);
-        }
-      }
-
-      // Rehydrate any HITL pause that happened while the page was closed (or on
-      // an earlier run in this session).  The live SSE pending_confirmation /
-      // pending_question event is missed on refresh/reconnect, so without this
-      // the run sits PAUSED with no card.  applyPendingInteractions mirrors the
-      // SSE handlers and is dedup-safe, so it can run alongside stream replay.
-      // Wrapped in its own try/catch so a failure never breaks message hydration.
-      try {
-        const pending = await api.sessions.pending(sid);
-        applyPendingInteractions(sid, pending.items);
-      } catch (err) {
-        console.warn('load pending interactions failed', err);
-      }
-    })();
+    void hydrateSession(activeSessionId);
   }, [activeSessionId]);
 
   // ── Persistent session SSE stream ───────────────────────────────────────────
@@ -1071,13 +1239,19 @@ export function useChat() {
   // The SSE stream (opened by the effect above) delivers all subsequent events.
   //
   // What sendMessage now does:
-  //   1. Guard against concurrent sends (isStreaming).
+  //   1. Guard against concurrent sends in THIS session (its own live-run flag;
+  //      another session's run never blocks it).
   //   2. Add optimistic USER message.
   //   3. POST /chat with the same body as before.
   //   4. On success: call setIsStreaming(true) optimistically so the UI shows
   //      the loading state immediately, before run_started arrives on the stream.
   //      The stream's run_complete (not this function) turns it off.
-  //   5. On failure: add SYSTEM error message, return.
+  //   5. On a refusal: the server writes the message together with its run, so
+  //      nothing was saved — drop the optimistic message and add a SYSTEM row
+  //      saying why; the caller keeps the draft.  On a network failure the
+  //      outcome is unknown: keep the optimistic message, add the error row.
+  // Resolves to a SendResult so callers that dispatch on the user's behalf
+  // (AgentPage's initial prompt) know whether it actually went out.
   //
   // The `res.body.getReader()` SSE loop that was previously here is GONE — the
   // persistent stream effect handles all events.
@@ -1087,13 +1261,15 @@ export function useChat() {
       attachmentIds?: string[],
       attachmentsMeta?: MessageAttachment[],
       workspaceFileIds?: string[],
-    ) => {
-      if (!activeSessionId || isStreaming) return;
+    ): Promise<SendResult> => {
+      if (!activeSessionId) return 'failed';
       const sessionId = activeSessionId;
+      if (useChatStore.getState().streamingSessions[sessionId]) return 'busy';
 
       // Optimistic USER message — shown immediately so the UI feels responsive.
+      const optimisticId = `temp_user_${Date.now()}`;
       useChatStore.getState().addMessage(sessionId, {
-        id: `temp_user_${Date.now()}`,
+        id: optimisticId,
         session_id: sessionId,
         role: 'USER',
         content: text,
@@ -1118,25 +1294,12 @@ export function useChat() {
         });
 
         if (!res.ok) {
-          // Parse the JSON error body (backend now returns plain JSON on failure).
-          let detail = `Request failed (${res.status})`;
-          try {
-            const errBody = await res.json();
-            if (errBody?.detail) detail = String(errBody.detail);
-          } catch {
-            // ignore parse error, keep default message
-          }
-          useChatStore.getState().addMessage(sessionId, {
-            id: `err_${Date.now()}`,
-            session_id: sessionId,
-            role: 'SYSTEM',
-            content: detail,
-            tool_calls: null,
-            run_id: null,
-            sequence: 0,
-            created_at: new Date().toISOString(),
-          });
-          return;
+          // Refused: the message is saved only together with a started run, so
+          // nothing reached the transcript.
+          useChatStore.getState().removeMessage(sessionId, optimisticId);
+          if (res.status === 401) notifySessionExpired();
+          addSendError(sessionId, await refusalMessage(res));
+          return res.status === 409 ? 'busy' : 'rejected';
         }
 
         // Success: parse {run_id, message_id, run}.
@@ -1150,19 +1313,23 @@ export function useChat() {
         // deduplicates by content (temp_user_* → real USER row) when the stream
         // emits the message_created event, so no extra work needed here.
         await res.json(); // consume body (run_id / message_id / run — unused for now)
-        setIsStreaming(true);
+        useChatStore.getState().setSessionStreaming(sessionId, true);
+        return 'sent';
       } catch (e) {
         if ((e as Error).name !== 'AbortError') {
-
           console.error('Chat error:', e);
+          // A network failure used to leave the optimistic message with no
+          // feedback at all.
+          addSendError(sessionId, 'Couldn’t send your message. Check your connection and try again.');
         }
-        // Note: we do NOT call setIsStreaming(false) here because the persistent
+        // Note: we do NOT clear the live-run flag here because the persistent
         // stream's run_complete is the authoritative signal.  If the POST aborted
-        // before the server processed it, no run was started, so isStreaming was
-        // never set to true and there's nothing to clear.
+        // before the server processed it, no run was started, so the flag was
+        // never set and there's nothing to clear.
+        return 'failed';
       }
     },
-    [activeSessionId, isStreaming, setIsStreaming],
+    [activeSessionId],
   );
 
   // ── cancel ──────────────────────────────────────────────────────────────────
@@ -1174,20 +1341,19 @@ export function useChat() {
   // stay open so we can see the run_complete event when the backend run
   // terminates.  The stream's run_complete will flip isStreaming(false).
   //
-  // We DO call setIsStreaming(false) immediately for responsive UI feedback,
+  // We DO clear the session's live-run flag immediately for responsive UI feedback,
   // accepting the tiny risk that a run_complete arrives a moment later and
   // redundantly calls it again (idempotent).
   const cancel = useCallback(() => {
     const sessionId = useChatStore.getState().activeSessionId;
     abortRef.current?.abort(); // abort POST if still in flight
-    setIsStreaming(false);
     if (sessionId) {
+      useChatStore.getState().setSessionStreaming(sessionId, false);
       api.sessions.cancel(sessionId).catch((err) => {
-
         console.warn('backend cancel failed', err);
       });
     }
-  }, [setIsStreaming]);
+  }, []);
 
   // rewindTo only *requests* a rewind — it opens an app-level confirm modal by
   // recording the pending message.  The actual delete happens in confirmRewind
@@ -1226,7 +1392,7 @@ export function useChat() {
   }, [activeSessionId, pendingRewind]);
 
   return {
-    sendMessage: sendMessage as (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[], workspaceFileIds?: string[]) => Promise<void>,
+    sendMessage: sendMessage as (text: string, attachmentIds?: string[], attachmentsMeta?: MessageAttachment[], workspaceFileIds?: string[]) => Promise<SendResult>,
     cancel,
     isStreaming,
     messages: activeSessionId ? messages[activeSessionId] || [] : [],

@@ -4,7 +4,24 @@ import { useChatStore } from '../stores/chatStore';
 
 type SsoOption = { id: string; name: string; kind: string };
 
-export function LoginPage() {
+/** Identity refused the sign-in because the account has pending required
+ *  actions (expired password, administrator-requested reset). */
+const ACCOUNT_SETUP_REQUIRED = 'FOUNDATION.IDENTITY.AUTH.ACCOUNT_SETUP_REQUIRED';
+
+// There is no self-service password reset in this product: the way out is the
+// emailed setup/reset link, or an administrator sending a new one.
+export const ACCOUNT_SETUP_REQUIRED_MESSAGE =
+  'Your account needs an update before you can sign in — for example, your password ' +
+  'has expired or an administrator asked for a password reset. Use the link in your ' +
+  'account setup or password reset email, or ask an administrator to send you a new ' +
+  'one (Admin → Users → Reset password).';
+
+type LoginPageProps = {
+  /** Shown above the form, e.g. why the user was signed out. */
+  notice?: string;
+};
+
+export function LoginPage({ notice }: LoginPageProps = {}) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
@@ -67,10 +84,12 @@ export function LoginPage() {
       const profile = await api.auth.me();
       login(profile);
     } catch (err) {
-      // Show a friendly message; the API error class carries enough detail
-      // for ops to diagnose via request_id but the raw `.message` is fine
-      // for end users (foundation surfaces localised text in `detail`).
-      if (err instanceof ApiError && err.status === 401) {
+      // Map the outcome to fixed copy keyed by status/code rather than showing
+      // the upstream text: wrong credentials stay deliberately vague, while
+      // an account with pending setup gets told how to resolve it.
+      if (err instanceof ApiError && err.code === ACCOUNT_SETUP_REQUIRED) {
+        setError(ACCOUNT_SETUP_REQUIRED_MESSAGE);
+      } else if (err instanceof ApiError && err.status === 401) {
         setError('Incorrect email or password. Please try again.');
       } else {
         setError('Sign-in failed. Please try again later.');
@@ -86,6 +105,14 @@ export function LoginPage() {
     <div className="min-h-screen flex items-center justify-center bg-surface-50">
       <div className="w-full max-w-sm p-8 bg-white rounded-xl shadow-sm border border-surface-200">
         <h1 className="text-2xl font-semibold text-center mb-8">Agent Platform</h1>
+        {notice && !error && (
+          <p
+            role="status"
+            className="mb-4 px-3 py-2 text-sm text-amber-800 bg-amber-50 border border-amber-200 rounded-lg"
+          >
+            {notice}
+          </p>
+        )}
         <form onSubmit={handleSubmit} className="space-y-4">
           <div>
             <label htmlFor="email" className="block text-sm font-medium text-gray-700 mb-1">Email</label>
@@ -110,7 +137,11 @@ export function LoginPage() {
               required
             />
           </div>
-          {error && <p className="text-red-500 text-sm">{error}</p>}
+          {error && (
+            <p role="alert" className="text-red-500 text-sm">
+              {error}
+            </p>
+          )}
           <button
             type="submit"
             disabled={loading}

@@ -326,3 +326,161 @@ def test_get_file_content_proxies_to_orchestrator(
         if c[0] == "GET" and "orch-test" in c[1] and "content" in c[1]
     ]
     assert file_calls, f"expected file content GET to orchestrator, got {fake_foundation.calls}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Admin replay of one session (GET /admin/sessions/{id}/runs|messages)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_OWNER = "usr_01J5TEST0000000000000OWNER"
+_SECRET = "my bank PIN is 4321"
+
+
+def _admin_replay_routes(
+    fake_foundation, monkeypatch, *, allowed: bool = True, status_code: int = 200,
+) -> list[tuple[str, str, dict]]:
+    """Authz + orchestrator stubs for the replay endpoints; returns the call log."""
+    import httpx as _httpx
+
+    calls: list[tuple[str, str, dict]] = []
+
+    def _route(method: str, url: str, **kw):
+        calls.append((method, url, kw))
+        if method == "POST" and url.endswith("/check"):
+            return _httpx.Response(200, json={"allowed": allowed})
+        if method == "POST" and url.endswith("/events"):
+            return _httpx.Response(201, json={"ok": True})
+        if url.endswith("/sessions/ses_abc/messages"):
+            if status_code != 200:
+                return _httpx.Response(status_code, json={"detail": "not found"})
+            return _httpx.Response(200, json={
+                "items": [
+                    {"id": "msg_1", "role": "user", "content": _SECRET, "sequence": 7},
+                    {"id": "msg_2", "role": "assistant", "content": "ok", "sequence": 8},
+                ],
+                "next_cursor": None,
+            })
+        if url.endswith("/sessions/ses_abc/runs"):
+            return _httpx.Response(200, json={
+                "items": [{"id": "run_1", "task_description": _SECRET}],
+            })
+        if url.endswith("/sessions/ses_abc"):
+            return _httpx.Response(200, json={"id": "ses_abc", "user_id": _OWNER})
+        return _httpx.Response(200, json={"ok": True})
+
+    monkeypatch.setattr(fake_foundation, "route", _route)
+    return calls
+
+
+def _audit_bodies(calls: list[tuple[str, str, dict]]) -> list[dict]:
+    return [kw.get("json") for (m, u, kw) in calls if m == "POST" and u.endswith("/events")]
+
+
+def test_admin_session_messages_requires_auth(client: TestClient) -> None:
+    resp = client.get("/api/bff/v1/admin/sessions/ses_abc/messages")
+    assert resp.status_code == 401
+
+
+def test_admin_session_messages_forbidden_without_tenant_admin(
+    client: TestClient, authed_cookie: dict[str, str], fake_foundation, monkeypatch,
+) -> None:
+    calls = _admin_replay_routes(fake_foundation, monkeypatch, allowed=False)
+    resp = client.get("/api/bff/v1/admin/sessions/ses_abc/messages", cookies=authed_cookie)
+    assert resp.status_code == 403
+    assert not [c for c in calls if "orch-test" in c[1]]
+    assert not _audit_bodies(calls)
+
+
+def test_admin_session_messages_reads_as_admin_with_the_user_params(
+    client: TestClient, authed_cookie: dict[str, str], fake_foundation, monkeypatch,
+) -> None:
+    """The orchestrator's owner check 404s a peer unless X-Actor: ADMIN is sent."""
+    calls = _admin_replay_routes(fake_foundation, monkeypatch)
+    resp = client.get(
+        "/api/bff/v1/admin/sessions/ses_abc/messages?cursor=7&limit=25",
+        cookies=authed_cookie,
+    )
+    assert resp.status_code == 200
+    assert [m["id"] for m in resp.json()["items"]] == ["msg_1", "msg_2"]
+    reads = [kw for (m, u, kw) in calls if m == "GET" and u.endswith("/ses_abc/messages")]
+    assert len(reads) == 1
+    assert reads[0]["headers"]["X-Actor"] == "ADMIN"
+    assert reads[0]["params"] == {"limit": 25, "cursor": "7"}
+
+
+def test_admin_session_messages_audits_counts_never_content(
+    client: TestClient, authed_cookie: dict[str, str], fake_foundation, monkeypatch,
+) -> None:
+    import json as _json
+
+    calls = _admin_replay_routes(fake_foundation, monkeypatch)
+    resp = client.get("/api/bff/v1/admin/sessions/ses_abc/messages", cookies=authed_cookie)
+    assert resp.status_code == 200
+    bodies = _audit_bodies(calls)
+    assert len(bodies) == 1
+    event = bodies[0]
+    assert event["event_type"] == "admin.session.messages.viewed"
+    assert event["actor_kind"] == "ADMIN"
+    assert event["resource_type"] == "session"
+    assert event["resource_id"] == "ses_abc"
+    assert event["payload"] == {
+        "via": "admin_session_view",
+        "message_count": 2,
+        "subject_user_id": _OWNER,
+        "first_sequence": 7,
+        "last_sequence": 8,
+    }
+    assert _SECRET not in _json.dumps(event)
+
+
+def test_admin_session_messages_failed_read_is_not_audited(
+    client: TestClient, authed_cookie: dict[str, str], fake_foundation, monkeypatch,
+) -> None:
+    calls = _admin_replay_routes(fake_foundation, monkeypatch, status_code=404)
+    resp = client.get("/api/bff/v1/admin/sessions/ses_abc/messages", cookies=authed_cookie)
+    assert resp.status_code == 404
+    assert not _audit_bodies(calls)
+
+
+def test_admin_session_messages_survive_audit_failure(
+    client: TestClient, authed_cookie: dict[str, str], fake_foundation, monkeypatch,
+) -> None:
+    _admin_replay_routes(fake_foundation, monkeypatch)
+    inner = fake_foundation.route
+
+    def _route(method: str, url: str, **kw):
+        if method == "POST" and url.endswith("/events"):
+            raise RuntimeError("audit down")
+        return inner(method, url, **kw)
+
+    monkeypatch.setattr(fake_foundation, "route", _route)
+    resp = client.get("/api/bff/v1/admin/sessions/ses_abc/messages", cookies=authed_cookie)
+    assert resp.status_code == 200
+
+
+def test_admin_session_runs_reads_as_admin_and_audits(
+    client: TestClient, authed_cookie: dict[str, str], fake_foundation, monkeypatch,
+) -> None:
+    import json as _json
+
+    calls = _admin_replay_routes(fake_foundation, monkeypatch)
+    resp = client.get("/api/bff/v1/admin/sessions/ses_abc/runs", cookies=authed_cookie)
+    assert resp.status_code == 200
+    reads = [kw for (m, u, kw) in calls if m == "GET" and u.endswith("/ses_abc/runs")]
+    assert reads and reads[0]["headers"]["X-Actor"] == "ADMIN"
+    bodies = _audit_bodies(calls)
+    assert len(bodies) == 1
+    assert bodies[0]["event_type"] == "admin.session.runs.viewed"
+    assert bodies[0]["payload"] == {
+        "via": "admin_session_view", "run_count": 1, "subject_user_id": _OWNER,
+    }
+    assert _SECRET not in _json.dumps(bodies[0])
+
+
+def test_admin_session_runs_forbidden_without_tenant_admin(
+    client: TestClient, authed_cookie: dict[str, str], fake_foundation, monkeypatch,
+) -> None:
+    calls = _admin_replay_routes(fake_foundation, monkeypatch, allowed=False)
+    resp = client.get("/api/bff/v1/admin/sessions/ses_abc/runs", cookies=authed_cookie)
+    assert resp.status_code == 403
+    assert not [c for c in calls if "orch-test" in c[1]]

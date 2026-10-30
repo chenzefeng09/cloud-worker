@@ -2,7 +2,89 @@
 
 from __future__ import annotations
 
+from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class PrivacyNoticePurpose(BaseModel):
+    """One processing purpose and its GDPR Art. 6 legal basis."""
+
+    purpose: str
+    legal_basis: str
+
+
+class PrivacyNoticeProcessor(BaseModel):
+    """One processor (or sub-processor) that receives personal data."""
+
+    name: str
+    role: str
+    country: str
+    transfer_mechanism: str
+
+
+# Defaults describe what this platform does out of the box.  Operators replace
+# them (JSON env vars) with their real purposes and the processors they have
+# configured — the defaults deliberately name no vendor.
+_DEFAULT_PRIVACY_PURPOSES: tuple[PrivacyNoticePurpose, ...] = (
+    PrivacyNoticePurpose(
+        purpose=(
+            "Provide the agent workspace: run your conversations and tasks and "
+            "store your files, workspaces and generated artifacts"
+        ),
+        legal_basis="Performance of a contract (GDPR Art. 6(1)(b))",
+    ),
+    PrivacyNoticePurpose(
+        purpose=(
+            "Memory: when the agent finishes a reply or a task, keep a "
+            "word-for-word excerpt of it (the start of your request and of the "
+            "agent's answer) to give later conversations and tasks context "
+            "(you can switch this off)"
+        ),
+        legal_basis=(
+            "Legitimate interests (GDPR Art. 6(1)(f)); you can object at any "
+            "time by turning memory off"
+        ),
+    ),
+    PrivacyNoticePurpose(
+        purpose=(
+            "Security, abuse prevention and audit, including administrator "
+            "review of conversations"
+        ),
+        legal_basis="Legitimate interests (GDPR Art. 6(1)(f))",
+    ),
+    PrivacyNoticePurpose(
+        purpose="Usage metering, quotas and billing",
+        legal_basis="Performance of a contract (GDPR Art. 6(1)(b))",
+    ),
+    PrivacyNoticePurpose(
+        purpose="Answer data protection requests and keep the records the law requires",
+        legal_basis="Legal obligation (GDPR Art. 6(1)(c))",
+    ),
+)
+
+_DEFAULT_PRIVACY_PROCESSORS: tuple[PrivacyNoticeProcessor, ...] = (
+    PrivacyNoticeProcessor(
+        name="Configured LLM provider",
+        role=(
+            "Generates agent responses from your prompts, files and conversation "
+            "context, reached through the platform's LLM gateway"
+        ),
+        country="Not specified",
+        transfer_mechanism="Not specified",
+    ),
+    PrivacyNoticeProcessor(
+        name="Configured embeddings provider",
+        role="Turns documents and session memory into vectors for search",
+        country="Not specified",
+        transfer_mechanism="Not specified",
+    ),
+    PrivacyNoticeProcessor(
+        name="Configured object storage",
+        role="Stores uploaded files, knowledge documents and generated artifacts",
+        country="Not specified",
+        transfer_mechanism="Not specified",
+    ),
+)
 
 
 class Settings(BaseSettings):
@@ -107,6 +189,21 @@ class Settings(BaseSettings):
     cookie_max_age: int = 86_400  # 24h
     cookie_secure: bool = False  # True in production (requires HTTPS)
 
+    # ── Server-side web sessions (domain/web_sessions.py) ───────────────────
+    # The cookie only names a session; its Keycloak access + refresh tokens
+    # are kept encrypted in the ``web_sessions`` table and refreshed by the BFF.
+    # Comma-separated Fernet keys: the first encrypts, all decrypt (prepend a
+    # new key to rotate).  Empty → a key derived from ``cookie_secret``; set
+    # explicit keys in production.  Generate one with
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    session_token_keys: str = ""
+    # Refresh the access token once it has less than this many seconds left
+    # (Keycloak issues 300 s tokens).
+    session_refresh_skew_seconds: int = Field(default=60, ge=5)
+    # Read timeout for identity's refresh call; requests waiting on a refresh
+    # wait at most about this long.
+    session_refresh_timeout_seconds: float = Field(default=15.0, gt=0)
+
     cors_origins: str = "http://localhost:5173,http://web:5173"
 
     otel_enabled: bool = True
@@ -125,6 +222,12 @@ class Settings(BaseSettings):
     db_pool_size: int = 5
     db_max_overflow: int = 10
     db_pool_recycle: int = 1800
+    # Log every SQL statement (BFF_SQL_ECHO=true), for a targeted SQL-debugging
+    # session only.  Off by default even in dev: every request reads its web
+    # session, so the echo floods the log pipe the SSE relay also writes to (the
+    # orchestrator stalled on exactly that).  Bound parameters are never logged
+    # either way: they include encrypted session tokens and API key hashes.
+    sql_echo: bool = False
 
     # ── Service-account token ────────────────────────────────────────────────
     # Shared secret used by internal services (cron-runner) to authenticate
@@ -150,3 +253,37 @@ class Settings(BaseSettings):
     # payloads before any parsing / upload.  25 MiB mirrors typical attachment
     # upload limits.
     webhook_max_body_bytes: int = 25 * 1024 * 1024
+
+    # ── Privacy notice (GDPR Art. 13) — served by GET /privacy/notice ───────
+    # The notice ``version`` is a short hash of the rendered content, so any
+    # change here (or in the retention the orchestrator reports) asks users to
+    # acknowledge again.  ``privacy_notice_version`` is an optional label
+    # prefixed to that hash (e.g. "2026-10" → "2026-10.3fa9c2d1e0ab").
+    privacy_notice_version: str = ""
+    privacy_controller_name: str = "Your organisation"
+    privacy_controller_contact_email: str = ""
+    privacy_dpo_email: str | None = None
+    # JSON lists, e.g. BFF_PRIVACY_NOTICE_PURPOSES='[{"purpose": "…",
+    # "legal_basis": "…"}]' and BFF_PRIVACY_NOTICE_PROCESSORS='[{"name": "…",
+    # "role": "…", "country": "…", "transfer_mechanism": "…"}]'.
+    privacy_notice_purposes: list[PrivacyNoticePurpose] = Field(
+        default_factory=lambda: list(_DEFAULT_PRIVACY_PURPOSES),
+    )
+    privacy_notice_processors: list[PrivacyNoticeProcessor] = Field(
+        default_factory=lambda: list(_DEFAULT_PRIVACY_PROCESSORS),
+    )
+
+    # ── Erasure ledger (GDPR Art. 17 vs backups) — domain/erasure_ledger.py ──
+    # Every erasure request is written here before it runs, so that after a
+    # backup restore ``python -m agent_bff.erasure_replay`` can erase the
+    # restored rows again.  The bucket must have Object Lock and must sit
+    # outside what a restore rewinds.  No bucket = no ledger: erasures still
+    # run, but a restore cannot replay them.
+    privacy_ledger_s3_bucket: str = ""
+    privacy_ledger_s3_region: str = "us-east-1"
+    privacy_ledger_s3_endpoint_url: str = ""
+    privacy_ledger_s3_access_key_id: str = ""
+    privacy_ledger_s3_secret_access_key: str = ""
+    # COMPLIANCE lock per entry; must outlast every backup that can still hold
+    # erased data (Postgres full backups: 4 weeks, MinIO noncurrent: 90 days).
+    privacy_ledger_retention_days: int = Field(default=365, ge=1)

@@ -43,7 +43,7 @@ from agent_session_orchestrator.api.dependencies import (
 from agent_session_orchestrator.api.dlp_guard import (
     DlpDownloadDeniedError,
     check_download,
-    scan_and_tag,
+    scan_upload,
 )
 
 # Shared helpers from the attachments module (same package): blob-store
@@ -67,6 +67,7 @@ from agent_session_orchestrator.services.clearance import (
     CLEARANCE_RANK,
     level_allows,
 )
+from agent_session_orchestrator.services.privacy_service import delete_unreferenced_blobs
 from agent_session_orchestrator.services.workspace_service import WorkspaceService
 
 router = APIRouter(tags=["Workspaces"])
@@ -321,6 +322,21 @@ async def upload_workspace_file(
     blob_key = (
         f"tenant/{tenant_id}/workspaces/{workspace_id}/files/{wsf.id}/{filename}"
     )
+
+    # DLP scan before any bytes are stored — text content only, same gating
+    # and DLP_FAILURE_MODE handling as attachment upload (closed: 503 and the
+    # row is rolled back; open: stored unscanned with an error log).
+    text_content = _maybe_text(data)
+    if text_content is not None:
+        await scan_upload(
+            dlp_url=request.app.state.settings.foundation_dlp_url,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            content=text_content,
+            resource_id=wsf.id,
+            resource_type="workspace_file",
+        )
+
     try:
         await asyncio.to_thread(blob_store.put, blob_key, data, content_type=mime)
     except Exception as exc:
@@ -332,17 +348,6 @@ async def upload_workspace_file(
 
     wsf.blob_key = blob_key
     await db.flush()
-
-    # DLP scan (fail-open) — text content only, same gating as attachments.
-    text_content = _maybe_text(data)
-    if text_content is not None:
-        await scan_and_tag(
-            dlp_url=request.app.state.settings.foundation_dlp_url,
-            tenant_id=tenant_id,
-            content=text_content,
-            resource_id=wsf.id,
-            resource_type="workspace_file",
-        )
 
     return WorkspaceFileOut.model_validate(wsf).model_dump(mode="json")
 
@@ -379,20 +384,16 @@ async def delete_workspace_file(
 ) -> Response:
     owner = _owner_filter(request, user_id)
     svc = WorkspaceService(db, tenant_id=tenant_id)
-    wsf = await svc.delete_file(workspace_id, file_id, user_id=owner)
+    blob_keys = await svc.delete_file(workspace_id, file_id, user_id=owner)
 
     # Best-effort blob delete: the row delete is authoritative; an orphaned
     # blob only costs storage and never blocks the API.  Deliberately does NOT
     # use _get_blob_store (503) — the delete must succeed without a blob store.
-    blob_store = getattr(request.app.state, "blob_store", None)
-    if blob_store is not None and wsf.blob_key:
-        try:
-            await asyncio.to_thread(blob_store.delete, wsf.blob_key)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "workspace file blob delete failed (best-effort)",
-                extra={"key": wsf.blob_key, "err": str(exc)},
-            )
+    # Bytes another row still uses (a restore shares keys) are kept.
+    await delete_unreferenced_blobs(
+        db, tenant_id=tenant_id, keys=blob_keys,
+        blob_store=getattr(request.app.state, "blob_store", None),
+    )
     return Response(status_code=204)
 
 
@@ -427,6 +428,8 @@ async def get_workspace_file_content(
             user_message="This file's sensitivity level exceeds your clearance level, so it cannot be downloaded.",
         )
 
+    # DLP decides with the clearance it resolves for ``user_id`` itself; a
+    # check that cannot complete follows DLP_FAILURE_MODE (closed: 503).
     try:
         await check_download(
             dlp_url=request.app.state.settings.foundation_dlp_url,
@@ -434,7 +437,6 @@ async def get_workspace_file_content(
             user_id=user_id,
             resource_id=wsf.id,
             resource_type="workspace_file",
-            user_clearance=clearance,
             destination="laptop",
         )
     except DlpDownloadDeniedError as exc:
@@ -543,12 +545,11 @@ async def process_writeback(
     for r in results:
         all_evicted.extend(r.pop("evicted_blobs", []))
 
-    blob_store = getattr(request.app.state, "blob_store", None)
-    if blob_store and all_evicted:
-        for key in all_evicted:
-            try:
-                await asyncio.to_thread(blob_store.delete, key)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("evicted blob delete failed", extra={"key": key, "err": str(exc)})
+    # An evicted version's bytes can still back the current file (a restore
+    # shares keys), so only unreferenced ones are deleted.  Best-effort.
+    await delete_unreferenced_blobs(
+        db, tenant_id=tenant_id, keys=all_evicted,
+        blob_store=getattr(request.app.state, "blob_store", None),
+    )
 
     return {"items": results}

@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from mcp_registry.errors import SecretEncryptionUnavailableError
 from mcp_registry.services import secret_crypto as sc
 
 
@@ -124,14 +125,61 @@ async def test_decrypt_legacy_plaintext_passthrough(
 
 
 @pytest.mark.asyncio
-async def test_encrypt_falls_back_to_plaintext_on_failure(
+async def test_encrypt_fails_closed_when_crypto_is_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sc.httpx, "AsyncClient", lambda *a, **kw: _FakeFailClient())
+    with pytest.raises(SecretEncryptionUnavailableError):
+        await sc.encrypt_secret(
+            "tok", crypto_url="http://crypto:8004/api/crypto/v1", timeout=5, tenant_id="t1",
+        )
+
+
+@pytest.mark.asyncio
+async def test_encrypt_falls_back_to_plaintext_only_when_allowed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(sc.httpx, "AsyncClient", lambda *a, **kw: _FakeFailClient())
     result = await sc.encrypt_secret(
         "tok", crypto_url="http://crypto:8004/api/crypto/v1", timeout=5, tenant_id="t1",
+        allow_plaintext=True,
     )
-    assert result == "tok"  # plaintext fallback - writes never blocked
+    assert result == "tok"  # dev-only fallback
+
+
+@pytest.mark.asyncio
+async def test_encrypt_values_round_trip_keeps_keys(fake_crypto: _FakeCryptoClient) -> None:
+    ctx = {"crypto_url": "http://crypto:8004/api/crypto/v1", "timeout": 5, "tenant_id": "t1"}
+    env = {"API_KEY": "sk-env", "EMPTY": "", "PORT": 8080}
+    encrypted = await sc.encrypt_values(env, **ctx)
+    assert set(encrypted) == {"API_KEY", "EMPTY", "PORT"}
+    assert sc.is_envelope(encrypted["API_KEY"])
+    assert "sk-env" not in encrypted["API_KEY"]
+    # Empty and non-string values have nothing to protect and pass through.
+    assert encrypted["EMPTY"] == "" and encrypted["PORT"] == 8080
+    assert len(fake_crypto.posts) == 1
+    # Idempotent on envelopes, like encrypt_auth.
+    assert await sc.encrypt_values(encrypted, **ctx) == encrypted
+    assert await sc.decrypt_values(encrypted, **ctx) == env
+
+
+@pytest.mark.asyncio
+async def test_value_helpers_accept_empty_maps(fake_crypto: _FakeCryptoClient) -> None:
+    ctx = {"crypto_url": "http://crypto:8004/api/crypto/v1", "timeout": 5, "tenant_id": "t1"}
+    assert await sc.encrypt_values({}, **ctx) == {}
+    assert await sc.encrypt_values(None, **ctx) == {}
+    assert await sc.decrypt_values(None, **ctx) == {}
+    assert fake_crypto.posts == []
+
+
+@pytest.mark.asyncio
+async def test_encrypt_values_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sc.httpx, "AsyncClient", lambda *a, **kw: _FakeFailClient())
+    with pytest.raises(SecretEncryptionUnavailableError):
+        await sc.encrypt_values(
+            {"Authorization": "Bearer x"},
+            crypto_url="http://crypto:8004/api/crypto/v1", timeout=5, tenant_id="t1",
+        )
 
 
 @pytest.mark.asyncio
@@ -297,3 +345,27 @@ def test_mask_auth_absent_secret_field() -> None:
     result = sc.mask_auth({"type": "bearer"})
     assert result["has_token"] is False
     assert "token" not in result or not result.get("token")
+
+
+def test_mask_values_hides_every_non_empty_value() -> None:
+    envelope = json.dumps({"ciphertext_b64": "c2VjcmV0"})
+    masked = sc.mask_values({"API_KEY": "sk-plain", "TOKEN": envelope, "EMPTY": "", "NONE": None})
+    # Keys stay visible; envelope and legacy plaintext are masked alike; empty
+    # values have nothing to hide.
+    assert masked == {
+        "API_KEY": sc.MASKED_SENTINEL,
+        "TOKEN": sc.MASKED_SENTINEL,
+        "EMPTY": "",
+        "NONE": None,
+    }
+
+
+def test_mask_values_none_or_empty() -> None:
+    assert sc.mask_values(None) == {}
+    assert sc.mask_values({}) == {}
+
+
+def test_masked_keys_lists_sentinel_values_only() -> None:
+    sent = {"A": sc.MASKED_SENTINEL, "B": "typed", "C": "", "D": sc.MASKED_SENTINEL}
+    assert sc.masked_keys(sent) == ["A", "D"]
+    assert sc.masked_keys(None) == []

@@ -75,6 +75,10 @@ def _raise_for_upstream(resp: httpx.Response) -> None:
 # MCP servers
 # --------------------------------------------------------------------------- #
 
+# Same sentinel mcp-registry puts in place of a masked auth secret.
+_MASKED = "••••••"
+
+
 def _scrub_mcp_server_secrets(server: dict) -> dict:
     """Strip connection credentials from an MCP server record for the
     normal-user library surface.
@@ -92,20 +96,20 @@ def _scrub_mcp_server_secrets(server: dict) -> dict:
         ``Authorization`` / ``X-API-Key`` / cookies, and distinguishing secret
         from non-secret entries at the BFF edge is unreliable, so the whole
         map is withheld from the library surface.
+      * ``env`` values and ``args`` are masked for the same reason (API keys as
+        env vars, tokens in CLI args): env keys stay so a user can see what a
+        server expects, and each value or argument becomes ``_MASKED``.  The
+        library only lists servers and installs new ones, so nothing in the SPA
+        reads these values back.
 
-    Everything else (name/transport/endpoint/command/env/enabled/
-    timeout_seconds/tool_filter/args/timestamps) is passed through unchanged -
-    these are the metadata a tenant user needs to browse and select servers.
+    Everything else (name/transport/endpoint/command/enabled/timeout_seconds/
+    tool_filter/timestamps) is passed through unchanged - these are the
+    metadata a tenant user needs to browse and select servers.
     The admin console (admin_platform.py) now sees masked auth: the registry
     replaces secret fields (``token`` / ``api_key`` / ``client_secret``) with a
     redacted sentinel on its tenant-facing read paths, so plaintext credentials
     never reach the browser.  Only the internal consumer endpoint
     (``/internal/mcp-servers``) still returns plaintext secrets.
-
-    Note: ``env`` and ``args`` can also carry secrets (API keys as env vars,
-    tokens in CLI args).  They are left intact here to preserve the existing
-    library contract (the SPA types and renders ``env``); masking their values
-    is a follow-up if the registry starts returning secret material in them.
     """
     if not isinstance(server, dict):
         return server
@@ -117,6 +121,12 @@ def _scrub_mcp_server_secrets(server: dict) -> dict:
         # token_url / scopes (oauth).
         scrubbed["auth"] = {"type": auth.get("type")}
     scrubbed.pop("headers", None)
+    env = scrubbed.get("env")
+    if isinstance(env, dict):
+        scrubbed["env"] = dict.fromkeys(env, _MASKED)
+    args = scrubbed.get("args")
+    if isinstance(args, list):
+        scrubbed["args"] = [_MASKED] * len(args)
     return scrubbed
 
 

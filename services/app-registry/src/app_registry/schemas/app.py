@@ -246,3 +246,41 @@ class AppReviewItem(BaseModel):
     app_id: str
     app_name: str
     author_id: str
+
+
+# ---------------------------------------------------------------------------
+# Privacy (GDPR export / erasure of one user's data)
+# ---------------------------------------------------------------------------
+class AppReviewTrailEntry(BaseModel):
+    """A version of someone else's App whose review trail names the subject.
+
+    Only the parts that are about the subject are filled in: when they created,
+    submitted or reviewed it, and the note they wrote as its reviewer.
+    """
+
+    app_id: str
+    version_id: str
+    version: str
+    status: AppVersionStatus
+    created_at: datetime | None = None
+    submitted_at: datetime | None = None
+    reviewed_at: datetime | None = None
+    review_note: str | None = None
+
+
+class UserAppsExport(BaseModel):
+    subject_user_id: str
+    apps: list[AppOut]
+    review_trail: list[AppReviewTrailEntry]
+
+
+class UserAppsEraseRequest(BaseModel):
+    user_id: str | None = None
+    dry_run: bool = False
+
+
+class UserAppsErasure(BaseModel):
+    subject_user_id: str
+    dry_run: bool
+    # apps_deleted / apps_deattributed / versions_deattributed
+    deleted: dict[str, int]

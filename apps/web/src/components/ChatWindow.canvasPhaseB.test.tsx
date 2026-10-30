@@ -82,7 +82,6 @@ vi.mock('./OutputFileCards', () => ({ OutputFileCards: () => null }));
 vi.mock('./composer/Composer', () => ({ Composer: () => <div data-testid="input-bar" /> }));
 vi.mock('./PlanBlock', () => ({ PlanBlock: () => null }));
 vi.mock('./RewindConfirmModal', () => ({ RewindConfirmModal: () => null }));
-vi.mock('./DataNoticeModal', () => ({ DataNoticeModal: () => null }));
 vi.mock('./hitl/ConfirmCard', () => ({ ConfirmCard: () => null }));
 vi.mock('./hitl/QuestionCard', () => ({ QuestionCard: () => null }));
 vi.mock('./StepGroup', () => ({ StepGroup: () => null }));
@@ -110,7 +109,7 @@ beforeEach(() => {
   flagState.thinkingUi = false;
   chatState.isStreaming = false;
   chatState.messages = [];
-  // Reset stores; localStorage-backed data notice never shows in jsdom default.
+  // Reset stores.
   useChatStore.setState({ activeSessionId: 'ses_1' });
   useCanvasStore.getState().reset();
   // Fire-and-forget fetchCanvas warm — stub so the hydration warm effect never

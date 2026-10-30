@@ -27,6 +27,7 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 
+import type { Usage } from "./result.js";
 import type { ResumePayload, Task } from "./task.js";
 
 /** Native sandbox tools the gate always allows (matches old __main__.py:829). */
@@ -99,54 +100,101 @@ export interface HitlContext {
   /** For a question pause: the human-facing question text. */
   question: string | null;
   /**
-   * Tool-use ids approved on a resume-confirm leg. The first time `canUseTool`
-   * sees one of these it allows it once (then removes it), so the re-emitted
-   * tool call runs exactly once. Matches the spec's "approved-tool registry".
+   * The tool call the human approved on a confirm-approve resume leg, as its
+   * tool name + canonical input. On resume the model re-emits the call with a
+   * fresh tool_use_id, so ids cannot match; `canUseTool` lets a call through
+   * only when BOTH the name and the canonical input match an approval, and
+   * consumes it (the approved call runs exactly once). Any other call —
+   * including the same tool with different arguments — pauses again.
    */
-  approvedToolUseIds: Set<string>;
-  /**
-   * Tool NAMES approved on a resume-confirm leg (allow-once-by-name). On resume
-   * the model re-emits the tool with a fresh tool_use_id, so id matching alone
-   * never fires; we allow the first call whose name was approved.
-   */
-  approvedToolNames: Set<string>;
+  approvals: ApprovedToolCall[];
 }
 
-/** Build a fresh gate context, seeding the approved registry from a resume. */
+/** One human-approved tool call (see HitlContext.approvals). */
+export interface ApprovedToolCall {
+  name: string;
+  /** stableStringify of the approved input (sorted keys). */
+  canonicalInput: string;
+}
+
+/** Build a fresh gate context, seeding the approvals from a resume. */
 export function newHitlContext(task: Task): HitlContext {
   const ctx: HitlContext = {
     paused: false,
     kind: null,
     pending: [],
     question: null,
-    approvedToolUseIds: new Set(),
-    approvedToolNames: new Set(),
+    approvals: [],
   };
-  seedApprovedRegistry(ctx, task);
+  seedApprovals(ctx, task);
   return ctx;
 }
 
 /**
- * On a confirm-approve resume leg, seed the approved registry so the re-emitted
- * tool call passes the gate once. Rejected confirms and answers seed nothing.
+ * On a confirm-approve resume leg, record the approved pending call (the one
+ * whose id the resume names; the sole pending call when no id is given) so its
+ * re-emission passes the gate once. Rejected confirms and answers seed nothing.
  */
-function seedApprovedRegistry(ctx: HitlContext, task: Task): void {
+function seedApprovals(ctx: HitlContext, task: Task): void {
   const resume = task.resume;
   if (!resume || resume.kind !== "confirm" || resume.confirmed !== true) return;
-  if (resume.tool_call_id) ctx.approvedToolUseIds.add(resume.tool_call_id);
-  // Recover the approved tool NAME from the saved transcript's pending call so
-  // the re-emitted call (which carries a fresh id) is allowed by name.
-  const state = parseReplayState(resume.agent_state);
-  for (const p of state?.pending ?? []) {
-    if (p.name) ctx.approvedToolNames.add(p.name);
+  const pending = parseReplayState(resume.agent_state)?.pending ?? [];
+  const approved = resume.tool_call_id
+    ? pending.find((p) => p.id === resume.tool_call_id)
+    : pending.length === 1
+      ? pending[0]
+      : undefined;
+  if (!approved?.name) return;
+  ctx.approvals.push({
+    name: approved.name,
+    canonicalInput: canonicalArgs(approved.args),
+  });
+}
+
+/**
+ * Canonical form of a JSON args string: re-serialised with sorted keys so key
+ * order / whitespace differences do not matter. Unparseable args compare raw.
+ */
+function canonicalArgs(args: string): string {
+  try {
+    return stableStringify(JSON.parse(args));
+  } catch {
+    return args;
   }
+}
+
+/**
+ * JSON.stringify with object keys sorted at every depth (JSON semantics
+ * otherwise: undefined members dropped, undefined array items → null), so two
+ * structurally equal inputs always produce the same string. Never throws.
+ */
+export function stableStringify(value: unknown): string {
+  try {
+    return JSON.stringify(sortKeysDeep(value)) ?? "null";
+  } catch {
+    return safeJsonStringify(value);
+  }
+}
+
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (value !== null && typeof value === "object") {
+    const toJSON = (value as { toJSON?: () => unknown }).toJSON;
+    if (typeof toJSON === "function") return sortKeysDeep(toJSON.call(value));
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      out[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
+    }
+    return out;
+  }
+  return value;
 }
 
 /**
  * Build the `canUseTool` callback. It is the SOLE pause trigger: on a tool that
  * needs human input it records the pending call, flips `ctx.paused`, and returns
- * deny+interrupt to end the run. Approved-registry hits allow once; everything
- * else allows.
+ * deny+interrupt to end the run. A call matching an approval (same name AND
+ * same canonical input) is allowed once; everything else goes through the gate.
  */
 export function makeCanUseTool(
   ctx: HitlContext,
@@ -163,15 +211,17 @@ export function makeCanUseTool(
   ): Promise<PermissionResult> {
     const toolUseId = options.toolUseID;
 
-    // Allow-once: a tool approved on the resume leg runs exactly once. Match by
-    // id first (rare — ids change across legs), then by name.
-    if (ctx.approvedToolUseIds.has(toolUseId)) {
-      ctx.approvedToolUseIds.delete(toolUseId);
-      return { behavior: "allow", updatedInput: input };
-    }
-    if (ctx.approvedToolNames.has(toolName)) {
-      ctx.approvedToolNames.delete(toolName);
-      return { behavior: "allow", updatedInput: input };
+    // Allow-once: the call the human approved runs exactly once — matched on
+    // name + canonical input (the re-emitted call carries a fresh id).
+    if (ctx.approvals.length > 0) {
+      const canonical = stableStringify(input);
+      const idx = ctx.approvals.findIndex(
+        (a) => a.name === toolName && a.canonicalInput === canonical,
+      );
+      if (idx >= 0) {
+        ctx.approvals.splice(idx, 1);
+        return { behavior: "allow", updatedInput: input };
+      }
     }
 
     const decision = requiresConfirmation(toolName, task);
@@ -207,16 +257,24 @@ function extractQuestion(input: Record<string, unknown>): string {
 
 // ── transcript snapshot + replay ─────────────────────────────────────────────
 
-/** One captured assistant text segment, in stream order. */
+/**
+ * One replay transcript entry. Entries are kept in REAL conversation order —
+ * assistant text and tool calls interleaved exactly as they happened.
+ */
 export interface TranscriptTurn {
   role: "assistant" | "tool";
   /** assistant text (role==="assistant"). */
   text?: string;
+  /** tool_use id (role==="tool"); informational. */
+  id?: string;
   /** tool name (role==="tool"). */
   name?: string;
   /** tool args JSON string (role==="tool"). */
   args?: string;
-  /** tool result text (role==="tool"). */
+  /**
+   * tool result text (role==="tool"). Absent when the call produced no result
+   * before the pause interrupted the run.
+   */
   result?: string;
 }
 
@@ -224,67 +282,211 @@ export interface TranscriptTurn {
  * The opaque object we store under the paused blob's `agent_state`. The
  * orchestrator round-trips it back to us on resume. On the resume leg
  * {@link buildReplayPrompt} reconstructs the conversation from it.
+ *
+ * Prior chat history is NOT stored here: it comes from the dispatch payload's
+ * `history` (re-sent on every resume leg) and lands in the system prompt
+ * exactly as on a fresh run.
  */
 export interface ReplayState {
+  /** Snapshot format: 2 = interleaved + cumulative across resume legs. */
+  version?: number;
   /** The original user task text, so the replay can restate the intent. */
   original_task: string;
-  /** Assistant text + completed tool_call/tool_result pairs observed so far. */
+  /**
+   * Assistant text + tool calls (with results) of every leg so far, in order;
+   * a resolved earlier pause appears as a tool turn carrying its outcome.
+   */
   transcript: TranscriptTurn[];
   /** The tool call(s) that triggered the pause (not yet executed). */
   pending: PendingToolCall[];
+  /**
+   * Token usage of every leg so far. The resumed leg counts on from it, so
+   * result.json always reports the whole run, never just the latest leg.
+   * Absent in snapshots taken before it was recorded (counted as zero).
+   */
+  usage?: Usage;
 }
 
-/** Inputs the worker accumulates during the run, used to build the snapshot. */
+/** What the worker records during one leg, in stream order. */
 export interface TranscriptAccumulator {
-  /** Assistant text streamed so far (consolidated). */
-  assistantText: string;
-  /** Completed tool calls keyed by tool_use_id, in first-seen order. */
-  toolOrder: string[];
-  toolName: Map<string, string>;
-  toolArgs: Map<string, string>;
-  toolResult: Map<string, string>;
+  turns: TranscriptTurn[];
+  /** block_id of the assistant text turn currently being extended. */
+  openTextBlockId: string | null;
+  /** tool_use id -> its turn (the result is attached when it arrives). */
+  toolTurns: Map<string, TranscriptTurn>;
 }
 
 /** A fresh accumulator for a run. */
 export function newTranscriptAccumulator(): TranscriptAccumulator {
-  return {
-    assistantText: "",
-    toolOrder: [],
-    toolName: new Map(),
-    toolArgs: new Map(),
-    toolResult: new Map(),
-  };
+  return { turns: [], openTextBlockId: null, toolTurns: new Map() };
 }
 
+/** Append streamed assistant text; a new text block starts a new turn. */
+export function recordTranscriptText(
+  acc: TranscriptAccumulator,
+  blockId: string,
+  text: string,
+): void {
+  if (!text) return;
+  const last = acc.turns[acc.turns.length - 1];
+  if (last?.role === "assistant" && acc.openTextBlockId === blockId) {
+    last.text = (last.text ?? "") + text;
+    return;
+  }
+  acc.turns.push({ role: "assistant", text });
+  acc.openTextBlockId = blockId;
+}
+
+/** Record a closed tool call at its position in the conversation (once). */
+export function recordTranscriptToolCall(
+  acc: TranscriptAccumulator,
+  id: string,
+  name: string,
+  args: string,
+): void {
+  if (!id || acc.toolTurns.has(id)) return;
+  const turn: TranscriptTurn = { role: "tool", id, name, args };
+  acc.turns.push(turn);
+  acc.toolTurns.set(id, turn);
+  acc.openTextBlockId = null;
+}
+
+/** Attach a tool result to its (already recorded) call. */
+export function recordTranscriptToolResult(
+  acc: TranscriptAccumulator,
+  id: string,
+  result: string,
+): void {
+  const turn = acc.toolTurns.get(id);
+  if (turn) turn.result = result;
+}
+
+// Size bounds for the snapshot. agent_state round-trips through the paused
+// blob into the resume leg's task payload, which some runtimes pass as one
+// environment variable (Linux caps a single env string at 128 KiB), so the
+// transcript must stay well below that whatever the tools returned.
+const MAX_TEXT_TURN_BYTES = 16 * 1024;
+const MAX_TOOL_FIELD_BYTES = 8 * 1024;
+const MAX_TRANSCRIPT_BYTES = 64 * 1024;
+const TRUNCATION_MARKER = "…[truncated]";
+
 /**
- * Assemble the replay state from what we observed + the pending call(s). The
- * pending tool call itself is excluded from the completed-tool list (it never
- * ran). Stored verbatim into the paused blob's `agent_state`.
+ * Assemble the replay state: the prior legs' transcript (on a resume leg) +
+ * the outcome of the pause that leg resolved + this leg's turns, in order.
+ * The pending tool call itself is excluded (it never ran; the decision turn
+ * restates it). Stored verbatim into the paused blob's `agent_state`, with
+ * `usage` (the run's usage so far, prior legs included) when given.
  */
 export function snapshotTranscriptForPause(
   task: Task,
   acc: TranscriptAccumulator,
   pending: PendingToolCall[],
+  usage?: Usage,
 ): ReplayState {
   const pendingIds = new Set(pending.map((p) => p.id));
-  const transcript: TranscriptTurn[] = [];
-  if (acc.assistantText.trim()) {
-    transcript.push({ role: "assistant", text: acc.assistantText });
+  const resume = task.resume ?? null;
+  const prior = resume ? parseReplayState(resume.agent_state) : null;
+  const turns: TranscriptTurn[] = [];
+  if (prior) {
+    turns.push(...prior.transcript);
+    const resolved = resolvedPauseTurn(resume, prior);
+    if (resolved) turns.push(resolved);
   }
-  for (const id of acc.toolOrder) {
-    if (pendingIds.has(id)) continue; // the pending call did not complete
-    transcript.push({
-      role: "tool",
-      name: acc.toolName.get(id) ?? "tool",
-      args: acc.toolArgs.get(id) ?? "",
-      result: acc.toolResult.get(id) ?? "",
-    });
+  for (const turn of acc.turns) {
+    if (turn.role === "assistant") {
+      if (turn.text?.trim()) turns.push({ ...turn });
+    } else if (!(turn.id && pendingIds.has(turn.id))) {
+      turns.push({ ...turn });
+    }
   }
   return {
-    original_task: task.task,
-    transcript,
+    version: 2,
+    original_task: prior?.original_task || task.task,
+    transcript: boundTranscript(turns),
     pending,
+    ...(usage ? { usage: { ...usage } } : {}),
   };
+}
+
+/**
+ * What the earlier legs of this run used: the usage the paused leg recorded in
+ * the resume payload's `agent_state`, or zero on a fresh run.
+ */
+export function resumedUsage(task: Task): Usage {
+  const usage = task.resume ? parseReplayState(task.resume.agent_state)?.usage : undefined;
+  return usage ?? { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+}
+
+/**
+ * The resolved earlier pause as a transcript turn, so a second pause keeps it:
+ * a rejected call and an answered question carry their outcome. An approved
+ * call gets no turn — the model re-issues it on this leg, where it is recorded
+ * with its real result.
+ */
+function resolvedPauseTurn(
+  resume: ResumePayload | null,
+  prior: ReplayState,
+): TranscriptTurn | null {
+  if (!resume) return null;
+  const call =
+    prior.pending.find((p) => p.id === resume.tool_call_id) ?? prior.pending[0];
+  if (!call) return null;
+  if (resume.kind === "answer" || resume.kind === "question") {
+    return {
+      role: "tool",
+      id: call.id,
+      name: call.name,
+      args: call.args,
+      result: `[the user answered] ${resume.answer ?? ""}`,
+    };
+  }
+  if (resume.confirmed !== true) {
+    return {
+      role: "tool",
+      id: call.id,
+      name: call.name,
+      args: call.args,
+      result: "[not executed: the user rejected this tool call]",
+    };
+  }
+  return null;
+}
+
+/** Cap each turn's fields, then drop the oldest turns past the total budget. */
+function boundTranscript(turns: TranscriptTurn[]): TranscriptTurn[] {
+  const bounded = turns.map((t) => {
+    const out: TranscriptTurn = { ...t };
+    if (out.text !== undefined) out.text = truncateUtf8(out.text, MAX_TEXT_TURN_BYTES);
+    if (out.args !== undefined) out.args = truncateUtf8(out.args, MAX_TOOL_FIELD_BYTES);
+    if (out.result !== undefined) {
+      out.result = truncateUtf8(out.result, MAX_TOOL_FIELD_BYTES);
+    }
+    return out;
+  });
+  const size = (t: TranscriptTurn) => Buffer.byteLength(JSON.stringify(t), "utf8");
+  let total = bounded.reduce((n, t) => n + size(t), 0);
+  let dropped = 0;
+  while (total > MAX_TRANSCRIPT_BYTES && dropped < bounded.length - 1) {
+    total -= size(bounded[dropped]);
+    dropped += 1;
+  }
+  if (dropped === 0) return bounded;
+  return [
+    {
+      role: "assistant",
+      text: `[${dropped} earlier step(s) omitted to keep the resume payload small]`,
+    },
+    ...bounded.slice(dropped),
+  ];
+}
+
+/** Truncate to at most maxBytes UTF-8 bytes INCLUDING the marker (idempotent). */
+function truncateUtf8(s: string, maxBytes: number): string {
+  const buf = Buffer.from(s, "utf8");
+  if (buf.length <= maxBytes) return s;
+  const keep = maxBytes - Buffer.byteLength(TRUNCATION_MARKER, "utf8");
+  // toString drops a trailing partial multi-byte sequence as U+FFFD; trim it.
+  return buf.subarray(0, keep).toString("utf8").replace(/�+$/, "") + TRUNCATION_MARKER;
 }
 
 /**
@@ -328,6 +530,7 @@ function renderReplayText(
     parts.push(`[Original task] ${original}`);
   }
 
+  // Rendered in the order it happened: text and tool calls interleaved.
   const turns = state?.transcript ?? [];
   if (turns.length > 0) {
     const lines = ["[Conversation so far]"];
@@ -335,7 +538,9 @@ function renderReplayText(
       if (t.role === "assistant" && t.text) {
         lines.push(`Assistant: ${t.text}`);
       } else if (t.role === "tool") {
-        lines.push(`Tool call ${t.name}(${t.args ?? ""}) -> ${t.result ?? ""}`);
+        const result =
+          t.result ?? "[no result: the run was interrupted before this call completed]";
+        lines.push(`Tool call ${t.name}(${t.args ?? ""}) -> ${result}`);
       }
     }
     parts.push(lines.join("\n"));
@@ -369,10 +574,10 @@ function renderDecision(
     );
   }
 
-  // confirm leg
+  // confirm leg — the call the decision is about (the one the resume names).
   const pending = state?.pending ?? [];
-  const first = pending[0];
-  const toolDesc = first ? `${first.name}(${first.args})` : "the previously requested tool call";
+  const call = pending.find((p) => p.id === resume.tool_call_id) ?? pending[0];
+  const toolDesc = call ? `${call.name}(${call.args})` : "the previously requested tool call";
 
   if (resume.confirmed === true) {
     return (
@@ -392,15 +597,39 @@ export function parseReplayState(raw: unknown): ReplayState | null {
   if (typeof raw !== "object" || raw === null) return null;
   const o = raw as Record<string, unknown>;
   const transcript = Array.isArray(o.transcript)
-    ? (o.transcript as TranscriptTurn[])
+    ? (o.transcript as unknown[]).filter(
+        (t): t is TranscriptTurn => typeof t === "object" && t !== null,
+      )
     : [];
   const pending = Array.isArray(o.pending)
-    ? (o.pending as PendingToolCall[])
+    ? (o.pending as unknown[]).filter(
+        (p): p is PendingToolCall => typeof p === "object" && p !== null,
+      )
     : [];
+  const usage = parseUsage(o.usage);
   return {
+    ...(typeof o.version === "number" ? { version: o.version } : {}),
     original_task: typeof o.original_task === "string" ? o.original_task : "",
     transcript,
     pending,
+    ...(usage ? { usage } : {}),
+  };
+}
+
+/** A round-tripped usage record, or null unless its counts are whole numbers ≥ 0. */
+function parseUsage(raw: unknown): Usage | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const o = raw as Record<string, unknown>;
+  const count = (v: unknown): number | null =>
+    typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
+  const input = count(o.input_tokens);
+  const output = count(o.output_tokens);
+  if (input === null || output === null) return null;
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: input + output,
+    cache_read_input_tokens: count(o.cache_read_input_tokens) ?? 0,
   };
 }
 

@@ -35,7 +35,12 @@ from fastapi.responses import StreamingResponse
 from agent_scheduler.api.authz_guard import require_permission
 from agent_scheduler.api.dependencies import TRuntime, TTenantId, TUserId
 from agent_scheduler.config import SANDBOX_TOKEN_SCOPES, Settings
-from agent_scheduler.errors import ContainerNotFoundError, SandboxSpawnError
+from agent_scheduler.errors import (
+    ContainerNotFoundError,
+    LlmGatewayUnavailableError,
+    LlmNotConfiguredError,
+    SandboxSpawnError,
+)
 from agent_scheduler.services.docker_runtime import DockerRuntime
 
 logger = logging.getLogger(__name__)
@@ -58,6 +63,11 @@ _PLACEHOLDER_TOKENS = {
 # uvicorn worker in B-M2.
 _KC_TOKEN_REFRESH_SLACK = 30  # seconds
 _kc_token_cache: dict[str, float | str] = {"token": "", "exp": 0.0}
+
+# The gateway's problem code for "this tenant has no enabled provider".  An
+# older gateway without the ephemeral endpoint also answers 404, but with
+# FastAPI's plain ``{"detail": "Not Found"}`` and no code.
+_GATEWAY_NO_PROVIDER = "FOUNDATION.LLM_GATEWAY.PROVIDER.NOT_FOUND"
 
 
 async def _bootstrap_scheduler_token(settings) -> str:  # type: ignore[no-untyped-def]
@@ -288,6 +298,16 @@ async def _fetch_tenant_virtual_key(
     return None
 
 
+def _problem_code(resp: httpx.Response) -> str | None:
+    """The ``code`` of an RFC 9457 problem body, or ``None`` if there is none."""
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    code = body.get("code") if isinstance(body, dict) else None
+    return code if isinstance(code, str) else None
+
+
 async def _mint_run_virtual_key(
     *,
     settings,  # type: ignore[no-untyped-def]
@@ -310,6 +330,10 @@ async def _mint_run_virtual_key(
     Returning ``None`` is intentional: ``create_run`` falls back to the
     long-lived tenant key so runs never break on an older or briefly-unhealthy
     gateway.  The fallback is logged so the weaker posture is observable.
+
+    Raises :class:`LlmNotConfiguredError` when the gateway answers that the
+    tenant has no enabled provider.  No key can route a model call then, so a
+    fallback key would only move the failure into the sandbox.
     """
     if not settings.llm_gateway_url:
         return None
@@ -339,6 +363,11 @@ async def _mint_run_virtual_key(
         )
         return None
 
+    if (
+        resp.status_code == status.HTTP_404_NOT_FOUND
+        and _problem_code(resp) == _GATEWAY_NO_PROVIDER
+    ):
+        raise LlmNotConfiguredError()
     if resp.status_code not in (status.HTTP_200_OK, status.HTTP_201_CREATED):
         # 404/405 → older gateway without the ephemeral endpoint; anything else
         # → a transient mint failure.  Either way we fall back to the tenant key
@@ -581,7 +610,9 @@ async def create_run(
     # gateway is older (no ephemeral endpoint) or minting fails, fall back to
     # the long-lived tenant key so runs don't break (logged as a weaker
     # posture).  With the gateway enforcer enabled this remains fail-closed: no
-    # virtual key at all → no sandbox spawn.
+    # virtual key at all → no sandbox spawn.  A tenant without an enabled
+    # provider is refused outright (LlmNotConfiguredError from the mint): that
+    # is a setting for an administrator to change, not a gateway outage.
     scheduler_bearer = _settings.scheduler_service_token
     if scheduler_bearer in _PLACEHOLDER_TOKENS:
         # Best-effort: try the cached KC token without re-minting to avoid a
@@ -606,10 +637,7 @@ async def create_run(
             bearer=scheduler_bearer,
         )
     if not virtual_key:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="LLM gateway virtual key unavailable for tenant",
-        )
+        raise LlmGatewayUnavailableError()
 
     try:
         # ``spawn_run`` is a SYNCHRONOUS call (docker SDK / sync httpx.Client) —
@@ -752,7 +780,9 @@ async def cancel_run(
     _require_tenant_owner(runtime, container_id, tenant_id)
 
     try:
-        runtime.cancel_run(container_id)
+        # What the run used up to the stop; the orchestrator records it, since a
+        # cancelled run is never polled for a result again.
+        usage = runtime.cancel_run(container_id)
     except ContainerNotFoundError as exc:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="run not found",
@@ -779,7 +809,7 @@ async def cancel_run(
         run_id=run_id,
         bearer=scheduler_bearer,
     )
-    return {"id": run_id, "status": "CANCELLED"}
+    return {"id": run_id, "status": "CANCELLED", "usage": usage}
 
 
 @router.get("/runs/{run_id}/events",

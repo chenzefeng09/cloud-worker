@@ -27,7 +27,8 @@ cube: `cube_runtime.spawn_run` 的 `task_json`,经 `AGENT_TASK_JSON` env)。
   "skills": ["name", ...],       // worker 据此在 /home/skills/<name> 下解析 SKILL.md
   "files": [{"key","filename","mime"}, ...],   // worker 下载到 /workspace/inputs/
   "memory": "string",            // 预取记忆片段,worker 前置进 system prompt
-  "history": [{"role","type",...}, ...],  // 多轮历史(有损 dict);resume 时忽略
+  "history": [{"role","type",...}, ...],  // 多轮历史(有损 dict),每一腿(含 resume)都带;
+                                 // 过长时最旧的若干条换成首条 history_omitted 标记,见下
   "model_override": "string|null",
   "reasoning_effort": "string|null",
   "sys_prompt": "string",        // App harness 系统提示;orchestrator 预取的租户知识库
@@ -39,6 +40,17 @@ cube: `cube_runtime.spawn_run` 的 `task_json`,经 `AGENT_TASK_JSON` env)。
                                  //     "agent_state":{...}}   ← 见 §4
 }
 ```
+
+**大小上限**:cube runtime 把整个 task JSON 放进单个环境变量 `AGENT_TASK_JSON`,而 Linux
+限制单个环境变量 128 KiB(MAX_ARG_STRLEN)——超了 worker 起不来,scheduler 却照样报成功。
+所以 orchestrator 每次派发(首腿 `create_run`、每个续跑腿 `respond_run`)前把载荷压在
+112 KiB 内(`runs._DISPATCH_MAX_BYTES`,给 scheduler 追加的字段留余量):从最旧的 history
+丢起,换成**一条**放在首位的标记
+`{"role":"system","type":"history_omitted","omitted":N,"content":"[N earlier message(s) omitted: …]"}`
+(续跑时与已有标记合并,不叠加),并记 warning 日志;history 丢光仍超限再记一条 warning。
+worker 渲染 history 时另有约 8000 token 的预算,也从最旧丢起(工具调用连同结果一起丢);
+两处丢掉的条数合计,以 `[N earlier message(s) of this conversation are not shown]` 写在
+system prompt 的 history 段开头,让模型知道对话不完整。
 
 ## 1a. MCP 选择:`mcp_server_ids`(三态)与 `mcp_servers`(遗留空键)
 
@@ -107,16 +119,37 @@ scheduler 解析不到虚拟密钥时**直接让 spawn 失败**,不存在直连�
 
 orchestrator 的 `_stream_tokens` 从 `0-0` 全量重放——**重连/续跑会重放整段**,
 消费端(前端)靠 `run_started` 清块 + offset 水位实现幂等;worker 只管 append,不重写。
+每次写入都会刷新流的 TTL(30 分钟,暂停时改为 7 天),MAXLEN 约 100k。
+运行中若连续 5 分钟没有任何写入(比如一个长时间不出声的工具调用),worker 写一条
+`heartbeat` 并重写 `agent:run:{run_id}:state`,流和热状态键都不会在 run 还活着时过期;
+run 暂停或结束即停止。
 
 | 条目 `type` | 其余字段 | 语义 |
 |---|---|---|
-| `delta` | `text` | 助手正文增量 |
-| `thinking` | `text` | 推理文本(整块) |
-| `tool_call` | `tool_call_id`, `name`, `args`(JSON 字符串) | 工具调用(参数已完整) |
+| `delta` | `text` | 助手正文增量(一条可合并多个 token,约 50 ms / 512 字符) |
+| `thinking_delta` | `text` | 推理增量,实时流出 |
+| `thinking` | `text` | 推理整块——**只用于未流式输出过的块**,在该条消息正文之后到达 |
+| `tool_call` | `tool_call_id`, `name`, `args`(JSON 字符串) | 工具调用,参数完整;**同一 id 至多一条** |
 | `tool_result` | `tool_call_id`, `name`, `result`, `state` | 工具结果 |
 | `pending_confirmation` | `tool_call_id`, `name`, `args` | HITL:等用户批准(一个待批工具一条) |
 | `pending_question` | `tool_call_id`, `question` | HITL:ask_user 等用户回答 |
-| `end` | — | 回复正常结束。**暂停时不发 end** |
+| `error` | `message` | 失败原因(固定的、可展示给用户的短句),在 `end{failed}` 之前 |
+| `heartbeat` | (无) | 保活,只为刷新 TTL(见上);读端一律忽略,不转发、不落库 |
+| `end` | `text: ""`, `status` | 每个 worker 进程**恰好一条**,之后不再写。`status` ∈ `completed` / `failed` / `cancelled` / `paused`;缺省视为未知(旧 worker) |
+
+暂停与续跑共用**同一条流**:`end{paused}` 写在 pending 条目之后;续跑腿在其后继续
+append,直到新的 `end`。因此读端遇到 `end{paused}` 必须继续读,不能当作结束。
+
+orchestrator 也会写两类条目:
+
+| 条目 `type` | 写入方 | 语义 |
+|---|---|---|
+| `pending_resolved` | `respond_run` | 用户已回应,`tool_call_id` 对应的卡片作废(该次暂停的每个 id 各一条);续跑时模型会以**新的** `tool_call_id` 重新发起调用 |
+| `end{status: cancelled}` | 取消 / 新一轮对话废弃暂停的 run | 让正在跟流的连接立即停止,重放时视为已结束 |
+
+orchestrator 还在 `agent:run:{run_id}:dispatch` 存放该 run 的原始派发载荷(模型、
+skills、MCP、文件、history、memory、system prompt、HITL;TTL 8 天),续跑时以它为底重派
+(加上 `resume`,再按 §1 的大小上限裁一次 history),run 进入终态后删除。
 
 ## 3. 输出②:`/workspace/result.json`(worker 写,scheduler `get_run_status` 透出)
 
@@ -134,6 +167,18 @@ scheduler 把 `status` 以顶层 `result_status` 透传;orchestrator reconcile �
 容器退出 + `result_status=="paused"` → Run 置 `PAUSED`(非终态,不落助手消息);
 `FAILED` 提升覆盖 exit-0;其余 → COMPLETED/FAILED。
 
+`usage` 是**整个 run 的累计用量**,不是单段:
+- worker 每次工具调用结束、每段结束(完成/失败/暂停/SIGTERM 取消)都重写它;同一进程内
+  只增不减(崩溃兜底写入也不会把已记录的数清零)。
+- 暂停时用量随 `agent_state.usage` 写入暂停状态(§4),续跑段从这个数接着累计,所以任何
+  时刻文件里的数都覆盖此前所有段。
+- scheduler 起新一段时先删掉上一段留在同一目录的 `result.json`,读到的永远是当前段的文件。
+- scheduler 的 cancel 在停掉沙箱后读一次 `usage` 并在响应里返回(被取消的 run 不会再被
+  轮询)。
+- orchestrator 在暂停、终态、取消时各记一次,规则是**只取较大值、从不调小**:同一段被多处
+  观察到、观察顺序颠倒都不会重复计算或回退。沙箱已消失(scheduler 404)的路径拿不到文件,
+  保留已记录的值。
+
 ## 4. 输出③:暂停状态 `agent:run:{run_id}:paused`(SET,TTL 7 天)
 
 ```jsonc
@@ -144,31 +189,42 @@ scheduler 把 `status` 以顶层 `result_status` 透传;orchestrator reconcile �
   "question": "string|null",
   "agent_state": {...},                  // worker 自定义的完整可恢复状态
                                          // (Claude SDK 会话恢复载荷),格式由 worker 定,
-                                         //   平台只负责原样回传,不解析
+                                         //   平台只负责原样回传,不解析;其中
+                                         //   `usage` 是暂停时整个 run 的累计用量(§3)
   "paused_at": "iso8601"
 }
 ```
 
 续跑:orchestrator `POST /sessions/{sid}/runs/{run_id}/respond` 读此 key →
-同一 Run 行 PAUSED→RUNNING → 重派 scheduler,`task.json["resume"]` 带回
-`agent_state` + 用户决定;worker 凭 state 还原并注入确认/答案事件续跑,
-token 续写**同一条**流(同 run_id)。同时 worker 更新热状态键
-`agent:run:{run_id}:state` 的 `status` 字段为 `"PAUSED"`。
+以条件更新抢占同一 Run 行(PAUSED→RUNNING;并发的取消先到则 409)→ 用存下的原始
+派发载荷重派 scheduler,`task.json["resume"]` 带回 `agent_state` + 用户决定;
+worker 凭 state 还原并注入确认/答案事件续跑,token 续写**同一条**流(同 run_id)。
+暂停时 worker 更新热状态键 `agent:run:{run_id}:state` 的 `status` 字段为 `"PAUSED"`。
+
+工具批准按「工具名 + 规范化参数(解析后各层 key 排序再序列化,所以 key 顺序、空白、
+`5.0`/`1e2` 之类的数字写法、字符转义都不影响)」匹配,且只用一次:参数不同或同参数的
+第二次调用都会再次暂停。
 
 ## 5. 平台 SSE 事件(orchestrator `GET /sessions/{id}/stream` → BFF relay → 前端)
 
 session-scoped、multiplex 该会话所有 run、5 分钟服务端 deadline(客户端自动重连)。
+重连带 `?after=<sequence>&after_id=<id>`(客户端最新的持久化行),只补发更新的行;
+该行若已不存在,服务端发 `transcript_reset`。一个会话同时只允许一个进行中的 run
+(第二个 `POST /runs` 返回 409)。
 
 | 事件 | payload | 备注 |
 |---|---|---|
 | `run_started` | `{run_id}` | 前端在此清该 run 的临时块+offset(重放幂等锚点) |
-| `token` / `thinking` | `{run_id, delta}` / `{run_id, text}` | |
+| `token` / `thinking_delta` / `thinking` | `{run_id, delta, offset}` / `{run_id, delta, offset}` / `{run_id, text, offset}` | |
 | `tool` | `{run_id, kind:"call"\|"result", tool_call_id, name, args?\|result?, state?}` | |
 | `plan` | `{run_id, plan_steps}` | |
-| `message` | 完整持久化消息行 | `addMessage` 按 id 去重 |
+| `message` | 完整持久化消息行 | 按 id 去重;助手/工具/推理行替换该 run 同类临时块 |
+| `transcript_reset` | `{session_id}` | 客户端持有的行已被删除(回退重发),重新拉取整段 transcript |
 | `pending_confirmation` / `pending_question` | 同 §2 字段 + `run_id` | 渲染确认/提问卡 |
+| `pending_resolved` | `{run_id, tool_call_id, offset}` | 卡片已被回应(可能在其他标签页),移除 |
 | `run_paused` | `{run_id}` | PAUSED run 对新连接会一次性重放(找回卡片) |
-| `run_complete` | `{run_id, status, result_summary}` | 助手消息已先落库 |
+| `run_stream_end` | `{run_id, paused}` | 本连接对该 run 的 token 跟流结束,**不代表 run 结束** |
+| `run_complete` | `{run_id, status, result_summary}` | 助手消息已先落库;失败的 run 另有一条 system 消息说明原因 |
 | `done` | `{}` | 仅表示本次连接周期结束,**不代表 run 结束** |
 | `error` | `{detail}` | detail 不含内部细节 |
 
@@ -203,12 +259,15 @@ façade 约定:
 - `MCP_REGISTRY_URL = {TOOL_BROKER_URL}/mcp/v1`
 - `SKILL_STORE_URL = {TOOL_BROKER_URL}/skills/v1`
 - `WEB_FETCH_GATEWAY_URL = {TOOL_BROKER_URL}/web-fetch/api/web-fetch/v1`
+- `DLP_URL = {TOOL_BROKER_URL}/dlp/api/dlp/v1`(`foundation` 模式为真实 DLP 地址,
+  `none` 模式为空,即 worker 端 DLP 关闭,见 §8)
 - `REDIS_URL = ""`, `S3_ENDPOINT_URL = ""`
 
 worker 启动后必须在工具执行前清理控制面 env。Bash 可以保留,但其子进程不得继承
 `FOUNDATION_API_TOKEN`、租户/用户/run id、真实服务地址、`TOOL_BROKER_URL`、
-`TOOL_BROKER_LEASE`、`AGENT_TASK_JSON` 等控制面变量。完整服务调用由 worker
-runtime 使用启动时快照的凭据和 broker URL 完成;Bash 只能在网络策略允许的范围内访问。
+`TOOL_BROKER_LEASE`、`AGENT_TASK_JSON`、`DLP_URL`、`DLP_FAILURE_MODE` 等控制面变量。
+完整服务调用由 worker runtime 使用启动时快照的凭据和 broker URL 完成;Bash 只能在
+网络策略允许的范围内访问。
 
 tool-broker 必须校验 `X-Tool-Broker-Lease` 中的 tenant/run 绑定、过期时间和 façade
 scope:
@@ -217,3 +276,93 @@ scope:
 - `mcp/v1/*` 需要 `mcp.read_internal`
 - `skills/v1/*` 需要 `skill.read_internal`
 - `web-fetch/api/web-fetch/v1/*` 需要 `web_fetch.invoke`
+- `dlp/api/dlp/v1/*` 需要 `dlp.scan`,且只放行 `core/scan` 一个路径。broker 丢弃
+  调用方的 `X-Actor` / `X-User-Id` / `X-Tenant-Id` / `X-Service-Scopes`,只按租约
+  重新注入租户与用户,所以沙箱无法冒充 `SERVICE` 改写分类标签(见 §8.4)
+
+## 8. DLP 策略(worker 工具调用 + orchestrator 上传/下载/助手回复)
+
+worker 的 PreToolUse 钩子(`worker-claude-sdk/src/dlp.ts`)与 session-orchestrator 的
+`api/dlp_guard.py` 执行同一张决策表。DLP 不可用时怎么办由部署显式配置,不存在
+静默放行。
+
+### 8.1 配置
+
+| 组件 | DLP 地址 | 失败策略 |
+|---|---|---|
+| worker | env `DLP_URL`(scheduler 下发,见 §7) | env `DLP_FAILURE_MODE` |
+| session-orchestrator | `SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL` | `SESSION_ORCHESTRATOR_DLP_FAILURE_MODE` |
+
+失败策略取 `closed`(默认)或 `open`,不区分大小写;空值即 `closed`;其他值按
+`closed` 处理并记一条告警/错误日志。生效策略只记一次日志:worker 在启动时,
+orchestrator 在第一次 DLP 判定时。
+
+### 8.2 决策表
+
+| 情况 | 结果 |
+|---|---|
+| DLP 地址为空 | DLP 关闭:全部放行,不发请求 |
+| DLP 正常应答 | 按 DLP 结论(见 8.3) |
+| 无法完成:网络错误、超时(2 s)、非 2xx、响应体不是 JSON 对象、判定字段(`action` / `allowed`)缺失或类型不对;worker 还包括工具入参无法序列化 | `closed`:拒绝。`open`:放行,且每一次都记 ERROR 日志(含资源 id 与原因) |
+
+拒绝时给用户/模型的文字只说明"DLP 检查无法完成、稍后再试",不含 DLP 地址、
+令牌或底层错误;技术原因只进日志。
+
+### 8.3 各挂载点
+
+**worker 工具调用(PreToolUse,每次工具调用前)**
+
+- 请求:`POST {DLP_URL}/core/scan`,体 `{content, resource_type: "tool_call",
+  resource_id: "<tool>:<tool_use_id>"}`,`content` 为 JSON 序列化的工具入参;头
+  `authorization: Bearer <FOUNDATION_API_TOKEN>`、`x-tenant-id`,broker 模式另带
+  `x-tool-broker-lease`。worker 不发 `x-actor`。
+- 只拦 `QUARANTINE`(L4 及以上):拒绝原因带命中规则名(最多 3 个)、敏感级别和
+  action。`ALLOW` 放行;`SCAN_REQUIRED`(L2/L3,如邮箱、手机号)也放行,但记一条
+  `console.warn`(资源 id、级别、规则名,不含数据本身)。契约之外的 action 视同
+  无法完成,按下一条处理。
+- 无法完成:`closed` 拒绝(原因说明扫描无法完成、工具调用不会在未扫描时执行);
+  `open` 放行并 `console.error` 记 `UNSCANNED`。
+- 只有拒绝时钩子才返回 `permissionDecision: "deny"`;放行时不返回任何决定,
+  以免绕过 HITL 的 `canUseTool`。
+
+**附件 / 工作区文件上传**
+
+- 在写 blob 之前调用 `POST {dlp}/core/scan`,头 `X-Tenant-Id`、`X-User-Id`、
+  `X-Actor: SERVICE`。只扫文本(含 NUL 字节或非 UTF-8 的二进制文件不扫),最多前
+  256 KiB。
+- 命中不拒绝上传:DLP 以命中级别写入该文件的分类标签(新标签下限为 DLP 默认级别
+  L3,只升不降),下载时由 `check:download` 执行。
+- 无法完成:`closed` 返回 HTTP 503 `AGENT.DLP.UNAVAILABLE`,请求事务回滚,不落 blob;
+  `open` 照常存储(未扫描、无标签)并记 ERROR `UNCHECKED`。
+
+**附件 / 工作区文件下载**
+
+- 返回字节前调用 `POST {dlp}/core/check:download`,头 `X-Tenant-Id`、`X-User-Id`,
+  体 `{resource_type, resource_id, destination}`。用户 clearance 由 DLP 向 identity
+  解析,不接受调用方传入(多余字段 422)。无标签的资源按 DLP 默认级别 L3 判定。
+- `allowed: false`:HTTP 403,`detail` 为 `DLP: <reason>`;`allowed: true`:放行。
+- 无法完成:`closed` 返回 HTTP 503 `AGENT.DLP.UNAVAILABLE`,不返回文件;`open` 返回
+  文件并记 ERROR `UNCHECKED`。
+
+**助手回复落库(run 收尾,`resource_type: "transcript"`)**
+
+- `POST {dlp}/core/scan`,`X-Actor: SERVICE`;命中只打标签,从不拦截。
+- 无法完成时两种模式行为相同:照常落库、不打标签,记 ERROR `UNLABELLED`(含消息
+  id),DLP 恢复后可据此重扫。不拦截、不扣留、不脱敏,原因:
+  - 回复在 run 进行中已经按 token 流式推给了用户,收尾落库时拒存或隐藏无法阻止
+    任何泄露,只会让用户丢掉刚看到的记录;
+  - 脱敏需要的正是这次失败的扫描结果;
+  - agent-platform 没有任何访问判定读取 transcript 标签,而 DLP 对无标签资源按
+    默认级别 L3 处理。
+  真正的出口控制(工具调用、文件下载)在 DLP 不可用时仍按失败策略拒绝。
+
+agent 产出的 artifact 落库时不扫描(只有 s3_key,没有内容),其下载仍经
+`check:download`。
+
+### 8.4 foundation-dlp 侧约定
+
+- `/core/scan` 对任何带租户上下文的调用方返回结论。只有 `X-Actor` 为 `SERVICE` /
+  `ADMIN` 的调用方会把命中级别写入资源分类标签;其他调用方(如沙箱 worker 扫描
+  自己的工具调用)只得到结论,不写标签。每次命中都会记 DLP 事件。
+- `check:download` 必须带 `X-User-Id`(否则 401),请求体只允许
+  `resource_type` / `resource_id` / `destination`。

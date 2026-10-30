@@ -5,6 +5,12 @@ import { formatDateTimeAuto } from '../../i18n/dates';
 import { useConfirm, useToast } from '../components/dialogs';
 import { Dialog } from '../components/Dialog';
 import { CustomSelect } from '../components/CustomSelect';
+import {
+  ADEQUACY_DECISIONS_URL,
+  isPiplPolicy,
+  regionStatus,
+  type RegionStatus,
+} from '../../components/privacy/eea';
 import type {
   ConsentRecord,
   CrossBorderResult,
@@ -25,6 +31,12 @@ function fmt(iso?: string | null): string {
 function csv(v: string): string[] {
   return v.split(',').map((x) => x.trim()).filter(Boolean);
 }
+
+const REGION_STATUS_TEXT: Record<RegionStatus, string> = {
+  eea: 'inside the EU/EEA',
+  outside: 'outside the EU/EEA',
+  unknown: 'check which country this region is in',
+};
 
 function decisionClass(decision?: string): string {
   switch ((decision ?? '').toUpperCase()) {
@@ -220,6 +232,10 @@ export function DataProtectionPage() {
   const isPending = (d?: DestructionRequest | null) =>
     !!d && (d.status ?? '').toUpperCase() === 'PENDING_APPROVAL';
 
+  const region = residency?.primary_region?.trim() || null;
+  const regionState = regionStatus(region);
+  const piplProfile = isPiplPolicy(residency?.policy);
+
   return (
     <div className="flex flex-col gap-5 p-6 overflow-auto h-full">
       <div>
@@ -273,15 +289,42 @@ export function DataProtectionPage() {
               )}
             </section>
 
+            {/* GDPR view of residency. The upstream service's own `policy` text and
+                restricted-destination list aren't shown: they describe a PIPL
+                (China) profile, and repeating them would read as a GDPR verdict. */}
             <section className="flex flex-col gap-2">
-              <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Data residency</div>
-              <div className="border border-line rounded-md p-4 bg-surface grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-[12px]">
-                <span className="font-mono text-dim">Primary region</span>
-                <span className="font-mono text-ink-2">{residency?.primary_region ?? '—'}</span>
-                <span className="font-mono text-dim">Restricted destinations</span>
-                <span className="font-mono text-ink-2">{residency?.restricted_destinations?.join(', ') || '—'}</span>
-                <span className="font-mono text-dim">Policy</span>
-                <span className="font-mono text-ink-2">{residency?.policy ?? '—'}</span>
+              <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">International transfers (GDPR)</div>
+              <div className="border border-line rounded-md p-4 bg-surface flex flex-col gap-3 text-[12px]">
+                <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2">
+                  <span className="font-mono text-dim">Hosting region (reported)</span>
+                  <span className="font-mono text-ink-2">
+                    {region ? `${region} · ${REGION_STATUS_TEXT[regionState]}` : '—'}
+                  </span>
+                </div>
+                {piplProfile ? (
+                  <div role="note" className="border border-warn/40 bg-warn/10 rounded-sm px-3 py-2 text-ink-2 leading-relaxed">
+                    The data-protection service reports a China (PIPL) residency profile. Its residency rules and
+                    transfer checks follow PIPL, not GDPR Chapter V, so they aren't shown as a compliance status here.
+                  </div>
+                ) : regionState === 'outside' ? (
+                  <div role="note" className="border border-warn/40 bg-warn/10 rounded-sm px-3 py-2 text-ink-2 leading-relaxed">
+                    Data is hosted outside the EU/EEA, so personal data of people in the EU/EEA is transferred there.
+                    That transfer needs an adequacy decision or safeguards such as SCCs or BCRs.
+                  </div>
+                ) : null}
+                <p className="text-ink-2 leading-relaxed">
+                  Under the GDPR, personal data may leave the EU/EEA only to a country with an EU adequacy decision,
+                  or with appropriate safeguards such as Standard Contractual Clauses (SCCs) or Binding Corporate
+                  Rules (BCRs). Record each transfer and its safeguard in the ROPA on the Compliance page.
+                </p>
+                <a
+                  href={ADEQUACY_DECISIONS_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="self-start font-mono text-[11px] text-accent underline underline-offset-2 hover:opacity-80"
+                >
+                  EU adequacy decisions ↗
+                </a>
               </div>
             </section>
           </div>
@@ -292,6 +335,13 @@ export function DataProtectionPage() {
               <div className="font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Cross-border transfer check</div>
               {!cbOpen && <button onClick={() => setCbOpen(true)} className="px-2.5 py-1 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2">+ Register cross-border transfer</button>}
             </div>
+            {piplProfile && (
+              <p className="text-[11.5px] text-dim leading-relaxed max-w-2xl">
+                Checks run on the data-protection service's built-in PIPL rules (data assumed to be stored in China),
+                so the result is a log entry, not a GDPR decision. For transfers out of the EU/EEA, document the
+                adequacy decision or safeguard in the ROPA.
+              </p>
+            )}
             {cbOpen && (
               <Dialog title="Register cross-border transfer" onClose={() => setCbOpen(false)} dismissable={!cbBusy} className="w-full max-w-2xl">
               <form onSubmit={handleCrossBorder} className="flex flex-col gap-2">
@@ -315,9 +365,9 @@ export function DataProtectionPage() {
             )}
             {cbResult && (
               <div className="border border-line rounded-md p-4 bg-surface grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-[12px] max-w-2xl">
-                <span className="font-mono text-dim">Allowed</span>
+                <span className="font-mono text-dim">Allowed (service rules)</span>
                 <span className="font-mono text-ink-2">{cbResult.allowed === undefined ? '—' : cbResult.allowed ? 'Yes' : 'No'}</span>
-                <span className="font-mono text-dim">Decision</span>
+                <span className="font-mono text-dim">Decision (service rules)</span>
                 <span className={`font-mono ${decisionClass(cbResult.decision)}`}>{cbResult.decision ?? '—'}</span>
                 <span className="font-mono text-dim">Risk</span>
                 <span className="font-mono text-ink-2">{cbResult.risks?.join('; ') || '—'}</span>

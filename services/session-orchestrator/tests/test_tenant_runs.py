@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 
 from agent_session_orchestrator.domain.models import Run
 from agent_session_orchestrator.services.session_service import SessionService
-from tests._helpers import TEST_TENANT, make_scalar_result
+from tests._helpers import TEST_TENANT, TEST_USER, make_scalar_result
 
 _URL = "/api/session/v1/runs"
 
@@ -113,6 +113,41 @@ def test_tenant_runs_scoped_to_tenant(
     # tenant_id bind param equals the authenticated tenant (X-Tenant-Id),
     # so a different tenant's rows can never match.
     assert TEST_TENANT in captured["params"].values()
+
+
+def test_tenant_runs_owner_scoped_for_ordinary_callers(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers: dict[str, str],
+) -> None:
+    """A member only sees runs of their own sessions (a run carries the prompt)."""
+    captured: dict[str, object] = {}
+
+    async def _capture(stmt: object) -> MagicMock:
+        captured["sql"] = str(stmt.compile())
+        captured["params"] = stmt.compile().params
+        return make_scalar_result([_run("run_mine")])
+
+    mock_db.execute.side_effect = _capture
+
+    resp = app_client.get(_URL, headers=auth_headers)
+    assert resp.status_code == 200
+    assert "JOIN session_orchestrator.session" in str(captured["sql"])
+    assert TEST_USER in captured["params"].values()
+
+
+def test_tenant_runs_admin_lists_whole_tenant(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers: dict[str, str],
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def _capture(stmt: object) -> MagicMock:
+        captured["sql"] = str(stmt.compile())
+        return make_scalar_result([])
+
+    mock_db.execute.side_effect = _capture
+
+    resp = app_client.get(_URL, headers={**auth_headers, "X-Actor": "ADMIN"})
+    assert resp.status_code == 200
+    assert "JOIN" not in str(captured["sql"])
 
 
 def test_tenant_runs_status_filter_normalised(

@@ -17,13 +17,22 @@ opentelemetry-sdk = "^1.28.0"
 opentelemetry-instrumentation-fastapi = "^0.49b0"
 opentelemetry-exporter-otlp = "^1.28.0"
 python-jose = { extras = ["cryptography"], version = "^3.3.0" }
+# web_sessions encrypts identity tokens with Fernet (domain/web_sessions.py).
+# python-jose's extra pulls it in as well, but a direct import is a direct dep.
+cryptography = ">=42"
 # CookieSigner + identity SDK
 itsdangerous = "^2.2.0"
 # BFF-local DB — notification preferences + api_keys (domain/db.py, alembic/)
 sqlalchemy = { extras = ["asyncio"], version = "^2.0.36" }
+# AsyncSession needs greenlet.  SQLAlchemy depends on it outright only on some
+# CPUs (not macOS arm64) and the lock drops the asyncio-extra path, so it is
+# declared here to be installed everywhere.
+greenlet = ">=3.0"
 asyncpg = "^0.30.0"
 aiosqlite = "^0.20.0"
 alembic = "^1.14.0"
+# GDPR erasure ledger — S3/MinIO bucket with Object Lock (domain/erasure_ledger.py)
+boto3 = "^1.35.0"
 # Foundation SDK — injected at image-build time via the docker-compose
 # `additional_contexts: foundation_sdk` entry (see the service Dockerfile,
 # which `pip install /sdk[fastapi]` before poetry runs).  When the internal

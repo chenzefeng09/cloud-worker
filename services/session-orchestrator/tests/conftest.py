@@ -83,6 +83,10 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "live_db: requires a running Postgres on SESSION_ORCHESTRATOR_DB_DSN",
     )
+    config.addinivalue_line(
+        "markers",
+        "owner_guard: keep the real per-resource ownership guards on app_client",
+    )
 
 
 @pytest.fixture
@@ -91,6 +95,9 @@ def settings() -> Settings:
         env="test",
         log_level="WARNING",
         otel_enabled=False,
+        # No DLP service in unit tests: DLP is disabled unless a test sets a
+        # URL (a set but unreachable URL fails closed — see dlp_guard).
+        foundation_dlp_url="",
     )
 
 
@@ -139,6 +146,7 @@ def mock_authz_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def app_client(
+    request: pytest.FixtureRequest,
     settings: Settings,
     mock_db: AsyncMock,
     mock_authz_allowed: None,
@@ -171,6 +179,22 @@ def app_client(
         yield mock_db
 
     app.dependency_overrides[db_session] = _override_db
+
+    # The per-resource ownership guards issue their own owner lookup, which
+    # would consume the canned ``mock_db.execute`` results ordinary API tests
+    # queue up for the handler.  Tests marked ``@pytest.mark.owner_guard``
+    # keep the real guards (see ``test_ownership_guard.py``).
+    if request.node.get_closest_marker("owner_guard") is None:
+        from agent_session_orchestrator.api.ownership import (
+            require_canvas_owner,
+            require_session_owner,
+        )
+
+        async def _owner_ok() -> None:
+            return None
+
+        app.dependency_overrides[require_session_owner] = _owner_ok
+        app.dependency_overrides[require_canvas_owner] = _owner_ok
 
     with TestClient(app, raise_server_exceptions=False) as c:
         yield c

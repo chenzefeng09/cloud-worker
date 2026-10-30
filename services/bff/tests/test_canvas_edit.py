@@ -6,17 +6,19 @@ Covers:
 3. happy path (document scope) → whole-doc prompt
 4. request model wins; no model → resolve tenant default
 5. no model + no tenant default → 400 with user_message
-6. no virtual key → 400 with user_message
+6. virtual key: minted per tenant; no provider → 422, older gateway → long-lived
+   key, none at all → 502
 7. gateway non-200 → 502 with user_message
 8. gateway timeout → 502 with user_message
 9. empty replacement → 502 with user_message
 10. tag parsing: with tags, no-tag fallback, code-fence stripping, missing instruction
-11. virtual-key cache TTL behaviour
+11. virtual-key cache: reused only while the minted key outlives a completion
 12. prompt builder semantics
 """
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import httpx
@@ -33,6 +35,9 @@ from agent_bff.api.v1.canvas import (
 
 PREFIX = "/api/bff/v1"
 
+# What the gateway answers a key mint for a tenant with no enabled LLM provider.
+_NO_PROVIDER = {"code": "FOUNDATION.LLM_GATEWAY.PROVIDER.NOT_FOUND", "status": 404}
+
 
 # ---------------------------------------------------------------------------
 # Fake gateway supporting the full workflow
@@ -41,18 +46,24 @@ PREFIX = "/api/bff/v1"
 class FakeGateway:
     """Stub for the multi-step canvas edit workflow.
 
-    Handles GET /tenant-keys, GET /tenant-defaults/resolve, POST /chat/completions.
+    Handles POST /tenant-keys/ephemeral, GET /tenant-keys, GET /tenant-defaults/resolve,
+    POST /chat/completions.
     """
 
     def __init__(
         self,
         *,
+        mint_status: int = 201,
+        mint_body: Any = None,
         virtual_keys: Any = None,
         default_model_id: str | None = "deepseek-chat",
         completion_content: str | None = None,
         completion_status: int = 200,
         completion_error: Exception | None = None,
     ) -> None:
+        self.mint_status = mint_status
+        self.mint_body = mint_body if mint_body is not None else {"virtual_key": "vk_eph"}
+        self.last_mint_payload: dict | None = None
         # None → return empty list (no key). Otherwise the raw JSON body.
         self.virtual_keys = (
             virtual_keys
@@ -77,6 +88,9 @@ class FakeGateway:
 
     def route(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
         self.calls.append((method, url, kwargs.get("headers")))
+        if url.endswith("/tenant-keys/ephemeral") and method == "POST":
+            self.last_mint_payload = kwargs.get("json")
+            return httpx.Response(self.mint_status, json=self.mint_body)
         if "/tenant-keys" in url and method == "GET":
             return httpx.Response(200, json=self.virtual_keys)
         if "/tenant-defaults/resolve" in url and method == "GET":
@@ -175,7 +189,7 @@ def test_canvas_edit_happy_selection(
 
     # chat/completions must have been called with the virtual key header + model.
     assert fake.last_completion_headers is not None
-    assert fake.last_completion_headers.get("X-LLM-Virtual-Key") == "vk_test"
+    assert fake.last_completion_headers.get("X-LLM-Virtual-Key") == "vk_eph"
     assert fake.last_completion_payload is not None
     assert fake.last_completion_payload["model"] == "deepseek-chat"
     assert fake.last_completion_payload["stream"] is False
@@ -225,18 +239,55 @@ def test_canvas_edit_resolves_default_model_when_omitted(
 # Error paths
 # ---------------------------------------------------------------------------
 
-def test_canvas_edit_no_virtual_key_400(
+def test_canvas_edit_tenant_without_llm_provider_422(
     client: TestClient, authed_cookie: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fake = FakeGateway(virtual_keys=[])
+    """No provider is a setting for an administrator, not an outage — and not cached."""
+    fake = FakeGateway(mint_status=404, mint_body=_NO_PROVIDER)
     _patch(fake, monkeypatch)
 
     resp = client.post(
         f"{PREFIX}/sessions/ses_abc/canvas/edit", cookies=authed_cookie, json=_body()
     )
-    assert resp.status_code == 400
+    assert resp.status_code == 422
     detail = resp.json()["detail"]
-    assert "model key" in detail["user_message"]
+    assert detail["detail"]["code"] == "AGENT.BFF.CANVAS.LLM_NOT_CONFIGURED"
+    assert "Admin → Models" in detail["user_message"]
+    # No long-lived key can stand in, and nothing reached the model.
+    assert not any(m == "GET" and "/tenant-keys" in u for m, u, _ in fake.calls)
+    assert fake.last_completion_payload is None
+    assert canvas_mod._vkey_cache == {}
+
+
+def test_canvas_edit_falls_back_to_tenant_key_on_older_gateway(
+    client: TestClient, authed_cookie: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A gateway without the mint endpoint answers a bare 404: use the long-lived key."""
+    fake = FakeGateway(mint_status=404, mint_body={"detail": "Not Found"})
+    _patch(fake, monkeypatch)
+
+    resp = client.post(
+        f"{PREFIX}/sessions/ses_abc/canvas/edit", cookies=authed_cookie, json=_body()
+    )
+    assert resp.status_code == 200
+    assert fake.last_completion_headers is not None
+    assert fake.last_completion_headers.get("X-LLM-Virtual-Key") == "vk_test"
+
+
+def test_canvas_edit_no_virtual_key_at_all_502(
+    client: TestClient, authed_cookie: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGateway(mint_status=503, mint_body={"detail": "down"}, virtual_keys=[])
+    _patch(fake, monkeypatch)
+
+    resp = client.post(
+        f"{PREFIX}/sessions/ses_abc/canvas/edit", cookies=authed_cookie, json=_body()
+    )
+    assert resp.status_code == 502
+    detail = resp.json()["detail"]
+    assert detail["detail"]["code"] == "AGENT.BFF.CANVAS.GATEWAY_UNAVAILABLE"
+    assert "temporarily unavailable" in detail["user_message"]
+    assert fake.last_completion_payload is None
 
 
 def test_canvas_edit_no_model_no_default_400(
@@ -420,7 +471,7 @@ def test_parse_empty_summary_is_none() -> None:
 def test_canvas_edit_vkey_cache_reuses_across_requests(
     client: TestClient, authed_cookie: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Second request within TTL must not re-query /tenant-keys."""
+    """Second request within the reuse window must not mint another key."""
     fake = FakeGateway()
     _patch(fake, monkeypatch)
 
@@ -435,7 +486,7 @@ def test_canvas_edit_vkey_cache_reuses_across_requests(
         f"{PREFIX}/sessions/ses_abc/canvas/edit", cookies=authed_cookie, json=_body()
     )
     assert r2.status_code == 200
-    # Still only one tenant-keys call total — cache hit on the second request.
+    # Still only one mint call total — cache hit on the second request.
     all_key_calls = [c for c in fake.calls if "/tenant-keys" in c[1]]
     assert len(all_key_calls) == 1
 
@@ -443,7 +494,7 @@ def test_canvas_edit_vkey_cache_reuses_across_requests(
 def test_canvas_edit_vkey_cache_expires(
     client: TestClient, authed_cookie: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Expired cache entry forces a re-query."""
+    """An entry past its reuse window forces a new mint."""
     fake = FakeGateway()
     _patch(fake, monkeypatch)
 
@@ -463,6 +514,24 @@ def test_canvas_edit_vkey_cache_expires(
     assert r2.status_code == 200
     key_calls = [c for c in fake.calls if "/tenant-keys" in c[1]]
     assert len(key_calls) == 2
+
+
+def test_canvas_edit_reuses_a_minted_key_only_while_it_outlives_a_completion(
+    client: TestClient, authed_cookie: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGateway()
+    _patch(fake, monkeypatch)
+
+    before = time.monotonic()
+    resp = client.post(
+        f"{PREFIX}/sessions/ses_abc/canvas/edit", cookies=authed_cookie, json=_body()
+    )
+    assert resp.status_code == 200
+    assert fake.last_mint_payload is not None
+    assert fake.last_mint_payload["ttl_seconds"] == canvas_mod._VKEY_TTL_SECONDS
+    _, reuse_until = canvas_mod._vkey_cache["tnt_01J5TEST00000000000000TNT1"]
+    # Whenever the cached key is handed out, a full completion still fits in its TTL.
+    assert reuse_until - before + canvas_mod._COMPLETION_TIMEOUT < canvas_mod._VKEY_TTL_SECONDS
 
 
 # ---------------------------------------------------------------------------

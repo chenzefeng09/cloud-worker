@@ -86,9 +86,10 @@ The remaining defaults (ports, pool watermarks, `FOUNDATION_NETWORK`,
 `FOUNDATION_SDK_PATH`) work as-is for a sibling-checkout layout.
 
 No model provider key goes in this file: agent runs reach models only through
-the foundation LLM gateway with a per-tenant virtual key, so make sure your
-tenant has one configured on the foundation side — a run for a tenant without a
-virtual key fails at spawn.
+the foundation LLM gateway, which gives each run a short-lived virtual key bound
+to the tenant's provider. So make sure your tenant has an enabled provider
+(Admin → Models in the web app): without one, every run is refused and the user
+is told no AI model is set up for their organization.
 
 ---
 

@@ -115,7 +115,8 @@ def upload_run_output_files(
     When ``workspace_id`` is non-empty the S3 key uses the workspace namespace
     (``tenant/{tid}/workspaces/{wid}/files/...``) so the blob is owned by the
     workspace.  When empty the legacy session/run namespace is used and only
-    ``artifacts`` is populated (no workspace to write back to).
+    ``outputs/`` is uploaded: there is no workspace to write the rest back to,
+    so it would sit in the bucket with nothing referencing (or deleting) it.
 
     Skipped: control-plane files in ``excluded_names`` (root level only, so an
     agent's own ``outputs/result.json`` still ships) and everything under
@@ -145,6 +146,9 @@ def upload_run_output_files(
             continue
 
         relpath = fpath.relative_to(workspace).as_posix()
+        is_output = fpath.is_relative_to(outputs_dir)
+        if not workspace_id and not is_output:
+            continue
 
         if workspace_id:
             s3_key = (
@@ -187,12 +191,6 @@ def upload_run_output_files(
             })
 
         # artifacts: only outputs/ files (chat output-file cards)
-        is_output = False
-        try:
-            fpath.relative_to(outputs_dir)
-            is_output = True
-        except ValueError:
-            pass
         if is_output:
             artifacts.append({
                 "filename": fpath.name,

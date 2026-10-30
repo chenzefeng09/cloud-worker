@@ -1,23 +1,24 @@
-"""One-shot backfill: envelope-encrypt plaintext auth secrets at rest.
+"""One-shot backfill: envelope-encrypt plaintext MCP server secrets at rest.
 
 Phase 2 introduced envelope encryption for MCP auth secret fields
-(``token`` / ``api_key`` / ``client_secret``).  Rows created before the
-crypto wiring landed store plaintext secrets; this script rewrites them in
-place so the DB never holds plaintext after migration.
+(``token`` / ``api_key`` / ``client_secret``); every ``env`` and ``headers``
+value is encrypted too.  Rows written before that store plaintext; this script
+rewrites them in place so the DB never holds plaintext after migration.
 
 The script is idempotent:
 
-  * ``encrypt_auth`` skips values that already look like envelopes, so
-    re-running on already-encrypted rows is a no-op.
-  * Rows whose ``auth`` is ``NULL`` or ``type=none`` are skipped.
+  * ``encrypt_auth`` / ``encrypt_values`` skip values that already look like
+    envelopes, so re-running on already-encrypted rows is a no-op.
+  * Rows with no secret material (no auth secret, empty ``env`` / ``headers``)
+    are skipped.
 
 Operational notes
 -----------------
   * Uses the migrator DSN (``MCP_REGISTRY_DB_DSN_MIGRATOR``) so it bypasses
     per-tenant RLS and can touch every tenant's rows in one pass.
   * The foundation crypto service must be reachable (``MCP_REGISTRY_CRYPTO_URL``).
-    If crypto is unreachable, ``encrypt_secret`` falls back to plaintext and
-    the row is left untouched (logged) - re-run once crypto is back.
+    A row the crypto service can't encrypt is left untouched and counted as
+    failed (the script then exits 1) - re-run once crypto is back.
   * Run inside the mcp-registry container::
 
       docker compose exec mcp-registry python -m mcp_registry.scripts.backfill_encrypt_auth
@@ -35,13 +36,15 @@ import argparse
 import asyncio
 import logging
 import sys
+from typing import Any
 
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from mcp_registry.config import Settings
 from mcp_registry.domain.models import McpServer
-from mcp_registry.services.secret_crypto import encrypt_auth
+from mcp_registry.errors import SecretEncryptionUnavailableError
+from mcp_registry.services.secret_crypto import encrypt_auth, encrypt_values
 
 log = logging.getLogger("backfill_encrypt_auth")
 
@@ -53,21 +56,22 @@ async def _encrypt_row(
     crypto_url: str,
     crypto_timeout: float,
 ) -> bool:
-    """Encrypt plaintext secrets on ``server.auth`` in place. Return True if changed."""
-    auth = server.auth
-    if not isinstance(auth, dict):
+    """Encrypt plaintext secrets on ``server`` in place. Return True if changed.
+
+    Raises ``SecretEncryptionUnavailableError`` (row untouched) when crypto
+    can't encrypt a value - this script never stores plaintext as a fallback.
+    """
+    ctx: dict[str, Any] = {
+        "crypto_url": crypto_url, "timeout": crypto_timeout, "tenant_id": server.tenant_id,
+    }
+    # Both helpers are idempotent (skip envelopes); ``encrypt_auth`` only
+    # touches the secret fields for the configured auth type.
+    auth = await encrypt_auth(server.auth, **ctx) if isinstance(server.auth, dict) else server.auth
+    env = await encrypt_values(server.env, **ctx)
+    headers = await encrypt_values(server.headers, **ctx)
+    if (auth, env, headers) == (server.auth, server.env or {}, server.headers or {}):
         return False
-    # ``encrypt_auth`` is idempotent (skips envelopes) and only touches the
-    # secret fields for the configured auth type.
-    encrypted = await encrypt_auth(
-        auth,
-        crypto_url=crypto_url,
-        timeout=crypto_timeout,
-        tenant_id=server.tenant_id,
-    )
-    if encrypted == auth:
-        return False
-    server.auth = encrypted
+    server.auth, server.env, server.headers = auth, env, headers
     return True
 
 
@@ -82,28 +86,35 @@ async def run(*, dry_run: bool, batch_size: int) -> int:
     engine = create_async_engine(settings.db_dsn_migrator)
     encrypted_count = 0
     skipped_count = 0
+    failed_count = 0
     try:
         async with engine.begin() as conn:
             # Migrator role owns the schema; no RLS enforcement.  Still set
             # search_path so the ORM finds the table on Postgres.
             await conn.execute(text(f'SET search_path TO "{settings.db_schema}", public'))
         async with AsyncSession(engine, expire_on_commit=False) as session:
-            result = await session.execute(
-                select(McpServer).where(McpServer.auth.isnot(None))
-            )
+            result = await session.execute(select(McpServer))
             servers = list(result.scalars().all())
             log.info("backfill_candidates total=%d", len(servers))
             for server in servers:
-                changed = await _encrypt_row(
-                    session,
-                    server,
-                    crypto_url=settings.crypto_url,
-                    crypto_timeout=settings.crypto_timeout,
-                )
+                try:
+                    changed = await _encrypt_row(
+                        session,
+                        server,
+                        crypto_url=settings.crypto_url,
+                        crypto_timeout=settings.crypto_timeout,
+                    )
+                except SecretEncryptionUnavailableError:
+                    failed_count += 1
+                    log.warning(
+                        "backfill_failed id=%s tenant=%s (crypto unavailable)",
+                        server.id, server.tenant_id,
+                    )
+                    continue
                 if changed:
                     encrypted_count += 1
                     log.info(
-                        "backill_encrypted id=%s tenant=%s name=%s",
+                        "backfill_encrypted id=%s tenant=%s name=%s",
                         server.id, server.tenant_id, server.name,
                     )
                     if encrypted_count % batch_size == 0:
@@ -119,10 +130,10 @@ async def run(*, dry_run: bool, batch_size: int) -> int:
         await engine.dispose()
 
     log.info(
-        "backfill_done encrypted=%d skipped=%d dry_run=%s",
-        encrypted_count, skipped_count, dry_run,
+        "backfill_done encrypted=%d skipped=%d failed=%d dry_run=%s",
+        encrypted_count, skipped_count, failed_count, dry_run,
     )
-    return 0
+    return 1 if failed_count else 0
 
 
 def main(argv: list[str] | None = None) -> int:

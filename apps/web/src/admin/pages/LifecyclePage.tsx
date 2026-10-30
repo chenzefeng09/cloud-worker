@@ -20,7 +20,7 @@ function fmt(iso?: string | null): string {
 export function LifecyclePage() {
   const { tenants, tenantsLoading, setTenants, setTenantsLoading, selectedTenantId, setSelectedTenantId } =
     useAdminStore();
-  const actorId = useChatStore((s) => s.userProfile?.id) ?? 'admin';
+  const actorId = useChatStore((s) => s.userProfile?.user_id) ?? 'admin';
   const toast = useToast();
   const confirm = useConfirm();
   const tid = selectedTenantId ?? undefined;

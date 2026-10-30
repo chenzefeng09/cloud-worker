@@ -276,7 +276,16 @@ ENDPOINTS = [
     ("POST",   "/admin/compliance/ropa", {"name": "n"}, 201),
     ("POST",   "/admin/compliance/dpia", {"name": "n"}, 201),
     ("POST",   "/admin/compliance/dpia/dpia_1/complete", {}, 200),
-    ("POST",   "/admin/compliance/dsar", {"subject": "s"}, 201),
+    (
+        "POST",
+        "/admin/compliance/dsar",
+        {
+            "user_id": "usr_01J5TEST0000000000000USER1",
+            "request_type": "access",
+            "details": "Copy of all personal data held about me",
+        },
+        201,
+    ),
     ("GET",    "/admin/compliance/dsar/dsar_1", None, 200),
     ("GET",    "/admin/compliance/reports", None, 200),
     ("POST",   "/admin/compliance/reports", {"kind": "k"}, 201),
@@ -344,6 +353,29 @@ def test_dlp_hits_dlp_url(gov_client, gov_cookie, gov_allowed) -> None:
         PREFIX + "/admin/dlp/scan", json={"content": "c"}, cookies=gov_cookie,
     )
     assert any(u == f"{DLP_URL}/core/scan" for (_, u, _, _) in gov_allowed.requests)
+
+
+@pytest.mark.parametrize(
+    "method,path,body,_ok",
+    [e for e in ENDPOINTS if e[1].startswith("/admin/dlp/")],
+)
+def test_only_classify_is_sent_with_admin_authority(
+    gov_client, gov_cookie, gov_allowed, method, path, body, _ok,
+) -> None:
+    """foundation-dlp lets only SERVICE/ADMIN actors write labels.
+
+    Classify needs that authority.  Scan must not have it: it checks text the
+    admin pastes in, and with it a hit would label the resource (or the
+    ``adhoc-scan`` placeholder).  An ``X-Actor`` sent by the browser is never
+    passed on.
+    """
+    _call(gov_client, method, path, body, cookies=gov_cookie, headers={"X-Actor": "SERVICE"})
+
+    upstream = path.split("?")[0].removeprefix("/admin/dlp/")
+    sent = [h for (_, u, h, _) in gov_allowed.requests if u == f"{DLP_URL}/core/{upstream}"]
+    assert sent, path
+    expected = "ADMIN" if upstream == "classification:tag" else None
+    assert sent[-1].get("X-Actor") == expected
 
 
 def test_compliance_hits_compliance_url(gov_client, gov_cookie, gov_allowed) -> None:

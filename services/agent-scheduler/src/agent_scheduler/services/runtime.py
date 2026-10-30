@@ -123,8 +123,19 @@ class SandboxRuntime(Protocol):
         The API layer uses this to refuse cross-tenant destructive ops.
         """
 
-    def cancel_run(self, container_id: str) -> None:
-        """Stop + remove a container.  Idempotent on already-gone containers."""
+    def cancel_run(
+        self, container_id: str, *, remove_workspace: bool = True,
+    ) -> dict[str, Any] | None:
+        """Stop + remove a container.  Idempotent on already-gone containers.
+
+        ``remove_workspace`` also deletes the run's host dir (user files) unless
+        a newer sandbox of the same run owns it; ``False`` leaves the dir to the
+        reaper's sweeps.
+
+        Returns the token usage the worker last wrote to ``result.json`` (read
+        after the stop, so counts saved on SIGTERM are in), or ``None``.  It is
+        the run's cumulative usage, earlier legs of a resumed run included.
+        """
 
     def list_containers(self, *, tenant_id: str) -> list[dict[str, Any]]:
         """List agent-platform containers belonging to ``tenant_id``.

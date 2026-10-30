@@ -12,6 +12,11 @@ all must pass or the request is rejected with HTTP 403:
 ``tenant_id`` is resolved from the request-scoped contextvar set by
 ``foundation_sdk.fastapi.install_request_context``; it is forwarded as the
 ``X-Tenant-Id`` header on the outbound check call (not in the body).
+
+``require_identified_caller()`` keeps deny point 1 only.  It is for the
+data-subject routes (privacy export / erasure / settings): those rights belong
+to the person, not to a role, so no role may be required to use them on one's
+own data.
 """
 
 from __future__ import annotations
@@ -28,6 +33,48 @@ from agent_session_orchestrator.api.middleware import get_tenant_id, get_user_id
 _USER_ID_RE = re.compile(r"^usr_[0-9A-Z]{26}$")
 
 _AUTHZ_TIMEOUT = 2.0  # seconds — tight; fail-closed on timeout
+
+
+def _require_identity() -> tuple[str, str]:
+    """Deny point 1: a tenant and a real, well-formed user id (no network)."""
+    tenant_id = get_tenant_id()
+    user_id = get_user_id()
+
+    if not tenant_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="RBAC: tenant_id missing",
+        )
+    if not user_id or user_id == "SYSTEM":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="RBAC: user_id missing or SYSTEM",
+        )
+    if not _USER_ID_RE.match(user_id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="RBAC: user_id format invalid",
+        )
+    return tenant_id, user_id
+
+
+def require_identified_caller() -> Callable[..., Any]:
+    """Return a dependency that admits any identified user, with no authz check.
+
+    For routes a caller uses on their *own* data whatever their role: the GDPR
+    data-subject rights (access, erasure, restriction, objection).  Gating them
+    on a role permission would leave whoever lacks it unable to exercise a
+    right the law gives them — the ``member`` role, for one, holds no
+    ``session.delete``.  Keeping each caller to their own data is the route's
+    job; an ``X-Actor: ADMIN`` caller passes as in ``require_permission``.
+    """
+
+    async def _guard(request: Request) -> None:
+        if request.headers.get("X-Actor") == "ADMIN":
+            return
+        _require_identity()
+
+    return _guard
 
 
 def require_permission(action: str, resource_type: str) -> Callable[..., Any]:
@@ -49,24 +96,7 @@ def require_permission(action: str, resource_type: str) -> Callable[..., Any]:
             return
 
         # ── Deny point 1: identity checks (no network) ──────────────────────
-        tenant_id = get_tenant_id()
-        user_id = get_user_id()
-
-        if not tenant_id:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="RBAC: tenant_id missing",
-            )
-        if not user_id or user_id == "SYSTEM":
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="RBAC: user_id missing or SYSTEM",
-            )
-        if not _USER_ID_RE.match(user_id):
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="RBAC: user_id format invalid",
-            )
+        tenant_id, user_id = _require_identity()
 
         # ── Deny point 2: authz network call ────────────────────────────────
         settings = request.app.state.settings

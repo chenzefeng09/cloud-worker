@@ -1,11 +1,15 @@
-"""Envelope encryption for MCP auth secrets.
+"""Envelope encryption for MCP server secrets.
 
 Secret fields inside an ``auth`` JSONB blob (``token`` for bearer,
-``api_key`` for api_key, ``client_secret`` for oauth) are encrypted at rest
-via the foundation crypto service and decrypted on read so that:
+``api_key`` for api_key, ``client_secret`` for oauth), and every value of the
+``env`` and ``headers`` maps (API keys as env vars, ``Authorization`` headers),
+are encrypted at rest via the foundation crypto service and decrypted on read
+so that:
 
-  * the DB column never holds plaintext secrets,
-  * admin GET and the internal consumer endpoint both return plaintext auth,
+  * the DB columns never hold plaintext secrets,
+  * the admin surface shows none of them (auth secrets and every ``env`` /
+    ``headers`` value are masked, see below) while the internal consumer
+    endpoint returns everything in plaintext,
   * consumers (``mcp_tenant_injector``) never have to know about envelopes.
 
 The contract mirrors ``llm-gateway``'s ``_encrypt_api_key`` / ``_decrypt_api_key``
@@ -17,13 +21,15 @@ of ``key_label`` / ``plaintext_b64``); llm-gateway is the verified reference.
 
 Resilience
 ----------
-Both helpers are best-effort and never raise:
-
-  * ``encrypt_secret`` falls back to plaintext when the crypto service is
-    unreachable so registry writes are never blocked.  It is also idempotent:
-    a value that already looks like an envelope is returned unchanged (so a
-    re-encrypt on update never double-wraps).
-  * ``decrypt_secret`` treats a non-envelope value as legacy plaintext and
+  * ``encrypt_secret`` fails closed: when the crypto service can't encrypt a
+    value it raises ``SecretEncryptionUnavailableError`` (HTTP 503), so a
+    secret is never written in clear.  ``allow_plaintext=True`` (the
+    ``allow_plaintext_secrets`` setting, local development only) restores the
+    old plaintext fallback.  It is idempotent: a value that already looks like
+    an envelope is returned unchanged (so a re-encrypt on update never
+    double-wraps).
+  * ``decrypt_secret`` never raises.  It treats a non-envelope value as legacy
+    plaintext and
     returns it as-is (migration compatibility).  A failed decrypt falls back
     to the stored value - worst case the upstream call 401s, which is
     preferable to crashing the registry.
@@ -33,9 +39,11 @@ Masking
 ``mask_auth`` replaces secret fields with a sentinel (``MASKED_SENTINEL``)
 for the tenant-facing admin surface so plaintext credentials never reach the
 browser.  Each masked field gets a ``has_{field}: True`` sibling so the UI
-knows a secret is stored even though the value is redacted.  The internal
-consumer endpoint (``/internal/mcp-servers``) bypasses masking and returns
-plaintext as before.
+knows a secret is stored even though the value is redacted.  ``mask_values``
+swaps every non-empty ``env`` / ``headers`` value for the same sentinel
+(keys stay visible).  On write the sentinel means "keep the stored value"
+(``masked_keys``).  The internal consumer endpoint
+(``/internal/mcp-servers``) bypasses masking and returns plaintext as before.
 
 The same caveat as llm-gateway applies in dev: the Vault transit backend is
 ephemeral and a reset invalidates existing envelopes.  Re-create the affected
@@ -44,12 +52,16 @@ MCP servers (or re-run the backfill script) when that happens.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
+
+from mcp_registry.errors import SecretEncryptionUnavailableError
 
 log = logging.getLogger(__name__)
 
@@ -91,12 +103,14 @@ async def encrypt_secret(
     crypto_url: str,
     timeout: float,
     tenant_id: str,
+    allow_plaintext: bool = False,
 ) -> str:
     """Envelope-encrypt ``plaintext`` via the foundation crypto service.
 
     Returns the envelope JSON string for storage.  Idempotent: an already
-    encrypted value is returned unchanged.  Falls back to plaintext on any
-    crypto failure (logged at WARNING) so writes are never blocked.
+    encrypted value is returned unchanged.  On any crypto failure (logged at
+    WARNING) it raises ``SecretEncryptionUnavailableError``, or returns the
+    plaintext when ``allow_plaintext`` is set.
     """
     if not plaintext:
         return plaintext
@@ -122,9 +136,11 @@ async def encrypt_secret(
             "mcp.crypto.encrypt_non_200",
             extra={"status": resp.status_code, "body": resp.text[:300]},
         )
-    except Exception as exc:  # noqa: BLE001 - crypto must never block writes
+    except Exception as exc:  # noqa: BLE001 - every failure takes the same exit
         log.warning("mcp.crypto.encrypt_failed", extra={"error": str(exc)})
-    return plaintext
+    if allow_plaintext:
+        return plaintext
+    raise SecretEncryptionUnavailableError
 
 
 async def decrypt_secret(
@@ -197,6 +213,7 @@ async def encrypt_auth(
     crypto_url: str,
     timeout: float,
     tenant_id: str,
+    allow_plaintext: bool = False,
 ) -> dict[str, Any] | None:
     """Return a copy of ``auth`` with its secret fields envelope-encrypted.
 
@@ -212,6 +229,7 @@ async def encrypt_auth(
         if isinstance(value, str) and value:
             out[field] = await encrypt_secret(
                 value, crypto_url=crypto_url, timeout=timeout, tenant_id=tenant_id,
+                allow_plaintext=allow_plaintext,
             )
     return out
 
@@ -238,6 +256,45 @@ async def decrypt_auth(
                 value, crypto_url=crypto_url, timeout=timeout, tenant_id=tenant_id,
             )
     return out
+
+
+async def _map_values(
+    values: dict[str, Any] | None, transform: Callable[[str], Awaitable[str]],
+) -> dict[str, Any]:
+    """Apply ``transform`` to every non-empty string value, concurrently."""
+    if not values:
+        return dict(values or {})
+    keys = [k for k, v in values.items() if isinstance(v, str) and v]
+    done = await asyncio.gather(*(transform(values[k]) for k in keys))
+    return {**values, **dict(zip(keys, done, strict=True))}
+
+
+async def encrypt_values(
+    values: dict[str, Any] | None,
+    *,
+    crypto_url: str,
+    timeout: float,
+    tenant_id: str,
+    allow_plaintext: bool = False,
+) -> dict[str, Any]:
+    """Envelope-encrypt every value of an ``env`` / ``headers`` map (keys stay)."""
+    return await _map_values(values, lambda value: encrypt_secret(
+        value, crypto_url=crypto_url, timeout=timeout, tenant_id=tenant_id,
+        allow_plaintext=allow_plaintext,
+    ))
+
+
+async def decrypt_values(
+    values: dict[str, Any] | None,
+    *,
+    crypto_url: str,
+    timeout: float,
+    tenant_id: str,
+) -> dict[str, Any]:
+    """Inverse of ``encrypt_values``; legacy plaintext values pass through."""
+    return await _map_values(values, lambda value: decrypt_secret(
+        value, crypto_url=crypto_url, timeout=timeout, tenant_id=tenant_id,
+    ))
 
 
 def mask_auth(auth: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -270,3 +327,25 @@ def mask_auth(auth: dict[str, Any] | None) -> dict[str, Any] | None:
         else:
             out[f"has_{field}"] = False
     return out
+
+
+def mask_values(values: dict[str, Any] | None) -> dict[str, Any]:
+    """Replace every non-empty ``env`` / ``headers`` value with ``MASKED_SENTINEL``.
+
+    Pure function (no crypto calls): the keys stay visible, and an empty value
+    (``""`` / ``None``) passes through because it holds nothing to hide.
+    Whether a value is an envelope or legacy plaintext makes no difference.
+    """
+    return {
+        key: value if value is None or value == "" else MASKED_SENTINEL
+        for key, value in (values or {}).items()
+    }
+
+
+def masked_keys(values: dict[str, Any] | None) -> list[str]:
+    """Return the keys whose submitted value is ``MASKED_SENTINEL``.
+
+    The admin form sends an untouched masked value back verbatim, so on write
+    the sentinel means "keep the value stored under this key".
+    """
+    return [key for key, value in (values or {}).items() if value == MASKED_SENTINEL]

@@ -4,20 +4,24 @@ This module replaces the B-M1 placeholder that stored ``{user_id, tenant_id}``
 in a plain ``base64(json)`` cookie — that scheme let any client edit the
 cookie and impersonate another tenant.  The current flow:
 
-* ``POST /auth/login`` calls foundation identity's ``POST /sessions`` (which
-  internally talks to Keycloak), pulls ``access_token / refresh_token /
-  user_id / tenant_id`` from the response, and writes them into a signed
-  cookie via :class:`foundation_sdk.CookieSigner`.  The cookie is
-  ``HttpOnly + SameSite=strict``; the access token never leaves the BFF and
-  is forwarded to downstream services as the ``Authorization`` header.
+* ``POST /auth/login`` (and the SSO variants) call foundation identity's
+  ``POST /sessions`` (which internally talks to Keycloak).  The returned
+  access + refresh tokens are stored server-side, encrypted, as a web session
+  (:mod:`agent_bff.api.web_session`); the browser only gets a signed
+  ``HttpOnly + SameSite=strict`` cookie naming that session
+  (``{sid, tenant_id, user_id}`` via :class:`foundation_sdk.CookieSigner`).
+  Tokens never reach the browser.  The session middleware forwards the access
+  token downstream as ``Authorization: Bearer`` and refreshes it shortly
+  before it expires, so a session lasts until identity's idle / absolute
+  timeout instead of the 5-minute token lifetime.
 
 * ``GET /auth/me`` re-resolves the caller's identity by calling foundation
   identity's ``GET /sessions/me`` with the access token.  This means the
   SPA never trusts client-side state — refreshing the page revalidates
   against the source of truth.
 
-* ``POST /auth/logout`` clears the cookie and revokes the session at
-  foundation identity (best-effort).
+* ``POST /auth/logout`` deletes the web session, ends it at foundation
+  identity (best-effort) and clears the cookie.
 """
 
 from __future__ import annotations
@@ -33,17 +37,24 @@ from foundation_sdk import (
     SignatureExpiredError,
     SignatureInvalid,
 )
-from pydantic import BaseModel, Field
 from foundation_sdk.fastapi import get_tenant_id, get_user_id
+from pydantic import BaseModel, Field
 
 from agent_bff.api._http import foundation_headers
-from agent_bff.api._jwt import clearance_from_token
-from agent_bff.api.dependencies import require_auth
+from agent_bff.api._people import forget as forget_display_name
+from agent_bff.api.dependencies import raise_unauthenticated, require_auth
 from agent_bff.api.middleware import get_access_token
+from agent_bff.api.web_session import WebSessionManager
 from agent_bff.errors import AuthenticationError, BFFError, ProxyError
 
 router = APIRouter(tags=["Auth"])
 logger = logging.getLogger(__name__)
+
+# Identity refuses a password login with this code when the password is right
+# but the account still has required actions pending in Keycloak (expired
+# password, admin-requested reset, ...).  It is passed through to the SPA so the
+# login page can say so instead of "incorrect email or password".
+ACCOUNT_SETUP_REQUIRED = "FOUNDATION.IDENTITY.AUTH.ACCOUNT_SETUP_REQUIRED"
 
 
 def _signer(request: Request) -> CookieSigner:
@@ -103,13 +114,22 @@ def _raise_for_upstream(resp: httpx.Response) -> None:
         except ValueError:
             raise HTTPException(
                 status_code=resp.status_code, detail=resp.text or "upstream error"
-            )
+            ) from None
         if isinstance(body, dict) and body.get("user_message") is not None:
             raise HTTPException(
                 status_code=resp.status_code,
                 detail={"detail": body, "user_message": body["user_message"]},
             )
         raise HTTPException(status_code=resp.status_code, detail=body)
+
+
+def _problem_code(resp: httpx.Response) -> str:
+    try:
+        body = resp.json()
+    except ValueError:
+        return ""
+    code = body.get("code") if isinstance(body, dict) else None
+    return code if isinstance(code, str) else ""
 
 
 async def _foundation_login(
@@ -120,22 +140,35 @@ async def _foundation_login(
     The contract is defined in ``saas-foundation/contracts/openapi/identity.yaml``
     under ``POST /sessions`` — the response carries ``access_token``,
     ``refresh_token``, ``user_id``, ``tenant_id`` and ``expires_at``.
+
+    Refusals stay a generic 401 "Invalid credentials" — except
+    ``ACCOUNT_SETUP_REQUIRED`` (the password was accepted, the account needs an
+    update first), which is passed through with identity's code and
+    ``user_message``.  An unreachable or failing identity is a 502, never a 401:
+    the login page must not report a wrong password for an outage.
     """
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            f"{identity_url}/sessions",
-            json={"method": "EMAIL_PASSWORD", "email": email, "password": password},
-        )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{identity_url}/sessions",
+                json={"method": "EMAIL_PASSWORD", "email": email, "password": password},
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("identity login unreachable", extra={"exc": type(exc).__name__})
+        raise ProxyError("identity", "login unavailable") from exc
     if resp.status_code == status.HTTP_201_CREATED:
         return resp.json()
     if resp.status_code in (401, 403):
+        if _problem_code(resp) == ACCOUNT_SETUP_REQUIRED:
+            _raise_for_upstream(resp)
         raise AuthenticationError("Invalid credentials")
-    # 5xx / unexpected — surface as auth failure but log for ops.
+    # 5xx / unexpected (incl. a 202 MFA challenge, which the BFF does not
+    # support yet) — log for ops.
     logger.warning(
         "identity login returned unexpected status",
         extra={"status": resp.status_code},
     )
-    raise AuthenticationError("Identity service unavailable")
+    raise ProxyError("identity", f"login returned {resp.status_code}")
 
 
 async def _foundation_sso_login(
@@ -148,15 +181,19 @@ async def _foundation_sso_login(
     EMAIL_PASSWORD flow.  The IdP ``access_token`` is sensitive — it is never
     logged.
     """
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(
-            f"{identity_url}/sessions",
-            json={
-                "method": "SSO_TOKEN",
-                "access_token": access_token,
-                "provider_id": provider_id,
-            },
-        )
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(
+                f"{identity_url}/sessions",
+                json={
+                    "method": "SSO_TOKEN",
+                    "access_token": access_token,
+                    "provider_id": provider_id,
+                },
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("identity sso login unreachable", extra={"exc": type(exc).__name__})
+        raise ProxyError("identity", "login unavailable") from exc
     if resp.status_code == status.HTTP_201_CREATED:
         return resp.json()
     if resp.status_code in (401, 403):
@@ -165,49 +202,62 @@ async def _foundation_sso_login(
         "identity sso login returned unexpected status",
         extra={"status": resp.status_code},
     )
-    raise AuthenticationError("Identity service unavailable")
+    raise ProxyError("identity", f"login returned {resp.status_code}")
 
 
-def _session_cookie_response(request: Request, *, session: dict, email: str) -> Response:
-    """Mint the signed session cookie from an identity session payload.
+def _web_sessions(request: Request) -> WebSessionManager:
+    return request.app.state.web_sessions
 
-    Shared by the EMAIL_PASSWORD and SSO_TOKEN login flows so both produce an
-    identical cookie and response shape.
+
+def _cookie_session(request: Request) -> dict | None:
+    """The server-side session the request's cookie names, if any."""
+    raw = request.cookies.get(request.app.state.settings.cookie_name)
+    if not raw:
+        return None
+    try:
+        payload = _signer(request).unsign(raw)
+    except (SignatureInvalid, SignatureExpiredError):
+        return None
+    sid = payload.get("sid")
+    tenant_id = payload.get("tenant_id")
+    user_id = payload.get("user_id")
+    if not (isinstance(sid, str) and sid and tenant_id and user_id):
+        return None
+    return {"session_id": sid, "tenant_id": str(tenant_id), "user_id": str(user_id)}
+
+
+async def _end_cookie_session(request: Request) -> None:
+    """Sign out the session the request's cookie names (best-effort)."""
+    current = _cookie_session(request)
+    if current is not None:
+        await _web_sessions(request).revoke(**current)
+
+
+async def _start_session(request: Request, session: dict) -> str:
+    """Store a fresh identity session server-side; return the signed cookie value.
+
+    Shared by every login flow (password, SSO token, SSO redirect) so they all
+    produce the same kind of session.  A session the browser held before is
+    signed out.  Raises ``SessionUnavailableError`` (503) when the session
+    cannot be stored.
     """
-    settings = request.app.state.settings
-    access_token = session.get("access_token", "")
     user_id = session.get("user_id", "")
     tenant_id = session.get("tenant_id", "")
-    # The identity response also carries a refresh_token; we intentionally
-    # do NOT persist it in the cookie.  Once refresh is implemented (M2) it
-    # will live in a server-side refresh-token DB so a stolen cookie can't
-    # extend a session on its own.
-    if not (access_token and user_id and tenant_id):
+    if not (session.get("access_token") and user_id and tenant_id):
         # Identity returned a 201 but the payload is malformed — refuse to
         # mint a cookie pointing nowhere.
         logger.error("identity returned 201 with missing fields")
-        raise AuthenticationError("Identity response malformed")
+        raise ProxyError("identity", "login response malformed")
 
-    # clearance lives in the access_token (Keycloak `clearance` claim), not the
-    # identity SessionRead payload — decode it out and bake it into the cookie
-    # so downstream requests don't have to re-parse the JWT every time.
-    clearance = clearance_from_token(access_token)
-    cookie_value = _signer(request).sign(
-        {
-            "user_id": user_id,
-            "tenant_id": tenant_id,
-            "access_token": access_token,
-            "clearance": clearance,
-        },
+    session_id = await _web_sessions(request).create(session)
+    await _end_cookie_session(request)
+    return _signer(request).sign(
+        {"sid": session_id, "user_id": user_id, "tenant_id": tenant_id},
     )
-    response = JSONResponse(
-        content={
-            "user_id": user_id,
-            "tenant_id": tenant_id,
-            "email": email,
-            "display_name": session.get("display_name", email),
-        },
-    )
+
+
+def _set_session_cookie(request: Request, response: Response, cookie_value: str) -> None:
+    settings = request.app.state.settings
     response.set_cookie(
         key=settings.cookie_name,
         value=cookie_value,
@@ -217,6 +267,26 @@ def _session_cookie_response(request: Request, *, session: dict, email: str) -> 
         samesite="strict",
         path="/",
     )
+
+
+async def _session_cookie_response(
+    request: Request, *, session: dict, email: str
+) -> Response:
+    """Start a web session and answer the SPA's login call with its cookie.
+
+    Shared by the EMAIL_PASSWORD and SSO_TOKEN login flows so both produce an
+    identical cookie and response shape.
+    """
+    cookie_value = await _start_session(request, session)
+    response = JSONResponse(
+        content={
+            "user_id": session.get("user_id", ""),
+            "tenant_id": session.get("tenant_id", ""),
+            "email": email,
+            "display_name": session.get("display_name", email),
+        },
+    )
+    _set_session_cookie(request, response, cookie_value)
     return response
 
 
@@ -234,7 +304,7 @@ async def login(request: Request) -> Response:
         email=email,
         password=password,
     )
-    return _session_cookie_response(request, session=session, email=email)
+    return await _session_cookie_response(request, session=session, email=email)
 
 
 @router.post("/auth/login/sso")
@@ -257,7 +327,7 @@ async def login_sso(request: Request) -> Response:
         access_token=access_token,
         provider_id=provider_id,
     )
-    return _session_cookie_response(
+    return await _session_cookie_response(
         request, session=session, email=session.get("email", "")
     )
 
@@ -482,62 +552,42 @@ async def sso_callback(request: Request) -> Response:
             status_code=status.HTTP_302_FOUND,
         )
 
-    session = resp.json()
-    access_token = session.get("access_token", "")
-    user_id = session.get("user_id", "")
-    tenant_id = session.get("tenant_id", "")
-    if not (access_token and user_id and tenant_id):
-        logger.error("sso/callback: identity returned 201 with missing fields")
+    # Start the same server-side session the password / SSO_TOKEN paths do,
+    # but attach its cookie to the redirect so the browser lands
+    # authenticated on /home.
+    try:
+        session = resp.json()
+        cookie_value = await _start_session(
+            request, session if isinstance(session, dict) else {}
+        )
+    except (ValueError, BFFError) as exc:
+        logger.error(
+            "sso/callback: could not start a session", extra={"exc": type(exc).__name__}
+        )
         return RedirectResponse(
             f"{origin}/login?sso_error=login_failed",
             status_code=status.HTTP_302_FOUND,
         )
-
-    # Mint the identical signed cookie the password / SSO_TOKEN paths produce,
-    # but attach it to the redirect so the browser lands authenticated on /home.
-    clearance = clearance_from_token(access_token)
-    cookie_value = _signer(request).sign(
-        {
-            "user_id": user_id,
-            "tenant_id": tenant_id,
-            "access_token": access_token,
-            "clearance": clearance,
-        },
-    )
     response = RedirectResponse(
         f"{origin}/home",
         status_code=status.HTTP_302_FOUND,
     )
-    response.set_cookie(
-        key=settings.cookie_name,
-        value=cookie_value,
-        max_age=settings.cookie_max_age,
-        httponly=True,
-        secure=settings.cookie_secure,
-        samesite="strict",
-        path="/",
-    )
+    _set_session_cookie(request, response, cookie_value)
     return response
 
 
 @router.post("/auth/logout", status_code=204)
 async def logout(request: Request) -> Response:
+    """Delete the web session, end it at identity, clear the cookie.
+
+    Deleting the server-side session is what signs the browser out; ending
+    the identity / Keycloak session (with the stored refresh token) is
+    best-effort, and the cookie is cleared unconditionally.  Cookies minted
+    before server-side sessions carry no refresh token, so there is nothing to
+    revoke for them.
+    """
     settings = request.app.state.settings
-    access_token = get_access_token()
-
-    # Best-effort revoke at foundation; don't fail logout if identity is down
-    # — the cookie is what binds the browser to the session, and we clear it
-    # unconditionally below.
-    if access_token:
-        try:
-            async with httpx.AsyncClient(timeout=3) as client:
-                await client.delete(
-                    f"{settings.foundation_identity_url}/sessions/current",
-                    headers={"Authorization": f"Bearer {access_token}"},
-                )
-        except httpx.HTTPError:
-            logger.info("logout: identity revoke failed (cookie cleared anyway)")
-
+    await _end_cookie_session(request)
     resp = Response(status_code=204)
     resp.delete_cookie(key=settings.cookie_name, path="/")
     return resp
@@ -556,7 +606,7 @@ async def me(request: Request) -> dict:
     """
     access_token = get_access_token()
     if not access_token:
-        raise AuthenticationError("Not authenticated")
+        raise_unauthenticated()
 
     settings = request.app.state.settings
     # Forward the same X-Tenant-Id / X-User-Id context every other
@@ -575,7 +625,7 @@ async def me(request: Request) -> dict:
             )
     except httpx.HTTPError as exc:
         logger.warning("me: identity unreachable", extra={"exc": str(exc)})
-        raise AuthenticationError("Identity service unavailable") from exc
+        raise ProxyError("identity", "unreachable") from exc
 
     if resp.status_code == 401:
         raise AuthenticationError("Session expired")
@@ -639,7 +689,7 @@ async def update_me(
             )
     except httpx.HTTPError as exc:
         logger.warning("update_me: identity unreachable", extra={"exc": str(exc)})
-        raise AuthenticationError("Identity service unavailable") from exc
+        raise ProxyError("identity", "unreachable") from exc
 
     if resp.status_code == 401:
         raise AuthenticationError("Session expired")
@@ -648,6 +698,8 @@ async def update_me(
     # raw JSON blob.
     _raise_for_upstream(resp)
 
+    # Pages that name the caller (an App's author, ...) show the new name now.
+    forget_display_name(tenant_id, user_id)
     # Enrich with the caller's effective permissions exactly like GET /auth/me,
     # so both /auth/me responses carry ``permissions`` and the SPA's
     # admin-gating doesn't break after a rename.
@@ -719,7 +771,7 @@ async def change_my_password(
         logger.warning(
             "change_my_password: identity unreachable", extra={"exc": str(exc)}
         )
-        raise AuthenticationError("Identity service unavailable") from exc
+        raise ProxyError("identity", "unreachable") from exc
 
     if resp.status_code == 401:
         raise AuthenticationError("Session expired")
@@ -770,7 +822,7 @@ async def list_auth_sessions(
             )
     except httpx.HTTPError as exc:
         logger.warning("auth/sessions: identity unreachable", extra={"exc": str(exc)})
-        raise AuthenticationError("Identity service unavailable") from exc
+        raise ProxyError("identity", "unreachable") from exc
 
     if resp.status_code == 401:
         raise AuthenticationError("Session expired")
@@ -819,7 +871,7 @@ async def list_mfa_methods(
             )
     except httpx.HTTPError as exc:
         logger.warning("mfa/methods: identity unreachable", extra={"exc": str(exc)})
-        raise AuthenticationError("Identity service unavailable") from exc
+        raise ProxyError("identity", "unreachable") from exc
 
     if resp.status_code == 401:
         raise AuthenticationError("Session expired")

@@ -1,4 +1,4 @@
-import type { Session } from '../../api/types';
+import type { TaskStatus } from '../../api/types';
 
 export type DesignStatus =
   | 'live'
@@ -8,7 +8,9 @@ export type DesignStatus =
   | 'paused'
   | 'queued'
   | 'idle'
-  | 'done';
+  | 'done'
+  | 'failed'
+  | 'cancelled';
 
 interface StatusConfig {
   c: string;
@@ -25,6 +27,8 @@ const STATUS_MAP: Record<DesignStatus, StatusConfig> = {
   done:     { c: '#2c8f5d', anim: false, l: 'done' },
   queued:   { c: '#75756f', anim: false, l: 'queued' },
   idle:     { c: '#75756f', anim: false, l: 'idle' },
+  failed:   { c: '#d23a1f', anim: false, l: 'failed' },
+  cancelled:{ c: '#75756f', anim: false, l: 'cancelled' },
 };
 
 export function StatusDot({
@@ -50,12 +54,15 @@ export function StatusDot({
   );
 }
 
-export function sessionToDesignStatus(s: Session['status']): DesignStatus {
+/** Task board status → dot. */
+export function taskToDesignStatus(s: TaskStatus): DesignStatus {
   switch (s) {
-    case 'ACTIVE':    return 'thinking';
-    case 'COMPLETED': return 'done';
-    case 'PAUSED':    return 'paused';
-    case 'ERROR':     return 'awaiting';
-    case 'ARCHIVED':  return 'idle';
+    case 'running':     return 'live';
+    case 'queued':      return 'queued';
+    case 'needs_input': return 'awaiting';
+    case 'completed':   return 'done';
+    case 'failed':      return 'failed';
+    case 'cancelled':   return 'cancelled';
+    case 'idle':        return 'idle';
   }
 }

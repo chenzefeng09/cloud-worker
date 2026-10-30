@@ -32,7 +32,7 @@ vi.mock('../stores/chatStore', () => ({
   useChatStore: (selector: (s: unknown) => unknown) =>
     selector({
       userProfile: {
-        id: 'usr_test',
+        user_id: 'usr_test',
         email: 'test@example.com',
         display_name: 'Test User',
         tenant_id: 'tnt_test',
@@ -61,7 +61,7 @@ vi.mock('../api/client', () => ({
       mfaMethods: () => mockMfaMethods(),
       logout: () => Promise.resolve(),
       sessions: () => mockAuthSessions(),
-      updateProfile: () => Promise.resolve({ id: 'usr_test', email: 'test@example.com', display_name: 'Test User', tenant_id: 'tnt_test', roles: [] }),
+      updateProfile: () => Promise.resolve({ user_id: 'usr_test', email: 'test@example.com', display_name: 'Test User', tenant_id: 'tnt_test', roles: [] }),
     },
     billing: {
       me: () => mockBillingMe(),
@@ -138,7 +138,7 @@ const NO_PLAN_RESPONSE = {
 describe('ProfilePage — billing & MFA wiring', () => {
   beforeEach(() => {
     mockAuthMe.mockResolvedValue({
-      id: 'usr_test',
+      user_id: 'usr_test',
       email: 'test@example.com',
       display_name: 'Test User',
       tenant_id: 'tnt_test',

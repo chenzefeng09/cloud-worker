@@ -288,6 +288,7 @@ def test_spawn_broker_egress_posts_broker_metadata_and_urls() -> None:
     assert env["WEB_FETCH_GATEWAY_URL"] == (
         "http://tool-broker:8024/api/tool-broker/v1/web-fetch/api/web-fetch/v1"
     )
+    assert env["DLP_FAILURE_MODE"] == "closed"
     # TOOL_BROKER_LEASE is a secret: it must NOT ride in the VM env, but be
     # delivered via the host-mounted .secrets.json instead (see the dedicated
     # secret-isolation tests).  Assert it's stripped from env and present in

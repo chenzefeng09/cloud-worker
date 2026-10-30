@@ -24,6 +24,7 @@ from agent_scheduler.api.v1.runs import (
     _revoke_run_virtual_keys,
 )
 from agent_scheduler.config import Settings
+from agent_scheduler.errors import LlmNotConfiguredError
 
 # Mirrors conftest._TENANT — the tenant header the gateway injects.
 _TENANT = "tnt_01J5TEST00000000000000TNT1"
@@ -242,6 +243,27 @@ async def test_mint_run_key_returns_none_on_404_older_gateway(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_mint_run_key_raises_when_tenant_has_no_provider(monkeypatch):
+    """The gateway's own 404 (a problem body with its code, unlike an older
+    gateway's bare 404) means the tenant has no enabled provider: no fallback
+    key could route a model call either."""
+    mock_client = _MockHTTPX(404, {
+        "status": 404,
+        "code": "FOUNDATION.LLM_GATEWAY.PROVIDER.NOT_FOUND",
+        "detail": "No enabled provider to bind ephemeral key for tenant='tnt_test'",
+    })
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: mock_client)
+
+    with pytest.raises(LlmNotConfiguredError):
+        await _mint_run_virtual_key(
+            settings=_gw_settings(),
+            tenant_id="tnt_test",
+            run_id="run_NOPROV",
+            bearer="tok",
+        )
+
+
+@pytest.mark.asyncio
 async def test_mint_run_key_returns_none_when_unreachable(monkeypatch):
     """Network error during mint → None (caller falls back to the tenant key)."""
 
@@ -377,6 +399,7 @@ def test_create_run_rejects_missing_virtual_key(
 
     assert resp.status_code == 502, resp.text
     assert resp.json()["detail"] == "LLM gateway virtual key unavailable for tenant"
+    assert resp.json()["code"] == "AGENT.SCHEDULER.LLM_GATEWAY_UNAVAILABLE"
     mock_docker_client.containers.run.assert_not_called()
 
 
@@ -570,6 +593,54 @@ def test_create_run_falls_back_to_tenant_key_when_mint_unavailable(
     assert secrets["LLM_VIRTUAL_KEY"] == "vk-tenant-FALLBACK"
 
 
+def test_create_run_refuses_tenant_without_llm_provider(
+    settings: Settings,
+    runtime,
+    mock_docker_client: MagicMock,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_headers: dict,
+) -> None:
+    """A tenant with no enabled provider gets a typed, non-retryable refusal,
+    not the gateway-outage 502, and no fallback to a long-lived key."""
+    from agent_scheduler.api.dependencies import get_runtime
+    from agent_scheduler.main import create_app
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        _make_minting_gateway_client(
+            mint_status=404,
+            mint_body={
+                "status": 404,
+                "code": "FOUNDATION.LLM_GATEWAY.PROVIDER.NOT_FOUND",
+                "detail": "No enabled provider to bind ephemeral key",
+            },
+            # A key bound to a since-disabled provider: it must not be used.
+            tenant_keys=[{"key": "vk-tenant-ORPHAN", "enabled": True}],
+        ),
+    )
+    mock_docker_client.containers.run.return_value = MagicMock(id="cid-noprov")
+
+    app = create_app(settings)
+    app.state.settings = settings
+    app.dependency_overrides[get_runtime] = lambda: runtime
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        resp = client.post(
+            "/api/scheduler/v1/runs",
+            headers=auth_headers,
+            json={
+                "session_id": "ses_01J5SES0000000000000NOP01",
+                "run_id": "run_01J5RUN0000000000000NOP01",
+                "task": "tenant without a provider",
+            },
+        )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "AGENT.SCHEDULER.LLM_NOT_CONFIGURED"
+    mock_docker_client.containers.run.assert_not_called()
+
+
 def test_create_run_rejects_when_gateway_down(
     settings: Settings,
     runtime,
@@ -626,4 +697,5 @@ def test_create_run_rejects_when_gateway_down(
 
     assert resp.status_code == 502, resp.text
     assert resp.json()["detail"] == "LLM gateway virtual key unavailable for tenant"
+    assert resp.json()["code"] == "AGENT.SCHEDULER.LLM_GATEWAY_UNAVAILABLE"
     mock_docker_client.containers.run.assert_not_called()

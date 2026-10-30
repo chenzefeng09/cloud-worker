@@ -34,16 +34,17 @@ import logging
 import re
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import suppress
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
 from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId
 from agent_session_orchestrator.api.dlp_guard import scan_and_tag
+from agent_session_orchestrator.api.ownership import require_session_owner
 from agent_session_orchestrator.domain.db import get_session as acquire_db_session
 from agent_session_orchestrator.domain.models import Run
 from agent_session_orchestrator.schemas.common import CursorPage
@@ -55,6 +56,9 @@ logger = logging.getLogger(__name__)
 
 _POLL_INTERVAL_SECONDS = 1.0
 _MAX_POLLS = 300  # 5 minutes wall-clock at 1 s/poll
+# Message rows the session stream sends per poll: pages × page size.
+_STREAM_MESSAGE_PAGE_SIZE = 200
+_STREAM_MESSAGE_MAX_PAGES = 10
 _MAX_TOOL_TEXT_CHARS = 8000
 # Grace window for the FIRST token when tailing an active run.  The agent worker
 # runs in a freshly-spawned Docker container that cold-starts (pull/import/model
@@ -79,12 +83,34 @@ _RUN_STATUS_RECHECK_READS = 5  # recheck run status every ~5s of idle
 _SANDBOX_GONE_GRACE_SECONDS = 30 * 60  # 30 minutes
 
 
+_TERMINAL_RUN_STATUSES = ("COMPLETED", "FAILED", "CANCELLED")
+# ``end`` marker ``status`` (worker vocabulary) → run status.  Anything else,
+# including a marker without a status, means the worker finished normally.
+_END_MARKER_RUN_STATUS = {"completed": "COMPLETED", "failed": "FAILED", "cancelled": "CANCELLED"}
+# Longest worker error detail copied into the transcript's failure note.
+_FAILURE_NOTE_MAX_CHARS = 300
+# A stored dispatch payload must outlive the paused blob it resumes (7 days).
+_RUN_DISPATCH_TTL_SECONDS = 8 * 24 * 3600
+# TTL for a token stream the orchestrator had to recreate (the worker's is 30 min).
+_RUN_STREAM_FALLBACK_TTL_SECONDS = 1800
+
+
 def _run_token_stream_key(run_id: str) -> str:
     return f"agent:run:{run_id}:tokens"
 
 
 def _run_canvas_key(run_id: str) -> str:
     return f"agent:run:{run_id}:canvas"
+
+
+def _run_dispatch_key(run_id: str) -> str:
+    """The scheduler payload a run was started with, replayed on HITL resume."""
+    return f"agent:run:{run_id}:dispatch"
+
+
+def _run_paused_key(run_id: str) -> str:
+    """The worker's HITL pause blob (prompt + agent_state), consumed on resume."""
+    return f"agent:run:{run_id}:paused"
 
 
 # ── Canvas materialization guard (canvas v2, Phase B) ─────────────────────────
@@ -230,6 +256,38 @@ def _sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+async def _messages_after(
+    svc: SessionService, session_id: str, after_seq: int, anchor_id: str | None = None,
+) -> list[Any] | None:
+    """Messages persisted after ``after_seq``, oldest first.
+
+    Follows the cursor (bounded per call) so a long reply or a reconnect is
+    never cut at one page; rows past the bound go out on the next poll.
+
+    ``anchor_id`` is the row the caller last saw at ``after_seq``.  When it is
+    no longer there, the transcript was rewound (rows deleted and their
+    sequences reused) and ``None`` is returned: rows after ``after_seq`` would
+    skip the replacements.
+    """
+    anchored = bool(anchor_id) and after_seq > 0
+    start = after_seq - 1 if anchored else after_seq
+    rows: list[Any] = []
+    cursor = str(start) if start else None
+    for _ in range(_STREAM_MESSAGE_MAX_PAGES):
+        items, next_cursor = await svc.list_messages(
+            session_id, cursor=cursor, limit=_STREAM_MESSAGE_PAGE_SIZE,
+        )
+        rows.extend(items)
+        if not next_cursor:
+            break
+        cursor = next_cursor
+    if anchored:
+        if not rows or rows[0].sequence != after_seq or rows[0].id != anchor_id:
+            return None
+        rows = rows[1:]
+    return rows
+
+
 async def _stream_tokens(
     *,
     redis_url: str,
@@ -237,6 +295,7 @@ async def _stream_tokens(
     deadline: float,
     wait_for_worker: bool = False,
     is_run_active: Callable[[], Awaitable[bool]] | None = None,
+    outcome: dict[str, Any] | None = None,
 ) -> AsyncGenerator[str, None]:
     """Tail a run token stream from Redis and yield frontend SSE events.
 
@@ -263,6 +322,16 @@ async def _stream_tokens(
     ``is_run_active`` is an optional async predicate returning ``True`` while the
     run is still RUNNING/PENDING.  When ``None`` (e.g. terminal replay calls) the
     active-run recheck path is simply not used.
+
+    HITL pauses: a ``pending_*`` entry (or an ``end`` marker with
+    ``status=paused``) means the worker stopped to wait for the user, so the
+    first empty read after it ends the tail.  A resumed run keeps writing to the
+    same stream after the ``pending_resolved`` entry ``respond_run`` appends, so
+    a replay from ``0-0`` walks through resolved pauses and carries on.
+
+    ``outcome``, when given, is filled with how the tail ended: ``paused``
+    (waiting for input), ``ended`` (a final ``end`` marker was read) and
+    ``status`` (that marker's ``status``; ``""`` when absent).
     """
     try:
         import redis.asyncio as aioredis  # type: ignore[import-not-found]
@@ -280,15 +349,24 @@ async def _stream_tokens(
     stream_key = _run_token_stream_key(run_id)
     last_id = "0-0"
     saw_entry = False
-    saw_pending = False
+    # Tool-call ids of HITL prompts not yet answered, plus a pause seen only
+    # through ``end{status: paused}``.  Either one means the run is waiting.
+    open_pending: set[str] = set()
+    pause_marker = False
     idle_reads = 0
     stream_ended = False
+    end_status = ""
     started_at = asyncio.get_event_loop().time()
     try:
         while asyncio.get_event_loop().time() < deadline:
             batches = await client.xread({stream_key: last_id}, block=1000, count=100)
             if not batches:
                 idle_reads += 1
+                if open_pending or pause_marker:
+                    # Paused for HITL input: nothing more arrives until the
+                    # user responds, so stop tailing (the caller emits
+                    # run_paused and picks the run up again on resume).
+                    break
                 if saw_entry:
                     if wait_for_worker:
                         # Active run: silence is the model thinking between tool
@@ -353,7 +431,14 @@ async def _stream_tokens(
                     # streamed text).  With ``offset`` the client drops any event
                     # whose offset it has already applied for this run.
                     if entry_type == "end":
+                        marker_status = str(entry.get("status") or "")
+                        if marker_status == "paused":
+                            # Pause boundary, not the end: a resumed run keeps
+                            # appending to this stream.
+                            pause_marker = True
+                            continue
                         stream_ended = True
+                        end_status = marker_status
                         break
                     if entry_type == "delta":
                         text = entry.get("text") or ""
@@ -404,7 +489,7 @@ async def _stream_tokens(
                     elif entry_type == "pending_confirmation":
                         # HITL: worker paused waiting for user to confirm a tool call.
                         # Relay verbatim so the frontend can render the confirmation card.
-                        saw_pending = True
+                        open_pending.add(str(entry.get("tool_call_id") or ""))
                         yield _sse(
                             "pending_confirmation",
                             {
@@ -416,7 +501,7 @@ async def _stream_tokens(
                         )
                     elif entry_type == "pending_question":
                         # HITL: worker paused waiting for a free-text answer.
-                        saw_pending = True
+                        open_pending.add(str(entry.get("tool_call_id") or ""))
                         yield _sse(
                             "pending_question",
                             {
@@ -424,6 +509,20 @@ async def _stream_tokens(
                                 "tool_call_id": entry.get("tool_call_id") or "",
                                 "question": entry.get("question") or "",
                             },
+                        )
+                    elif entry_type == "pending_resolved":
+                        # Written by respond_run when the user answered: the
+                        # card is settled, so other tabs (and replays) drop it.
+                        resolved_id = str(entry.get("tool_call_id") or "")
+                        if resolved_id:
+                            open_pending.discard(resolved_id)
+                        else:
+                            open_pending.clear()
+                        if not open_pending:
+                            pause_marker = False
+                        yield _sse(
+                            "pending_resolved",
+                            {"run_id": run_id, "tool_call_id": resolved_id, "offset": last_id},
                         )
                 if stream_ended:
                     # `end` entry consumed in the inner loop — stop the outer
@@ -436,7 +535,10 @@ async def _stream_tokens(
         # the run paused for HITL input — this lets the caller decide
         # paused-vs-complete without waiting on scheduler lag, and gives
         # replay-only connections a clean stream terminator.
-        yield _sse("run_stream_end", {"run_id": run_id, "paused": saw_pending})
+        paused = bool(open_pending) or pause_marker
+        if outcome is not None:
+            outcome.update(paused=paused, ended=stream_ended, status=end_status)
+        yield _sse("run_stream_end", {"run_id": run_id, "paused": paused})
     except Exception as exc:  # noqa: BLE001
         logger.warning("Redis token stream read failed: %s", exc)
         return
@@ -467,6 +569,8 @@ async def _read_ordered_blocks_from_redis(
     blocks: list[dict[str, Any]] = []
     text_parts: list[str] = []
     tools_by_id: dict[str, dict[str, Any]] = {}
+    # Whether a tool block's ``input`` came from args that parsed as JSON.
+    args_parsed: dict[str, bool] = {}
 
     def flush_text() -> None:
         if text_parts:
@@ -481,19 +585,30 @@ async def _read_ordered_blocks_from_redis(
             entry = _coerce_redis_entry(raw_entry)
             entry_type = entry.get("type")
             if entry_type == "end":
+                if str(entry.get("status") or "") == "paused":
+                    # HITL pause boundary: the resumed leg appends after it.
+                    # The user's decision sits between the two legs' text.
+                    flush_text()
+                    continue
                 break
             if entry_type == "delta":
                 text_parts.append(str(entry.get("text") or ""))
                 continue
             if entry_type == "thinking":
-                # Legacy whole-block thinking event (pre-streaming).
+                # Whole-block thinking event (a block that was not streamed).
+                # It arrives with the finished message, after that message's
+                # streamed text, but belongs above it — so the pending text is
+                # deliberately not flushed first.
                 text = str(entry.get("text") or "")
                 if text:
                     blocks.append({"kind": "thinking", "text": text})
                 continue
             if entry_type == "thinking_delta":
                 # Incremental thinking token — accumulate into a single
-                # thinking block during finalize (same as delta→text).
+                # thinking block during finalize (same as delta→text).  Deltas
+                # arrive in true order, so text streamed before them (an
+                # earlier turn) stays ahead of them.
+                flush_text()
                 if not blocks or blocks[-1].get("kind") != "thinking":
                     blocks.append({"kind": "thinking", "text": ""})
                 blocks[-1]["text"] += str(entry.get("text") or "")
@@ -508,8 +623,20 @@ async def _read_ordered_blocks_from_redis(
                         parsed_args if isinstance(parsed_args, dict)
                         else {"value": parsed_args}
                     )
+                    parsed_ok = True
                 except Exception:  # noqa: BLE001
                     input_payload = {"value": str(args)}
+                    parsed_ok = False
+
+                existing = tools_by_id.get(tool_call_id) if tool_call_id else None
+                if existing is not None:
+                    # The same call reported twice (e.g. streamed, then again
+                    # from the final message): keep one block, and prefer the
+                    # args that parse over a partial or doubled stream.
+                    if parsed_ok and not args_parsed.get(tool_call_id):
+                        existing["input"] = input_payload
+                        args_parsed[tool_call_id] = True
+                    continue
 
                 block = {
                     "kind": "tool",
@@ -520,6 +647,7 @@ async def _read_ordered_blocks_from_redis(
                     "state": None,
                 }
                 tools_by_id[tool_call_id] = block
+                args_parsed[tool_call_id] = parsed_ok
                 blocks.append(block)
                 continue
             if entry_type == "tool_result":
@@ -550,6 +678,11 @@ async def _read_ordered_blocks_from_redis(
             await client.aclose()
 
 
+# How much of a finished run a memory keeps, word for word.
+_MEMORY_TASK_CHARS = 300
+_MEMORY_ANSWER_CHARS = 600
+
+
 async def _write_memory(
     *,
     knowledge_ingest_url: str,
@@ -561,15 +694,20 @@ async def _write_memory(
 ) -> None:
     """Write a memory document to knowledge-ingest after run completion.
 
-    The document is a brief Q&A pair: user task + assistant summary.  It is
+    The document is a Q&A pair copied verbatim: the start of the user's request
+    and of the agent's final answer.  It is
     uploaded as ``text/plain``, then immediately ingested (embedded) so it
     becomes searchable.  Failure-open: any error is logged at DEBUG level
     and the caller is not affected.
 
-    ``user_id`` must be the real originating user (``usr_...``) — knowledge-
-    ingest's authz guard is fail-closed and rejects the ``SYSTEM`` sentinel,
-    which used to make this write silently 403.  Callers resolve the session
-    owner when they only hold a system identity.
+    ``user_id`` must be the real originating user (``usr_...``): it becomes the
+    memory's owner (``origin_user_id``), which keeps the document private to
+    them, so a write without one is dropped.  Callers resolve the session owner
+    when they only hold a system identity.  The write is the platform's, not
+    the user's, so it goes as ``X-Actor: ADMIN`` like the orchestrator's other
+    knowledge-ingest calls — the user's own role usually lacks
+    ``document.create`` (tenant knowledge uploads are admin-only), which used
+    to make the write a silent 403 for every ordinary member.
 
     ``session_id`` is stamped onto the document as ``origin_session_id`` so the
     memory pre-fetch (``_fetch_memory``) can exclude this session's own prior-turn
@@ -582,9 +720,12 @@ async def _write_memory(
     """
     if not (knowledge_ingest_url and task_description and summary):
         return
-    # Truncate to keep the document small.
-    snippet_task = task_description[:300].strip()
-    snippet_summary = summary[:600].strip()
+    if not user_id or user_id == "SYSTEM":
+        return
+    # A verbatim excerpt, not a summary: the privacy notice (BFF
+    # ``_DEFAULT_PRIVACY_PURPOSES``) and the web Memory copy say so.
+    snippet_task = task_description[:_MEMORY_TASK_CHARS].strip()
+    snippet_summary = summary[:_MEMORY_ANSWER_CHARS].strip()
     content = f"User task: {snippet_task}\n\nAssistant answer: {snippet_summary}"
     title = f"[memory] {snippet_task[:80]}"
 
@@ -594,7 +735,7 @@ async def _write_memory(
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            headers = {"X-Tenant-Id": tenant_id, "X-User-Id": user_id}
+            headers = {"X-Tenant-Id": tenant_id, "X-User-Id": user_id, "X-Actor": "ADMIN"}
             upload_resp = await client.post(
                 f"{knowledge_ingest_url}/documents",
                 headers=headers,
@@ -650,11 +791,7 @@ async def _replay_run_blocks_into_messages(
 
     ``redis_url`` must be truthy; callers gate on it before invoking.
     """
-    existing_messages, _ = await svc.list_messages(run.session_id, limit=200)
-    already_persisted_for_run = any(
-        m.run_id == run.id and (m.role or "").lower() in {"assistant", "tool", "thinking"}
-        for m in existing_messages
-    )
+    already_persisted_for_run = await svc.run_has_output(run.session_id, run.id)
     persisted_from_stream = False
     if already_persisted_for_run:
         return persisted_from_stream, already_persisted_for_run
@@ -727,23 +864,28 @@ async def _replay_run_blocks_into_messages(
     return persisted_from_stream, already_persisted_for_run
 
 
-async def _redis_stream_has_end_marker(
+async def _redis_stream_end_state(
     *,
     redis_url: str,
     run_id: str,
-) -> bool:
-    """Return True iff the run's token stream contains a ``type=end`` entry.
+) -> tuple[str | None, str | None]:
+    """Return ``(end_status, worker_error)`` read from the run's token stream.
 
-    The worker pushes exactly one authoritative ``type=end`` marker as the last
-    stream entry of a *normal* completion (``push_token_end`` in the runtime
-    worker's ``redis_state``).  On an HITL pause it deliberately pushes NO
-    ``end`` marker — only ``pending_confirmation`` / ``pending_question``
-    entries.  So the presence of ``end`` is a reliable "the worker finished
-    normally" signal, which lets the 404 branch of ``_reconcile_run_completion``
-    tell a completed-but-sandbox-pruned run apart from a paused one.
+    ``end_status`` is how the worker's latest leg finished:
 
-    Failure-open: any connect/read error returns ``False`` (caller then falls
-    through to the grace-window logic, never mis-marking COMPLETED).
+    * ``None`` — no final ``end`` marker (still running, or the worker died).
+    * ``"paused"`` — waiting for HITL input: an unanswered ``pending_*``
+      entry, or an ``end`` marker with ``status=paused`` that no later entry
+      (``pending_resolved``, the resumed leg's output) has superseded.
+    * the final marker's ``status`` otherwise — ``"completed"``, ``"failed"``,
+      ``"cancelled"``, or ``""`` from a worker that does not report one.
+
+    ``worker_error`` is the message of the last ``type=error`` entry, if any.
+    This lets the 404 branch of ``_reconcile_run_completion`` finalize a run
+    whose sandbox was pruned with the status the worker actually reached.
+
+    Failure-open: any connect/read error returns ``(None, None)`` (the caller
+    falls through to the grace-window logic, never mis-marking COMPLETED).
     """
     try:
         import redis.asyncio as aioredis  # type: ignore[import-not-found]
@@ -756,20 +898,174 @@ async def _redis_stream_has_end_marker(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Redis end-marker connect failed: %s", exc)
-        return False
+        return None, None
 
     try:
         entries = await client.xrange(_run_token_stream_key(run_id), min="-", max="+")
+        state: str | None = None
+        worker_error: str | None = None
+        open_pending: set[str] = set()
         for _entry_id, raw_entry in entries:
-            if _coerce_redis_entry(raw_entry).get("type") == "end":
-                return True
-        return False
+            entry = _coerce_redis_entry(raw_entry)
+            entry_type = entry.get("type")
+            if entry_type == "end":
+                state = str(entry.get("status") or "")
+                if state != "paused":
+                    break
+                continue
+            if entry_type == "error":
+                worker_error = str(entry.get("message") or "") or worker_error
+            elif entry_type in ("pending_confirmation", "pending_question"):
+                open_pending.add(str(entry.get("tool_call_id") or ""))
+            elif entry_type == "pending_resolved":
+                resolved_id = str(entry.get("tool_call_id") or "")
+                if resolved_id:
+                    open_pending.discard(resolved_id)
+                else:
+                    open_pending.clear()
+            if state == "paused":
+                # Anything after a pause marker belongs to the resumed leg.
+                state = None
+        if state is None and open_pending:
+            state = "paused"
+        return state, worker_error
     except Exception as exc:  # noqa: BLE001
         logger.warning("Redis end-marker read failed: %s", exc)
-        return False
+        return None, None
     finally:
         with suppress(Exception):
             await client.aclose()
+
+
+def _redis_client(redis_url: str) -> Any:
+    import redis.asyncio as aioredis
+
+    return aioredis.Redis.from_url(
+        redis_url, socket_connect_timeout=2, socket_timeout=2, decode_responses=True,
+    )
+
+
+async def _append_run_stream_event(
+    *, redis_url: str | None, run_id: str, fields: dict[str, str],
+) -> bool:
+    """XADD an orchestrator-side entry (``pending_resolved``, ``end``) to a run's stream.
+
+    The worker owns the stream's TTL; if the key is gone (expired) the XADD
+    recreates it, so give it a TTL then rather than leak it.  Best-effort:
+    returns ``False`` when Redis is unconfigured or unreachable.
+    """
+    if not redis_url:
+        return False
+    key = _run_token_stream_key(run_id)
+    try:
+        client = _redis_client(redis_url)
+        try:
+            await client.xadd(key, fields)
+            if await client.ttl(key) < 0:
+                await client.expire(key, _RUN_STREAM_FALLBACK_TTL_SECONDS)
+            return True
+        finally:
+            with suppress(Exception):
+                await client.aclose()
+    except Exception as exc:  # noqa: BLE001 — readers also recheck run status
+        logger.warning("run stream append failed for %s: %s", run_id, exc)
+        return False
+
+
+async def _store_run_dispatch(
+    *, redis_url: str | None, run_id: str, payload: dict[str, Any],
+) -> None:
+    """Keep the scheduler payload a run started with, for a later HITL resume.
+
+    A resume re-dispatches a fresh sandbox, which needs the original model,
+    skills, MCP selection, files, history, memory and prompt — without them
+    the resumed agent runs on defaults.  Best-effort: a missing payload makes
+    the resume fall back to a minimal one.
+    """
+    if not redis_url:
+        return
+    try:
+        client = _redis_client(redis_url)
+        try:
+            await client.set(
+                _run_dispatch_key(run_id),
+                json.dumps(payload, ensure_ascii=False),
+                ex=_RUN_DISPATCH_TTL_SECONDS,
+            )
+        finally:
+            with suppress(Exception):
+                await client.aclose()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("storing dispatch payload failed for %s: %s", run_id, exc)
+
+
+async def _load_run_dispatch(*, redis_url: str | None, run_id: str) -> dict[str, Any] | None:
+    """The payload ``_store_run_dispatch`` kept, or ``None`` (absent / unreadable)."""
+    if not redis_url:
+        return None
+    try:
+        client = _redis_client(redis_url)
+        try:
+            raw = await client.get(_run_dispatch_key(run_id))
+        finally:
+            with suppress(Exception):
+                await client.aclose()
+        payload = json.loads(raw) if raw else None
+        return payload if isinstance(payload, dict) else None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("loading dispatch payload failed for %s: %s", run_id, exc)
+        return None
+
+
+async def _delete_run_keys(*, redis_url: str | None, keys: list[str]) -> None:
+    """Best-effort DELETE of per-run Redis keys (they expire on their own)."""
+    if not redis_url or not keys:
+        return
+    try:
+        client = _redis_client(redis_url)
+        try:
+            await client.delete(*keys)
+        finally:
+            with suppress(Exception):
+                await client.aclose()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("run key cleanup failed for %s: %s", keys, exc)
+
+
+async def _forget_run_dispatch(*, redis_url: str | None, run_id: str) -> None:
+    """Drop a finished run's stored dispatch payload.
+
+    It carries the run's history, memory and prompt, and is only needed to
+    resume a paused run — once the run is terminal it is dead weight holding
+    personal data until its TTL.
+    """
+    await _delete_run_keys(redis_url=redis_url, keys=[_run_dispatch_key(run_id)])
+
+
+def _failure_note(detail: str | None) -> str:
+    """The transcript line recording why a run failed (first line, bounded)."""
+    lines = (detail or "").strip().splitlines()
+    text = lines[0].strip() if lines else ""
+    if len(text) > _FAILURE_NOTE_MAX_CHARS:
+        text = text[:_FAILURE_NOTE_MAX_CHARS].rstrip() + "…"
+    return f"The run failed: {text}" if text else "The run failed before it could finish."
+
+
+async def _record_run_failure(*, svc: SessionService, run: Run, detail: str | None) -> None:
+    """Persist a system message saying the run failed.
+
+    Without it a failed chat run just stops: the UI shows whatever partial
+    output was saved and nothing explains why.  Mirrors the "Task cancelled"
+    row a cancel writes.  Callers hold the run's terminal claim, so this runs
+    once per run.
+    """
+    await svc.create_message(
+        session_id=run.session_id,
+        role="system",
+        content=_failure_note(detail),
+        tool_calls=None,
+        run_id=run.id,
+    )
 
 
 async def _read_canvas_payloads_from_redis(
@@ -994,9 +1290,14 @@ async def _reconcile_run_completion(
 
     Best-effort: scheduler errors are logged and treated as "still running"
     so the next poll retries.
+
+    Every status change goes through ``svc.claim_run_transition`` — several
+    reconcilers can race on one run, and only the one that wins the
+    conditional UPDATE persists the reply, artifacts and memory.  A loser
+    returns the status the winner (or a cancel / resume) left on the row.
     """
     if not run.sandbox_id or run.status not in ("RUNNING", "PENDING"):
-        return run.status in ("COMPLETED", "FAILED", "CANCELLED"), []
+        return run.status in _TERMINAL_RUN_STATUSES, []
 
     # Scheduler's ``GET /runs/{id}`` uses the path segment as the Docker
     # container id (its ``sandbox_id``), falling back to ``run_id`` only
@@ -1021,49 +1322,62 @@ async def _reconcile_run_completion(
     # re-hits the same 404 and gives up too).  We resolve the run definitively
     # instead of treating 404 as "still running":
     #
-    #   1. Token stream carries an ``end`` marker  → the worker DID finish
-    #      normally before the sandbox vanished. Replay the ordered blocks into
-    #      durable message rows (same path as a 200-COMPLETED) and mark
-    #      COMPLETED. The scheduler-only fields (result_summary/usage/artifacts)
-    #      are simply unavailable here, so they stay None/absent.
-    #   2. No ``end`` marker, run older than the grace window → the sandbox is
+    #   1. The stream is waiting on an unanswered HITL prompt → the worker
+    #      paused and its container was reaped.  Mark PAUSED; respond_run
+    #      resumes it in a fresh sandbox from the paused blob.
+    #   2. The stream carries a final ``end`` marker → the worker DID finish
+    #      before the sandbox vanished. Replay the ordered blocks into durable
+    #      message rows (same path as a 200-COMPLETED) and take the marker's
+    #      status (COMPLETED unless it says failed / cancelled). The
+    #      scheduler-only fields (result_summary/usage/artifacts) are simply
+    #      unavailable here, so they stay None/absent.
+    #   3. No ``end`` marker, run older than the grace window → the sandbox is
     #      genuinely gone with no completion recorded. Mark FAILED so the run
     #      stops hanging.
-    #   3. No ``end`` marker, run still within the grace window → a 404 can be
+    #   4. No ``end`` marker, run still within the grace window → a 404 can be
     #      momentary right after spawn (container id registered a beat late), so
     #      keep treating it as still-running and retry on the next poll.
-    #
-    # Only an explicit ``end`` marker takes the COMPLETED path: an HITL pause
-    # writes NO ``end`` marker (only pending_* entries), so a paused run whose
-    # sandbox was pruned correctly falls through to the grace/FAILED logic and
-    # is never mis-marked COMPLETED.
     if resp.status_code == 404:
-        has_end = bool(redis_url) and await _redis_stream_has_end_marker(
-            redis_url=redis_url,
-            run_id=run.id,
+        end_status, worker_error = (
+            await _redis_stream_end_state(redis_url=redis_url, run_id=run.id)
+            if redis_url
+            else (None, None)
         )
-        if has_end:
+        if end_status == "paused":
+            if await svc.claim_run_transition(run, to_status="PAUSED"):
+                run.status = "PAUSED"
+                logger.info(
+                    "sandbox gone (404) while paused for input; set status=PAUSED",
+                    extra={"run_id": run.id},
+                )
+            return run.status in _TERMINAL_RUN_STATUSES, []
+        if end_status is not None and redis_url:
+            final_status = _END_MARKER_RUN_STATUS.get(end_status, "COMPLETED")
+            if not await svc.claim_run_transition(run, to_status=final_status):
+                return run.status in _TERMINAL_RUN_STATUSES, []
             logger.info(
                 "sandbox gone (404) but token stream has end marker; "
-                "finalizing run as COMPLETED from Redis replay",
-                extra={"run_id": run.id},
+                "finalizing run from Redis replay",
+                extra={"run_id": run.id, "status": final_status},
             )
-            # Replay the ordered blocks into durable rows (idempotent via the
-            # helper's already_persisted_for_run guard).  There is no scheduler
-            # ``summary`` fallback on this path, so the helper's return values
-            # are not needed — the replayed rows ARE the reply.
+            # Replay the ordered blocks into durable rows.  There is no
+            # scheduler ``summary`` fallback on this path, so the helper's
+            # return values are not needed — the replayed rows ARE the reply.
             await _replay_run_blocks_into_messages(
                 run=run,
                 svc=svc,
                 tenant_id=tenant_id,
-                redis_url=redis_url,  # non-empty (gated by has_end above)
+                redis_url=redis_url,  # non-empty (gated above)
                 dlp_url=dlp_url,
             )
-            run.status = "COMPLETED"
+            run.status = final_status
             run.finished_at = dt.datetime.now(tz=dt.UTC)
             # Scheduler-only fields are unavailable once the sandbox is gone.
             run.result_summary = None
-            run.error_message = None
+            run.error_message = worker_error if final_status == "FAILED" else None
+            if final_status == "FAILED":
+                await _record_run_failure(svc=svc, run=run, detail=worker_error)
+            await _forget_run_dispatch(redis_url=redis_url, run_id=run.id)
             return True, []
 
         # No end marker: decide FAILED vs. keep-waiting on the run's age.  Both
@@ -1077,6 +1391,8 @@ async def _reconcile_run_completion(
             (now - reference).total_seconds() if reference is not None else None
         )
         if age_seconds is not None and age_seconds >= _SANDBOX_GONE_GRACE_SECONDS:
+            if not await svc.claim_run_transition(run, to_status="FAILED"):
+                return run.status in _TERMINAL_RUN_STATUSES, []
             logger.warning(
                 "sandbox gone (404), no end marker, past grace window; "
                 "marking run FAILED",
@@ -1092,6 +1408,15 @@ async def _reconcile_run_completion(
                 "sandbox no longer exists (scheduler returned 404); "
                 "marked FAILED by reconcile"
             )
+            if redis_url:
+                # Keep whatever the worker streamed before it vanished.
+                await _replay_run_blocks_into_messages(
+                    run=run, svc=svc, tenant_id=tenant_id, redis_url=redis_url, dlp_url=dlp_url,
+                )
+            await _record_run_failure(
+                svc=svc, run=run, detail=worker_error or "its sandbox stopped responding",
+            )
+            await _forget_run_dispatch(redis_url=redis_url, run_id=run.id)
             return True, []
 
         # Within the grace window — a transient 404 is plausible; retry later.
@@ -1129,29 +1454,35 @@ async def _reconcile_run_completion(
     )
     if sched_status in ("COMPLETED", "FAILED") and (worker_status == "paused"):
         # Worker paused — set PAUSED, do NOT write assistant message, NOT terminal.
-        run.status = "PAUSED"
-        logger.info(
-            "run paused (HITL): set status=PAUSED",
-            extra={"run_id": run.id},
-        )
-        return False, plan_steps
+        if await svc.claim_run_transition(run, to_status="PAUSED"):
+            run.status = "PAUSED"
+            # The usage so far: it stands even if the run is never resumed.
+            await svc.raise_run_usage(run, payload.get("usage"))
+            logger.info(
+                "run paused (HITL): set status=PAUSED",
+                extra={"run_id": run.id},
+            )
+        return run.status in _TERMINAL_RUN_STATUSES, plan_steps
 
     if sched_status not in ("COMPLETED", "FAILED"):
         # Run is still in progress; surface plan_steps to the SSE caller.
         return False, plan_steps
 
+    if not await svc.claim_run_transition(run, to_status=sched_status):
+        # Another reconciler (or a cancel / resume) already moved this run on;
+        # it owns the side effects below.
+        return run.status in _TERMINAL_RUN_STATUSES, plan_steps
+
     summary = payload.get("result_summary")
     error = payload.get("result_error")
     artifacts = payload.get("artifacts") or []
-    usage = payload.get("usage") or {}
 
     run.status = sched_status
     run.result_summary = summary
     run.error_message = error
     run.finished_at = dt.datetime.now(tz=dt.UTC)
-    run.input_tokens = usage.get("input_tokens")
-    run.output_tokens = usage.get("output_tokens")
-    run.total_tokens = usage.get("total_tokens")
+    # The worker reports the whole run's usage, earlier legs included.
+    await svc.raise_run_usage(run, payload.get("usage"))
 
     persisted_from_stream = False
     already_persisted_for_run = False
@@ -1188,6 +1519,10 @@ async def _reconcile_run_completion(
                 resource_id=msg.id,
             )
 
+    if sched_status == "FAILED":
+        await _record_run_failure(svc=svc, run=run, detail=error)
+    await _forget_run_dispatch(redis_url=redis_url, run_id=run.id)
+
     # Persist artifact metadata as output attachments (kind=output).
     # Failure-open: any error is logged; run completion is not affected.
     if artifacts:
@@ -1221,13 +1556,16 @@ async def _reconcile_run_completion(
                 )
                 all_evicted = [k for r in results for k in r.pop("evicted_blobs", [])]
                 if all_evicted:
-                    blob_store = getattr(svc._db, "_blob_store", None)
-                    for key in all_evicted:
-                        try:
-                            if blob_store:
-                                blob_store.delete(key)
-                        except Exception:  # noqa: BLE001
-                            pass
+                    # Evicted version blobs can still back the current file (a
+                    # restore shares keys), so delete only unreferenced ones,
+                    # via the app blob store — the DB session never had one.
+                    from agent_session_orchestrator.services.privacy_service import (
+                        delete_unreferenced_blobs,
+                    )
+
+                    await delete_unreferenced_blobs(
+                        svc._db, tenant_id=tenant_id, keys=all_evicted,
+                    )
                 logger.info(
                     "writeback processed: %d file(s) for run %s",
                     len(results), run.id,
@@ -1259,14 +1597,19 @@ async def _reconcile_run_completion(
                     "memory write: could not resolve session owner for %s",
                     run.session_id,
                 )
-        await _write_memory(
-            knowledge_ingest_url=knowledge_ingest_url,
-            tenant_id=tenant_id,
-            user_id=memory_user_id,
-            task_description=run.task_description or "",
-            summary=summary,
-            session_id=run.session_id,
-        )
+        # GDPR opt-out: the owner may have disabled long-term memory.  The
+        # lookup is fail-closed (an error or the SYSTEM sentinel → no write).
+        from agent_session_orchestrator.services.privacy_service import memory_enabled_for
+
+        if await memory_enabled_for(svc._db, tenant_id=tenant_id, user_id=memory_user_id):
+            await _write_memory(
+                knowledge_ingest_url=knowledge_ingest_url,
+                tenant_id=tenant_id,
+                user_id=memory_user_id,
+                task_description=run.task_description or "",
+                summary=summary,
+                session_id=run.session_id,
+            )
 
     return True, plan_steps
 
@@ -1336,14 +1679,17 @@ async def _persist_artifacts(
 
 
 @router.get("/sessions/{session_id}/messages", response_model=CursorPage,
-            dependencies=[Depends(require_permission("session.message.read", "session"))])
+            dependencies=[
+                Depends(require_permission("session.message.read", "session")),
+                Depends(require_session_owner),
+            ])
 async def list_messages(
     session_id: str,
     request: Request,
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     cursor: str | None = None,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=500),
 ) -> CursorPage:
     svc = SessionService(db, tenant_id=tenant_id)
     # Opportunistically reconcile any RUNNING run on the session before
@@ -1388,7 +1734,10 @@ async def list_messages(
 
 
 @router.post("/sessions/{session_id}/messages", status_code=201, response_model=MessageOut,
-             dependencies=[Depends(require_permission("session.message.create", "session"))])
+             dependencies=[
+                 Depends(require_permission("session.message.create", "session")),
+                 Depends(require_session_owner),
+             ])
 async def create_message(
     session_id: str,
     body: MessageCreate,
@@ -1408,7 +1757,10 @@ async def create_message(
 
 
 @router.delete("/sessions/{session_id}/messages",
-               dependencies=[Depends(require_permission("session.message.delete", "session"))])
+               dependencies=[
+                   Depends(require_permission("session.message.delete", "session")),
+                   Depends(require_session_owner),
+               ])
 async def delete_messages_from_sequence(
     session_id: str,
     from_sequence: int,
@@ -1427,14 +1779,26 @@ async def delete_messages_from_sequence(
 
 @router.get(
     "/sessions/{session_id}/stream",
-    dependencies=[Depends(require_permission("session.message.read", "session"))],
+    dependencies=[
+        Depends(require_permission("session.message.read", "session")),
+        Depends(require_session_owner),
+    ],
 )
 async def stream_session(
     session_id: str,
     request: Request,
     tenant_id: str = TTenantId,
+    after: Annotated[int | None, Query(ge=0)] = None,
+    after_id: Annotated[str | None, Query(max_length=64)] = None,
 ) -> StreamingResponse:
     """Session-scoped multiplexing SSE stream (Phase 1.2).
+
+    ``after`` is the highest message sequence the client already holds and
+    ``after_id`` that row's id; only rows after it are sent, so a reconnect
+    does not resend the whole transcript.  Omit them to receive every row.
+    Whenever the last row the client holds disappears (a rewind deleted it, in
+    this tab or another), ``transcript_reset`` tells the client to reload the
+    transcript; the stream then carries on from the newest row.
 
     Unlike ``stream_messages`` which binds to one run and ends when that run
     completes, this endpoint holds the HTTP connection open for the lifetime of
@@ -1450,6 +1814,8 @@ async def stream_session(
       ``thinking``      — reasoning text (from Redis stream).
       ``plan``          — structured plan steps update.
       ``message``       — newly persisted message row.
+      ``transcript_reset`` — rows the client holds were deleted (rewind);
+        reload the transcript.
       ``run_complete``  — active run reached a terminal state.
       ``ping``          — liveness heartbeat carrying no payload of interest.
         Emitted on every otherwise-silent poll (no active run, nothing new to
@@ -1501,7 +1867,38 @@ async def stream_session(
         # re-stream the same run (e.g. if a reconcile poll sees it as still
         # RUNNING before the final terminal write completes).
         streamed_run_ids: set[str] = set()
-        last_seq = 0
+        # The newest row sent (or held by the client on connect): its sequence
+        # is the cursor, its id detects a rewind that reused the sequence.
+        last_seq = after or 0
+        last_id: str | None = after_id if after else None
+
+        async def _new_messages(svc: SessionService, out: list[str]) -> list[Any]:
+            """Rows after the cursor as ``message`` events appended to ``out``.
+
+            On a rewind, appends ``transcript_reset`` instead and moves the
+            cursor to the newest row (the client's reload covers the rest).
+            """
+            nonlocal last_seq, last_id
+            rows = await _messages_after(svc, session_id, last_seq, last_id)
+            if rows is None:
+                head = await svc.latest_message(session_id)
+                last_seq, last_id = (head.sequence, head.id) if head is not None else (0, None)
+                out.append(_sse("transcript_reset", {"session_id": session_id}))
+                return []
+            for msg in rows:
+                msg_json = MessageOut.model_validate(msg).model_dump_json()
+                out.append(f"event: message\ndata: {msg_json}\n\n")
+                last_seq, last_id = msg.sequence, msg.id
+            return rows
+
+        # Runs whose tail already ended (final ``end`` marker, or a HITL pause)
+        # while the row still said RUNNING — scheduler lag.  Re-tailing them
+        # would replay the stream and send a second run_started, so they stay
+        # in ``streamed_run_ids`` and each poll reports them once reconcile
+        # lands the real status.  Maps run id → (sandbox at that time, whether
+        # run_paused was already sent); a different sandbox means the run was
+        # resumed and must be tailed again.
+        awaiting_status: dict[str, tuple[str | None, bool]] = {}
         # Publish the current title once when the stream opens, then again only
         # when it changes (automatic first-message naming or a manual rename).
         # A local sentinel distinguishes "not observed yet" from a real NULL
@@ -1733,26 +2130,18 @@ async def stream_session(
                         )
 
                     # Emit newly persisted messages since last_seq.
-                    items, _ = await svc.list_messages(
-                        session_id,
-                        cursor=str(last_seq) if last_seq else None,
-                        limit=50,
-                    )
+                    items = await _new_messages(svc, events)
                     # Track durable rows for *this* run specifically, not any
                     # row in the poll — an unrelated run persisting a message in
                     # the same poll must not satisfy the skip-replay guard below.
-                    emitted_durable_for_active_run = False
                     active_run_id = (
                         active_run_to_stream.id
                         if active_run_to_stream is not None
                         else None
                     )
-                    for msg in items:
-                        msg_json = MessageOut.model_validate(msg).model_dump_json()
-                        events.append(f"event: message\ndata: {msg_json}\n\n")
-                        last_seq = msg.sequence
-                        if active_run_id is not None and msg.run_id == active_run_id:
-                            emitted_durable_for_active_run = True
+                    emitted_durable_for_active_run = active_run_id is not None and any(
+                        msg.run_id == active_run_id for msg in items
+                    )
 
                     # Only skip the token replay when durable rows for the
                     # just-completed active run were actually delivered this poll.
@@ -1762,6 +2151,35 @@ async def stream_session(
                     if active_run_durably_completed and not emitted_durable_for_active_run:
                         active_run_durably_completed = False
 
+                    # Runs whose tail ended while the row lagged: report the
+                    # status reconcile has now landed (after their rows above).
+                    for r in runs:
+                        if r.id not in awaiting_status:
+                            continue
+                        tail_sandbox, paused_sent = awaiting_status[r.id]
+                        if r.status in _TERMINAL_RUN_STATUSES:
+                            del awaiting_status[r.id]
+                            events.append(
+                                _sse(
+                                    "run_complete",
+                                    {
+                                        "run_id": r.id,
+                                        "status": r.status,
+                                        "result_summary": r.result_summary,
+                                    },
+                                )
+                            )
+                        elif r.status == "PAUSED":
+                            del awaiting_status[r.id]
+                            streamed_run_ids.discard(r.id)
+                            replayed_paused_run_ids.add(r.id)
+                            if not paused_sent:
+                                events.append(_sse("run_paused", {"run_id": r.id}))
+                        elif r.sandbox_id != tail_sandbox:
+                            # Resumed into a new sandbox: tail the new leg.
+                            del awaiting_status[r.id]
+                            streamed_run_ids.discard(r.id)
+
                 # ── DB block closed / committed ──────────────────────────────
                 for ev in events:
                     yield ev
@@ -1770,15 +2188,13 @@ async def stream_session(
                 # Driven OUTSIDE the DB session so that streaming (which can
                 # last many seconds) does not hold an open DB connection.
                 if active_run_to_stream is not None:
-                    # Authoritative pause signal from the token stream itself.
-                    # The post-stream reconcile below often still sees the run as
-                    # RUNNING (scheduler lag) right after the worker writes a
-                    # pending_confirmation and pauses; trusting only run.status
-                    # would emit run_complete and leave the run stuck in
-                    # streamed_run_ids, so the PAUSED-replay path never fires on
-                    # the live connection.  run_stream_end{paused:true} closes
-                    # that gap.
-                    stream_signaled_pause = False
+                    # How the tail ended, filled in by _stream_tokens.  The
+                    # post-stream reconcile below often still sees the run as
+                    # RUNNING (scheduler lag) right after the worker pauses or
+                    # writes its final ``end``; trusting only run.status would
+                    # emit run_complete for a pause, or re-tail (and replay) a
+                    # finished stream.  ``paused`` / ``ended`` close that gap.
+                    tail_outcome: dict[str, Any] = {}
 
                     # Idle-recheck predicate for the active tail: a quiet gap
                     # between tool batches must NOT be mistaken for a finished
@@ -1814,12 +2230,11 @@ async def stream_session(
                             deadline=deadline,
                             wait_for_worker=True,
                             is_run_active=_is_run_active,
+                            outcome=tail_outcome,
                         ):
-                            if ev.startswith("event: run_stream_end") and (
-                                '"paused": true' in ev or '"paused":true' in ev
-                            ):
-                                stream_signaled_pause = True
                             yield ev
+                    stream_signaled_pause = bool(tail_outcome.get("paused"))
+                    stream_signaled_end = bool(tail_outcome.get("ended"))
 
                     # After _stream_tokens returns (end marker, pause, or stall),
                     # reconcile the run one final time to persist its terminal
@@ -1838,6 +2253,9 @@ async def stream_session(
                     # but reconcile shows the run is STILL RUNNING/PENDING.  In
                     # that case we emit NO lifecycle event and re-tail next poll.
                     post_stream_run_still_active = False
+                    # Set when the tail ended (final ``end`` or a pause) but the
+                    # row still says RUNNING: wait for its status, don't re-tail.
+                    post_stream_await: tuple[str | None, bool] | None = None
                     post_stream_run_id = active_run_to_stream.id
                     async for db in acquire_db_session(tenant_id=tenant_id):
                         svc = SessionService(db, tenant_id=tenant_id)
@@ -1882,37 +2300,16 @@ async def stream_session(
                                 )
                             )
                             # Emit newly persisted messages produced by reconcile.
-                            new_items, _ = await svc.list_messages(
-                                session_id,
-                                cursor=str(last_seq) if last_seq else None,
-                                limit=50,
-                            )
-                            for msg in new_items:
-                                msg_json = (
-                                    MessageOut.model_validate(msg).model_dump_json()
-                                )
-                                post_stream_events.append(
-                                    f"event: message\ndata: {msg_json}\n\n"
-                                )
-                                last_seq = msg.sequence
+                            await _new_messages(svc, post_stream_events)
 
-                            if run_obj.status == "PAUSED" or stream_signaled_pause:
+                            if run_obj.status == "PAUSED":
                                 # HITL pause: do NOT emit run_complete; instead
                                 # signal the frontend that the run needs input.
-                                # ``stream_signaled_pause`` makes the pause
-                                # authoritative even when the scheduler has not
-                                # yet surfaced status=PAUSED (lag), so the run is
-                                # correctly discarded from streamed_run_ids and
-                                # the PAUSED-replay path can fire on resume.
                                 post_stream_run_paused = True
                                 post_stream_events.append(
                                     _sse("run_paused", {"run_id": run_obj.id})
                                 )
-                            elif run_obj.status in (
-                                "COMPLETED",
-                                "FAILED",
-                                "CANCELLED",
-                            ):
+                            elif run_obj.status in _TERMINAL_RUN_STATUSES:
                                 post_stream_events.append(
                                     _sse(
                                         "run_complete",
@@ -1923,6 +2320,21 @@ async def stream_session(
                                         },
                                     )
                                 )
+                            elif stream_signaled_pause:
+                                # The worker paused but the scheduler has not
+                                # surfaced PAUSED yet (lag).  The stream is the
+                                # authority: tell the client now, then wait for
+                                # the row instead of re-tailing (a re-tail would
+                                # send run_started and flicker the cards).
+                                post_stream_events.append(
+                                    _sse("run_paused", {"run_id": run_obj.id})
+                                )
+                                post_stream_await = (run_obj.sandbox_id, True)
+                            elif stream_signaled_end:
+                                # The worker wrote its final ``end``; its
+                                # container just hasn't been reported finished.
+                                # run_complete follows once reconcile lands it.
+                                post_stream_await = (run_obj.sandbox_id, False)
                             else:
                                 # Still RUNNING/PENDING: the tail returned early
                                 # (crashed-worker hard cap or a transient blip),
@@ -1939,11 +2351,18 @@ async def stream_session(
 
                     # Remove from streamed_run_ids so the same run_id can be
                     # re-entered on the next poll's active path:
-                    #   • PAUSED  → re-entered when resumed (status back to RUNNING)
+                    #   • PAUSED  → re-entered when resumed (status back to RUNNING);
+                    #     marked replayed so this connection does not replay the
+                    #     pause it just streamed live.
                     #   • still RUNNING/PENDING (early tail return) → re-tailed so
                     #     the worker's remaining output is not stranded.
-                    if post_stream_run_paused or post_stream_run_still_active:
+                    if post_stream_run_paused:
                         streamed_run_ids.discard(post_stream_run_id)
+                        replayed_paused_run_ids.add(post_stream_run_id)
+                    elif post_stream_run_still_active:
+                        streamed_run_ids.discard(post_stream_run_id)
+                    elif post_stream_await is not None:
+                        awaiting_status[post_stream_run_id] = post_stream_await
 
                     # Continue the outer loop — do NOT end the stream; a future
                     # run may start on this session (e.g. the user sends another

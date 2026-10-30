@@ -36,6 +36,9 @@ from agent_bff.api.dependencies import require_auth
 from agent_bff.api.v1.canvas import (
     _COMPLETION_TIMEOUT,
     _META_TIMEOUT,
+    LlmNotConfiguredError,
+    _llm_not_configured_problem,
+    _no_virtual_key_problem,
     _problem,
     _resolve_default_model,
     _resolve_virtual_key,
@@ -683,19 +686,17 @@ async def canvas_v2_edit(
 
     # ── 虚拟密钥 + 模型解析（复用 canvas.py 基建）────────────────────────────────
     async with httpx.AsyncClient(timeout=_META_TIMEOUT) as meta_client:
-        virtual_key = await _resolve_virtual_key(
-            client=meta_client,
-            gateway_url=gateway_url,
-            tenant_id=tenant_id,
-            access_token=access_token,
-        )
-        if not virtual_key:
-            raise _problem(
-                400,
-                "No model key is configured for this tenant. Please ask an administrator to set one up in Model Management.",
-                code="AGENT.BFF.CANVAS.NO_VIRTUAL_KEY",
-                detail="tenant has no enabled virtual key",
+        try:
+            virtual_key = await _resolve_virtual_key(
+                client=meta_client,
+                gateway_url=gateway_url,
+                tenant_id=tenant_id,
+                access_token=access_token,
             )
+        except LlmNotConfiguredError:
+            raise _llm_not_configured_problem() from None
+        if not virtual_key:
+            raise _no_virtual_key_problem()
 
         model = req.model or None
         if not model:

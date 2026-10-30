@@ -5,6 +5,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
 from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, TUserId
+from agent_session_orchestrator.api.ownership import require_session_owner
+from agent_session_orchestrator.errors import OrchestratorError
 from agent_session_orchestrator.schemas.common import CursorPage
 from agent_session_orchestrator.schemas.session import SessionCreate, SessionOut, SessionUpdate
 from agent_session_orchestrator.services.session_service import SessionService
@@ -69,7 +71,10 @@ async def create_session(
 
 
 @router.get("/sessions/{session_id}", response_model=SessionOut,
-            dependencies=[Depends(require_permission("session.read", "session"))])
+            dependencies=[
+                Depends(require_permission("session.read", "session")),
+                Depends(require_session_owner),
+            ])
 async def get_session(
     session_id: str,
     db: AsyncSession = TDbSession,
@@ -81,7 +86,10 @@ async def get_session(
 
 
 @router.patch("/sessions/{session_id}", response_model=SessionOut,
-              dependencies=[Depends(require_permission("session.update", "session"))])
+              dependencies=[
+                  Depends(require_permission("session.update", "session")),
+                  Depends(require_session_owner),
+              ])
 async def update_session(
     session_id: str,
     body: SessionUpdate,
@@ -89,13 +97,29 @@ async def update_session(
     tenant_id: str = TTenantId,
 ) -> SessionOut:
     svc = SessionService(db, tenant_id=tenant_id)
-    updates = body.model_dump(exclude_none=True)
+    updates = body.model_dump(exclude_none=True, exclude={"task"})
+    if body.task is not None:
+        current = await svc.get_session(session_id)
+        meta = dict(current.agent_metadata or {})
+        if meta.get("kind") != "task":
+            raise OrchestratorError(
+                "task spec on a non-task session",
+                code="AGENT.SESSION.NOT_A_TASK",
+                status=422,
+                user_message="Only task sessions can carry a task definition.",
+            )
+        meta["task"] = body.task.model_dump()
+        # Assign a fresh dict: in-place JSONB mutation is not change-tracked.
+        updates["agent_metadata"] = meta
     session = await svc.update_session(session_id, **updates)
     return SessionOut.model_validate(session)
 
 
 @router.delete("/sessions/{session_id}", status_code=204,
-               dependencies=[Depends(require_permission("session.delete", "session"))])
+               dependencies=[
+                   Depends(require_permission("session.delete", "session")),
+                   Depends(require_session_owner),
+               ])
 async def delete_session(
     session_id: str,
     db: AsyncSession = TDbSession,

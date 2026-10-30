@@ -41,7 +41,7 @@ vi.mock('../stores/chatStore', () => ({
   useChatStore: (selector: (s: unknown) => unknown) =>
     selector({
       userProfile: {
-        id: 'usr_test',
+        user_id: 'usr_test',
         email: 'test@example.com',
         display_name: 'Test User',
         tenant_id: 'tnt_test',
@@ -128,7 +128,7 @@ vi.mock('../api/client', () => ({
 import { ProfilePage } from './ProfilePage';
 
 const BASE_PROFILE = {
-  id: 'usr_test',
+  user_id: 'usr_test',
   email: 'test@example.com',
   display_name: 'Test User',
   tenant_id: 'tnt_test',

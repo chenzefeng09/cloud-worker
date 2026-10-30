@@ -6,6 +6,7 @@ import { WorkspaceProvider } from '../lib/workspaceContext';
 import { Sidebar } from './shell/Sidebar';
 import { HomePage } from '../pages/HomePage';
 import { AgentPage } from '../pages/AgentPage';
+import { TasksPage } from '../pages/TasksPage';
 import { AppRunPage } from '../pages/AppRunPage';
 import { AppResultPage } from '../pages/AppResultPage';
 import { AppEditorPage } from '../pages/AppEditorPage';
@@ -19,6 +20,8 @@ import { ArtifactsPage } from '../pages/ArtifactsPage';
 import { ProfilePage } from '../pages/ProfilePage';
 import { AdminLayout, canAccessAdmin } from '../admin/AdminLayout';
 import { DialogProvider } from '../admin/components/dialogs';
+import { DataNoticeModal } from './DataNoticeModal';
+import { DataNoticeProvider } from './privacy/useDataNotice';
 
 /**
  * Authenticated app shell: sidebar + routed main view. WorkspaceProvider lives
@@ -27,8 +30,12 @@ import { DialogProvider } from '../admin/components/dialogs';
  * cloud-worker-specific state.
  *
  * The route table is kept flat and mirrors the cloud-worker hash routes:
- *   /home /tasks/:id /files /library /workspace
+ *   /home /tasks /tasks/:id /files /library /workspace
  * Anything else falls back to /home.
+ *
+ * The privacy notice gate sits above the routes so it shows on whichever page
+ * the user lands on first; its DataNoticeProvider is shared with the Privacy
+ * tab, so acknowledging in one updates the other.
  */
 export function WorkspaceLayout() {
   const userProfile = useChatStore((s) => s.userProfile);
@@ -36,61 +43,65 @@ export function WorkspaceLayout() {
 
   return (
     <WorkspaceProvider>
-      <div className="h-screen flex bg-paper">
-        <SessionsBootstrap />
-        <Routes>
-          {/* Admin shell — accessible to anyone holding at least one admin
-              module permission (platform admins see everything). */}
-          <Route
-            path="/admin/*"
-            element={
-              canAdmin ? (
-                <div className="flex-1 flex min-w-0 h-full">
-                  <AdminLayout />
-                </div>
-              ) : (
-                <Navigate to="/home" replace />
-              )
-            }
-          />
-          {/* Standard workspace shell. DialogProvider is mounted here (the admin
-              shell mounts its own) so workspace pages get in-app confirm/toast
-              instead of the unstyled, thread-blocking native dialogs. */}
-          <Route
-            path="*"
-            element={
-              <DialogProvider>
-                <div className="flex-1 flex min-w-0 h-full">
-                  <Sidebar />
-                  <main className="flex-1 flex flex-col min-w-0">
-                    <Routes>
-                      <Route path="/home" element={<HomePage />} />
-                      <Route path="/tasks/:id" element={<AgentPage />} />
-                      {/* App routes — static/longer paths first so react-router v6
-                          ranking never lets `/apps/:id` shadow `/apps/new` etc. */}
-                      <Route path="/apps/new" element={<Navigate to="/home" replace />} />
-                      <Route path="/apps/runs/:sessionId/:runId" element={<AppResultPage />} />
-                      <Route path="/apps/:id/edit" element={<AppEditorPage />} />
-                      <Route path="/apps/:id/run" element={<AppRunPage />} />
-                      <Route path="/apps/:id/history" element={<AppHistoryPage />} />
-                      <Route path="/apps/:id" element={<AppDetailPage />} />
-                      <Route path="/apps" element={<AppListPage />} />
-                      {/* 定时任务 folded into the app surface as a tab. */}
-                      <Route path="/schedules" element={<Navigate to="/apps?tab=schedules" replace />} />
-                      <Route path="/files" element={<FilesPage />} />
-                      <Route path="/library" element={<LibraryPage />} />
-                      <Route path="/workspace" element={<WorkspacePage />} />
-                      <Route path="/artifacts" element={<ArtifactsPage />} />
-                      <Route path="/profile" element={<ProfilePage />} />
-                      <Route path="*" element={<Navigate to="/home" replace />} />
-                    </Routes>
-                  </main>
-                </div>
-              </DialogProvider>
-            }
-          />
-        </Routes>
-      </div>
+      <DataNoticeProvider>
+        <div className="h-screen flex bg-paper">
+          <SessionsBootstrap />
+          <DataNoticeModal />
+          <Routes>
+            {/* Admin shell — accessible to anyone holding at least one admin
+                module permission (platform admins see everything). */}
+            <Route
+              path="/admin/*"
+              element={
+                canAdmin ? (
+                  <div className="flex-1 flex min-w-0 h-full">
+                    <AdminLayout />
+                  </div>
+                ) : (
+                  <Navigate to="/home" replace />
+                )
+              }
+            />
+            {/* Standard workspace shell. DialogProvider is mounted here (the admin
+                shell mounts its own) so workspace pages get in-app confirm/toast
+                instead of the unstyled, thread-blocking native dialogs. */}
+            <Route
+              path="*"
+              element={
+                <DialogProvider>
+                  <div className="flex-1 flex min-w-0 h-full">
+                    <Sidebar />
+                    <main className="flex-1 flex flex-col min-w-0">
+                      <Routes>
+                        <Route path="/home" element={<HomePage />} />
+                        <Route path="/tasks" element={<TasksPage />} />
+                        <Route path="/tasks/:id" element={<AgentPage />} />
+                        {/* App routes — static/longer paths first so react-router v6
+                            ranking never lets `/apps/:id` shadow `/apps/new` etc. */}
+                        <Route path="/apps/new" element={<Navigate to="/home" replace />} />
+                        <Route path="/apps/runs/:sessionId/:runId" element={<AppResultPage />} />
+                        <Route path="/apps/:id/edit" element={<AppEditorPage />} />
+                        <Route path="/apps/:id/run" element={<AppRunPage />} />
+                        <Route path="/apps/:id/history" element={<AppHistoryPage />} />
+                        <Route path="/apps/:id" element={<AppDetailPage />} />
+                        <Route path="/apps" element={<AppListPage />} />
+                        {/* 定时任务 folded into the app surface as a tab. */}
+                        <Route path="/schedules" element={<Navigate to="/apps?tab=schedules" replace />} />
+                        <Route path="/files" element={<FilesPage />} />
+                        <Route path="/library" element={<LibraryPage />} />
+                        <Route path="/workspace" element={<WorkspacePage />} />
+                        <Route path="/artifacts" element={<ArtifactsPage />} />
+                        <Route path="/profile" element={<ProfilePage />} />
+                        <Route path="*" element={<Navigate to="/home" replace />} />
+                      </Routes>
+                    </main>
+                  </div>
+                </DialogProvider>
+              }
+            />
+          </Routes>
+        </div>
+      </DataNoticeProvider>
     </WorkspaceProvider>
   );
 }

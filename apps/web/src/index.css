@@ -924,6 +924,11 @@ body {
     color: white;
     border-color: #d23a1f;
   }
+  /* Without this, .cw-btn:hover's light background hides the white label. */
+  .cw-btn-accent:hover {
+    background: #b3311a;
+    border-color: #b3311a;
+  }
   .cw-btn-ghost {
     background: transparent;
     border-color: transparent;

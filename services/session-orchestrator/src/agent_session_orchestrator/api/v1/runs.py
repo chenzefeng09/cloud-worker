@@ -8,6 +8,12 @@ twice; if the second commit failed (e.g. session row updated_at conflict)
 the run row was already persisted but the session pointed nowhere, leaving
 an orphaned run hidden from the UI but still consuming sandbox resources.
 
+A new turn's user message rides in the same request (``message``) and is
+written in that transaction too, so a run that is refused (another run is
+live), or that the scheduler cannot start, leaves no unanswered message
+behind.  The session row is locked first, which serializes concurrent starts
+on one session: the second sees the first's run and gets 409.
+
 If the scheduler call itself fails, the whole transaction rolls back via
 the implicit ``async with session.begin()`` opened by ``db_session``, so
 no half-baked run record survives.  The container is the one external
@@ -18,36 +24,54 @@ sandbox times out via ``Settings.sandbox_timeout`` and stops itself.
 Memory pre-fetch
 ----------------
 Before relaying the run to the scheduler, ``create_run`` calls knowledge-ingest
-``GET /search`` using the task text as the query.  The top-K hits (memories
-stored by previous runs) are formatted into a ``memory`` string and included
-in the task body sent to the scheduler, which in turn writes it to task.json.
-The in-sandbox worker reads ``task["memory"]`` and prepends it to the system
-prompt.  This is intentionally failure-open: if knowledge-ingest is unreachable
-the run proceeds without memory context.
+``POST /search`` using the task text as the query (in the body, so it stays out
+of URLs and logs).  The top-K hits (memories stored by previous runs) are
+formatted into a ``memory`` string and included in the task body sent to the
+scheduler, which in turn writes it to task.json.  The in-sandbox worker reads
+``task["memory"]`` and prepends it to the system prompt.  This is intentionally
+failure-open: if knowledge-ingest is unreachable the run proceeds without memory
+context.  A user who turned memory off (privacy settings) gets none.
 """
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import json
 import logging
 from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
 from agent_session_orchestrator.api.dependencies import TClearance, TDbSession, TTenantId, TUserId
+from agent_session_orchestrator.api.ownership import require_session_owner
 
 # Reuse the chat path's run-completion reconciler verbatim (poll scheduler,
 # map container status, persist result_summary/status/finished_at/tokens, write
 # the assistant message, failure-open).  It is module-private in messages.py but
 # both modules live in the same ``api.v1`` package, so importing the
 # ``_``-prefixed helper here is the least-invasive way to share it without
-# duplicating any of its logic.
-from agent_session_orchestrator.api.v1.messages import _reconcile_run_completion
-from agent_session_orchestrator.domain.models import Run
+# duplicating any of its logic.  The run-stream Redis helpers are shared the
+# same way.
+from agent_session_orchestrator.api.v1.messages import (
+    _TERMINAL_RUN_STATUSES,
+    _append_run_stream_event,
+    _delete_run_keys,
+    _load_run_dispatch,
+    _reconcile_run_completion,
+    _replay_run_blocks_into_messages,
+    _run_dispatch_key,
+    _run_paused_key,
+    _store_run_dispatch,
+)
+from agent_session_orchestrator.domain.models import Message, Run
+from agent_session_orchestrator.errors import LlmNotConfiguredError, RunQuotaExceededError
+from agent_session_orchestrator.schemas.message import MessageOut, TurnMessage
 from agent_session_orchestrator.services import knowledge_client
 from agent_session_orchestrator.services.clearance import clearance_rank
 from agent_session_orchestrator.services.session_service import SessionService
@@ -57,6 +81,15 @@ logger = logging.getLogger(__name__)
 
 _MEMORY_SEARCH_K = 5  # top-K memory hits to inject
 _KNOWLEDGE_SEARCH_K = 5  # top-K tenant-knowledge hits to inject
+
+# The scheduler hands the worker each dispatch as one JSON document, and the
+# cube runtime passes it in a single environment variable.  Linux caps one at
+# 128 KiB (MAX_ARG_STRLEN); past that the worker never starts while the
+# scheduler still reports success.  Every dispatch (the first leg and each
+# resume leg) is kept under this budget, with headroom for what the scheduler
+# adds, by dropping the oldest history (see ``_fit_dispatch_history``).
+_DISPATCH_MAX_BYTES = 112 * 1024
+_HISTORY_OMITTED = "history_omitted"
 
 
 def _effective_clearance(user_clearance: str, workspace_sensitivity: str | None) -> str:
@@ -81,6 +114,34 @@ def _effective_clearance(user_clearance: str, workspace_sensitivity: str | None)
 
 def _now() -> dt.datetime:
     return dt.datetime.now(tz=dt.UTC)
+
+
+def _scheduler_refusal(resp: httpx.Response, *, run_id: str, action: str) -> Exception:
+    """The error to answer a scheduler refusal of ``action`` ("run" / "resume") with.
+
+    Refusals a user can act on keep their meaning: no model configured for the
+    tenant, quota exhausted.  Any other one is the platform's problem, answered
+    with a 502 that does not echo the scheduler's body (it may carry internal
+    details); the log keeps its status and code.
+    """
+    code: str | None = None
+    with contextlib.suppress(ValueError):
+        body = resp.json()
+        if isinstance(body, dict) and isinstance(body.get("code"), str):
+            code = body["code"]
+    logger.warning(
+        "scheduler rejected %s %s: HTTP %s %s",
+        action, run_id, resp.status_code, code or "-",
+        extra={"status": resp.status_code, "code": code, "run_id": run_id},
+    )
+    if code == "AGENT.SCHEDULER.LLM_NOT_CONFIGURED":
+        return LlmNotConfiguredError()
+    if resp.status_code == status.HTTP_402_PAYMENT_REQUIRED:
+        return RunQuotaExceededError()
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=f"scheduler rejected {action} (HTTP {resp.status_code})",
+    )
 
 
 def _merge_skills(base: list[str], extra: list[str]) -> list[str]:
@@ -152,8 +213,10 @@ async def _fetch_memory(
 ) -> str:
     """Query knowledge-ingest for relevant memories and return a formatted string.
 
-    Uses ``GET /search?q=<query>&k=<K>&scope=memory`` with ``X-Tenant-Id`` /
-    ``X-User-Id`` / ``X-User-Clearance`` headers.  ``scope=memory`` restricts the
+    Uses ``POST /search`` with a JSON body ``{"q", "k", "scope": "memory",
+    "exclude_origin_session_id"?}`` and ``X-Tenant-Id`` / ``X-User-Id`` /
+    ``X-User-Clearance`` headers — the prompt travels in the body so it stays
+    out of URLs, access logs and trace attributes.  ``scope=memory`` restricts the
     search to this user's own ``[memory]`` documents (the knowledge base is a
     separate ``scope=knowledge`` prefetch — see ``_fetch_knowledge``).  Returns an
     empty string on any error (failure-open).
@@ -170,18 +233,18 @@ async def _fetch_memory(
     """
     if not query.strip() or not knowledge_ingest_url:
         return ""
-    params: dict[str, Any] = {
+    payload: dict[str, Any] = {
         "q": query[:500],
         "k": _MEMORY_SEARCH_K,
         "scope": "memory",
     }
     if session_id:
-        params["exclude_origin_session_id"] = session_id
+        payload["exclude_origin_session_id"] = session_id
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
+            resp = await client.post(
                 f"{knowledge_ingest_url}/search",
-                params=params,
+                json=payload,
                 headers={
                     "X-Tenant-Id": tenant_id,
                     "X-User-Id": user_id,
@@ -330,7 +393,7 @@ async def _fetch_knowledge(
 ) -> str:
     """Prefetch top-K tenant-knowledge hits for the worker's system prompt.
 
-    Delegates the ``GET /search?scope=knowledge`` call + ``[Document | folder/path]``
+    Delegates the ``POST /search`` (``scope=knowledge``) call + ``[Document | folder/path]``
     provenance formatting to :mod:`knowledge_client`.  Carries the run's
     **effective clearance** in ``X-User-Clearance`` so ki enforces the
     visibility gate.  Failure-open: any error → ``""``.
@@ -348,7 +411,11 @@ async def _fetch_knowledge(
 
 
 async def _assemble_history(
-    svc: SessionService, session_id: str, *, current_task: str
+    svc: SessionService,
+    session_id: str,
+    *,
+    current_task: str,
+    input_message_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build structured prior-turn history for the worker to restore.
 
@@ -358,10 +425,12 @@ async def _assemble_history(
         {"role": "assistant", "type": "text", "content": "..."}
         {"role": "tool", "type": "tool", "tool": {id,name,input,result,state}}
 
-    The current user message — already persisted by BFF just before this run
-    was triggered — is excluded (it's this turn's input, not history).  SYSTEM
-    rows are dropped; empty ASSISTANT/TOOL rows are skipped.  Failure-open:
-    returns an empty list on any error so a history glitch never blocks a run.
+    This turn's own user message is excluded (it's the run's input, not
+    history): by id when the run request wrote it (``input_message_id``),
+    otherwise the latest USER row whose content is the task — a turn re-run
+    from a message already in the transcript (task retry).  SYSTEM rows are
+    dropped; empty ASSISTANT/TOOL rows are skipped.  Failure-open: returns an
+    empty list on any error so a history glitch never blocks a run.
     """
     try:
         messages = await svc.list_all_messages(session_id)
@@ -369,18 +438,19 @@ async def _assemble_history(
         logger.debug("history assembly failed (failure-open): %s", exc)
         return []
 
-    # Drop the most recent USER row whose content matches this run's task —
-    # that's the message BFF just wrote as this turn's input.
     # NB: the message table stores role inconsistently ("USER" upper-cased,
     # but "assistant"/"tool"/"system" lower-cased), so compare case-insensitively
     # — otherwise assistant/tool history is silently dropped and the model only
     # sees a stream of unanswered user questions.
-    task_norm = current_task.strip()
-    for i in range(len(messages) - 1, -1, -1):
-        if (messages[i].role or "").upper() == "USER":
-            if (messages[i].content or "").strip() == task_norm:
-                messages.pop(i)
-            break
+    if input_message_id is not None:
+        messages = [m for m in messages if m.id != input_message_id]
+    else:
+        task_norm = current_task.strip()
+        for i in range(len(messages) - 1, -1, -1):
+            if (messages[i].role or "").upper() == "USER":
+                if (messages[i].content or "").strip() == task_norm:
+                    messages.pop(i)
+                break
 
     history: list[dict[str, Any]] = []
     for msg in messages:
@@ -403,13 +473,92 @@ async def _assemble_history(
     return history
 
 
+def _json_size(value: Any) -> int:
+    """UTF-8 bytes of ``value`` serialised the way the scheduler serialises the task."""
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _history_omitted_marker(count: int) -> dict[str, Any]:
+    return {
+        "role": "system",
+        "type": _HISTORY_OMITTED,
+        "omitted": count,
+        "content": (
+            f"[{count} earlier message(s) omitted: "
+            "the conversation is too long to send in full]"
+        ),
+    }
+
+
+def _fit_dispatch_history(payload: dict[str, Any], *, run_id: str) -> None:
+    """Keep ``payload`` under ``_DISPATCH_MAX_BYTES`` by dropping its oldest history.
+
+    The dropped items are replaced (in place) by one leading marker item that
+    says how many are gone, so the worker can tell the model the conversation is
+    incomplete instead of its start vanishing silently.  A marker from an earlier
+    fit (a resume leg re-sends the stored dispatch) is merged, not stacked.
+    """
+    history = payload.get("history")
+    if not isinstance(history, list) or _json_size(payload) <= _DISPATCH_MAX_BYTES:
+        return
+    items = list(history)
+    omitted = 0
+    if items and isinstance(items[0], dict) and items[0].get("type") == _HISTORY_OMITTED:
+        prior = items.pop(0).get("omitted")
+        omitted = prior if isinstance(prior, int) else 0
+    # Size everything but the history items once (with the widest marker the
+    # result can carry), then keep the newest items that still fit; each item
+    # costs its own size plus the ", " separator.
+    payload["history"] = [_history_omitted_marker(omitted + len(items))]
+    room = _DISPATCH_MAX_BYTES - _json_size(payload)
+    keep = 0
+    for item in reversed(items):
+        room -= _json_size(item) + 2
+        if room < 0:
+            break
+        keep += 1
+    dropped = len(items) - keep
+    payload["history"] = [_history_omitted_marker(omitted + dropped), *items[dropped:]]
+    logger.warning(
+        "run dispatch over %d bytes: dropped the %d oldest history item(s)",
+        _DISPATCH_MAX_BYTES, dropped, extra={"run_id": run_id},
+    )
+    if _json_size(payload) > _DISPATCH_MAX_BYTES:
+        logger.warning(
+            "run dispatch still over %d bytes with no history left; a runtime that "
+            "passes the task in the environment cannot start it",
+            _DISPATCH_MAX_BYTES, extra={"run_id": run_id},
+        )
+
+
 async def _get_scheduler_url(request: Request) -> str:
     url: str = request.app.state.settings.agent_scheduler_url
     return url
 
 
+def _turn_message(body: dict[str, Any]) -> TurnMessage | None:
+    """The user message a run request carries for its turn, if any.
+
+    ``None`` when the request carries none: the turn's message is already in
+    the transcript (task retry), or the run has no user turn (App and
+    scheduled runs).
+    """
+    if body.get("message") is None:
+        return None
+    try:
+        return TurnMessage.model_validate(body["message"])
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.errors(include_url=False, include_context=False, include_input=False),
+        ) from None
+
+
 @router.post("/sessions/{session_id}/runs", status_code=201,
-             dependencies=[Depends(require_permission("run.create", "run"))])
+             dependencies=[
+                 Depends(require_permission("run.create", "run")),
+                 Depends(require_session_owner),
+             ])
 async def create_run(
     session_id: str,
     body: dict[str, Any],
@@ -419,8 +568,34 @@ async def create_run(
     user_id: str = TUserId,
     clearance: str = TClearance,
 ) -> dict[str, Any]:
+    turn_message = _turn_message(body)
+    if turn_message is not None:
+        # Writing the turn's message is what POST /messages does: same grant.
+        await require_permission("session.message.create", "session")(request)
+
     svc = SessionService(db, tenant_id=tenant_id)
-    session = await svc.get_session(session_id)
+    # Locked until this request's transaction ends, so two starts on one
+    # session can't both pass the live-run check below.
+    session = await svc.get_session(session_id, lock=True)
+    redis_url: str | None = request.app.state.settings.redis_url
+
+    # One live run per session.  A second one would interleave two agents'
+    # output in the same transcript (the stream tails only the newest run).
+    for existing in await svc.list_runs(session_id):
+        if existing.status in ("RUNNING", "PENDING"):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A run is already in progress in this session",
+            )
+        # The UI blocks sending while a HITL card is open, so a new turn means
+        # a pause was abandoned (its card expired or was never shown).  Retire
+        # it so it cannot resurface over the new run.
+        if existing.status == "PAUSED" and await svc.claim_run_transition(
+            existing, to_status="CANCELLED", from_statuses=("PAUSED",), match_sandbox=False,
+        ):
+            await _settle_cancelled_run(
+                svc=svc, run=existing, tenant_id=tenant_id, redis_url=redis_url,
+            )
 
     task = body.get("task", "")
 
@@ -478,6 +653,14 @@ async def create_run(
         session_id, task, app_snapshot=app_snapshot, source=source,
         execution_mode=execution_mode,
     )
+    # The turn's user message, in the same transaction: if anything below
+    # fails, the message goes with the run instead of sitting unanswered.
+    input_message: Message | None = None
+    if turn_message is not None:
+        input_message = await svc.create_message(
+            session_id, role="USER", content=turn_message.content,
+            attachment_ids=turn_message.attachment_ids,
+        )
 
     # Relay to agent-scheduler.
     scheduler_url = await _get_scheduler_url(request)
@@ -531,21 +714,29 @@ async def create_run(
     # knowledge-ingest; failure-open.  The tenant knowledge base
     # (scope=knowledge) is prefetched separately below and folded into
     # sys_prompt.
+    # Skipped when the session owner opted out of long-term memory (GDPR);
+    # the lookup is fail-closed, so an error also means "no memory".
+    from agent_session_orchestrator.services.privacy_service import memory_enabled_for
+
     knowledge_ingest_url = request.app.state.settings.knowledge_ingest_url
-    memory_snippets = await _fetch_memory(
-        knowledge_ingest_url=knowledge_ingest_url,
-        tenant_id=tenant_id,
-        user_id=user_id,
-        query=task,
-        session_id=session_id,
-        clearance=effective_clearance,
-    )
+    memory_snippets = ""
+    if await memory_enabled_for(db, tenant_id=tenant_id, user_id=session.user_id):
+        memory_snippets = await _fetch_memory(
+            knowledge_ingest_url=knowledge_ingest_url,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            query=task,
+            session_id=session_id,
+            clearance=effective_clearance,
+        )
 
     # Assemble prior-turn conversation history so the worker can restore it
-    # into the agent's context (multi-turn memory).  BFF writes the current
-    # user message *before* triggering this run, so it's already in the table
-    # as the latest USER row — we drop it (it's this run's input, not history).
-    history = await _assemble_history(svc, session_id, current_task=task)
+    # into the agent's context (multi-turn memory), without this turn's own
+    # message (it's this run's input, not history).
+    history = await _assemble_history(
+        svc, session_id, current_task=task,
+        input_message_id=input_message.id if input_message is not None else None,
+    )
 
     # Skill selection has presence semantics, not truthiness semantics:
     # explicitly sending ``skills`` (including ``[]`` or ``null``) suppresses
@@ -721,10 +912,10 @@ async def create_run(
         # ``sampling_params`` is applied per-run by the gateway model.
         "sys_prompt": sys_prompt,
         "sampling_params": sampling_params,
-        # HITL gating: normal session runs always enable human-in-the-loop
-        # so the worker can pause for confirmation / free-text questions.
-        # Scheduled/batch runs will override to False (future).
-        "hitl": True,
+        # HITL gating: runs enable human-in-the-loop by default so the worker
+        # can pause for confirmation / free-text questions.  Only a literal
+        # ``false`` (a task the user explicitly set to run unattended) opts out.
+        "hitl": body.get("hitl") is not False,
         # Effective clearance (min(user, workspace)) so the sandbox
         # worker's knowledge_tool can send X-User-Clearance to
         # knowledge-ingest and the scheduler can sign it into the
@@ -739,6 +930,7 @@ async def create_run(
     # "[] -> disable all", and a null would collapse that distinction.
     if run_mcp_server_ids is not None:
         scheduler_body["mcp_server_ids"] = run_mcp_server_ids
+    _fit_dispatch_history(scheduler_body, run_id=run.id)
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -755,16 +947,8 @@ async def create_run(
         ) from exc
 
     if resp.status_code >= 400:
-        # Don't echo upstream body verbatim — it may include stack traces or
-        # other sensitive details.  Capture in audit instead.
-        logger.warning(
-            "scheduler rejected run",
-            extra={"status": resp.status_code, "run_id": run.id},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"scheduler rejected run (HTTP {resp.status_code})",
-        )
+        # No container was spawned — the transaction rolls back.
+        raise _scheduler_refusal(resp, run_id=run.id, action="run")
 
     scheduler_run = resp.json()
 
@@ -781,7 +965,11 @@ async def create_run(
     session.current_run_id = run.id
     await db.flush()
 
-    return {
+    # A HITL resume re-dispatches with this exact configuration.
+    if scheduler_body.get("hitl"):
+        await _store_run_dispatch(redis_url=redis_url, run_id=run.id, payload=scheduler_body)
+
+    created: dict[str, Any] = {
         "id": run.id,
         "session_id": session_id,
         "sandbox_id": run.sandbox_id,
@@ -791,10 +979,16 @@ async def create_run(
         "execution_mode": run.execution_mode,
         "created_at": run.created_at.isoformat(),
     }
+    if input_message is not None:
+        created["message"] = MessageOut.model_validate(input_message).model_dump(mode="json")
+    return created
 
 
 @router.get("/sessions/{session_id}/runs",
-            dependencies=[Depends(require_permission("run.read", "run"))])
+            dependencies=[
+                Depends(require_permission("run.read", "run")),
+                Depends(require_session_owner),
+            ])
 async def list_runs(
     session_id: str,
     db: AsyncSession = TDbSession,
@@ -808,8 +1002,10 @@ async def list_runs(
 @router.get("/runs",
             dependencies=[Depends(require_permission("run.read", "run"))])
 async def list_tenant_runs(
+    request: Request,
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
+    user_id: str = TUserId,
     status: str | None = None,
     app_id: str | None = None,
     limit: int = Query(default=50, ge=1, le=200),
@@ -824,17 +1020,24 @@ async def list_tenant_runs(
     ``limit`` is capped at 200 and ``offset`` pages past the newest rows.  Both
     ``app_id`` and ``offset`` default to off so the existing tenant-wide
     behaviour is preserved.  Response shape matches the session-level list.
+
+    Owner-scoped: an ordinary caller only sees runs of their own sessions;
+    the BFF admin path (``X-Actor: ADMIN``) lists the whole tenant.
     """
     svc = SessionService(db, tenant_id=tenant_id)
     status_norm = status.upper() if status else None
+    owner = None if request.headers.get("X-Actor") == "ADMIN" else user_id
     runs = await svc.list_tenant_runs(
-        status=status_norm, limit=limit, app_id=app_id, offset=offset,
+        status=status_norm, limit=limit, app_id=app_id, offset=offset, user_id=owner,
     )
     return {"items": [_serialize_run(r) for r in runs]}
 
 
 @router.get("/sessions/{session_id}/runs/{run_id}",
-            dependencies=[Depends(require_permission("run.read", "run"))])
+            dependencies=[
+                Depends(require_permission("run.read", "run")),
+                Depends(require_session_owner),
+            ])
 async def get_run(
     session_id: str,
     run_id: str,
@@ -903,7 +1106,10 @@ async def get_run(
 
 
 @router.get("/sessions/{session_id}/runs/{run_id}/state",
-            dependencies=[Depends(require_permission("run.read", "run"))])
+            dependencies=[
+                Depends(require_permission("run.read", "run")),
+                Depends(require_session_owner),
+            ])
 async def get_run_state(
     session_id: str,
     run_id: str,
@@ -968,7 +1174,7 @@ async def get_run_state(
 
 @router.get(
     "/sessions/{session_id}/pending",
-    dependencies=[Depends(require_permission("run.read", "run"))],
+    dependencies=[Depends(require_permission("run.read", "run")), Depends(require_session_owner)],
 )
 async def get_session_pending(
     session_id: str,
@@ -987,8 +1193,8 @@ async def get_session_pending(
     Authority is Redis, not the DB row: the worker writes
     ``agent:run:{run_id}:paused`` before scheduler reconciliation flips the DB
     row to PAUSED, so a RUNNING/PENDING run may still have a live pause blob
-    (same reasoning as ``respond_run``).  We therefore list every run in the
-    session and GET its paused key directly rather than filtering on DB status.
+    (same reasoning as ``respond_run``).  We therefore GET the paused key of
+    every run that is not yet terminal rather than filtering on PAUSED.
 
     Best-effort / failure-open: never 404 or 500 from this mount-time pull.
     If Redis is unavailable or unconfigured we return ``{"items": []}``.  The
@@ -1017,7 +1223,11 @@ async def get_session_pending(
         )
         try:
             for run in runs:
-                raw = await client.get(f"agent:run:{run.id}:paused")
+                if run.status in _TERMINAL_RUN_STATUSES:
+                    # A blob left behind by a finished run is no longer
+                    # answerable; surfacing it would resurrect a dead card.
+                    continue
+                raw = await client.get(_run_paused_key(run.id))
                 if not raw:
                     continue
                 blob = json.loads(raw)
@@ -1050,7 +1260,7 @@ async def get_session_pending(
 
 @router.post(
     "/sessions/{session_id}/runs/{run_id}/respond",
-    dependencies=[Depends(require_permission("run.create", "run"))],
+    dependencies=[Depends(require_permission("run.create", "run")), Depends(require_session_owner)],
 )
 async def respond_run(
     session_id: str,
@@ -1076,10 +1286,12 @@ async def respond_run(
        stream can deliver ``pending_confirmation`` before scheduler reconciliation
        has flipped the DB row to PAUSED, so RUNNING/PENDING with a paused blob is
        accepted as an in-flight pause.
-    3. Re-dispatch to the scheduler with a ``resume`` payload containing the agent_state
-       from the paused Redis key plus the user decision.
+    3. Claim the run (a concurrent cancel wins), then re-dispatch to the scheduler
+       with the run's original dispatch payload plus a ``resume`` payload holding
+       the agent_state from the paused Redis key and the user decision.
     4. Update the same run row: status="RUNNING", sandbox_id=<new container>, clear errors.
-    5. DELETE the paused Redis key (consumed).
+    5. Append ``pending_resolved`` to the run's token stream, then DELETE the
+       paused Redis key (consumed).
     6. Return {run_id, status: "RUNNING"}.
 
     Uses the same ``run.create`` permission as create_run (write-level action on runs).
@@ -1173,6 +1385,7 @@ async def respond_run(
             ),
         )
     paused_tool_calls = paused_data.get("tool_calls") or []
+    paused_ids: set[str] = set()
     if isinstance(paused_tool_calls, list) and paused_tool_calls:
         paused_ids = {
             str(tc.get("id"))
@@ -1227,47 +1440,62 @@ async def respond_run(
             detail="run resume is already in progress",
         )
 
-    # agent_state is the worker's full in-memory state snapshot; replaying it
-    # replaces the need to re-send conversation history.
+    # agent_state is the worker's snapshot of this run's conversation so far;
+    # the worker replays it as the resume leg's prompt.
     agent_state: dict[str, Any] = paused_data.get("agent_state") or {}
 
-    # Step 3: Re-dispatch to the scheduler.
-    # Reuse the same env/skill assembly as create_run (scheduler builds the
-    # sandbox from the task payload, not from the original run_id).  For a
-    # resume the history is replaced by agent_state; we pass history=[] to
-    # signal the worker to restore from agent_state instead.
+    # Claim the run for this resume before spawning anything: a cancel that
+    # landed meanwhile wins, and no orphan sandbox is started.  The claim rolls
+    # back with the transaction if the dispatch below fails.
+    if not await svc.claim_run_transition(
+        run, to_status="RUNNING", from_statuses=("PAUSED", "RUNNING", "PENDING"),
+    ):
+        with contextlib.suppress(Exception):
+            await redis_client.delete(resume_lock_key)
+        await redis_client.aclose()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"run is no longer paused (current status: {run.status}); cannot respond",
+        )
+
+    # Step 3: Re-dispatch to the scheduler with the configuration the run
+    # started with (model, skills, MCP selection, files, history, memory,
+    # prompt, HITL), so the resumed leg behaves like the first.  Runs started
+    # before that payload was stored fall back to a minimal one.
     scheduler_url = await _get_scheduler_url(request)
     headers = {"X-Tenant-Id": tenant_id, "X-User-Id": user_id}
+    dispatch = await _load_run_dispatch(redis_url=redis_url, run_id=run_id) or {
+        "agent_config": {},
+        "files": [],
+        "total_attachment_bytes": 0,
+        "memory": "",
+        "history": [],
+        "sys_prompt": None,
+        "sampling_params": {},
+        "hitl": True,
+    }
+    dispatch.update(
+        session_id=session_id,
+        run_id=run_id,
+        task=run.task_description,
+        # Resume payload: tells the worker to restore agent_state and deliver
+        # the user decision as the tool response.
+        resume={
+            "kind": kind,
+            "tool_call_id": tool_call_id,
+            "confirmed": confirmed,
+            "answer": answer,
+            "agent_state": agent_state,
+        },
+    )
+    # The resume payload makes this leg bigger than the first one was.
+    _fit_dispatch_history(dispatch, run_id=run_id)
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 f"{scheduler_url}/runs",
-                json={
-                    "session_id": session_id,
-                    "run_id": run_id,
-                    "task": run.task_description,
-                    "agent_config": {},
-                    "files": [],
-                    "total_attachment_bytes": 0,
-                    "memory": "",
-                    # agent_state from the paused key replaces history for resume.
-                    "history": [],
-                    "sys_prompt": None,
-                    "sampling_params": {},
-                    # HITL gating: resumed runs retain HITL so the worker can
-                    # pause again if needed.
-                    "hitl": True,
-                    # Resume payload: tells the worker to restore agent_state
-                    # and deliver the user decision as the tool response.
-                    "resume": {
-                        "kind": kind,
-                        "tool_call_id": tool_call_id,
-                        "confirmed": confirmed,
-                        "answer": answer,
-                        "agent_state": agent_state,
-                    },
-                },
+                json=dispatch,
                 headers=headers,
             )
     except httpx.HTTPError as exc:
@@ -1284,10 +1512,7 @@ async def respond_run(
         ) from exc
 
     if resp.status_code >= 400:
-        logger.warning(
-            "scheduler rejected resume",
-            extra={"status": resp.status_code, "run_id": run_id},
-        )
+        refusal = _scheduler_refusal(resp, run_id=run_id, action="resume")
         if resume_lock_acquired and redis_client is not None:
             try:
                 await redis_client.delete(resume_lock_key)
@@ -1295,10 +1520,7 @@ async def respond_run(
                 pass
         if redis_client is not None:
             await redis_client.aclose()
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"scheduler rejected resume (HTTP {resp.status_code})",
-        )
+        raise refusal
 
     scheduler_run = resp.json()
 
@@ -1309,6 +1531,17 @@ async def respond_run(
     run.error_message = None
     run.started_at = _now()
     await db.flush()
+
+    # Record the answer in the run's stream.  Every prompt of this pause is
+    # settled (siblings re-appear under new ids on the resumed leg), so live
+    # tails stop treating the run as paused and replays — another tab, a
+    # reload — drop the cards instead of resurrecting them.
+    for resolved_id in sorted(paused_ids | {str(tool_call_id)}):
+        await _append_run_stream_event(
+            redis_url=redis_url,
+            run_id=run_id,
+            fields={"type": "pending_resolved", "tool_call_id": resolved_id},
+        )
 
     # Step 5: Delete the paused Redis key (it has been consumed) and release the
     # short resume lock.
@@ -1329,6 +1562,45 @@ async def respond_run(
     return {"run_id": run_id, "status": "RUNNING"}
 
 
+async def _settle_cancelled_run(
+    *,
+    svc: SessionService,
+    run: Run,
+    tenant_id: str,
+    redis_url: str | None,
+) -> None:
+    """Tidy up after ``run`` was claimed CANCELLED (by a cancel, or a new turn).
+
+    * An ``end{status: cancelled}`` entry closes the token stream, so live
+      tails stop at once and replays treat the run as finished.
+    * The output streamed so far is saved as messages: the user watched it
+      arrive, and without this it vanished on reload.
+    * The paused blob and stored dispatch payload are dropped, so a stale
+      card cannot be resumed and no copy of the run's context lingers.
+    * A "Task cancelled" row records the cancellation.
+    """
+    run.status = "CANCELLED"
+    run.finished_at = _now()
+    if redis_url:
+        await _append_run_stream_event(
+            redis_url=redis_url,
+            run_id=run.id,
+            fields={"type": "end", "text": "", "status": "cancelled"},
+        )
+        await _replay_run_blocks_into_messages(
+            run=run, svc=svc, tenant_id=tenant_id, redis_url=redis_url,
+        )
+        await _delete_run_keys(
+            redis_url=redis_url, keys=[_run_paused_key(run.id), _run_dispatch_key(run.id)],
+        )
+    await svc.create_message(
+        run.session_id,
+        role="system",
+        content="Task cancelled",
+        run_id=run.id,
+    )
+
+
 async def _do_cancel_run(
     *,
     session_id: str,
@@ -1338,56 +1610,74 @@ async def _do_cancel_run(
     tenant_id: str,
     user_id: str,
 ) -> dict[str, Any]:
-    """Core cancel logic — shared by the run-level and session-level endpoints."""
+    """Core cancel logic — shared by the run-level and session-level endpoints.
+
+    Idempotent: a run that already finished (or another tab cancelled) is
+    returned as-is, without a second "Task cancelled" row.  A PAUSED run is
+    cancellable too — that is how a user dismisses a pending prompt.
+    """
     svc = SessionService(db, tenant_id=tenant_id)
     run = await svc.get_run(session_id, run_id)
+    if run.status in _TERMINAL_RUN_STATUSES:
+        return {"id": run.id, "status": run.status}
 
+    redis_url: str | None = request.app.state.settings.redis_url
+    if not await svc.claim_run_transition(
+        run,
+        to_status="CANCELLED",
+        from_statuses=("RUNNING", "PENDING", "PAUSED"),
+        match_sandbox=False,
+    ):
+        return {"id": run.id, "status": run.status}
+
+    # What the run used up to the stop.  Nothing polls a cancelled run again,
+    # so this is the only chance to record the tokens it spent.
+    usage: object = None
     # Legacy inline (chat-mode) runs have no sandbox / scheduler container, so
-    # there is nothing to stop — just mark the row cancelled.
-    if run.execution_mode == "inline":
-        run.status = "CANCELLED"
-        run.finished_at = _now()
-        await db.flush()
-        await svc.create_message(
-            session_id,
-            role="system",
-            content="Task cancelled",
-            run_id=run_id,
-        )
-        return {"id": run.id, "status": "CANCELLED"}
+    # there is nothing to stop.
+    if run.execution_mode != "inline":
+        # A resume may have moved the run to a new sandbox after we loaded it;
+        # stop the container that is actually running.
+        await db.refresh(run, attribute_names=["sandbox_id"])
+        # Use run.sandbox_id (short Docker container id) as the scheduler path
+        # segment — the same convention used by _reconcile_run_completion in
+        # messages.py.  Passing run_id here would fail because the scheduler
+        # looks up the container by its Docker id, not our internal run id.
+        scheduler_run_key = run.sandbox_id or run_id
 
-    # Use run.sandbox_id (short Docker container id) as the scheduler path
-    # segment — the same convention used by _reconcile_run_completion in
-    # messages.py.  Passing run_id here would fail because the scheduler
-    # looks up the container by its Docker id, not our internal run id.
-    scheduler_run_key = run.sandbox_id or run_id
+        scheduler_url = await _get_scheduler_url(request)
+        try:
+            # The stop gives the worker up to 10 s to save its final counts;
+            # then the scheduler removes the sandbox and revokes the run's keys.
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{scheduler_url}/runs/{scheduler_run_key}/cancel",
+                    headers={"X-Tenant-Id": tenant_id, "X-User-Id": user_id},
+                )
+            usage = _cancel_usage(resp)
+        except httpx.HTTPError:
+            # The container may already have stopped; we still mark it
+            # cancelled in our DB so the UI stops showing it as RUNNING.  The
+            # next sandbox timeout will reap any leftover container.
+            logger.warning("cancel: scheduler unreachable", extra={"run_id": run_id})
 
-    scheduler_url = await _get_scheduler_url(request)
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            await client.post(
-                f"{scheduler_url}/runs/{scheduler_run_key}/cancel",
-                headers={"X-Tenant-Id": tenant_id, "X-User-Id": user_id},
-            )
-    except httpx.HTTPError:
-        # The container may already have stopped; we still mark it cancelled
-        # in our DB so the UI stops showing it as RUNNING.  The next sandbox
-        # timeout will reap any leftover container.
-        logger.warning("cancel: scheduler unreachable", extra={"run_id": run_id})
-
-    run.status = "CANCELLED"
-    run.finished_at = _now()
+    await _settle_cancelled_run(svc=svc, run=run, tenant_id=tenant_id, redis_url=redis_url)
+    # Cumulative across the run's legs and applied as a maximum, so cancelling
+    # a run whose pause already recorded the same usage counts nothing twice.
+    await svc.raise_run_usage(run, usage)
     await db.flush()
-
-    # Write a system message so the transcript records the cancellation.
-    await svc.create_message(
-        session_id,
-        role="system",
-        content="Task cancelled",
-        run_id=run_id,
-    )
-
     return {"id": run.id, "status": "CANCELLED"}
+
+
+def _cancel_usage(resp: httpx.Response) -> object:
+    """The ``usage`` from the scheduler's cancel response, or ``None``."""
+    if resp.status_code != 200:
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    return body.get("usage") if isinstance(body, dict) else None
 
 
 @router.get("/runs/token-usage/daily")
@@ -1527,7 +1817,10 @@ async def token_usage_breakdown(
 
 
 @router.post("/sessions/{session_id}/runs/{run_id}/cancel",
-             dependencies=[Depends(require_permission("run.cancel", "run"))])
+             dependencies=[
+                 Depends(require_permission("run.cancel", "run")),
+                 Depends(require_session_owner),
+             ])
 async def cancel_run(
     session_id: str,
     run_id: str,
@@ -1547,7 +1840,10 @@ async def cancel_run(
 
 
 @router.post("/sessions/{session_id}/cancel",
-             dependencies=[Depends(require_permission("run.cancel", "run"))])
+             dependencies=[
+                 Depends(require_permission("run.cancel", "run")),
+                 Depends(require_session_owner),
+             ])
 async def cancel_session_run(
     session_id: str,
     request: Request,
@@ -1568,13 +1864,14 @@ async def cancel_session_run(
     svc = SessionService(db, tenant_id=tenant_id)
     await svc.get_session(session_id)
 
-    # Find the most recent RUNNING or PENDING run for this session.
+    # Find the most recent live run for this session — a PAUSED one included,
+    # so cancelling also dismisses a prompt the user does not want to answer.
     stmt = (
         _select(_Run)
         .where(
             _Run.session_id == session_id,
             _Run.tenant_id == tenant_id,
-            _Run.status.in_(("RUNNING", "PENDING")),
+            _Run.status.in_(("RUNNING", "PENDING", "PAUSED")),
         )
         .order_by(_Run.created_at.desc())
         .limit(1)
