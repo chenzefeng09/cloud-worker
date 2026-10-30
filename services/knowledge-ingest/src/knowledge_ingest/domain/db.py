@@ -17,8 +17,10 @@ _session_factory: async_sessionmaker[AsyncSession] | None = None
 async def init_db(settings: Settings) -> None:
     global _engine, _session_factory
     is_sqlite = settings.db_dsn.startswith("sqlite")
+    # hide_parameters keeps bound values (document text, memories and embeddings) out of
+    # the SQL echo and out of DBAPI error messages, which end up in logs.
     if is_sqlite:
-        _engine = create_async_engine(settings.db_dsn, echo=False)
+        _engine = create_async_engine(settings.db_dsn, echo=False, hide_parameters=True)
     else:
         # pgbouncer transaction-mode requires prepared_statement_cache_size=0
         url = make_url(settings.db_dsn).update_query_dict(
@@ -29,7 +31,8 @@ async def init_db(settings: Settings) -> None:
             pool_size=settings.db_pool_size,
             max_overflow=settings.db_max_overflow,
             pool_recycle=settings.db_pool_recycle,
-            echo=settings.env == "dev",
+            echo=settings.sql_echo,
+            hide_parameters=True,
         )
         # ORM models are schema-less; on Postgres translate the default schema
         # (None) to this service's owned schema (SQLite tests never set this).
