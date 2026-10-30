@@ -126,6 +126,14 @@ class McpServerCreate(BaseModel):
 
 
 class McpServerUpdate(BaseModel):
+    """PATCH body.  A field left out (or sent as ``null``) keeps its stored value.
+
+    ``env`` / ``headers`` replace the stored map (a key the map omits is
+    removed), except that a value equal to the masked sentinel the admin read
+    paths show for every stored value means "keep the value stored under this
+    key".  Auth secret fields use the same sentinel.
+    """
+
     transport: Transport | None = None
     endpoint: str | None = Field(None, max_length=500)
     command: str | None = Field(None, max_length=500)
@@ -210,7 +218,9 @@ class McpServerTestOverride(BaseModel):
     value than the stored one forfeits stored credentials — ``auth`` and
     ``headers`` must then be supplied explicitly, or the probe is refused.
     Otherwise a read-only caller could redirect the probe at a URL they control
-    and collect the tenant's decrypted secret.
+    and collect the tenant's decrypted secret.  A masked sentinel in
+    ``headers`` stands for the stored value of that key, so it obeys the same
+    rule: it resolves only while the endpoint is not redirected.
     """
 
     transport: Transport | None = None

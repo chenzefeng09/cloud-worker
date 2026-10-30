@@ -336,9 +336,11 @@ export interface McpServer {
   transport: McpTransport;
   endpoint: string | null;
   command: string | null;
+  /** Env vars (stdio transport). Keys are real; every non-empty value comes
+   *  back masked as "••••••", never the stored value. */
   env: Record<string, string>;
   enabled: boolean;
-  /** HTTP custom headers (http transport only). */
+  /** HTTP custom headers (http transport only). Values are masked like `env`. */
   headers?: Record<string, string>;
   /** Auth scheme for HTTP transport. */
   auth?: McpAuth;

@@ -179,8 +179,8 @@ def mock_crypto_roundtrip(monkeypatch: pytest.MonkeyPatch) -> None:
 
     This avoids real HTTP calls to the foundation crypto service in every
     test while still exercising the full encrypt-on-write / decrypt-on-read
-    round-trip: the DB row holds an envelope (``ciphertext_b64``) and every
-    API/internal response returns plaintext.  Tests that need to assert on
+    round-trip: the DB row holds an envelope (``ciphertext_b64``), admin
+    responses mask it and the internal endpoint returns plaintext.  Tests that need to assert on
     ciphertext-at-rest read the ORM row directly (bypassing the API decrypt).
     """
     import mcp_registry.api.v1.mcp_servers as api_module
