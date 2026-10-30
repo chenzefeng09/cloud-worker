@@ -37,6 +37,19 @@ function deletedCount(outcome: unknown): number | null {
   return typeof n === 'number' && Number.isFinite(n) ? n : null;
 }
 
+const APP_COUNT_LABELS: Record<string, string> = {
+  apps_deleted: 'Apps deleted',
+  apps_deattributed: 'Shared apps kept, author removed',
+  versions_deattributed: 'App versions no longer naming you',
+};
+
+function appRows(apps: unknown): CountRow[] {
+  return countRows(apps, 'apps').map((row) => {
+    const label = APP_COUNT_LABELS[row.key.slice('apps.'.length)];
+    return label ? { ...row, label } : row;
+  });
+}
+
 export function erasureGroups(result: Partial<ErasureResult> | null | undefined): CountGroup[] {
   if (!result || typeof result !== 'object') return [];
   const groups: CountGroup[] = [];
@@ -50,6 +63,8 @@ export function erasureGroups(result: Partial<ErasureResult> | null | undefined)
   if (typeof result.memories_deleted === 'number') {
     groups.push({ title: 'Memory', rows: [{ key: 'memories_deleted', label: 'Memories', count: result.memories_deleted }] });
   }
+  const apps = appRows(result.apps);
+  if (apps.length) groups.push({ title: 'Apps', rows: apps });
   const account = countRows(result.bff, 'bff');
   const modelPreferences = deletedCount(result.llm_preferences);
   if (modelPreferences !== null) {
@@ -112,11 +127,7 @@ const SKIP_REASONS: Record<string, string> = {
   not_supported: 'not supported for this request',
 };
 
-function skipReason({ step, reason }: SkippedStep): string {
-  // The model gateway only lets a user clear their own preferences.
-  if (step === 'llm_preferences' && reason === 'not_supported') {
-    return 'not deleted — only the user can clear these, by deleting their own data';
-  }
+function skipReason({ reason }: SkippedStep): string {
   return SKIP_REASONS[reason] ?? humanizeKey(reason);
 }
 
@@ -165,7 +176,8 @@ const STEP_LABELS: Record<string, string> = {
   memory: 'Memories',
   knowledge: 'Memories',
   llm_preferences: 'Model preferences',
-  bff: 'Preferences and API keys',
+  apps: 'Apps',
+  bff: 'Preferences, API keys and sign-ins',
   account: 'Sign-in account',
 };
 

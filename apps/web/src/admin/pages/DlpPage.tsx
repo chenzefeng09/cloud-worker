@@ -606,6 +606,10 @@ export function DlpPage() {
             <div className="flex flex-col gap-2">
               <div className="font-mono text-[10px] uppercase tracking-[0.1em] text-dim">Content scan</div>
               <form onSubmit={handleScan} className="border border-line rounded-md p-4 bg-surface flex flex-col gap-2 max-w-2xl">
+                <p className="text-[11.5px] text-dim">
+                  Checks the text against this tenant's DLP rules and records the check. It never changes a
+                  resource's classification; use Classify resource for that.
+                </p>
                 {scanError && <div className="text-[12px] text-accent bg-accent-soft px-2 py-1 rounded-sm">{scanError}</div>}
                 <div className="flex flex-col gap-1">
                   <label className="text-[11px] text-dim font-mono">Content to scan</label>

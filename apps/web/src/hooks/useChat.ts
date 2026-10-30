@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useCanvasStore } from '../stores/canvasStore';
 import { api, ApiError } from '../api/client';
+import { notifySessionExpired } from '../api/authEvents';
 import type { Message, MessageAttachment, PendingInteractionItem } from '../api/types';
 
 // ── SSE event handler registry ────────────────────────────────────────────────
@@ -818,8 +819,9 @@ export function shouldWatchdogFire(
 /**
  * HTTP statuses on which reconnecting the session stream cannot help: the
  * session was deleted, is not the caller's, or the request is malformed.
- * 401 (session expiry, recovered by re-login), 408 and 429 stay retryable,
- * as does every 5xx.  Exported for tests.
+ * 401, 408 and 429 stay retryable, as does every 5xx.  A 401 is also reported
+ * as a possible session expiry: AuthGate confirms it and signs the user out,
+ * which tears this loop down.  Exported for tests.
  */
 export function isPermanentStreamFailure(status: number): boolean {
   return status >= 400 && status < 500 && status !== 401 && status !== 408 && status !== 429;
@@ -829,6 +831,8 @@ export function isPermanentStreamFailure(status: number): boolean {
 async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> {
   const { controller: master } = handle;
   let backoffMs = 1000;
+  // A 401 is reported once per outage, not on every reconnect attempt.
+  let reportedExpiry = false;
 
   while (!handle.cancelled) {
     const connectStart = Date.now();
@@ -878,12 +882,17 @@ async function runConnectLoop(sid: string, handle: StreamHandle): Promise<void> 
           if (activeStreams.get(sid) === handle) activeStreams.delete(sid);
           break;
         }
+        if (res.status === 401 && !reportedExpiry) {
+          reportedExpiry = true;
+          notifySessionExpired();
+        }
         console.warn(`[useChat] session stream ${res.status} for ${sid}; backing off ${backoffMs}ms`);
         await delay(backoffMs, attempt.signal);
         backoffMs = Math.min(backoffMs * 2, 8000);
         continue;
       }
 
+      reportedExpiry = false;
       const reader = res.body.getReader();
       // Backoff resets only once the connection proves useful (delivers an
       // event) — resetting on every 200 turned a relay that answers 200 and
@@ -1129,10 +1138,30 @@ export function hydrateSession(sid: string): Promise<void> {
   return load;
 }
 
-/** Outcome of `sendMessage`: dispatched, refused because this session already
- *  has a live run (nothing was added), or attempted and failed (an error row
- *  explains why). */
-export type SendResult = 'sent' | 'busy' | 'failed';
+/** Outcome of `sendMessage`:
+ *  - `sent`: the run started with the message.
+ *  - `busy`: this session already has a live run — known here (nothing was
+ *    added) or reported by the server (an error row explains).
+ *  - `rejected`: the server refused the send for another reason (an error row
+ *    explains).
+ *  - `failed`: the request did not complete, so whether the message arrived is
+ *    unknown (an error row explains; the optimistic message stays).
+ *  After `busy` and `rejected` nothing was saved, so the caller keeps the
+ *  draft for a retry. */
+export type SendResult = 'sent' | 'busy' | 'rejected' | 'failed';
+
+/** The user-facing reason the server gave for refusing a send. */
+async function refusalMessage(res: Response): Promise<string> {
+  if (res.status === 401) return 'You have been signed out. Sign in again, then resend your message.';
+  try {
+    const body = await res.json();
+    if (typeof body?.user_message === 'string' && body.user_message) return body.user_message;
+    if (typeof body?.detail === 'string' && body.detail) return body.detail;
+  } catch {
+    // not JSON: fall through to the generic message
+  }
+  return `Your message could not be sent (HTTP ${res.status}). Please try again.`;
+}
 
 function addSendError(sessionId: string, content: string): void {
   useChatStore.getState().addMessage(sessionId, {
@@ -1217,7 +1246,10 @@ export function useChat() {
   //   4. On success: call setIsStreaming(true) optimistically so the UI shows
   //      the loading state immediately, before run_started arrives on the stream.
   //      The stream's run_complete (not this function) turns it off.
-  //   5. On failure: add SYSTEM error message.
+  //   5. On a refusal: the server writes the message together with its run, so
+  //      nothing was saved — drop the optimistic message and add a SYSTEM row
+  //      saying why; the caller keeps the draft.  On a network failure the
+  //      outcome is unknown: keep the optimistic message, add the error row.
   // Resolves to a SendResult so callers that dispatch on the user's behalf
   // (AgentPage's initial prompt) know whether it actually went out.
   //
@@ -1235,8 +1267,9 @@ export function useChat() {
       if (useChatStore.getState().streamingSessions[sessionId]) return 'busy';
 
       // Optimistic USER message — shown immediately so the UI feels responsive.
+      const optimisticId = `temp_user_${Date.now()}`;
       useChatStore.getState().addMessage(sessionId, {
-        id: `temp_user_${Date.now()}`,
+        id: optimisticId,
         session_id: sessionId,
         role: 'USER',
         content: text,
@@ -1261,16 +1294,12 @@ export function useChat() {
         });
 
         if (!res.ok) {
-          // Parse the JSON error body (backend now returns plain JSON on failure).
-          let detail = `Request failed (${res.status})`;
-          try {
-            const errBody = await res.json();
-            if (errBody?.detail) detail = String(errBody.detail);
-          } catch {
-            // ignore parse error, keep default message
-          }
-          addSendError(sessionId, detail);
-          return 'failed';
+          // Refused: the message is saved only together with a started run, so
+          // nothing reached the transcript.
+          useChatStore.getState().removeMessage(sessionId, optimisticId);
+          if (res.status === 401) notifySessionExpired();
+          addSendError(sessionId, await refusalMessage(res));
+          return res.status === 409 ? 'busy' : 'rejected';
         }
 
         // Success: parse {run_id, message_id, run}.

@@ -39,8 +39,8 @@ export function DataExportSection() {
     <PrivacySection title="Download your data">
       <Prose>
         Get a copy of the data we hold about you as a JSON file: your profile and preferences, tasks and
-        conversations, files and canvases, workspaces, memories, and API key details (never the secret key
-        itself).
+        conversations, files and canvases, workspaces, memories, triggers, the apps you made, and API key
+        details (never the secret key itself).
       </Prose>
       <div className="flex items-center gap-3 flex-wrap">
         <button type="button" className={btn.primary} onClick={handleExport} disabled={working}>

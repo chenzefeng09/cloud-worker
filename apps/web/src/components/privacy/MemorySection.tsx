@@ -170,8 +170,9 @@ export function MemorySection({ platformMemoryEnabled }: { platformMemoryEnabled
       }
     >
       <Prose>
-        Memory saves a short summary of each task you complete and reuses it as context in your later tasks, so
-        you don't have to repeat yourself.
+        When the agent finishes a reply or a task, Memory saves a word-for-word excerpt of it (the start of
+        your request and of the agent&apos;s answer) and reuses it as context in your later conversations and
+        tasks, so you don&apos;t have to repeat yourself.
       </Prose>
 
       <div className="flex items-center gap-4">

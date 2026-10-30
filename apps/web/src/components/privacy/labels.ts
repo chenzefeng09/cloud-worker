@@ -117,6 +117,7 @@ const COUNT_LABELS: Record<string, string> = {
   cron_jobs: 'Triggers',
   acknowledgements: 'Notice acknowledgements',
   privacy_settings: 'Privacy settings',
+  web_sessions: 'Signed-in sessions ended',
 };
 
 export function countLabel(key: string): string {

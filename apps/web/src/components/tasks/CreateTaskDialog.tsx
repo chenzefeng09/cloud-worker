@@ -7,7 +7,7 @@ import { useModelOptions } from '../../hooks/useModelOptions';
 import { useDefaultModel } from '../../hooks/useDefaultModel';
 import { useWorkspace } from '../../lib/workspaceContext';
 import { SENSITIVITY_LABELS, DEFAULT_SENSITIVITY } from '../../lib/sensitivity';
-import { SYSTEM_FALLBACK_MODEL } from '../../lib/modelOptions';
+import { NO_MODEL_CONFIGURED, SYSTEM_FALLBACK_MODEL } from '../../lib/modelOptions';
 import { appInputCls as inputCls } from '../app/AppMetaFields';
 
 interface CreateTaskDialogProps {
@@ -32,7 +32,7 @@ export function CreateTaskDialog({ open, onClose, onCreated }: CreateTaskDialogP
   const { activeWorkspace, workspaces } = useWorkspace();
   const skills = useInstalledSkills();
   const { servers: mcpServers } = useMcpServers();
-  const { options: modelOptions } = useModelOptions();
+  const { options: modelOptions, noProvider } = useModelOptions();
   const { modelId: defaultModelId } = useDefaultModel('llm');
 
   const [title, setTitle] = useState('');
@@ -272,6 +272,7 @@ export function CreateTaskDialog({ open, onClose, onCreated }: CreateTaskDialogP
                   <option key={m.id} value={m.id}>{m.label}</option>
                 ))}
               </select>
+              {noProvider && <div className="text-[11.5px] text-dim">{NO_MODEL_CONFIGURED}</div>}
             </div>
           </div>
 

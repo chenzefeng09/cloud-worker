@@ -14,6 +14,7 @@
  * `../api/client` with only `api` + `ApiError` can still import this module.
  */
 import { apiQuery, apiRequest, ApiError, BFF_BASE } from './client';
+import { notifySessionExpired } from './authEvents';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -67,8 +68,10 @@ export interface ErasureResult {
   schedules?: ErasureStepOutcome;
   platform: { deleted: Record<string, number>; runs_cancelled: number };
   memories_deleted: number;
-  /** Model preferences held by the LLM gateway (skipped on an admin request). */
+  /** Model preferences held by the LLM gateway. */
   llm_preferences?: ErasureStepOutcome;
+  /** Apps the user authored: unshared ones deleted, shared ones kept without their name. */
+  apps?: { apps_deleted: number; apps_deattributed: number; versions_deattributed: number };
   bff: Record<string, unknown>;
   account: string;
 }
@@ -136,6 +139,9 @@ function innermostObject(problem: unknown): unknown {
 }
 
 async function errorFromResponse(res: Response): Promise<PrivacyApiError> {
+  // As in client.ts: the BFF refreshes tokens itself, so a 401 means the
+  // browser session could not be kept (AuthGate confirms and signs out).
+  if (res.status === 401) notifySessionExpired();
   let problem: unknown;
   try {
     problem = await res.json();

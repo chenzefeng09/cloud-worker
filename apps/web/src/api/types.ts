@@ -261,17 +261,19 @@ export interface CursorPage<T> {
   next_cursor: string | null;
 }
 
+/** POST /auth/login — the identity tokens stay in the BFF (server-side web
+ *  session); the browser only gets the HttpOnly session cookie. */
 export interface LoginResponse {
-  access_token: string;
-  refresh_token: string;
   user_id: string;
   tenant_id: string;
   email: string;
   display_name: string;
 }
 
+/** GET / PATCH /auth/me — foundation identity's profile, plus the caller's
+ *  effective permissions. The caller's id is `user_id` (there is no `id`). */
 export interface UserProfile {
-  id: string;
+  user_id: string;
   email: string;
   display_name: string;
   tenant_id: string;
@@ -493,6 +495,10 @@ export interface AppVersion {
   review_note?: string | null;
   created_by?: string | null;
   created_at: string;
+  /** Display names the BFF resolves beside each user id; null when it can't. */
+  submitted_by_name?: string | null;
+  reviewed_by_name?: string | null;
+  created_by_name?: string | null;
 }
 
 /** Request body for creating a draft version (or the App's initial draft). */
@@ -517,6 +523,8 @@ export interface App {
   description?: string | null;
   icon?: string | null;
   author_id: string;
+  /** The author's display name (resolved by the BFF); null when it can't be. */
+  author_name?: string | null;
   visibility: AppVisibility;
   current_version_id?: string | null;
   /** Free-form tags shown on the app card and used for OR-filtering in the app center. */
@@ -552,6 +560,7 @@ export interface AppReviewItem {
   app_id: string;
   app_name: string;
   author_id: string;
+  author_name?: string | null;
 }
 
 /** One resolved input value recorded in an App run snapshot. */
@@ -1194,6 +1203,12 @@ export interface PermissionDefinition {
   requires_policy?: boolean;
 }
 
+/**
+ * Binding lifecycle: REVOKED once revoked (wins over expiry), EXPIRED once
+ * `expires_at` has passed, otherwise ACTIVE — the only state that grants access.
+ */
+export type RoleBindingStatus = 'ACTIVE' | 'EXPIRED' | 'REVOKED';
+
 /** A grant of a role to a subject (user / team / org-unit), optionally scoped. */
 export interface RoleBinding {
   id: string;
@@ -1205,9 +1220,15 @@ export interface RoleBinding {
   scope_resource_id?: string | null;
   granted_by?: string;
   granted_at?: string;
-  /** JIT elevation: auto-revoked at this time when set. */
+  /** JIT elevation: stops granting (status EXPIRED) after this time when set. */
   expires_at?: string | null;
   reason?: string | null;
+  /** The list returns ACTIVE bindings unless EXPIRED / REVOKED are asked for. */
+  status?: RoleBindingStatus;
+  /** Revocation is final (soft delete); re-granting creates a new binding. */
+  revoked_at?: string | null;
+  revoked_by?: string | null;
+  revoked_reason?: string | null;
 }
 
 export interface CreateBindingRequest {

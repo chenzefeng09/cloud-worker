@@ -68,6 +68,7 @@ vi.mock('../api/privacy', () => ({
 }));
 
 import { ProfilePage } from './ProfilePage';
+import { DataNoticeProvider } from '../components/privacy/useDataNotice';
 
 const NOTICE = {
   version: '2026-10',
@@ -84,7 +85,9 @@ function renderPage() {
   return render(
     <DialogProvider>
       <MemoryRouter>
-        <ProfilePage />
+        <DataNoticeProvider>
+          <ProfilePage />
+        </DataNoticeProvider>
       </MemoryRouter>
     </DialogProvider>,
   );

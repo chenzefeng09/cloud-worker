@@ -7,7 +7,8 @@
 import { Dialog } from '../../admin/components/Dialog';
 import { Chip } from '../shell/Chip';
 import { VersionStatusChip } from './VersionStatusChip';
-import { formatAbsoluteTime } from '../../lib/format';
+import { formatAbsoluteTime, personLabel } from '../../lib/format';
+import { useChatStore } from '../../stores/chatStore';
 import type { App } from '../../api/types';
 
 interface Props {
@@ -19,6 +20,7 @@ interface Props {
 }
 
 export function VersionHistoryDialog({ app, open, onClose }: Props) {
+  const me = useChatStore((s) => s.userProfile?.user_id);
   if (!open) return null;
   // Newest-first, same ordering the old inline section used.
   const versions = [...(app.versions ?? [])].reverse();
@@ -45,13 +47,13 @@ export function VersionHistoryDialog({ app, open, onClose }: Props) {
               <div className="font-mono text-[10.5px] text-dim flex flex-col gap-0.5">
                 {v.submitted_by && (
                   <span>
-                    Submitted by {v.submitted_by}
+                    Submitted by {personLabel(v.submitted_by, v.submitted_by_name, me)}
                     {v.submitted_at ? ` · ${formatAbsoluteTime(v.submitted_at)}` : ''}
                   </span>
                 )}
                 {v.reviewed_by && (
                   <span>
-                    Reviewed by {v.reviewed_by}
+                    Reviewed by {personLabel(v.reviewed_by, v.reviewed_by_name, me)}
                     {v.reviewed_at ? ` · ${formatAbsoluteTime(v.reviewed_at)}` : ''}
                   </span>
                 )}

@@ -1,5 +1,6 @@
 /**
- * DataNoticeModal — the chat-page privacy notice gate.
+ * DataNoticeModal — the workspace privacy notice gate — and the notice state
+ * it shares (DataNoticeProvider) with the other views of the notice.
  *
  * Content comes from GET /privacy/notice; acknowledgement is recorded with
  * POST /me/privacy/acknowledgements and checked against GET …/latest, so the
@@ -11,7 +12,7 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { DataNoticeModal } from './DataNoticeModal';
-import { FALLBACK_NOTICE_VERSION } from './privacy/useDataNotice';
+import { DataNoticeProvider, FALLBACK_NOTICE_VERSION, useDataNotice } from './privacy/useDataNotice';
 import { useChatStore } from '../stores/chatStore';
 import { callsTo, jsonBody, jsonResponse, memoryStorage, mockFetch, noContent } from './privacy/testUtils';
 import type { PrivacyNotice } from '../api/privacy';
@@ -36,11 +37,29 @@ const NOTICE: PrivacyNotice = {
   rights: ['access', 'erasure', 'portability'],
 };
 
-function renderGate() {
+function renderGate(otherViews?: React.ReactNode) {
   return render(
     <MemoryRouter>
-      <DataNoticeModal />
+      <DataNoticeProvider>
+        <DataNoticeModal />
+        {otherViews}
+      </DataNoticeProvider>
     </MemoryRouter>,
+  );
+}
+
+/** Another view of the same notice state, like the Privacy tab. */
+function NoticeStatus() {
+  const n = useDataNotice({ autoOpen: false });
+  return (
+    <div>
+      <output aria-label="Notice status">
+        {n.loading ? 'loading' : n.needsAck ? 'not acknowledged' : `acknowledged ${n.acknowledged?.version}`}
+      </output>
+      <button type="button" onClick={() => void n.acknowledge()}>
+        Acknowledge here
+      </button>
+    </div>
   );
 }
 
@@ -50,12 +69,13 @@ beforeEach(() => {
   storage = memoryStorage();
   vi.stubGlobal('localStorage', storage);
   useChatStore.setState({
-    userProfile: { id: 'usr_1', email: 'a@b.c', display_name: 'A', tenant_id: 't', roles: [] } as never,
+    userProfile: { user_id: 'usr_1', email: 'a@b.c', display_name: 'A', tenant_id: 't', roles: [] } as never,
   });
 });
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.restoreAllMocks();
 });
 
 describe('DataNoticeModal', () => {
@@ -121,13 +141,29 @@ describe('DataNoticeModal', () => {
     expect(await screen.findByRole('dialog', { name: 'Privacy notice' })).toBeInTheDocument();
   });
 
-  it('skips the server check when the cache already matches the current version', async () => {
+  // Erasing your data deletes your acknowledgements too: this device's cache
+  // still says "acknowledged", the server no longer does, and the server wins.
+  it('shows the notice again when the server no longer has the cached acknowledgement', async () => {
     storage.setItem(CACHE_KEY, JSON.stringify({ version: '2026-10', acknowledged_at: '2026-10-02T00:00:00Z' }));
-    const fetchMock = mockFetch({ [`GET ${NOTICE_URL}`]: NOTICE });
+    mockFetch({
+      [`GET ${NOTICE_URL}`]: NOTICE,
+      [`GET ${LATEST_URL}`]: { notice_version: null, acknowledged_at: null },
+    });
     renderGate();
-    await waitFor(() => expect(callsTo(fetchMock, 'GET', NOTICE_URL)).toHaveLength(1));
+    expect(await screen.findByRole('dialog', { name: 'Privacy notice' })).toBeInTheDocument();
+    // Nor does the stale cache come back the next time the server is unreachable.
+    expect(storage.getItem(CACHE_KEY)).toBeNull();
+  });
+
+  it('relies on a cached acknowledgement of this version only while the server cannot be asked', async () => {
+    storage.setItem(CACHE_KEY, JSON.stringify({ version: '2026-10', acknowledged_at: '2026-10-02T00:00:00Z' }));
+    const fetchMock = mockFetch({
+      [`GET ${NOTICE_URL}`]: NOTICE,
+      [`GET ${LATEST_URL}`]: () => jsonResponse({ detail: 'down' }, { status: 503 }),
+    });
+    renderGate();
+    await waitFor(() => expect(callsTo(fetchMock, 'GET', LATEST_URL)).toHaveLength(1));
     await new Promise((r) => setTimeout(r, 0));
-    expect(callsTo(fetchMock, 'GET', LATEST_URL)).toHaveLength(0);
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
@@ -211,5 +247,52 @@ describe('DataNoticeModal', () => {
     expect(within(dialog).getByText(/Memory is off/)).toBeInTheDocument();
     expect(within(dialog).getByText('Tasks and conversations are kept until you delete them.')).toBeInTheDocument();
     expect(within(dialog).getByText(/removed for good straight away/)).toBeInTheDocument();
+  });
+
+  describe('shared with the other views of the notice', () => {
+    it('asks the server once for all of them', async () => {
+      const fetchMock = mockFetch({
+        [`GET ${NOTICE_URL}`]: NOTICE,
+        [`GET ${LATEST_URL}`]: { notice_version: '2026-10', acknowledged_at: '2026-10-01T00:00:00Z' },
+      });
+      renderGate(<NoticeStatus />);
+      expect(await screen.findByRole('status', { name: 'Notice status' })).toHaveTextContent('acknowledged 2026-10');
+      expect(callsTo(fetchMock, 'GET', NOTICE_URL)).toHaveLength(1);
+      expect(callsTo(fetchMock, 'GET', LATEST_URL)).toHaveLength(1);
+    });
+
+    it('acknowledging in the gate updates them', async () => {
+      mockFetch({
+        [`GET ${NOTICE_URL}`]: NOTICE,
+        [`GET ${LATEST_URL}`]: { notice_version: null, acknowledged_at: null },
+        [`POST ${ACK_URL}`]: () => noContent(),
+      });
+      renderGate(<NoticeStatus />);
+      const status = screen.getByRole('status', { name: 'Notice status' });
+      await waitFor(() => expect(status).toHaveTextContent('not acknowledged'));
+
+      await userEvent.click(await screen.findByRole('button', { name: 'Got it' }));
+      await waitFor(() => expect(status).toHaveTextContent('acknowledged 2026-10'));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+
+    it('closes the gate when the notice is acknowledged from another view', async () => {
+      const fetchMock = mockFetch({
+        [`GET ${NOTICE_URL}`]: NOTICE,
+        [`GET ${LATEST_URL}`]: { notice_version: null, acknowledged_at: null },
+        [`POST ${ACK_URL}`]: () => noContent(),
+      });
+      renderGate(<NoticeStatus />);
+      await screen.findByRole('dialog', { name: 'Privacy notice' });
+
+      await userEvent.click(screen.getByRole('button', { name: 'Acknowledge here' }));
+      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+      expect(callsTo(fetchMock, 'POST', ACK_URL)).toHaveLength(1);
+    });
+
+    it('needs the provider', () => {
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      expect(() => render(<NoticeStatus />)).toThrow(/within <DataNoticeProvider>/);
+    });
   });
 });

@@ -136,6 +136,13 @@ interface ChatState {
   setSessionsCursor: (cursor: string | null) => void;
   setSessionsLoadingMore: (loading: boolean) => void;
   addSession: (session: Session) => void;
+  /**
+   * Put a session fetched on its own (one the loaded pages don't include,
+   * such as a task started from the board) into the list: replaced in place
+   * when present, otherwise inserted where the server's newest-first order
+   * puts it.
+   */
+  upsertSession: (session: Session) => void;
   updateSessionTitle: (sessionId: string, title: string | null) => void;
   setActiveSession: (sessionId: string | null) => void;
   setMessages: (sessionId: string, messages: Message[]) => void;
@@ -744,6 +751,19 @@ export const useChatStore = create<ChatState>((set) => ({
   setSessionsCursor: (cursor) => set({ sessionsCursor: cursor }),
   setSessionsLoadingMore: (loading) => set({ sessionsLoadingMore: loading }),
   addSession: (session) => set((s) => ({ sessions: [session, ...s.sessions] })),
+  upsertSession: (session) =>
+    set((s) => {
+      if (s.sessions.some((existing) => existing.id === session.id)) {
+        return {
+          sessions: s.sessions.map((existing) => (existing.id === session.id ? session : existing)),
+        };
+      }
+      const updated = Date.parse(session.updated_at);
+      const at = s.sessions.findIndex((existing) => Date.parse(existing.updated_at) < updated);
+      const sessions = [...s.sessions];
+      sessions.splice(at === -1 ? sessions.length : at, 0, session);
+      return { sessions };
+    }),
   updateSessionTitle: (sessionId, title) =>
     set((s) => ({
       sessions: s.sessions.map((session) =>

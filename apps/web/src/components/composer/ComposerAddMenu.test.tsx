@@ -13,8 +13,9 @@ vi.mock('../../hooks/useCanUploadAttachment', () => ({
   }),
 }));
 
-// Composer fetches the model catalogue via useModelOptions; resolve empty so it
-// falls back to MODEL_OPTIONS without making a real (jsdom-unresolvable) fetch.
+// Composer fetches the model catalogue via useModelOptions; resolve it empty
+// (no provider, so no model picker options) instead of making a real
+// (jsdom-unresolvable) fetch.
 vi.mock('../../api/client', () => ({
   api: { modelPreferences: { listModels: vi.fn().mockResolvedValue([]) } },
 }));

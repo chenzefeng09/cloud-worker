@@ -91,11 +91,12 @@ function NoticeBody({ notice, privacyLink }: { notice: PrivacyNotice; privacyLin
       <Block title="Memory">
         {notice.memory?.enabled ? (
           <p>
-            Memory is on: when a task finishes, a short summary of it is saved and can be reused as context in
-            your later tasks. You can turn this off or delete saved memories {privacyLink}.
+            Memory is on: when the agent finishes a reply or a task, a word-for-word excerpt of it (the start of
+            your request and of the agent's answer) is saved and can be reused as context in your later
+            conversations and tasks. You can turn this off or delete saved memories {privacyLink}.
           </p>
         ) : (
-          <p>Memory is off, so summaries of your tasks aren't saved or reused in later tasks.</p>
+          <p>Memory is off, so nothing from your conversations or tasks is saved for reuse later.</p>
         )}
       </Block>
 

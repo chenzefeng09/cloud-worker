@@ -178,9 +178,12 @@ describe('TasksPage', () => {
     await screen.findByText('Summarise contracts');
     await userEvent.click(screen.getByRole('tab', { name: /Failed/ }));
     await waitFor(() =>
-      expect(mocks.list).toHaveBeenLastCalledWith(
-        expect.objectContaining({ status: ['failed', 'cancelled'] }),
-      ),
+      expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ status: ['failed'] })),
+    );
+    // A task stopped on purpose is not a failure: it has its own tab.
+    await userEvent.click(screen.getByRole('tab', { name: /Cancelled/ }));
+    await waitFor(() =>
+      expect(mocks.list).toHaveBeenLastCalledWith(expect.objectContaining({ status: ['cancelled'] })),
     );
   });
 

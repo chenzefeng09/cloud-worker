@@ -6,7 +6,7 @@ import { useChatStore } from './chatStore';
 import type { Message, ToolCallEntry, UserProfile } from '../api/types';
 
 const PROFILE: UserProfile = {
-  id: 'usr_test',
+  user_id: 'usr_test',
   email: 'test@example.com',
   display_name: 'Test',
   tenant_id: 'tnt_test',

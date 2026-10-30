@@ -10,7 +10,6 @@ import { OutputFileCards } from './OutputFileCards';
 import { Composer } from './composer/Composer';
 import { PlanBlock } from './PlanBlock';
 import { RewindConfirmModal } from './RewindConfirmModal';
-import { DataNoticeModal } from './DataNoticeModal';
 import { ConfirmCard } from './hitl/ConfirmCard';
 import { QuestionCard } from './hitl/QuestionCard';
 import { CanvasMessageCard } from './CanvasMessageCard';
@@ -583,11 +582,11 @@ export function ChatWindow({
     shouldStickToBottomRef.current = true;
     scrollToBottom('smooth');
     const send = onSendMessage ?? sendMessage;
-    // A send refused because this session already has a live run added
-    // nothing, so keep the draft (Composer treats `false` as "not accepted").
-    // A failed send stays visible as the optimistic message + its error row.
+    // A refused send (a live run, or the server said no) saved nothing, so keep
+    // the draft (Composer treats `false` as "not accepted").  A send whose
+    // outcome is unknown stays visible as the optimistic message + its error row.
     return Promise.resolve(send(text, attachmentIds, attMeta, workspaceFileIds)).then(
-      (result) => (result === 'busy' ? false : undefined),
+      (result) => (result === 'busy' || result === 'rejected' ? false : undefined),
     );
   };
 
@@ -879,8 +878,6 @@ export function ChatWindow({
           }}
           mentionCandidates={mentionCandidates}
         />
-        {/* Privacy notice: decides for itself (server-recorded acknowledgement per notice version). */}
-        <DataNoticeModal />
         {pendingRewind && (
           <RewindConfirmModal
             message={pendingRewind}

@@ -18,7 +18,8 @@ function reloadHome() {
 
 /**
  * "Delete your data" — POST /me/privacy/erase with the typed phrase (GDPR Art. 17).
- * A 502 means some steps finished and others didn't; retrying is safe.
+ * A 503 means nothing was deleted (a service the deletion needs is unavailable);
+ * a 502 means some steps finished and others didn't. Retrying is safe either way.
  *
  * @param onFinished called from "Continue" after a successful erasure
  *   (defaults to a full reload of /home).
@@ -44,6 +45,11 @@ export function DataErasureSection({ onFinished = reloadHome }: { onFinished?: (
       const status = httpStatus(err);
       if (status === 502) {
         setState({ phase: 'partial', details: errorDetails(err) });
+      } else if (status === 503) {
+        setState({
+          phase: 'error',
+          message: "Nothing was deleted: a service the deletion needs is unavailable right now. Please try again later.",
+        });
       } else if (status === 422) {
         setState({ phase: 'error', message: `The confirmation didn't match. Type ${ERASE_CONFIRMATION_PHRASE} exactly, in capitals.` });
       } else {
@@ -72,8 +78,9 @@ export function DataErasureSection({ onFinished = reloadHome }: { onFinished?: (
     <PrivacySection title="Delete your data">
       <Prose>
         This permanently deletes your tasks and conversations, uploaded and generated files, canvases,
-        workspaces, triggers, memories, preferences and API keys, and stops any tasks that are still running. It
-        can't be undone, so download your data first if you want a copy.
+        workspaces, triggers, memories, model and notification preferences and API keys, and stops any tasks
+        that are still running. Apps only you could use are deleted; apps you shared with your organization stay
+        available to it without your name. It can't be undone, so download your data first if you want a copy.
       </Prose>
       <Prose>Your sign-in account itself isn't deleted here — an administrator closes it separately.</Prose>
 

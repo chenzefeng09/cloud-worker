@@ -1,29 +1,41 @@
-/** What an erasure removed, and which steps it skipped (admin requests skip model preferences). */
+/** What an erasure removed, and which steps it skipped. */
 import { describe, expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import type { ErasureResult } from '../../api/privacy';
 import { ErasureSummary, erasureGroups, skippedSteps } from './ErasureSummary';
 
 const ADMIN_RESULT: ErasureResult = {
-  schedules: { deleted: 3 },
+  schedules: { skipped: 'not_configured' },
   platform: { deleted: { sessions: 2 }, runs_cancelled: 0 },
   memories_deleted: 1,
-  llm_preferences: { skipped: 'not_supported' },
+  llm_preferences: { deleted: 2 },
+  apps: { apps_deleted: 1, apps_deattributed: 2, versions_deattributed: 3 },
   bff: { api_keys: 1 },
   account: 'pending_admin_closure',
 };
 
 describe('erasureGroups', () => {
-  it('counts triggers with the content and model preferences with the account settings', () => {
-    const groups = erasureGroups({ ...ADMIN_RESULT, llm_preferences: { deleted: 2 } });
+  it('counts triggers with the content, apps on their own and model preferences with the account settings', () => {
+    const groups = erasureGroups({ ...ADMIN_RESULT, schedules: { deleted: 3 } });
     const rows = Object.fromEntries(groups.map((g) => [g.title, g.rows.map((r) => [r.label, r.count])]));
     expect(rows['Tasks and content']).toEqual([['Tasks and conversations', 2], ['Running tasks stopped', 0], ['Triggers', 3]]);
+    expect(rows.Apps).toEqual([
+      ['Apps deleted', 1],
+      ['Shared apps kept, author removed', 2],
+      ['App versions no longer naming you', 3],
+    ]);
     expect(rows['Account settings']).toEqual([['API keys', 1], ['Model preferences', 2]]);
+  });
+
+  it('counts the sign-ins the erasure ended', () => {
+    const groups = erasureGroups({ ...ADMIN_RESULT, bff: { api_keys: 1, web_sessions: 2 } });
+    const account = groups.find((g) => g.title === 'Account settings');
+    expect(account?.rows.map((r) => [r.label, r.count])).toContainEqual(['Signed-in sessions ended', 2]);
   });
 
   it('never counts a skipped step', () => {
     const rows = erasureGroups(ADMIN_RESULT).flatMap((g) => g.rows.map((r) => r.key));
-    expect(rows).not.toContain('llm_preferences');
+    expect(rows).not.toContain('schedules');
   });
 });
 
@@ -49,9 +61,7 @@ describe('ErasureSummary', () => {
   it('says plainly when a step was skipped rather than done', () => {
     render(<ErasureSummary result={ADMIN_RESULT} />);
     expect(screen.getByText('Skipped:')).toBeInTheDocument();
-    expect(
-      screen.getByText('Model preferences: not deleted — only the user can clear these, by deleting their own data'),
-    ).toBeInTheDocument();
-    expect(screen.getByText('Triggers').nextElementSibling).toHaveTextContent('3');
+    expect(screen.getByText('Triggers: not part of this deployment')).toBeInTheDocument();
+    expect(screen.getByText('Model preferences').nextElementSibling).toHaveTextContent('2');
   });
 });

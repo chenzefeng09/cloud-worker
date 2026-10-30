@@ -33,6 +33,7 @@ vi.mock('../lib/workspaceContext', () => ({
 vi.mock('../hooks/useSessions', () => ({
   useSessions: () => ({ sessions: [], createSession: mocks.createSession }),
 }));
+vi.mock('../hooks/useTasks', () => ({ useTasks: () => ({ items: [] }) }));
 vi.mock('../hooks/useApps', () => ({ useApps: () => ({ apps: [], loading: false }) }));
 vi.mock('../hooks/useDefaultModel', () => ({
   useDefaultModel: () => ({ modelId: 'deepseek-v4-flash', isLoading: false }),
@@ -68,9 +69,8 @@ vi.mock('../hooks/useMcpServers', () => ({
 vi.mock('../api/client', () => ({
   api: {
     attachments: { upload: vi.fn(), remove: vi.fn() },
-    // Composer fetches the model catalogue via useModelOptions; resolve empty
-    // so it falls back to MODEL_OPTIONS and the existing menu tests are
-    // unaffected by the new fetch.
+    // Composer fetches the model catalogue via useModelOptions; resolve it
+    // empty so the menu tests are unaffected by the fetch.
     modelPreferences: { listModels: vi.fn().mockResolvedValue([]) },
   },
 }));

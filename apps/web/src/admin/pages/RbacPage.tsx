@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api/client';
 import { useAdminStore } from '../../stores/adminStore';
 import { useChatStore } from '../../stores/chatStore';
@@ -14,9 +14,12 @@ import type {
   CreateRoleRequest,
   PermissionDefinition,
   RoleBinding,
+  RoleBindingStatus,
 } from '../../api/types';
 
 const SUBJECT_TYPES: BindingSubjectType[] = ['USER', 'TEAM', 'ORG_UNIT'];
+// "Show revoked & expired" asks for every lifecycle state; off = authz's ACTIVE-only default.
+const ALL_BINDING_STATUSES: RoleBindingStatus[] = ['ACTIVE', 'REVOKED', 'EXPIRED'];
 // Upstream authz requires lowercase role names: ^[a-z][a-z0-9_]{1,99}$.
 const ROLE_NAME_RE = /^[a-z][a-z0-9_]{1,99}$/;
 
@@ -583,6 +586,32 @@ function PermissionsTab({ permissions }: { permissions: PermissionExtra[] }) {
 
 // ─── Bindings Tab ─────────────────────────────────────────────────────────────
 
+/** authz sends `status`; derive it by the same rule if an older upstream omits it. */
+function bindingStatus(b: RoleBinding): RoleBindingStatus {
+  if (b.status) return b.status;
+  if (b.revoked_at) return 'REVOKED';
+  if (b.expires_at && new Date(b.expires_at).getTime() < Date.now()) return 'EXPIRED';
+  return 'ACTIVE';
+}
+
+const STATUS_CHIP: Record<RoleBindingStatus, { label: string; className: string }> = {
+  ACTIVE: { label: 'Active', className: 'text-green-700 bg-green-50 border-green-200' },
+  EXPIRED: { label: 'Expired', className: 'text-amber-700 bg-amber-50 border-amber-200' },
+  REVOKED: { label: 'Revoked', className: 'text-red-700 bg-red-50 border-red-200' },
+};
+
+/** What the table holds: loaded rows by state, and whether more pages exist. */
+function bindingsSummary(bindings: RoleBinding[], showRevoked: boolean, hasMore: boolean): string {
+  const count = (s: RoleBindingStatus) => bindings.filter((b) => bindingStatus(b) === s).length;
+  const active = count('ACTIVE');
+  const noun = (n: number) => (n === 1 ? 'binding' : 'bindings');
+  const shown =
+    showRevoked || active < bindings.length
+      ? `${bindings.length} ${noun(bindings.length)}: ${active} active · ${count('REVOKED')} revoked · ${count('EXPIRED')} expired`
+      : `${active} active ${noun(active)}`;
+  return `Showing ${shown}${hasMore ? ' · more not loaded yet' : ''}`;
+}
+
 function CreateBindingForm({
   tenantId,
   roles,
@@ -721,81 +750,152 @@ function BindingsTab({
   tenantId,
   bindings,
   roles,
+  showRevoked,
+  onShowRevokedChange,
+  refreshing,
+  hasMore,
+  loadingMore,
+  onLoadMore,
   onReload,
   onError,
 }: {
   tenantId: string | null;
   bindings: RoleBinding[];
   roles: AdminRole[];
+  showRevoked: boolean;
+  onShowRevokedChange: (show: boolean) => void;
+  /** The list is being fetched again (status filter, revoke, new binding). */
+  refreshing: boolean;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
   onReload: () => void;
   onError: (m: string) => void;
 }) {
-  const [deleting, setDeleting] = useState<string | null>(null);
+  const [revoking, setRevoking] = useState<string | null>(null);
   const roleName = (id?: string) => {
     const r = roles.find((x) => x.id === id);
     return r?.display_name || r?.name || id || '—';
   };
   const confirm = useConfirm();
 
-  const handleDelete = async (b: RoleBinding) => {
-    if (!(await confirm({ title: 'Delete role binding', message: 'Delete this role binding?', tone: 'danger', confirmText: 'Delete' }))) return;
-    setDeleting(b.id);
+  // authz revokes rather than deletes: the binding stops granting at once and
+  // its record stays listed under "Show revoked & expired".
+  const handleRevoke = async (b: RoleBinding) => {
+    if (bindingStatus(b) !== 'ACTIVE') return;
+    if (!(await confirm({ title: 'Revoke role binding', message: 'Revoke this role binding? It stops granting access immediately; the record stays listed under “Show revoked & expired”.', tone: 'danger', confirmText: 'Revoke' }))) return;
+    setRevoking(b.id);
     onError('');
     try {
       await api.admin.authz.bindings.delete(b.id, tenantId ?? undefined);
       onReload();
     } catch (err) {
-      onError(err instanceof ApiError ? err.message : 'Failed to delete');
+      onError(err instanceof ApiError ? err.message : 'Failed to revoke');
     } finally {
-      setDeleting(null);
+      setRevoking(null);
     }
   };
 
   return (
     <div className="flex flex-col gap-4">
       <CreateBindingForm tenantId={tenantId} roles={roles} onCreated={onReload} />
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <span className="font-mono text-[11px] text-dim" aria-live="polite">
+          {refreshing ? 'Loading…' : bindings.length > 0 && bindingsSummary(bindings, showRevoked, hasMore)}
+        </span>
+        <label className="flex items-center gap-1.5 text-[11px] font-mono text-dim cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={showRevoked}
+            onChange={(e) => onShowRevokedChange(e.target.checked)}
+            className="accent-ink"
+          />
+          Show revoked & expired
+        </label>
+      </div>
       {bindings.length === 0 ? (
-        <div className="font-mono text-[12px] text-dim italic">No bindings</div>
+        !refreshing && (
+          <div className="font-mono text-[12px] text-dim italic">{showRevoked ? 'No bindings' : 'No active bindings'}</div>
+        )
       ) : (
-        <div className="border border-line rounded-md overflow-hidden">
+        <div
+          className={`border border-line rounded-md overflow-hidden ${refreshing ? 'opacity-60' : ''}`}
+          aria-busy={refreshing}
+        >
           <table className="w-full text-left border-collapse">
             <thead className="bg-paper-2 border-b border-line">
               <tr>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Subject type</th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Subject ID</th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Role</th>
+                <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Status</th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Expires at</th>
                 <th className="px-3 py-2 font-mono text-[10.5px] uppercase tracking-[0.1em] text-dim">Actions</th>
               </tr>
             </thead>
             <tbody>
-              {bindings.map((b) => (
-                <tr key={b.id} className="border-b border-line-2 hover:bg-paper-2 transition-colors">
-                  <td className="px-3 py-2 font-mono text-[11px] text-ink-2">{b.subject_type ?? '—'}</td>
-                  <td className="px-3 py-2 font-mono text-[11px] text-dim truncate max-w-[160px]">
-                    {b.subject_id ?? '—'}
-                  </td>
-                  <td className="px-3 py-2 font-mono text-[12px] text-ink">{roleName(b.role_id)}</td>
-                  <td className="px-3 py-2 font-mono text-[11px] text-dim">
-                    {b.expires_at ? (
-                      <span className="text-amber-700">{formatDateTimeAuto(new Date(b.expires_at))}</span>
-                    ) : (
-                      'Never'
-                    )}
-                  </td>
-                  <td className="px-3 py-2">
-                    <button
-                      onClick={() => handleDelete(b)}
-                      disabled={deleting === b.id}
-                      className="text-[11px] font-mono text-red-600 border border-red-200 rounded-sm px-2 py-0.5 hover:bg-red-50 disabled:opacity-50"
-                    >
-                      {deleting === b.id ? '…' : 'Delete'}
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {bindings.map((b) => {
+                const status = bindingStatus(b);
+                const active = status === 'ACTIVE';
+                return (
+                  <tr
+                    key={b.id}
+                    className={`border-b border-line-2 hover:bg-paper-2 transition-colors ${active ? '' : 'bg-paper-2'}`}
+                  >
+                    <td className="px-3 py-2 font-mono text-[11px] text-ink-2">{b.subject_type ?? '—'}</td>
+                    <td className="px-3 py-2 font-mono text-[11px] text-dim truncate max-w-[160px]">
+                      {b.subject_id ?? '—'}
+                    </td>
+                    <td className={`px-3 py-2 font-mono text-[12px] ${active ? 'text-ink' : 'text-dim'}`}>
+                      {roleName(b.role_id)}
+                    </td>
+                    <td className="px-3 py-2">
+                      <span className={`font-mono text-[9.5px] border rounded-sm px-1.5 py-0.5 ${STATUS_CHIP[status].className}`}>
+                        {STATUS_CHIP[status].label}
+                      </span>
+                      {status === 'REVOKED' && (
+                        <div className="mt-1 font-mono text-[10.5px] text-dim">
+                          <div>
+                            {b.revoked_at ? formatDateTimeAuto(new Date(b.revoked_at)) : 'Time unknown'}
+                            {b.revoked_by && ` · by ${b.revoked_by}`}
+                          </div>
+                          {b.revoked_reason && <div className="font-sans text-[11px]">Reason: {b.revoked_reason}</div>}
+                        </div>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-[11px] text-dim">
+                      {b.expires_at ? (
+                        <span className="text-amber-700">{formatDateTimeAuto(new Date(b.expires_at))}</span>
+                      ) : (
+                        'Never'
+                      )}
+                    </td>
+                    <td className="px-3 py-2">
+                      <button
+                        onClick={() => handleRevoke(b)}
+                        disabled={!active || revoking === b.id}
+                        className="text-[11px] font-mono text-red-600 border border-red-200 rounded-sm px-2 py-0.5 hover:bg-red-50 disabled:opacity-40 disabled:cursor-not-allowed"
+                        title={active ? undefined : status === 'REVOKED' ? 'Already revoked' : 'Expired — no longer grants access'}
+                      >
+                        {revoking === b.id ? '…' : 'Revoke'}
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
+        </div>
+      )}
+      {hasMore && (
+        <div className="flex justify-center">
+          <button
+            onClick={onLoadMore}
+            disabled={loadingMore}
+            className="px-3 py-1.5 text-[11px] font-mono border border-line rounded-sm text-ink-2 hover:bg-paper-2 disabled:opacity-50"
+          >
+            {loadingMore ? 'Loading…' : 'Load more'}
+          </button>
         </div>
       )}
     </div>
@@ -818,9 +918,23 @@ export function RbacPage() {
   const [roles, setRoles] = useState<AdminRole[]>([]);
   const [permissions, setPermissions] = useState<PermissionExtra[]>([]);
   const [bindings, setBindings] = useState<RoleBinding[]>([]);
+  // next_cursor of the last bindings page loaded; null once every page is in.
+  const [bindingsCursor, setBindingsCursor] = useState<string | null>(null);
+  const [loadingMoreBindings, setLoadingMoreBindings] = useState(false);
+  // Off: ACTIVE bindings only (the authz default). On: revoked / expired too.
+  // The ref is what the fetches read, so flipping the filter refetches the
+  // bindings alone instead of re-running the whole page load.
+  const [showRevoked, setShowRevoked] = useState(false);
+  const showRevokedRef = useRef(false);
   const [loading, setLoading] = useState(false);
+  const [bindingsRefreshing, setBindingsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [isTodoEndpoint, setIsTodoEndpoint] = useState(false);
+  // Bumped by every page load / every bindings fetch, so a slower response for
+  // an earlier tenant or filter (or a "Load more" still in flight) can't
+  // overwrite the newer list.
+  const loadGen = useRef(0);
+  const bindingsGen = useRef(0);
 
   // Bootstrap tenant list
   useEffect(() => {
@@ -833,30 +947,90 @@ export function RbacPage() {
       .finally(() => setTenantsLoading(false));
   }, [tenants.length, setTenants, setTenantsLoading]);
 
+  const listBindings = useCallback(
+    (cursor?: string) =>
+      api.admin.authz.bindings.list(selectedTenantId ?? undefined, {
+        status: showRevokedRef.current ? ALL_BINDING_STATUSES : undefined,
+        cursor,
+      }),
+    [selectedTenantId],
+  );
+
   const load = useCallback(async () => {
+    const gen = ++loadGen.current;
+    // Supersedes a bindings refetch still in flight (its result is dropped).
+    const bGen = ++bindingsGen.current;
+    setBindingsRefreshing(false);
     setLoading(true);
     setError(null);
     setIsTodoEndpoint(false);
     const tid = selectedTenantId ?? undefined;
     try {
-      const [roleList, permList, bindingList] = await Promise.all([
+      const [roleList, permList, bindingPage] = await Promise.all([
         api.admin.authz.roles.list(tid),
         api.admin.authz.permissions.list(),
-        api.admin.authz.bindings.list(tid),
+        listBindings(),
       ]);
+      if (gen !== loadGen.current) return;
       setRoles(roleList);
       setPermissions(permList as PermissionExtra[]);
-      setBindings(bindingList);
+      // A filter change since then has fetched a newer bindings list.
+      if (bGen === bindingsGen.current) {
+        setBindings(bindingPage.items);
+        setBindingsCursor(bindingPage.next_cursor ?? null);
+      }
     } catch (err) {
+      if (gen !== loadGen.current) return;
       if (err instanceof ApiError && (err.status === 404 || err.status === 501)) {
         setIsTodoEndpoint(true);
       } else {
         setError(err instanceof ApiError ? err.message : 'Failed to load');
       }
     } finally {
-      setLoading(false);
+      if (gen === loadGen.current) setLoading(false);
     }
-  }, [selectedTenantId]);
+  }, [selectedTenantId, listBindings]);
+
+  // Fetch the first bindings page again, leaving roles, permissions and the
+  // tab on screen (a half-filled "New role binding" form included).
+  const reloadBindings = useCallback(async () => {
+    const gen = ++bindingsGen.current;
+    setBindingsRefreshing(true);
+    setError(null);
+    try {
+      const page = await listBindings();
+      if (gen !== bindingsGen.current) return;
+      setBindings(page.items);
+      setBindingsCursor(page.next_cursor ?? null);
+    } catch (err) {
+      if (gen === bindingsGen.current) setError(err instanceof ApiError ? err.message : 'Failed to load role bindings');
+    } finally {
+      if (gen === bindingsGen.current) setBindingsRefreshing(false);
+    }
+  }, [listBindings]);
+
+  const changeShowRevoked = (show: boolean) => {
+    showRevokedRef.current = show;
+    setShowRevoked(show);
+    void reloadBindings();
+  };
+
+  // Append the next bindings page (same tenant / status filter).
+  const loadMoreBindings = async () => {
+    if (!bindingsCursor || loadingMoreBindings) return;
+    const gen = bindingsGen.current;
+    setLoadingMoreBindings(true);
+    try {
+      const page = await listBindings(bindingsCursor);
+      if (gen !== bindingsGen.current) return;
+      setBindings((prev) => [...prev, ...page.items]);
+      setBindingsCursor(page.next_cursor ?? null);
+    } catch (err) {
+      if (gen === bindingsGen.current) setError(err instanceof ApiError ? err.message : 'Failed to load more');
+    } finally {
+      setLoadingMoreBindings(false);
+    }
+  };
 
   // Tenant admins must never carry a cross-tenant selection (the adminStore is
   // shared and could hold a stale id from a prior platform-admin session).
@@ -870,10 +1044,12 @@ export function RbacPage() {
     load();
   }, [load]);
 
+  // The bindings tab counts current grants only; "+" while pages are unloaded.
+  const activeBindings = bindings.filter((b) => bindingStatus(b) === 'ACTIVE').length;
   const TABS: { key: Tab; label: string }[] = [
     { key: 'roles', label: `Roles (${roles.length})` },
     { key: 'permissions', label: `Permission catalog (${permissions.length})` },
-    { key: 'bindings', label: `Role bindings (${bindings.length})` },
+    { key: 'bindings', label: `Role bindings (${activeBindings}${bindingsCursor ? '+' : ''} active)` },
   ];
 
   return (
@@ -953,7 +1129,13 @@ export function RbacPage() {
                 tenantId={selectedTenantId}
                 bindings={bindings}
                 roles={roles}
-                onReload={load}
+                showRevoked={showRevoked}
+                onShowRevokedChange={changeShowRevoked}
+                refreshing={bindingsRefreshing}
+                hasMore={!!bindingsCursor}
+                loadingMore={loadingMoreBindings}
+                onLoadMore={loadMoreBindings}
+                onReload={reloadBindings}
                 onError={(m) => setError(m || null)}
               />
             )}

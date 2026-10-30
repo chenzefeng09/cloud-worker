@@ -122,7 +122,7 @@ describe('DataErasureSection', () => {
                   succeeded: ['platform'],
                   skipped: { schedules: 'not_configured' },
                   failed: 'memories',
-                  not_attempted: ['llm_preferences', 'bff'],
+                  not_attempted: ['llm_preferences', 'apps', 'bff'],
                   error: 'knowledge-ingest returned HTTP 503',
                   results: { schedules: { skipped: 'not_configured' }, platform: RESULT.platform },
                 },
@@ -139,7 +139,7 @@ describe('DataErasureSection', () => {
     expect(screen.getByText(/safe to try again/)).toBeInTheDocument();
     expect(screen.getByText('Tasks, files, canvases and workspaces')).toBeInTheDocument();
     expect(screen.getByText('Memories')).toBeInTheDocument();
-    expect(screen.getByText('Model preferences, Preferences and API keys')).toBeInTheDocument();
+    expect(screen.getByText('Model preferences, Apps, Preferences, API keys and sign-ins')).toBeInTheDocument();
     expect(screen.getByText('Triggers: not part of this deployment')).toBeInTheDocument();
     // The counts come from `results`, not the top level of the problem body.
     expect(screen.getByText('Already deleted:')).toBeInTheDocument();
@@ -148,6 +148,30 @@ describe('DataErasureSection', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
     expect(await screen.findByText('Your data has been deleted.')).toBeInTheDocument();
     expect(attempts).toBe(2);
+  });
+
+  it('says plainly that nothing was deleted when the preflight refuses (503)', async () => {
+    mockFetch({
+      [`POST ${ERASE_URL}`]: () =>
+        jsonResponse(
+          {
+            detail: {
+              user_message: 'Nothing was erased: a platform service is unavailable or refused the request.',
+              code: 'PRIVACY_ERASURE_UNAVAILABLE',
+              failed: 'apps',
+              error: 'app-registry unreachable (ConnectError)',
+            },
+          },
+          { status: 503 },
+        ),
+    });
+    render(<DataErasureSection onFinished={vi.fn()} />);
+    await userEvent.type(confirmInput(), 'DELETE MY DATA');
+    await userEvent.click(screen.getByRole('button', { name: 'Delete my data' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/^Nothing was deleted/);
+    expect(screen.queryByText(/couldn't be deleted yet/)).not.toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Delete my data' })).toBeEnabled());
   });
 
   it('reports other failures without claiming success', async () => {

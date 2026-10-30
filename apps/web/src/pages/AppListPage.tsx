@@ -7,6 +7,8 @@ import { CreateAppModal } from '../components/app/CreateAppModal';
 import { VersionStatusChip } from '../components/app/VersionStatusChip';
 import { SchedulesPanel } from '../components/schedule/SchedulesPanel';
 import type { App, AppVersion } from '../api/types';
+import { personLabel } from '../lib/format';
+import { useChatStore } from '../stores/chatStore';
 
 /** Default glyph for an App card when the App has no icon set. */
 const DEFAULT_APP_GLYPH = '▤';
@@ -44,6 +46,7 @@ function AppCard({
   children?: React.ReactNode;
 }) {
   const tags = app.tags ?? [];
+  const me = useChatStore((s) => s.userProfile?.user_id);
   return (
     <div
       onClick={onClick}
@@ -67,7 +70,7 @@ function AppCard({
           <span key={t} className="cw-chip text-[9px] text-dim">#{t}</span>
         ))}
         <span className="font-mono text-[10.5px] text-dim ml-auto truncate" title={app.author_id}>
-          {app.author_id}
+          {personLabel(app.author_id, app.author_name, me)}
         </span>
       </div>
     </div>

@@ -5,6 +5,7 @@ import { Chip } from '../components/shell/Chip';
 import { ActionMenu, type ActionMenuItem } from '../components/shell/ActionMenu';
 import { api, ApiError } from '../api/client';
 import { useChatStore } from '../stores/chatStore';
+import { personLabel } from '../lib/format';
 import { useConfirm } from '../admin/components/dialogs';
 import { VersionStatusChip } from '../components/app/VersionStatusChip';
 import { RunCard } from '../components/app/RunCard';
@@ -128,7 +129,7 @@ export function AppDetailPage() {
   // 定时运行 always fires the published harness, so an app without one has
   // nothing to schedule.
   const canSchedule = (app?.versions ?? []).some((v) => v.status === 'published');
-  const isOwner = Boolean(app && userProfile && app.author_id === userProfile.id);
+  const isOwner = Boolean(app && userProfile && app.author_id === userProfile.user_id);
   const isAdmin = Boolean(userProfile?.roles?.includes('super_admin'));
   const canManage = isOwner || isAdmin;
 
@@ -232,7 +233,7 @@ export function AppDetailPage() {
                   <p className="mt-1 mb-0 text-[13px] text-dim leading-[1.5]">{app.description}</p>
                 )}
                 <div className="mt-1 font-mono text-[10.5px] text-dim">
-                  Author {app.author_id}
+                  Author {personLabel(app.author_id, app.author_name, userProfile?.user_id)}
                   {published && <span className="ml-2">· Current version v{published.version}</span>}
                 </div>
               </div>

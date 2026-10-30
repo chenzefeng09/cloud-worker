@@ -4,6 +4,7 @@
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from './client';
+import { onSessionExpired } from './authEvents';
 import {
   ERASE_CONFIRMATION_PHRASE,
   errorDetails,
@@ -153,6 +154,34 @@ describe('privacyApi — erasure', () => {
       [`POST ${BASE}/me/privacy/erase`]: () => jsonResponse({ detail: 'confirm must be "DELETE MY DATA"' }, { status: 422 }),
     });
     await expect(privacyApi.eraseMyData('nope')).rejects.toMatchObject({ status: 422 });
+  });
+});
+
+describe('privacyApi — session expiry', () => {
+  it('reports a 401 from an export or an erasure as a possible session expiry', async () => {
+    const expired = vi.fn();
+    const unsubscribe = onSessionExpired(expired);
+    mockFetch({
+      [`GET ${BASE}/me/privacy/export`]: () => jsonResponse({ detail: 'Session expired' }, { status: 401 }),
+      [`POST ${BASE}/me/privacy/erase`]: () => jsonResponse({ detail: 'Session expired' }, { status: 401 }),
+    });
+
+    await expect(privacyApi.exportMyData()).rejects.toMatchObject({ status: 401 });
+    await expect(privacyApi.eraseMyData(ERASE_CONFIRMATION_PHRASE)).rejects.toMatchObject({ status: 401 });
+
+    expect(expired).toHaveBeenCalledTimes(2);
+    unsubscribe();
+  });
+
+  it('does not report other failures', async () => {
+    const expired = vi.fn();
+    const unsubscribe = onSessionExpired(expired);
+    mockFetch({ [`POST ${BASE}/me/privacy/erase`]: () => jsonResponse({ detail: 'nope' }, { status: 403 }) });
+
+    await expect(privacyApi.eraseMyData(ERASE_CONFIRMATION_PHRASE)).rejects.toMatchObject({ status: 403 });
+
+    expect(expired).not.toHaveBeenCalled();
+    unsubscribe();
   });
 });
 

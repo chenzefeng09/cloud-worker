@@ -1,4 +1,4 @@
-import type { Session, TaskStatus } from '../../api/types';
+import type { TaskStatus } from '../../api/types';
 
 export type DesignStatus =
   | 'live'
@@ -64,15 +64,5 @@ export function taskToDesignStatus(s: TaskStatus): DesignStatus {
     case 'failed':      return 'failed';
     case 'cancelled':   return 'cancelled';
     case 'idle':        return 'idle';
-  }
-}
-
-export function sessionToDesignStatus(s: Session['status']): DesignStatus {
-  switch (s) {
-    case 'ACTIVE':    return 'thinking';
-    case 'COMPLETED': return 'done';
-    case 'PAUSED':    return 'paused';
-    case 'ERROR':     return 'awaiting';
-    case 'ARCHIVED':  return 'idle';
   }
 }

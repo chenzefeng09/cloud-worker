@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   setSessionModel: vi.fn(),
   setSessionEffort: vi.fn(),
   setSessionExecutionMode: vi.fn(),
+  recent: [] as unknown[],
 }));
 
 vi.mock('react-router-dom', () => ({ useNavigate: () => mocks.navigate }));
@@ -28,6 +29,7 @@ vi.mock('../lib/workspaceContext', () => ({
 vi.mock('../hooks/useSessions', () => ({
   useSessions: () => ({ sessions: [], createSession: mocks.createSession }),
 }));
+vi.mock('../hooks/useTasks', () => ({ useTasks: () => ({ items: mocks.recent }) }));
 vi.mock('../hooks/useApps', () => ({
   useApps: () => ({ apps: [], loading: false }),
 }));
@@ -63,9 +65,9 @@ vi.mock('../stores/chatStore', () => ({
 vi.mock('../api/client', () => ({
   api: {
     attachments: { upload: vi.fn(), remove: vi.fn() },
-    // Composer fetches the model catalogue via useModelOptions; resolve empty
-    // so it falls back to MODEL_OPTIONS (the useDefaultModel mock returns
-    // 'deepseek-v4-flash', which is a MODEL_OPTIONS entry) - no auto-correct.
+    // Composer fetches the model catalogue via useModelOptions; resolve it
+    // empty (no provider): with no options there is nothing to auto-correct
+    // the useDefaultModel mock's 'deepseek-v4-flash' to.
     modelPreferences: { listModels: vi.fn().mockResolvedValue([]) },
   },
 }));
@@ -73,6 +75,7 @@ vi.mock('../api/client', () => ({
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.createSession.mockReset();
+  mocks.recent = [];
 });
 
 describe('HomePage composer toolbar', () => {
@@ -131,5 +134,44 @@ describe('HomePage composer toolbar', () => {
     expect(textbox).toHaveValue('Keep this task draft');
     expect(mocks.navigate).not.toHaveBeenCalled();
     warnSpy.mockRestore();
+  });
+});
+
+describe('HomePage recent rail', () => {
+  const task = (over: Record<string, unknown>) => ({
+    id: 'ses_1', title: 'Quarterly report', kind: 'task', status: 'completed',
+    workspace_id: null, instructions: null, options: null, latest_run: null, run_count: 1,
+    created_at: '2026-10-30T10:00:00Z', updated_at: '2026-10-30T10:00:00Z',
+    ...over,
+  });
+
+  it('shows what each run is actually doing, not that its session is open', () => {
+    mocks.recent = [
+      task({ id: 'ses_done', title: 'Done thing', status: 'completed' }),
+      task({ id: 'ses_live', title: 'Live thing', status: 'running' }),
+      task({ id: 'ses_stop', title: 'Stopped thing', status: 'cancelled' }),
+    ];
+    render(<HomePage />);
+
+    const card = (title: string) => screen.getByText(title).parentElement as HTMLElement;
+    expect(card('Done thing')).toHaveTextContent('done');
+    expect(card('Live thing')).toHaveTextContent('live');
+    expect(card('Stopped thing')).toHaveTextContent('cancelled');
+    expect(screen.queryByText('thinking')).not.toBeInTheDocument();
+    expect(screen.queryByText(/In progress/)).not.toBeInTheDocument();
+  });
+
+  it('opens an app run on its run page and anything else on its task page', async () => {
+    const user = userEvent.setup();
+    mocks.recent = [
+      task({ id: 'ses_app', title: 'App run', kind: 'app_run', latest_run: { id: 'run_9' } }),
+      task({ id: 'ses_chat', title: 'A chat', kind: 'chat' }),
+    ];
+    render(<HomePage />);
+
+    await user.click(screen.getByText('App run'));
+    expect(mocks.navigate).toHaveBeenLastCalledWith('/apps/runs/ses_app/run_9');
+    await user.click(screen.getByText('A chat'));
+    expect(mocks.navigate).toHaveBeenLastCalledWith('/tasks/ses_chat');
   });
 });

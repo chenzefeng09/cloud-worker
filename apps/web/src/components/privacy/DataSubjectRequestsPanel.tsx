@@ -29,6 +29,13 @@ function failureMessage(err: unknown, userId: string, fallback: string): string 
   return describeError(err, fallback);
 }
 
+function erasureFailureMessage(err: unknown, userId: string): string {
+  if (httpStatus(err) === 503) {
+    return 'Nothing was erased: a service the erasure needs is unavailable right now. Try again later.';
+  }
+  return failureMessage(err, userId, 'Erasure failed.');
+}
+
 /**
  * Admin: fulfil a data subject request for one user — export everything the
  * platform holds about them (Art. 15 / 20) or erase it (Art. 17). Erasure needs
@@ -72,7 +79,7 @@ export function DataSubjectRequestsPanel({ tenantId }: { tenantId?: string }) {
       } else if (httpStatus(err) === 422) {
         setState({ kind: 'error', message: "The confirmation didn't match the user ID, so nothing was erased." });
       } else {
-        setState({ kind: 'error', message: failureMessage(err, target, 'Erasure failed.') });
+        setState({ kind: 'error', message: erasureFailureMessage(err, target) });
       }
     }
   };
@@ -84,11 +91,10 @@ export function DataSubjectRequestsPanel({ tenantId }: { tenantId?: string }) {
       description: (
         <>
           This permanently deletes the data user <span className="font-mono text-ink">{id}</span> has on the
-          platform: tasks and conversations, files, canvases, workspaces, triggers, memories, preferences and API
-          keys. Running tasks are stopped. It can't be undone — export first if the user asked for a copy.
-          {'\n\n'}
-          Model preferences aren't included: the model gateway only lets users clear their own, so ask the user
-          to delete their data themselves if they need those gone too.
+          platform: tasks and conversations, files, canvases, workspaces, triggers, memories, model and
+          notification preferences and API keys. Running tasks are stopped. Apps only they could use are deleted;
+          apps shared with the organization stay, without their name. It can't be undone — export first if the
+          user asked for a copy.
           {'\n\n'}
           Their sign-in account isn't closed by this; close it separately (for example, freeze it on the Users
           page).

@@ -23,6 +23,7 @@ import {
 } from './useChat';
 import type { ToolCallEntry, PendingInteractionItem, Message } from '../api/types';
 import { api } from '../api/client';
+import { onSessionExpired } from '../api/authEvents';
 import { useCanvasStore } from '../stores/canvasStore';
 
 // Mock the API client so the run_complete reconcile path (fire-and-forget
@@ -1362,6 +1363,25 @@ describe('stream connect loop — permanent failures', () => {
     warn.mockRestore();
   });
 
+  it('reports a 401 as a possible session expiry once per outage, and keeps retrying', async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const expired = vi.fn();
+    const unsubscribeExpired = onSessionExpired(expired);
+    const fetchMock = vi.fn(async () => new Response('{"detail":"Session expired"}', { status: 401 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const unsub = subscribeSessionStream('ses_401');
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+    expect(expired).toHaveBeenCalledTimes(1);
+    unsub();
+    await vi.advanceTimersByTimeAsync(100);
+    unsubscribeExpired();
+    warn.mockRestore();
+  });
+
   it('keeps backing off (not a 1 s storm) while the relay answers 502', async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -1590,5 +1610,87 @@ describe('sendMessage — per-session busy guard', () => {
     expect(outcome).toBe('sent');
     expect(useChatStore.getState().streamingSessions['ses_new']).toBe(true);
     unmount();
+  });
+});
+
+describe('sendMessage — refusals', () => {
+  beforeEach(() => {
+    (api.messages.list as unknown as ReturnType<typeof vi.fn>)
+      .mockResolvedValue({ items: [], next_cursor: null });
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  function stubChat(chat: () => Promise<Response>): void {
+    vi.stubGlobal('fetch', vi.fn(async (url: string) => (
+      url.endsWith('/chat') ? chat() : new Promise<Response>(() => {})
+    )));
+  }
+
+  async function send(sessionId: string, text: string): Promise<string | undefined> {
+    useChatStore.setState({ activeSessionId: sessionId, messages: {} });
+    const { result, unmount } = renderHook(() => useChat());
+    let outcome: string | undefined;
+    await act(async () => {
+      outcome = await result.current.sendMessage(text);
+    });
+    unmount();
+    return outcome;
+  }
+
+  it.each([
+    [409, 'busy', 'A run is already in progress in this conversation.'],
+    [503, 'rejected', 'The agent could not be started, so your message was not sent.'],
+  ])('a %s takes the optimistic message back and says why', async (status, expected, detail) => {
+    stubChat(async () => new Response(JSON.stringify({ detail, status }), { status }));
+
+    const outcome = await send('ses_refused', 'hello');
+
+    expect(outcome).toBe(expected);
+    const rows = useChatStore.getState().messages['ses_refused'] ?? [];
+    expect(rows.map((m) => [m.role, m.content])).toEqual([['SYSTEM', detail]]);
+  });
+
+  it('never shows a structured error body verbatim', async () => {
+    stubChat(async () => new Response(
+      JSON.stringify({ detail: [{ loc: ['body'], msg: 'bad' }] }), { status: 422 },
+    ));
+
+    const outcome = await send('ses_422', 'hello');
+
+    expect(outcome).toBe('rejected');
+    const [row] = useChatStore.getState().messages['ses_422'] ?? [];
+    expect(row.content).toBe('Your message could not be sent (HTTP 422). Please try again.');
+  });
+
+  it('a 401 says the user was signed out and reports a possible session expiry', async () => {
+    const expired = vi.fn();
+    const unsubscribeExpired = onSessionExpired(expired);
+    stubChat(async () => new Response('{"detail":"Session expired"}', { status: 401 }));
+
+    const outcome = await send('ses_401', 'hello');
+
+    expect(outcome).toBe('rejected');
+    expect(expired).toHaveBeenCalledTimes(1);
+    const [row] = useChatStore.getState().messages['ses_401'] ?? [];
+    expect(row.content).toBe('You have been signed out. Sign in again, then resend your message.');
+    unsubscribeExpired();
+  });
+
+  it('keeps the optimistic message when the outcome is unknown', async () => {
+    stubChat(async () => {
+      throw new TypeError('Failed to fetch');
+    });
+
+    const outcome = await send('ses_offline', 'hello');
+
+    expect(outcome).toBe('failed');
+    const rows = useChatStore.getState().messages['ses_offline'] ?? [];
+    expect(rows.map((m) => m.role)).toEqual(['USER', 'SYSTEM']);
   });
 });

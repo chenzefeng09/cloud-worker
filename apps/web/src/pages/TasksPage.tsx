@@ -19,7 +19,9 @@ const TABS: FilterTab[] = [
   { id: 'active', label: 'Active', statuses: ['queued', 'running'] },
   { id: 'needs_input', label: 'Needs input', statuses: ['needs_input'] },
   { id: 'completed', label: 'Completed', statuses: ['completed'] },
-  { id: 'failed', label: 'Failed', statuses: ['failed', 'cancelled'] },
+  { id: 'failed', label: 'Failed', statuses: ['failed'] },
+  // Stopped on purpose, so not a failure.
+  { id: 'cancelled', label: 'Cancelled', statuses: ['cancelled'] },
 ];
 
 const KIND_FILTERS: { id: string; label: string; kinds?: TaskKind[] }[] = [

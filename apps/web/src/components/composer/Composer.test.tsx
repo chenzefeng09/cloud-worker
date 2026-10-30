@@ -5,6 +5,7 @@ import { describe, expect, it, vi, beforeEach } from 'vitest';
 
 import { Composer } from './Composer';
 import type { ModelCatalogProvider } from '../../api/types';
+import { NO_MODEL_CONFIGURED } from '../../lib/modelOptions';
 
 vi.mock('../../hooks/useCanUploadAttachment', () => ({
   useCanUploadAttachment: () => ({
@@ -12,9 +13,8 @@ vi.mock('../../hooks/useCanUploadAttachment', () => ({
   }),
 }));
 
-// Hoisted mock so the factory can reference it. Default resolves to [] which
-// makes useModelOptions fall back to MODEL_OPTIONS - preserving the behaviour
-// the existing structural tests were written against. Per-test overrides below.
+// Hoisted mock so the factory can reference it. Default resolves to a tenant
+// with one provider (DEEPSEEK_PROVIDER). Per-test overrides below.
 const apiMocks = vi.hoisted(() => ({
   listModels: vi.fn(),
 }));
@@ -36,7 +36,7 @@ const DEEPSEEK_PROVIDER: ModelCatalogProvider = {
 
 beforeEach(() => {
   apiMocks.listModels.mockReset();
-  apiMocks.listModels.mockResolvedValue([]); // default: no providers -> MODEL_OPTIONS
+  apiMocks.listModels.mockResolvedValue([DEEPSEEK_PROVIDER]);
 });
 
 describe('Composer - session variant', () => {
@@ -216,6 +216,31 @@ describe('Composer - model catalogue', () => {
     // The hook logs the failure (and still falls back) rather than throwing.
     expect(warnSpy).toHaveBeenCalledWith('Failed to load model list', expect.any(Error));
     warnSpy.mockRestore();
+  });
+
+  it('offers no model when the tenant has no provider, and says why', async () => {
+    const user = userEvent.setup();
+    const onModelChange = vi.fn();
+    const onSend = vi.fn();
+    apiMocks.listModels.mockResolvedValue([]);
+
+    render(
+      <Composer onSend={onSend} model="deepseek-v4-flash" onModelChange={onModelChange} />,
+    );
+
+    // Not the built-in 'V4 Flash': nothing the tenant could run is on offer.
+    const trigger = screen.getByRole('button', { name: 'Select model' });
+    await waitFor(() => expect(trigger).toHaveTextContent('No model available'));
+    expect(screen.getByRole('tooltip', { name: NO_MODEL_CONFIGURED })).toBeInTheDocument();
+    await user.click(trigger);
+    expect(screen.queryByRole('menuitemradio')).not.toBeInTheDocument();
+    expect(onModelChange).not.toHaveBeenCalled();
+
+    // Sending stays possible: the server's refusal explains it as well, and an
+    // administrator may add a provider while this page is open.
+    await user.type(screen.getByRole('textbox'), 'hello');
+    await user.click(screen.getByRole('button', { name: 'Send message' }));
+    expect(onSend).toHaveBeenCalled();
   });
 
   it('auto-corrects a fictional model id to the first real catalogue model', async () => {

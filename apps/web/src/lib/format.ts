@@ -71,6 +71,24 @@ export function formatAbsoluteTime(value: string | Date | null | undefined): str
   );
 }
 
+/**
+ * Who a user id stands for, for display.  `name` is the display name the BFF
+ * resolves beside the id; the caller is marked "(you)".  An id with no name is
+ * an erased user's placeholder (not a `usr_` id) or one identity could not
+ * resolve — neither is worth showing raw.
+ */
+export function personLabel(
+  userId: string | null | undefined,
+  name: string | null | undefined,
+  currentUserId?: string | null,
+): string {
+  if (!userId) return '—';
+  const isMe = Boolean(currentUserId) && userId === currentUserId;
+  if (name) return isMe ? `${name} (you)` : name;
+  if (isMe) return 'You';
+  return userId.startsWith('usr_') ? 'Unknown user' : 'Deleted user';
+}
+
 /** Map session status enum from the API to a display label. */
 export function sessionStatusLabel(status: string | null | undefined): string {
   switch (status) {

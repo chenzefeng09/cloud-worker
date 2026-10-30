@@ -46,7 +46,7 @@ afterEach(() => {
 describe('MemorySection', () => {
   it('explains memory, shows the setting and lists saved memories', async () => {
     setup();
-    expect(screen.getByText(/short summary of each task you complete/)).toBeInTheDocument();
+    expect(screen.getByText(/word-for-word excerpt of it/)).toBeInTheDocument();
     const toggle = await screen.findByRole('switch', { name: 'Use memory' });
     await waitFor(() => expect(toggle).toBeEnabled());
     expect(toggle).toHaveAttribute('aria-checked', 'true');
