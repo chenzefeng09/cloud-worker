@@ -339,6 +339,7 @@ def _scheduler(status_code: int, payload: dict[str, Any] | None = None) -> Any:
 def _reconcile_svc(*, claim: bool = True) -> MagicMock:
     svc = MagicMock()
     svc.claim_run_transition = AsyncMock(return_value=claim)
+    svc.raise_run_usage = AsyncMock()
     svc.run_has_output = AsyncMock(return_value=False)
     svc.create_message = AsyncMock(return_value=SimpleNamespace(id="msg_x"))
     return svc
@@ -363,6 +364,7 @@ def test_a_reconciler_that_loses_the_claim_persists_nothing() -> None:
         return False
 
     svc.claim_run_transition = AsyncMock(side_effect=_lost)
+    svc.raise_run_usage = AsyncMock()
     state = _RedisState({TOKENS: [{"type": "delta", "text": "hi"}, {"type": "end"}]})
 
     with _scheduler(200, {"status": "COMPLETED", "result_summary": "hi"}):
@@ -677,6 +679,44 @@ def test_resume_is_refused_when_the_run_was_cancelled_meanwhile(
     assert resp.status_code == 409
     assert "CANCELLED" in resp.text
     assert dispatched == []
+    assert "agent:run:run_1:resume_lock" not in state.kv
+
+
+def test_a_resume_the_scheduler_refuses_keeps_the_pause_and_says_why(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers: dict[str, str],
+) -> None:
+    app_client.app.state.settings.redis_url = "redis://fake"
+    state = _RedisState()
+    paused = json.dumps({"kind": "confirm", "tool_calls": [{"id": "tc1", "name": "Bash"}]})
+    state.kv["agent:run:run_1:paused"] = paused
+    mock_db.execute.side_effect = [
+        make_scalar_result(_run(status="PAUSED")),  # get_run
+        MagicMock(rowcount=1),                      # claim RUNNING for the resume
+    ]
+
+    class _Client(AuthzAwareClient):
+        async def post(self, url: str, **kw: Any) -> httpx.Response:
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            return httpx.Response(422, json={
+                "code": "AGENT.SCHEDULER.LLM_NOT_CONFIGURED",
+                "detail": "No enabled LLM provider is configured for this tenant",
+            })
+
+    with (
+        patch.object(httpx, "AsyncClient", return_value=_Client()),
+        _patch_redis_asyncio(_fake_redis(state)),
+    ):
+        resp = app_client.post(
+            "/api/session/v1/sessions/ses_1/runs/run_1/respond",
+            headers=auth_headers,
+            json={"kind": "confirm", "tool_call_id": "tc1", "confirmed": True},
+        )
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "AGENT.RUN.LLM_NOT_CONFIGURED"
+    # The answer can be given again once a model is set up.
+    assert state.kv["agent:run:run_1:paused"] == paused
     assert "agent:run:run_1:resume_lock" not in state.kv
 
 

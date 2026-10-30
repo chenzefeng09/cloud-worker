@@ -226,13 +226,19 @@ def test_patch_stores_task_spec_on_a_task_session(
     resp = app_client.patch(
         "/api/session/v1/sessions/ses_1",
         headers=auth_headers,
-        json={"task": {"instructions": "Summarise the contracts", "options": {"hitl": False}}},
+        json={"task": {
+            "instructions": "Summarise the contracts",
+            "options": {"hitl": False},
+            "attachment_ids": ["att_1"],
+        }},
     )
 
     assert resp.status_code == 200, resp.text
     assert session.agent_metadata["kind"] == "task"
     assert session.agent_metadata["task"] == {
-        "instructions": "Summarise the contracts", "options": {"hitl": False},
+        "instructions": "Summarise the contracts",
+        "options": {"hitl": False},
+        "attachment_ids": ["att_1"],
     }
     # A fresh dict, not an in-place mutation (JSONB changes must be tracked).
     assert session.agent_metadata is not original_meta

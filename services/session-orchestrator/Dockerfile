@@ -62,6 +62,6 @@ USER app
 EXPOSE 8006
 
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8006/healthz').read()" || exit 1
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8006/api/session/v1/healthz').read()" || exit 1
 
 CMD ["uvicorn", "agent_session_orchestrator.main:create_app", "--host", "0.0.0.0", "--port", "8006", "--factory"]

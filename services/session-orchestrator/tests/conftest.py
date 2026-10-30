@@ -95,6 +95,9 @@ def settings() -> Settings:
         env="test",
         log_level="WARNING",
         otel_enabled=False,
+        # No DLP service in unit tests: DLP is disabled unless a test sets a
+        # URL (a set but unreachable URL fails closed — see dlp_guard).
+        foundation_dlp_url="",
     )
 
 

@@ -58,10 +58,12 @@ class Settings(BaseSettings):
     foundation_billing_url: str = "http://billing:8007/api/billing/v1"
     feature_flag_url: str = "http://feature-flag:8012/api/feature-flag/v1"
 
-    # Foundation DLP — data-flow controls on the attachment path:
-    #   • download check:download (fail-open on DLP error — see dlp_guard.py)
-    #   • upload   scan + classification:tag (fail-open)
-    # Env var: SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL
+    # Foundation DLP — data-flow controls on attachments and workspace files:
+    #   • download: check:download (DLP resolves the user's clearance itself)
+    #   • upload:   scan before the blob is written; DLP tags the resource
+    # A check that cannot be completed follows SESSION_ORCHESTRATOR_DLP_FAILURE_MODE
+    # (closed by default = 503, nothing stored or served; see dlp_guard.py).
+    # Empty = DLP disabled.  Env var: SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL
     foundation_dlp_url: str = "http://foundation-dlp:80/api/dlp/v1"
 
     # Session-retention sweep — background job that soft-deletes sessions older

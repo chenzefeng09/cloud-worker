@@ -35,6 +35,15 @@ class MessageCreate(BaseModel):
     attachment_ids: list[str] = []
 
 
+class TurnMessage(BaseModel):
+    """The user message a run request carries: written with the run, atomically."""
+
+    model_config = {"extra": "forbid"}
+
+    content: str
+    attachment_ids: list[str] = []
+
+
 class MessageOut(BaseModel):
     id: str
     session_id: str

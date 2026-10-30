@@ -59,12 +59,13 @@ async def current_user() -> str:
 async def current_clearance() -> str:
     """Resolve the caller's data clearance from the contextvar.
 
-    The clearance rides in on the ``X-User-Clearance`` header (injected by the
-    BFF on the download path) and is read into a contextvar by
-    :class:`RequestContextMiddleware`.  When the header is absent the
+    The clearance rides in on the ``X-User-Clearance`` header (forwarded by the
+    BFF) and is read into a contextvar by :class:`RequestContextMiddleware`.
+    It gates workspace and file sensitivity levels and bounds what a run may
+    retrieve from knowledge-ingest.  DLP ``check:download`` does not use it:
+    DLP resolves the user's clearance itself.  When the header is absent the
     contextvar is an empty string, so we fall back to ``"L2"`` — a
-    conservative non-privileged default that keeps DLP ``check:download``
-    enforcing rather than silently elevating to a higher tier.
+    conservative non-privileged default rather than a silently higher tier.
     """
     return get_clearance() or "L2"
 

@@ -43,7 +43,7 @@ from agent_session_orchestrator.api.dependencies import (
 from agent_session_orchestrator.api.dlp_guard import (
     DlpDownloadDeniedError,
     check_download,
-    scan_and_tag,
+    scan_upload,
 )
 
 # Shared helpers from the attachments module (same package): blob-store
@@ -322,6 +322,21 @@ async def upload_workspace_file(
     blob_key = (
         f"tenant/{tenant_id}/workspaces/{workspace_id}/files/{wsf.id}/{filename}"
     )
+
+    # DLP scan before any bytes are stored — text content only, same gating
+    # and DLP_FAILURE_MODE handling as attachment upload (closed: 503 and the
+    # row is rolled back; open: stored unscanned with an error log).
+    text_content = _maybe_text(data)
+    if text_content is not None:
+        await scan_upload(
+            dlp_url=request.app.state.settings.foundation_dlp_url,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            content=text_content,
+            resource_id=wsf.id,
+            resource_type="workspace_file",
+        )
+
     try:
         await asyncio.to_thread(blob_store.put, blob_key, data, content_type=mime)
     except Exception as exc:
@@ -333,17 +348,6 @@ async def upload_workspace_file(
 
     wsf.blob_key = blob_key
     await db.flush()
-
-    # DLP scan (fail-open) — text content only, same gating as attachments.
-    text_content = _maybe_text(data)
-    if text_content is not None:
-        await scan_and_tag(
-            dlp_url=request.app.state.settings.foundation_dlp_url,
-            tenant_id=tenant_id,
-            content=text_content,
-            resource_id=wsf.id,
-            resource_type="workspace_file",
-        )
 
     return WorkspaceFileOut.model_validate(wsf).model_dump(mode="json")
 
@@ -424,6 +428,8 @@ async def get_workspace_file_content(
             user_message="This file's sensitivity level exceeds your clearance level, so it cannot be downloaded.",
         )
 
+    # DLP decides with the clearance it resolves for ``user_id`` itself; a
+    # check that cannot complete follows DLP_FAILURE_MODE (closed: 503).
     try:
         await check_download(
             dlp_url=request.app.state.settings.foundation_dlp_url,
@@ -431,7 +437,6 @@ async def get_workspace_file_content(
             user_id=user_id,
             resource_id=wsf.id,
             resource_type="workspace_file",
-            user_clearance=clearance,
             destination="laptop",
         )
     except DlpDownloadDeniedError as exc:

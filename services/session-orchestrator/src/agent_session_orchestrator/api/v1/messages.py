@@ -678,6 +678,11 @@ async def _read_ordered_blocks_from_redis(
             await client.aclose()
 
 
+# How much of a finished run a memory keeps, word for word.
+_MEMORY_TASK_CHARS = 300
+_MEMORY_ANSWER_CHARS = 600
+
+
 async def _write_memory(
     *,
     knowledge_ingest_url: str,
@@ -689,7 +694,8 @@ async def _write_memory(
 ) -> None:
     """Write a memory document to knowledge-ingest after run completion.
 
-    The document is a brief Q&A pair: user task + assistant summary.  It is
+    The document is a Q&A pair copied verbatim: the start of the user's request
+    and of the agent's final answer.  It is
     uploaded as ``text/plain``, then immediately ingested (embedded) so it
     becomes searchable.  Failure-open: any error is logged at DEBUG level
     and the caller is not affected.
@@ -716,9 +722,10 @@ async def _write_memory(
         return
     if not user_id or user_id == "SYSTEM":
         return
-    # Truncate to keep the document small.
-    snippet_task = task_description[:300].strip()
-    snippet_summary = summary[:600].strip()
+    # A verbatim excerpt, not a summary: the privacy notice (BFF
+    # ``_DEFAULT_PRIVACY_PURPOSES``) and the web Memory copy say so.
+    snippet_task = task_description[:_MEMORY_TASK_CHARS].strip()
+    snippet_summary = summary[:_MEMORY_ANSWER_CHARS].strip()
     content = f"User task: {snippet_task}\n\nAssistant answer: {snippet_summary}"
     title = f"[memory] {snippet_task[:80]}"
 
@@ -1449,6 +1456,8 @@ async def _reconcile_run_completion(
         # Worker paused — set PAUSED, do NOT write assistant message, NOT terminal.
         if await svc.claim_run_transition(run, to_status="PAUSED"):
             run.status = "PAUSED"
+            # The usage so far: it stands even if the run is never resumed.
+            await svc.raise_run_usage(run, payload.get("usage"))
             logger.info(
                 "run paused (HITL): set status=PAUSED",
                 extra={"run_id": run.id},
@@ -1467,15 +1476,13 @@ async def _reconcile_run_completion(
     summary = payload.get("result_summary")
     error = payload.get("result_error")
     artifacts = payload.get("artifacts") or []
-    usage = payload.get("usage") or {}
 
     run.status = sched_status
     run.result_summary = summary
     run.error_message = error
     run.finished_at = dt.datetime.now(tz=dt.UTC)
-    run.input_tokens = usage.get("input_tokens")
-    run.output_tokens = usage.get("output_tokens")
-    run.total_tokens = usage.get("total_tokens")
+    # The worker reports the whole run's usage, earlier legs included.
+    await svc.raise_run_usage(run, payload.get("usage"))
 
     persisted_from_stream = False
     already_persisted_for_run = False

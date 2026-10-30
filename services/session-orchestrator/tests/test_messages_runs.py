@@ -2103,6 +2103,7 @@ def test_reconcile_persists_tool_message_before_assistant() -> None:
 
     svc = MagicMock()
     svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
     svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock(side_effect=_fake_create_message)
@@ -2212,6 +2213,7 @@ def test_reconcile_no_tool_message_when_no_tool_calls() -> None:
 
     svc = MagicMock()
     svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
     svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock(side_effect=_fake_create_message)
@@ -2316,6 +2318,7 @@ def test_reconcile_tool_message_idempotent() -> None:
     # Rows for this run already exist → already_persisted=True → no create_message calls
     svc = MagicMock()
     svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
     svc.run_has_output = AsyncMock(return_value=True)
     svc.list_messages = AsyncMock(return_value=([existing_tool_msg, existing_asst_msg], None))
     svc.create_message = AsyncMock()
@@ -2728,6 +2731,7 @@ def test_reconcile_sets_paused_status_when_worker_pauses(
     ses = Session(id="ses_pause", tenant_id=TEST_TENANT, user_id="u1", status="ACTIVE")
     svc = MagicMock()
     svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
     svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock()
@@ -2922,6 +2926,7 @@ def test_reconcile_404_with_end_marker_marks_completed_and_replays() -> None:
 
     svc = MagicMock()
     svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
     svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock(side_effect=_fake_create_message)
@@ -2984,6 +2989,7 @@ def test_reconcile_404_no_end_marker_past_grace_marks_failed() -> None:
 
     svc = MagicMock()
     svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
     svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock()
@@ -3048,6 +3054,7 @@ def test_reconcile_404_no_end_marker_within_grace_keeps_running() -> None:
 
     svc = MagicMock()
     svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
     svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock()
@@ -3100,6 +3107,7 @@ def test_reconcile_503_keeps_running_unchanged() -> None:
 
     svc = MagicMock()
     svc.claim_run_transition = AsyncMock(return_value=True)
+    svc.raise_run_usage = AsyncMock()
     svc.run_has_output = AsyncMock(return_value=False)
     svc.list_messages = AsyncMock(return_value=([], None))
     svc.create_message = AsyncMock()

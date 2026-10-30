@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from foundation_sdk.fastapi import install_request_context, register_problem_details
 
+from agent_session_orchestrator.api.dlp_guard import log_dlp_policy
 from agent_session_orchestrator.config import Settings
 from agent_session_orchestrator.domain.db import close_db, init_db
 from agent_session_orchestrator.observability import init_observability
@@ -76,15 +77,24 @@ async def _retention_sweep_loop(settings: Settings, blob_store: object | None = 
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = app.state.settings
     init_observability(service_name="session-orchestrator")
+    # The effective DLP policy goes in the log at startup, not at the first
+    # upload or download (a bad DLP_FAILURE_MODE value shows up here too).
+    log_dlp_policy(settings.foundation_dlp_url)
     await init_db(settings)
 
-    from agent_session_orchestrator.services.reconcile_sweeper import run_sweeper
+    from agent_session_orchestrator.services.reconcile_sweeper import (
+        run_completion_watcher,
+        run_sweeper,
+    )
 
     sweep_task = asyncio.create_task(
         _retention_sweep_loop(settings, app.state.blob_store), name="session-retention-sweep"
     )
     reconcile_task = asyncio.create_task(
         run_sweeper(app), name="run-reconcile-sweep"
+    )
+    completion_task = asyncio.create_task(
+        run_completion_watcher(app), name="run-completion-watcher"
     )
 
     from agent_session_orchestrator.services.version_cleanup import (
@@ -100,6 +110,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         sweep_task.cancel()
         reconcile_task.cancel()
+        completion_task.cancel()
         version_cleanup_task.cancel()
         # Cancelled tasks raise CancelledError on await — expected; suppress
         # so shutdown completes cleanly.
@@ -107,6 +118,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await sweep_task
         with contextlib.suppress(asyncio.CancelledError):
             await reconcile_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await completion_task
         with contextlib.suppress(asyncio.CancelledError):
             await version_cleanup_task
         await close_db()

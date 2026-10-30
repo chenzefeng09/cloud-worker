@@ -239,13 +239,81 @@ paths:
                     not in the session's workspace file set are silently ignored;
                     a non-list value or non-string elements are ignored (never a
                     400).
+                message:
+                  type: object
+                  nullable: true
+                  additionalProperties: false
+                  required: [content]
+                  description: >-
+                    The user message that starts this turn. It is written in the
+                    run's own transaction (needs `session.message.create`), so a
+                    run that is refused or cannot start leaves no unanswered
+                    message behind. Omit it when the turn's message is already in
+                    the transcript (a task retry) or the run has no user turn
+                    (App and scheduled runs).
+                  properties:
+                    content: { type: string }
+                    attachment_ids:
+                      type: array
+                      items: { type: string }
       responses:
         '201':
           description: Run created and started
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Run'
+                allOf:
+                  - $ref: '#/components/schemas/Run'
+                  - type: object
+                    properties:
+                      message:
+                        description: The turn's user message, when the request carried one.
+                        allOf:
+                          - $ref: '#/components/schemas/Message'
+        '409':
+          description: >-
+            A run is already in progress in this session (one live run per
+            session; concurrent starts are serialized on the session row).
+            Nothing of the turn is saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '402':
+          description: >-
+            `code: AGENT.RUN.QUOTA_EXCEEDED`. The scheduler refused the run
+            because the tenant's agent run quota is used up. `user_message` says
+            so for the user; retrying does not help. Nothing of the turn is saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: >-
+            Request validation failed (a malformed `message` included), or
+            `code: AGENT.RUN.LLM_NOT_CONFIGURED`: the tenant has no enabled LLM
+            provider. `user_message` tells the user
+            an administrator has to add one; retrying does not help. Nothing of
+            the turn is saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '502':
+          description: >-
+            The scheduler refused the run for any other reason. Its body is not
+            relayed (it may carry internal details); `detail` names its status.
+            Nothing of the turn is saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: The scheduler is unreachable. Nothing of the turn is saved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
 
   /api/session/v1/sessions/{session_id}/pending:
     get:
@@ -544,6 +612,8 @@ paths:
                 $ref: '#/components/schemas/WorkspaceFile'
         '413':
           description: File exceeds the workspace file size limit
+        '503':
+          $ref: '#/components/responses/DlpUnavailable'
 
   /api/session/v1/workspaces/{workspace_id}/files/{file_id}:
     delete:
@@ -587,8 +657,15 @@ paths:
               schema:
                 type: string
                 format: binary
+        '403':
+          description: |
+            The file's sensitivity level exceeds the caller's clearance, or
+            foundation-dlp `check:download` denied it (`detail` is
+            `DLP: <reason>`).
         '404':
           $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/DlpUnavailable'
 
   # ---------------------------------------------------------------------------
   # Health
@@ -600,6 +677,7 @@ paths:
       tags: [Health]
       responses:
         '200':
+          description: The service is alive
           content:
             application/json:
               schema:
@@ -612,6 +690,7 @@ paths:
       tags: [Health]
       responses:
         '200':
+          description: The service is ready to take requests
           content:
             application/json:
               schema:
@@ -790,10 +869,29 @@ components:
         detail: { type: string }
         instance: { type: string }
         code: { type: string }
+        user_message:
+          type: string
+          description: >-
+            English text for the user, on the orchestrator's own errors.
+            Defaults to `detail`, which is written for operators, unless the
+            error sets its own.
 
   responses:
     NotFound:
       description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    DlpUnavailable:
+      description: |
+        `code: AGENT.DLP.UNAVAILABLE`. The foundation-dlp scan (upload) or
+        `check:download` (download) could not be completed (network error,
+        timeout, non-2xx, unreadable answer) and
+        `SESSION_ORCHESTRATOR_DLP_FAILURE_MODE` is `closed`, the default. A
+        refused upload stores nothing; a refused download serves no bytes.
+        Retry later. In `open` mode the request proceeds unchecked instead,
+        with an ERROR log. See contracts/worker-wire-contract.md §8.
       content:
         application/json:
           schema:

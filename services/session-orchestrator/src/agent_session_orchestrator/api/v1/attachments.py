@@ -30,7 +30,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.api.authz_guard import require_permission
 from agent_session_orchestrator.api.dependencies import (
-    TClearance,
     TDbSession,
     TTenantId,
     TUserId,
@@ -38,7 +37,7 @@ from agent_session_orchestrator.api.dependencies import (
 from agent_session_orchestrator.api.dlp_guard import (
     DlpDownloadDeniedError,
     check_download,
-    scan_and_tag,
+    scan_upload,
 )
 from agent_session_orchestrator.api.ownership import require_session_owner
 from agent_session_orchestrator.services.session_service import SessionService
@@ -99,6 +98,25 @@ async def upload_attachment(
 
     blob_key = f"tenant/{tenant_id}/sessions/{session_id}/attachments/{att.id}/{filename}"
 
+    # ── DLP scan (mount point 2), before any bytes are stored ───────────────
+    # Only text content is scanned — binary blobs (images, archives, etc.)
+    # are skipped to avoid garbage hits and decode cost. A hit does NOT reject
+    # the upload: DLP labels the attachment with the hit level, which
+    # check:download enforces later. A scan that cannot complete follows
+    # DLP_FAILURE_MODE (see dlp_guard): closed (default) raises 503, and the
+    # request transaction drops the row before any blob exists; open stores
+    # the file unscanned and logs an error.
+    text_content = _maybe_text(data)
+    if text_content is not None:
+        await scan_upload(
+            dlp_url=request.app.state.settings.foundation_dlp_url,
+            tenant_id=tenant_id,
+            user_id=user_id,
+            content=text_content,
+            resource_id=att.id,
+            resource_type="attachment",
+        )
+
     # Upload to S3 (synchronous boto3 call — acceptable in dev; in high-QPS
     # prod this should run in a thread pool via asyncio.to_thread).
     try:
@@ -114,21 +132,6 @@ async def upload_attachment(
     # Persist the real blob_key.
     att.blob_key = blob_key
     await db.flush()
-
-    # ── DLP scan (mount point 2): fail-open ─────────────────────────────────
-    # Only text content is scanned — binary blobs (images, archives, etc.)
-    # are skipped to avoid garbage hits and decode cost. A hit does NOT reject
-    # the upload; scan_and_tag auto-classifies the attachment instead. Any DLP
-    # error is logged and swallowed inside scan_and_tag.
-    text_content = _maybe_text(data)
-    if text_content is not None:
-        await scan_and_tag(
-            dlp_url=request.app.state.settings.foundation_dlp_url,
-            tenant_id=tenant_id,
-            content=text_content,
-            resource_id=att.id,
-            resource_type="attachment",
-        )
 
     return {
         "id": att.id,
@@ -221,7 +224,6 @@ async def get_file_content(
     db: AsyncSession = TDbSession,
     tenant_id: str = TTenantId,
     user_id: str = TUserId,
-    clearance: str = TClearance,
 ) -> Response:
     """Download or preview the raw bytes for a session file.
 
@@ -236,15 +238,13 @@ async def get_file_content(
         raise HTTPException(status_code=404, detail="file not found") from None
 
     # ── DLP check:download (mount point 1) ──────────────────────────────────
-    # fail-OPEN on DLP error (network/timeout/non-200 → WARN, download
-    # proceeds; see dlp_guard.check_download), but an explicit allowed=false
-    # from DLP raises DlpDownloadDeniedError → 403. The Attachment model has no
-    # dedicated resource-type column, so resource_type is the constant
-    # "attachment"; resource_id is the attachment id.
-    #
-    # ``clearance`` is the caller's real data clearance, resolved from the
-    # ``X-User-Clearance`` header (injected by the BFF) via the
-    # ``current_clearance`` dependency; it falls back to "L2" when absent.
+    # DLP compares the clearance it resolves for ``user_id`` with the
+    # attachment's label; allowed=false raises DlpDownloadDeniedError → 403.
+    # A check that cannot complete follows DLP_FAILURE_MODE (see dlp_guard):
+    # closed (default) raises 503, open serves the file and logs an error.
+    # The Attachment model has no dedicated resource-type column, so
+    # resource_type is the constant "attachment"; resource_id is the
+    # attachment id.
     try:
         await check_download(
             dlp_url=request.app.state.settings.foundation_dlp_url,
@@ -252,7 +252,6 @@ async def get_file_content(
             user_id=user_id,
             resource_id=att.id,
             resource_type="attachment",
-            user_clearance=clearance,
             destination="laptop",
         )
     except DlpDownloadDeniedError as exc:
@@ -296,7 +295,11 @@ def _maybe_text(data: bytes) -> str | None:
         return None
     try:
         return sample.decode("utf-8")
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as exc:
+        # The cut can split a multi-byte character (likely for CJK text);
+        # drop that partial tail rather than skip the scan of a text file.
+        if len(data) > len(sample) and exc.start >= len(sample) - 3:
+            return sample[: exc.start].decode("utf-8")
         return None
 
 

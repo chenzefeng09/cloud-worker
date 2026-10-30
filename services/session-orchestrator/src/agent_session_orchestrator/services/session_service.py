@@ -19,7 +19,7 @@ from __future__ import annotations
 import datetime as dt
 import logging
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_session_orchestrator.config import Settings
@@ -42,6 +42,34 @@ logger = logging.getLogger(__name__)
 
 def _now() -> dt.datetime:
     return dt.datetime.now(tz=dt.UTC)
+
+
+_TOKEN_COLUMNS = ("input_tokens", "output_tokens", "total_tokens")
+_MAX_TOKEN_COUNT = 2**31 - 1  # the run columns are INTEGER
+
+
+def _token_counts(usage: object) -> dict[str, int]:
+    """The usable counts in a worker ``usage`` record, keyed by ``run`` column.
+
+    The record comes from a file in the sandbox, which the agent can write
+    too, so only whole numbers that fit the column are taken; anything else
+    is dropped rather than allowed to fail the transaction recording it.
+    ``total_tokens`` is derived from the other two when it is missing.
+    """
+    if not isinstance(usage, dict):
+        return {}
+    counts = {
+        column: value
+        for column in _TOKEN_COLUMNS
+        if isinstance(value := usage.get(column), int)
+        and not isinstance(value, bool)
+        and 0 <= value <= _MAX_TOKEN_COUNT
+    }
+    if "total_tokens" not in counts and {"input_tokens", "output_tokens"} <= counts.keys():
+        total = counts["input_tokens"] + counts["output_tokens"]
+        if total <= _MAX_TOKEN_COUNT:
+            counts["total_tokens"] = total
+    return counts
 
 
 async def purge_expired_sessions(settings: Settings, retention_days: int) -> int:
@@ -199,12 +227,21 @@ class SessionService:
         await self._db.refresh(session)
         return session
 
-    async def get_session(self, session_id: str) -> Session:
+    async def get_session(self, session_id: str, *, lock: bool = False) -> Session:
+        """The live session, or ``SessionNotFoundError``.
+
+        ``lock=True`` holds the row (``FOR NO KEY UPDATE``) until the
+        transaction ends, so callers that check and then change what hangs off
+        the session — starting a run — are serialized per session.  It does not
+        block inserts that merely reference the session (messages, runs).
+        """
         stmt = select(Session).where(
             Session.id == session_id,
             Session.tenant_id == self._tenant_id,
             Session.deleted_at.is_(None),
         )
+        if lock:
+            stmt = stmt.with_for_update(key_share=True)  # FOR NO KEY UPDATE
         result = await self._db.execute(stmt)
         session = result.scalar_one_or_none()
         if session is None:
@@ -748,3 +785,31 @@ class SessionService:
             return False
         run.status = to_status
         return True
+
+    async def raise_run_usage(self, run: Run, usage: object) -> None:
+        """Raise ``run``'s token counts to the worker's ``usage``; never lower them.
+
+        The worker reports the run's cumulative usage (a resumed leg counts on
+        from where its paused leg stopped), so every observation of it - the
+        pause, the end, a cancel, a reconcile repeated or out of order - can be
+        applied as it comes and the row ends at the highest count seen.  The
+        comparison runs in the UPDATE, so a stale in-memory ``run`` cannot lower
+        a count another transaction already raised.
+        """
+        counts = _token_counts(usage)
+        if not counts:
+            return
+        values = {
+            column: case(
+                (func.coalesce(getattr(Run, column), -1) < amount, amount),
+                else_=getattr(Run, column),
+            )
+            for column, amount in counts.items()
+        }
+        await self._db.execute(
+            update(Run)
+            .where(Run.id == run.id, Run.tenant_id == self._tenant_id)
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+        await self._db.refresh(run, attribute_names=list(counts))

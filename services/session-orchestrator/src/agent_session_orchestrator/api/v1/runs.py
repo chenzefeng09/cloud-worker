@@ -8,6 +8,12 @@ twice; if the second commit failed (e.g. session row updated_at conflict)
 the run row was already persisted but the session pointed nowhere, leaving
 an orphaned run hidden from the UI but still consuming sandbox resources.
 
+A new turn's user message rides in the same request (``message``) and is
+written in that transaction too, so a run that is refused (another run is
+live), or that the scheduler cannot start, leaves no unanswered message
+behind.  The session row is locked first, which serializes concurrent starts
+on one session: the second sees the first's run and gets 409.
+
 If the scheduler call itself fails, the whole transaction rolls back via
 the implicit ``async with session.begin()`` opened by ``db_session``, so
 no half-baked run record survives.  The container is the one external
@@ -37,6 +43,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import ValidationError
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -62,7 +69,9 @@ from agent_session_orchestrator.api.v1.messages import (
     _run_paused_key,
     _store_run_dispatch,
 )
-from agent_session_orchestrator.domain.models import Run
+from agent_session_orchestrator.domain.models import Message, Run
+from agent_session_orchestrator.errors import LlmNotConfiguredError, RunQuotaExceededError
+from agent_session_orchestrator.schemas.message import MessageOut, TurnMessage
 from agent_session_orchestrator.services import knowledge_client
 from agent_session_orchestrator.services.clearance import clearance_rank
 from agent_session_orchestrator.services.session_service import SessionService
@@ -105,6 +114,34 @@ def _effective_clearance(user_clearance: str, workspace_sensitivity: str | None)
 
 def _now() -> dt.datetime:
     return dt.datetime.now(tz=dt.UTC)
+
+
+def _scheduler_refusal(resp: httpx.Response, *, run_id: str, action: str) -> Exception:
+    """The error to answer a scheduler refusal of ``action`` ("run" / "resume") with.
+
+    Refusals a user can act on keep their meaning: no model configured for the
+    tenant, quota exhausted.  Any other one is the platform's problem, answered
+    with a 502 that does not echo the scheduler's body (it may carry internal
+    details); the log keeps its status and code.
+    """
+    code: str | None = None
+    with contextlib.suppress(ValueError):
+        body = resp.json()
+        if isinstance(body, dict) and isinstance(body.get("code"), str):
+            code = body["code"]
+    logger.warning(
+        "scheduler rejected %s %s: HTTP %s %s",
+        action, run_id, resp.status_code, code or "-",
+        extra={"status": resp.status_code, "code": code, "run_id": run_id},
+    )
+    if code == "AGENT.SCHEDULER.LLM_NOT_CONFIGURED":
+        return LlmNotConfiguredError()
+    if resp.status_code == status.HTTP_402_PAYMENT_REQUIRED:
+        return RunQuotaExceededError()
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=f"scheduler rejected {action} (HTTP {resp.status_code})",
+    )
 
 
 def _merge_skills(base: list[str], extra: list[str]) -> list[str]:
@@ -374,7 +411,11 @@ async def _fetch_knowledge(
 
 
 async def _assemble_history(
-    svc: SessionService, session_id: str, *, current_task: str
+    svc: SessionService,
+    session_id: str,
+    *,
+    current_task: str,
+    input_message_id: str | None = None,
 ) -> list[dict[str, Any]]:
     """Build structured prior-turn history for the worker to restore.
 
@@ -384,10 +425,12 @@ async def _assemble_history(
         {"role": "assistant", "type": "text", "content": "..."}
         {"role": "tool", "type": "tool", "tool": {id,name,input,result,state}}
 
-    The current user message — already persisted by BFF just before this run
-    was triggered — is excluded (it's this turn's input, not history).  SYSTEM
-    rows are dropped; empty ASSISTANT/TOOL rows are skipped.  Failure-open:
-    returns an empty list on any error so a history glitch never blocks a run.
+    This turn's own user message is excluded (it's the run's input, not
+    history): by id when the run request wrote it (``input_message_id``),
+    otherwise the latest USER row whose content is the task — a turn re-run
+    from a message already in the transcript (task retry).  SYSTEM rows are
+    dropped; empty ASSISTANT/TOOL rows are skipped.  Failure-open: returns an
+    empty list on any error so a history glitch never blocks a run.
     """
     try:
         messages = await svc.list_all_messages(session_id)
@@ -395,18 +438,19 @@ async def _assemble_history(
         logger.debug("history assembly failed (failure-open): %s", exc)
         return []
 
-    # Drop the most recent USER row whose content matches this run's task —
-    # that's the message BFF just wrote as this turn's input.
     # NB: the message table stores role inconsistently ("USER" upper-cased,
     # but "assistant"/"tool"/"system" lower-cased), so compare case-insensitively
     # — otherwise assistant/tool history is silently dropped and the model only
     # sees a stream of unanswered user questions.
-    task_norm = current_task.strip()
-    for i in range(len(messages) - 1, -1, -1):
-        if (messages[i].role or "").upper() == "USER":
-            if (messages[i].content or "").strip() == task_norm:
-                messages.pop(i)
-            break
+    if input_message_id is not None:
+        messages = [m for m in messages if m.id != input_message_id]
+    else:
+        task_norm = current_task.strip()
+        for i in range(len(messages) - 1, -1, -1):
+            if (messages[i].role or "").upper() == "USER":
+                if (messages[i].content or "").strip() == task_norm:
+                    messages.pop(i)
+                break
 
     history: list[dict[str, Any]] = []
     for msg in messages:
@@ -492,6 +536,24 @@ async def _get_scheduler_url(request: Request) -> str:
     return url
 
 
+def _turn_message(body: dict[str, Any]) -> TurnMessage | None:
+    """The user message a run request carries for its turn, if any.
+
+    ``None`` when the request carries none: the turn's message is already in
+    the transcript (task retry), or the run has no user turn (App and
+    scheduled runs).
+    """
+    if body.get("message") is None:
+        return None
+    try:
+        return TurnMessage.model_validate(body["message"])
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.errors(include_url=False, include_context=False, include_input=False),
+        ) from None
+
+
 @router.post("/sessions/{session_id}/runs", status_code=201,
              dependencies=[
                  Depends(require_permission("run.create", "run")),
@@ -506,8 +568,15 @@ async def create_run(
     user_id: str = TUserId,
     clearance: str = TClearance,
 ) -> dict[str, Any]:
+    turn_message = _turn_message(body)
+    if turn_message is not None:
+        # Writing the turn's message is what POST /messages does: same grant.
+        await require_permission("session.message.create", "session")(request)
+
     svc = SessionService(db, tenant_id=tenant_id)
-    session = await svc.get_session(session_id)
+    # Locked until this request's transaction ends, so two starts on one
+    # session can't both pass the live-run check below.
+    session = await svc.get_session(session_id, lock=True)
     redis_url: str | None = request.app.state.settings.redis_url
 
     # One live run per session.  A second one would interleave two agents'
@@ -584,6 +653,14 @@ async def create_run(
         session_id, task, app_snapshot=app_snapshot, source=source,
         execution_mode=execution_mode,
     )
+    # The turn's user message, in the same transaction: if anything below
+    # fails, the message goes with the run instead of sitting unanswered.
+    input_message: Message | None = None
+    if turn_message is not None:
+        input_message = await svc.create_message(
+            session_id, role="USER", content=turn_message.content,
+            attachment_ids=turn_message.attachment_ids,
+        )
 
     # Relay to agent-scheduler.
     scheduler_url = await _get_scheduler_url(request)
@@ -654,10 +731,12 @@ async def create_run(
         )
 
     # Assemble prior-turn conversation history so the worker can restore it
-    # into the agent's context (multi-turn memory).  BFF writes the current
-    # user message *before* triggering this run, so it's already in the table
-    # as the latest USER row — we drop it (it's this run's input, not history).
-    history = await _assemble_history(svc, session_id, current_task=task)
+    # into the agent's context (multi-turn memory), without this turn's own
+    # message (it's this run's input, not history).
+    history = await _assemble_history(
+        svc, session_id, current_task=task,
+        input_message_id=input_message.id if input_message is not None else None,
+    )
 
     # Skill selection has presence semantics, not truthiness semantics:
     # explicitly sending ``skills`` (including ``[]`` or ``null``) suppresses
@@ -868,16 +947,8 @@ async def create_run(
         ) from exc
 
     if resp.status_code >= 400:
-        # Don't echo upstream body verbatim — it may include stack traces or
-        # other sensitive details.  Capture in audit instead.
-        logger.warning(
-            "scheduler rejected run",
-            extra={"status": resp.status_code, "run_id": run.id},
-        )
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"scheduler rejected run (HTTP {resp.status_code})",
-        )
+        # No container was spawned — the transaction rolls back.
+        raise _scheduler_refusal(resp, run_id=run.id, action="run")
 
     scheduler_run = resp.json()
 
@@ -898,7 +969,7 @@ async def create_run(
     if scheduler_body.get("hitl"):
         await _store_run_dispatch(redis_url=redis_url, run_id=run.id, payload=scheduler_body)
 
-    return {
+    created: dict[str, Any] = {
         "id": run.id,
         "session_id": session_id,
         "sandbox_id": run.sandbox_id,
@@ -908,6 +979,9 @@ async def create_run(
         "execution_mode": run.execution_mode,
         "created_at": run.created_at.isoformat(),
     }
+    if input_message is not None:
+        created["message"] = MessageOut.model_validate(input_message).model_dump(mode="json")
+    return created
 
 
 @router.get("/sessions/{session_id}/runs",
@@ -1438,10 +1512,7 @@ async def respond_run(
         ) from exc
 
     if resp.status_code >= 400:
-        logger.warning(
-            "scheduler rejected resume",
-            extra={"status": resp.status_code, "run_id": run_id},
-        )
+        refusal = _scheduler_refusal(resp, run_id=run_id, action="resume")
         if resume_lock_acquired and redis_client is not None:
             try:
                 await redis_client.delete(resume_lock_key)
@@ -1449,10 +1520,7 @@ async def respond_run(
                 pass
         if redis_client is not None:
             await redis_client.aclose()
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"scheduler rejected resume (HTTP {resp.status_code})",
-        )
+        raise refusal
 
     scheduler_run = resp.json()
 
@@ -1562,6 +1630,9 @@ async def _do_cancel_run(
     ):
         return {"id": run.id, "status": run.status}
 
+    # What the run used up to the stop.  Nothing polls a cancelled run again,
+    # so this is the only chance to record the tokens it spent.
+    usage: object = None
     # Legacy inline (chat-mode) runs have no sandbox / scheduler container, so
     # there is nothing to stop.
     if run.execution_mode != "inline":
@@ -1576,11 +1647,14 @@ async def _do_cancel_run(
 
         scheduler_url = await _get_scheduler_url(request)
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(
+            # The stop gives the worker up to 10 s to save its final counts;
+            # then the scheduler removes the sandbox and revokes the run's keys.
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
                     f"{scheduler_url}/runs/{scheduler_run_key}/cancel",
                     headers={"X-Tenant-Id": tenant_id, "X-User-Id": user_id},
                 )
+            usage = _cancel_usage(resp)
         except httpx.HTTPError:
             # The container may already have stopped; we still mark it
             # cancelled in our DB so the UI stops showing it as RUNNING.  The
@@ -1588,8 +1662,22 @@ async def _do_cancel_run(
             logger.warning("cancel: scheduler unreachable", extra={"run_id": run_id})
 
     await _settle_cancelled_run(svc=svc, run=run, tenant_id=tenant_id, redis_url=redis_url)
+    # Cumulative across the run's legs and applied as a maximum, so cancelling
+    # a run whose pause already recorded the same usage counts nothing twice.
+    await svc.raise_run_usage(run, usage)
     await db.flush()
     return {"id": run.id, "status": "CANCELLED"}
+
+
+def _cancel_usage(resp: httpx.Response) -> object:
+    """The ``usage`` from the scheduler's cancel response, or ``None``."""
+    if resp.status_code != 200:
+        return None
+    try:
+        body = resp.json()
+    except ValueError:
+        return None
+    return body.get("usage") if isinstance(body, dict) else None
 
 
 @router.get("/runs/token-usage/daily")

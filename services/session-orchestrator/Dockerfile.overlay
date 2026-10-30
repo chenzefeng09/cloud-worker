@@ -7,12 +7,15 @@
 # FROM ``:base``, NOT ``:latest`` — compose builds this file INTO ``:latest``,
 # so a ``FROM :latest`` is self-referential and compounds layers on every
 # rebuild (it reached 733 layers by 2026-06 and broke ALL derived builds with
-# "mount options is too long").  ``:base`` is a flattened snapshot (1 layer);
-# every rebuild is now base + a constant handful of overlay layers.
-# To refresh ``:base`` itself (e.g. dependency changes): rebuild the full
-# Dockerfile, or flatten a known-good container:
-#   docker export <container> | docker import --change 'ENV ...' ... - \
-#     agent-platform-dev-session-orchestrator:base
+# "mount options is too long").  ``:base`` is a separate image, so every
+# rebuild is base + a constant handful of overlay layers.
+# docker compose builds ``:base`` from the full Dockerfile itself (the
+# build-only ``session-orchestrator-base`` service, wired in through an
+# additional_contexts entry), so nothing has to be built or tagged by hand.
+# For a standalone ``docker build`` of this file, build ``:base`` first:
+#   docker build -f Dockerfile --build-context foundation_sdk=<sdk> \
+#     --build-context feature_flag_client=<ff-client> \
+#     -t agent-platform-dev-session-orchestrator:base .
 
 FROM agent-platform-dev-session-orchestrator:base
 

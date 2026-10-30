@@ -200,37 +200,64 @@ def test_retention_null_when_sweep_disabled(
 # ── authz ────────────────────────────────────────────────────────────────────
 
 
-def test_privacy_routes_require_rbac(
+_SELF_ROUTES = [
+    ("get", f"{_P}/export"),
+    ("post", f"{_P}/erase"),
+    ("get", f"{_P}/settings"),
+    ("put", f"{_P}/settings"),
+    ("get", f"{_P}/retention"),
+]
+
+
+class _AuthzMustNotBeCalled:
+    """Stand-in for the authz client: data-subject routes never consult authz."""
+
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        raise AssertionError("privacy routes must not call authz /check")
+
+
+def _call(client: TestClient, method: str, path: str, headers: dict[str, str]) -> Any:
+    kwargs: dict[str, Any] = {"headers": headers}
+    if method == "put":
+        kwargs["json"] = {"memory_enabled": False}
+    return getattr(client, method)(path, **kwargs)
+
+
+def test_privacy_routes_need_no_role_permission(
     app_client: TestClient, auth_headers: dict[str, str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fail-closed: a denied authz check is a 403 before any handler runs."""
-    import httpx
-
-    denied = MagicMock(spec=httpx.Response)
-    denied.status_code = 200
-    denied.json = MagicMock(return_value={"allowed": False})
-
-    class _Deny:
-        def __init__(self, *a: Any, **kw: Any) -> None:
-            pass
-
-        async def __aenter__(self) -> _Deny:
-            return self
-
-        async def __aexit__(self, *a: Any) -> None:
-            return None
-
-        async def post(self, *a: Any, **kw: Any) -> MagicMock:
-            return denied
-
+    """A caller whose role holds no ``session.delete`` (``member``) still
+    exercises every data-subject right on their own data: no authz check runs."""
     monkeypatch.setattr(
-        "agent_session_orchestrator.api.authz_guard.httpx.AsyncClient", _Deny,
+        "agent_session_orchestrator.api.authz_guard.httpx.AsyncClient", _AuthzMustNotBeCalled,
     )
+    patches = {
+        "export_user_data": AsyncMock(return_value={}),
+        "erase_user_data": AsyncMock(return_value={}),
+        "get_privacy_settings": AsyncMock(return_value={"memory_enabled": True}),
+        "set_privacy_settings": AsyncMock(return_value={"memory_enabled": False}),
+    }
+    with patch.multiple(PrivacyService, **patches):
+        for method, path in _SELF_ROUTES:
+            assert _call(app_client, method, path, auth_headers).status_code == 200, path
+    patches["erase_user_data"].assert_awaited_once()
+    assert patches["erase_user_data"].call_args.args == (TEST_USER,)
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        {"X-User-Id": "SYSTEM"},
+        {"X-User-Id": "not-a-user-id"},
+    ],
+)
+def test_privacy_routes_require_an_identified_caller(
+    app_client: TestClient, auth_headers: dict[str, str], identity: dict[str, str],
+) -> None:
+    """Fail-closed on identity: no real user id → 403 before any handler runs."""
     erase = AsyncMock()
     with patch.object(PrivacyService, "erase_user_data", erase):
-        for method, path in [
-            ("get", f"{_P}/export"), ("post", f"{_P}/erase"), ("get", f"{_P}/settings"),
-            ("get", f"{_P}/retention"),
-        ]:
-            assert getattr(app_client, method)(path, headers=auth_headers).status_code == 403
+        for method, path in _SELF_ROUTES:
+            resp = _call(app_client, method, path, {**auth_headers, **identity})
+            assert resp.status_code == 403, path
     erase.assert_not_awaited()

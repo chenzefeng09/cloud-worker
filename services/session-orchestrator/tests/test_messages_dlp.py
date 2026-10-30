@@ -78,6 +78,7 @@ def _make_svc() -> MagicMock:
     svc.create_message = AsyncMock(side_effect=_create_message)
     svc.claim_run_transition = AsyncMock(return_value=True)
     svc.run_has_output = AsyncMock(return_value=False)
+    svc.raise_run_usage = AsyncMock()
     # No redis_url is passed below, so the stream-replay branch (which lists
     # existing messages) is skipped; list_messages is never called.
     return svc

@@ -6,6 +6,11 @@ signal ``require_permission`` honours — may name another data subject with
 ``user_id``; for anyone else naming a different user is a 403.  Every query
 stays inside the caller's tenant (RLS).
 
+No role permission gates these routes (``require_identified_caller``): access,
+erasure, restriction and objection are the data subject's own rights, so any
+identified user may exercise them on their own data — including a ``member``,
+whose role holds no ``session.delete``.
+
     GET  /privacy/export[?user_id=usr_…]  → full JSON export (soft-deleted rows included)
     POST /privacy/erase   {"user_id"?, "dry_run"?} → hard delete + counts
     GET  /privacy/settings[?user_id=usr_…] → {"memory_enabled", "updated_at"}
@@ -21,7 +26,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from agent_session_orchestrator.api.authz_guard import require_permission
+from agent_session_orchestrator.api.authz_guard import require_identified_caller
 from agent_session_orchestrator.api.dependencies import TDbSession, TTenantId, TUserId
 from agent_session_orchestrator.services.privacy_service import (
     USER_ID_RE,
@@ -31,6 +36,9 @@ from agent_session_orchestrator.services.privacy_service import (
 )
 
 router = APIRouter(tags=["Privacy"])
+
+# Identity only — see the module docstring.
+_SUBJECT = require_identified_caller()
 
 
 class EraseRequest(BaseModel):
@@ -59,10 +67,7 @@ def _resolve_subject(request: Request, caller: str, requested: str | None) -> st
 
 @router.get(
     "/privacy/export",
-    dependencies=[
-        Depends(require_permission("session.read", "session")),
-        Depends(require_permission("workspace.read", "workspace")),
-    ],
+    dependencies=[Depends(_SUBJECT)],
 )
 async def export_user_data(
     request: Request,
@@ -77,10 +82,7 @@ async def export_user_data(
 
 @router.post(
     "/privacy/erase",
-    dependencies=[
-        Depends(require_permission("session.delete", "session")),
-        Depends(require_permission("workspace.manage", "workspace")),
-    ],
+    dependencies=[Depends(_SUBJECT)],
 )
 async def erase_user_data(
     request: Request,
@@ -103,7 +105,7 @@ async def erase_user_data(
 
 @router.get(
     "/privacy/settings",
-    dependencies=[Depends(require_permission("session.read", "session"))],
+    dependencies=[Depends(_SUBJECT)],
 )
 async def get_privacy_settings(
     request: Request,
@@ -118,7 +120,7 @@ async def get_privacy_settings(
 
 @router.put(
     "/privacy/settings",
-    dependencies=[Depends(require_permission("session.update", "session"))],
+    dependencies=[Depends(_SUBJECT)],
 )
 async def put_privacy_settings(
     request: Request,
@@ -136,7 +138,7 @@ async def put_privacy_settings(
 
 @router.get(
     "/privacy/retention",
-    dependencies=[Depends(require_permission("session.read", "session"))],
+    dependencies=[Depends(_SUBJECT)],
 )
 async def get_retention_policy(request: Request) -> dict[str, Any]:
     """The platform's storage-limitation policy, for display to data subjects.

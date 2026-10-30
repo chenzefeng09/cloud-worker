@@ -81,8 +81,8 @@ class AsyncSQLiteSession:
     async def flush(self) -> None:
         self.sync.flush()
 
-    async def refresh(self, obj: Any) -> None:
-        self.sync.refresh(obj)
+    async def refresh(self, obj: Any, attribute_names: Any = None) -> None:
+        self.sync.refresh(obj, attribute_names=attribute_names)
 
     async def delete(self, obj: Any) -> None:
         self.sync.delete(obj)
