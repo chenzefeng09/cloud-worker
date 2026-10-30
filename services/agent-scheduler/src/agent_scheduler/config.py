@@ -271,6 +271,13 @@ class Settings(BaseSettings):
     # Gateway mode is unconditional: a missing tenant virtual key is a
     # spawn-time error and there is no direct-connect fallback.
     llm_gateway_url: str = "http://llm-gateway:8011/api/llm-gateway/v1"
+    # Proves the scheduler is a SERVICE caller to the gateway, which mints and
+    # revokes run-scoped keys for no one else: sent as X-Internal-Service-Token
+    # with X-Actor: SERVICE, it must equal the gateway's
+    # LLM_GATEWAY_INTERNAL_SERVICE_TOKEN.  Like ``scheduler_service_token`` it
+    # must NOT reach the sandboxes we spawn.  Empty → the gateway refuses the
+    # mint (403) and runs fall back to the long-lived tenant key.
+    llm_gateway_service_token: str = ""
 
     # Knowledge-ingest (KB v1) - base URL *with* API version prefix.
     # Forwarded into the sandbox as KNOWLEDGE_INGEST_URL so the in-sandbox

@@ -124,6 +124,7 @@ class FakeBackends:
         self.suggestion_body = suggestion_body
 
         self.calls: list[tuple[str, str, dict | None]] = []
+        self.last_mint_headers: dict[str, str] | None = None
         self.last_completion_payload: dict | None = None
         self.last_completion_headers: dict[str, str] | None = None
         self.completion_payloads: list[dict] = []
@@ -134,6 +135,7 @@ class FakeBackends:
 
         # ── gateway meta ──
         if url.endswith("/tenant-keys/ephemeral") and method == "POST":
+            self.last_mint_headers = kwargs.get("headers")
             return httpx.Response(self.mint_status, json=self.mint_body)
         if "/tenant-keys" in url and method == "GET":
             return httpx.Response(200, json=self.virtual_keys)
@@ -626,6 +628,24 @@ def test_canvas_v2_no_virtual_key_at_all_502(
     resp = client.post(_url(), cookies=authed_cookie, json=_body())
     assert resp.status_code == 502
     assert resp.json()["detail"]["detail"]["code"] == "AGENT.BFF.CANVAS.GATEWAY_UNAVAILABLE"
+
+
+def test_canvas_v2_mints_as_a_proven_service(
+    client: TestClient,
+    settings: Any,
+    authed_cookie: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gateway mints keys for a SERVICE caller with its pre-shared token only."""
+    settings.foundation_llm_gateway_service_token = "bff-gw-service-token-0123456789"
+    fake = FakeBackends()
+    _patch(fake, monkeypatch)
+
+    resp = client.post(_url(), cookies=authed_cookie, json=_body())
+    assert resp.status_code == 200
+    assert fake.last_mint_headers is not None
+    assert fake.last_mint_headers["X-Actor"] == "SERVICE"
+    assert fake.last_mint_headers["X-Internal-Service-Token"] == "bff-gw-service-token-0123456789"
 
 
 def test_canvas_v2_resolves_default_model_when_omitted(

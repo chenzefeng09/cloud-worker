@@ -191,7 +191,10 @@ Narrated steps:
    spawn. The BFF's own model calls (canvas edits, session titles) use the same kind
    of short-lived key, minted per tenant and reused for a few minutes; without a
    provider, canvas edits answer `AGENT.BFF.CANVAS.LLM_NOT_CONFIGURED` and titles
-   fall back to the start of the first message. Then, via the selected `SandboxRuntime` implementation (Docker through
+   fall back to the start of the first message. The gateway mints and revokes these
+   keys only for a SERVICE caller holding its pre-shared token
+   (`X-Internal-Service-Token`, `LLM_GATEWAY_SERVICE_TOKEN`), which the scheduler and
+   the BFF keep and no sandbox ever sees. Then, via the selected `SandboxRuntime` implementation (Docker through
    docker-socket-proxy, or Cube through the cube-controller over mTLS on `:8443`),
    it spawns a sandbox from a warm **sandbox-pool** slot. It delivers identity + LLM + OTEL env, `task.json` (`{task, mcp_server_ids,
    skills, files, sys_prompt, …}`), and a mode-`0600` `/workspace/.secrets.json`

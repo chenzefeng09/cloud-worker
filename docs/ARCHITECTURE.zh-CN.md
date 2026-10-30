@@ -177,7 +177,9 @@ sequenceDiagram
    签发失败时才回退到 `GET /tenant-keys` 的租户长期密钥）。租户没有已启用的 LLM provider 时运行被拒绝
    （`AGENT.RUN.LLM_NOT_CONFIGURED`：告知用户需由管理员添加），完全拿不到密钥则令生成失败。BFF 自己的
    模型调用（画布修订、会话标题）用同类短期密钥，按租户铸造并复用几分钟；没有 provider 时画布修订返回
-   `AGENT.BFF.CANVAS.LLM_NOT_CONFIGURED`，会话标题退回取首条消息开头。随后经所选的
+   `AGENT.BFF.CANVAS.LLM_NOT_CONFIGURED`，会话标题退回取首条消息开头。gateway 只为持有其预共享令牌
+   （`X-Internal-Service-Token`，即 `LLM_GATEWAY_SERVICE_TOKEN`）的 SERVICE 调用方铸造、吊销这类密钥；
+   令牌只在 scheduler 和 BFF 手里，沙盒永远拿不到。随后经所选的
    `SandboxRuntime` 实现（Docker 经 docker-socket-proxy，或 Cube 经 cube-controller 在 `:8443` 上的
    mTLS）从一个预热 **sandbox-pool** 槽位生成沙盒。它投递身份 + LLM + OTEL 环境变量、`task.json`
    （`{task, mcp_server_ids, skills, files, sys_prompt, …}`），以及一个 mode-`0600` 的

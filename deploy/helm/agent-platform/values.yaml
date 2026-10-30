@@ -66,6 +66,12 @@ global:
     billingUrl: http://foundation-billing:80/api/billing/v1
     auditUrl: http://foundation-audit:80/api/audit/v1
     llmGatewayUrl: http://foundation-llm-gateway:80/api/llm/v1
+    # llm-gateway 的 SERVICE 预共享令牌：scheduler / BFF 凭它（X-Internal-Service-Token）
+    # 铸造、吊销 run 级 key。与 foundation chart 的 llmGatewayServiceToken 是同一个
+    # secret；secret 不存在时铸造被拒（403），两边退回租户长期 key。
+    llmGatewayServiceToken:
+      existingSecret: foundation-llm-gateway-service-token
+      secretKey: token
     dlpUrl: http://foundation-dlp:80/api/dlp/v1
     # DLP 检查无法完成（不可达、超时、非 2xx、无法解析）时：closed = 拒绝（沙箱拒绝
     # 工具调用，orchestrator 上传/下载返回 503）；open = 放行并每次记 error。

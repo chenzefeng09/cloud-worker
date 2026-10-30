@@ -113,6 +113,15 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.agentScheduler.existingSecret | default "ap-agent-scheduler-secrets" }}
                   key: SCHEDULER_SERVICE_TOKEN
+            # Proves the scheduler to the LLM gateway as SERVICE (mint / revoke
+            # run-scoped keys); the gateway reads the same secret.  Never
+            # forwarded into a sandbox.
+            - name: SCHEDULER_LLM_GATEWAY_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.global.foundation.llmGatewayServiceToken.existingSecret | quote }}
+                  key: {{ .Values.global.foundation.llmGatewayServiceToken.secretKey | default "token" | quote }}
+                  optional: true
             # MCP / Skill Store / Web Fetch URLs (forwarded into sandbox)
             - name: SCHEDULER_MCP_REGISTRY_URL
               valueFrom:

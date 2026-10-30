@@ -136,6 +136,9 @@ async def generate_and_update_session_title(
                     gateway_url=gateway_url,
                     tenant_id=tenant_id,
                     access_token=access_token,
+                    service_token=str(
+                        getattr(settings, "foundation_llm_gateway_service_token", "") or ""
+                    ),
                 )
             except LlmNotConfiguredError:
                 virtual_key = None  # no model to ask: the fallback title stands

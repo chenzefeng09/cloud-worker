@@ -223,6 +223,28 @@ async def _mint_sandbox_token(
     return token
 
 
+def _gateway_headers(
+    settings,  # type: ignore[no-untyped-def]
+    *,
+    tenant_id: str,
+    bearer: str,
+) -> dict[str, str]:
+    """Headers for the scheduler's own calls to the LLM gateway.
+
+    The gateway resolves the tenant from X-Tenant-Id (its
+    TenantContextMiddleware); without it the request is 401.  It mints and
+    revokes run-scoped keys for SERVICE callers only, and believes an
+    ``X-Actor: SERVICE`` claim only alongside the pre-shared
+    ``llm_gateway_service_token`` — so the pair is sent only when that token
+    is configured (an unproven claim would just be logged and downgraded).
+    """
+    headers = {"Authorization": f"Bearer {bearer}", "X-Tenant-Id": tenant_id}
+    if settings.llm_gateway_service_token:
+        headers["X-Actor"] = "SERVICE"
+        headers["X-Internal-Service-Token"] = settings.llm_gateway_service_token
+    return headers
+
+
 async def _fetch_tenant_virtual_key(
     *,
     settings,  # type: ignore[no-untyped-def]
@@ -246,16 +268,10 @@ async def _fetch_tenant_virtual_key(
         async with httpx.AsyncClient(timeout=3.0) as client:
             resp = await client.get(
                 url,
+                # Kept for forward-compat; the gateway reads the tenant from
+                # the X-Tenant-Id header only.
                 params={"tenant_id": tenant_id},
-                headers={
-                    "Authorization": f"Bearer {bearer}",
-                    # The gateway resolves the tenant from X-Tenant-Id (its
-                    # TenantContextMiddleware); without this header it returns
-                    # 401 and we would never retrieve the virtual key.  The
-                    # query param is kept for forward-compat but the header is
-                    # what the gateway actually reads.
-                    "X-Tenant-Id": tenant_id,
-                },
+                headers=_gateway_headers(settings, tenant_id=tenant_id, bearer=bearer),
             )
     except httpx.HTTPError as exc:
         logger.warning(
@@ -324,6 +340,8 @@ async def _mint_run_virtual_key(
 
     Returns the ephemeral virtual key string, or ``None`` if:
       * ``llm_gateway_url`` is unset, or
+      * the gateway refuses the caller (403: ``llm_gateway_service_token`` is
+        unset or not the gateway's), or
       * the gateway does not support ephemeral minting (older gateway → 404 /
         405), or the mint call otherwise fails / is unreachable.
 
@@ -348,12 +366,7 @@ async def _mint_run_virtual_key(
             resp = await client.post(
                 url,
                 json={"run_id": run_id, "ttl_seconds": ttl_seconds},
-                headers={
-                    "Authorization": f"Bearer {bearer}",
-                    # Gateway resolves the tenant from X-Tenant-Id (its
-                    # TenantContextMiddleware); without it the request is 401.
-                    "X-Tenant-Id": tenant_id,
-                },
+                headers=_gateway_headers(settings, tenant_id=tenant_id, bearer=bearer),
             )
     except httpx.HTTPError as exc:
         logger.warning(
@@ -368,6 +381,16 @@ async def _mint_run_virtual_key(
         and _problem_code(resp) == _GATEWAY_NO_PROVIDER
     ):
         raise LlmNotConfiguredError()
+    if resp.status_code == status.HTTP_403_FORBIDDEN:
+        # The gateway did not take us for a SERVICE caller: the token is unset
+        # here or is not the gateway's.  A deploy setting rather than an
+        # outage, so say which one; the run still falls back to the tenant key.
+        logger.warning(
+            "llm-gateway refused to mint a run-scoped key (HTTP 403): "
+            "SCHEDULER_LLM_GATEWAY_SERVICE_TOKEN must equal the gateway's "
+            "LLM_GATEWAY_INTERNAL_SERVICE_TOKEN (falling back to tenant key)",
+        )
+        return None
     if resp.status_code not in (status.HTTP_200_OK, status.HTTP_201_CREATED):
         # 404/405 → older gateway without the ephemeral endpoint; anything else
         # → a transient mint failure.  Either way we fall back to the tenant key
@@ -411,13 +434,10 @@ async def _revoke_run_virtual_keys(
     url = f"{settings.llm_gateway_url.rstrip('/')}/tenant-keys/revoke-run"
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            await client.post(
+            resp = await client.post(
                 url,
                 json={"run_id": run_id},
-                headers={
-                    "Authorization": f"Bearer {bearer}",
-                    "X-Tenant-Id": tenant_id,
-                },
+                headers=_gateway_headers(settings, tenant_id=tenant_id, bearer=bearer),
             )
     except httpx.HTTPError as exc:
         # Non-fatal: the key will still expire on its own via TTL.
@@ -425,6 +445,15 @@ async def _revoke_run_virtual_keys(
             "llm-gateway unreachable while revoking run-scoped key "
             "(TTL expiry will still apply): %s",
             exc,
+        )
+        return
+    if resp.status_code != status.HTTP_200_OK:
+        # Equally non-fatal, but visible: a 403 means the gateway did not take
+        # us for a SERVICE caller (SCHEDULER_LLM_GATEWAY_SERVICE_TOKEN).
+        logger.warning(
+            "llm-gateway returned HTTP %s for POST /tenant-keys/revoke-run "
+            "(TTL expiry will still apply)",
+            resp.status_code,
         )
 
 

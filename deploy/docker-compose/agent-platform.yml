@@ -572,6 +572,11 @@ services:
       # With llm_gateway_enforcer enabled by default, missing tenant virtual keys
       # fail sandbox spawn instead of falling back to direct provider credentials.
       SCHEDULER_LLM_GATEWAY_URL: ${LLM_GATEWAY_URL:-http://llm-gateway:8011/api/llm-gateway/v1}
+      # Proves the scheduler to the gateway as SERVICE, the only caller it mints
+      # or revokes run-scoped keys for.  The gateway reads the same variable
+      # (LLM_GATEWAY_INTERNAL_SERVICE_TOKEN in saas-foundation dev.yml).  Never
+      # forwarded into a sandbox.
+      SCHEDULER_LLM_GATEWAY_SERVICE_TOKEN: ${LLM_GATEWAY_SERVICE_TOKEN:-dev-llm-gateway-service-token-change-me}
       # NOTE: FOUNDATION_SERVICE_SCOPES is injected into sandbox env by the
       # scheduler as a dev-mode shim (see agent_scheduler/config.py
       # SANDBOX_SERVICE_SCOPES).  It is not an env var of the *scheduler*
@@ -685,6 +690,10 @@ services:
       BFF_DB_DSN_MIGRATOR: postgresql+asyncpg://app_migrator:${APP_MIGRATOR_PASSWORD:-app_migrator_change_me}@postgres:5432/foundation
       # Service-account token — shared with cron-runner for machine-path auth.
       BFF_SERVICE_TOKEN: ${BFF_SERVICE_TOKEN:-dev_service_token_change_me}
+      # Proves the BFF to the LLM gateway as SERVICE, the only caller it mints
+      # the short-lived canvas / session-title keys for.  The gateway reads the
+      # same variable (LLM_GATEWAY_INTERNAL_SERVICE_TOKEN in saas-foundation dev.yml).
+      BFF_FOUNDATION_LLM_GATEWAY_SERVICE_TOKEN: ${LLM_GATEWAY_SERVICE_TOKEN:-dev-llm-gateway-service-token-change-me}
       # Cron-runner proxy target.
       BFF_CRON_RUNNER_URL: http://cron-runner:8013/api/cron/v1
       # Inbound-webhook receiver re-enters this same process's /apps/{id}/run

@@ -111,6 +111,16 @@ spec:
                 configMapKeyRef:
                   name: ap-config
                   key: AP_PROFILE
+            {{- if eq $svcName "bff" }}
+            # Proves the BFF to the LLM gateway as SERVICE (canvas / session-title
+            # keys); the gateway reads the same secret.
+            - name: BFF_FOUNDATION_LLM_GATEWAY_SERVICE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.global.foundation.llmGatewayServiceToken.existingSecret | quote }}
+                  key: {{ $root.Values.global.foundation.llmGatewayServiceToken.secretKey | default "token" | quote }}
+                  optional: true
+            {{- end }}
             {{- with $svc.env }}
               {{- toYaml . | nindent 12 }}
             {{- end }}

@@ -59,6 +59,7 @@ class _FakeClient:
         self.renamed_during_generation = renamed_during_generation
         self.session_reads = 0
         self.patches: list[dict[str, Any]] = []
+        self.mint_headers: dict[str, str] | None = None
 
     async def __aenter__(self) -> _FakeClient:
         return self
@@ -81,6 +82,7 @@ class _FakeClient:
 
     async def post(self, url: str, **_kwargs: Any) -> httpx.Response:
         if url.endswith("/tenant-keys/ephemeral"):
+            self.mint_headers = _kwargs.get("headers")
             return self.mint_response
         assert url.endswith("/chat/completions")
         self.completions += 1
@@ -133,6 +135,33 @@ def test_generate_and_update_session_title_uses_model(
         )
     )
 
+    assert fake.patches == [{"title": "航天反作用飞轮 FOC 控制验证"}]
+
+
+def test_generate_mints_the_title_key_as_a_proven_service(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gateway mints keys for a SERVICE caller with its pre-shared token only."""
+    fake = _FakeClient()
+    monkeypatch.setattr(session_title.httpx, "AsyncClient", lambda **_kwargs: fake)
+    settings = _settings()
+    settings.foundation_llm_gateway_service_token = "bff-gw-service-token-0123456789"
+
+    asyncio.run(
+        session_title.generate_and_update_session_title(
+            settings=settings,
+            session_id="ses_1",
+            message="设计一套真实的航天反作用飞轮 FOC 控制验证任务",
+            tenant_id="tnt_1",
+            user_id="usr_1",
+            access_token="token",
+            model_hint="deepseek-fast",
+        )
+    )
+
+    assert fake.mint_headers is not None
+    assert fake.mint_headers["X-Actor"] == "SERVICE"
+    assert fake.mint_headers["X-Internal-Service-Token"] == "bff-gw-service-token-0123456789"
     assert fake.patches == [{"title": "航天反作用飞轮 FOC 控制验证"}]
 
 
