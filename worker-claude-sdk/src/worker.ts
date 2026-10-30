@@ -37,7 +37,7 @@ import {
 } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 
-import type { Env, Task } from "./task.js";
+import { HISTORY_OMITTED, type Env, type Task } from "./task.js";
 import type { RedisStateClient } from "./redis_state.js";
 import { appendEvent, writeResult, type Usage } from "./result.js";
 import { EventTranslator, type EventPayload } from "./event_translator.js";
@@ -287,16 +287,23 @@ function estimateTokens(text: string): number {
 
 /**
  * Serialize task.history[] into plain text, keeping only the most recent
- * ~8000 tokens (B.2). Older turns are dropped from the front.
+ * ~8000 tokens (B.2). Older turns are dropped from the front (a tool call
+ * together with its result), and a leading note says how many earlier turns
+ * are not shown — dropped here, or already left out by the orchestrator (its
+ * `history_omitted` item) — so the model knows the conversation is incomplete.
  */
 export function historyToText(task: Task): string {
   const history = task.history ?? [];
-  const lines: string[] = [];
+  const turns: string[] = [];
+  let omitted = 0;
   for (const item of history) {
-    if (item.role === "user") {
-      lines.push(`[user]: ${item.content ?? ""}`);
+    if (item.type === HISTORY_OMITTED) {
+      const n = item.omitted;
+      if (typeof n === "number" && Number.isInteger(n) && n > 0) omitted += n;
+    } else if (item.role === "user") {
+      turns.push(`[user]: ${item.content ?? ""}`);
     } else if (item.role === "assistant") {
-      lines.push(`[assistant]: ${item.content ?? ""}`);
+      turns.push(`[assistant]: ${item.content ?? ""}`);
     } else if (item.role === "tool" && item.tool) {
       const name = item.tool.name ?? "tool";
       const input =
@@ -307,23 +314,25 @@ export function historyToText(task: Task): string {
         typeof item.tool.result === "string"
           ? item.tool.result
           : JSON.stringify(item.tool.result ?? "");
-      lines.push(`[tool_call:${name}]: ${input}`);
-      lines.push(`[tool_result:${name}]: ${result}`);
+      turns.push(`[tool_call:${name}]: ${input}\n[tool_result:${name}]: ${result}`);
     }
   }
-  if (lines.length === 0) return "";
 
-  // Keep the most recent lines under the ~8000-token budget.
+  // Keep the most recent turns under the ~8000-token budget.
   const MAX_TOKENS = 8000;
   const kept: string[] = [];
   let tokens = 0;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const t = estimateTokens(lines[i]);
+  for (let i = turns.length - 1; i >= 0; i--) {
+    const t = estimateTokens(turns[i]);
     if (tokens + t > MAX_TOKENS && kept.length > 0) break;
-    kept.push(lines[i]);
+    kept.push(turns[i]);
     tokens += t;
   }
   kept.reverse();
+  const notShown = omitted + turns.length - kept.length;
+  if (notShown > 0) {
+    kept.unshift(`[${notShown} earlier message(s) of this conversation are not shown]`);
+  }
   return kept.join("\n");
 }
 

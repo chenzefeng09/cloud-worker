@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import json
+import logging
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +25,11 @@ from agent_session_orchestrator.api.v1.messages import (
     _reconcile_run_completion,
     _redis_stream_end_state,
     _stream_tokens,
+)
+from agent_session_orchestrator.api.v1.runs import (
+    _DISPATCH_MAX_BYTES,
+    _fit_dispatch_history,
+    _json_size,
 )
 from agent_session_orchestrator.domain.models import Message, Run, Session
 from agent_session_orchestrator.services.session_service import SessionService
@@ -272,6 +278,38 @@ def test_end_state_reflects_the_latest_leg(
             _redis_stream_end_state(redis_url="redis://fake", run_id="run_1")
         )
     assert result == expected
+
+
+def test_heartbeat_entries_change_nothing_for_any_stream_reader() -> None:
+    """The worker's keep-alive entries (written while a long tool call is silent)
+    must stay invisible: no SSE event, no persisted block, no effect on the end
+    state."""
+    entries = [
+        {"type": "delta", "text": "Running the import."},
+        {"type": "tool_call", "tool_call_id": "tc1", "name": "mcp__etl__run", "args": "{}"},
+        {"type": "heartbeat"},
+        {"type": "heartbeat"},
+        {"type": "tool_result", "tool_call_id": "tc1", "name": "mcp__etl__run",
+         "result": "ok", "state": "success"},
+        {"type": "delta", "text": "Done."},
+        {"type": "end", "text": "", "status": "completed"},
+    ]
+    without = [e for e in entries if e["type"] != "heartbeat"]
+
+    def _relayed(stream: list[dict[str, str]]) -> tuple[list[Any], dict[str, Any]]:
+        outcome: dict[str, Any] = {}
+        events = _tail(_RedisState({TOKENS: stream}), wait_for_worker=False, outcome=outcome)
+        return [(n, {k: v for k, v in p.items() if k != "offset"}) for n, p in events], outcome
+
+    def _end_state(stream: list[dict[str, str]]) -> tuple[str | None, str | None]:
+        with _patch_redis_asyncio(_fake_redis(_RedisState({TOKENS: stream}))):
+            return asyncio.get_event_loop().run_until_complete(
+                _redis_stream_end_state(redis_url="redis://fake", run_id="run_1")
+            )
+
+    assert _relayed(entries) == _relayed(without)
+    assert _blocks(entries) == _blocks(without)
+    assert _end_state(entries) == _end_state(without) == ("completed", None)
 
 
 # ── _reconcile_run_completion ────────────────────────────────────────────────
@@ -640,6 +678,171 @@ def test_resume_is_refused_when_the_run_was_cancelled_meanwhile(
     assert "CANCELLED" in resp.text
     assert dispatched == []
     assert "agent:run:run_1:resume_lock" not in state.kv
+
+
+# ── dispatch size budget ─────────────────────────────────────────────────────
+
+
+def _turns(n: int, size: int = 1000) -> list[dict[str, Any]]:
+    """``n`` history items, oldest first, each carrying ``size`` filler characters."""
+    return [
+        {"role": "user" if i % 2 == 0 else "assistant", "type": "text",
+         "content": f"turn {i}: " + "x" * size}
+        for i in range(n)
+    ]
+
+
+def test_a_dispatch_within_the_budget_is_sent_unchanged() -> None:
+    payload = {"task": "t", "history": _turns(10)}
+    before = json.loads(json.dumps(payload))
+    _fit_dispatch_history(payload, run_id="run_1")
+    assert payload == before
+
+
+def test_an_oversized_dispatch_drops_the_oldest_history_behind_a_marker() -> None:
+    history = _turns(300)
+    payload = {"task": "t", "memory": "m", "history": list(history)}
+    _fit_dispatch_history(payload, run_id="run_1")
+
+    marker, *kept = payload["history"]
+    dropped = len(history) - len(kept)
+    assert marker["role"] == "system"
+    assert marker["type"] == "history_omitted"
+    assert marker["omitted"] == dropped > 0
+    assert f"{dropped} earlier message(s) omitted" in marker["content"]
+    assert kept == history[dropped:]  # the newest turns, in order
+    assert _json_size(payload) <= _DISPATCH_MAX_BYTES
+    # As much as fits is kept: one more turn would not fit.
+    payload["history"] = [marker, history[dropped - 1], *kept]
+    assert _json_size(payload) > _DISPATCH_MAX_BYTES
+
+
+def test_a_second_fit_merges_the_earlier_marker_instead_of_stacking_one() -> None:
+    history = _turns(300)
+    payload = {"task": "t", "history": list(history)}
+    _fit_dispatch_history(payload, run_id="run_1")
+    first_dropped = payload["history"][0]["omitted"]
+
+    payload["resume"] = {"kind": "confirm", "agent_state": {"transcript": "y" * 30_000}}
+    _fit_dispatch_history(payload, run_id="run_1")
+
+    marker, *kept = payload["history"]
+    assert [h["type"] for h in payload["history"]].count("history_omitted") == 1
+    assert marker["omitted"] == len(history) - len(kept) > first_dropped
+    assert kept == history[marker["omitted"]:]
+    assert _json_size(payload) <= _DISPATCH_MAX_BYTES
+
+
+def test_a_dispatch_too_big_even_without_history_is_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    payload = {"task": "t", "memory": "z" * _DISPATCH_MAX_BYTES, "history": _turns(3)}
+    with caplog.at_level(logging.WARNING, logger="agent_session_orchestrator.api.v1.runs"):
+        _fit_dispatch_history(payload, run_id="run_1")
+    (marker,) = payload["history"]
+    assert marker["omitted"] == 3
+    assert "no history left" in caplog.text
+
+
+def _scheduler_capture(dispatched: list[dict[str, Any]]) -> AuthzAwareClient:
+    class _Client(AuthzAwareClient):
+        async def post(self, url: str, **kw: Any) -> httpx.Response:
+            if "/check" in url and "authz" in url:
+                return self._authz_allowed_resp()
+            if url.endswith("/runs"):
+                dispatched.append(kw["json"])
+            return httpx.Response(201, json={"sandbox_id": "sb_new_000000"})
+
+    return _Client()
+
+
+def test_create_run_fits_a_long_conversation_into_the_dispatch(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers: dict[str, str],
+) -> None:
+    mock_db.execute.return_value = make_scalar_result(_session())
+
+    async def _refresh(obj: Any, attribute_names: list[str] | None = None) -> None:
+        if isinstance(obj, Run):
+            obj.id = "run_1"
+            obj.created_at = dt.datetime(2026, 1, 1, tzinfo=dt.UTC)
+
+    mock_db.refresh.side_effect = _refresh
+    dispatched: list[dict[str, Any]] = []
+    history = _turns(300)
+
+    with (
+        patch.object(httpx, "AsyncClient", return_value=_scheduler_capture(dispatched)),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._fetch_memory",
+            new=AsyncMock(return_value=""),
+        ),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._assemble_history",
+            new=AsyncMock(return_value=history),
+        ),
+        patch(
+            "agent_session_orchestrator.api.v1.runs._fetch_default_installed_skills",
+            new=AsyncMock(return_value=[]),
+        ),
+    ):
+        resp = app_client.post(
+            "/api/session/v1/sessions/ses_1/runs", headers=auth_headers, json={"task": "next"},
+        )
+
+    assert resp.status_code == 201, resp.text
+    (body,) = dispatched
+    assert _json_size(body) <= _DISPATCH_MAX_BYTES
+    marker, *kept = body["history"]
+    assert marker["type"] == "history_omitted"
+    assert kept == history[marker["omitted"]:]
+
+
+def test_resume_drops_more_history_to_make_room_for_the_resume_payload(
+    app_client: TestClient, mock_db: AsyncMock, auth_headers: dict[str, str],
+) -> None:
+    app_client.app.state.settings.redis_url = "redis://fake"
+    state = _RedisState()
+    agent_state = {
+        "original_task": "do the thing",
+        "transcript": [{"role": "assistant", "text": "y" * 40_000}],
+        "pending": [{"id": "tc1", "name": "mcp__etl__run", "args": "{}"}],
+    }
+    state.kv["agent:run:run_1:paused"] = json.dumps({
+        "kind": "confirm",
+        "tool_calls": [{"id": "tc1", "name": "mcp__etl__run"}],
+        "agent_state": agent_state,
+    })
+    history = _turns(100)
+    original = {
+        "session_id": "ses_1", "run_id": "run_1", "task": "do the thing", "hitl": True,
+        "history": history,
+    }
+    assert _json_size(original) <= _DISPATCH_MAX_BYTES  # the first leg fitted
+    state.kv["agent:run:run_1:dispatch"] = json.dumps(original)
+    mock_db.execute.side_effect = [
+        make_scalar_result(_run(status="PAUSED")),  # get_run
+        MagicMock(rowcount=1),                      # claim RUNNING for the resume
+    ]
+    dispatched: list[dict[str, Any]] = []
+
+    with (
+        patch.object(httpx, "AsyncClient", return_value=_scheduler_capture(dispatched)),
+        _patch_redis_asyncio(_fake_redis(state)),
+    ):
+        resp = app_client.post(
+            "/api/session/v1/sessions/ses_1/runs/run_1/respond",
+            headers=auth_headers,
+            json={"kind": "confirm", "tool_call_id": "tc1", "confirmed": True},
+        )
+
+    assert resp.status_code == 200, resp.text
+    (body,) = dispatched
+    assert _json_size(body) <= _DISPATCH_MAX_BYTES
+    assert body["resume"]["agent_state"] == agent_state
+    marker, *kept = body["history"]
+    assert marker["type"] == "history_omitted"
+    assert marker["omitted"] == len(history) - len(kept) > 0
+    assert kept == history[marker["omitted"]:]
 
 
 def test_pending_ignores_blobs_left_by_finished_runs(

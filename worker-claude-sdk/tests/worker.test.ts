@@ -290,6 +290,53 @@ describe("worker", () => {
     expect(prompt).toContain("report.pdf");
   });
 
+  it("historyToText renders a complete history as-is, with no omission note", () => {
+    const task = baseTask({
+      history: [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "hello" },
+      ],
+    });
+    expect(worker.historyToText(task)).toBe("[user]: hi\n[assistant]: hello");
+  });
+
+  it("historyToText says how many earlier messages the orchestrator left out", () => {
+    const marker = {
+      role: "system",
+      type: "history_omitted",
+      omitted: 5,
+      content: "[5 earlier message(s) omitted: the conversation is too long to send in full]",
+    } as const;
+    expect(
+      worker.historyToText(
+        baseTask({ history: [marker, { role: "user", content: "hi" }, { role: "assistant", content: "hello" }] }),
+      ),
+    ).toBe("[5 earlier message(s) of this conversation are not shown]\n[user]: hi\n[assistant]: hello");
+    // Everything left out: the note alone still tells the model there was more.
+    expect(worker.historyToText(baseTask({ history: [marker] }))).toBe(
+      "[5 earlier message(s) of this conversation are not shown]",
+    );
+  });
+
+  it("historyToText counts the turns its own budget drops, a tool call together with its result", () => {
+    const task = baseTask({
+      history: [
+        { role: "system", type: "history_omitted", omitted: 2 },
+        { role: "user", content: "load the table" },
+        // ~6000 tokens of call, a tiny result: dropped as one turn.
+        { role: "tool", tool: { id: "t1", name: "etl", input: { sql: "y".repeat(15_000) }, result: "ok" } },
+        { role: "assistant", content: "x".repeat(10_000) }, // ~4000 tokens
+        { role: "user", content: "latest" },
+      ],
+    });
+    const text = worker.historyToText(task);
+    expect(text.split("\n")[0]).toBe("[4 earlier message(s) of this conversation are not shown]");
+    expect(text).not.toContain("[tool_call:");
+    expect(text).not.toContain("[tool_result:");
+    expect(text).toContain("[user]: latest");
+    expect(text).not.toContain("load the table");
+  });
+
   it("runQuery prepends the resume note to the user prompt (not the system prompt)", async () => {
     let seenPrompt: unknown;
     const capturingQuery = (args: { prompt: unknown }) => {

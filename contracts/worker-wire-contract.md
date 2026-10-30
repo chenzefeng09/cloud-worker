@@ -27,7 +27,8 @@ cube: `cube_runtime.spawn_run` 的 `task_json`,经 `AGENT_TASK_JSON` env)。
   "skills": ["name", ...],       // worker 据此在 /home/skills/<name> 下解析 SKILL.md
   "files": [{"key","filename","mime"}, ...],   // worker 下载到 /workspace/inputs/
   "memory": "string",            // 预取记忆片段,worker 前置进 system prompt
-  "history": [{"role","type",...}, ...],  // 多轮历史(有损 dict);resume 时忽略
+  "history": [{"role","type",...}, ...],  // 多轮历史(有损 dict),每一腿(含 resume)都带;
+                                 // 过长时最旧的若干条换成首条 history_omitted 标记,见下
   "model_override": "string|null",
   "reasoning_effort": "string|null",
   "sys_prompt": "string",        // App harness 系统提示;orchestrator 预取的租户知识库
@@ -39,6 +40,17 @@ cube: `cube_runtime.spawn_run` 的 `task_json`,经 `AGENT_TASK_JSON` env)。
                                  //     "agent_state":{...}}   ← 见 §4
 }
 ```
+
+**大小上限**:cube runtime 把整个 task JSON 放进单个环境变量 `AGENT_TASK_JSON`,而 Linux
+限制单个环境变量 128 KiB(MAX_ARG_STRLEN)——超了 worker 起不来,scheduler 却照样报成功。
+所以 orchestrator 每次派发(首腿 `create_run`、每个续跑腿 `respond_run`)前把载荷压在
+112 KiB 内(`runs._DISPATCH_MAX_BYTES`,给 scheduler 追加的字段留余量):从最旧的 history
+丢起,换成**一条**放在首位的标记
+`{"role":"system","type":"history_omitted","omitted":N,"content":"[N earlier message(s) omitted: …]"}`
+(续跑时与已有标记合并,不叠加),并记 warning 日志;history 丢光仍超限再记一条 warning。
+worker 渲染 history 时另有约 8000 token 的预算,也从最旧丢起(工具调用连同结果一起丢);
+两处丢掉的条数合计,以 `[N earlier message(s) of this conversation are not shown]` 写在
+system prompt 的 history 段开头,让模型知道对话不完整。
 
 ## 1a. MCP 选择:`mcp_server_ids`(三态)与 `mcp_servers`(遗留空键)
 
@@ -108,6 +120,9 @@ scheduler 解析不到虚拟密钥时**直接让 spawn 失败**,不存在直连�
 orchestrator 的 `_stream_tokens` 从 `0-0` 全量重放——**重连/续跑会重放整段**,
 消费端(前端)靠 `run_started` 清块 + offset 水位实现幂等;worker 只管 append,不重写。
 每次写入都会刷新流的 TTL(30 分钟,暂停时改为 7 天),MAXLEN 约 100k。
+运行中若连续 5 分钟没有任何写入(比如一个长时间不出声的工具调用),worker 写一条
+`heartbeat` 并重写 `agent:run:{run_id}:state`,流和热状态键都不会在 run 还活着时过期;
+run 暂停或结束即停止。
 
 | 条目 `type` | 其余字段 | 语义 |
 |---|---|---|
@@ -119,6 +134,7 @@ orchestrator 的 `_stream_tokens` 从 `0-0` 全量重放——**重连/续跑会
 | `pending_confirmation` | `tool_call_id`, `name`, `args` | HITL:等用户批准(一个待批工具一条) |
 | `pending_question` | `tool_call_id`, `question` | HITL:ask_user 等用户回答 |
 | `error` | `message` | 失败原因(固定的、可展示给用户的短句),在 `end{failed}` 之前 |
+| `heartbeat` | (无) | 保活,只为刷新 TTL(见上);读端一律忽略,不转发、不落库 |
 | `end` | `text: ""`, `status` | 每个 worker 进程**恰好一条**,之后不再写。`status` ∈ `completed` / `failed` / `cancelled` / `paused`;缺省视为未知(旧 worker) |
 
 暂停与续跑共用**同一条流**:`end{paused}` 写在 pending 条目之后;续跑腿在其后继续
@@ -132,8 +148,8 @@ orchestrator 也会写两类条目:
 | `end{status: cancelled}` | 取消 / 新一轮对话废弃暂停的 run | 让正在跟流的连接立即停止,重放时视为已结束 |
 
 orchestrator 还在 `agent:run:{run_id}:dispatch` 存放该 run 的原始派发载荷(模型、
-skills、MCP、文件、history、memory、system prompt、HITL;TTL 8 天),续跑时原样重派,
-run 进入终态后删除。
+skills、MCP、文件、history、memory、system prompt、HITL;TTL 8 天),续跑时以它为底重派
+(加上 `resume`,再按 §1 的大小上限裁一次 history),run 进入终态后删除。
 
 ## 3. 输出②:`/workspace/result.json`(worker 写,scheduler `get_run_status` 透出)
 
@@ -172,8 +188,9 @@ scheduler 把 `status` 以顶层 `result_status` 透传;orchestrator reconcile �
 worker 凭 state 还原并注入确认/答案事件续跑,token 续写**同一条**流(同 run_id)。
 暂停时 worker 更新热状态键 `agent:run:{run_id}:state` 的 `status` 字段为 `"PAUSED"`。
 
-工具批准按「工具名 + 规范化参数(各层 key 排序)」匹配,且只用一次:参数不同或
-同参数的第二次调用都会再次暂停。
+工具批准按「工具名 + 规范化参数(解析后各层 key 排序再序列化,所以 key 顺序、空白、
+`5.0`/`1e2` 之类的数字写法、字符转义都不影响)」匹配,且只用一次:参数不同或同参数的
+第二次调用都会再次暂停。
 
 ## 5. 平台 SSE 事件(orchestrator `GET /sessions/{id}/stream` → BFF relay → 前端)
 

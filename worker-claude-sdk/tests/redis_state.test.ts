@@ -8,6 +8,8 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type { StateTransport } from "../src/redis_state.js";
+
 // ── ioredis mock ─────────────────────────────────────────────────────────────
 // One shared instance per test so we can inspect what was written.
 interface XaddCall {
@@ -498,6 +500,106 @@ describe("checkpoint state", () => {
   });
 });
 
+describe("heartbeat keep-alive", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const types = (redis: FakeRedis) => redis.xaddCalls.map((x) => streamFields(x).type);
+
+  it("a quiet run gets a heartbeat per interval, refreshing the stream and state TTLs", async () => {
+    vi.useFakeTimers();
+    const c = new RedisStateClient("run_x", "redis://localhost:6379");
+    await c.writeStep({ cursor: "start", status: "RUNNING" });
+    c.startHeartbeat(1000);
+    // The tool call is announced, then runs without writing anything.
+    await c.pushToolCall("tc-1", "mcp__etl__run", "{}");
+    const redis = FakeRedis.last!;
+    const runningBlob = redis.setCalls[0].value;
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(redis.xaddCalls.map(streamFields).at(-1)).toEqual({ type: "heartbeat" });
+    expect(redis.multiBatches.at(-1)).toEqual(["xadd", "expire"]);
+    expect(redis.expireCalls.at(-1)).toEqual({ key: "agent:run:run_x:tokens", ttl: 1800 });
+    // The RUNNING blob is re-set unchanged (no step bump), with the running TTL.
+    expect(redis.setCalls.at(-1)).toEqual({ key: "agent:run:run_x:state", value: runningBlob });
+    expect(redis.setExArgs.at(-1)).toBe(1800);
+
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(types(redis)).toEqual(["tool_call", "heartbeat", "heartbeat", "heartbeat"]);
+    await c.close();
+  });
+
+  it("writes no heartbeat while the stream keeps flowing", async () => {
+    vi.useFakeTimers();
+    const c = new RedisStateClient("run_x", "redis://localhost:6379", null, {
+      coalesceWindowMs: 0,
+    });
+    c.startHeartbeat(1000);
+    for (let i = 0; i < 5; i += 1) {
+      await vi.advanceTimersByTimeAsync(600);
+      await c.pushToken(`t${i}`);
+    }
+    expect(types(FakeRedis.last!)).toEqual(["delta", "delta", "delta", "delta", "delta"]);
+    await c.close();
+  });
+
+  const stops: Array<[string, (c: InstanceType<typeof RedisStateClient>) => Promise<void>]> = [
+    ["the terminal end", (c) => c.pushTokenEnd("completed")],
+    ["a pause", (c) => c.markPaused()],
+    ["a terminal status", (c) => c.markFailed()],
+    ["close()", (c) => c.close()],
+  ];
+  for (const [name, stop] of stops) {
+    it(`stops at ${name}`, async () => {
+      vi.useFakeTimers();
+      const c = new RedisStateClient("run_x", "redis://localhost:6379");
+      await c.writeStep({ cursor: "start", status: "RUNNING" });
+      c.startHeartbeat(1000);
+      await stop(c);
+      const setsBefore = FakeRedis.last!.setCalls.length;
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(types(FakeRedis.last!)).not.toContain("heartbeat");
+      expect(FakeRedis.last!.setCalls).toHaveLength(setsBefore);
+    });
+  }
+
+  it("a heartbeat already writing lands before the terminal status, never over it", async () => {
+    vi.useFakeTimers();
+    let stored: string | null = null;
+    const statuses: string[] = [];
+    let gate: Promise<void> | null = null;
+    let release: () => void = () => {};
+    const transport: StateTransport = {
+      async get() {
+        return stored;
+      },
+      async set(_key, value) {
+        if (gate && JSON.parse(value).status === "RUNNING") await gate;
+        stored = value;
+        statuses.push(JSON.parse(value).status);
+      },
+      async xadd() {},
+      async close() {},
+    };
+    const c = new RedisStateClient("run_x", undefined, transport);
+    await c.writeStep({ cursor: "start", status: "RUNNING" });
+    c.startHeartbeat(1000);
+    gate = new Promise((resolve) => {
+      release = resolve;
+    });
+    await vi.advanceTimersByTimeAsync(1000); // the heartbeat's RUNNING re-set is now stuck
+
+    const marking = c.markCompleted();
+    await vi.advanceTimersByTimeAsync(0); // an unguarded status write would land here
+    release();
+    await marking;
+
+    expect(statuses).toEqual(["RUNNING", "RUNNING", "COMPLETED"]);
+    expect(JSON.parse(stored!).status).toBe("COMPLETED");
+  });
+});
+
 describe("failure-open", () => {
   it("does not throw when xadd throws", async () => {
     const c = new RedisStateClient("run_x", "redis://localhost:6379");
@@ -632,6 +734,37 @@ describe("broker egress transport", () => {
       ["end", 7 * 24 * 3600],
     ]);
     expect(xadds[2].fields).toEqual({ type: "end", text: "", status: "paused" });
+  });
+
+  it("a heartbeat goes through the broker xadd (TTL folded in) and re-sets kind=state", async () => {
+    vi.useFakeTimers();
+    try {
+      const calls = stubFetch(() => Response.json({ ok: true }));
+      const c = fromEnv();
+      await c.writeStep({ cursor: "start", status: "RUNNING" });
+      c.startHeartbeat(1000);
+      await vi.advanceTimersByTimeAsync(1000);
+
+      const sent = calls.map((x) => ({
+        path: new URL(x.url).pathname,
+        body: JSON.parse(x.init.body as string),
+      }));
+      expect(sent.map((s) => s.path)).toEqual([
+        "/state/v1/set",
+        "/state/v1/xadd",
+        "/state/v1/set",
+      ]);
+      expect(sent[1].body).toEqual({
+        run_id: "run_b",
+        fields: { type: "heartbeat" },
+        maxlen: 100000,
+        expire: 1800,
+      });
+      expect(sent[2].body).toEqual({ ...sent[0].body, ttl: 1800 });
+      await c.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("writeStep POSTs /state/v1/set with kind=state and the aligned blob", async () => {

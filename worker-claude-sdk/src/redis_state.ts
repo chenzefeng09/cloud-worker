@@ -10,13 +10,16 @@
  *   agent:run:{run_id}:tokens -> Redis Stream of interleaved
  *                                delta | thinking_delta | thinking | tool_call |
  *                                tool_result | pending_confirmation |
- *                                pending_question | error | end
+ *                                pending_question | error | heartbeat | end
  *
  * Token stream guarantees (what the orchestrator SSE bridge relies on):
  *   - every write refreshes the stream TTL (MULTI XADD+EXPIRE on ioredis, the
  *     `expire` field on every broker xadd), so the key never outlives its TTL
  *     and never expires while the run is still writing; a pause extends it to
  *     the paused TTL so the pending entries survive the human wait;
+ *   - once startHeartbeat() runs, a quiet stretch (a long tool call) gets a
+ *     `heartbeat` entry every HEARTBEAT_INTERVAL_MS, so the stream and state
+ *     keys never expire mid-run either;
  *   - adjacent `delta` (and adjacent `thinking_delta`) chunks are coalesced for
  *     up to COALESCE_WINDOW_MS / COALESCE_MAX_CHARS; any other entry flushes
  *     the buffer first, so the relative order of entries is preserved;
@@ -63,6 +66,16 @@ const COALESCE_WINDOW_MS = 50;
 
 /** Flush the coalescing buffer as soon as it holds this many characters. */
 const COALESCE_MAX_CHARS = 512;
+
+/**
+ * Keep-alive cadence, well inside STATE_TTL_SECONDS. A run that writes nothing
+ * to its stream for this long — a tool call still executing (MCP tool calls
+ * have no default timeout), a model call being retried — gets a `heartbeat`
+ * entry and its RUNNING state blob re-set. Without it both keys can reach
+ * their 30-min TTL mid-run, and the orchestrator, which rebuilds the persisted
+ * transcript from the stream, would lose everything written before the gap.
+ */
+const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 
 /** Terminal status carried by the `end` stream entry. */
 export type TerminalStatus = "completed" | "failed" | "paused" | "cancelled";
@@ -391,6 +404,13 @@ export class RedisStateClient {
   private ended = false;
   private closed = false;
   private readonly pushedToolCallIds = new Set<string>();
+  /** When the latest stream write was queued (the heartbeat waits for quiet). */
+  private lastStreamWriteAt = Date.now();
+  /** The RUNNING state blob writeStep last stored; the heartbeat re-sets it. */
+  private runningState: string | null = null;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Heartbeat writes in flight; a status change waits for them to land. */
+  private heartbeatWrites: Promise<void> = Promise.resolve();
 
   /**
    * @param runId      stable run identifier (scheduler injects RUN_ID).
@@ -485,11 +505,9 @@ export class RedisStateClient {
       status: opts?.status ?? "RUNNING",
       updated_step: this.step,
     };
-    await this.transport.set(
-      this.stateKey,
-      JSON.stringify(state),
-      STATE_TTL_SECONDS,
-    );
+    const blob = JSON.stringify(state);
+    this.runningState = state.status === "RUNNING" ? blob : null;
+    await this.transport.set(this.stateKey, blob, STATE_TTL_SECONDS);
   }
 
   /** Mark status=COMPLETED, keeping the key alive for the TTL. */
@@ -500,6 +518,55 @@ export class RedisStateClient {
   /** Mark status=FAILED, keeping the key alive for the TTL. */
   async markFailed(): Promise<void> {
     await this.writeTerminal("FAILED");
+  }
+
+  // ── keep-alive ─────────────────────────────────────────────────────────────
+
+  /**
+   * Keep the run's keys alive through quiet stretches: each time `intervalMs`
+   * passes without a stream write, append a `heartbeat` entry (refreshing the
+   * stream TTL) and re-set the RUNNING state blob (refreshing its TTL). Stops
+   * at the terminal `end`, a pause, a terminal status or close().
+   */
+  startHeartbeat(intervalMs: number = HEARTBEAT_INTERVAL_MS): void {
+    if (this.transport === null || this.ended || this.closed) return;
+    if (this.heartbeatTimer !== null) return;
+    this.lastStreamWriteAt = Date.now();
+    this.heartbeatTimer = setInterval(() => {
+      if (Date.now() - this.lastStreamWriteAt < intervalMs) return;
+      this.lastStreamWriteAt = Date.now();
+      this.heartbeatWrites = this.heartbeatWrites
+        .then(() => this.beat())
+        .catch((err: unknown) => {
+          console.warn(
+            `[redis_state] heartbeat failed for run ${this.runId}: ${(err as Error).message}`,
+          );
+        });
+    }, intervalMs);
+    // Never keep the process alive just to send a heartbeat.
+    this.heartbeatTimer.unref?.();
+  }
+
+  /** One keep-alive: a `heartbeat` entry, then the RUNNING blob re-set. */
+  private async beat(): Promise<void> {
+    await this.xadd({ type: "heartbeat" });
+    if (this.transport !== null && this.runningState !== null) {
+      await this.transport.set(this.stateKey, this.runningState, STATE_TTL_SECONDS);
+    }
+  }
+
+  /**
+   * Stop the keep-alive as the run leaves RUNNING. Resolves once a heartbeat
+   * already writing has landed, so it cannot re-set the RUNNING blob over the
+   * status the caller writes next.
+   */
+  private stopHeartbeat(): Promise<void> {
+    this.runningState = null;
+    if (this.heartbeatTimer !== null) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    return this.heartbeatWrites;
   }
 
   // ── HITL pause ─────────────────────────────────────────────────────────────
@@ -529,6 +596,7 @@ export class RedisStateClient {
    */
   async markPaused(): Promise<void> {
     if (this.transport === null) return;
+    await this.stopHeartbeat();
     this.streamTtlSec = PAUSED_TTL_SECONDS;
     const transport = this.transport;
     if (transport.expireTokenStream) {
@@ -622,6 +690,8 @@ export class RedisStateClient {
    */
   async pushTokenEnd(status: TerminalStatus = "completed"): Promise<void> {
     if (this.transport === null || this.ended || this.closed) return;
+    // Nothing left to keep alive once the stream has ended.
+    void this.stopHeartbeat();
     this.flushBuffer();
     const written = this.enqueueStreamWrite({ type: "end", text: "", status });
     // Mark synchronously so a push racing this one cannot land after `end`.
@@ -675,6 +745,7 @@ export class RedisStateClient {
 
   private async writeTerminal(status: string): Promise<void> {
     if (this.transport === null) return;
+    await this.stopHeartbeat();
     let state: CheckpointState;
     const raw = await this.transport.get(this.stateKey);
     if (raw) {
@@ -763,6 +834,7 @@ export class RedisStateClient {
   private enqueueStreamWrite(fields: Record<string, string>): Promise<void> {
     const transport = this.transport;
     if (transport === null) return Promise.resolve();
+    this.lastStreamWriteAt = Date.now();
     // streamTtlSec is read when the write RUNS, so a write queued before
     // markPaused() still carries the paused TTL.
     return this.enqueueWrite(() =>
@@ -790,6 +862,7 @@ export class RedisStateClient {
   /** Flush buffered writes, then close the underlying connection. */
   async close(): Promise<void> {
     if (this.transport === null || this.closed) return;
+    await this.stopHeartbeat();
     await this.flush();
     this.closed = true;
     await this.transport.close();
@@ -846,6 +919,7 @@ export function fromEnv(): RedisStateClient {
 // Exported for tests.
 export {
   BrokerTransport,
+  HEARTBEAT_INTERVAL_MS,
   IoredisTransport,
   maybeBrokerTransport,
   PAUSED_TTL_SECONDS,
