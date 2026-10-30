@@ -36,8 +36,15 @@ deployment cannot perform is reported as skipped with the reason, never as
 done.  Every step is idempotent, so after a partial failure (502 naming the
 steps that finished) the request is simply repeated.
 
+Before the first step, the request is written to the erasure ledger
+(``domain/erasure_ledger.py``), which a backup restore does not rewind, so
+``agent_bff.erasure_replay`` can erase the restored rows again.  A configured
+ledger that can't be written refuses the erasure (503, nothing erased): an
+erasure a restore would silently undo is not performed.
+
 The export and erasure fan-outs are plain functions so the tenant-admin DSAR
-routes (``admin_privacy.py``) run the same code with admin headers.
+routes (``admin_privacy.py``) and the post-restore replay run the same code
+with admin headers.
 """
 
 from __future__ import annotations
@@ -64,6 +71,7 @@ from agent_bff.api.dependencies import require_auth
 from agent_bff.api.v1.admin import _raise_for_upstream
 from agent_bff.config import Settings
 from agent_bff.domain import db as db_module
+from agent_bff.domain.erasure_ledger import ErasureLedger, LedgerError
 from agent_bff.domain.models import ApiKey, NotificationPreference, PrivacyNoticeAcknowledgement
 
 router = APIRouter(tags=["Privacy"])
@@ -662,7 +670,7 @@ async def run_erasure(settings: Settings, subject: DataSubject) -> ErasureRun:
     return run
 
 
-def _erasure_counts(results: dict[str, Any]) -> dict[str, Any]:
+def erasure_counts(results: dict[str, Any]) -> dict[str, Any]:
     """Counts-only summary of an erasure for the audit payload."""
     counts: dict[str, Any] = {}
     platform = results.get("platform")
@@ -680,6 +688,51 @@ def _erasure_counts(results: dict[str, Any]) -> dict[str, Any]:
     return counts
 
 
+async def _record_in_ledger(
+    settings: Settings, subject: DataSubject, *, via: str, event_type: str,
+) -> str:
+    """Write the erasure request to the ledger before anything is erased.
+
+    Returns ``"recorded"``, or ``"not_configured"`` when this deployment has no
+    ledger (the erasure still runs, but a backup restore can't replay it).  A
+    configured ledger that can't be written refuses the request: HTTP 503,
+    audited, nothing erased.
+    """
+    ledger = ErasureLedger.from_settings(settings)
+    if ledger is None:
+        logger.warning(
+            "privacy erasure ledger not configured: a backup restore cannot replay this erasure",
+        )
+        return "not_configured"
+    try:
+        await ledger.record(
+            tenant_id=subject.tenant_id,
+            user_id=subject.user_id,
+            via=via,
+            actor_user_id=subject.actor_user_id,
+        )
+    except LedgerError as exc:
+        logger.error("privacy erasure refused, ledger unavailable: %s", exc)
+        await emit_privacy_audit(
+            settings,
+            subject,
+            event_type=event_type,
+            outcome="FAILURE",
+            payload={"via": via, "failed": "ledger"},
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "user_message": (
+                    "The data could not be erased right now because the erasure could "
+                    "not be recorded. Nothing was erased; please try again later."
+                ),
+                "code": "PRIVACY_LEDGER_UNAVAILABLE",
+            },
+        ) from exc
+    return "recorded"
+
+
 async def erase_with_audit(
     settings: Settings,
     subject: DataSubject,
@@ -687,16 +740,21 @@ async def erase_with_audit(
     event_type: str,
     account_note: str,
 ) -> dict[str, Any]:
-    """``run_erasure`` + an audit event either way; incomplete → HTTP 502."""
+    """Ledger entry, ``run_erasure``, then an audit event either way.
+
+    Ledger unavailable → HTTP 503 (nothing erased); incomplete → HTTP 502.
+    """
     via = "admin_dsar" if subject.admin else "self_service"
+    ledger = await _record_in_ledger(settings, subject, via=via, event_type=event_type)
     try:
         run = await run_erasure(settings, subject)
     except ErasureIncompleteError as exc:
         payload: dict[str, Any] = {
             "via": via,
+            "ledger": ledger,
             "succeeded": exc.succeeded,
             "failed": exc.failed,
-            **_erasure_counts(exc.results),
+            **erasure_counts(exc.results),
         }
         if exc.skipped:
             payload["skipped"] = exc.skipped
@@ -708,7 +766,9 @@ async def erase_with_audit(
             payload=payload,
         )
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=exc.detail()) from exc
-    payload = {"via": via, "succeeded": run.succeeded, **_erasure_counts(run.results)}
+    payload = {
+        "via": via, "ledger": ledger, "succeeded": run.succeeded, **erasure_counts(run.results),
+    }
     if run.skipped:
         payload["skipped"] = run.skipped
     await emit_privacy_audit(

@@ -79,6 +79,19 @@ data:
   {{- if .Values.bff.config.corsOrigins }}
   BFF_CORS_ORIGINS: {{ .Values.bff.config.corsOrigins | quote }}
   {{- end }}
+  {{- with .Values.bff.config.privacyLedger }}
+  {{- if .bucket }}
+  # GDPR erasure ledger — runbook backup-restore-b-m6.md §3.7
+  BFF_PRIVACY_LEDGER_S3_BUCKET: {{ .bucket | quote }}
+  {{- if .endpointUrl }}
+  BFF_PRIVACY_LEDGER_S3_ENDPOINT_URL: {{ .endpointUrl | quote }}
+  {{- end }}
+  {{- if .region }}
+  BFF_PRIVACY_LEDGER_S3_REGION: {{ .region | quote }}
+  {{- end }}
+  BFF_PRIVACY_LEDGER_RETENTION_DAYS: {{ .retentionDays | default 365 | quote }}
+  {{- end }}
+  {{- end }}
 
   # Web Fetch Gateway config
   WEB_FETCH_ALLOWED_DOMAINS:      {{ .Values.webFetchGateway.config.allowedDomains | quote }}

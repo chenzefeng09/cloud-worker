@@ -24,6 +24,8 @@ sqlalchemy = { extras = ["asyncio"], version = "^2.0.36" }
 asyncpg = "^0.30.0"
 aiosqlite = "^0.20.0"
 alembic = "^1.14.0"
+# GDPR erasure ledger — S3/MinIO bucket with Object Lock (domain/erasure_ledger.py)
+boto3 = "^1.35.0"
 # Foundation SDK — injected at image-build time via the docker-compose
 # `additional_contexts: foundation_sdk` entry (see the service Dockerfile,
 # which `pip install /sdk[fastapi]` before poetry runs).  When the internal

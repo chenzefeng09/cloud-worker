@@ -249,3 +249,18 @@ class Settings(BaseSettings):
     privacy_notice_processors: list[PrivacyNoticeProcessor] = Field(
         default_factory=lambda: list(_DEFAULT_PRIVACY_PROCESSORS),
     )
+
+    # ── Erasure ledger (GDPR Art. 17 vs backups) — domain/erasure_ledger.py ──
+    # Every erasure request is written here before it runs, so that after a
+    # backup restore ``python -m agent_bff.erasure_replay`` can erase the
+    # restored rows again.  The bucket must have Object Lock and must sit
+    # outside what a restore rewinds.  No bucket = no ledger: erasures still
+    # run, but a restore cannot replay them.
+    privacy_ledger_s3_bucket: str = ""
+    privacy_ledger_s3_region: str = "us-east-1"
+    privacy_ledger_s3_endpoint_url: str = ""
+    privacy_ledger_s3_access_key_id: str = ""
+    privacy_ledger_s3_secret_access_key: str = ""
+    # COMPLIANCE lock per entry; must outlast every backup that can still hold
+    # erased data (Postgres full backups: 4 weeks, MinIO noncurrent: 90 days).
+    privacy_ledger_retention_days: int = Field(default=365, ge=1)
