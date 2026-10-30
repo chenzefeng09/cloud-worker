@@ -129,12 +129,15 @@ OPA、LiteLLM、MinIO、Vault 或 Unleash —— 一律调用对应的 foundatio
 3. **服务间 HTTP** —— BFF 把管理后台流量代理到 foundation 服务；orchestrator 与 worker 携带
    per-run 虚拟密钥访问 LLM 网关。
 
-SDK 有两条获取路径，详见
+SDK 目前没有 pin 版本，各条路径装的都是 saas-foundation 的某个源码树，详见
 [docs/foundation-sdk-consumption.md](docs/foundation-sdk-consumption.md)：
 
-- **内部 PyPI**（CI / 生产）—— 从私有源拉取 `foundation-sdk = ">=0.1,<0.2"`。
-- **构建上下文**（本地开发，本仓库默认）—— docker-compose 通过 `additional_contexts` 注入兄弟
-  目录里的 `sdks/python`，改 SDK 立即生效，不必先发版。
+- **构建上下文**（所有镜像）—— docker-compose 通过 `additional_contexts` 注入兄弟目录里的
+  `sdks/python`，由 session-orchestrator 镜像安装，其他服务的镜像都 `FROM` 这个镜像。
+  改了 SDK，下次重建镜像就会生效，不必先发版。
+- **可编辑安装**（CI 与本机 venv）—— CI 的 setup action 和 `make install-sdk` 从
+  saas-foundation 的 checkout（CI 里是 `main`）安装 `sdks/python[fastapi]`。
+- **内部 PyPI**（规划中）—— 从私有源拉取 pin 住版本的 `foundation-sdk`，pin 写在上面那份文档里。
 
 ### ⚠️ 必须有 saas-foundation 才能跑起来
 

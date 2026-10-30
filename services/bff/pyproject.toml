@@ -34,10 +34,10 @@ alembic = "^1.14.0"
 # GDPR erasure ledger — S3/MinIO bucket with Object Lock (domain/erasure_ledger.py)
 boto3 = "^1.35.0"
 # Foundation SDK — injected at image-build time via the docker-compose
-# `additional_contexts: foundation_sdk` entry (see the service Dockerfile,
-# which `pip install /sdk[fastapi]` before poetry runs).  When the internal
-# PyPI is online this dep returns as `foundation-sdk = ">=0.1,<0.2"` with a
-# `[[tool.poetry.source]]` block; until then the Dockerfile is the source.
+# `foundation_sdk` build context, which the session-orchestrator image installs
+# and this image inherits (FROM it); CI and `make install-sdk` install it
+# editable.  Not declared here: once the internal PyPI serves it, it returns as
+# the pinned dependency in docs/foundation-sdk-consumption.md.
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"
