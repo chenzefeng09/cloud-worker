@@ -148,11 +148,14 @@ import type {
   RecycleBinItem,
   RecycleBinPage,
   SoftDeleteRequest,
-  HardDeleteRequest,
+  HardDeleteResult,
   SweepResult,
   LegalHold,
   PlaceLegalHoldRequest,
-  ReleaseLegalHoldRequest,
+  ReleaseLegalHoldResult,
+  ApprovalRequest,
+  ApprovalRequestListParams,
+  ApprovalRequestPage,
   MaskingRulesResponse,
   DataResidency,
   CrossBorderCheckRequest,
@@ -1415,11 +1418,11 @@ export const api = {
           request<RecycleBinItem>('POST', `/admin/lifecycle/recycle-bin:soft-delete${qs({ tenant_id: tenantId })}`, body),
         restore: (id: string, tenantId?: string) =>
           request<Record<string, unknown>>('POST', `/admin/lifecycle/recycle-bin/${id}:restore${qs({ tenant_id: tenantId })}`),
-        hardDelete: (id: string, body: HardDeleteRequest, tenantId?: string) =>
-          request<Record<string, unknown>>(
+        // Opens a four-eyes approval request; destroys nothing by itself.
+        hardDelete: (id: string, tenantId?: string) =>
+          request<HardDeleteResult>(
             'POST',
             `/admin/lifecycle/recycle-bin/${id}:hard-delete${qs({ tenant_id: tenantId })}`,
-            body,
           ),
       },
       sweep: (tenantId?: string) =>
@@ -1432,11 +1435,42 @@ export const api = {
           ).then((r) => (Array.isArray(r) ? r : r.items ?? [])),
         create: (body: PlaceLegalHoldRequest, tenantId?: string) =>
           request<LegalHold>('POST', `/admin/lifecycle/legal-holds${qs({ tenant_id: tenantId })}`, body),
-        release: (id: string, body: ReleaseLegalHoldRequest, tenantId?: string) =>
-          request<Record<string, unknown>>(
+        // Opens a four-eyes approval request; releases nothing by itself.
+        release: (id: string, tenantId?: string) =>
+          request<ReleaseLegalHoldResult>(
             'POST',
             `/admin/lifecycle/legal-holds/${id}:release${qs({ tenant_id: tenantId })}`,
-            body,
+          ),
+      },
+      // Four-eyes approval requests, newest first. Approving carries the
+      // hard-delete / release out; the requester's own approval is refused
+      // (403), as is deciding a request no longer pending (409).
+      approvalRequests: {
+        list: (params?: ApprovalRequestListParams, tenantId?: string) =>
+          request<ApprovalRequestPage>(
+            'GET',
+            `/admin/lifecycle/approval-requests${qs({
+              'filter.status': params?.status,
+              'filter.operation': params?.operation,
+              cursor: params?.cursor,
+              limit: params?.limit,
+              tenant_id: tenantId,
+            })}`,
+          ),
+        get: (id: string, tenantId?: string) =>
+          request<ApprovalRequest>(
+            'GET',
+            `/admin/lifecycle/approval-requests/${encodeURIComponent(id)}${qs({ tenant_id: tenantId })}`,
+          ),
+        approve: (id: string, tenantId?: string) =>
+          request<ApprovalRequest>(
+            'POST',
+            `/admin/lifecycle/approval-requests/${encodeURIComponent(id)}/approve${qs({ tenant_id: tenantId })}`,
+          ),
+        reject: (id: string, tenantId?: string) =>
+          request<ApprovalRequest>(
+            'POST',
+            `/admin/lifecycle/approval-requests/${encodeURIComponent(id)}/reject${qs({ tenant_id: tenantId })}`,
           ),
       },
       // Storage admin (Phase 7-8): cross-tenant quota summary + adjust + the
