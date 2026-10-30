@@ -1,6 +1,5 @@
 """OTel init for BFF."""
 
-import logging
 import os
 
 import opentelemetry.metrics
@@ -11,13 +10,9 @@ from opentelemetry.sdk.trace import TracerProvider
 
 
 def init_observability(*, service_name: str) -> None:
+    # Logging is set up by create_app (logging_setup), whether OTel is on or not.
     if os.environ.get("BFF_OTEL_ENABLED", "true").lower() == "false":
         return
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format='{"timestamp":"%(asctime)s","level":"%(levelname)s","service":"%(name)s","message":"%(message)s"}',
-    )
 
     resource = Resource.create({SERVICE_NAME: service_name})
     opentelemetry.trace.set_tracer_provider(TracerProvider(resource=resource))

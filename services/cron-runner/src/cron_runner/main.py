@@ -10,6 +10,7 @@ from fastapi import FastAPI
 
 from cron_runner.config import Settings
 from cron_runner.domain.db import close_db, init_db
+from cron_runner.logging_setup import configure_logging
 
 
 @asynccontextmanager
@@ -34,6 +35,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(settings: Settings | None = None) -> FastAPI:
     if settings is None:
         settings = Settings()
+    # First thing, so all later output (uvicorn's included) is JSON at the
+    # configured level, with or without OTel.
+    configure_logging(service="cron-runner", level=settings.log_level)
 
     app = FastAPI(title="Cron Runner", version="0.1.0a1", lifespan=lifespan)
     app.state.settings = settings

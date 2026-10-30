@@ -14,6 +14,7 @@ from agent_bff.api.middleware import SessionMiddleware
 from agent_bff.api.web_session import WebSessionManager
 from agent_bff.config import Settings
 from agent_bff.domain.db import close_db, init_db
+from agent_bff.logging_setup import configure_logging
 from agent_bff.observability import init_observability
 
 
@@ -28,6 +29,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(settings: Settings | None = None) -> FastAPI:
     if settings is None:
         settings = Settings()
+    # First thing, so all later output (uvicorn's included) is JSON at the
+    # configured level, with or without OTel.
+    configure_logging(service="agent-bff", level=settings.log_level)
 
     # CookieSigner runs its own validation (length ≥ 32, no placeholder strings)
     # and raises ValueError at startup if the secret is unsafe.  Letting that

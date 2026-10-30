@@ -5,11 +5,15 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from web_fetch_gateway.config import Settings
+from web_fetch_gateway.logging_setup import configure_logging
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     if settings is None:
         settings = Settings()
+    # First thing, so all later output (uvicorn's included) is JSON at the
+    # configured level, with or without OTel.
+    configure_logging(service="web-fetch-gateway", level=settings.log_level)
 
     app = FastAPI(
         title="Web Fetch Gateway",

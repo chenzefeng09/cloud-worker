@@ -12,6 +12,7 @@ from foundation_sdk.fastapi import install_request_context, register_problem_det
 from agent_session_orchestrator.api.dlp_guard import log_dlp_policy
 from agent_session_orchestrator.config import Settings
 from agent_session_orchestrator.domain.db import close_db, init_db
+from agent_session_orchestrator.logging_setup import configure_logging
 from agent_session_orchestrator.observability import init_observability
 
 logger = logging.getLogger(__name__)
@@ -128,6 +129,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(settings: Settings | None = None) -> FastAPI:
     if settings is None:
         settings = Settings()
+    # First thing, so all later output (uvicorn's included) is JSON at the
+    # configured level, with or without OTel.
+    configure_logging(service="session-orchestrator", level=settings.log_level)
 
     app = FastAPI(
         title="Agent Session Orchestrator",

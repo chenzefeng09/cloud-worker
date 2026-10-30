@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from tool_broker.config import Settings
+from tool_broker.logging_setup import configure_logging
 
 _LOG = logging.getLogger(__name__)
 
@@ -1389,6 +1390,9 @@ async def proxy_mcp_tenant(
 def create_app(settings: Settings | None = None) -> FastAPI:
     if settings is None:
         settings = Settings()
+    # First thing, so all later output (uvicorn's included) is JSON at the
+    # configured level, with or without OTel.
+    configure_logging(service="tool-broker", level=settings.log_level)
 
     # L1: the broker is reached only by untrusted sandboxes, so it must not
     # advertise its control-plane API.  Disabling the schema + docs endpoints

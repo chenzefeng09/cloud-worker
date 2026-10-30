@@ -13,6 +13,7 @@ from foundation_sdk.fastapi import install_request_context, register_problem_det
 from prometheus_client import CollectorRegistry, make_asgi_app
 
 from sandbox_pool.config import Settings
+from sandbox_pool.logging_setup import configure_logging
 from sandbox_pool.pool import Pool
 
 logger = logging.getLogger(__name__)
@@ -76,6 +77,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app(settings: Settings | None = None) -> FastAPI:
     if settings is None:
         settings = Settings()
+    # First thing, so all later output (uvicorn's included) is JSON at the
+    # configured level, with or without OTel.
+    configure_logging(service="sandbox-pool", level=settings.log_level)
 
     app = FastAPI(
         title="Sandbox Pool",

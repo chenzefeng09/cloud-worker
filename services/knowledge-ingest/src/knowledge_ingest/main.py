@@ -12,6 +12,7 @@ from knowledge_ingest.blob.base import BlobStore
 from knowledge_ingest.config import Settings
 from knowledge_ingest.domain.db import close_db, init_db
 from knowledge_ingest.embeddings.base import EmbeddingClient
+from knowledge_ingest.logging_setup import configure_logging
 
 
 @asynccontextmanager
@@ -62,6 +63,9 @@ def create_app(
 ) -> FastAPI:
     if settings is None:
         settings = Settings()
+    # First thing, so all later output (uvicorn's included) is JSON at the
+    # configured level, with or without OTel.
+    configure_logging(service="knowledge-ingest", level=settings.log_level)
 
     app = FastAPI(title="Knowledge Ingest", version="0.1.0a1", lifespan=lifespan)
     app.state.settings = settings
