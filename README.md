@@ -145,13 +145,17 @@ means those components can be swapped without touching agent code.
 3. **Service-to-service HTTP** — the BFF proxies admin traffic to foundation services;
    orchestrator and workers reach the LLM gateway with per-run virtual keys.
 
-The SDK reaches your services by one of two paths, documented in
-[docs/foundation-sdk-consumption.md](docs/foundation-sdk-consumption.md):
+No SDK version is pinned yet; every path installs a saas-foundation source tree
+([docs/foundation-sdk-consumption.md](docs/foundation-sdk-consumption.md) has the details):
 
-- **Internal PyPI** (CI/production) — `foundation-sdk = ">=0.1,<0.2"` from a private index.
-- **Build context** (local dev, the default here) — docker-compose injects the sibling
-  checkout's `sdks/python` via `additional_contexts`, so SDK edits show up immediately
-  without a release.
+- **Build context** (every image) — docker-compose injects the sibling checkout's
+  `sdks/python` via `additional_contexts`. The session-orchestrator image installs it and
+  the other service images build `FROM` that image, so SDK edits reach the containers on
+  the next rebuild, without a release.
+- **Editable install** (CI and local venvs) — the CI setup action and `make install-sdk`
+  install `sdks/python[fastapi]` from a saas-foundation checkout (`main` in CI).
+- **Internal PyPI** (planned) — a pinned `foundation-sdk` from a private index; the
+  consumption doc above has the pin.
 
 ### ⚠️ You need saas-foundation to run this
 

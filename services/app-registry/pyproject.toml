@@ -16,7 +16,8 @@ asyncpg = "^0.30.0"
 aiosqlite = "^0.20.0"
 alembic = "^1.14.0"
 httpx = "^0.28.0"
-# foundation-sdk injected at build time via Dockerfile `pip install /sdk[fastapi]`.
+# foundation-sdk is not declared here: the image inherits it from the
+# session-orchestrator image.  See docs/foundation-sdk-consumption.md.
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.0"
