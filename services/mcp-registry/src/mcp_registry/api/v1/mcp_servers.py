@@ -16,6 +16,7 @@ from mcp_registry.api.dependencies import (
     internal_db_session,
 )
 from mcp_registry.config import Settings
+from mcp_registry.errors import MaskedValueNotStoredError
 from mcp_registry.schemas.common import ListPage
 from mcp_registry.schemas.mcp_server import (
     McpProbeRequest,
@@ -35,6 +36,8 @@ from mcp_registry.services.secret_crypto import (
     encrypt_values,
     has_secret,
     mask_auth,
+    mask_values,
+    masked_keys,
 )
 from mcp_registry.services.server_tester import test_connection
 
@@ -68,15 +71,19 @@ async def _revealed(server: Any, tenant_id: str) -> McpServerOut:
     return out
 
 
-async def _masked(server: Any, tenant_id: str) -> McpServerOut:
-    """``_revealed`` with the auth secret fields masked.
+def _masked(server: Any) -> McpServerOut:
+    """Admin view: auth secret fields and every ``env`` / ``headers`` value masked.
 
-    Used by the tenant-facing admin surface (GET/list/create/PATCH) so
-    plaintext credentials never reach the browser.  Non-secret fields
-    (header_name, client_id, token_url, scopes) pass through unchanged.
+    Used by the tenant-facing admin surface (GET/list/create/PATCH) so stored
+    credentials never reach the browser.  Masking only needs to know whether a
+    value is set, so nothing is decrypted here.  Map keys and the non-secret
+    auth fields (header_name, client_id, token_url, scopes) pass through
+    unchanged.
     """
-    out = await _revealed(server, tenant_id)
+    out = McpServerOut.model_validate(server)
     out.auth = mask_auth(out.auth)
+    out.env = mask_values(out.env)
+    out.headers = mask_values(out.headers)
     return out
 
 
@@ -90,8 +97,35 @@ async def _serialize_internal(server: Any, tenant_id: str) -> dict[str, Any]:
     return (await _revealed(server, tenant_id)).model_dump(mode="json")
 
 
-async def _serialize_masked(server: Any, tenant_id: str) -> dict[str, Any]:
-    return (await _masked(server, tenant_id)).model_dump(mode="json")
+def _serialize_masked(server: Any) -> dict[str, Any]:
+    return _masked(server).model_dump(mode="json")
+
+
+async def _merge_masked_values(
+    field: str, submitted: dict[str, Any], stored: dict[str, Any] | None, tenant_id: str,
+) -> dict[str, Any]:
+    """Build the ``env`` / ``headers`` map a PATCH stores.
+
+    The submitted map replaces the stored one, so a key it omits is dropped.
+    A ``MASKED_SENTINEL`` value is the admin form echoing a value it was only
+    ever shown masked: it means "unchanged", and that key keeps its stored
+    value byte for byte (no crypto call).  Every other value is newly typed
+    plaintext and is encrypted.
+    """
+    stored = stored or {}
+    unknown = [key for key in masked_keys(submitted) if not stored.get(key)]
+    if unknown:
+        # Storing the sentinel itself, or silently dropping the key, would
+        # both corrupt the config - make the admin type the value instead.
+        raise MaskedValueNotStoredError(field, unknown)
+    fresh = await encrypt_values(
+        {key: value for key, value in submitted.items() if value != MASKED_SENTINEL},
+        **_encrypt_ctx(tenant_id),
+    )
+    return {
+        key: stored[key] if value == MASKED_SENTINEL else fresh[key]
+        for key, value in submitted.items()
+    }
 
 
 @router.get("/mcp-servers", response_model=ListPage,
@@ -102,7 +136,7 @@ async def list_servers(
 ) -> ListPage:
     svc = RegistryService(db, tenant_id=tenant_id)
     items = await svc.list_servers()
-    payload = [await _serialize_masked(s, tenant_id) for s in items]
+    payload = [_serialize_masked(s) for s in items]
     return ListPage(items=payload, total=len(payload))
 
 
@@ -138,7 +172,7 @@ async def create_server(
         tool_filter=body.tool_filter.model_dump(),
         args=body.args,
     )
-    return await _masked(server, tenant_id)
+    return _masked(server)
 
 
 # NOTE: declared *before* the ``/mcp-servers/{server_id}`` routes below so the
@@ -191,7 +225,7 @@ async def get_server(
     tenant_id: str = TTenantId,
 ) -> McpServerOut:
     svc = RegistryService(db, tenant_id=tenant_id)
-    return await _masked(await svc.get(server_id), tenant_id)
+    return _masked(await svc.get(server_id))
 
 
 @router.patch("/mcp-servers/{server_id}", response_model=McpServerOut,
@@ -203,6 +237,9 @@ async def update_server(
     tenant_id: str = TTenantId,
 ) -> McpServerOut:
     svc = RegistryService(db, tenant_id=tenant_id)
+    # The stored row resolves masked sentinels ("unchanged") in auth / env /
+    # headers below; fetching it first also 404s before any crypto work.
+    existing = await svc.get(server_id)
     changes = body.model_dump(exclude_none=True)
     if "transport" in changes:
         changes["transport"] = changes["transport"].value if hasattr(
@@ -217,7 +254,6 @@ async def update_server(
             # without retyping the secret, the frontend sends the masked
             # sentinel back.  Detect it and preserve the stored (encrypted)
             # value so the real secret is never lost.
-            existing = await svc.get(server_id)
             stored_auth = existing.auth or {}
             for field in _secret_fields_for(auth_dict):
                 if auth_dict.get(field) == MASKED_SENTINEL:
@@ -231,10 +267,11 @@ async def update_server(
             changes["auth"] = await encrypt_auth(auth_dict, **_encrypt_ctx(tenant_id))
     for field in ("env", "headers"):
         if field in changes:
-            # Idempotent on envelopes, like ``encrypt_auth``.
-            changes[field] = await encrypt_values(changes[field], **_encrypt_ctx(tenant_id))
+            changes[field] = await _merge_masked_values(
+                field, changes[field], getattr(existing, field), tenant_id,
+            )
     server = await svc.update(server_id, **changes)
-    return await _masked(server, tenant_id)
+    return _masked(server)
 
 
 @router.delete("/mcp-servers/{server_id}", status_code=204,
@@ -300,10 +337,22 @@ async def test_server(
         so a redirect there is allowed through unchanged;
       * only the omitted half is required - explicit ``auth`` + explicit
         ``headers`` (the real "re-probe my unsaved edits" case) proceeds.
+
+    Masked header values
+    --------------------
+    The admin surface shows every stored ``headers`` value as
+    ``MASKED_SENTINEL``, and the edit form sends an untouched one back
+    verbatim.  In a ``headers`` override the sentinel therefore stands for the
+    value stored under that key.  It resolves (decrypted) only while the
+    endpoint is not redirected: on a redirect it counts as reusing a stored
+    header, exactly like omitting ``headers``, and is refused the same way.  A
+    sentinel for a key with nothing stored is refused rather than sent upstream
+    verbatim.
     """
     svc = RegistryService(db, tenant_id=tenant_id)
     server = await svc.get(server_id)
     overrides = body.model_dump(exclude_unset=True) if body is not None else {}
+    kept_header_keys = masked_keys(overrides.get("headers"))
 
     # ``exclude_unset`` is what makes this safe to key on: a field the caller
     # never sent is absent from ``overrides`` entirely, so "omitted" cannot be
@@ -318,7 +367,11 @@ async def test_server(
         # ``has_secret`` is a pure predicate over the stored auth shape - it
         # answers "is there a secret here" without decrypting anything.
         reuses_stored_auth = "auth" not in overrides and has_secret(server.auth)
-        reuses_stored_headers = "headers" not in overrides and bool(server.headers)
+        # Omitting ``headers`` reuses the whole stored map; a masked value
+        # reuses the one stored under its key.
+        reuses_stored_headers = (
+            "headers" not in overrides and bool(server.headers)
+        ) or bool(kept_header_keys)
         if reuses_stored_auth or reuses_stored_headers:
             # Never raise: this endpoint's contract is that every failure comes
             # back as ok=false + error, and the admin console relies on it.
@@ -330,6 +383,15 @@ async def test_server(
                     "(submit them explicitly empty if none are needed), then test again."
                 ),
             )
+
+    stored_headers: dict[str, Any] = server.headers or {}
+    unknown = [key for key in kept_header_keys if not stored_headers.get(key)]
+    if unknown:
+        return McpTestResult(
+            ok=False,
+            error=f"No saved value for header {', '.join(unknown)}. "
+            "Re-enter it, then test again.",
+        )
 
     if body is not None and "auth" in overrides:
         # Plaintext straight from the admin form - never decrypted.
@@ -347,8 +409,14 @@ async def test_server(
         # Sent headers replace the stored ones even when empty or null: the
         # redirect guard above admits an explicit ``{}`` because it means "no
         # headers", so falling back to the stored map here would hand it to
-        # the redirected endpoint.
-        headers = overrides["headers"] or {}
+        # the redirected endpoint.  Masked values (not redirected, checked
+        # above) take the stored value for their key.
+        headers = dict(overrides["headers"] or {})
+        if kept_header_keys:
+            headers.update(await decrypt_values(
+                {key: stored_headers[key] for key in kept_header_keys},
+                **_crypto_ctx(tenant_id),
+            ))
     else:
         headers = await decrypt_values(server.headers, **_crypto_ctx(tenant_id))
 

@@ -264,8 +264,8 @@ def test_create_with_extended_config_roundtrip(
     resp = app_client.post("/api/mcp/v1/mcp-servers", headers=tenant_headers, json=payload)
     assert resp.status_code == 201, resp.text
     created = resp.json()
-    assert created["headers"] == {"X-Custom": "abc"}
-    # Tenant-facing endpoints now return masked auth.
+    # Tenant-facing endpoints return masked header values and masked auth.
+    assert created["headers"] == {"X-Custom": "••••••"}
     assert created["auth"]["type"] == "bearer"
     assert created["auth"]["token"] == "••••••"
     assert created["auth"]["has_token"] is True
@@ -279,7 +279,7 @@ def test_create_with_extended_config_roundtrip(
     assert fetched["auth"]["type"] == "bearer"
     assert fetched["auth"]["token"] == "••••••"
     assert fetched["auth"]["has_token"] is True
-    assert fetched["headers"] == {"X-Custom": "abc"}
+    assert fetched["headers"] == {"X-Custom": "••••••"}
     assert fetched["timeout_seconds"] == 15
     assert fetched["tool_filter"] == {"allow": ["echo"], "block": ["dangerous"]}
     assert fetched["args"] == ["--flag", "value"]
@@ -421,8 +421,8 @@ def test_update_extended_fields(
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["headers"] == {"X-Trace": "1"}
     # PATCH response is masked.
+    assert body["headers"] == {"X-Trace": "••••••"}
     assert body["auth"]["type"] == "bearer"
     assert body["auth"]["token"] == "••••••"
     assert body["auth"]["has_token"] is True
@@ -1340,9 +1340,10 @@ def test_update_auth_re_encrypts_secret(
 def test_api_calls_encrypt_and_decrypt(
     app_client: TestClient,
     tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Verify the API actually wires encrypt-on-write and decrypt-on-read."""
+    """Verify the API wires encrypt-on-write and decrypt on the internal read."""
     import mcp_registry.api.v1.mcp_servers as api_module
     from tests.conftest import _reversible_decrypt_auth, _reversible_encrypt_auth
 
@@ -1368,10 +1369,18 @@ def test_api_calls_encrypt_and_decrypt(
     # The create response is now masked (secret is stored but not echoed).
     assert created["auth"]["token"] == "••••••"
     assert created["auth"]["has_token"] is True
-    # encrypt ran on write with the plaintext auth; decrypt ran on the read
-    # path that produced the create response (before masking).
+    # encrypt ran on write with the plaintext auth.  Masking only needs to know
+    # a secret is set, so the admin read path never decrypts ...
     assert any(c and c.get("token") == "tok-spy" for c in encrypt_calls)
-    assert decrypt_calls, "decrypt_auth must be called on the read path"
+    assert decrypt_calls == []
+    # ... while the internal consumer read does.
+    internal = app_client.get(
+        "/api/mcp/v1/internal/mcp-servers",
+        params={"tenant_id": "tnt_01J5TEST00000000000000TNT1"},
+        headers=internal_headers,
+    ).json()
+    assert internal["items"][0]["auth"]["token"] == "tok-spy"
+    assert decrypt_calls, "decrypt_auth must be called on the internal read path"
 
 
 def _record_writes(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
@@ -1419,10 +1428,11 @@ def test_env_and_header_values_are_encrypted_at_rest(
     assert _is_envelope(stored["headers"]["X-Api-Key"])
     assert "sk-env" not in str(stored) and "hdr-secret" not in str(stored)
 
-    # The admin surface and the internal consumer endpoint see plaintext.
+    # The admin surface sees masked values; the internal consumer endpoint
+    # sees plaintext.
     body = created.json()
-    assert body["env"] == {"API_KEY": "sk-env"}
-    assert body["headers"] == {"X-Api-Key": "hdr-secret"}
+    assert body["env"] == {"API_KEY": "••••••"}
+    assert body["headers"] == {"X-Api-Key": "••••••"}
     internal = app_client.get(
         "/api/mcp/v1/internal/mcp-servers",
         params={"tenant_id": "tnt_01J5TEST00000000000000TNT1"},
@@ -1438,7 +1448,13 @@ def test_env_and_header_values_are_encrypted_at_rest(
     )
     assert patched.status_code == 200, patched.text
     assert _is_envelope(writes[-1]["env"]["API_KEY"])
-    assert patched.json()["env"] == {"API_KEY": "sk-rotated"}
+    assert patched.json()["env"] == {"API_KEY": "••••••"}
+    internal = app_client.get(
+        "/api/mcp/v1/internal/mcp-servers",
+        params={"tenant_id": "tnt_01J5TEST00000000000000TNT1"},
+        headers=internal_headers,
+    ).json()
+    assert internal["items"][0]["env"] == {"API_KEY": "sk-rotated"}
 
 
 def test_secret_write_fails_closed_when_crypto_is_unavailable(
@@ -1968,6 +1984,308 @@ def test_auth_none_not_masked(
     )
     assert resp.status_code == 201
     assert resp.json()["auth"] == {"type": "none"}
+
+
+# ---------------------------------------------------------------------------
+# env / headers masking — admin responses, PATCH sentinel, /test resolution
+# ---------------------------------------------------------------------------
+
+
+def _internal_item(app_client: TestClient, internal_headers: dict[str, str]) -> dict[str, Any]:
+    """The tenant's single server as the internal consumer endpoint returns it."""
+    resp = app_client.get(
+        "/api/mcp/v1/internal/mcp-servers",
+        params={"tenant_id": "tnt_01J5TEST00000000000000TNT1"},
+        headers=internal_headers,
+    )
+    assert resp.status_code == 200, resp.text
+    item: dict[str, Any] = resp.json()["items"][0]
+    return item
+
+
+def test_admin_responses_mask_env_and_header_values(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+) -> None:
+    """Create / get / list / PATCH all mask every non-empty env and header
+    value (keys stay visible); only the internal endpoint returns plaintext."""
+    created = app_client.post(
+        "/api/mcp/v1/mcp-servers",
+        headers=tenant_headers,
+        json=_http_payload(
+            env={"API_KEY": "sk-env", "EMPTY": ""}, headers={"X-Api-Key": "hdr-secret"},
+        ),
+    )
+    assert created.status_code == 201, created.text
+    url = f"/api/mcp/v1/mcp-servers/{created.json()['id']}"
+    single = [
+        created,
+        app_client.get(url, headers=tenant_headers),
+        app_client.patch(url, headers=tenant_headers, json={"timeout_seconds": 30}),
+    ]
+    listed = app_client.get("/api/mcp/v1/mcp-servers", headers=tenant_headers)
+    for resp in [*single, listed]:
+        assert resp.status_code in (200, 201), resp.text
+        assert "sk-env" not in resp.text and "hdr-secret" not in resp.text
+    for server in [*(r.json() for r in single), listed.json()["items"][0]]:
+        assert server["env"] == {"API_KEY": "••••••", "EMPTY": ""}
+        assert server["headers"] == {"X-Api-Key": "••••••"}
+
+    item = _internal_item(app_client, internal_headers)
+    assert item["env"] == {"API_KEY": "sk-env", "EMPTY": ""}
+    assert item["headers"] == {"X-Api-Key": "hdr-secret"}
+
+
+@pytest.mark.parametrize("field", ["env", "headers"])
+def test_patch_masked_values_keep_stored_envelopes(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    """Sending the masked values back verbatim keeps every stored envelope byte
+    for byte, and the sentinel is never encrypted as if it were a new value."""
+    import mcp_registry.api.v1.mcp_servers as api_module
+    from tests.conftest import _reversible_encrypt_values
+
+    writes = _record_writes(monkeypatch)
+    created = app_client.post(
+        "/api/mcp/v1/mcp-servers",
+        headers=tenant_headers,
+        json=_http_payload(**{field: {"API_KEY": "sk-1", "OTHER": "sk-2", "BLANK": ""}}),
+    ).json()
+    stored_before = writes[-1][field]
+
+    encrypted: list[dict[str, Any]] = []
+
+    async def _spy(values, **kw):  # type: ignore[no-untyped-def]
+        encrypted.append(dict(values or {}))
+        return await _reversible_encrypt_values(values, **kw)
+
+    monkeypatch.setattr(api_module, "encrypt_values", _spy)
+
+    resp = app_client.patch(
+        f"/api/mcp/v1/mcp-servers/{created['id']}",
+        headers=tenant_headers,
+        json={field: created[field]},  # {"API_KEY": "••••••", "OTHER": "••••••", "BLANK": ""}
+    )
+    assert resp.status_code == 200, resp.text
+    assert writes[-1][field] == stored_before
+    assert all(value != "••••••" for call in encrypted for value in call.values())
+    assert _internal_item(app_client, internal_headers)[field] == {
+        "API_KEY": "sk-1", "OTHER": "sk-2", "BLANK": "",
+    }
+
+
+@pytest.mark.parametrize("field", ["env", "headers"])
+def test_patch_replaces_typed_values_and_drops_omitted_keys(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    """A typed value replaces the stored one (encrypted), a masked one keeps its
+    envelope, and a key the submitted map omits is removed - the map still
+    replaces the stored one as a whole."""
+    from tests.conftest import _is_envelope
+
+    writes = _record_writes(monkeypatch)
+    created = app_client.post(
+        "/api/mcp/v1/mcp-servers",
+        headers=tenant_headers,
+        json=_http_payload(**{field: {"ROTATE": "old", "KEEP": "keep-me", "DROP": "bye"}}),
+    ).json()
+    stored_before = writes[-1][field]
+
+    resp = app_client.patch(
+        f"/api/mcp/v1/mcp-servers/{created['id']}",
+        headers=tenant_headers,
+        json={field: {"ROTATE": "new-secret", "KEEP": "••••••", "ADDED": "fresh"}},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()[field] == {"ROTATE": "••••••", "KEEP": "••••••", "ADDED": "••••••"}
+    stored = writes[-1][field]
+    assert stored["KEEP"] == stored_before["KEEP"]
+    assert _is_envelope(stored["ROTATE"]) and stored["ROTATE"] != stored_before["ROTATE"]
+    assert _is_envelope(stored["ADDED"])
+    assert "DROP" not in stored
+    assert _internal_item(app_client, internal_headers)[field] == {
+        "ROTATE": "new-secret", "KEEP": "keep-me", "ADDED": "fresh",
+    }
+
+
+@pytest.mark.parametrize("field", ["env", "headers"])
+@pytest.mark.parametrize("sent_key", ["API_KEY_RENAMED", "BLANK"])
+def test_patch_masked_value_without_stored_value_is_rejected(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+    field: str,
+    sent_key: str,
+) -> None:
+    """A sentinel for a key with nothing stored (renamed while masked, or a
+    blank stored value) can't mean "keep": 422, and nothing changes."""
+    created = app_client.post(
+        "/api/mcp/v1/mcp-servers",
+        headers=tenant_headers,
+        json=_http_payload(**{field: {"API_KEY": "sk-1", "BLANK": ""}}),
+    ).json()
+
+    resp = app_client.patch(
+        f"/api/mcp/v1/mcp-servers/{created['id']}",
+        headers=tenant_headers,
+        json={field: {sent_key: "••••••"}},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["code"] == "MCP.SERVER.MASKED_VALUE_NOT_STORED"
+    assert sent_key in resp.json()["detail"]
+    assert _internal_item(app_client, internal_headers)[field] == {"API_KEY": "sk-1", "BLANK": ""}
+
+
+def test_patch_with_unchanged_admin_form_changes_nothing(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    internal_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Open the edit form and save without touching anything: the PATCH body is
+    the masked admin view sent straight back, and the stored config - secrets
+    included - comes out exactly as it went in."""
+    writes = _record_writes(monkeypatch)
+    created = app_client.post(
+        "/api/mcp/v1/mcp-servers",
+        headers=tenant_headers,
+        json=_http_payload(
+            headers={"X-Api-Key": "hdr-secret", "X-Blank": ""},
+            auth={"type": "bearer", "token": "tok-secret"},
+            timeout_seconds=15,
+            tool_filter={"allow": ["search"]},
+        ),
+    ).json()
+    stored = writes[-1]
+    before = _internal_item(app_client, internal_headers)
+
+    shown = app_client.get(
+        f"/api/mcp/v1/mcp-servers/{created['id']}", headers=tenant_headers,
+    ).json()
+    form_body = {
+        key: shown[key]
+        for key in ("endpoint", "headers", "enabled", "timeout_seconds", "tool_filter")
+    }
+    form_body["auth"] = {"type": "bearer", "token": shown["auth"]["token"]}
+    resp = app_client.patch(
+        f"/api/mcp/v1/mcp-servers/{created['id']}", headers=tenant_headers, json=form_body,
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert writes[-1]["headers"] == stored["headers"]
+    assert writes[-1]["auth"] == stored["auth"]
+    after = _internal_item(app_client, internal_headers)
+    assert {k: v for k, v in after.items() if k != "updated_at"} == {
+        k: v for k, v in before.items() if k != "updated_at"
+    }
+
+
+def test_test_endpoint_masked_header_uses_stored_value(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-probing from the edit form: an untouched masked header stands for the
+    stored (decrypted) value; a typed one is sent as typed."""
+    fake = _install_handshake_client(monkeypatch)
+    created = app_client.post(
+        "/api/mcp/v1/mcp-servers",
+        headers=tenant_headers,
+        json=_http_payload(headers={"X-Api-Key": "hdr-secret", "X-Trace": "old"}),
+    ).json()
+
+    resp = app_client.post(
+        f"/api/mcp/v1/mcp-servers/{created['id']}/test",
+        headers=tenant_headers,
+        json={
+            # The form echoes the unchanged endpoint: not a redirect.
+            "endpoint": "https://weather.example.com/mcp",
+            "headers": {"X-Api-Key": "••••••", "X-Trace": "edited"},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ok"] is True
+    assert fake.calls
+    for call in fake.calls:
+        assert call["url"] == "https://weather.example.com/mcp"
+        assert call["headers"]["X-Api-Key"] == "hdr-secret"
+        assert call["headers"]["X-Trace"] == "edited"
+
+
+def test_test_endpoint_redirect_refuses_masked_header(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a redirected endpoint a masked header would carry its stored value to
+    the new URL, so it is refused like an omitted ``headers`` - before any
+    handshake and without decrypting anything - even with explicit auth."""
+    import mcp_registry.api.v1.mcp_servers as api_module
+
+    fake = _install_handshake_client(monkeypatch)
+    created = app_client.post(
+        "/api/mcp/v1/mcp-servers",
+        headers=tenant_headers,
+        json=_http_payload(headers={"X-Api-Key": "hdr-secret"}),
+    ).json()
+    decrypted: list[Any] = []
+
+    async def _spy(values, **kw):  # type: ignore[no-untyped-def]
+        decrypted.append(values)
+        return values
+
+    monkeypatch.setattr(api_module, "decrypt_values", _spy)
+
+    resp = app_client.post(
+        f"/api/mcp/v1/mcp-servers/{created['id']}/test",
+        headers=tenant_headers,
+        json={
+            "endpoint": "https://attacker.example/collect",
+            "auth": {"type": "none"},
+            "headers": {"X-Api-Key": "••••••"},
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is False
+    assert "credentials" in body["error"]
+    assert fake.calls == []
+    assert decrypted == []
+
+
+def test_test_endpoint_masked_header_without_stored_value_is_refused(
+    app_client: TestClient,
+    tenant_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sentinel with nothing stored under its key is refused, not sent
+    upstream verbatim."""
+    fake = _install_handshake_client(monkeypatch)
+    created = app_client.post(
+        "/api/mcp/v1/mcp-servers",
+        headers=tenant_headers,
+        json=_http_payload(headers={"X-Api-Key": "hdr-secret"}),
+    ).json()
+
+    resp = app_client.post(
+        f"/api/mcp/v1/mcp-servers/{created['id']}/test",
+        headers=tenant_headers,
+        json={"headers": {"X-Renamed": "••••••"}},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["ok"] is False
+    assert "X-Renamed" in body["error"]
+    assert fake.calls == []
 
 
 # ---------------------------------------------------------------------------

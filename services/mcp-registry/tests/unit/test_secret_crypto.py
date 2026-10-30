@@ -345,3 +345,27 @@ def test_mask_auth_absent_secret_field() -> None:
     result = sc.mask_auth({"type": "bearer"})
     assert result["has_token"] is False
     assert "token" not in result or not result.get("token")
+
+
+def test_mask_values_hides_every_non_empty_value() -> None:
+    envelope = json.dumps({"ciphertext_b64": "c2VjcmV0"})
+    masked = sc.mask_values({"API_KEY": "sk-plain", "TOKEN": envelope, "EMPTY": "", "NONE": None})
+    # Keys stay visible; envelope and legacy plaintext are masked alike; empty
+    # values have nothing to hide.
+    assert masked == {
+        "API_KEY": sc.MASKED_SENTINEL,
+        "TOKEN": sc.MASKED_SENTINEL,
+        "EMPTY": "",
+        "NONE": None,
+    }
+
+
+def test_mask_values_none_or_empty() -> None:
+    assert sc.mask_values(None) == {}
+    assert sc.mask_values({}) == {}
+
+
+def test_masked_keys_lists_sentinel_values_only() -> None:
+    sent = {"A": sc.MASKED_SENTINEL, "B": "typed", "C": "", "D": sc.MASKED_SENTINEL}
+    assert sc.masked_keys(sent) == ["A", "D"]
+    assert sc.masked_keys(None) == []

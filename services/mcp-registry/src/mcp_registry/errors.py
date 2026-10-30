@@ -53,3 +53,14 @@ class SecretEncryptionUnavailableError(RegistryError):
             code="MCP.CRYPTO.UNAVAILABLE",
             status=503,
         )
+
+
+class MaskedValueNotStoredError(RegistryError):
+    """A PATCH kept a masked ``env`` / ``headers`` value whose key has nothing stored."""
+
+    def __init__(self, field: str, keys: list[str]) -> None:
+        super().__init__(
+            f"No saved value to keep for {field} {', '.join(keys)}; enter the value again",
+            code="MCP.SERVER.MASKED_VALUE_NOT_STORED",
+            status=422,
+        )

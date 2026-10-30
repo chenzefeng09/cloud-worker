@@ -7,9 +7,9 @@ are encrypted at rest via the foundation crypto service and decrypted on read
 so that:
 
   * the DB columns never hold plaintext secrets,
-  * the admin surface shows ``env`` / ``headers`` in plaintext (auth secrets
-    are masked, see below) and the internal consumer endpoint returns
-    everything in plaintext,
+  * the admin surface shows none of them (auth secrets and every ``env`` /
+    ``headers`` value are masked, see below) while the internal consumer
+    endpoint returns everything in plaintext,
   * consumers (``mcp_tenant_injector``) never have to know about envelopes.
 
 The contract mirrors ``llm-gateway``'s ``_encrypt_api_key`` / ``_decrypt_api_key``
@@ -39,9 +39,11 @@ Masking
 ``mask_auth`` replaces secret fields with a sentinel (``MASKED_SENTINEL``)
 for the tenant-facing admin surface so plaintext credentials never reach the
 browser.  Each masked field gets a ``has_{field}: True`` sibling so the UI
-knows a secret is stored even though the value is redacted.  The internal
-consumer endpoint (``/internal/mcp-servers``) bypasses masking and returns
-plaintext as before.
+knows a secret is stored even though the value is redacted.  ``mask_values``
+swaps every non-empty ``env`` / ``headers`` value for the same sentinel
+(keys stay visible).  On write the sentinel means "keep the stored value"
+(``masked_keys``).  The internal consumer endpoint
+(``/internal/mcp-servers``) bypasses masking and returns plaintext as before.
 
 The same caveat as llm-gateway applies in dev: the Vault transit backend is
 ephemeral and a reset invalidates existing envelopes.  Re-create the affected
@@ -325,3 +327,25 @@ def mask_auth(auth: dict[str, Any] | None) -> dict[str, Any] | None:
         else:
             out[f"has_{field}"] = False
     return out
+
+
+def mask_values(values: dict[str, Any] | None) -> dict[str, Any]:
+    """Replace every non-empty ``env`` / ``headers`` value with ``MASKED_SENTINEL``.
+
+    Pure function (no crypto calls): the keys stay visible, and an empty value
+    (``""`` / ``None``) passes through because it holds nothing to hide.
+    Whether a value is an envelope or legacy plaintext makes no difference.
+    """
+    return {
+        key: value if value is None or value == "" else MASKED_SENTINEL
+        for key, value in (values or {}).items()
+    }
+
+
+def masked_keys(values: dict[str, Any] | None) -> list[str]:
+    """Return the keys whose submitted value is ``MASKED_SENTINEL``.
+
+    The admin form sends an untouched masked value back verbatim, so on write
+    the sentinel means "keep the value stored under this key".
+    """
+    return [key for key, value in (values or {}).items() if value == MASKED_SENTINEL]
