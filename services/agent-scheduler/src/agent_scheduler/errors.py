@@ -24,3 +24,29 @@ class SandboxSpawnError(SchedulerError):
             code="AGENT.SCHEDULER.SPAWN_FAILED",
             status=500,
         )
+
+
+class LlmNotConfiguredError(SchedulerError):
+    """The tenant has no enabled LLM provider, so no run can call a model.
+
+    A tenant setting, not an outage: retrying cannot help until an
+    administrator adds a provider.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "No enabled LLM provider is configured for this tenant",
+            code="AGENT.SCHEDULER.LLM_NOT_CONFIGURED",
+            status=422,
+        )
+
+
+class LlmGatewayUnavailableError(SchedulerError):
+    """No model key could be obtained because the LLM gateway did not answer."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "LLM gateway virtual key unavailable for tenant",
+            code="AGENT.SCHEDULER.LLM_GATEWAY_UNAVAILABLE",
+            status=502,
+        )

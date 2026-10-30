@@ -478,6 +478,69 @@ def test_docker_spawn_clears_a_stale_marker(
     assert not _marker(run_dir).exists()
 
 
+_USAGE = {"input_tokens": 900, "output_tokens": 300, "total_tokens": 1200}
+
+
+def _write_result(run_dir: Path, status: str, usage: dict[str, int] | None = None) -> None:
+    payload = {"status": status, "summary": "", "usage": usage or _USAGE, "plan_steps": []}
+    (run_dir / "result.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_docker_cancel_returns_the_usage_the_worker_saved_on_sigterm(
+    docker_rt: DockerRuntime, mock_docker_client: MagicMock, tmp_path: Path,
+) -> None:
+    run_dir = _run_dir(tmp_path)
+    _write_result(run_dir, "RUNNING", {**_USAGE, "input_tokens": 100})
+    container = _container("running")
+    # The worker writes its final counts while it handles the stop's SIGTERM.
+    container.stop.side_effect = lambda **kw: _write_result(run_dir, "FAILED")
+    mock_docker_client.containers.get.return_value = container
+    mock_docker_client.containers.list.return_value = []
+
+    assert docker_rt.cancel_run("c1") == _USAGE
+    # ...read before the workspace (and the file with it) is removed.
+    assert not run_dir.exists()
+
+
+@pytest.mark.parametrize("content", [None, "{not json", '{"usage": "lots"}', "[]"])
+def test_docker_cancel_without_readable_usage_returns_none(
+    docker_rt: DockerRuntime, mock_docker_client: MagicMock, tmp_path: Path,
+    content: str | None,
+) -> None:
+    run_dir = _run_dir(tmp_path)
+    if content is not None:
+        (run_dir / "result.json").write_text(content, encoding="utf-8")
+    mock_docker_client.containers.get.return_value = _container("running")
+    mock_docker_client.containers.list.return_value = []
+    assert docker_rt.cancel_run("c1") is None
+
+
+def test_docker_cancel_kept_workspace_still_reports_usage(
+    docker_rt: DockerRuntime, mock_docker_client: MagicMock, tmp_path: Path,
+) -> None:
+    run_dir = _run_dir(tmp_path)
+    _write_result(run_dir, "paused")
+    mock_docker_client.containers.get.return_value = _container("exited")
+    assert docker_rt.cancel_run("c1", remove_workspace=False) == _USAGE
+    assert run_dir.is_dir()
+
+
+def test_docker_spawn_drops_the_previous_legs_result(
+    docker_rt: DockerRuntime, mock_docker_client: MagicMock, tmp_path: Path,
+) -> None:
+    # A resume spawns into the paused leg's dir; its result.json must not pass
+    # for the new leg's.
+    run_dir = _run_dir(tmp_path)
+    _write_result(run_dir, "paused")
+    mock_docker_client.containers.run.return_value = MagicMock(id="container-xyz")
+    docker_rt.spawn_run(
+        run_id=RUN, session_id=SES, task="t", tenant_id=TNT, user_id=USR,
+        foundation_token="tok", llm_virtual_key="vk-test",
+    )
+    assert not (run_dir / "result.json").exists()
+    assert (run_dir / "outputs" / "report.md").is_file()
+
+
 # --------------------------------------------------------------------------- #
 # cube runtime
 # --------------------------------------------------------------------------- #
@@ -638,3 +701,45 @@ def test_cube_spawn_clears_a_stale_marker(tmp_path: Path) -> None:
     )
     assert (run_dir / ".secrets.json").is_file()
     assert not _marker(run_dir).exists()
+
+
+def test_cube_spawn_drops_the_previous_legs_result(tmp_path: Path) -> None:
+    # Otherwise the first poll of the resumed VM reads the paused leg's file
+    # and reports the run paused again.
+    client = MagicMock()
+    client.post.return_value = _resp({"sandboxID": "sb_new"}, status=201)
+    rt = _cube(client, tmp_path)
+    run_dir = _run_dir(tmp_path)
+    _write_result(run_dir, "paused")
+    rt.spawn_run(
+        run_id=RUN, session_id=SES, task="t", tenant_id=TNT, user_id=USR,
+        foundation_token="tok", llm_virtual_key="vk-test",
+    )
+    assert not (run_dir / "result.json").exists()
+
+
+@pytest.mark.parametrize("remove_workspace", [True, False])
+def test_cube_cancel_returns_the_reported_usage_before_removing_the_dir(
+    tmp_path: Path, remove_workspace: bool,
+) -> None:
+    cancelled = _vm("sb_full_1", "2026-10-30T10:00:00Z")
+    client = MagicMock()
+    client.get.side_effect = (
+        lambda url, **kw: _resp(cancelled) if url == "/sandboxes/sb_1" else _resp([cancelled])
+    )
+    client.delete.return_value = _resp({}, status=204)
+    rt = _cube(client, tmp_path)
+    run_dir = _run_dir(tmp_path)
+    _write_result(run_dir, "RUNNING")
+
+    assert rt.cancel_run("sb_1", remove_workspace=remove_workspace) == _USAGE
+    assert run_dir.is_dir() is not remove_workspace
+
+
+def test_cube_cancel_of_a_vm_without_metadata_returns_no_usage(tmp_path: Path) -> None:
+    client = MagicMock()
+    client.get.return_value = _resp({"sandboxID": "sb_full_1", "metadata": {}})
+    client.delete.return_value = _resp({}, status=204)
+    rt = _cube(client, tmp_path)
+    _write_result(_run_dir(tmp_path), "RUNNING")
+    assert rt.cancel_run("sb_1") is None

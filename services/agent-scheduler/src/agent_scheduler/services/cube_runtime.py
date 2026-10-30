@@ -323,6 +323,36 @@ def clear_run_collected(run_dir: Path) -> None:
         _collected_marker(run_dir).unlink(missing_ok=True)
 
 
+def clear_previous_leg_result(run_dir: Path) -> None:
+    """Delete the ``result.json`` an earlier leg of this run left in its dir.
+
+    A resumed run spawns into its paused leg's dir.  Until the new worker
+    writes its own file, every reader would take the paused leg's for the new
+    leg's: the status poll would report a fresh cube VM as already paused
+    (flipping the resumed run straight back to PAUSED) and a cancel would read
+    stale usage.  Nothing is lost: the paused leg's usage travels on in the
+    resume payload and the new worker reports the run's total.  Raises
+    ``OSError`` if the file is there but cannot be removed.
+    """
+    (run_dir / "result.json").unlink(missing_ok=True)
+
+
+def reported_usage(run_dir: Path | None) -> dict[str, Any] | None:
+    """The token usage the run's worker last wrote to ``result.json``, if any.
+
+    Never raises: the file may be missing (the worker never got that far),
+    half-written or not JSON at all.
+    """
+    if run_dir is None:
+        return None
+    try:
+        payload = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    return usage if isinstance(usage, dict) else None
+
+
 def remove_run_workspace(base: str | os.PathLike[str], run_dir: Path | None) -> bool:
     """Delete a per-run host dir and its marker; ``True`` once it is gone.
 
@@ -713,6 +743,7 @@ class CubeSandboxRuntime:
             "SKILL_STORE_URL": service_env["SKILL_STORE_URL"],
             "WEB_FETCH_GATEWAY_URL": service_env["WEB_FETCH_GATEWAY_URL"],
             "DLP_URL": service_env["DLP_URL"],
+            "DLP_FAILURE_MODE": self._settings.dlp_failure_mode,
             "FOUNDATION_SERVICE_SCOPES": SANDBOX_SERVICE_SCOPES,
             "RUN_ID": run_id,
             # The Claude Agent SDK CLI tries to phone home (Statsig / BigQuery 1P
@@ -761,6 +792,7 @@ class CubeSandboxRuntime:
         try:
             secrets_host_dir.mkdir(parents=True, exist_ok=True)
             clear_run_collected(secrets_host_dir)
+            clear_previous_leg_result(secrets_host_dir)
             secrets_host_path.write_text(
                 json.dumps(secret_file_payload, ensure_ascii=False),
                 encoding="utf-8",
@@ -1244,7 +1276,9 @@ class CubeSandboxRuntime:
         return str(tenant)
 
     # ---------------------------------------------------------------- cancel
-    def cancel_run(self, container_id: str, *, remove_workspace: bool = True) -> None:
+    def cancel_run(
+        self, container_id: str, *, remove_workspace: bool = True,
+    ) -> dict[str, Any] | None:
         client = self._require_client()
         # Resolve the VM's run ids BEFORE the delete: once the controller has
         # forgotten the VM, the sandbox id no longer maps to its host dir.
@@ -1265,8 +1299,17 @@ class CubeSandboxRuntime:
                 "cube cancel returned non-404 error; treating as gone",
                 extra={"sandbox_id": container_id, "status": resp.status_code},
             )
+        # The run dir is host-mounted, so what the worker last reported is still
+        # readable with the VM gone - but not once the dir is removed below.
+        ids = self._run_ids(sandbox) if sandbox is not None else None
+        usage = (
+            reported_usage(run_workspace_dir(self._settings.workspace_base, *ids))
+            if ids is not None
+            else None
+        )
         if sandbox is not None and remove_workspace:
             self._remove_cancelled_workspace(sandbox)
+        return usage
 
     def _remove_cancelled_workspace(self, sandbox: dict[str, Any]) -> None:
         """Delete a cancelled run's host dir unless a newer VM now owns it.

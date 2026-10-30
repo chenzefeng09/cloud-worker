@@ -258,6 +258,12 @@ class Settings(BaseSettings):
     # in foundation mode it is this direct service URL.
     dlp_url: str = "http://foundation-dlp:80/api/dlp/v1"
 
+    # What the worker does when a DLP scan cannot be completed (DLP unreachable,
+    # timed out, non-2xx or unparseable answer): ``closed`` denies the tool
+    # call, ``open`` allows it and logs an error each time.  Forwarded into the
+    # sandbox as DLP_FAILURE_MODE (see worker-claude-sdk/src/dlp.ts).
+    dlp_failure_mode: Literal["open", "closed"] = "closed"
+
     # LLM Gateway (M1-P3) — base URL *with* API version prefix.
     # Forwarded into every sandbox as LLM_GATEWAY_URL.  The scheduler also
     # queries GET /tenant-keys?tenant_id= on this base URL to retrieve the

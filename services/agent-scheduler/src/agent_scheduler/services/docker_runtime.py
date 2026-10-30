@@ -54,9 +54,11 @@ from agent_scheduler.services import artifact_store, egress_policy
 # Per-run host dir lifecycle, shared by both runtimes (see the comment block in
 # cube_runtime: it lives there so that module never needs the docker SDK).
 from agent_scheduler.services.cube_runtime import (
+    clear_previous_leg_result,
     clear_run_collected,
     mark_run_collected,
     remove_run_workspace,
+    reported_usage,
     run_collected_at,
     run_workspace_dir,
     sweep_run_workspaces,
@@ -310,6 +312,7 @@ class DockerRuntime:
         workspace_dir = Path(self._settings.workspace_base) / tenant_id / session_id / run_id
         workspace_dir.mkdir(parents=True, exist_ok=True)
         clear_run_collected(workspace_dir)
+        clear_previous_leg_result(workspace_dir)
 
         # The task arrives as a file the worker reads, not an argv arg,
         # so we never splice user-controlled text into a shell command.
@@ -418,6 +421,9 @@ class DockerRuntime:
             # ${DLP_URL}/core/scan for scanning.  Reached directly (foundation
             # mode) or through the tool-broker /dlp façade (broker mode).
             "DLP_URL": service_env["DLP_URL"],
+            # Whether a scan that cannot be completed denies (closed) or
+            # allows (open) the tool call.
+            "DLP_FAILURE_MODE": self._settings.dlp_failure_mode,
             # Knowledge-ingest (KB v1) - the worker's knowledge tool GETs
             # ${KNOWLEDGE_INGEST_URL}/search?scope=knowledge.  Reached directly
             # (foundation mode) or through the tool-broker /knowledge/v1
@@ -749,7 +755,9 @@ class DockerRuntime:
         return str(tenant)
 
     # ---------------------------------------------------------------- cancel
-    def cancel_run(self, container_id: str, *, remove_workspace: bool = True) -> None:
+    def cancel_run(
+        self, container_id: str, *, remove_workspace: bool = True,
+    ) -> dict[str, Any] | None:
         try:
             c = self.client.containers.get(container_id)
         except docker.errors.NotFound as exc:
@@ -765,8 +773,11 @@ class DockerRuntime:
         with contextlib.suppress(docker.errors.NotFound):
             # Removed concurrently; nothing to do.
             c.remove()
+        # After the stop (the worker saves its final counts on SIGTERM), before
+        # the dir goes.
+        usage = reported_usage(run_dir)
         if run_dir is None or not remove_workspace:
-            return
+            return usage
         # A resumed HITL run gets a new container with the same run id and dir;
         # stopping the stale container must not pull the workspace out from
         # under the live one.  Unknown (list failed) counts as live.
@@ -776,8 +787,9 @@ class DockerRuntime:
                 "cancel: run workspace may still be in use; leaving it to the reaper",
                 extra={"container_id": container_id, "run_id": run_dir.name},
             )
-            return
+            return usage
         remove_run_workspace(self._settings.workspace_base, run_dir)
+        return usage
 
     def _labelled_run_dir(self, container: Any) -> Path | None:
         """The container's per-run host dir, from its (untrusted) labels."""

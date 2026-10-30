@@ -414,6 +414,21 @@ def test_cancel_run_for_owner(
     container.stop.assert_called_once()
 
 
+def test_cancel_run_returns_the_usage_the_runtime_read(
+    app_client: TestClient, mock_docker_client: MagicMock, auth_headers,
+) -> None:
+    container = MagicMock()
+    container.labels = {"agent-platform.tenant-id": auth_headers["X-Tenant-Id"]}
+    mock_docker_client.containers.get.return_value = container
+    usage = {"input_tokens": 900, "output_tokens": 300, "total_tokens": 1200}
+    with patch.object(DockerRuntime, "cancel_run", return_value=usage):
+        resp = app_client.post(
+            "/api/scheduler/v1/runs/c_owned/cancel", headers=auth_headers,
+        )
+    assert resp.status_code == 200
+    assert resp.json() == {"id": "c_owned", "status": "CANCELLED", "usage": usage}
+
+
 # --------------------------------------------------------------------------- #
 # GET /runs — tenant-scoped list, proxied from session-orchestrator
 # --------------------------------------------------------------------------- #
