@@ -137,6 +137,12 @@ spec:
                 configMapKeyRef:
                   name: ap-config
                   key: FOUNDATION_DLP_URL
+            # Forwarded into the sandbox as DLP_FAILURE_MODE (closed | open).
+            - name: SCHEDULER_DLP_FAILURE_MODE
+              valueFrom:
+                configMapKeyRef:
+                  name: ap-config
+                  key: FOUNDATION_DLP_FAILURE_MODE
             # ---- Sandbox egress mode (broker | foundation | none) -----------
             # broker (default): the sandbox reaches infra ONLY through the
             # tool-broker façade via signed per-run leases. service_env rewrites

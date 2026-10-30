@@ -4,9 +4,8 @@ extends:
 rules:
   operation-operationId: off
   openapi-tags: off
-  no-server-variables-in-path: off
-  path-keys-no-ambiguous-trailing-slash: error
+  path-keys-no-trailing-slash: error
   operation-success-response: error
-  openapi-v3_1-schema-valid: error
+  oas3-schema: error
   path-params: error
   typed-enum: error

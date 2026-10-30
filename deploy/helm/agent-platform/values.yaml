@@ -67,6 +67,9 @@ global:
     auditUrl: http://foundation-audit:80/api/audit/v1
     llmGatewayUrl: http://foundation-llm-gateway:80/api/llm/v1
     dlpUrl: http://foundation-dlp:80/api/dlp/v1
+    # DLP 检查无法完成（不可达、超时、非 2xx、无法解析）时：closed = 拒绝（沙箱拒绝
+    # 工具调用，orchestrator 上传/下载返回 503）；open = 放行并每次记 error。
+    dlpFailureMode: closed
 
     # OTEL Collector
     otelCollector:
@@ -130,6 +133,9 @@ bff:
     enabled: false
   config:
     cookieSecret: ""          # 占位；生产通过 existingSecret 或 --set-file 注入
+    # web_sessions 中 identity token 的 Fernet 密钥（逗号分隔，第一个加密、全部可解密）。
+    # 留空 = 由 cookieSecret 派生；生产请通过 existingSecret 的 BFF_SESSION_TOKEN_KEYS 注入。
+    sessionTokenKeys: ""
     cookieName: ap_session
     cookieMaxAge: "86400"
     cookieSecure: "true"
