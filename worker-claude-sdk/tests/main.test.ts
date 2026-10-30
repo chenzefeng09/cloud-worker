@@ -111,6 +111,8 @@ describe("main", () => {
       "SANDBOX_EGRESS_MODE",
       "S3_SECRET_ACCESS_KEY",
       "REDIS_URL",
+      "DLP_URL",
+      "DLP_FAILURE_MODE",
     ]) {
       saved[k] = process.env[k];
       delete process.env[k];
@@ -180,6 +182,50 @@ describe("main", () => {
     expect(result.usage.total_tokens).toBe(120);
   });
 
+  it("logs the DLP policy exactly once at startup (disabled when DLP_URL is unset)", async () => {
+    setEnv(REQUIRED_ENV);
+    setEnv({ AGENT_TASK_JSON: JSON.stringify({ task: "say hi" }) });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      const code = await main({
+        makeRedis: () => new RedisStateClient("run", undefined),
+        makeAdapter: () => new FakeAdapter() as never,
+        queryFn: fakeQuerySuccess("hi back") as never,
+      });
+      expect(code).toBe(0);
+      const dlpLines = logSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((l) => l.includes("DLP"));
+      expect(dlpLines).toHaveLength(1);
+      expect(dlpLines[0]).toContain("DLP disabled");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
+  it("logs the DLP failure mode at startup when DLP is configured", async () => {
+    setEnv(REQUIRED_ENV);
+    setEnv({
+      AGENT_TASK_JSON: JSON.stringify({ task: "say hi" }),
+      DLP_URL: "http://dlp:8007/api/dlp/v1",
+    });
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await main({
+        makeRedis: () => new RedisStateClient("run", undefined),
+        makeAdapter: () => new FakeAdapter() as never,
+        queryFn: fakeQuerySuccess("hi back") as never,
+      });
+      const dlpLines = logSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((l) => l.includes("DLP"));
+      expect(dlpLines).toHaveLength(1);
+      expect(dlpLines[0]).toContain("DLP_FAILURE_MODE=closed");
+    } finally {
+      logSpy.mockRestore();
+    }
+  });
+
   it("scrubs control-plane env before SDK query can run tools", async () => {
     setEnv(REQUIRED_ENV);
     setEnv({
@@ -192,6 +238,8 @@ describe("main", () => {
       SANDBOX_EGRESS_MODE: "broker",
       REDIS_URL: "redis://:secret@foundation-redis:6379/0",
       S3_SECRET_ACCESS_KEY: "minio-secret",
+      DLP_URL: "http://dlp:8007/api/dlp/v1",
+      DLP_FAILURE_MODE: "closed",
     });
 
     const keys = [
@@ -207,6 +255,8 @@ describe("main", () => {
       "SANDBOX_EGRESS_MODE",
       "REDIS_URL",
       "S3_SECRET_ACCESS_KEY",
+      "DLP_URL",
+      "DLP_FAILURE_MODE",
     ];
     const inspected: Record<string, string | undefined> = {};
     const queryFn = () =>

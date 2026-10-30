@@ -47,32 +47,48 @@ export interface ResultPayload {
 }
 
 /**
+ * The highest usage this process has written to each result.json. Usage only
+ * grows during a run, and the platform bills from what the file says last, so
+ * a later write must never lower it: the crash handler, for one, knows only
+ * what earlier legs used, not what this leg's checkpoints already recorded.
+ */
+const writtenUsage = new Map<string, Usage>();
+
+function neverBelowWritten(file: string, usage: Usage): Usage {
+  const prior = writtenUsage.get(file);
+  const merged: Usage = {
+    input_tokens: Math.max(usage.input_tokens, prior?.input_tokens ?? 0),
+    output_tokens: Math.max(usage.output_tokens, prior?.output_tokens ?? 0),
+    total_tokens: Math.max(usage.total_tokens, prior?.total_tokens ?? 0),
+    // DeepSeek prefix-cache hit observability — additive field, defaults to 0
+    // when the upstream did not report a cache hit. Does not alter the three
+    // AgentScope-contract fields above.
+    cache_read_input_tokens: Math.max(
+      usage.cache_read_input_tokens ?? 0,
+      prior?.cache_read_input_tokens ?? 0,
+    ),
+  };
+  writtenUsage.set(file, merged);
+  return merged;
+}
+
+/**
  * Synchronously write /workspace/result.json. Failure-open: a write error is
  * logged and swallowed (the run outcome is already decided; a missing artifact
- * is preferable to crashing on the way out).
+ * is preferable to crashing on the way out). `usage` never drops below what an
+ * earlier write in this process recorded.
  */
 export function writeResult(workspace: string, payload: ResultPayload): void {
+  const file = path.join(workspace, "result.json");
   const body = {
     status: payload.status,
     summary: payload.summary ?? "",
     error: payload.error ?? null,
-    usage: {
-      input_tokens: payload.usage.input_tokens,
-      output_tokens: payload.usage.output_tokens,
-      total_tokens: payload.usage.total_tokens,
-      // DeepSeek prefix-cache hit observability — additive field, defaults to 0
-      // when the upstream did not report a cache hit. Does not alter the three
-      // AgentScope-contract fields above.
-      cache_read_input_tokens: payload.usage.cache_read_input_tokens ?? 0,
-    },
+    usage: neverBelowWritten(file, payload.usage),
     plan_steps: payload.plan_steps,
   };
   try {
-    writeFileSync(
-      path.join(workspace, "result.json"),
-      JSON.stringify(body, null, 2),
-      "utf8",
-    );
+    writeFileSync(file, JSON.stringify(body, null, 2), "utf8");
   } catch (err) {
     console.warn(
       `[result] failed to write result.json: ${(err as Error).message}`,

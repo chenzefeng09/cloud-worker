@@ -23,7 +23,9 @@ import {
   recordTranscriptText,
   recordTranscriptToolCall,
   recordTranscriptToolResult,
+  parseReplayState,
   requiresConfirmation,
+  resumedUsage,
   snapshotTranscriptForPause,
   stableStringify,
   type ReplayState,
@@ -386,6 +388,76 @@ describe("snapshotTranscriptForPause", () => {
     // The newest turn survives; an omission marker replaces the dropped ones.
     expect(state.transcript.at(-1)!.args).toBe('{"i":19}');
     expect(state.transcript[0].text).toMatch(/earlier step\(s\) omitted/);
+  });
+});
+
+describe("usage across resume legs", () => {
+  const usage = {
+    input_tokens: 1200,
+    output_tokens: 300,
+    total_tokens: 1500,
+    cache_read_input_tokens: 400,
+  };
+
+  it("the pause snapshot carries the run's usage and the resumed leg reads it back", () => {
+    const state = snapshotTranscriptForPause(baseTask(), newTranscriptAccumulator(), [], usage);
+    expect(state.usage).toEqual(usage);
+
+    // agent_state round-trips through Redis and the orchestrator as JSON.
+    const agentState = JSON.parse(JSON.stringify(state));
+    const task = baseTask({
+      resume: { kind: "confirm", tool_call_id: "tu_1", confirmed: true, agent_state: agentState },
+    });
+    expect(resumedUsage(task)).toEqual(usage);
+  });
+
+  it("a fresh run, or a snapshot without usage, starts from zero", () => {
+    const zero = { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
+    expect(resumedUsage(baseTask())).toEqual(zero);
+    const legacy = { original_task: "T", transcript: [], pending: [] };
+    expect(
+      resumedUsage(
+        baseTask({ resume: { kind: "confirm", tool_call_id: "x", agent_state: legacy } }),
+      ),
+    ).toEqual(zero);
+  });
+
+  it("ignores a malformed usage record instead of trusting it", () => {
+    for (const bad of [
+      { input_tokens: -1, output_tokens: 2 },
+      { input_tokens: 1.5, output_tokens: 2 },
+      { input_tokens: "10", output_tokens: 2 },
+      { input_tokens: 10 },
+      "lots",
+    ]) {
+      const state = parseReplayState({ original_task: "T", transcript: [], pending: [], usage: bad });
+      expect(state?.usage).toBeUndefined();
+    }
+    // The total is derived, never taken on trust.
+    const state = parseReplayState({
+      original_task: "T",
+      transcript: [],
+      pending: [],
+      usage: { input_tokens: 10, output_tokens: 5, total_tokens: 999 },
+    });
+    expect(state?.usage).toEqual({
+      input_tokens: 10,
+      output_tokens: 5,
+      total_tokens: 15,
+      cache_read_input_tokens: 0,
+    });
+  });
+
+  it("a second pause keeps counting on from the first", () => {
+    const leg1 = snapshotTranscriptForPause(baseTask(), newTranscriptAccumulator(), [
+      { id: "tu_1", name: "mcp__x__y", args: "{}" },
+    ], usage);
+    const task = baseTask({
+      resume: { kind: "confirm", tool_call_id: "tu_1", confirmed: true, agent_state: leg1 },
+    });
+    const leg2Usage = { ...usage, input_tokens: 2000, total_tokens: 2300 };
+    const leg2 = snapshotTranscriptForPause(task, newTranscriptAccumulator(), [], leg2Usage);
+    expect(leg2.usage).toEqual(leg2Usage);
   });
 });
 

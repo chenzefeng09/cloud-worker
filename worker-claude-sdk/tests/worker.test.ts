@@ -139,6 +139,7 @@ function baseEnv(over: Partial<Env> = {}): Env {
     TOOL_BROKER_LEASE: "",
     SANDBOX_EGRESS_MODE: "",
     DLP_URL: "",
+    DLP_FAILURE_MODE: "",
     OTEL_EXPORTER_OTLP_ENDPOINT: "",
     ...over,
   };
@@ -1187,6 +1188,109 @@ describe("worker", () => {
     }
   });
 
+  /** A PreToolUse input for the DLP hook tests below. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const dlpHookInput = (over: Record<string, unknown> = {}): any => ({
+    hook_event_name: "PreToolUse",
+    tool_name: "Bash",
+    tool_input: { command: "ls" },
+    tool_use_id: "tu_3",
+    session_id: "s",
+    transcript_path: "/tmp/t",
+    cwd: "/workspace",
+    ...over,
+  });
+
+  /** fetch stub answering every DLP scan with the pre-fix 403. */
+  const dlp403 = () =>
+    vi.fn(
+      async () =>
+        new Response(JSON.stringify({ code: "FOUNDATION.DLP.POLICY.DLP_DENIED" }), {
+          status: 403,
+          headers: { "content-type": "application/json" },
+        }),
+    ) as unknown as typeof fetch;
+
+  it("makeDlpPreToolUse: a scan that cannot complete is DENIED by default (fail-closed)", async () => {
+    const realFetch = global.fetch;
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      global.fetch = dlp403();
+      // DLP_FAILURE_MODE unset → closed.
+      const hook = worker.makeDlpPreToolUse(baseEnv({ DLP_URL: "http://dlp.test" }));
+      const out = await hook(dlpHookInput());
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const hso = (out as any).hookSpecificOutput;
+      expect(hso.permissionDecision).toBe("deny");
+      expect(hso.permissionDecisionReason).toContain("could not be completed");
+      expect(hso.permissionDecisionReason).toContain("HTTP 403");
+      expect(errSpy).toHaveBeenCalled();
+    } finally {
+      global.fetch = realFetch;
+      errSpy.mockRestore();
+    }
+  });
+
+  it("makeDlpPreToolUse: DLP_FAILURE_MODE=open lets an unscanned call through (no decision) and logs it", async () => {
+    const realFetch = global.fetch;
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      global.fetch = dlp403();
+      const hook = worker.makeDlpPreToolUse(
+        baseEnv({ DLP_URL: "http://dlp.test", DLP_FAILURE_MODE: "open" }),
+      );
+      const out = await hook(dlpHookInput());
+      // Allowed, but WITHOUT permissionDecision:"allow" (that would bypass HITL).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((out as any).hookSpecificOutput).toBeUndefined();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((out as any).continue).toBe(true);
+      expect(errSpy).toHaveBeenCalledTimes(1);
+      expect(String(errSpy.mock.calls[0][0])).toContain("UNSCANNED");
+    } finally {
+      global.fetch = realFetch;
+      errSpy.mockRestore();
+    }
+  });
+
+  it("makeDlpPreToolUse: an unexpected throw is treated as an incomplete scan, not a silent allow", async () => {
+    const realFetch = global.fetch;
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    try {
+      const fetchSpy = vi.fn();
+      global.fetch = fetchSpy as unknown as typeof fetch;
+      // tool_input's getter throws while the hook builds the scan request.
+      const input = dlpHookInput();
+      Object.defineProperty(input, "tool_input", {
+        enumerable: true,
+        get() {
+          throw new Error("boom");
+        },
+      });
+
+      const closed = await worker.makeDlpPreToolUse(
+        baseEnv({ DLP_URL: "http://dlp.test" }),
+      )(input);
+      const open = await worker.makeDlpPreToolUse(
+        baseEnv({ DLP_URL: "http://dlp.test", DLP_FAILURE_MODE: "open" }),
+      )(input);
+      const disabled = await worker.makeDlpPreToolUse(baseEnv({ DLP_URL: "" }))(input);
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((closed as any).hookSpecificOutput.permissionDecision).toBe("deny");
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((open as any).continue).toBe(true);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      expect((disabled as any).continue).toBe(true);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      // One error line each for the closed and open cases; disabled is silent.
+      expect(errSpy).toHaveBeenCalledTimes(2);
+    } finally {
+      global.fetch = realFetch;
+      errSpy.mockRestore();
+    }
+  });
+
   // ── HITL pause path ─────────────────────────────────────────────────────────
 
   it("pauses on an mcp tool call: writePaused blob, markPaused, pending_confirmation, end(paused), status=paused", async () => {
@@ -1248,10 +1352,18 @@ describe("worker", () => {
     ]);
     expect(typeof blob.paused_at).toBe("string");
     // agent_state carries our replay transcript (assistant text captured).
-    const state = blob.agent_state as { original_task: string; transcript: unknown[]; pending: unknown[] };
+    const state = blob.agent_state as {
+      original_task: string;
+      transcript: unknown[];
+      pending: unknown[];
+      usage: Record<string, number>;
+    };
     expect(state.original_task).toBe("find the repo");
     expect(state.pending).toHaveLength(1);
     expect(state.transcript).toContainEqual({ role: "assistant", text: "let me search" });
+    // ...and the usage so far, for the resumed leg to count on from.
+    expect(state.usage).toMatchObject({ input_tokens: 5, output_tokens: 3, total_tokens: 8 });
+    expect(result.usage).toMatchObject({ input_tokens: 5, output_tokens: 3, total_tokens: 8 });
   });
 
   it("does NOT push the synthetic tool_result for the paused tool call (would wipe the pending card)", async () => {
@@ -1528,6 +1640,44 @@ describe("worker", () => {
     );
     expect(seenPromptIsAsync).toBe(true);
     expect(result.status).toBe("OK");
+  });
+
+  it("resume leg reports the whole run's usage, earlier legs included", async () => {
+    const queryFn = () =>
+      (async function* () {
+        yield {
+          type: "assistant",
+          message: {
+            content: [{ type: "text", text: "continuing" }],
+            usage: { input_tokens: 40, output_tokens: 10 },
+          },
+        } as AnyMsg;
+        yield { type: "result", subtype: "success" } as AnyMsg;
+      })() as AnyMsg;
+
+    const result = await worker.runQuery(
+      baseTask({
+        resume: {
+          kind: "confirm",
+          tool_call_id: "tu_old",
+          confirmed: true,
+          agent_state: {
+            original_task: "t",
+            transcript: [],
+            pending: [{ id: "tu_old", name: "mcp__x__y", args: "{}" }],
+            usage: { input_tokens: 500, output_tokens: 200, total_tokens: 700 },
+          },
+        },
+      }),
+      baseEnv(),
+      { systemPrompt: "sys", mcpServers: {}, redis: noopRedis(), deps: { queryFn } },
+    );
+    expect(result.status).toBe("OK");
+    expect(result.usage).toMatchObject({
+      input_tokens: 540,
+      output_tokens: 210,
+      total_tokens: 750,
+    });
   });
 
   it("does NOT map sampling.max_tokens onto maxThinkingTokens (output-cap bug fix)", async () => {

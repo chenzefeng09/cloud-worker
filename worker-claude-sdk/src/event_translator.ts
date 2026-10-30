@@ -174,6 +174,18 @@ export class EventTranslator {
     cache_read_input_tokens: 0,
   };
 
+  /**
+   * @param priorUsage what earlier legs of this run used. A resumed leg counts
+   *   on from it, so the usage it reports covers the whole run.
+   */
+  constructor(priorUsage?: Partial<CumulativeUsage>) {
+    if (priorUsage) {
+      this.cumulative.input_tokens = priorUsage.input_tokens ?? 0;
+      this.cumulative.output_tokens = priorUsage.output_tokens ?? 0;
+      this.cumulative.cache_read_input_tokens = priorUsage.cache_read_input_tokens ?? 0;
+    }
+  }
+
   /** Cumulative usage accumulated across all assistant messages so far. */
   getCumulativeUsage(): CumulativeUsage {
     return {

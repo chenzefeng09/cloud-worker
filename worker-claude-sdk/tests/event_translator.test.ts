@@ -186,6 +186,34 @@ describe("EventTranslator", () => {
     expect(t.getCumulativeUsage().cache_read_input_tokens).toBe(100);
   });
 
+  it("a resumed leg counts on from the usage of the earlier legs", () => {
+    const t = new EventTranslator({
+      input_tokens: 1000,
+      output_tokens: 400,
+      total_tokens: 1400,
+      cache_read_input_tokens: 300,
+    });
+    expect(t.getCumulativeUsage()).toEqual({
+      input_tokens: 1000,
+      output_tokens: 400,
+      total_tokens: 1400,
+      cache_read_input_tokens: 300,
+    });
+    t.translateMessage({
+      type: "assistant",
+      message: {
+        content: [{ type: "text", text: "a" }],
+        usage: { input_tokens: 100, output_tokens: 50, cache_read_input_tokens: 20 },
+      },
+    } as AnyMsg);
+    expect(t.getCumulativeUsage()).toEqual({
+      input_tokens: 1100,
+      output_tokens: 450,
+      total_tokens: 1550,
+      cache_read_input_tokens: 320,
+    });
+  });
+
   it("defaults cache_read_input_tokens to 0 when absent (failure-open)", () => {
     const t = new EventTranslator();
     t.translateMessage({

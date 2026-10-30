@@ -179,8 +179,10 @@ export type SDKUserMessage = {
 > `hookSpecificOutput.permissionDecision: "allow"` (debug string: "bypassing
 > permission check"). An allow-all DLP hook therefore DISABLES HITL entirely —
 > every `mcp__*`/`ask_user` call auto-runs with no pause. The DLP hook MUST stay
-> **silent** (`{continue: true}`, no `permissionDecision`) on a clean scan and on
-> fail-open, and return `permissionDecision: "deny"` ONLY on a real DLP hit. Only
+> **silent** (`{continue: true}`, no `permissionDecision`) whenever it lets a call
+> run (a clean scan, an L2/L3 SCAN_REQUIRED hit, fail-open), and return
+> `permissionDecision: "deny"` ONLY when the call must be blocked (a QUARANTINE
+> hit, or a scan that cannot complete under `DLP_FAILURE_MODE=closed`). Only
 > a hook with no `permissionDecision` lets `canUseTool` run. Additionally, after a
 > canUseTool deny+interrupt the SDK emits an `is_error` tool_result for the gated
 > call ("paused for human approval"); that `ToolResultEndEvent` must be suppressed

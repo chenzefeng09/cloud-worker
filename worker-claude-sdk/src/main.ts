@@ -34,6 +34,8 @@ import {
   type Env,
   type Task,
 } from "./task.js";
+import { logDlpPolicy, resolveDlpPolicy } from "./dlp.js";
+import { resumedUsage } from "./hitl.js";
 import { writeResult } from "./result.js";
 import { fromEnv as redisFromEnv, type RedisStateClient } from "./redis_state.js";
 import { GatewayAdapter, type GatewayAdapterOptions } from "./adapter.js";
@@ -78,6 +80,8 @@ const TOOL_ENV_SCRUB_KEYS = [
   "TOOL_BROKER_URL",
   "TOOL_BROKER_LEASE",
   "SANDBOX_EGRESS_MODE",
+  "DLP_URL",
+  "DLP_FAILURE_MODE",
   "OTEL_EXPORTER_OTLP_ENDPOINT",
   "AGENT_TASK_JSON",
 ] as const;
@@ -293,6 +297,9 @@ export async function main(deps: MainDeps = {}): Promise<number> {
   }
 
   const env = readEnv();
+  // Say once, at startup, whether tool calls are DLP-scanned and what happens
+  // when a scan cannot complete (the hook itself never logs "disabled").
+  logDlpPolicy(resolveDlpPolicy(env));
 
   // Empty task text: completed run with FAILED status (exit 0), matching Python.
   if (!task.task || task.task.trim() === "") {
@@ -380,12 +387,14 @@ export async function main(deps: MainDeps = {}): Promise<number> {
     await redis.markFailed();
     return 1;
   } catch (err) {
-    // Last-resort safety net: any unexpected throw → FAILED + exit 1.
+    // Last-resort safety net: any unexpected throw → FAILED + exit 1.  The
+    // usage is at least what earlier legs used; writeResult keeps this leg's
+    // checkpointed counts on top of that.
     writeResult(getWorkspaceDir(), {
       status: "FAILED",
       summary: "worker crashed",
       error: `${(err as Error).name}: ${(err as Error).message}`,
-      usage: EMPTY_USAGE,
+      usage: resumedUsage(task),
       plan_steps: [],
     });
     // A no-op when runQuery already ended the stream (the client pushes `end`

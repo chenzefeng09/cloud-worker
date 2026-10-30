@@ -36,6 +36,7 @@ function makeEnv(over: Partial<Env> = {}): Env {
     TOOL_BROKER_LEASE: "",
     SANDBOX_EGRESS_MODE: "",
     DLP_URL: "",
+    DLP_FAILURE_MODE: "",
     OTEL_EXPORTER_OTLP_ENDPOINT: "",
     ...over,
   };

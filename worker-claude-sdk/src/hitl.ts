@@ -27,6 +27,7 @@ import type {
   SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 
+import type { Usage } from "./result.js";
 import type { ResumePayload, Task } from "./task.js";
 
 /** Native sandbox tools the gate always allows (matches old __main__.py:829). */
@@ -298,6 +299,12 @@ export interface ReplayState {
   transcript: TranscriptTurn[];
   /** The tool call(s) that triggered the pause (not yet executed). */
   pending: PendingToolCall[];
+  /**
+   * Token usage of every leg so far. The resumed leg counts on from it, so
+   * result.json always reports the whole run, never just the latest leg.
+   * Absent in snapshots taken before it was recorded (counted as zero).
+   */
+  usage?: Usage;
 }
 
 /** What the worker records during one leg, in stream order. */
@@ -367,12 +374,14 @@ const TRUNCATION_MARKER = "…[truncated]";
  * Assemble the replay state: the prior legs' transcript (on a resume leg) +
  * the outcome of the pause that leg resolved + this leg's turns, in order.
  * The pending tool call itself is excluded (it never ran; the decision turn
- * restates it). Stored verbatim into the paused blob's `agent_state`.
+ * restates it). Stored verbatim into the paused blob's `agent_state`, with
+ * `usage` (the run's usage so far, prior legs included) when given.
  */
 export function snapshotTranscriptForPause(
   task: Task,
   acc: TranscriptAccumulator,
   pending: PendingToolCall[],
+  usage?: Usage,
 ): ReplayState {
   const pendingIds = new Set(pending.map((p) => p.id));
   const resume = task.resume ?? null;
@@ -395,7 +404,17 @@ export function snapshotTranscriptForPause(
     original_task: prior?.original_task || task.task,
     transcript: boundTranscript(turns),
     pending,
+    ...(usage ? { usage: { ...usage } } : {}),
   };
+}
+
+/**
+ * What the earlier legs of this run used: the usage the paused leg recorded in
+ * the resume payload's `agent_state`, or zero on a fresh run.
+ */
+export function resumedUsage(task: Task): Usage {
+  const usage = task.resume ? parseReplayState(task.resume.agent_state)?.usage : undefined;
+  return usage ?? { input_tokens: 0, output_tokens: 0, total_tokens: 0 };
 }
 
 /**
@@ -587,11 +606,30 @@ export function parseReplayState(raw: unknown): ReplayState | null {
         (p): p is PendingToolCall => typeof p === "object" && p !== null,
       )
     : [];
+  const usage = parseUsage(o.usage);
   return {
     ...(typeof o.version === "number" ? { version: o.version } : {}),
     original_task: typeof o.original_task === "string" ? o.original_task : "",
     transcript,
     pending,
+    ...(usage ? { usage } : {}),
+  };
+}
+
+/** A round-tripped usage record, or null unless its counts are whole numbers ≥ 0. */
+function parseUsage(raw: unknown): Usage | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const o = raw as Record<string, unknown>;
+  const count = (v: unknown): number | null =>
+    typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
+  const input = count(o.input_tokens);
+  const output = count(o.output_tokens);
+  if (input === null || output === null) return null;
+  return {
+    input_tokens: input,
+    output_tokens: output,
+    total_tokens: input + output,
+    cache_read_input_tokens: count(o.cache_read_input_tokens) ?? 0,
   };
 }
 

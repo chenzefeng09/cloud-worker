@@ -167,6 +167,18 @@ scheduler 把 `status` 以顶层 `result_status` 透传;orchestrator reconcile �
 容器退出 + `result_status=="paused"` → Run 置 `PAUSED`(非终态,不落助手消息);
 `FAILED` 提升覆盖 exit-0;其余 → COMPLETED/FAILED。
 
+`usage` 是**整个 run 的累计用量**,不是单段:
+- worker 每次工具调用结束、每段结束(完成/失败/暂停/SIGTERM 取消)都重写它;同一进程内
+  只增不减(崩溃兜底写入也不会把已记录的数清零)。
+- 暂停时用量随 `agent_state.usage` 写入暂停状态(§4),续跑段从这个数接着累计,所以任何
+  时刻文件里的数都覆盖此前所有段。
+- scheduler 起新一段时先删掉上一段留在同一目录的 `result.json`,读到的永远是当前段的文件。
+- scheduler 的 cancel 在停掉沙箱后读一次 `usage` 并在响应里返回(被取消的 run 不会再被
+  轮询)。
+- orchestrator 在暂停、终态、取消时各记一次,规则是**只取较大值、从不调小**:同一段被多处
+  观察到、观察顺序颠倒都不会重复计算或回退。沙箱已消失(scheduler 404)的路径拿不到文件,
+  保留已记录的值。
+
 ## 4. 输出③:暂停状态 `agent:run:{run_id}:paused`(SET,TTL 7 天)
 
 ```jsonc
@@ -177,7 +189,8 @@ scheduler 把 `status` 以顶层 `result_status` 透传;orchestrator reconcile �
   "question": "string|null",
   "agent_state": {...},                  // worker 自定义的完整可恢复状态
                                          // (Claude SDK 会话恢复载荷),格式由 worker 定,
-                                         //   平台只负责原样回传,不解析
+                                         //   平台只负责原样回传,不解析;其中
+                                         //   `usage` 是暂停时整个 run 的累计用量(§3)
   "paused_at": "iso8601"
 }
 ```
@@ -246,12 +259,15 @@ façade 约定:
 - `MCP_REGISTRY_URL = {TOOL_BROKER_URL}/mcp/v1`
 - `SKILL_STORE_URL = {TOOL_BROKER_URL}/skills/v1`
 - `WEB_FETCH_GATEWAY_URL = {TOOL_BROKER_URL}/web-fetch/api/web-fetch/v1`
+- `DLP_URL = {TOOL_BROKER_URL}/dlp/api/dlp/v1`(`foundation` 模式为真实 DLP 地址,
+  `none` 模式为空,即 worker 端 DLP 关闭,见 §8)
 - `REDIS_URL = ""`, `S3_ENDPOINT_URL = ""`
 
 worker 启动后必须在工具执行前清理控制面 env。Bash 可以保留,但其子进程不得继承
 `FOUNDATION_API_TOKEN`、租户/用户/run id、真实服务地址、`TOOL_BROKER_URL`、
-`TOOL_BROKER_LEASE`、`AGENT_TASK_JSON` 等控制面变量。完整服务调用由 worker
-runtime 使用启动时快照的凭据和 broker URL 完成;Bash 只能在网络策略允许的范围内访问。
+`TOOL_BROKER_LEASE`、`AGENT_TASK_JSON`、`DLP_URL`、`DLP_FAILURE_MODE` 等控制面变量。
+完整服务调用由 worker runtime 使用启动时快照的凭据和 broker URL 完成;Bash 只能在
+网络策略允许的范围内访问。
 
 tool-broker 必须校验 `X-Tool-Broker-Lease` 中的 tenant/run 绑定、过期时间和 façade
 scope:
@@ -260,3 +276,93 @@ scope:
 - `mcp/v1/*` 需要 `mcp.read_internal`
 - `skills/v1/*` 需要 `skill.read_internal`
 - `web-fetch/api/web-fetch/v1/*` 需要 `web_fetch.invoke`
+- `dlp/api/dlp/v1/*` 需要 `dlp.scan`,且只放行 `core/scan` 一个路径。broker 丢弃
+  调用方的 `X-Actor` / `X-User-Id` / `X-Tenant-Id` / `X-Service-Scopes`,只按租约
+  重新注入租户与用户,所以沙箱无法冒充 `SERVICE` 改写分类标签(见 §8.4)
+
+## 8. DLP 策略(worker 工具调用 + orchestrator 上传/下载/助手回复)
+
+worker 的 PreToolUse 钩子(`worker-claude-sdk/src/dlp.ts`)与 session-orchestrator 的
+`api/dlp_guard.py` 执行同一张决策表。DLP 不可用时怎么办由部署显式配置,不存在
+静默放行。
+
+### 8.1 配置
+
+| 组件 | DLP 地址 | 失败策略 |
+|---|---|---|
+| worker | env `DLP_URL`(scheduler 下发,见 §7) | env `DLP_FAILURE_MODE` |
+| session-orchestrator | `SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL` | `SESSION_ORCHESTRATOR_DLP_FAILURE_MODE` |
+
+失败策略取 `closed`(默认)或 `open`,不区分大小写;空值即 `closed`;其他值按
+`closed` 处理并记一条告警/错误日志。生效策略只记一次日志:worker 在启动时,
+orchestrator 在第一次 DLP 判定时。
+
+### 8.2 决策表
+
+| 情况 | 结果 |
+|---|---|
+| DLP 地址为空 | DLP 关闭:全部放行,不发请求 |
+| DLP 正常应答 | 按 DLP 结论(见 8.3) |
+| 无法完成:网络错误、超时(2 s)、非 2xx、响应体不是 JSON 对象、判定字段(`action` / `allowed`)缺失或类型不对;worker 还包括工具入参无法序列化 | `closed`:拒绝。`open`:放行,且每一次都记 ERROR 日志(含资源 id 与原因) |
+
+拒绝时给用户/模型的文字只说明"DLP 检查无法完成、稍后再试",不含 DLP 地址、
+令牌或底层错误;技术原因只进日志。
+
+### 8.3 各挂载点
+
+**worker 工具调用(PreToolUse,每次工具调用前)**
+
+- 请求:`POST {DLP_URL}/core/scan`,体 `{content, resource_type: "tool_call",
+  resource_id: "<tool>:<tool_use_id>"}`,`content` 为 JSON 序列化的工具入参;头
+  `authorization: Bearer <FOUNDATION_API_TOKEN>`、`x-tenant-id`,broker 模式另带
+  `x-tool-broker-lease`。worker 不发 `x-actor`。
+- 只拦 `QUARANTINE`(L4 及以上):拒绝原因带命中规则名(最多 3 个)、敏感级别和
+  action。`ALLOW` 放行;`SCAN_REQUIRED`(L2/L3,如邮箱、手机号)也放行,但记一条
+  `console.warn`(资源 id、级别、规则名,不含数据本身)。契约之外的 action 视同
+  无法完成,按下一条处理。
+- 无法完成:`closed` 拒绝(原因说明扫描无法完成、工具调用不会在未扫描时执行);
+  `open` 放行并 `console.error` 记 `UNSCANNED`。
+- 只有拒绝时钩子才返回 `permissionDecision: "deny"`;放行时不返回任何决定,
+  以免绕过 HITL 的 `canUseTool`。
+
+**附件 / 工作区文件上传**
+
+- 在写 blob 之前调用 `POST {dlp}/core/scan`,头 `X-Tenant-Id`、`X-User-Id`、
+  `X-Actor: SERVICE`。只扫文本(含 NUL 字节或非 UTF-8 的二进制文件不扫),最多前
+  256 KiB。
+- 命中不拒绝上传:DLP 以命中级别写入该文件的分类标签(新标签下限为 DLP 默认级别
+  L3,只升不降),下载时由 `check:download` 执行。
+- 无法完成:`closed` 返回 HTTP 503 `AGENT.DLP.UNAVAILABLE`,请求事务回滚,不落 blob;
+  `open` 照常存储(未扫描、无标签)并记 ERROR `UNCHECKED`。
+
+**附件 / 工作区文件下载**
+
+- 返回字节前调用 `POST {dlp}/core/check:download`,头 `X-Tenant-Id`、`X-User-Id`,
+  体 `{resource_type, resource_id, destination}`。用户 clearance 由 DLP 向 identity
+  解析,不接受调用方传入(多余字段 422)。无标签的资源按 DLP 默认级别 L3 判定。
+- `allowed: false`:HTTP 403,`detail` 为 `DLP: <reason>`;`allowed: true`:放行。
+- 无法完成:`closed` 返回 HTTP 503 `AGENT.DLP.UNAVAILABLE`,不返回文件;`open` 返回
+  文件并记 ERROR `UNCHECKED`。
+
+**助手回复落库(run 收尾,`resource_type: "transcript"`)**
+
+- `POST {dlp}/core/scan`,`X-Actor: SERVICE`;命中只打标签,从不拦截。
+- 无法完成时两种模式行为相同:照常落库、不打标签,记 ERROR `UNLABELLED`(含消息
+  id),DLP 恢复后可据此重扫。不拦截、不扣留、不脱敏,原因:
+  - 回复在 run 进行中已经按 token 流式推给了用户,收尾落库时拒存或隐藏无法阻止
+    任何泄露,只会让用户丢掉刚看到的记录;
+  - 脱敏需要的正是这次失败的扫描结果;
+  - agent-platform 没有任何访问判定读取 transcript 标签,而 DLP 对无标签资源按
+    默认级别 L3 处理。
+  真正的出口控制(工具调用、文件下载)在 DLP 不可用时仍按失败策略拒绝。
+
+agent 产出的 artifact 落库时不扫描(只有 s3_key,没有内容),其下载仍经
+`check:download`。
+
+### 8.4 foundation-dlp 侧约定
+
+- `/core/scan` 对任何带租户上下文的调用方返回结论。只有 `X-Actor` 为 `SERVICE` /
+  `ADMIN` 的调用方会把命中级别写入资源分类标签;其他调用方(如沙箱 worker 扫描
+  自己的工具调用)只得到结论,不写标签。每次命中都会记 DLP 事件。
+- `check:download` 必须带 `X-User-Id`(否则 401),请求体只允许
+  `resource_type` / `resource_id` / `destination`。

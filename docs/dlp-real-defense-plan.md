@@ -1,6 +1,6 @@
 # DLP 改造方案：从「测试工具页」补齐成「生效防线」
 
-> 状态：**已实现（P0/P1/P2 三阶段全部落地，工作区未 commit）**
+> 状态：**已实现（P0/P1/P2 三阶段全部落地）**。2026-10-30 修订：DLP 无法完成检查时默认拒绝（fail-closed），见「七、失败策略与上线顺序」。
 > 范围：`saas-foundation/packages/dlp`（底座）+ `agent-platform`（session-orchestrator / bff / web）
 > 撰写依据：对两仓 DLP 相关代码的只读勘察，挂载点已精确到函数。
 
@@ -11,11 +11,14 @@
 | 阶段 | 内容 | 状态 | 验证 |
 |---|---|---|---|
 | **P1** | 默认规则库（7 条全局 REGEX）+ scan 的 L 级比较 bug 修复 | ✅ | foundation dlp 单测 31 passed |
-| **P0** | session-orchestrator 接入：下载 check:download（fail-open+告警）、上传 scan 自动标密（fail-open） | ✅ | 9 个 dlp_guard 单测 + 既有测试 pass |
+| **P0** | session-orchestrator 接入：下载 check:download、上传先 scan 后写 blob（DLP 直接打标）、助手回复落库后 scan 打标；无法完成时按 `DLP_FAILURE_MODE`（默认 closed → 503） | ✅ | `test_dlp_guard.py`、`test_startup_dlp_policy.py` |
+| **P0-W** | worker PreToolUse：每次工具调用前 scan，只拦 `QUARANTINE`（`SCAN_REQUIRED` 放行并告警）；无法完成时按 `DLP_FAILURE_MODE`（默认拒绝） | ✅ | worker `tests/dlp.test.ts` |
 | **P2a** | scan 结果落 dlp_event、/core/events、/core/classifications、/core/stats 读端点、prometheus metrics + /metrics | ✅ | foundation dlp 单测 31 passed |
 | **P2b** | BFF 代理三读端点、web client/types、DlpPage 升级为治理面板（统计/历史/密级表 + 手动工具下沉折叠） | ✅ | tsc 0 新错、vite build exit 0 |
 
-**已知遗留（见各阶段「待决策项」与下方第六节）**：用户真实 clearance 未接（下载 check 暂用 L3 默认）；产物（output artifact）扫描挂载点 3 退化为 TODO（避免对账路径加 S3 IP）；下载策略当前 fail-open，硬化为 fail-closed 的开关点已注释标好；银行卡正则 `\d{16,19}` 偏宽可能误报。
+**已知遗留（见第六节）**：产物（output artifact）扫描挂载点 3 仍是 TODO（避免对账路径加 S3 IO）；银行卡正则 `\d{16,19}` 偏宽可能误报；`foundation` egress 模式下沙箱能直连 DLP、自带 `X-Actor: SERVICE` 改标签，只有 `broker` 模式防得住。
+
+**已解决**：下载 check 不再用 L3 默认 clearance，由 DLP 按 `X-User-Id` 自查（调用方传的 clearance 会被拒）；无标签资源由 DLP 按 L3 判。下载与上传不再 fail-open（见第七节）。
 
 ### 实现细节速查
 - **P1 默认规则**：身份证 L4 / 手机 L3 / 银行卡 L4 / 邮箱 L2 / AWS AK L4 / 私钥头 L4 / 通用 api_key L3。migration `0002_dlp_default_rules`（down_revision `0001_dlp_init`），全局 `tenant_id NULL`，`op.execute` 原生 SQL 绕 RLS。
@@ -58,13 +61,14 @@
 #### P0-1　下载前拦截 `check:download`
 - **挂载点**：`services/session-orchestrator/src/agent_session_orchestrator/api/v1/attachments.py:151` `get_file_content()`
 - **插入位置**：`att = await svc.get_attachment(...)`（:166）拿到元数据后、`blob_store.get(...)`（:172）取字节**之前**。
-- **做法**：以 `att.id` 为 `resource_id`、附件类型为 `resource_type`，调 foundation-dlp `POST /core/check:download`（带 `user_id` + `user_clearance`）。判定为拒绝则在落字节前返回 403。
+- **做法**：以 `att.id` 为 `resource_id`、附件类型为 `resource_type`，调 foundation-dlp `POST /core/check:download`（header 带 `X-User-Id`，body 只有 `{resource_type, resource_id, destination}`，clearance 由 DLP 自查）。判定为拒绝则在落字节前返回 403。
 - **覆盖面**：这是用户/agent 读取任何文件内容的**唯一入口**，对 input（上传）和 output（产物）都生效——是整条防线的咽喉。
 
 #### P0-2　上传/入库时 `scan`
 - **挂载点**：`attachments.py:52` `upload_attachment()`
 - **插入位置**：`data = await file.read()`（:67）后、`blob_store.put(...)`（:92）写 S3 **之前**。
 - **做法**：拿 `data`/`filename`/`mime` 调 `POST /core/scan`；命中高敏感则**拒绝上传**或**自动打 classification 密级标**（推荐后者：入库即标密，下载时再凭标做 check:download）。
+- **已实现**：采用后者，先 scan 再写 blob。scan 以 `X-Actor: SERVICE` 发出，DLP 直接把命中级别写成标签，不再单独调 `classification:tag`；DLP 只让 SERVICE/ADMIN 写标签。
 
 #### P0-3　run 产物入库时 scan + 标密
 - **挂载点**：`services/session-orchestrator/src/agent_session_orchestrator/api/v1/messages.py:544` `_persist_artifacts()`（在 `_reconcile_run_completion` 内）
@@ -74,9 +78,7 @@
 #### P0 配套：orchestrator 接入 foundation-dlp 的工程改动
 - orchestrator 的 `config.py` **当前没有** `foundation_dlp_url`，需仿照已有的 `authz_url` 新增。
 - 调用范式照搬 authz guard：`services/session-orchestrator/src/agent_session_orchestrator/api/authz_guard.py:76` —— 裸 `httpx.AsyncClient`、`X-Tenant-Id` 走 header（不进 body）、紧 timeout。
-- **fail-open vs fail-closed 决策点（必须显式定）**：authz 是 fail-closed（错→403）；但 run 链路里 `_fetch_memory`/`_persist_artifacts` 惯例是 fail-open。建议：
-  - **下载 check（P0-1）**：倾向 fail-closed 或「fail-open 但告警」——这是防泄漏的最后一道闸，但也要权衡 DLP 故障时是否要堵死所有下载。**需产品决策**。
-  - **入库 scan（P0-2/3）**：fail-open（DLP 挂了不应阻断业务写入），但记录扫描失败事件。
+- **fail-open vs fail-closed（已定，2026-10-30）**：由 `DLP_FAILURE_MODE` 决定，默认 `closed`，下载和入库 scan 都适用，细节见第七节。原先「入库 scan fail-open」的建议作废：没扫过的文件没有标签，下载时只按 L3 判，等于绕过了标签。助手回复是例外：它在 run 过程中已经流式推给用户，scan 失败时照常落库、不打标签，记 ERROR 以便重扫。
 - **不要走 BFF admin 代理**：BFF 的 `check:read`/`check:download` 挂在 `require_super_admin_bff` 下，只适合后台手动核验；每次下载的内联拦截应由 orchestrator **直连** foundation-dlp。
 
 ### P1 — 默认规则库（让空膛的枪装上弹匣）
@@ -134,7 +136,22 @@ P0 工程接入   ──┘
 
 ## 六、待决策项（需产品/安全拍板）
 
-1. **下载 check 的 fail-open / fail-closed**：DLP 故障时，堵死所有下载还是放行+告警？
-2. **入库命中高敏感时**：拒绝上传，还是放行但强制打密级标？
+1. ~~**下载 check 的 fail-open / fail-closed**~~：已定，默认 fail-closed，`DLP_FAILURE_MODE=open` 可改为放行+告警（第七节）。
+2. ~~**入库命中高敏感时**~~：已定，放行并由 DLP 打密级标，下载时凭标准入。
 3. **默认规则的密级映射**：身份证/银行卡/密钥分别对应 L 几，影响下载准入。
 4. **是否扫消息正文**：还是只扫文件（性能/隐私权衡）。
+5. ~~**worker 工具调用的拦截门槛**~~：已定（2026-10-30），只拦 `QUARANTINE`（L4 及以上）；`SCAN_REQUIRED`（L2/L3，例如工具入参里的邮箱、手机号）放行，记一条带规则名的告警；契约之外的 action 按 `DLP_FAILURE_MODE` 处理。
+
+## 七、失败策略与上线顺序（2026-10-30）
+
+DLP 检查无法完成（不可达、2 秒超时、非 2xx、响应无法解析）时的处理：
+
+| 组件 | 配置 | DLP 地址为空 | 正常应答 | 无法完成 + `closed`（默认） | 无法完成 + `open` |
+|---|---|---|---|---|---|
+| worker（PreToolUse） | `DLP_URL` / `DLP_FAILURE_MODE`，由 scheduler 的 `SCHEDULER_DLP_URL` / `SCHEDULER_DLP_FAILURE_MODE` 下发到沙箱 | 全部放行，启动时记一次 | 只拦 `QUARANTINE`，原因带规则名；`SCAN_REQUIRED` 放行并告警 | 拒绝工具调用 | 放行，每次 `console.error` |
+| session-orchestrator（附件、工作区文件） | `SESSION_ORCHESTRATOR_FOUNDATION_DLP_URL` / `SESSION_ORCHESTRATOR_DLP_FAILURE_MODE` | 全部放行，启动时记 WARNING | 下载 `allowed=false` → 403；上传命中照常存，由 DLP 打标 | 503 `AGENT.DLP.UNAVAILABLE`，上传什么都不存，下载不发字节 | 放行，每次记 ERROR |
+
+- 生效策略在服务启动时写进日志；无法识别的 `DLP_FAILURE_MODE` 按 `closed` 处理（scheduler 直接拒绝启动）。
+- docker compose 用一个 `DLP_FAILURE_MODE`（默认 `closed`）同时喂 scheduler 和 orchestrator；helm 用 `global.foundation.dlpFailureMode`。
+- **上线顺序**：先部署（或同时部署）新版 foundation-dlp（任何带租户上下文的调用方都能从 `/core/scan` 拿到判定，只有 SERVICE/ADMIN 写标签），再上新的沙箱镜像和 orchestrator。旧版 DLP 对 worker 的 scan 一律 403，而新 worker 默认 `closed`，会拒绝所有工具调用。
+- **管理后台**：BFF 的 `/admin/dlp/classification:tag` 以 `X-Actor: ADMIN` 发出；`/admin/dlp/scan` 故意不带，只给判定、记事件，不写标签（管理员扫的是自己粘贴的文本，空 resource id 还会落成 `adhoc-scan` 占位）。

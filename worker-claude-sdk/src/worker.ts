@@ -41,7 +41,12 @@ import { HISTORY_OMITTED, type Env, type Task } from "./task.js";
 import type { RedisStateClient } from "./redis_state.js";
 import { appendEvent, writeResult, type Usage } from "./result.js";
 import { EventTranslator, type EventPayload } from "./event_translator.js";
-import { scanToolCall } from "./dlp.js";
+import {
+  decideUnscanned,
+  resolveDlpPolicy,
+  scanToolCall,
+  type DlpDecision,
+} from "./dlp.js";
 import {
   ASK_USER_TOOL,
   buildReplayPrompt,
@@ -51,6 +56,7 @@ import {
   recordTranscriptText,
   recordTranscriptToolCall,
   recordTranscriptToolResult,
+  resumedUsage,
   snapshotTranscriptForPause,
   type HitlContext,
   type PendingToolCall,
@@ -913,11 +919,13 @@ export async function buildResumeContext(
 
 /**
  * Build the PreToolUse hook for this run. Each tool call is scanned by
- * Foundation-DLP (see dlp.ts): a non-ALLOW verdict denies the call, everything
- * else allows. The hook is **fail-OPEN at two layers**:
- *   1. dlp.ts fails open on DLP unset / unreachable / timeout / non-2xx / bad JSON.
- *   2. any unexpected throw inside the hook itself is caught here → allow, so a
- *      hook bug can never hard-block the agent.
+ * Foundation-DLP and allowed or denied by the decision table in dlp.ts:
+ * DLP_URL unset → allow (DLP disabled); clean → allow; an L2/L3 hit
+ * (SCAN_REQUIRED) → allow with a warning; an L4+ hit (QUARANTINE) → deny; a scan
+ * that cannot complete → deny under DLP_FAILURE_MODE=closed (the default), or
+ * allow with an error log under DLP_FAILURE_MODE=open. An unexpected throw inside
+ * the hook means the call was not scanned, so it gets the same failure-mode
+ * treatment rather than a silent allow.
  *
  * Identity headers mirror the authenticated MCP-registry fetch (x-tenant-id +
  * conditional x-tool-broker-lease) so the scan works through the broker façade.
@@ -925,22 +933,23 @@ export async function buildResumeContext(
 export function makeDlpPreToolUse(
   env: Env,
 ): (input: HookInput) => Promise<HookJSONOutput> {
+  const policy = resolveDlpPolicy(env);
   return async function dlpPreToolUse(
     input: HookInput,
   ): Promise<HookJSONOutput> {
-    try {
-      // The SDK only registers this under PreToolUse, so the input carries
-      // tool_name / tool_input / tool_use_id; narrow defensively all the same.
-      const toolName =
-        "tool_name" in input ? String(input.tool_name ?? "") : "";
-      const toolInput = "tool_input" in input ? input.tool_input : undefined;
-      const toolUseId =
-        "tool_use_id" in input ? String(input.tool_use_id ?? "") : "";
+    // The SDK only registers this under PreToolUse, so the input carries
+    // tool_name / tool_input / tool_use_id; narrow defensively all the same.
+    const toolName = "tool_name" in input ? String(input.tool_name ?? "") : "";
+    const toolUseId =
+      "tool_use_id" in input ? String(input.tool_use_id ?? "") : "";
 
-      const { decision, reason } = await scanToolCall({
-        dlpUrl: env.DLP_URL,
+    let result: DlpDecision;
+    try {
+      result = await scanToolCall({
+        dlpUrl: policy.url,
+        failureMode: policy.failureMode,
         toolName,
-        toolInput,
+        toolInput: "tool_input" in input ? input.tool_input : undefined,
         toolUseId,
         headers: {
           apiToken: env.FOUNDATION_API_TOKEN,
@@ -950,32 +959,33 @@ export function makeDlpPreToolUse(
             : {}),
         },
       });
-
-      // A PreToolUse hook that returns an explicit `permissionDecision: "allow"`
-      // SHORT-CIRCUITS the SDK permission flow and the `canUseTool` callback is
-      // never consulted — which would silently disable the HITL gate (every MCP
-      // tool / ask_user call would auto-run instead of pausing). So on a clean
-      // scan we assert NO permission decision and let `canUseTool` decide. Only
-      // a real DLP hit emits a `deny` (which canUseTool can't override anyway).
-      if (decision === "deny") {
-        return {
-          hookSpecificOutput: {
-            hookEventName: "PreToolUse",
-            permissionDecision: "deny",
-            permissionDecisionReason: reason,
-          },
-        };
-      }
-      return { continue: true };
     } catch (err) {
-      // fail-OPEN: a hook bug must never block the agent. Stay silent on the
-      // permission decision (same rationale as the clean-scan path above) so a
-      // hook error doesn't accidentally bypass the HITL canUseTool gate.
-      console.warn(
-        `[worker] DLP PreToolUse hook threw (fail-open, allowing): ${(err as Error).message}`,
-      );
-      return { continue: true };
+      // scanToolCall never throws by design; if it does, the call was not
+      // scanned — apply the failure mode instead of silently allowing.
+      result = policy.url
+        ? decideUnscanned(policy.failureMode, toolName, `${toolName}:${toolUseId}`, {
+            cause: "an internal error in the DLP check",
+            detail: `hook threw: ${(err as Error)?.message ?? String(err)}`,
+          })
+        : { decision: "allow", reason: "DLP disabled" };
     }
+
+    // A PreToolUse hook that returns an explicit `permissionDecision: "allow"`
+    // SHORT-CIRCUITS the SDK permission flow and the `canUseTool` callback is
+    // never consulted — which would silently disable the HITL gate (every MCP
+    // tool / ask_user call would auto-run instead of pausing). So an allowed
+    // call asserts NO permission decision and lets `canUseTool` decide. Only a
+    // deny is emitted (which canUseTool can't override anyway).
+    if (result.decision === "deny") {
+      return {
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "deny",
+          permissionDecisionReason: result.reason,
+        },
+      };
+    }
+    return { continue: true };
   };
 }
 
@@ -989,7 +999,7 @@ export function makeDlpPreToolUse(
  * (true exposure), so this hook only needs to reason about allow.
  *
  * Returns `null` when no server has an allow list, so runQuery can skip wiring
- * an extra hook in the common case. Like the DLP hook, it is fail-OPEN: any
+ * an extra hook in the common case. Unlike the DLP hook, it is fail-OPEN: any
  * unexpected throw returns `{continue:true}` so a hook bug can never hard-block
  * the agent, and an allowed/non-MCP tool stays silent (`{continue:true}`) so the
  * HITL canUseTool gate and DLP hook still run (never returns
@@ -1281,7 +1291,8 @@ export async function runQuery(
   },
 ): Promise<RunResult> {
   const queryFn = opts.deps?.queryFn ?? query;
-  const translator = new EventTranslator();
+  // A resumed leg counts on from the usage its paused leg reached.
+  const translator = new EventTranslator(resumedUsage(task));
 
   // Ensure workspace I/O dirs + events.jsonl exist before the loop.
   await ensureDirs();
@@ -1675,8 +1686,9 @@ async function handlePause(
   const pending: PendingToolCall[] = ctx.pending;
   const kind = ctx.kind === "question" ? "question" : "confirm";
 
-  // Our replay transcript → agent_state (opaque to the orchestrator).
-  const replayState: ReplayState = snapshotTranscriptForPause(task, acc, pending);
+  // Our replay transcript → agent_state (opaque to the orchestrator), with the
+  // run's usage so far for the resumed leg to count on from.
+  const replayState: ReplayState = snapshotTranscriptForPause(task, acc, pending, usage);
 
   await redis.writePaused({
     kind,
