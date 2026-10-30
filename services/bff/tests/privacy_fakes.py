@@ -5,12 +5,19 @@ authz, session-orchestrator, knowledge-ingest, cron-runner, identity,
 llm-gateway, data-protection and audit — with just enough state to check that an export
 reads, and an erasure deletes, the right person's data.  Every call is
 recorded; ``down`` / ``status`` inject failures per service.
+
+``FakeS3`` stands in for the erasure-ledger bucket (Object Lock: a stored key
+can't be rewritten); ``install_ledger`` points the ledger at it.
 """
 
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
+import json
 import re
+import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
@@ -25,6 +32,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from agent_bff.config import Settings
 from agent_bff.domain import db as db_module
+from agent_bff.domain import erasure_ledger
+from agent_bff.domain.erasure_ledger import LedgerEntry
 from agent_bff.domain.models import (
     ApiKey,
     Base,
@@ -378,6 +387,98 @@ def install_fake(monkeypatch: pytest.MonkeyPatch, fake: FakePlatform) -> FakePla
 
     monkeypatch.setattr(httpx, "AsyncClient", _FakeAsyncClient)
     return fake
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Erasure-ledger bucket fake
+# ─────────────────────────────────────────────────────────────────────────────
+
+LEDGER_BUCKET = "privacy-ledger-test"
+
+
+class FakeS3:
+    """In-memory ledger bucket with Object Lock: a stored key can't be rewritten.
+
+    ``fail`` makes every call raise it; ``on_put`` runs before each write, so a
+    test can look at what had already happened when the entry was written.
+    """
+
+    def __init__(self, page_size: int = 1000) -> None:
+        self.objects: dict[str, bytes] = {}
+        self.puts: list[dict[str, Any]] = []
+        self.page_size = page_size
+        self.fail: Exception | None = None
+        self.on_put: Callable[[], None] | None = None
+
+    def _check(self) -> None:
+        if self.fail is not None:
+            raise self.fail
+
+    def put_object(self, **kw: Any) -> dict[str, Any]:
+        self._check()
+        if self.on_put is not None:
+            self.on_put()
+        assert kw["Bucket"] == LEDGER_BUCKET
+        body = kw["Body"]
+        assert kw["ContentMD5"] == base64.b64encode(hashlib.md5(body).digest()).decode()
+        if kw["Key"] in self.objects:
+            raise RuntimeError("AccessDenied: the object is WORM protected")
+        self.objects[kw["Key"]] = body
+        self.puts.append(kw)
+        return {}
+
+    def list_objects_v2(self, **kw: Any) -> dict[str, Any]:
+        self._check()
+        assert kw["Bucket"] == LEDGER_BUCKET
+        keys = sorted(
+            key for key in self.objects
+            if key.startswith(kw.get("Prefix", "")) and key > kw.get("StartAfter", "")
+        )
+        start = int(kw.get("ContinuationToken", "0"))
+        page = keys[start:start + self.page_size]
+        truncated = start + self.page_size < len(keys)
+        response: dict[str, Any] = {"IsTruncated": truncated}
+        if page:  # S3 leaves "Contents" out of an empty page
+            response["Contents"] = [{"Key": key} for key in page]
+        if truncated:
+            response["NextContinuationToken"] = str(start + self.page_size)
+        return response
+
+    def get_object(self, **kw: Any) -> dict[str, Any]:
+        self._check()
+        return {"Body": io.BytesIO(self.objects[kw["Key"]])}
+
+    def entries(self) -> list[dict[str, Any]]:
+        """Stored entries, oldest first."""
+        return [json.loads(self.objects[key]) for key in sorted(self.objects)]
+
+
+def install_ledger(monkeypatch: pytest.MonkeyPatch, s3: FakeS3) -> FakeS3:
+    """Make every ``ErasureLedger`` talk to ``s3`` instead of a real bucket."""
+    monkeypatch.setattr(erasure_ledger, "_s3_client", lambda **_kw: s3)
+    return s3
+
+
+def add_ledger_entry(
+    s3: FakeS3,
+    *,
+    at: datetime,
+    tenant_id: str,
+    user_id: str,
+    via: str = "self_service",
+    actor_user_id: str | None = None,
+) -> LedgerEntry:
+    """Store an entry as if it had been recorded at ``at``."""
+    entry = LedgerEntry(
+        entry_id=uuid.uuid4().hex,
+        requested_at=at,
+        tenant_id=tenant_id,
+        user_id=user_id,
+        via=via,
+        actor_user_id=actor_user_id or user_id,
+    )
+    s3.objects[entry.key] = entry.to_json()
+    return entry
 
 
 def assert_valid_audit_event(event: dict[str, Any]) -> None:

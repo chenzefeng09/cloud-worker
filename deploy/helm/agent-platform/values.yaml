@@ -134,6 +134,17 @@ bff:
     cookieMaxAge: "86400"
     cookieSecure: "true"
     corsOrigins: ""           # 如 https://agent-platform.example.com
+    # GDPR 擦除台账（domain/erasure_ledger.py）：每次擦除执行前先写入这里，备份恢复后用
+    # `python -m agent_bff.erasure_replay` 重放（docs/runbook/backup-restore-b-m6.md §3.7）。
+    # 桶必须在创建时开启 Object Lock，且不在任何恢复范围内。凭据放 existingSecret 的
+    # BFF_PRIVACY_LEDGER_S3_ACCESS_KEY_ID / BFF_PRIVACY_LEDGER_S3_SECRET_ACCESS_KEY，
+    # 或不配、走 Pod 自身的云角色（如 IRSA）。
+    # bucket 留空 = 不记台账：擦除照常执行，但恢复备份后无法重放。
+    privacyLedger:
+      bucket: ""
+      endpointUrl: ""         # 留空 = AWS S3；MinIO 如 http://minio:9000
+      region: ""              # 留空 = us-east-1（MinIO 默认）
+      retentionDays: 365      # COMPLIANCE 锁定天数；须长于任何仍可能被恢复的备份的保留期
   existingSecret: ""          # 若设置，从此 Secret 注入 BFF_COOKIE_SECRET 等敏感值
   env: []
 

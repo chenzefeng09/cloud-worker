@@ -102,14 +102,15 @@ services:
     networks: [foundation]
 
   # ===========================================================================
-  # minio-init — creates the "agent-platform" S3 bucket on foundation-minio
+  # minio-init — creates the "agent-platform" S3 bucket on foundation-minio,
+  # plus the Object-Locked GDPR erasure ledger bucket the BFF writes to
   #
   # foundation-minio lives in the saas-foundation compose project; docker-
   # compose forbids depends_on across projects, so we cannot gate on its
   # healthcheck here.  Instead we loop until `mc alias set` succeeds (retries
   # every 2 s, up to 30 attempts / ~60 s) so start-order doesn't matter.
-  # The four storage-using services (knowledge-ingest, skill-store,
-  # session-orchestrator, agent-scheduler) declare
+  # The storage-using services (knowledge-ingest, skill-store,
+  # session-orchestrator, agent-scheduler, bff) declare
   #   depends_on: { minio-init: { condition: service_completed_successfully } }
   # which IS valid within the same compose project.
   # ===========================================================================
@@ -136,6 +137,9 @@ services:
         done
         mc mb --ignore-existing local/agent-platform
         echo "=== minio-init: agent-platform bucket ready ==="
+        # Object Lock can only be switched on when a bucket is created.
+        mc mb --ignore-existing --with-lock local/agent-platform-privacy-ledger
+        echo "=== minio-init: agent-platform-privacy-ledger bucket ready (Object Lock) ==="
     networks: [foundation]
 
   mcp-registry-migrate:
@@ -615,6 +619,17 @@ services:
       # Inbound-webhook receiver re-enters this same process's /apps/{id}/run
       # over HTTP (machine path); localhost reaches this uvicorn in-container.
       BFF_SELF_URL: http://localhost:8005
+      # GDPR erasure ledger (domain/erasure_ledger.py): every erasure request is
+      # written here before it runs, so that after a backup restore
+      # `python -m agent_bff.erasure_replay` can erase the restored rows again
+      # (docs/runbook/backup-restore-b-m6.md §3.7).  Entries are COMPLIANCE-
+      # locked for BFF_PRIVACY_LEDGER_RETENTION_DAYS (default 365): not even
+      # the MinIO root user can delete one before then.
+      BFF_PRIVACY_LEDGER_S3_BUCKET: agent-platform-privacy-ledger
+      BFF_PRIVACY_LEDGER_S3_ENDPOINT_URL: http://foundation-minio:9000
+      BFF_PRIVACY_LEDGER_S3_REGION: us-east-1
+      BFF_PRIVACY_LEDGER_S3_ACCESS_KEY_ID: ${MINIO_ROOT_USER:-foundation}
+      BFF_PRIVACY_LEDGER_S3_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD:-minio_change_me_min_12_chars}
     ports:
       - "${PORT_BFF:-8005}:8005"
     networks: [foundation]
@@ -625,6 +640,8 @@ services:
       retries: 10
     depends_on:
       bff-migrate:
+        condition: service_completed_successfully
+      minio-init:
         condition: service_completed_successfully
       session-orchestrator:
         condition: service_healthy

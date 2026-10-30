@@ -375,6 +375,8 @@ def test_erase_emits_an_audit_event_with_counts_only(
     assert event["tenant_id"] == TENANT
     assert event["payload"] == {
         "via": "self_service",
+        # No ledger bucket configured: erased, but a backup restore can't replay it.
+        "ledger": "not_configured",
         "succeeded": ["schedules", "platform", "memories", "llm_preferences", "bff"],
         "schedules_deleted": 2,
         "platform_deleted": {"sessions": 2, "messages": 7, "workspaces": 1},
