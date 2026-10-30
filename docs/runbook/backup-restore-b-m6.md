@@ -505,7 +505,7 @@ docker compose -f dev.yml run --rm migration-runner
 
 > 为什么不用审计日志当台账：foundation-audit 的事件虽然能按类型和时间查询，但 ① 只能按单个租户查；② 它的 Postgres outbox 与 ClickHouse 都在恢复范围内，会随恢复一起回退——丢掉的恰好是需要重放的那一段；③ 隐私事件级别是 NOTICE，不进 WORM 桶；④ 写审计是 best-effort，失败不阻断擦除。
 
-**时机**：所有数据源恢复完成、migration 跑完（§3.6），foundation 服务与 session-orchestrator / agent-scheduler / knowledge-ingest / cron-runner 已启动之后；**bff 启动、对外开放流量之前**。
+**时机**：所有数据源恢复完成、migration 跑完（§3.6），foundation 服务（含 llm-gateway）与 session-orchestrator / agent-scheduler / knowledge-ingest / cron-runner / app-registry 已启动之后；**bff 启动、对外开放流量之前**。
 
 **确定 `--since`**：
 
@@ -535,7 +535,8 @@ kubectl -n agent-platform exec deploy/ap-bff -- \
 ```
 
 - `--actor`：执行恢复的超级管理员自己的平台用户 ID（`usr_` 开头），记入审计。
-- 对台账里的每个用户，重放执行与管理员擦除相同的步骤（定时任务 → 会话 / 工作区 / 文件 → 记忆 → bff 本地数据），以 `X-Actor: ADMIN` 进入该用户所在的租户；同一用户在台账里出现多次只擦一次；每个用户写一条审计事件 `admin.privacy.user.erasure_replayed`（只含计数）。
+- 对台账里的每个用户，重放执行与管理员擦除相同的流程，以 `X-Actor: ADMIN` 进入该用户所在的租户：先做一遍不改任何数据的预检（各服务的 dry run / 列表），全部通过后再按顺序删除（定时任务 → 会话 / 工作区 / 文件 → 记忆 → LLM 模型偏好 → App → bff 本地数据）。同一用户在台账里出现多次只擦一次；每个用户写一条审计事件 `admin.privacy.user.erasure_replayed`（只含计数）。
+- App：只有作者自己能用的 App（私有，或从未发布）整个删除；已共享给租户的 App 保留，作者和审核记录里的该用户改为 `erased-user`。
 - 每一步都是幂等的，重复执行无害。
 - 预览时检查：报告里 `ledger_entries` 为 0 时，先确认台账桶是原来的桶（或已从副本取回），而不是 minio-init 刚建的空桶——空台账会让重放"成功"，却什么都没擦。
 
@@ -544,12 +545,11 @@ kubectl -n agent-platform exec deploy/ap-bff -- \
 | 退出码 | 含义 | 处理 |
 |---|---|---|
 | 0 | 台账里每个用户都已重新擦除（`--dry-run`：没有删除任何数据） | 启动 bff，开放流量 |
-| 1 | 至少一个用户没擦完：报告里该用户 `status` 为 `incomplete`，`failed` 是失败的步骤，`error` 是原因 | 修好对应服务后用**同样的参数**重跑；exit 0 之前不得开放流量 |
+| 1 | 至少一个用户没擦完：报告里该用户 `status` 为 `incomplete`，`failed` 是失败的步骤，`error` 是原因；带 `"phase": "preflight"` 的是预检没通过，该用户什么都没删 | 修好对应服务后用**同样的参数**重跑；exit 0 之前不得开放流量 |
 | 2 | 参数错误、未配置台账（`BFF_PRIVACY_LEDGER_S3_BUCKET` 为空）或台账读不了 | 没有删除任何数据；修好后重跑 |
 
 **已知缺口**（重放覆盖不到，需另行处理）：
 
-- **LLM 模型偏好**：llm-gateway 只接受用户本人调用，管理员路径清不掉，报告里记为 `"skipped": {"llm_preferences": "not_supported"}`；恢复后这些用户的模型偏好会回来，需要 llm-gateway 提供管理员删除接口（saas-foundation 跟进项）。
 - **登录账号本身**：擦除不删 Keycloak / identity 账号（由管理员另行关闭）；恢复 keycloak 库后，已关闭的账号可能重新出现，需按管理员的关闭记录复核。
 - **MinIO 镜像里的旧对象**：`mc mirror` 不带 `--remove`，副本保留了源桶里已删除的对象。整站恢复（§3.3 步骤 4）会把恢复点**之前**就已擦除的用户文件作为无引用对象带回来；擦除按数据库行的引用删除文件，重放删不到它们。需要调整镜像策略（跟进项）。
 - **未配置台账期间的擦除**：`BFF_PRIVACY_LEDGER_S3_BUCKET` 为空时擦除照常执行但不记台账（bff 记 warning 日志，审计 payload 带 `"ledger": "not_configured"`），这些擦除无法重放。
