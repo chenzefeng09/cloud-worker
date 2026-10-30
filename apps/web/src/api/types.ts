@@ -2046,11 +2046,6 @@ export interface SoftDeleteRequest {
   resource_name?: string | null;
 }
 
-export interface HardDeleteRequest {
-  destroyed_by: string;
-  witness_user_id?: string | null;
-}
-
 export interface SweepResult {
   destroyed?: number;
   [key: string]: unknown;
@@ -2071,9 +2066,55 @@ export interface PlaceLegalHoldRequest {
   case_reference?: string | null;
 }
 
-export interface ReleaseLegalHoldRequest {
-  released_by: string;
+// Four-eyes approval (lifecycle-v1 §4.4): hard-delete and legal-hold release
+// only open an approval request. A second admin carries it out by approving it
+// before it expires; the requester can't approve it, but anyone may reject it.
+// Requester and approver are the signed-in user, so neither call takes a body.
+
+export type ApprovalOperation = 'HARD_DELETE' | 'RELEASE_LEGAL_HOLD';
+
+/** EXPIRED once the window closes with nobody deciding. */
+export type ApprovalStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED';
+
+export interface ApprovalRequest {
+  id: string;
+  operation: ApprovalOperation;
+  /** The recycle-bin entry (bin id) to destroy, or the legal hold (hold id) to release. */
+  target_id: string;
+  status: ApprovalStatus;
+  /** Who asked; once approved, recorded as who destroyed or released. */
+  requested_by: string;
+  requested_at: string;
+  /** The approval window closes then. */
+  expires_at: string;
+  /** Who approved or rejected; for HARD_DELETE the approver is the destruction certificate's witness. */
+  decided_by: string | null;
+  decided_at: string | null;
 }
+
+export interface ApprovalRequestPage {
+  items: ApprovalRequest[];
+  next_cursor: string | null;
+}
+
+export interface ApprovalRequestListParams {
+  status?: ApprovalStatus;
+  operation?: ApprovalOperation;
+  cursor?: string;
+  limit?: number;
+}
+
+/** 202: an approval request was opened (or the one already pending returned,
+ *  whoever opened it). 200: the entry is already destroyed. */
+export type HardDeleteResult =
+  | { destroyed: false; approval_request: ApprovalRequest }
+  | { destroyed: true };
+
+/** 202: an approval request was opened (or the pending one returned). 200: the
+ *  hold is already released. */
+export type ReleaseLegalHoldResult =
+  | { released: false; approval_request: ApprovalRequest }
+  | { released: true };
 
 // ─── Data protection (→ foundation-data-protection) ─────────────────────────────
 
