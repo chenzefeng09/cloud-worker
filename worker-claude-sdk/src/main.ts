@@ -327,6 +327,9 @@ export async function main(deps: MainDeps = {}): Promise<number> {
 
     // Mark the run RUNNING before dispatch (first checkpoint write).
     await redis.writeStep({ cursor: "start", status: "RUNNING" });
+    // From here until the run ends, a quiet stretch (a long tool call) must not
+    // let the run's Redis keys expire under it.
+    redis.startHeartbeat();
     const downloaded = await downloadAttachments(task, env);
     // task.mcp_server_ids is three-state: undefined => tenant default (every
     // enabled server, the historical behaviour), [] => MCP off for this run,

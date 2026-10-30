@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import json
 import logging
 from typing import Any
 
@@ -71,6 +72,15 @@ logger = logging.getLogger(__name__)
 
 _MEMORY_SEARCH_K = 5  # top-K memory hits to inject
 _KNOWLEDGE_SEARCH_K = 5  # top-K tenant-knowledge hits to inject
+
+# The scheduler hands the worker each dispatch as one JSON document, and the
+# cube runtime passes it in a single environment variable.  Linux caps one at
+# 128 KiB (MAX_ARG_STRLEN); past that the worker never starts while the
+# scheduler still reports success.  Every dispatch (the first leg and each
+# resume leg) is kept under this budget, with headroom for what the scheduler
+# adds, by dropping the oldest history (see ``_fit_dispatch_history``).
+_DISPATCH_MAX_BYTES = 112 * 1024
+_HISTORY_OMITTED = "history_omitted"
 
 
 def _effective_clearance(user_clearance: str, workspace_sensitivity: str | None) -> str:
@@ -417,6 +427,64 @@ async def _assemble_history(
                 history.append({"role": "tool", "type": "tool", "tool": tool})
         # SYSTEM rows are intentionally skipped.
     return history
+
+
+def _json_size(value: Any) -> int:
+    """UTF-8 bytes of ``value`` serialised the way the scheduler serialises the task."""
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8"))
+
+
+def _history_omitted_marker(count: int) -> dict[str, Any]:
+    return {
+        "role": "system",
+        "type": _HISTORY_OMITTED,
+        "omitted": count,
+        "content": (
+            f"[{count} earlier message(s) omitted: "
+            "the conversation is too long to send in full]"
+        ),
+    }
+
+
+def _fit_dispatch_history(payload: dict[str, Any], *, run_id: str) -> None:
+    """Keep ``payload`` under ``_DISPATCH_MAX_BYTES`` by dropping its oldest history.
+
+    The dropped items are replaced (in place) by one leading marker item that
+    says how many are gone, so the worker can tell the model the conversation is
+    incomplete instead of its start vanishing silently.  A marker from an earlier
+    fit (a resume leg re-sends the stored dispatch) is merged, not stacked.
+    """
+    history = payload.get("history")
+    if not isinstance(history, list) or _json_size(payload) <= _DISPATCH_MAX_BYTES:
+        return
+    items = list(history)
+    omitted = 0
+    if items and isinstance(items[0], dict) and items[0].get("type") == _HISTORY_OMITTED:
+        prior = items.pop(0).get("omitted")
+        omitted = prior if isinstance(prior, int) else 0
+    # Size everything but the history items once (with the widest marker the
+    # result can carry), then keep the newest items that still fit; each item
+    # costs its own size plus the ", " separator.
+    payload["history"] = [_history_omitted_marker(omitted + len(items))]
+    room = _DISPATCH_MAX_BYTES - _json_size(payload)
+    keep = 0
+    for item in reversed(items):
+        room -= _json_size(item) + 2
+        if room < 0:
+            break
+        keep += 1
+    dropped = len(items) - keep
+    payload["history"] = [_history_omitted_marker(omitted + dropped), *items[dropped:]]
+    logger.warning(
+        "run dispatch over %d bytes: dropped the %d oldest history item(s)",
+        _DISPATCH_MAX_BYTES, dropped, extra={"run_id": run_id},
+    )
+    if _json_size(payload) > _DISPATCH_MAX_BYTES:
+        logger.warning(
+            "run dispatch still over %d bytes with no history left; a runtime that "
+            "passes the task in the environment cannot start it",
+            _DISPATCH_MAX_BYTES, extra={"run_id": run_id},
+        )
 
 
 async def _get_scheduler_url(request: Request) -> str:
@@ -783,6 +851,7 @@ async def create_run(
     # "[] -> disable all", and a null would collapse that distinction.
     if run_mcp_server_ids is not None:
         scheduler_body["mcp_server_ids"] = run_mcp_server_ids
+    _fit_dispatch_history(scheduler_body, run_id=run.id)
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -1345,6 +1414,8 @@ async def respond_run(
             "agent_state": agent_state,
         },
     )
+    # The resume payload makes this leg bigger than the first one was.
+    _fit_dispatch_history(dispatch, run_id=run_id)
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:

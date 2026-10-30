@@ -20,10 +20,21 @@ export interface FileSpec {
   mime: string;
 }
 
-/** One prior conversation turn. `tool` is present on tool turns only. */
+/**
+ * `HistoryItem.type` of the item the orchestrator puts first when it had to
+ * leave the oldest turns out of the task to keep it under its size limit.
+ */
+export const HISTORY_OMITTED = "history_omitted";
+
+/**
+ * One prior conversation turn. `tool` is present on tool turns only; a
+ * `history_omitted` item (role "system") stands for `omitted` earlier turns.
+ */
 export interface HistoryItem {
-  role: "user" | "assistant" | "tool";
+  role: "user" | "assistant" | "tool" | "system";
+  type?: string;
   content?: string;
+  omitted?: number;
   tool?: {
     id: string;
     name: string;

@@ -10,9 +10,13 @@ import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AbortError } from "@anthropic-ai/claude-agent-sdk";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { RedisStateClient, type StateTransport } from "../src/redis_state.js";
+import {
+  HEARTBEAT_INTERVAL_MS,
+  RedisStateClient,
+  type StateTransport,
+} from "../src/redis_state.js";
 import { main } from "../src/main.js";
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -307,6 +311,74 @@ describe("main", () => {
       { type: "delta", text: "hi back" },
       { type: "end", text: "", status: "completed" },
     ]);
+  });
+
+  it("a tool call that stays silent past the keep-alive interval leaves a heartbeat", async () => {
+    setEnv(REQUIRED_ENV);
+    setEnv({ AGENT_TASK_JSON: JSON.stringify({ task: "run the import", hitl: false }) });
+    const { redis, wire } = wireRedis();
+    let announced: () => void = () => {};
+    const toolCallWritten = new Promise<void>((resolve) => {
+      announced = resolve;
+    });
+    const record = wire.xadd.bind(wire);
+    wire.xadd = async (fields: Record<string, string>) => {
+      await record(fields);
+      if (fields.type === "tool_call") announced();
+    };
+    let finishTool: () => void = () => {};
+    const toolDone = new Promise<void>((resolve) => {
+      finishTool = resolve;
+    });
+    const usage = { input_tokens: 10, output_tokens: 5 };
+    const queryFn = () =>
+      (async function* () {
+        yield {
+          type: "assistant",
+          message: {
+            id: "m1",
+            content: [{ type: "tool_use", id: "tu_1", name: "mcp__etl__run", input: {} }],
+            usage,
+          },
+        } as AnyMsg;
+        await toolDone; // the tool runs for a long time, writing nothing
+        yield {
+          type: "user",
+          message: { content: [{ type: "tool_result", tool_use_id: "tu_1", content: "imported" }] },
+        } as AnyMsg;
+        yield {
+          type: "assistant",
+          message: { id: "m2", content: [{ type: "text", text: "Done." }], usage },
+        } as AnyMsg;
+        yield { type: "result", subtype: "success" } as AnyMsg;
+      })() as AnyMsg;
+
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+    try {
+      const running = main({
+        makeRedis: () => redis,
+        makeAdapter: () => new FakeAdapter() as never,
+        queryFn: queryFn as never,
+      });
+      await toolCallWritten;
+      await vi.advanceTimersByTimeAsync(HEARTBEAT_INTERVAL_MS);
+      finishTool();
+      expect(await running).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(wire.entries.map((e) => e.type)).toEqual([
+      "tool_call",
+      "heartbeat",
+      "tool_result",
+      "delta",
+      "end",
+    ]);
+    // The state blob written at the tool call was re-set by the heartbeat.
+    const states = wire.sets.filter((s) => s.key === "agent:run:run:state").map((s) => s.value);
+    expect(states[2]).toBe(states[1]);
+    expect(JSON.parse(states[1]).status).toBe("RUNNING");
   });
 
   describe("early failures reach the token stream", () => {

@@ -169,6 +169,32 @@ describe("makeCanUseTool", () => {
     ]);
   });
 
+  it("matches the approved call however its stored args were re-serialised", async () => {
+    // What a JSON round trip on the way back (e.g. Python json.dumps with indent
+    // and ensure_ascii) can make of the stored args: whitespace and newlines,
+    // reversed nested key order, other number spellings, escaped characters.
+    const reserialised = [
+      "{",
+      '  "query": "caf\\u00e9 \\/ bar",',
+      '  "opts": {"tags": ["b", "a"], "limit": 5.0, "max": 1e2}',
+      "}",
+    ].join("\n");
+    const task = approveResume(
+      [{ id: "tu_old", name: "mcp__search__run", args: reserialised }],
+      "tu_old",
+    );
+    const ctx = newHitlContext(task);
+    const gate = makeCanUseTool(ctx, task);
+
+    const input = { opts: { max: 100, limit: 5, tags: ["b", "a"] }, query: "café / bar" };
+    expect(await gate("mcp__search__run", input, { toolUseID: "tu_new" })).toEqual({
+      behavior: "allow",
+      updatedInput: input,
+    });
+    expect(ctx.paused).toBe(false);
+    expect(ctx.approvals).toEqual([]);
+  });
+
   it("does NOT auto-allow the approved tool with different arguments", async () => {
     const task = approveResume(
       [{ id: "tu_old", name: "mcp__slack__post", args: '{"channel":"#general","text":"hi"}' }],
