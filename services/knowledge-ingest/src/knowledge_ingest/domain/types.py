@@ -6,6 +6,24 @@ can send a plain string while Postgres casts it to the ``vector`` type.
 No numpy or pgvector Python package is needed.
 
 SQLite (unit tests) → JSON-encoded list of floats.
+
+Distance operators
+------------------
+pgvector's distance operators are methods on the column, with the same names
+as ``pgvector.sqlalchemy.Vector``::
+
+    Chunk.embedding.cosine_distance(query_vec)    # <=>
+    Chunk.embedding.l2_distance(query_vec)        # <->
+    Chunk.embedding.max_inner_product(query_vec)  # <#>
+    Chunk.embedding.l1_distance(query_vec)        # <+>
+
+Each one returns a ``Float`` expression and binds ``query_vec`` as a parameter
+of this type, which renders as ``CAST($n AS vector)``.  Do not build these
+with ``Chunk.embedding.op("<=>")(…)``.  A custom ``op()`` without a
+``return_type`` gets the type of its left operand, here this vector type.
+Comparing that expression with a float threshold then sends the float
+through ``process_bind_param`` (``TypeError: 'float' object is not
+iterable``), and the threshold renders as ``CAST(… AS vector)``.
 """
 
 from __future__ import annotations
@@ -13,8 +31,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import String
+from sqlalchemy import Float, String
 from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.types import TypeDecorator, UserDefinedType
 
 
@@ -40,11 +59,48 @@ def _compile_vector_sqlite(type_: Any, compiler: Any, **kw: Any) -> str:  # noqa
     return "TEXT"
 
 
+class VectorComparator(TypeDecorator.Comparator[Any]):
+    """pgvector distance operators for ``VectorColumn``, each typed ``Float``.
+
+    pgvector's distance operators return ``double precision``.  Typing the
+    expression as ``Float`` makes a comparison such as ``distance <= 0.6``
+    bind the threshold as a float, and makes result rows use the ``Float``
+    result processor instead of the vector one.  ``other`` is a vector, either
+    a Python sequence (bound as a ``VectorColumn`` parameter) or a SQL
+    expression.  These operators are PostgreSQL-only; SQLite has no pgvector.
+    """
+
+    __slots__ = ()
+
+    def _distance(self, opstring: str, other: Any) -> ColumnElement[float]:
+        return self.expr.op(opstring, return_type=Float)(other)
+
+    def l2_distance(self, other: Any) -> ColumnElement[float]:
+        """``<->``: Euclidean (L2) distance."""
+        return self._distance("<->", other)
+
+    def max_inner_product(self, other: Any) -> ColumnElement[float]:
+        """``<#>``: the *negative* inner product (lower = more similar)."""
+        return self._distance("<#>", other)
+
+    def cosine_distance(self, other: Any) -> ColumnElement[float]:
+        """``<=>``: cosine distance in ``[0, 2]`` (0 = same direction)."""
+        return self._distance("<=>", other)
+
+    def l1_distance(self, other: Any) -> ColumnElement[float]:
+        """``<+>``: taxicab (L1) distance (pgvector >= 0.7)."""
+        return self._distance("<+>", other)
+
+
 class VectorColumn(TypeDecorator):  # type: ignore[type-arg]
     """Store vectors as text on Postgres (CAST AS vector), JSON on SQLite."""
 
     impl = String
     cache_ok = True
+    # Replaces TypeDecorator's default comparator (built from ``impl``, i.e.
+    # String's).  String operators such as ``+`` → ``||`` mean nothing for a
+    # vector.  This one adds the pgvector distance methods above.
+    comparator_factory = VectorComparator
 
     def __init__(self, dim: int) -> None:
         super().__init__()
@@ -97,4 +153,4 @@ class VectorColumn(TypeDecorator):  # type: ignore[type-arg]
         return value
 
 
-__all__ = ["VectorColumn"]
+__all__ = ["VectorColumn", "VectorComparator"]

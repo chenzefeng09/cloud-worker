@@ -27,7 +27,7 @@ import logging
 import math
 from typing import Any
 
-from sqlalchemy import Select, func, select
+from sqlalchemy import ColumnElement, Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from knowledge_ingest.blob.base import BlobStore, make_key
@@ -547,7 +547,7 @@ class IngestService:
 
     # ----------------------------------------------------------- search
 
-    def _scope_clause(self, scope: str, allowed_levels: list[str]):  # noqa: ANN202
+    def _scope_clause(self, scope: str, allowed_levels: list[str]) -> ColumnElement[bool]:
         """Reachability + visibility predicate for a search scope.
 
         * ``knowledge`` — tenant-shared uploads (``origin_session_id`` IS NULL),
@@ -660,26 +660,23 @@ class IngestService:
             )
         return hits
 
-    async def _search_pgvector(
+    def _pgvector_search_stmt(
         self,
         qvec: list[float],
         *,
         k: int,
-        scope_clause: Any,
+        scope_clause: ColumnElement[bool],
         exclude_origin_session_id: str | None = None,
-    ) -> list[tuple[Chunk, Document, float]]:
-        # pgvector ships ``<=>`` (cosine distance) as an operator on the
-        # ``vector`` type.  Lower distance = better match.
-        #
-        # We embed the query vector as an inline text literal cast to vector,
-        # which lets asyncpg bind it without needing pgvector's numpy-backed codec.
-        from sqlalchemy import text as sa_text
+    ) -> Select[tuple[Chunk, Document, float]]:
+        """The pgvector query behind :meth:`search`: nearest chunks by cosine distance.
 
-        vec_text = "[" + ",".join(str(float(v)) for v in qvec) + "]"
-        # Build: "chunks.embedding <=> CAST('[x,y,z]' AS vector)" as a column expression.
-        distance = Chunk.embedding.op("<=>")(
-            sa_text(f"CAST('{vec_text}' AS vector)")
-        )
+        ``cosine_distance`` renders pgvector's ``<=>`` with ``qvec`` as a bound
+        parameter (``CAST($n AS vector)``), not as SQL text.  The expression is
+        typed ``Float``, so the ``search_max_distance`` gate binds a plain
+        float and the ``dist`` column is read back as one.  Ordering by the
+        raw ``<=>`` expression lets Postgres use the cosine index.
+        """
+        distance: ColumnElement[float] = Chunk.embedding.cosine_distance(qvec)
         stmt = (
             select(Chunk, Document, distance.label("dist"))
             .join(Document, Document.id == Chunk.document_id)
@@ -694,15 +691,30 @@ class IngestService:
                 (Document.origin_session_id.is_(None))
                 | (Document.origin_session_id != exclude_origin_session_id)
             )
+        return stmt
+
+    async def _search_pgvector(
+        self,
+        qvec: list[float],
+        *,
+        k: int,
+        scope_clause: ColumnElement[bool],
+        exclude_origin_session_id: str | None = None,
+    ) -> list[tuple[Chunk, Document, float]]:
+        stmt = self._pgvector_search_stmt(
+            qvec, k=k, scope_clause=scope_clause,
+            exclude_origin_session_id=exclude_origin_session_id,
+        )
         result = await self._db.execute(stmt)
-        return [(chunk, doc, float(1.0 - dist)) for chunk, doc, dist in result.all()]
+        # Lower distance = better match; report similarity (1 - distance).
+        return [(chunk, doc, 1.0 - dist) for chunk, doc, dist in result.all()]
 
     async def _search_python(
         self,
         qvec: list[float],
         *,
         k: int,
-        scope_clause: Any,
+        scope_clause: ColumnElement[bool],
         exclude_origin_session_id: str | None = None,
     ) -> list[tuple[Chunk, Document, float]]:
         """Fallback for unit tests on SQLite — small dataset, fine to brute force."""
