@@ -160,3 +160,16 @@ def test_release_rejects_cross_tenant(client: TestClient) -> None:
         headers=owner_headers,
     )
     assert owner_rel.status_code == 204
+
+
+def test_shutdown_stops_the_warm_sandboxes(settings: Settings) -> None:
+    """A graceful shutdown leaves no warm spare behind for nobody to reap."""
+    mock_runtime = _mock_runtime_factory()
+    mock_runtime.running_pool_ids.return_value = set()
+    with patch("sandbox_pool.pool.PoolDockerRuntime", return_value=mock_runtime):
+        app = create_app(settings)
+    with TestClient(app, raise_server_exceptions=False):
+        warm = app.state.pool._spawn_one("base")  # noqa: SLF001 — a warm spare
+        mock_runtime.stop_container.assert_not_called()
+
+    mock_runtime.stop_container.assert_called_once_with(warm.sandbox_id)

@@ -45,16 +45,25 @@ def _make_pool(**over: object) -> tuple[Pool, MagicMock]:
     """Build a Pool with a mock runtime.
 
     The mock's ``start_idle_container`` returns unique 12-char hex ids so
-    the pool's ``sandbox_id`` values look like real short container ids.
+    the pool's ``sandbox_id`` values look like real short container ids
+    (``000000000000``, ``000000000001``, … in spawn order).
     The mock's ``stop_container`` is a no-op (assertable).
+    The mock's ``alive_ids`` reports every id alive; see ``_kill``.
     """
     runtime = MagicMock()
     _counter = itertools.count()
     runtime.start_idle_container.side_effect = (
         lambda template, memory_limit=None: f"{next(_counter):012x}"
     )
+    runtime.alive_ids.side_effect = set
+    runtime.running_pool_ids.return_value = set()
     pool = Pool(_settings(**over), runtime=runtime)
     return pool, runtime
+
+
+def _kill(runtime: MagicMock, *dead: str) -> None:
+    """Make the mock runtime report ``dead`` ids as no longer alive."""
+    runtime.alive_ids.side_effect = lambda ids: set(ids) - set(dead)
 
 
 # --------------------------------------------------------------------------- #
@@ -189,6 +198,174 @@ async def test_reap_excess_tick_drops_above_high_watermark() -> None:
     reaped = await pool.reap_excess_tick()
     # idle 8 → high 3 → reap 5
     assert reaped == 5
+
+
+# --------------------------------------------------------------------------- #
+# Liveness reconciliation
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_reconcile_reaps_dead_idle_and_warmup_replaces_it() -> None:
+    """A warm container that died is dropped, removed, and re-warmed."""
+    pool, runtime = _make_pool(idle_low_watermark=2)
+    await pool.warmup_tick()
+    dead_id, live_id = "000000000000", "000000000001"
+    _kill(runtime, dead_id)
+    runtime.start_idle_container.reset_mock()
+
+    dropped = await pool.reconcile_tick()
+
+    assert dropped == 1
+    # One batched probe covers every idle entry.
+    runtime.alive_ids.assert_called_once()
+    (probed,), _ = runtime.alive_ids.call_args
+    assert sorted(probed) == [dead_id, live_id]
+    runtime.stop_container.assert_called_once_with(dead_id)
+    assert pool.snapshot()["by_template"]["base"] == {"idle": 1, "total": 1}
+
+    spawned = await pool.warmup_tick()
+
+    assert spawned == 1
+    runtime.start_idle_container.assert_called_once_with("base", memory_limit="1g")
+    assert pool.snapshot()["by_template"]["base"] == {"idle": 2, "total": 2}
+
+
+@pytest.mark.asyncio
+async def test_acquire_never_returns_known_dead_entry() -> None:
+    """Once reconcile finds a warm sandbox dead, acquire must skip it."""
+    pool, runtime = _make_pool(idle_low_watermark=2)
+    await pool.warmup_tick()
+    # The dead one is first in acquire's scan order.
+    dead_id = "000000000000"
+    _kill(runtime, dead_id)
+    await pool.reconcile_tick()
+    runtime.start_idle_container.reset_mock()
+
+    first = await pool.acquire(tenant_id="t1")   # the surviving warm one
+    second = await pool.acquire(tenant_id="t2")  # no warm left → cold spawn
+
+    assert dead_id not in {first.sandbox_id, second.sandbox_id}
+    runtime.start_idle_container.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_keeps_entries_when_probe_fails() -> None:
+    """An unreachable runtime must not read as "every warm sandbox died"."""
+    pool, runtime = _make_pool(idle_low_watermark=2)
+    await pool.warmup_tick()
+    runtime.alive_ids.side_effect = RuntimeError("docker daemon unreachable")
+
+    dropped = await pool.reconcile_tick()
+
+    assert dropped == 0
+    runtime.stop_container.assert_not_called()
+    assert pool.snapshot()["by_template"]["base"]["idle"] == 2
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_acquired_entries_alone() -> None:
+    """Only IDLE entries are probed; an ACQUIRED one belongs to its caller."""
+    pool, runtime = _make_pool(idle_low_watermark=2)
+    await pool.warmup_tick()
+    acquired = await pool.acquire(tenant_id="t1")
+    runtime.alive_ids.side_effect = lambda ids: set()  # every container dead
+
+    dropped = await pool.reconcile_tick()
+
+    assert dropped == 1
+    (probed,), _ = runtime.alive_ids.call_args
+    assert acquired.sandbox_id not in probed
+    assert pool.snapshot()["by_template"]["base"] == {"idle": 0, "total": 1}
+    # Still tracked, so the caller can release it as usual.
+    await pool.release(acquired.sandbox_id, tenant_id="t1")
+    assert pool.snapshot()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_probe_without_idle_entries() -> None:
+    pool, runtime = _make_pool(idle_low_watermark=0)
+    assert await pool.reconcile_tick() == 0
+    runtime.alive_ids.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Startup: warm sandboxes an earlier pool process left running
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_reap_orphans_stops_running_sandboxes_the_pool_does_not_know() -> None:
+    pool, runtime = _make_pool(idle_low_watermark=1)
+    await pool.warmup_tick()  # this process's own warm sandbox: 000000000000
+    runtime.running_pool_ids.return_value = {"000000000000", "0ldc0ntainer", "0ldc0ntaine2"}
+
+    stopped = await pool.reap_orphans()
+
+    assert stopped == 2
+    assert sorted(c.args[0] for c in runtime.stop_container.call_args_list) == [
+        "0ldc0ntaine2", "0ldc0ntainer",
+    ]
+    assert pool.snapshot()["by_template"]["base"]["idle"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reap_orphans_stops_nothing_when_the_listing_fails() -> None:
+    pool, runtime = _make_pool()
+    runtime.running_pool_ids.side_effect = RuntimeError("docker daemon unreachable")
+
+    assert await pool.reap_orphans() == 0
+    runtime.stop_container.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reap_orphans_carries_on_past_a_failed_stop() -> None:
+    pool, runtime = _make_pool()
+    runtime.running_pool_ids.return_value = {"0ldc0ntainer", "0ldc0ntaine2"}
+    runtime.stop_container.side_effect = [RuntimeError("busy"), None]
+
+    # Both are tried; only the one that stopped is counted.
+    assert await pool.reap_orphans() == 1
+    assert runtime.stop_container.call_count == 2
+
+
+# --------------------------------------------------------------------------- #
+# Shutdown: stop this process's warm spares
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_drain_idle_stops_every_warm_sandbox() -> None:
+    pool, runtime = _make_pool(idle_low_watermark=2)
+    await pool.warmup_tick()
+
+    assert await pool.drain_idle() == 2
+
+    assert sorted(c.args[0] for c in runtime.stop_container.call_args_list) == [
+        "000000000000", "000000000001",
+    ]
+    assert pool.snapshot()["total"] == 0
+
+
+@pytest.mark.asyncio
+async def test_drain_idle_leaves_handed_out_sandboxes_alone() -> None:
+    pool, runtime = _make_pool(idle_low_watermark=0)
+    acquired = await pool.acquire(tenant_id="tnt_a")
+
+    assert await pool.drain_idle() == 0
+
+    runtime.stop_container.assert_not_called()
+    assert pool.snapshot()["total"] == 1
+    assert acquired.sandbox_id == "000000000000"
+
+
+@pytest.mark.asyncio
+async def test_drain_idle_carries_on_past_a_failed_stop() -> None:
+    pool, runtime = _make_pool(idle_low_watermark=2)
+    await pool.warmup_tick()
+    runtime.stop_container.side_effect = [RuntimeError("busy"), None]
+
+    # Both are tried and both leave the pool; only the one that stopped counts.
+    assert await pool.drain_idle() == 1
+    assert runtime.stop_container.call_count == 2
+    assert pool.snapshot()["total"] == 0
 
 
 # --------------------------------------------------------------------------- #

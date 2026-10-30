@@ -83,6 +83,7 @@ paths:
       security: []
       responses:
         '200':
+          description: The service is alive
           content:
             application/json:
               schema: { $ref: '#/components/schemas/HealthStatus' }
@@ -94,6 +95,7 @@ paths:
       security: []
       responses:
         '200':
+          description: The service is ready to take requests
           content:
             application/json:
               schema: { $ref: '#/components/schemas/HealthStatus' }
@@ -154,7 +156,7 @@ components:
         title:   { type: string }
         status:  { type: integer }
         detail:  { type: string }
-        instance:{ type: string }
+        instance: { type: string }
         code:    { type: string }
 
   responses:

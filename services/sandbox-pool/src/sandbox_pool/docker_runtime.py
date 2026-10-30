@@ -2,8 +2,9 @@
 
 The pool needs a narrower interface than the agent-scheduler's DockerRuntime:
 it only needs to *start an idle container* (no task payload, no workspace
-bind-mount) and *stop + remove* it by id.  We do NOT duplicate spawn_run logic
-here; the agent-scheduler's DockerRuntime handles running containers.
+bind-mount), *stop + remove* it by id, and ask *which of its containers are
+still running*.  We do NOT duplicate spawn_run logic here; the
+agent-scheduler's DockerRuntime handles running containers.
 
 Security posture matches agent-scheduler:
 
@@ -12,13 +13,15 @@ Security posture matches agent-scheduler:
 * Containers are labelled ``agent-platform.pool-managed=true`` and
   ``agent-platform.pool-state=idle`` so they can be audited and cleaned up
   by anything that knows the label convention.
-* The sandbox container is started with an idle command (``sleep infinity``
-  for Docker — the real Claude SDK worker (``node /app/dist/main.js``) runs
-  only after acquire + task injection in the KEDA/B-M3 path).  For the current Docker
-  dev path the idle container just parks a warm image; the acquire caller
-  stops it and agent-scheduler spawns a fresh one with the task.  This gives
-  the warm-pool the intended latency benefit: image layers are already pulled
-  and the image is in the kernel page cache.
+* The sandbox container is parked on ``sleep infinity`` by overriding the
+  image ENTRYPOINT.  The sandbox image's ENTRYPOINT *is* the Claude SDK worker
+  (``node /app/dist/main.js``), so an idle ``command`` would only be appended
+  to it as argv — the worker would start with no RUN_ID and exit 1 at once.
+  The real worker runs only after acquire + task injection in the KEDA/B-M3
+  path.  For the current Docker dev path the idle container just parks a warm
+  image; the acquire caller stops it and agent-scheduler spawns a fresh one
+  with the task.  This gives the warm-pool the intended latency benefit: image
+  layers are already pulled and the image is in the kernel page cache.
 
 Pool label convention
 ---------------------
@@ -30,6 +33,10 @@ Pool label convention
     state in ``PoolState``; the Docker label is best-effort for observability.
 ``agent-platform.pool-template`` = ``<template_name>``
     Which template this container was spawned from.
+``agent-platform.pool-owner`` = ``<Settings.pool_owner>``
+    The pool process that started it.  Liveness probes and the startup orphan
+    reap list only this owner's containers, so pool replicas sharing a daemon
+    never probe or stop each other's.
 """
 
 from __future__ import annotations
@@ -37,6 +44,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+from collections.abc import Iterable
 
 import docker
 import docker.errors
@@ -143,20 +151,28 @@ class PoolDockerRuntime:
         pre-allocated, so each tier must warm at its own size; when omitted we
         fall back to the legacy single-bucket ``sandbox_memory_limit``.
 
-        The container runs ``sleep infinity`` so it parks the warm image
-        without consuming CPU.  The pool hands the *short id* out as
-        sandbox_id — 12 hex chars, matching the VARCHAR(50) convention used
-        for container_id throughout this project.
+        The image ENTRYPOINT (the worker) is replaced by ``sleep infinity``
+        with no ``command``, so the container parks the warm image without
+        consuming CPU and the worker never starts.  ``init=True`` runs
+        docker-init as PID 1: ``sleep`` as PID 1 would ignore SIGTERM and make
+        every ``stop_container`` wait out its full timeout.  The pool hands the
+        *short id* out as sandbox_id — 12 hex chars, matching the VARCHAR(50)
+        convention used for container_id throughout this project.
 
         Labels set on the container:
         * ``agent-platform.pool-managed=true``
         * ``agent-platform.pool-state=idle``
         * ``agent-platform.pool-template=<template>``
+        * ``agent-platform.pool-owner=<Settings.pool_owner>``
         """
         try:
             container = self.client.containers.run(
                 image=self._settings.sandbox_image,
-                command=["sleep", "infinity"],
+                # Override the ENTRYPOINT, not the command: a command would be
+                # appended to the image's worker entrypoint as argv.  ``init``
+                # forwards SIGTERM, which ``sleep`` as PID 1 would ignore.
+                entrypoint=["sleep", "infinity"],
+                init=True,
                 network=self._settings.docker_network,
                 # FIX B4 — kernel hardening (no-new-privileges, cap_drop=ALL,
                 # pids_limit, nofile ulimit).  See ``_kernel_hardening_kwargs``.
@@ -169,6 +185,7 @@ class PoolDockerRuntime:
                     f"{_LABEL_PREFIX}.pool-managed": "true",
                     f"{_LABEL_PREFIX}.pool-state": "idle",
                     f"{_LABEL_PREFIX}.pool-template": template,
+                    f"{_LABEL_PREFIX}.pool-owner": self._settings.pool_owner,
                 },
             )
         except docker.errors.ImageNotFound as exc:
@@ -219,6 +236,40 @@ class PoolDockerRuntime:
             "pool: idle container stopped and removed",
             extra={"container_id": container_id},
         )
+
+    # ------------------------------------------------------------------ liveness
+
+    def alive_ids(self, container_ids: Iterable[str]) -> set[str]:
+        """Return the subset of ``container_ids`` whose container is running.
+
+        One label-filtered list covers every id (see ``running_pool_ids``), so
+        the pool probes all its idle entries for the cost of a single API
+        request.  Exited, dead and removed containers are simply absent from
+        the list.  Docker errors propagate: an unreachable daemon must not
+        read as "all dead".
+        """
+        running_ids = self.running_pool_ids()
+        return {cid for cid in container_ids if cid in running_ids}
+
+    def running_pool_ids(self) -> set[str]:
+        """Short ids of every running container this pool owner started.
+
+        Containers of another pool owner (a peer replica) are never listed.
+        ``sparse=True`` skips docker-py's per-container inspect.  Docker errors
+        propagate.
+        """
+        running = self.client.containers.list(
+            filters={
+                # Several label filters must all match.
+                "label": [
+                    f"{_LABEL_PREFIX}.pool-managed=true",
+                    f"{_LABEL_PREFIX}.pool-owner={self._settings.pool_owner}",
+                ],
+                "status": "running",
+            },
+            sparse=True,
+        )
+        return {c.id[:12] for c in running}
 
     # ------------------------------------------------------------------ label
 

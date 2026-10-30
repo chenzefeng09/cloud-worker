@@ -1,8 +1,8 @@
 """CubeSandbox-backed pool runtime.
 
-Implements the same narrow two-method interface as :class:`PoolDockerRuntime`
-but calls the CubeSandbox controller (E2B-compatible HTTP API) instead of the
-Docker daemon.
+Implements the same narrow interface as :class:`PoolDockerRuntime` but calls
+the CubeSandbox controller (E2B-compatible HTTP API) instead of the Docker
+daemon.
 
 Interface contract (mirroring PoolDockerRuntime)
 -------------------------------------------------
@@ -11,6 +11,14 @@ Interface contract (mirroring PoolDockerRuntime)
 
 ``stop_container(sandbox_id: str) -> None``
     Kill and delete the microVM.  Idempotent — 404 is silently swallowed.
+
+``alive_ids(sandbox_ids) -> set[str]``
+    Which of the given microVMs the controller still has alive — one
+    ``GET /sandboxes`` per call.  Raises when the list can't be read.
+
+``running_pool_ids() -> set[str]``
+    Every live microVM whose metadata marks it pool-managed by this pool
+    owner (``Settings.pool_owner``); a peer replica's VMs are never listed.
 
 ``set_pool_state_label(sandbox_id: str, state: str) -> None``
     Best-effort label update (logged only — CubeSandbox metadata is immutable
@@ -48,6 +56,7 @@ References
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 
 import httpx
 
@@ -58,8 +67,16 @@ logger = logging.getLogger(__name__)
 # Labels we embed in microVM metadata (analogous to Docker labels).
 _LABEL_PREFIX = "agent-platform"
 
-# Claude Agent SDK worker entry (``worker-claude-sdk`` image ENTRYPOINT).
-WORKER_CMD: list[str] = ["node", "/app/dist/main.js"]
+# What a warm microVM runs until a task is injected: nothing.  The worker needs
+# a RUN_ID and a real task and exits without them, so starting it here would
+# only get the VM dropped and respawned on every pool tick.
+IDLE_CMD: list[str] = ["sleep", "infinity"]
+
+# Controller ``state`` values that mean a VM is gone for good — the terminal
+# half of agent-scheduler's ``_E2B_STATUS_MAP``.  Anything else (creating,
+# running, paused by cube-lifecycle-manager, or a state we don't know) counts
+# as alive, so controller vocabulary drift can't churn the warm pool.
+_TERMINAL_STATES = frozenset({"killed", "completed", "errored", "not_found"})
 
 
 class PoolCubeRuntime:
@@ -67,7 +84,7 @@ class PoolCubeRuntime:
 
     Communicates with the CubeSandbox controller using the E2B-compatible
     REST API (same protocol as agent-scheduler's CubeSandboxRuntime).
-    Implements the two-method interface expected by :class:`~sandbox_pool.pool.Pool`.
+    Implements the ``PoolRuntime`` interface expected by :class:`~sandbox_pool.pool.Pool`.
     """
 
     def __init__(self, settings: Settings) -> None:
@@ -131,8 +148,8 @@ class PoolCubeRuntime:
         each tier must warm at its own size; when omitted we fall back to the
         legacy single-bucket ``sandbox_memory_limit``.
 
-        The microVM runs the Claude SDK worker entry (``WORKER_CMD``) with an
-        empty task (AGENT_TASK_JSON is set to a quiescent payload).
+        The microVM parks on ``IDLE_CMD`` instead of running the worker, which
+        exits without a RUN_ID and a real task.
         The pool will hand the sandbox_id to the scheduler on acquire; the
         scheduler then tells the VM what task to run by other means
         (for CubeSandbox this relies on the snapshot fork path — follow-up).
@@ -143,8 +160,6 @@ class PoolCubeRuntime:
         already being booted (OS + Node runtime in memory), not from
         a memory-checkpoint fork.  Snapshot integration is a follow-up.
         """
-        import json
-
         body = {
             # E2B-compatible fields
             "template_id": self._settings.sandbox_image,
@@ -152,20 +167,11 @@ class PoolCubeRuntime:
                 f"{_LABEL_PREFIX}.pool-managed": "true",
                 f"{_LABEL_PREFIX}.pool-state": "idle",
                 f"{_LABEL_PREFIX}.pool-template": template,
+                f"{_LABEL_PREFIX}.pool-owner": self._settings.pool_owner,
             },
-            "env": {
-                # Quiescent task — the VM will block until a real task is
-                # injected.  In the snapshot path this state is captured as
-                # the "ready" checkpoint; until snapshots land the VM just
-                # waits for a signal.
-                "AGENT_TASK_JSON": json.dumps(
-                    {"task": "__idle__", "mcp_servers": [], "skills": []},
-                ),
-            },
-            # Worker entry point — matches agent-scheduler's cube_runtime
-            # (CubeSandbox's behaviour with an empty cmd is unspecified, so the
-            # image ENTRYPOINT is passed explicitly).
-            "cmd": list(WORKER_CMD),
+            # Park the VM (CubeSandbox's behaviour with an empty cmd is
+            # unspecified, so the command is always passed explicitly).
+            "cmd": list(IDLE_CMD),
             "resources": {
                 "memory_mb": _parse_memory_mb(
                     memory_limit or self._settings.sandbox_memory_limit,
@@ -186,9 +192,12 @@ class PoolCubeRuntime:
                 f"CubeSandbox refused pool spawn (HTTP {resp.status_code}): {resp.text[:200]}",
             )
 
-        sandbox_id: str = resp.json().get("sandbox_id", "")
+        # E2B answers ``sandboxID`` (what agent-scheduler reads); older
+        # controller builds said ``sandbox_id``.
+        created = resp.json()
+        sandbox_id = str(created.get("sandboxID") or created.get("sandbox_id") or "")
         if not sandbox_id:
-            raise RuntimeError("CubeSandbox returned no sandbox_id for pool warm-up spawn")
+            raise RuntimeError("CubeSandbox returned no sandboxID for pool warm-up spawn")
 
         logger.info(
             "pool: cube idle microVM started",
@@ -229,6 +238,63 @@ class PoolCubeRuntime:
             extra={"sandbox_id": sandbox_id},
         )
 
+    # --------------------------------------------------------------- liveness
+
+    def alive_ids(self, sandbox_ids: Iterable[str]) -> set[str]:
+        """Return the subset of ``sandbox_ids`` the controller still has alive.
+
+        One ``GET /sandboxes`` (the list agent-scheduler's reaper walks) covers
+        every id.  A VM is dead only when its record is gone or its ``state``
+        is terminal (``_TERMINAL_STATES``).  Raises when the list can't be read
+        (unreachable, non-200, unrecognised body): an unreachable controller
+        must not look like every warm VM died.
+        """
+        alive = {_vm_id(vm) for vm in self._live_vms()}
+        return {sid for sid in sandbox_ids if sid in alive}
+
+    def running_pool_ids(self) -> set[str]:
+        """Ids of every live microVM this pool owner started.
+
+        A VM without the pool metadata is never included: it may be a run the
+        scheduler started.  Neither is one another pool owner (a peer replica)
+        started.  Raises when the list can't be read.
+        """
+        owner = self._settings.pool_owner
+        return {
+            _vm_id(vm)
+            for vm in self._live_vms()
+            if isinstance(vm.get("metadata"), dict)
+            and vm["metadata"].get(f"{_LABEL_PREFIX}.pool-managed") == "true"
+            and vm["metadata"].get(f"{_LABEL_PREFIX}.pool-owner") == owner
+        }
+
+    def _live_vms(self) -> list[dict]:
+        """Every VM record from ``GET /sandboxes`` whose state is not terminal."""
+        try:
+            resp = self._client.get("/sandboxes")
+        except httpx.HTTPError as exc:
+            raise RuntimeError(
+                f"CubeSandbox controller unreachable during pool liveness probe: {exc}",
+            ) from exc
+
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"CubeSandbox refused pool liveness probe (HTTP {resp.status_code}): "
+                f"{resp.text[:200]}",
+            )
+
+        payload = resp.json()
+        # Controller versions answer with a bare list or ``{"items": [...]}``.
+        records = payload.get("items") if isinstance(payload, dict) else payload
+        if not isinstance(records, list):
+            raise RuntimeError("CubeSandbox returned an unrecognised sandbox list")
+        return [
+            vm for vm in records
+            if isinstance(vm, dict)
+            and (vm.get("state") or vm.get("status")) not in _TERMINAL_STATES
+            and _vm_id(vm)
+        ]
+
     # --------------------------------------------------------------- label (no-op)
 
     def set_pool_state_label(self, sandbox_id: str, state: str) -> None:
@@ -252,3 +318,7 @@ def _parse_memory_mb(limit: str) -> int:
     if limit.endswith("m"):
         return int(limit[:-1])
     return int(limit)
+
+
+def _vm_id(vm: dict) -> str:
+    return str(vm.get("sandboxID") or vm.get("sandbox_id") or "")
