@@ -104,3 +104,21 @@ class InternalScopeRequiredError(AppRegistryError):
             code="APP.AUTH.INTERNAL_SCOPE_REQUIRED",
             status=403,
         )
+
+
+class PrivacyForbiddenError(AppRegistryError):
+    def __init__(self) -> None:
+        super().__init__(
+            "Only an administrator may act on another user's data",
+            code="APP.PRIVACY.FORBIDDEN",
+            status=403,
+        )
+
+
+class PrivacyInvalidSubjectError(AppRegistryError):
+    def __init__(self, user_id: str) -> None:
+        super().__init__(
+            f"Invalid data subject user_id {user_id!r}",
+            code="APP.PRIVACY.INVALID_SUBJECT",
+            status=422,
+        )

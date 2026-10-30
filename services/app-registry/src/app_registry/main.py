@@ -36,9 +36,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     from app_registry.api.v1.apps import router as apps_router
     from app_registry.api.v1.health import router as health_router
+    from app_registry.api.v1.privacy import router as privacy_router
 
     app.include_router(health_router, prefix=settings.api_prefix)
     app.include_router(apps_router, prefix=settings.api_prefix)
+    app.include_router(privacy_router, prefix=settings.api_prefix)
     return app
 
 

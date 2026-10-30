@@ -201,11 +201,12 @@ def test_list_mine_and_published_scopes(
     mine = _create_app(app_client, tenant_headers)
     other = app_client.post(
         f"{PREFIX}/apps",
-        json={"name": "Other App", "version": _version_body()},
+        json={"name": "Other App", "visibility": "tenant", "version": _version_body()},
         headers=other_user_headers,
     ).json()
 
-    # Publish only the other user's App; it should appear on the tenant shelf.
+    # Publish only the other user's (tenant-visible) App; it should appear on
+    # the tenant shelf.
     other_vid = other["versions"][0]["id"]
     published = app_client.post(
         f"{PREFIX}/apps/{other['id']}/versions/{other_vid}/publish",
@@ -240,7 +241,7 @@ def test_full_review_lifecycle(app_client: TestClient, tenant_headers: dict,
     assert q.json()["total"] == 1
     assert q.json()["items"][0]["app_name"] == "Contract Reviewer"
 
-    # approve → published + app pointer + visibility
+    # approve → published + app pointer; visibility stays the owner's choice
     a = app_client.post(f"{PREFIX}/apps/review/{vid}/approve", json={"note": "lgtm"},
                         headers=tenant_headers)
     assert a.status_code == 200
@@ -248,9 +249,17 @@ def test_full_review_lifecycle(app_client: TestClient, tenant_headers: dict,
 
     detail = app_client.get(f"{PREFIX}/apps/{app_id}", headers=tenant_headers).json()
     assert detail["current_version_id"] == vid
-    assert detail["visibility"] == "tenant"
+    assert detail["visibility"] == "private"
 
-    # shows up in published list
+    # a private App never reaches the shelf …
+    pub = app_client.get(f"{PREFIX}/apps?scope=published", headers=tenant_headers).json()
+    assert all(a["id"] != app_id for a in pub["items"])
+
+    # … until its owner shares it with the tenant
+    shared = app_client.put(
+        f"{PREFIX}/apps/{app_id}", json={"visibility": "tenant"}, headers=tenant_headers,
+    )
+    assert shared.status_code == 200, shared.text
     pub = app_client.get(f"{PREFIX}/apps?scope=published", headers=tenant_headers).json()
     assert any(a["id"] == app_id for a in pub["items"])
 

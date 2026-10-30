@@ -8,8 +8,17 @@ review state machine is::
 
 Only ``draft`` versions are editable; every other status is immutable.  An
 author edits a published App by creating a *new* draft version.  ``approve``
-(and direct ``publish``) sets ``app.current_version_id`` and bumps
-``app.visibility`` to ``tenant`` so the version becomes shelf-visible.
+(and direct ``publish``) sets ``app.current_version_id``.
+
+Visibility is the owner's choice and publishing never changes it: a
+``private`` App is seen only by its author (and reviewers), before and after
+publication; a ``tenant`` App reaches the shared shelf once it has a published
+version.
+
+Privacy (GDPR Art. 15 / 17): ``export_user_apps`` returns everything held
+about one user — the Apps they authored and the review-trail entries naming
+them; ``erase_user_apps`` deletes the Apps only they could see and
+de-attributes the ones shared with the tenant (see its docstring).
 
 Ownership: ``author_id == user_id`` is enforced for App-owner mutations
 (update / new version / edit draft / submit / publish).  Callers holding the
@@ -41,6 +50,10 @@ from app_registry.schemas.app import AppVersionCreate
 
 # Visibility levels that put an App on the shared tenant shelf (published list).
 _SHELF_VISIBILITIES = ("tenant",)
+
+# Stands in for an erased user in ``author_id`` and the review trail of an App
+# kept for the tenant.  Not a user id (``usr_…``), so it matches nobody.
+ERASED_USER = "erased-user"
 
 
 class AppService:
@@ -162,6 +175,18 @@ class AppService:
         await self._db.flush()
         await self._db.refresh(app)
         return await self.get_app(app.id)
+
+    async def get_visible_app(self, app_id: str, *, is_reviewer: bool) -> App:
+        """``get_app`` for a reader: a private App exists only for its author
+        and reviewers — anyone else gets the same 404 as for a missing one."""
+        app = await self.get_app(app_id)
+        if (
+            app.visibility not in _SHELF_VISIBILITIES
+            and not is_reviewer
+            and app.author_id != self._user_id
+        ):
+            raise AppNotFoundError(app_id)
+        return app
 
     async def get_app(self, app_id: str) -> App:
         stmt = (
@@ -299,8 +324,8 @@ class AppService:
                               is_reviewer: bool) -> AppVersion:
         """Direct publish (admin-built Apps / app.publish holders).
 
-        Publishes any draft|pending_review version, sets the app pointer and
-        bumps visibility to ``tenant``.
+        Publishes any draft|pending_review version and sets the app pointer.
+        Visibility is left as the owner set it.
         """
         app = await self.get_app(app_id)
         self._assert_owner_or_reviewer(app, is_reviewer=is_reviewer)
@@ -309,7 +334,6 @@ class AppService:
             raise AppVersionNotDraftError(ver.status)
         self._set_status(ver, "published", actor=self._require_user())
         app.current_version_id = ver.id
-        app.visibility = "tenant"
         await self._db.flush()
         await self._db.refresh(ver)
         return ver
@@ -339,7 +363,6 @@ class AppService:
         if note:
             ver.review_note = note
         app.current_version_id = ver.id
-        app.visibility = "tenant"
         await self._db.flush()
         await self._db.refresh(ver)
         return ver
@@ -367,3 +390,85 @@ class AppService:
         if ver.status != "published":
             raise AppNoPublishedVersionError(app_id)
         return app, ver
+
+    # -------------------------------------------------------------- privacy
+
+    @staticmethod
+    def _is_shared(app: App) -> bool:
+        """On the tenant shelf: others may have run it, scheduled it or relied on it."""
+        return app.visibility in _SHELF_VISIBILITIES and app.current_version_id is not None
+
+    async def export_user_apps(self, user_id: str) -> tuple[list[App], list[AppVersion]]:
+        """The Apps ``user_id`` authored (every version), and the versions of
+        other authors' Apps whose review trail names them."""
+        authored = (
+            await self._db.execute(
+                select(App)
+                .where(App.tenant_id == self._tenant_id, App.author_id == user_id)
+                .options(selectinload(App.versions))
+                .order_by(App.created_at.asc())
+            )
+        ).scalars().all()
+        trail = (
+            await self._db.execute(
+                select(AppVersion)
+                .join(App, App.id == AppVersion.app_id)
+                .where(
+                    AppVersion.tenant_id == self._tenant_id,
+                    App.author_id != user_id,
+                    (AppVersion.created_by == user_id)
+                    | (AppVersion.submitted_by == user_id)
+                    | (AppVersion.reviewed_by == user_id),
+                )
+                .order_by(AppVersion.created_at.asc())
+            )
+        ).scalars().all()
+        return list(authored), list(trail)
+
+    async def erase_user_apps(self, user_id: str, *, dry_run: bool = False) -> dict[str, int]:
+        """Erase what this service holds about ``user_id``; idempotent.
+
+        * An App they authored that nobody else can use (private, or never
+          published) is deleted with all its versions.
+        * An App they authored that is shared with the tenant stays — others
+          may run or schedule it — but no longer names them: ``author_id``
+          becomes ``ERASED_USER``.
+        * Every review-trail field naming them (``created_by``,
+          ``submitted_by``, ``reviewed_by``) on a version that stays becomes
+          ``ERASED_USER``, and a review note they wrote is removed: it is their
+          own words, and the export hands it to them as their data.
+
+        ``dry_run`` counts without changing anything.
+        """
+        authored, _ = await self.export_user_apps(user_id)
+        deleted = [app for app in authored if not self._is_shared(app)]
+        kept = [app for app in authored if self._is_shared(app)]
+        deleted_ids = {app.id for app in deleted}
+        trail_stmt = select(AppVersion).where(
+            AppVersion.tenant_id == self._tenant_id,
+            (AppVersion.created_by == user_id)
+            | (AppVersion.submitted_by == user_id)
+            | (AppVersion.reviewed_by == user_id),
+        )
+        if deleted_ids:
+            trail_stmt = trail_stmt.where(AppVersion.app_id.not_in(deleted_ids))
+        trail = (await self._db.execute(trail_stmt)).scalars().all()
+        counts = {
+            "apps_deleted": len(deleted),
+            "apps_deattributed": len(kept),
+            "versions_deattributed": len(trail),
+        }
+        if dry_run:
+            return counts
+        for app in deleted:
+            await self._db.delete(app)
+        for app in kept:
+            app.author_id = ERASED_USER
+        for ver in trail:
+            if ver.reviewed_by == user_id:
+                ver.review_note = None
+            for field in ("created_by", "submitted_by", "reviewed_by"):
+                if getattr(ver, field) == user_id:
+                    setattr(ver, field, ERASED_USER)
+        await self._db.flush()
+        return counts

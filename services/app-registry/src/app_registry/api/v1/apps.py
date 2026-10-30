@@ -168,9 +168,13 @@ async def get_app(
     user_id: str = TUserId,
     reviewer: bool = TIsReviewer,
 ) -> AppOut:
-    """App detail — author/admin see all versions; others see published current."""
+    """App detail — author/admin see all versions; others see published current.
+
+    A private App is the author's alone: to anyone else (bar reviewers) it does
+    not exist, so the BFF run path, which reads through here, can't run it.
+    """
     svc = AppService(db, tenant_id=tenant_id, user_id=user_id)
-    app = await svc.get_app(app_id)
+    app = await svc.get_visible_app(app_id, is_reviewer=reviewer)
     out = AppOut.model_validate(app)
     if app.author_id != user_id and not reviewer:
         # Non-owner: expose only the published current version.
@@ -298,7 +302,7 @@ async def publish_version(
     user_id: str = TUserId,
     reviewer: bool = TIsReviewer,
 ) -> AppVersionOut:
-    """Direct publish — sets app.current_version_id + visibility=tenant."""
+    """Direct publish — sets app.current_version_id (visibility unchanged)."""
     svc = AppService(db, tenant_id=tenant_id, user_id=user_id)
     ver = await svc.publish_version(app_id, version_id, is_reviewer=reviewer)
     return AppVersionOut.model_validate(ver)
